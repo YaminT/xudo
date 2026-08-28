@@ -107,6 +107,15 @@ pub enum DenialCode {
     NoConfirmationChannel,
     /// The action is allowed for humans but never on the agent path.
     HumanPathOnly,
+    /// The program the caller asked to run is not the program the action names.
+    ///
+    /// Its own code rather than [`Self::ArgvRejected`], because the two send a
+    /// caller to different places: a rejected argv means fix the arguments, a
+    /// mismatched program means you are asking the wrong action entirely. It
+    /// also has to be visible in an audit record — "tried to run X under a rule
+    /// for Y" is the shape of an attempted bypass, and folding it into
+    /// `argv_rejected` would hide it among ordinary typos.
+    ExeMismatch,
 }
 
 impl DenialCode {
@@ -120,6 +129,7 @@ impl DenialCode {
             Self::Frozen => 5,
             Self::NoConfirmationChannel => 6,
             Self::HumanPathOnly => 7,
+            Self::ExeMismatch => 8,
         }
     }
 
@@ -133,6 +143,7 @@ impl DenialCode {
             Self::Frozen => "frozen",
             Self::NoConfirmationChannel => "no_confirmation_channel",
             Self::HumanPathOnly => "human_path_only",
+            Self::ExeMismatch => "exe_mismatch",
         }
     }
 
@@ -169,6 +180,9 @@ impl DenialCode {
             }
             Self::HumanPathOnly => {
                 "this action is never available to an agent; hand it to a person"
+            }
+            Self::ExeMismatch => {
+                "this action runs a different program than the one requested; run `aido list`                  to find the action that names this program"
             }
         }
     }
@@ -267,7 +281,14 @@ pub struct Decision {
     pub action: Option<ActionId>,
     /// Where the matching rule is defined, for `file:line` reporting.
     pub rule_source: Option<Source>,
-    /// The canonicalized argv the decision was made about.
+    /// The program the decision was made about, when the caller named one.
+    ///
+    /// Carried separately from [`Self::resolved_argv`], and rendered with it, so
+    /// no surface can show a command without showing which binary runs it. A
+    /// decision record that lists `restart nginx.service` and omits the program
+    /// describes a command nobody can reconstruct.
+    pub resolved_exe: Option<String>,
+    /// The canonicalized argv the decision was made about — operands only.
     pub resolved_argv: Vec<String>,
     /// Whether a human must approve.
     pub confirm: Confirm,
@@ -285,10 +306,31 @@ impl Decision {
             remediation: Some(code.remediation().to_owned()),
             action: None,
             rule_source: None,
+            resolved_exe: None,
             resolved_argv,
             confirm: Confirm::NotRequired,
             trace,
         }
+    }
+
+    /// Records which program this decision was about.
+    #[must_use]
+    pub fn about_program(mut self, exe: impl Into<String>) -> Self {
+        self.resolved_exe = Some(exe.into());
+        self
+    }
+
+    /// The command as a caller would type it: the program, then its operands.
+    ///
+    /// Used by every rendered surface so none of them can drift into showing
+    /// operands alone.
+    pub fn resolved_command(&self) -> Vec<String> {
+        let mut command = Vec::with_capacity(self.resolved_argv.len().saturating_add(1));
+        if let Some(exe) = &self.resolved_exe {
+            command.push(exe.clone());
+        }
+        command.extend(self.resolved_argv.iter().cloned());
+        command
     }
 
     /// The process exit status for this decision.
@@ -312,7 +354,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 7] = [
+    const ALL_CODES: [DenialCode; 8] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -320,6 +362,7 @@ mod tests {
         DenialCode::Frozen,
         DenialCode::NoConfirmationChannel,
         DenialCode::HumanPathOnly,
+        DenialCode::ExeMismatch,
     ];
 
     #[test]
@@ -334,7 +377,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();
@@ -447,6 +490,37 @@ mod tests {
 
         let tampered = json.replace(r#""verdict""#, r#""allow_everything":true,"verdict""#);
         assert!(serde_json::from_str::<Decision>(&tampered).is_err());
+    }
+
+    #[test]
+    fn the_rendered_command_always_carries_the_program() {
+        // A record listing `restart nginx.service` with no program describes a
+        // command nobody can reconstruct, which on a decision surface is worse
+        // than showing nothing.
+        let denial = DenialCode::ExeMismatch;
+        let decision = Decision::deny(
+            denial,
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            Vec::new(),
+        );
+        // Without a program named, the operands stand alone — this is the
+        // introspection case, and there is nothing to add.
+        assert_eq!(decision.resolved_exe, None);
+        assert_eq!(
+            decision.resolved_command(),
+            vec!["restart".to_owned(), "nginx.service".to_owned()]
+        );
+
+        let named = decision.about_program("/bin/sh");
+        assert_eq!(
+            named.resolved_command(),
+            vec![
+                "/bin/sh".to_owned(),
+                "restart".to_owned(),
+                "nginx.service".to_owned()
+            ]
+        );
+        assert_eq!(named.resolved_exe.as_deref(), Some("/bin/sh"));
     }
 
     #[test]

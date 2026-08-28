@@ -22,8 +22,12 @@ pub fn human(decision: &Decision) -> String {
     };
     let _ = writeln!(out, "{headline}");
 
-    if !decision.resolved_argv.is_empty() {
-        let _ = writeln!(out, "  command   {}", decision.resolved_argv.join(" "));
+    // The whole command, program included. Showing operands alone describes a
+    // command nobody can reconstruct, and on a decision surface that is worse
+    // than showing nothing.
+    let command = decision.resolved_command();
+    if !command.is_empty() {
+        let _ = writeln!(out, "  command   {}", command.join(" "));
     }
     if let Some(action) = &decision.action {
         let _ = writeln!(out, "  action    {action}");

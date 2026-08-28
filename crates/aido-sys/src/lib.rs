@@ -35,6 +35,7 @@
 
 pub mod error;
 pub mod exec;
+pub mod kernel;
 pub mod platform;
 pub mod probe;
 pub mod proc;
@@ -44,6 +45,7 @@ pub mod trust;
 
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};

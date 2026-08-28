@@ -171,7 +171,57 @@ fn decide(action: &Action, argv: &Argv, agent: bool, hints: Vec<Hint>) -> Decisi
     )
 }
 
+/// Decides a request that names `program` as the binary to run.
+fn decide_program(action: &Action, program: &str, argv: &Argv) -> Decision {
+    let rules = RuleSet::load(vec![action.clone()]).unwrap();
+    aido_policy::evaluate(
+        &rules,
+        &caller(false, Vec::new()),
+        &Request::for_program(action.id.clone(), program, argv.clone()),
+        Settings::default(),
+    )
+}
+
 proptest! {
+    /// Naming a program can only narrow.
+    ///
+    /// The program check was added after the argv matcher, so it has to be
+    /// provably subtractive: if a request that names a binary is permitted, the
+    /// same request without one must have been permitted too. Anything else
+    /// would mean naming a binary *unlocked* something, which is the shape of a
+    /// bypass rather than a check.
+    #[test]
+    fn naming_a_program_never_turns_a_deny_into_an_allow(
+        action in arb_action("a.b"),
+        argv in arb_argv(),
+        program in arb_exe(),
+    ) {
+        let named = decide_program(&action, &program, &argv);
+        if named.verdict != Verdict::Allow {
+            return Ok(());
+        }
+        let unnamed = decide(&action, &argv, false, Vec::new());
+        prop_assert_eq!(unnamed.verdict, Verdict::Allow);
+    }
+
+    /// A program that is not the rule's own is always refused.
+    ///
+    /// Byte-exact, so no generated path — however plausibly it resolves to the
+    /// same file — can pass for the one the rule names.
+    #[test]
+    fn only_the_rules_own_program_is_ever_accepted(
+        action in arb_action("a.b"),
+        argv in arb_argv(),
+        program in arb_exe(),
+    ) {
+        if program.as_bytes() == action.exe.as_bytes() {
+            return Ok(());
+        }
+        let decision = decide_program(&action, &program, &argv);
+        prop_assert_eq!(decision.verdict, Verdict::Deny);
+        prop_assert_eq!(decision.denial, Some(DenialCode::ExeMismatch));
+    }
+
     /// Invariant 5: canonicalization is idempotent.
     ///
     /// If it were not, the tuple the matcher checked could differ from the

@@ -37,15 +37,36 @@ use crate::rule::{ActionId, ConfirmPolicy, RuleSet};
 pub struct Request {
     /// The named action being asked for.
     pub action: ActionId,
-    /// The operands, as supplied by the front-end.
+    /// The program the caller wants to run, as absolute bytes.
+    ///
+    /// Carried separately from [`Self::argv`] and compared here rather than in
+    /// the front-end, because a front-end that decides which program an action
+    /// may run is a front-end making a decision. `None` means the caller did not
+    /// name one, which is only legitimate for an introspection command that has
+    /// already been told which action to interrogate.
+    pub exe: Option<Arg>,
+    /// The operands — the arguments **after** the program name.
     pub argv: Argv,
 }
 
 impl Request {
-    /// Builds a request.
+    /// Builds a request that names no program.
+    ///
+    /// For interrogating one action's argument list in isolation. A request that
+    /// will actually run something must use [`Self::for_program`].
     pub fn new(action: impl Into<ActionId>, argv: Argv) -> Self {
         Self {
             action: action.into(),
+            exe: None,
+            argv,
+        }
+    }
+
+    /// Builds a request to run `exe` with `argv` as its operands.
+    pub fn for_program(action: impl Into<ActionId>, exe: impl Into<Arg>, argv: Argv) -> Self {
+        Self {
+            action: action.into(),
+            exe: Some(exe.into()),
             argv,
         }
     }
@@ -110,6 +131,23 @@ pub fn evaluate(
         });
         return Decision::deny(DenialCode::UnknownAction, resolved_argv, trace);
     };
+
+    // The program is checked before the arguments. A caller asking to run
+    // /bin/sh under a rule for /usr/bin/systemctl is not making an argument
+    // mistake, and reporting it as one would bury an attempted bypass among
+    // ordinary typos. Compared byte-exactly: the rule's exe is an absolute path
+    // and no normalisation happens here, because normalising is how two
+    // different paths start comparing equal.
+    if let Some(requested_exe) = &request.exe
+        && requested_exe.as_bytes() != action.exe.as_bytes()
+    {
+        trace.push(TraceStep::ActionRejected {
+            action: action.id.to_string(),
+            reason: format!("this action runs {}, not the requested program", action.exe),
+        });
+        return Decision::deny(DenialCode::ExeMismatch, resolved_argv, trace)
+            .about_program(requested_exe.display());
+    }
 
     if let Err(err) = match_argv(&action.args, &canonical) {
         trace.push(TraceStep::ActionRejected {
@@ -177,6 +215,11 @@ pub fn evaluate(
         remediation: None,
         action: Some(action.id.clone()),
         rule_source: Some(action.source.clone()),
+        // The rule's own program, not the caller's spelling of it. They are
+        // byte-identical by the time execution is permitted — the check above
+        // guarantees it — and taking the rule's copy means an allowed decision
+        // records the path policy authorised rather than the one that was typed.
+        resolved_exe: Some(action.exe.clone()),
         resolved_argv,
         confirm,
         trace,
@@ -415,6 +458,126 @@ mod tests {
         assert_eq!(
             evaluate(&set, &human(), &restart_request(), Settings::default()).verdict,
             Verdict::Allow
+        );
+    }
+
+    /// A rule permitting `systemctl restart <unit>`.
+    fn restart_action() -> Action {
+        Action {
+            id: ActionId::new("aido.svc.restart"),
+            tier: Tier::SvcControl,
+            exe: "/usr/bin/systemctl".into(),
+            args: vec![
+                ArgSpec::one("verb", Matcher::Literal("restart".into())),
+                ArgSpec::one("unit", Matcher::Name(crate::matcher::NameKind::UnitName)),
+            ],
+            confirm: ConfirmPolicy::Never,
+            agent_allowed: true,
+            env_allow: Vec::new(),
+            source: Source::new("20-services.toml", 1),
+        }
+    }
+
+    #[test]
+    fn a_request_naming_another_program_is_denied_before_the_arguments_matter() {
+        // The bypass this check exists for. Without it a rule's `exe` was never
+        // compared to anything: whatever program the caller named, only the
+        // arguments were matched, so a rule for /usr/bin/systemctl authorised
+        // `restart nginx.service` no matter which binary was about to run it.
+        let set = RuleSet::load(vec![restart_action()]).unwrap();
+        let d = evaluate(
+            &set,
+            &human(),
+            &Request::for_program(
+                "aido.svc.restart",
+                "/bin/sh",
+                Argv::new(["restart", "nginx.service"]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(d.verdict, Verdict::Deny);
+        assert_eq!(d.denial, Some(DenialCode::ExeMismatch));
+        // Reported before the argument list is consulted, so the trace names the
+        // program rather than an argument position.
+        assert!(
+            format!("{:?}", d.trace).contains("not the requested program"),
+            "{:?}",
+            d.trace
+        );
+    }
+
+    #[test]
+    fn the_program_is_compared_byte_exactly_and_not_normalised() {
+        // Every one of these resolves to the same file on a real filesystem, and
+        // every one is refused. Normalising here is how two different paths
+        // start comparing equal, and the engine performs no I/O so it cannot
+        // know what a path resolves to anyway.
+        let set = RuleSet::load(vec![restart_action()]).unwrap();
+        for program in [
+            "/usr/bin/./systemctl",
+            "/usr/bin//systemctl",
+            "/usr/bin/systemctl/",
+            "/usr/local/../bin/systemctl",
+            "systemctl",
+            "/usr/bin/Systemctl",
+            "",
+        ] {
+            let d = evaluate(
+                &set,
+                &human(),
+                &Request::for_program(
+                    "aido.svc.restart",
+                    program,
+                    Argv::new(["restart", "nginx.service"]),
+                ),
+                Settings::default(),
+            );
+            assert_eq!(d.denial, Some(DenialCode::ExeMismatch), "{program}");
+        }
+    }
+
+    #[test]
+    fn naming_the_rules_own_program_permits_the_command() {
+        let set = RuleSet::load(vec![restart_action()]).unwrap();
+        let d = evaluate(
+            &set,
+            &human(),
+            &Request::for_program(
+                "aido.svc.restart",
+                "/usr/bin/systemctl",
+                Argv::new(["restart", "nginx.service"]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(d.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn a_request_that_names_no_program_still_checks_the_arguments() {
+        // `Request::new` is for interrogating one action's argument list in
+        // isolation, and it must not become a way to skip the program check on a
+        // path that runs something — which is why the executor will only ever
+        // build requests through `for_program`.
+        let set = RuleSet::load(vec![restart_action()]).unwrap();
+        let d = evaluate(
+            &set,
+            &human(),
+            &Request::new("aido.svc.restart", Argv::new(["reboot"])),
+            Settings::default(),
+        );
+        assert_eq!(d.denial, Some(DenialCode::ArgvRejected));
+        let named = Request::for_program(
+            "aido.svc.restart",
+            "/usr/bin/systemctl",
+            Argv::new(["restart", "nginx.service"]),
+        );
+        assert_eq!(
+            named.exe.as_ref().map(Arg::as_bytes),
+            Some(&b"/usr/bin/systemctl"[..])
+        );
+        assert_eq!(
+            Request::new("aido.svc.restart", Argv::new(["reboot"])).exe,
+            None
         );
     }
 

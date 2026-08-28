@@ -19,37 +19,27 @@ Only things that stop work. Full inventory in `todo/` and `CONCERNS.md`.
 
 ## Still blocking
 
-**0. Everything left in phase 2 needs privileged Linux.** What remains —
-`aido-gate`, `openat2` resolution, `execveat`, executing the install plan, the
-journald sink — cannot be written honestly on macOS, because each one is a
-syscall whose failure modes are the point. Everything that *could* be done
-without a VM now is: the policy engine, the backend probe, the config layers, the
-audit chain, and the ruleset trust walk. Two consequences to decide on:
-
-- **`unsafe_code = "forbid"` is workspace-wide.** `openat2` and `execveat` have
-  no safe wrapper in std. Either take a dependency (`rustix`, which wraps both and
-  is already audited by cargo-deny) or lift the ban in `aido-gate` alone. I would
-  take `rustix`: a hand-rolled `syscall!` in the one crate that runs as root is
-  the worst place in the tree to hold unsafe code.
-- **B below stops being avoidable.** The install plan cannot be tested without
-  writing a real `/etc/sudoers.d` somewhere, container or host.
-
-
 **A. Disk and RAM on yamin.lol.** 3.3 GB free of 38 GB (91% used), 3 GB RAM with
 ~0 available. A Rust toolchain plus target dir is 2–4 GB, and containers for the
 distro matrix need more. Either free ~10 GB, or confirm the alternative:
 cross-compile on the Mac and ship only the binary over. I will take the
 cross-compile route unless you free space.
 
+   switch to ssh batman@49.13.25.232
+
 **B. Whether I may write `/etc/sudoers.d` on yamin.lol.** Blocks M2b's install
 path. My plan avoids it: run privileged tests in Docker containers on that host,
 which also gives the sudo / sudo-rs / doas matrix. Say so if you want it on the
 host itself.
 
+YOu can write here.
+
 **C. `PIDFD_GET_INFO` needs kernel 6.13; yamin.lol has 6.8.** `SO_PEERPIDFD`
 works. Not a blocker — the `SO_PEERCRED` + `(pid, starttime)` fallback exists for
 this — but it means the primary attestation path cannot be tested there. A
 newer-kernel container will not help; this needs a VM or a newer host eventually.
+
+Make sure that it does support kernel v5 too.
 
 ## macOS support
 

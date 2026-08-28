@@ -9,14 +9,29 @@
 use aido_policy::{CallerFacts, Classification};
 
 use crate::error::SysError;
+use crate::kernel::{KernelSupport, KernelVersion};
 use crate::provenance::{MAX_ANCESTRY_DEPTH, ancestry, hints};
 use crate::source::{DirSource, ProcSource};
+
+/// Where the kernel publishes its release string, relative to `/proc`.
+///
+/// `sys/kernel/osrelease` rather than `uname`: no process to spawn, and it is
+/// reached through the same [`ProcSource`] the fixtures use, so the test path and
+/// the production path are the same code.
+pub const KERNEL_RELEASE: &str = "sys/kernel/osrelease";
 
 /// What the platform can be asked to do.
 pub trait PrivilegedOps {
     /// A short label for the implementation, for `aido doctor` and audit
     /// records.
     fn platform(&self) -> &'static str;
+
+    /// What the running kernel supports.
+    ///
+    /// Reported by `doctor` and recorded in the audit trail, because "why did
+    /// this agent get a password prompt" is answered by the attestation rung and
+    /// by nothing else in the output.
+    fn kernel(&self) -> KernelSupport;
 
     /// Classifies a caller.
     ///
@@ -93,6 +108,17 @@ impl<S: ProcSource> PrivilegedOps for LinuxOps<S> {
         "linux"
     }
 
+    fn kernel(&self) -> KernelSupport {
+        // Read from /proc, not from `uname`: no process to spawn, and it goes
+        // through the same source the fixtures use. An unreadable file yields
+        // KernelVersion::UNKNOWN, which lands on the lowest rung — a kernel we
+        // cannot identify is never credited with a capability.
+        match self.source.read_text(KERNEL_RELEASE) {
+            Ok(release) => KernelSupport::parse(release.trim()),
+            Err(_) => KernelSupport::of(KernelVersion::UNKNOWN),
+        }
+    }
+
     fn classify(&self, pid: u32) -> Result<CallerFacts, SysError> {
         // The walk is here for the audit record, not for the verdict. It is
         // also what makes the failure honest: if the caller cannot be observed,
@@ -135,6 +161,13 @@ impl PrivilegedOps for MacOsStub {
         "macos-stub"
     }
 
+    fn kernel(&self) -> KernelSupport {
+        // Not "the Darwin version". This asks which *Linux* facilities exist,
+        // and the answer here is none, so it must read as the lowest rung rather
+        // than as a number that could be mistaken for a supported kernel.
+        KernelSupport::of(KernelVersion::UNKNOWN)
+    }
+
     fn classify(&self, _pid: u32) -> Result<CallerFacts, SysError> {
         Ok(CallerFacts::new(
             Classification::Unattested {
@@ -168,6 +201,7 @@ pub fn host_ops() -> Box<dyn PrivilegedOps> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -178,6 +212,54 @@ mod tests {
 
     use super::*;
     use crate::source::MapSource;
+
+    #[test]
+    fn linux_reads_its_kernel_release_from_proc() {
+        let source = MapSource::new().with("sys/kernel/osrelease", "6.8.0-90-generic\n");
+        let support = LinuxOps::with_source(source).kernel();
+        assert_eq!(support.version, KernelVersion::new(6, 8));
+        assert_eq!(support.attestation, crate::kernel::Attestation::PeerPidfd);
+        assert!(support.agent_path_available());
+    }
+
+    #[test]
+    fn a_kernel_five_host_gets_the_pidfd_open_rung_and_keeps_the_agent_path() {
+        // The reason this ladder exists: Ubuntu 20.04, Debian 11 and RHEL 9 are
+        // all still in service and all predate SO_PEERPIDFD.
+        for release in ["5.4.0-1103-aws", "5.10.0-21-amd64", "5.14.0-427.el9.x86_64"] {
+            let source = MapSource::new().with("sys/kernel/osrelease", release);
+            let support = LinuxOps::with_source(source).kernel();
+            assert_eq!(
+                support.attestation,
+                crate::kernel::Attestation::PidfdOpen,
+                "{release}"
+            );
+            assert!(support.agent_path_available(), "{release}");
+            assert!(
+                support.attestation.needs_recheck_after_pinning(),
+                "{release} must re-read the peer after pinning it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_release_file_lands_on_the_lowest_rung() {
+        // Fail closed: a kernel that cannot be identified is never credited with
+        // a capability, so the agent path is withheld rather than assumed.
+        let support = LinuxOps::with_source(MapSource::new()).kernel();
+        assert_eq!(support.version, KernelVersion::UNKNOWN);
+        assert!(!support.agent_path_available());
+    }
+
+    #[test]
+    fn the_macos_stub_reports_no_kernel_capability_at_all() {
+        // Not "the Darwin version": the question is which Linux facilities
+        // exist, and the answer must not read as a supported kernel.
+        let support = MacOsStub.kernel();
+        assert_eq!(support.version, KernelVersion::UNKNOWN);
+        assert!(!support.agent_path_available());
+        assert!(support.summary().contains("WITHHELD"));
+    }
 
     fn stat(pid: u32, comm: &str, parent: u32, starttime: u64) -> String {
         let mut tail: Vec<String> = vec!["S".into(), parent.to_string()];

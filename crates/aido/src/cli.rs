@@ -312,11 +312,24 @@ fn explain(
         return ExitCode::Unusable;
     };
     let caller = classify(ops, err);
-    let requested = Argv::new(args.argv.iter().map(String::as_str).collect::<Vec<_>>());
+    // argv[0] is the program, the rest are its operands. Splitting here and
+    // handing both to the engine is what makes the program part of the decision:
+    // before this split the whole command was matched against the argument list,
+    // so a rule for /usr/bin/systemctl would happily accept a bare `restart
+    // nginx.service` with no program named at all.
+    let (program, operands) = split_program(&args.argv);
+    let requested = Argv::new(operands.iter().map(String::as_str).collect::<Vec<_>>());
 
     let decision = if let Some(action) = &args.action {
-        evaluate_one(loaded.rules(), &caller, action, &requested, settings)
-    } else if let Some(found) = best_match(loaded.rules(), &caller, &requested, settings) {
+        evaluate_one(
+            loaded.rules(),
+            &caller,
+            action,
+            program,
+            &requested,
+            settings,
+        )
+    } else if let Some(found) = best_match(loaded.rules(), &caller, program, &requested, settings) {
         found
     } else {
         // Nothing in the ruleset resembles this command, which only happens
@@ -347,8 +360,9 @@ fn why_not(
         return ExitCode::Unusable;
     };
     let caller = classify(ops, err);
-    let argv = Argv::new(argv.iter().map(String::as_str).collect::<Vec<_>>());
-    let decision = evaluate_one(loaded.rules(), &caller, action, &argv, settings);
+    let (program, operands) = split_program(argv);
+    let argv = Argv::new(operands.iter().map(String::as_str).collect::<Vec<_>>());
+    let decision = evaluate_one(loaded.rules(), &caller, action, program, &argv, settings);
     if decision.verdict.is_permitted() {
         let _ = writeln!(err, "aido: {action} does not refuse this command");
     }
@@ -361,9 +375,21 @@ fn why_not(
 /// refusal that got furthest — an argv-shape rejection is more informative than
 /// an unknown action, because it means the operator picked the right rule and
 /// the wrong arguments.
+/// Splits a command into its program and its operands.
+///
+/// The program is `argv[0]`. There is no `PATH` search and no resolution: the
+/// bytes are handed to the engine, which compares them to the rule's own
+/// absolute path byte-exactly.
+fn split_program(argv: &[String]) -> (&str, &[String]) {
+    const NOTHING: &[String] = &[];
+    argv.split_first()
+        .map_or(("", NOTHING), |(first, rest)| (first.as_str(), rest))
+}
+
 fn best_match(
     rules: &RuleSet,
     caller: &CallerFacts,
+    program: &str,
     argv: &Argv,
     settings: Settings,
 ) -> Option<Decision> {
@@ -372,7 +398,7 @@ fn best_match(
         let decision = aido_policy::evaluate(
             rules,
             caller,
-            &Request::new(action.id.clone(), argv.clone()),
+            &Request::for_program(action.id.clone(), program, argv.clone()),
             settings,
         );
         if decision.verdict.is_permitted() {
@@ -389,6 +415,15 @@ fn best_match(
         // codes it considered informative, which meant a code added later would
         // be silently dropped and reported as "unknown action" — exactly the
         // failure the freeze case above was fixing.
+        //
+        // One exception: a program mismatch says nothing about this argv, only
+        // that this rule runs something else. Reporting it would name whichever
+        // rule happened to sort first and send the operator to an unrelated
+        // action, so a real refusal from a rule that *does* name this program
+        // takes precedence.
+        if decision.denial == Some(DenialCode::ExeMismatch) {
+            continue;
+        }
         if best.is_none() {
             best = Some(decision);
         }
@@ -400,10 +435,16 @@ fn evaluate_one(
     rules: &RuleSet,
     caller: &CallerFacts,
     action: &str,
+    program: &str,
     argv: &Argv,
     settings: Settings,
 ) -> Decision {
-    aido_policy::evaluate(rules, caller, &Request::new(action, argv.clone()), settings)
+    aido_policy::evaluate(
+        rules,
+        caller,
+        &Request::for_program(action, program, argv.clone()),
+        settings,
+    )
 }
 
 /// Lints the ruleset.
@@ -474,6 +515,7 @@ fn doctor(
     out: &mut dyn Write,
 ) -> ExitCode {
     let _ = writeln!(out, "platform     {}", ops.platform());
+    let _ = writeln!(out, "kernel       {}", ops.kernel().summary());
     let _ = writeln!(out, "rules dir    {}", cli.rules.display());
 
     match loaded {
@@ -793,6 +835,18 @@ mod tests {
     }
 
     #[test]
+    fn doctor_names_the_attestation_rung_not_just_the_kernel_version() {
+        // "Why did this agent get a password prompt" is answered by the rung and
+        // by nothing else in the output.
+        let fx = fixture("cli-doctor-kernel");
+        let (_, out, _) = run_ops(&fx, &BlindOps, &["doctor"]);
+        assert!(
+            out.contains("kernel       6.8 via SO_PEERPIDFD (agent path available)"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn doctor_reports_the_ruleset_as_untrusted_in_a_checkout() {
         // A development checkout is owned by the developer, not root, so the
         // honest answer is UNTRUSTED. A doctor that said otherwise here would
@@ -965,6 +1019,10 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     struct BlindOps;
 
     impl PrivilegedOps for BlindOps {
+        fn kernel(&self) -> aido_sys::KernelSupport {
+            aido_sys::KernelSupport::parse("6.8.0-90-generic")
+        }
+
         fn platform(&self) -> &'static str {
             "blind-test-stub"
         }
@@ -986,6 +1044,10 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     struct AttestingOps;
 
     impl PrivilegedOps for AttestingOps {
+        fn kernel(&self) -> aido_sys::KernelSupport {
+            aido_sys::KernelSupport::parse("6.8.0-90-generic")
+        }
+
         fn platform(&self) -> &'static str {
             "attesting-test-stub"
         }
@@ -1038,7 +1100,13 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         let (code, out, err) = run_ops(
             &fx,
             &BlindOps,
-            &["explain", "--", "restart", "nginx.service"],
+            &[
+                "explain",
+                "--",
+                "/usr/bin/systemctl",
+                "restart",
+                "nginx.service",
+            ],
         );
         assert!(err.contains("cannot observe this caller"), "{err}");
         assert!(err.contains("treating as unattested"), "{err}");
@@ -1077,7 +1145,13 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         let (code, out, _) = run_ops(
             &fx,
             &AttestingOps,
-            &["explain", "--", "restart", "nginx.service"],
+            &[
+                "explain",
+                "--",
+                "/usr/bin/systemctl",
+                "restart",
+                "nginx.service",
+            ],
         );
         assert_eq!(code, ExitCode::NotConfirmed);
         assert!(out.contains("ALLOW, after a human confirms"), "{out}");
@@ -1094,6 +1168,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
                 "--action",
                 "aido.svc.restart",
                 "--",
+                "/usr/bin/systemctl",
                 "restart",
                 "nginx",
             ],
@@ -1103,8 +1178,13 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     #[test]
     fn explain_finds_the_matching_action_without_being_told_which() {
-        let (code, out, _) =
-            fixture("cli-explain").run(&["explain", "--", "restart", "nginx.service"]);
+        let (code, out, _) = fixture("cli-explain").run(&[
+            "explain",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
+        ]);
         // ALLOW, and note what that does *not* mean: the human path's password
         // is sudo's job, not the verdict's. `confirm_agent_actions` applies to
         // an attested agent, and nobody is attested in this build, so the
@@ -1117,7 +1197,8 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     #[test]
     fn explain_reports_the_argv_rejection_when_nothing_permits_it() {
-        let (code, out, _) = fixture("cli-reject").run(&["explain", "--", "restart", "nginx"]);
+        let (code, out, _) =
+            fixture("cli-reject").run(&["explain", "--", "/usr/bin/systemctl", "restart", "nginx"]);
         assert_eq!(code, ExitCode::Denied);
         assert!(out.contains("DENY"), "{out}");
         assert!(out.contains("argv_rejected"), "{out}");
@@ -1128,7 +1209,14 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         // Every action rejects this argv on shape, and that is more useful to
         // report than "unknown", because it tells the operator a rule exists
         // and the arguments were wrong.
-        let (code, out, _) = fixture("cli-unknown").run(&["explain", "--", "wat", "is", "this"]);
+        let (code, out, _) = fixture("cli-unknown").run(&[
+            "explain",
+            "--",
+            "/usr/bin/systemctl",
+            "wat",
+            "is",
+            "this",
+        ]);
         assert_eq!(code, ExitCode::Denied);
         assert!(out.contains("argv_rejected"), "{out}");
     }
@@ -1138,7 +1226,13 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         // The only way there is no nearest refusal: no rules at all, which is
         // exactly the state of a fresh install.
         let empty = Fixture::new("cli-empty-rules");
-        let (code, out, err) = empty.run(&["explain", "--", "restart", "nginx.service"]);
+        let (code, out, err) = empty.run(&[
+            "explain",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
+        ]);
         assert_eq!(code, ExitCode::Denied);
         assert!(err.contains("no action in"), "{err}");
         assert!(out.contains("unknown_action"), "{out}");
@@ -1151,12 +1245,85 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "--action",
             "aido.pkg.update",
             "--",
+            "/usr/bin/apt-get",
             "restart",
             "nginx.service",
         ]);
         // Pinned to the wrong rule on purpose: the answer must be about that
-        // rule, not about whichever rule happens to match.
+        // rule, not about whichever rule happens to match. Names the rule's own
+        // program, so the refusal is about the arguments rather than the
+        // program.
         assert!(out.contains("argv_rejected"), "{out}");
+    }
+
+    #[test]
+    fn asking_a_rule_to_run_a_program_it_does_not_name_is_its_own_refusal() {
+        // Not argv_rejected: a caller asking to run apt-get under a rule for
+        // systemctl is not making an argument mistake, and an audit record that
+        // called it one would bury an attempted bypass among ordinary typos.
+        let (code, out, _) = fixture("cli-exe-mismatch").run(&[
+            "explain",
+            "--action",
+            "aido.svc.restart",
+            "--",
+            "/usr/bin/apt-get",
+            "restart",
+            "nginx.service",
+        ]);
+        assert_eq!(code, ExitCode::Denied);
+        assert!(out.contains("exe_mismatch"), "{out}");
+        assert!(
+            out.contains("/usr/bin/systemctl, not the requested"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn splitting_an_empty_command_yields_no_program_and_no_operands() {
+        // Reachable rather than defensive: an empty program matches no rule's
+        // exe, so the split still fails closed if a caller ever skips the
+        // emptiness check above it.
+        let (program, operands) = split_program(&[]);
+        assert_eq!(program, "");
+        assert!(operands.is_empty());
+    }
+
+    #[test]
+    fn the_first_real_refusal_is_kept_when_several_rules_name_the_program() {
+        // Two rules for the same binary, both refusing. The first refusal is the
+        // answer; the second must not overwrite it, or the reported position
+        // would depend on rule ordering.
+        let fx = Fixture::new("cli-two-rules").write(
+            "10-two.toml",
+            r#"
+[[action]]
+id = "aido.svc.aaa"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [{ name = "verb", matcher = { literal = "start" } }]
+
+[[action]]
+id = "aido.svc.bbb"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [{ name = "verb", matcher = { literal = "stop" } }]
+"#,
+        );
+        let (code, out, _) = fx.run(&["explain", "--", "/usr/bin/systemctl", "reload"]);
+        assert_eq!(code, ExitCode::Denied);
+        assert!(out.contains("argv_rejected"), "{out}");
+        assert!(out.contains("aido.svc.aaa"), "{out}");
+    }
+
+    #[test]
+    fn a_command_with_no_program_named_matches_nothing() {
+        // Before the program became part of the decision, a bare `restart
+        // nginx.service` was matched against the argument list and *allowed* by
+        // a rule for /usr/bin/systemctl — with no program named at all.
+        let (code, out, _) =
+            fixture("cli-no-program").run(&["explain", "--", "restart", "nginx.service"]);
+        assert_eq!(code, ExitCode::Denied);
+        assert!(!out.contains("ALLOW"), "{out}");
     }
 
     #[test]
@@ -1173,6 +1340,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "json",
             "explain",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx.service",
         ]);
@@ -1188,6 +1356,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "--action",
             "aido.svc.restart",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx",
         ]);
@@ -1202,6 +1371,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "--action",
             "aido.svc.restart",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx.service",
         ]);
@@ -1352,6 +1522,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             path.to_str().unwrap(),
             "explain",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx.service",
         ];
@@ -1395,6 +1566,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             path.to_str().unwrap(),
             "explain",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx.service",
         ]);
@@ -1410,6 +1582,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "--action",
             "aido.svc.restart",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx",
         ]);

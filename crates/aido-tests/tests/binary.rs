@@ -50,7 +50,13 @@ fn aido(dir: &Path) -> Command {
 #[test]
 fn a_permitted_command_exits_zero() {
     aido(&rules_dir("bin-allow"))
-        .args(["explain", "--", "restart", "nginx.service"])
+        .args([
+            "explain",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
+        ])
         .assert()
         .success()
         .stdout(contains("ALLOW").and(contains("aido.svc.restart")));
@@ -62,7 +68,7 @@ fn a_refused_command_exits_seventeen() {
     // the code sits above the signal range so it cannot be confused with a
     // killed child.
     aido(&rules_dir("bin-deny"))
-        .args(["explain", "--", "restart", "nginx"])
+        .args(["explain", "--", "/usr/bin/systemctl", "restart", "nginx"])
         .assert()
         .code(17)
         .stdout(contains("DENY"));
@@ -83,7 +89,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     )
     .unwrap();
     aido(&dir)
-        .args(["explain", "--action", "aido.oops", "--", "-c"])
+        .args(["explain", "--action", "aido.oops", "--", "/bin/sh", "-c"])
         .assert()
         .code(17)
         .stdout(contains("deny_listed").and(contains("do not retry")));
@@ -109,6 +115,7 @@ fn the_json_envelope_is_parseable_from_a_pipe() {
             "json",
             "explain",
             "--",
+            "/usr/bin/systemctl",
             "restart",
             "nginx.service",
         ])

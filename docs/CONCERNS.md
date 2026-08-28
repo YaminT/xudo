@@ -181,6 +181,88 @@ dead until a test made a **real** socket with `UnixListener::bind` — dead code
 a trust check is a branch nobody has ever seen behave, so it was worth the four
 lines rather than a waiver.
 
+### Kernel 5 support: a ladder, not a floor
+
+Requested, and it forced a decision that was going to have to be made anyway.
+`aido` cannot require a 2025 kernel — Ubuntu 20.04 ships 5.4, Debian 11 ships
+5.10, RHEL 9 ships 5.14, and all three are still in service. So attestation is a
+**ladder** (`aido-sys/kernel.rs`), and the rung is reported by `doctor`:
+
+| Rung | Since | What the broker learns |
+|---|---|---|
+| `PeerPidfdInfo` | 6.13 | pidfd + creds + cgroup id in one race-free `PIDFD_GET_INFO` |
+| `PeerPidfd` | 6.5 | pidfd straight from the socket (`SO_PEERPIDFD`) |
+| `PidfdOpen` | 5.3 | pid from `SO_PEERCRED`, then `pidfd_open`, then re-read and compare |
+| `PeerCredOnly` | 2.2 | a pid, and no way to stop it being reused |
+
+The line that matters is not convenience, it is whether the peer can be
+**pinned**. A pid is a name that can be recycled: the process that connected may
+have exited and its number been reissued before the broker reads `/proc`. A pidfd
+is a handle to that specific process.
+
+So `PeerCredOnly` **cannot carry the agent path** — it withholds passwordless
+operation rather than authorising a race. That is invariant 2 applied to the
+kernel, and it is asserted directly rather than left to be inferred. An old kernel
+does not lose `aido`; a human typing a password is not relying on the broker
+knowing which process asked.
+
+`openat2` (5.6) degrades to one `openat(O_PATH|O_NOFOLLOW|O_DIRECTORY)` per
+component, and that loses **nothing** here, because the ruleset walk refuses a
+symlinked component rather than resolving it and refuses `..` outright. So the
+resolution rung does not gate the agent path; only attestation does. Verified:
+5.4, 5.10 and 5.14 all keep the agent path and all require the post-pin re-read.
+
+An unparseable version is `UNKNOWN`, which sits below every threshold — a kernel
+we cannot identify is treated as the oldest we support, never the newest.
+
+### A real bypass, found by running the binary on a Linux host
+
+The first host run of `aido explain -- /usr/bin/systemctl restart nginx.service`
+came back `DENY … argument 0 ("/usr/bin/systemctl") does not satisfy no-pager`.
+The front-end was handing the **whole command** to the argument matcher, so:
+
+- the program was consumed as operand 0, and
+- a rule's `exe` was never compared against anything at all.
+
+Which means `aido explain -- restart nginx.service` — naming **no program** —
+was ALLOWED by a rule for `/usr/bin/systemctl`. Not exploitable today, because
+nothing executes yet. It would have been the day the gate landed, and it is
+exactly the class of bug that is invisible in unit tests written against the same
+wrong assumption. Nine existing tests encoded it.
+
+Fixed in the **engine**, not the CLI: `Request::for_program` carries the program,
+and `evaluate` compares it to the rule's `exe` byte-exactly *before* the argument
+list is consulted. Four decisions in that:
+
+- **Its own denial code** (`exe_mismatch`, 8). "Tried to run `/bin/sh` under a
+  rule for `systemctl`" is the shape of an attempted bypass, and folding it into
+  `argv_rejected` would bury it among ordinary typos. The two also send a caller
+  to different places: fix the arguments, versus you want a different action.
+- **Byte-exact, no normalisation.** `/usr/bin/./systemctl`, `/usr/bin//systemctl`,
+  `systemctl`, and `/usr/bin/Systemctl` are all refused. The engine performs no
+  I/O so it cannot know what a path resolves to, and normalising is how two
+  different paths start comparing equal.
+- **Checked in the engine, not the front-end.** A front-end that decides which
+  program an action may run is a front-end making a decision.
+- **Two new standing proptest invariants**: naming a program never turns a deny
+  into an allow (the check is provably subtractive), and only the rule's own
+  program is ever accepted.
+
+`best_match` skips an `exe_mismatch` when scanning every action, because that
+refusal says nothing about the argv — reporting it would name whichever rule
+sorted first and send an operator to an unrelated action.
+
+Then a second, smaller defect from the same change: the rendered `command` line
+showed operands **without** the program. A decision record listing `restart
+nginx.service` describes a command nobody can reconstruct. `Decision` now carries
+`resolved_exe` and every surface renders through `resolved_command()`, so none of
+them can drift back. On an allow it records the **rule's** copy of the path, not
+the caller's spelling — identical by then, but it means the record shows what
+policy authorised.
+
+Confirmed on the host: program named plus permitted argv → ALLOW; same argv with
+`/bin/sh` substituted → `exe_mismatch`; no program named → `unknown_action`.
+
 ### Still not done in phase 2
 
 `aido-gate` itself, `openat2` resolution (the ancestor ownership walk it needs
