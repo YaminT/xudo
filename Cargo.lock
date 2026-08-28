@@ -15,6 +15,7 @@ dependencies = [
 name = "aido"
 version = "0.0.1"
 dependencies = [
+ "aido-audit",
  "aido-backend",
  "aido-config",
  "aido-policy",

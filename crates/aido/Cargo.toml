@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
 aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-config = { path = "../aido-config", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }

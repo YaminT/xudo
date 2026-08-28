@@ -110,6 +110,15 @@ pub enum Command {
         schema: bool,
     },
 
+    /// Verify that the audit log has not been edited.
+    Audit {
+        /// The log to read. Defaults to `$HOME/.local/state/ido/log.jsonl`;
+        /// pass this if `XDG_STATE_HOME` is set, because the environment is not
+        /// consulted.
+        #[arg(long, value_name = "PATH")]
+        log: Option<PathBuf>,
+    },
+
     /// Print the block that tells an agent what it may do.
     Agentdoc {
         /// Which harness to write for.
@@ -194,6 +203,7 @@ pub fn run_with(
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
+        Command::Audit { log } => audit(log.clone().or_else(default_log_file), out, err),
         Command::Agentdoc { format } => with_rules!(|l: &LoadedRules| {
             let _ = write!(
                 out,
@@ -203,6 +213,74 @@ pub fn run_with(
             ExitCode::Delegated
         }),
     }
+}
+
+/// Verifies the audit log, naming the first position that does not hold.
+///
+/// Reads only; it cannot repair a log, because a tool that can rewrite the
+/// evidence is a tool an attacker can use to launder it.
+/// Takes the path already resolved, so "there is no log path" is a case a test
+/// can produce on a machine that has a home directory.
+fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let Some(path) = log else {
+        let _ = writeln!(
+            err,
+            "aido: no log path: HOME is unset and --log was not given"
+        );
+        return ExitCode::Unusable;
+    };
+
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(source) => {
+            let _ = writeln!(err, "aido: cannot read {}: {source}", path.display());
+            // An unreadable log is not a verified log. A missing file is the
+            // same answer as a corrupt one here on purpose: "nothing to check"
+            // and "I could not check" must not print the same reassurance.
+            return ExitCode::Unusable;
+        }
+    };
+
+    match aido_audit::Chain::from_jsonl(&contents) {
+        Ok(chain) => {
+            let _ = writeln!(
+                out,
+                "audit  {} record(s) in {}: chain intact",
+                chain.len(),
+                path.display()
+            );
+            let _ = writeln!(
+                out,
+                "note   an unbroken chain proves nothing was edited in place. It cannot \
+                 prove the log was never truncated and rebuilt, because the hashes are \
+                 all in the log."
+            );
+            ExitCode::Delegated
+        }
+        Err(source) => {
+            let _ = writeln!(err, "aido: {} is not intact: {source}", path.display());
+            ExitCode::Denied
+        }
+    }
+}
+
+/// The per-user log, resolved the way `aido-config` resolves it.
+///
+/// The XDG variables are deliberately **not** read here. `std::env::var` is on
+/// this project's disallowed list because a privileged binary must not take a
+/// path from its environment, and carving an exception for the convenient case
+/// is how that rule stops meaning anything. A caller whose `XDG_STATE_HOME` is
+/// set passes `--log`, which `--help` says.
+fn default_log_file() -> Option<PathBuf> {
+    log_file_for(std::env::home_dir())
+}
+
+/// The per-user log under `home`, or `None` if there is no home directory.
+///
+/// Split out from [`default_log_file`] so the no-home case is reachable from a
+/// test on a machine that has one.
+fn log_file_for(home: Option<PathBuf>) -> Option<PathBuf> {
+    Some(aido_config::XdgPaths::resolve(&home?, None, None, None, None).log_file())
 }
 
 /// Evaluates an argv against one action, or against every action.
@@ -695,6 +773,129 @@ mod tests {
                 String::from_utf8_lossy(&err).into_owned(),
             )
         }
+    }
+
+    #[test]
+    fn audit_verify_accepts_an_intact_log_and_states_what_it_does_not_prove() {
+        let fx = Fixture::new("audit-intact");
+        let mut chain = aido_audit::Chain::new();
+        chain.append(
+            aido_audit::Decision::Allowed,
+            vec!["/usr/bin/systemctl".to_owned(), "restart".to_owned()],
+            "human",
+        );
+        chain.append(
+            aido_audit::Decision::Denied,
+            vec!["/bin/sh".to_owned()],
+            "unattested",
+        );
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, chain.to_jsonl()).unwrap();
+
+        let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("2 record(s)"), "{out}");
+        assert!(out.contains("chain intact"), "{out}");
+        // The limit is printed with the good news, not buried in a man page.
+        assert!(out.contains("truncated and rebuilt"), "{out}");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn audit_verify_names_the_position_where_an_edited_log_stops_matching() {
+        let fx = Fixture::new("audit-edited");
+        let mut chain = aido_audit::Chain::new();
+        chain.append(
+            aido_audit::Decision::Allowed,
+            vec!["/usr/bin/systemctl".to_owned()],
+            "human",
+        );
+        chain.append(
+            aido_audit::Decision::Allowed,
+            vec!["/usr/bin/apt-get".to_owned()],
+            "human",
+        );
+        let tampered = chain
+            .to_jsonl()
+            .replace("/usr/bin/apt-get", "/usr/bin/HACKED");
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, tampered).unwrap();
+
+        let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(err.contains("is not intact"), "{err}");
+        assert!(err.contains("record 2 was edited"), "{err}");
+    }
+
+    #[test]
+    fn audit_verify_rejects_a_line_that_is_not_a_record() {
+        let fx = Fixture::new("audit-garbage");
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, "not json\n").unwrap();
+
+        let (code, _, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Denied);
+        assert!(err.contains("line 1 is not an audit record"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_log_is_unusable_rather_than_reported_as_clean() {
+        // "Nothing to check" and "I could not check" must not print the same
+        // reassurance, so a missing file is Unusable and not Delegated.
+        let fx = Fixture::new("audit-missing");
+        let log = fx.dir.join("absent.jsonl");
+
+        let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_log_verifies_because_nothing_has_happened_yet() {
+        let fx = Fixture::new("audit-empty");
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, "").unwrap();
+
+        let (code, out, _) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("0 record(s)"), "{out}");
+    }
+
+    #[test]
+    fn the_default_log_path_ignores_the_environment() {
+        // Reading XDG_STATE_HOME here would be a path taken from the
+        // environment, which this project forbids. Assert the resolved default
+        // instead, so the day someone "fixes" it for convenience, this fails.
+        let path = log_file_for(Some(PathBuf::from("/home/u"))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.local/state/ido/log.jsonl"));
+        // No home directory is not a default path.
+        assert_eq!(log_file_for(None), None);
+        // And the real resolution goes through the same helper.
+        let _ = default_log_file();
+    }
+
+    #[test]
+    fn audit_without_a_log_argument_resolves_a_path_or_says_why_not() {
+        // Runs against the real home directory, where the log almost certainly
+        // does not exist. Either answer is correct; reporting the log as clean
+        // is not.
+        let fx = Fixture::new("audit-default");
+        let (code, out, err) = fx.run(&["audit"]);
+        assert_ne!(code, ExitCode::Delegated, "out={out} err={err}");
+        assert!(!err.is_empty(), "a failure must say something");
+    }
+
+    #[test]
+    fn audit_with_no_resolvable_path_refuses_rather_than_guessing_one() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = audit(None, &mut out, &mut err);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(out.is_empty());
+        let message = String::from_utf8_lossy(&err).into_owned();
+        assert!(message.contains("HOME is unset"), "{message}");
     }
 
     const RULES: &str = r#"

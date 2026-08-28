@@ -105,6 +105,38 @@ loses the record it was about to write. If serialization ever failed, the fallba
 line still carries the sequence and hash, so the chain stays verifiable across the
 gap.
 
+### `aido audit verify` — the crate now has a consumer
+
+A crate with no caller is a crate whose interface has never been used in anger,
+so `aido audit <--log PATH>` landed with it. Four choices in it are deliberate:
+
+- **It reads, it never repairs.** A tool that can rewrite the evidence is a tool
+  an attacker can use to launder it. There is no `--fix`.
+- **A missing log exits 19 (unusable), not 0.** "Nothing to check" and "I could
+  not check" must not print the same reassurance. Only a log that was read and
+  verified exits 0; a broken chain exits 17.
+- **The limit prints with the good news.** The success line is followed by a note
+  that an unbroken chain proves nothing was edited *in place* and cannot prove
+  the log was never truncated and rebuilt. Burying that in a man page is how
+  people come to over-trust it.
+- **The default path ignores the environment.** `std::env::var` is on this
+  project's disallowed list because a privileged binary must not take a path from
+  its environment, and carving an exception for the convenient case is how that
+  rule stops meaning anything. So the default is `$HOME/.local/state/ido/log.jsonl`
+  and `XDG_STATE_HOME` is *not* consulted — `--help` says so, and a test asserts
+  the resolved default, so the day someone "fixes" it for convenience it fails.
+
+The coverage work here is worth recording because it repeated a pattern. Five of
+the last uncovered regions in the whole workspace were not missing tests at all —
+they were **branches nothing can reach**: a lazily-built fallback for a
+serializer that cannot fail, a `home_dir()` returning `None` on a machine that
+has one, and `assert!` panic-message arguments on assertions that pass. Each was
+fixed by changing the code so the branch does not exist: compute the fallback
+eagerly and hand it over as a value, take the resolved path as a parameter,
+bind the message before asserting. That is the project rule working as intended —
+prefer deleting an unreachable branch to waiving it — and it left 100% with no
+line-level waivers.
+
 ### Still not done in phase 2
 
 `aido-gate` itself, `openat2` resolution with the ancestor ownership walk,
