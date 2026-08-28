@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# aido pre-commit hook. Runs the same gate as CI.
+#
+# The full gate rather than a fast subset: a privilege broker with a red build is
+# not a thing to have on a branch, and the suite runs in seconds. Bypass with
+# `git commit --no-verify` only to record work in progress on a branch that is
+# not going near main.
+set -euo pipefail
+
+# git hooks do not inherit an interactive shell's PATH, and a keg-only rustup or
+# a fresh rustup install leaves cargo somewhere the hook cannot see. Add the
+# usual locations rather than failing with "command not found", which reads as a
+# broken repository instead of a missing PATH entry.
+for dir in \
+    "$HOME/.cargo/bin" \
+    /opt/homebrew/opt/rustup/bin \
+    /opt/homebrew/bin \
+    /usr/local/opt/rustup/bin \
+    /usr/local/bin
+do
+    [ -d "$dir" ] && case ":$PATH:" in *":$dir:"*) ;; *) PATH="$dir:$PATH" ;; esac
+done
+export PATH
+
+missing=()
+command -v cargo >/dev/null 2>&1 || missing+=("cargo (install rustup)")
+command -v just  >/dev/null 2>&1 || missing+=("just (brew install just)")
+if [ ${#missing[@]} -gt 0 ]; then
+    printf 'pre-commit: cannot run the gate, missing:\n' >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    printf 'pre-commit: install them, or commit with --no-verify and run `just verify` yourself.\n' >&2
+    exit 1
+fi
+
+echo "pre-commit: running the gate (just verify)"
+just verify

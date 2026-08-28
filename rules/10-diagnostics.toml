@@ -1,0 +1,79 @@
+# T0 · diag-read — reads system state, changes nothing.
+#
+# Most of this tier does not need root at all. journalctl(1) states that members
+# of the "systemd-journal", "adm", and "wheel" groups can read all journal
+# files, so adding the agent's user to a group is strictly better than a rule:
+# it grants the same capability with no privileged exec at all. These entries
+# exist for hosts where that is not an option.
+#
+# Every entry pins --no-pager. A pager as root honours LESSOPEN and executes
+# `!cmd`, which is why pagers are in the compiled-in deny-list; suppressing the
+# pager is what keeps these actions in this tier instead of that list.
+
+[[action]]
+id = "aido.svc.logs"
+tier = "diag-read"
+exe = "/usr/bin/journalctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "unit-flag", matcher = { literal = "-u" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+  { name = "lines-flag", matcher = { literal = "-n" }, repeat = "optional" },
+  { name = "lines", matcher = { int-range = { lo = 1, hi = 20000 } }, repeat = "optional" },
+]
+
+[[action]]
+id = "aido.dmesg"
+tier = "diag-read"
+exe = "/usr/bin/journalctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "kernel", matcher = { literal = "-k" } },
+  { name = "boot", matcher = { one-of = [
+    "-b",
+    "0",
+  ] }, repeat = "optional" },
+]
+
+[[action]]
+id = "aido.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "full", matcher = { literal = "--full" } },
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[action]]
+id = "aido.svc.show"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "verb", matcher = { literal = "show" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+  # One complete token, not a flag/value pair. Canonicalization does not split
+  # `--key=value`, so a rule matches the argv byte-for-byte as the kernel
+  # delivers it, and a rule that wants both spellings must list both. Only the
+  # joined spelling is accepted here, because it is the one people type and
+  # because one enumerated token has no ambiguity about how many arguments the
+  # position consumes.
+  { name = "property", matcher = { one-of = [
+    "--property=ActiveState",
+    "--property=SubState",
+    "--property=LoadState",
+    "--property=UnitFileState",
+    "--property=ExecMainPID",
+    "--property=Result",
+    "--property=NRestarts",
+  ] }, repeat = "optional" },
+]
+
+[[action]]
+id = "aido.net.listeners"
+tier = "diag-read"
+# Fixed argv, no caller input reaches it at all — the safest shape a rule has.
+exe = "/usr/bin/ss"
+args = [{ name = "flags", matcher = { literal = "-tulpnH" } }]

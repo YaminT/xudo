@@ -1,0 +1,61 @@
+# T2/T3 · package install and removal.
+#
+# This tier is, by construction, a transitive grant of arbitrary root code
+# execution, bounded only by the trust placed in the configured, root-owned
+# repositories. That is stated plainly rather than papered over: maintainer
+# scripts run as root by design.
+#
+# What the rules can still do is make every *other* route unreachable. The
+# deb-name matcher rejects "/", "=", ":", a leading "-", and "..", so
+# `apt-get install ./local.deb`, a version-pinned downgrade, an architecture
+# qualifier, and a URL install are all unrepresentable. The compiled-in
+# deny-list independently refuses `-o`/`--option`/`--config-file`, because
+# `apt-get -o DPkg::Pre-Invoke::='...'` is a /bin/sh-as-root injection through a
+# rule that only meant to install a package.
+#
+# Removal is capped at 10 names and requires confirmation: `apt-get remove X`
+# can resolve into hundreds of removals, including the toolchain the agent is
+# standing on.
+
+[[action]]
+id = "aido.pkg.install"
+tier = "pkg-install"
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "assume-yes", matcher = { literal = "-y" } },
+  { name = "no-recommends", matcher = { literal = "--no-install-recommends" } },
+  { name = "verb", matcher = { literal = "install" } },
+  { name = "separator", matcher = { literal = "--" } },
+  { name = "pkg", matcher = { name = "deb-name" }, repeat = { between = { min = 1, max = 20 } } },
+]
+
+[[action]]
+id = "aido.pkg.update"
+tier = "pkg-install"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "update" } }]
+
+[[action]]
+id = "aido.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+confirm = "always"
+args = [
+  { name = "assume-yes", matcher = { literal = "-y" } },
+  { name = "verb", matcher = { literal = "remove" } },
+  { name = "separator", matcher = { literal = "--" } },
+  { name = "pkg", matcher = { name = "deb-name" }, repeat = { between = { min = 1, max = 10 } } },
+]
+
+[[action]]
+id = "aido.pkg.dry-run-install"
+tier = "diag-read"
+# Simulation only. This is what the broker runs to render a preview into the
+# confirmation prompt, so a human approving a removal sees what will actually go.
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "simulate", matcher = { literal = "-s" } },
+  { name = "verb", matcher = { literal = "install" } },
+  { name = "separator", matcher = { literal = "--" } },
+  { name = "pkg", matcher = { name = "deb-name" }, repeat = { between = { min = 1, max = 20 } } },
+]

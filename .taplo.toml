@@ -1,0 +1,13 @@
+# taplo formats the TOML this project ships and nothing else.
+#
+# `target/` holds generated test fixtures, deliberately including a file whose
+# bytes are not valid UTF-8 and a directory named `10-a.toml` — both exist to
+# prove the rule loader refuses them. Letting the formatter walk into that
+# directory makes `taplo fmt --check` fail for reasons that have nothing to do
+# with the repository's own formatting.
+exclude = ["target/**", "fuzz/target/**"]
+
+[formatting]
+align_entries = false
+array_trailing_comma = true
+indent_string = "  "

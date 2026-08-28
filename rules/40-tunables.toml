@@ -1,0 +1,44 @@
+# T4 · sys-tunable — writes kernel tunables, from an enumeration only.
+#
+# The sysctl namespace is not uniformly risky. A handful of keys are ordinary
+# capacity limits that a developer legitimately needs; a different handful are
+# code-execution primitives (kernel.core_pattern is a program specification,
+# kernel.modprobe names a binary the kernel runs). So the key is an enum with a
+# per-key value range rather than a pattern, and the dangerous keys are
+# independently refused by the compiled-in deny-list.
+#
+# Every file-driven form — sysctl -p, --load, --system — is denied outright: the
+# values come from a file the argv does not name, so argv matching cannot see
+# what is being applied.
+
+[[action]]
+id = "aido.sysctl.max-map-count"
+tier = "sys-tunable"
+exe = "/usr/sbin/sysctl"
+args = [
+  { name = "quiet", matcher = { literal = "-q" } },
+  { name = "write", matcher = { literal = "-w" } },
+  { name = "key", matcher = { literal = "vm.max_map_count" } },
+  { name = "value", matcher = { int-range = { lo = 65530, hi = 2147483647 } } },
+]
+
+[[action]]
+id = "aido.sysctl.inotify-watches"
+tier = "sys-tunable"
+exe = "/usr/sbin/sysctl"
+args = [
+  { name = "quiet", matcher = { literal = "-q" } },
+  { name = "write", matcher = { literal = "-w" } },
+  { name = "key", matcher = { literal = "fs.inotify.max_user_watches" } },
+  { name = "value", matcher = { int-range = { lo = 8192, hi = 1048576 } } },
+]
+
+[[action]]
+id = "aido.time.set-ntp"
+tier = "sys-tunable"
+exe = "/usr/bin/timedatectl"
+args = [
+  { name = "verb", matcher = { literal = "set-ntp" } },
+  # "false" is the precondition for clock manipulation, so it is confirmed.
+  { name = "value", matcher = { one-of = ["true", "false"] } },
+]

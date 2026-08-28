@@ -1,0 +1,53 @@
+# T1 · svc-control — changes running state, never a unit definition.
+#
+# The verb list is an enumeration, not a pattern. Every unit-definition-mutating
+# verb (enable, disable, mask, unmask, link, revert, edit, set-property, …) is
+# excluded by not appearing here, AND independently refused by the compiled-in
+# deny-list, because a tier boundary that depends on one list being complete is
+# not a boundary.
+#
+# Unit names are validated for shape here and should be narrowed to an
+# enumeration per host: `systemctl restart foo` resolves `foo` to `foo.service`,
+# so a rule matching a suffix-less name matches more units than it appears to,
+# which is why unit-name requires an explicit suffix.
+
+[[action]]
+id = "aido.svc.lifecycle"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = [
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+  ] } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[action]]
+id = "aido.svc.reset-failed"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "verb", matcher = { literal = "reset-failed" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[action]]
+id = "aido.svc.reload-units"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+# Zero arguments beyond the pinned flags. Note that daemon-reload re-reads every
+# unit search path, so this is only as safe as those directories' ownership,
+# which aido-sys verifies before the gate execs.
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "verb", matcher = { literal = "daemon-reload" } },
+]

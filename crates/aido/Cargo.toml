@@ -1,0 +1,23 @@
+[package]
+name = "aido"
+description = "Agent-aware privilege broker for Linux: the unprivileged front-end library. It decides nothing and holds no secret."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aido-backend = { path = "../aido-backend", version = "0.0.1" }
+aido-config = { path = "../aido-config", version = "0.0.1" }
+aido-policy = { path = "../aido-policy", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+# Each entry below is a documented root-exploit vector, not a style opinion.
+# See CLAUDE.md § "Banned in privileged code".
+msrv = "1.85"
+
+disallowed-methods = [
+  { path = "std::ffi::OsStr::to_string_lossy", reason = "Linux argv is arbitrary bytes; one lossy conversion in the matcher is a policy bypass. Compare byte-exact on OsStr/&[u8]." },
+  { path = "std::path::Path::to_string_lossy", reason = "Same: paths are bytes. Never round-trip a path through a lossy String in a decision path." },
+  { path = "std::env::var", reason = "The caller controls the environment. Reading it in a decision path puts the safety default one `export` away from off." },
+  { path = "std::env::var_os", reason = "See std::env::var." },
+  { path = "std::env::vars", reason = "See std::env::var." },
+  { path = "std::process::Command::new", reason = "No PATH search, ever. Resolve absolutely in aido-sys, then exec the fd you validated." },
+]
+
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "Iteration order is nondeterministic, which makes audit records and snapshots unstable. Use BTreeMap." },
+  { path = "std::collections::HashSet", reason = "See HashMap." },
+]

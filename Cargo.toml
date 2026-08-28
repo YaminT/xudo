@@ -1,0 +1,92 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/aido-backend",
+  "crates/aido-config",
+  "crates/aido-policy",
+  "crates/aido-sys",
+  "crates/aido",
+  "crates/aido-bin",
+  "crates/aido-tests",
+]
+
+# `fuzz` stays out of the workspace: cargo-fuzz needs nightly, its own release
+# profile, and sanitizer flags, none of which should reach the pinned stable
+# build that ships.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/yamin/aido"
+authors = ["aido contributors"]
+
+[workspace.dependencies]
+bstr = { version = "1", default-features = false, features = ["alloc"] }
+regex = { version = "1", default-features = false, features = [
+  "std",
+  "perf",
+  "unicode-case",
+] }
+serde = { version = "1", default-features = false, features = [
+  "std",
+  "derive",
+] }
+sha2 = { version = "0.10", default-features = false }
+thiserror = "2"
+toml = { version = "0.9", default-features = false, features = [
+  "parse",
+  "serde",
+] }
+
+insta = "1"
+proptest = "1"
+serde_json = "1"
+clap = { version = "4", default-features = false, features = [
+  "std",
+  "derive",
+  "help",
+  "usage",
+  "error-context",
+  "wrap_help",
+] }
+assert_cmd = "2"
+predicates = "3"
+
+# Lints are declared once here and inherited by every crate via
+# `[lints] workspace = true`. Rationale for each group is in CLAUDE.md.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Deny-by-default posture: this is a privilege broker, a panic in a decision
+# path is undefined policy.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"
+arithmetic_side_effects = "deny"
+disallowed_methods = "deny"
+# Correctness and clarity.
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Coverage must reflect the code that ships, so keep test builds honest.
+[profile.test]
+debug = true

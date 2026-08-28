@@ -1,0 +1,23 @@
+[package]
+name = "aido-bin"
+description = "The `aido` executable. A five-line entry point over the aido library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package so the library is compiled — and therefore measured — exactly
+# once. A package that is both a library and a binary links every module twice,
+# which double-counts coverage and fully covers neither copy.
+[[bin]]
+name = "aido"
+path = "src/main.rs"
+
+[dependencies]
+aido = { path = "../aido", version = "0.0.1" }
+clap.workspace = true
+
+[lints]
+workspace = true

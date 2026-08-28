@@ -1,0 +1,24 @@
+# GTFOBins waivers.
+#
+# A binary on the GTFOBins list can be turned into a shell, an arbitrary read,
+# or an arbitrary write WHEN INVOKED FREELY. Allowlisting one is therefore only
+# defensible when the rule constrains it so that the specific technique is
+# unreachable. This file is where that argument is written down and reviewed.
+#
+# Format: <absolute path>|<the GTFOBins technique>|<why the rule neutralises it>
+#
+# A waiver is not permission to relax the rule later. If a rule that owns a
+# waiver here is widened, the waiver's reasoning must be re-checked, because the
+# technique it claims is unreachable may no longer be.
+
+/usr/bin/systemctl|Pager escape (`!cmd` via the default pager) and unit-definition verbs (`edit`, `link`, `set-property`) that write a unit file the caller controls|Every shipped systemctl rule pins `--no-pager`, so no pager is ever spawned. The verb is a closed enum containing only lifecycle verbs; every unit-definition-mutating verb is absent from the enum AND independently refused by the compiled-in deny-list's UnitDefinitionMutation class. Unit names must carry an explicit suffix, so a bare name cannot resolve to something wider.
+
+/usr/sbin/sysctl|Writing a key whose value is a program specification (`kernel.core_pattern=|/tmp/x`, `kernel.modprobe`), and the file-driven forms `-p`, `--load`, `--system`, which apply values from a file the argv does not name|The key is a literal or a closed enum per rule, never a pattern, and each key carries its own integer range. Every code-execution key is in the deny-list's FATAL_SYSCTL_KEYS, and all three file-driven flags are refused by the ConfigNamedProgram class, so the values applied are always visible in the argv the matcher checked.
+
+/usr/bin/timedatectl|Pager escape via the systemd pager environment|The only shipped rule takes the fixed verb `set-ntp` with a two-value enum operand and no path, file, or free-form argument. No pager is invoked because no output is paged; `SYSTEMD_PAGER` and `PAGER` are absent from the child environment, which is built from an allowlist rather than inherited.
+
+/usr/bin/ss|Reading a caller-named file via `-F/--filter <file>`, and the pager on long output|The shipped rule has a completely fixed argv (`-tulpnH`) with no caller input reaching it at all, so `-F` is unrepresentable. This is the safest rule shape available and is the reason it was written this way.
+
+/usr/bin/journalctl|Pager escape (`!cmd`, `LESSOPEN`) and the log-mutating flags `--vacuum-*`, `--rotate`, `--setup-keys`|Both journalctl rules pin `--no-pager`. `PAGER`, `LESS`, `LESSOPEN`, `SYSTEMD_PAGER`, and `SYSTEMD_LESS` are absent from the constructed child environment. The remaining positions are a validated unit name, a bounded integer, and closed enums, so no mutating flag can be named.
+
+/usr/bin/apt-get|Maintainer scripts running as root, `-o DPkg::Pre-Invoke::=<program>` which is a /bin/sh injection, and installing a local file or URL|Maintainer-script execution is inherent to this tier and is stated plainly rather than waived: the boundary is that packages come only from configured, root-owned repositories. What the rules do remove is every other route — `-o`, `--option`, `-c`, and `--config-file` are refused by the ConfigNamedProgram class, and the deb-name matcher rejects `/`, `=`, `:`, `..`, and a leading `-`, so a path, a version pin, an architecture qualifier, and a URL are all unrepresentable.

@@ -1,0 +1,52 @@
+# Supply-chain policy. aido is a privilege broker: a compromised dependency in
+# the privileged crates is a root compromise, so the dependency budget is
+# deliberately tiny (sudo-rs's bar) and enforced here rather than by habit.
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+unmaintained = "all"
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.93
+# Keep the allowlist to licences actually present, so an unexpected licence in a
+# new dependency fails the gate instead of being pre-approved.
+
+[bans]
+# Two copies of a crate in the privileged path means two versions to audit and
+# two sets of advisories to track.
+multiple-versions = "deny"
+wildcards = "deny"
+# Nothing in the tree may reach the network or spawn a process on its own.
+deny = [
+  { crate = "openssl", reason = "no TLS in the default build; networking is behind a non-default feature" },
+  { crate = "openssl-sys", reason = "see openssl" },
+  { crate = "reqwest", reason = "the default build is provably telemetry-free" },
+  { crate = "hyper", reason = "see reqwest" },
+  { crate = "tokio", reason = "the policy crate is a pure function; async belongs only in the broker, and only when justified" },
+  { crate = "shlex", reason = "shlex::split re-parses a rendered command string, which reintroduces injection; one-way quoting only, added deliberately if ever" },
+]
+# A skip is a documented waiver, never a convenience. Each entry names the
+# duplicate, why it is not our doing, and what would remove it.
+skip = [
+  # `toml` 0.9 depends on winnow 0.7 while its own `toml_parser` has moved to
+  # winnow 1.0. Both copies are pure parsing code with no unsafe and no I/O,
+  # reached only from the rule-file parser, which is fuzzed as a trust boundary
+  # in its own right. Removed upstream when toml unifies on winnow 1.
+  { crate = "winnow", reason = "transitive duplicate inside toml 0.9; parsing-only, fuzzed, no unsafe" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

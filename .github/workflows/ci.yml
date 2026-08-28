@@ -1,0 +1,135 @@
+name: ci
+
+# The gate. `just verify` locally runs the same commands, so a local pass and a
+# CI failure is a bug in the justfile, not in CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly deep fuzz and a fresh advisory check, at an off-peak minute.
+    - cron: "37 4 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  # A privilege broker should not be built with an unpinned toolchain.
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is the development platform and must stay green, because the
+        # policy crate's whole point is that it builds and tests without Linux.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        # rust-toolchain.toml pins the channel and components.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gate tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-llvm-cov,cargo-nextest,cargo-deny,cargo-audit,taplo-cli
+
+      - name: Format
+        run: just fmt-check
+
+      - name: Lint
+        run: just lint
+
+      - name: TOML format
+        run: taplo fmt --check
+
+      - name: Test
+        run: just test
+
+      - name: Doc tests
+        run: just doc-test
+
+      - name: Coverage (100%, two documented package exclusions)
+        run: just coverage-clean && just coverage
+
+      - name: Supply chain
+        run: just supply-chain
+
+      - name: GTFOBins gate
+        run: just gtfobins
+
+  cross:
+    name: linux targets from the dev host
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Type-check Linux targets
+        run: just check-linux
+
+  miri:
+    name: undefined behaviour
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --component miri
+      - uses: Swatinem/rust-cache@v2
+      # --lib only: see the justfile's miri recipe for why.
+      - run: cargo +nightly miri test -p aido-policy --lib
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-24.04
+    # The three trust-boundary parsers get a short run per push and a long run
+    # on the nightly schedule.
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz,just
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz (smoke)
+        if: github.event_name != 'schedule'
+        run: just fuzz-smoke
+      - name: Fuzz (nightly, long)
+        if: github.event_name == 'schedule'
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=1800
+          done
+
+  # Placeholder for the differential compliance matrix that lands with M2, when
+  # there is a privileged path to compare across sudo, sudo-rs, and OpenDoas.
+  # Kept here, failing loudly if it ever silently disappears, because "we will
+  # add it later" is how it never gets added.
+  differential:
+    name: differential compliance (M2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm the matrix is still tracked
+        run: |
+          # aido-tests now exists and runs the binary as a process, but there
+          # is still no privileged path to compare across backends. This job
+          # fails deliberately once a gate binary appears, so the matrix cannot
+          # be forgotten at the moment it starts to matter.
+          if [ -e crates/aido-gate ] || [ -e crates/aidod ]; then
+            echo "a privileged path exists; wire the sudo / sudo-rs / doas matrix into this job"
+            exit 1
+          fi
+          echo "M1: no privileged path yet, so there is nothing to compare. Tracked for M2."

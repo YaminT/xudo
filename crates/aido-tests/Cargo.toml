@@ -1,0 +1,30 @@
+[package]
+name = "aido-tests"
+description = "End-to-end tests that run the real aido binary as a process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# A separate package on purpose. These tests spawn the built `aido` binary,
+# which links every module a second time; measuring coverage over that second
+# instantiation double-counts every file and covers neither copy fully. Keeping
+# them here lets `just coverage` exclude the package (`--exclude aido-tests`) so
+# each file is measured exactly once, while `just test` still runs them.
+#
+# This is also where the M2 differential compliance matrix lands: the same
+# ruleset driven against sudo, sudo-rs, and OpenDoas across the distro grid.
+
+[dependencies]
+
+[dev-dependencies]
+aido = { path = "../aido", version = "0.0.1" }
+assert_cmd.workspace = true
+predicates.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

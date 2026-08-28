@@ -1,0 +1,18 @@
+[package]
+name = "aido-sys"
+description = "Platform abstraction for aido: /proc parsing, ancestry walking, and caller classification behind traits with in-memory fakes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aido-backend = { path = "../aido-backend", version = "0.0.1" }
+aido-policy = { path = "../aido-policy", version = "0.0.1" }
+bstr.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+# Pinned so every developer and CI runner sees identical lint and coverage
+# results. Nightly is used only for `cargo fuzz`, `cargo miri`, and region
+# coverage — never for a shipped build.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+]
