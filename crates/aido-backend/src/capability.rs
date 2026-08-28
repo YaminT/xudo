@@ -25,11 +25,21 @@ pub enum Capability {
     /// `/etc/sudoers`, so on that backend a snippet must be validated by
     /// substitution into a temporary copy rather than in place.
     ValidateNamedFile,
-    /// A per-command settings scope, so aido's `Defaults` cannot leak onto
+    /// A per-command settings scope, so aido's settings cannot leak onto
     /// unrelated commands.
     ///
-    /// `sudo`'s `Defaults!<Cmnd_Alias>`. `doas` has per-rule options instead,
-    /// which is a better shape but a different one.
+    /// A **property**, not a syntax. `sudo` has it as `Defaults!<Cmnd_Alias>`;
+    /// `doas` has it more directly, because its options live on the rule itself
+    /// and cannot apply to anything else. Either satisfies this.
+    ///
+    /// **Required**, and measured rather than assumed. `sudo-rs` 0.2.2 supports
+    /// only *global* `Defaults`: `Defaults!ALIAS`, `Defaults:user`,
+    /// `Defaults>runas` and `Defaults@host` are all rejected as
+    /// `unknown setting`. Without a scope, the only way to apply
+    /// `timestamp_timeout=0` and `use_pty` is to apply them to **every** sudo
+    /// user on the host, and an installer that silently changes unrelated sudo
+    /// behaviour is doing something an operator did not ask for. So a backend
+    /// without this is refused rather than accommodated.
     PerCommandDefaults,
     /// The credential cache can be disabled for aido's own rules.
     ///
@@ -75,7 +85,10 @@ impl Capability {
     /// is a path by which a privileged command runs with less checking than the
     /// operator was promised.
     pub fn is_required(self) -> bool {
-        matches!(self, Self::DisableCredentialCache | Self::AllocatePty)
+        matches!(
+            self,
+            Self::DisableCredentialCache | Self::AllocatePty | Self::PerCommandDefaults
+        )
     }
 
     /// Why aido cares, in one sentence, for `aido doctor`.
@@ -90,8 +103,9 @@ impl Capability {
                  snippet must be validated by substitution into a temporary copy"
             }
             Self::PerCommandDefaults => {
-                "scopes aido's settings to aido's own commands, so they cannot leak \
-                 onto unrelated rules"
+                "REQUIRED: scopes aido's settings to aido's own commands; without it the \
+                 only way to apply them is globally, which changes sudo's behaviour for \
+                 every user on the host"
             }
             Self::DisableCredentialCache => {
                 "REQUIRED: without it the agent path can ride a credential a human \
@@ -221,14 +235,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_controls_with_no_substitute_are_required() {
+    fn only_the_controls_with_no_substitute_are_required() {
         let required: Vec<Capability> = Capability::ALL
             .into_iter()
             .filter(|c| c.is_required())
             .collect();
         assert_eq!(
             required,
-            vec![Capability::DisableCredentialCache, Capability::AllocatePty]
+            vec![
+                Capability::PerCommandDefaults,
+                Capability::DisableCredentialCache,
+                Capability::AllocatePty
+            ]
         );
     }
 
@@ -240,23 +258,30 @@ mod tests {
         assert!(!pty_only.is_usable());
         assert_eq!(
             pty_only.missing_required(),
-            vec![Capability::DisableCredentialCache]
+            vec![
+                Capability::PerCommandDefaults,
+                Capability::DisableCredentialCache
+            ]
         );
 
         let cache_only = CapabilityMatrix::empty().with(Capability::DisableCredentialCache);
-        assert_eq!(cache_only.missing_required(), vec![Capability::AllocatePty]);
+        assert_eq!(
+            cache_only.missing_required(),
+            vec![Capability::PerCommandDefaults, Capability::AllocatePty]
+        );
 
         let neither = CapabilityMatrix::empty().with(Capability::DropInDirectory);
-        assert_eq!(neither.missing_required().len(), 2);
+        assert_eq!(neither.missing_required().len(), 3);
     }
 
     #[test]
-    fn a_backend_with_both_required_capabilities_is_usable_even_if_spartan() {
+    fn a_backend_with_every_required_capability_is_usable_even_if_spartan() {
         // A doas port with no drop-in directory and no per-command defaults is
         // still usable; those have workarounds, the other two do not.
         let spartan = CapabilityMatrix::from_supported([
             Capability::DisableCredentialCache,
             Capability::AllocatePty,
+            Capability::PerCommandDefaults,
         ]);
         assert!(spartan.is_usable());
         assert!(spartan.missing_required().is_empty());

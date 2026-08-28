@@ -313,6 +313,7 @@ mod tests {
         let mut caps = CapabilityMatrix::from_supported([
             Capability::DisableCredentialCache,
             Capability::AllocatePty,
+            Capability::PerCommandDefaults,
         ]);
         if drop_in {
             caps = caps.with(Capability::DropInDirectory);
@@ -322,6 +323,7 @@ mod tests {
         }
         Backend {
             kind,
+            exe: kind.exe().to_owned(),
             version: format!("{} test", kind.label()),
             capabilities: caps,
         }
@@ -394,7 +396,9 @@ mod tests {
 
     #[test]
     fn a_backend_that_cannot_check_a_named_file_gets_the_substitution_step() {
-        // And it says why, so nobody replaces it with the cheaper check.
+        // And it says why, so nobody replaces it with the cheaper check. Built
+        // through the helper with every required capability present, because a
+        // backend missing one is refused before a plan exists at all.
         let plan = InstallPlan::human_only(&backend(BackendKind::SudoRs, true, false)).unwrap();
         let reason = plan
             .steps
@@ -566,6 +570,7 @@ mod tests {
     #[test]
     fn a_backend_that_cannot_be_given_an_honest_snippet_yields_no_plan() {
         let crippled = Backend {
+            exe: "/usr/bin/sudo".to_owned(),
             kind: BackendKind::Sudo,
             version: "0.0".to_owned(),
             capabilities: CapabilityMatrix::empty(),
@@ -573,6 +578,7 @@ mod tests {
         assert!(InstallPlan::human_only(&crippled).is_err());
 
         let crippled_doas = Backend {
+            exe: "/usr/bin/doas".to_owned(),
             kind: BackendKind::Doas,
             version: "0.0".to_owned(),
             capabilities: CapabilityMatrix::empty(),

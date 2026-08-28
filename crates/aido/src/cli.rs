@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aido_backend::{Capability, DetectError, Probe, detect};
+use aido_backend::{Capability, DetectError, InstallPlan, PlanStep, Probe, detect};
 use aido_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use aido_policy::{
     Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict, engine::Settings,
@@ -110,6 +110,21 @@ pub enum Command {
         schema: bool,
     },
 
+    /// Show the steps that would integrate aido with the local sudo backend.
+    ///
+    /// Prints the plan and exits. This build has no installer, so `--dry-run` is
+    /// the only accepted mode and must be given explicitly — a subcommand named
+    /// `install` that silently did nothing would be worse than no subcommand.
+    Install {
+        /// Required. Print the plan without performing any step.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Print the file contents each step would write, not just its summary.
+        #[arg(long)]
+        show_contents: bool,
+    },
+
     /// Verify that the audit log has not been edited.
     Audit {
         /// The log to read. Defaults to `$HOME/.local/state/ido/log.jsonl`;
@@ -193,6 +208,10 @@ pub fn run_with(
     match &cli.command {
         Command::Doctor => doctor(cli, ops, probe, loaded.as_ref().ok(), out),
         Command::Config { schema } => config(cli, *schema, out, err),
+        Command::Install {
+            dry_run,
+            show_contents,
+        } => install(probe, *dry_run, *show_contents, out, err),
         Command::Explain(args) => {
             with_rules!(|l: &LoadedRules| explain(cli, ops, l, args, out, err))
         }
@@ -223,6 +242,87 @@ fn trust_line(rules: &Path) -> String {
     match aido_sys::verify_path(rules) {
         Ok(()) => "root-owned, no writable component".to_owned(),
         Err(source) => format!("UNTRUSTED: {source}"),
+    }
+}
+
+/// Prints the install plan for the detected backend.
+///
+/// Performs no step. The plan is built by `aido-backend`, which is pure, so this
+/// is the same data an installer would execute — printing it is how the steps get
+/// reviewed before anything runs as root.
+fn install(
+    probe: &dyn Probe,
+    dry_run: bool,
+    show_contents: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if !dry_run {
+        let _ = writeln!(
+            err,
+            "aido: this build has no installer; pass --dry-run to see the plan"
+        );
+        return ExitCode::Unusable;
+    }
+
+    // One refusal path, not two. A backend that cannot be given a snippet is a
+    // backend aido cannot use, so the snippet failure is folded into the same
+    // answer rather than given its own arm — an arm that detection's usability
+    // guarantee means nothing could ever reach.
+    let plan = match detect(probe)
+        .map_err(|source| source.to_string())
+        .and_then(|backend| plan_for(&backend))
+    {
+        Ok(plan) => plan,
+        Err(reason) => {
+            let _ = writeln!(err, "aido: no usable backend: {reason}");
+            return ExitCode::Unusable;
+        }
+    };
+
+    let _ = writeln!(out, "plan for     {}", plan.backend.label());
+    let _ = writeln!(out, "steps        {}", plan.steps.len());
+    for (index, step) in plan.steps.iter().enumerate() {
+        let ordinal = index.saturating_add(1);
+        let _ = writeln!(out, "  {ordinal:>2}. {}", step.describe());
+        if show_contents {
+            for line in step_contents(step).lines() {
+                let _ = writeln!(out, "      | {line}");
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nNothing was written. This build grants the human path only: every rule it\n\
+         would install requires a password, and no passwordless rule exists in it."
+    );
+    ExitCode::Delegated
+}
+
+/// The plan for one backend, with the failure rendered as text.
+///
+/// Split out so the failure is reachable from a test: detection refuses an
+/// unusable backend before `install` ever asks for a plan, so this arm cannot be
+/// reached through the command — but it is still a real failure mode of the
+/// planner, and an untested error path in a privileged tool is one nobody has
+/// read.
+fn plan_for(backend: &aido_backend::Backend) -> Result<InstallPlan, String> {
+    InstallPlan::human_only(backend).map_err(|source| source.to_string())
+}
+
+/// The text a step would write, or an empty string for a step that writes none.
+fn step_contents(step: &PlanStep) -> &str {
+    match step {
+        PlanStep::WriteCandidate { contents, .. } => contents,
+        PlanStep::AppendBlock { block, .. } => block,
+        PlanStep::Notice { text } => text,
+        PlanStep::CreateGroup { .. }
+        | PlanStep::Validate { .. }
+        | PlanStep::ValidateBySubstitution { .. }
+        | PlanStep::Install { .. }
+        | PlanStep::RemoveBlock { .. }
+        | PlanStep::Remove { .. }
+        | PlanStep::FunctionalProbe { .. } => "",
     }
 }
 
@@ -717,7 +817,7 @@ fn capability_label(capability: Capability) -> &'static str {
     match capability {
         Capability::DropInDirectory => "drop-in directory",
         Capability::ValidateNamedFile => "validate named file",
-        Capability::PerCommandDefaults => "per-command defaults",
+        Capability::PerCommandDefaults => "per-command defaults (REQUIRED)",
         Capability::DisableCredentialCache => "disable credential cache (REQUIRED)",
         Capability::AllocatePty => "allocate pty (REQUIRED)",
         Capability::RejectsArgumentWildcards => "rejects argument wildcards",
@@ -1463,6 +1563,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
             false
         }
+
+        fn honours_scoped_directive(&self, path: &str, directive: &str) -> bool {
+            self.honours_directive(path, directive)
+        }
+
+        fn validates_named_file(&self, _path: &str) -> bool {
+            true
+        }
+
+        fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+            true
+        }
     }
 
     /// A machine with a fully working sudo.
@@ -1481,6 +1593,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
             true
         }
+
+        fn honours_scoped_directive(&self, path: &str, directive: &str) -> bool {
+            self.honours_directive(path, directive)
+        }
+
+        fn validates_named_file(&self, _path: &str) -> bool {
+            true
+        }
+
+        fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+            true
+        }
     }
 
     fn run_probe(fx: &Fixture, probe: &dyn Probe, args: &[&str]) -> String {
@@ -1491,6 +1615,193 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut err = Vec::new();
         let _ = run_with(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Runs a command with a probe, returning (exit, stdout, stderr).
+    fn run_probe_full(
+        fx: &Fixture,
+        probe: &dyn Probe,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let mut full = vec!["aido", "--rules", fx.dir.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn the_probe_doubles_answer_every_question_in_the_trait() {
+        // These are part of each double's contract even when the command under
+        // test stops before asking. A double that silently answered differently
+        // from what a test assumes is a test proving nothing.
+        assert!(WorkingSudoProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
+        assert!(WorkingSudoProbe.validates_named_file("/usr/bin/sudo"));
+        assert!(WorkingSudoProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!NoBackendProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
+        assert!(NoBackendProbe.validates_named_file("/usr/bin/sudo"));
+        assert!(NoBackendProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+    }
+
+    #[test]
+    fn a_backend_that_cannot_be_given_a_snippet_reports_why() {
+        // Unreachable through the command, because detection refuses an unusable
+        // backend first. Exercised directly so the planner's own error path is
+        // one somebody has read.
+        let crippled = aido_backend::Backend {
+            kind: aido_backend::BackendKind::Sudo,
+            exe: "/usr/bin/sudo".to_owned(),
+            version: "Sudo version 0.0".to_owned(),
+            capabilities: aido_backend::CapabilityMatrix::empty(),
+        };
+        let reason = plan_for(&crippled).unwrap_err();
+        assert!(reason.contains("cannot generate a snippet"), "{reason}");
+    }
+
+    #[test]
+    fn install_prints_the_plan_and_writes_nothing() {
+        let fx = fixture("cli-install");
+        let (code, out, err) = run_probe_full(&fx, &WorkingSudoProbe, &["install", "--dry-run"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("plan for     sudo"), "{out}");
+        // The order is the security property: validate before install, and a
+        // functional probe after it, because a file existing proves nothing.
+        let validate = out.find("validate:").expect("a validate step");
+        let install = out.find("atomically install").expect("an install step");
+        let probe_at = out.find("probe:").expect("a functional probe step");
+        assert!(validate < install, "{out}");
+        assert!(install < probe_at, "{out}");
+        assert!(out.contains("Nothing was written"), "{out}");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn install_without_dry_run_refuses_rather_than_appearing_to_work() {
+        // A subcommand named `install` that silently did nothing would be worse
+        // than no subcommand at all.
+        let fx = fixture("cli-install-bare");
+        let (code, out, err) = run_probe_full(&fx, &WorkingSudoProbe, &["install"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("no installer"), "{err}");
+    }
+
+    #[test]
+    fn install_shows_the_file_it_would_write_when_asked() {
+        let fx = fixture("cli-install-contents");
+        let (_, out, _) = run_probe_full(
+            &fx,
+            &WorkingSudoProbe,
+            &["install", "--dry-run", "--show-contents"],
+        );
+        // The two tokens that carry the whole security argument for the file.
+        assert!(out.contains("timestamp_timeout=0"), "{out}");
+        assert!(out.contains("use_pty"), "{out}");
+        // And no passwordless rule, in the build that ships.
+        assert!(!out.contains("NOPASSWD"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_when_there_is_no_backend_to_install_into() {
+        let fx = fixture("cli-install-nobackend");
+        let (code, _, err) = run_probe_full(&fx, &NoBackendProbe, &["install", "--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("no usable backend"), "{err}");
+    }
+
+    #[test]
+    fn install_refuses_a_backend_that_cannot_be_given_a_snippet() {
+        // A backend that answers no to every directive fails detection first,
+        // which is the same refusal an operator needs to see: aido declines
+        // rather than installing something weaker than it advertises.
+        struct MuteProbe;
+        impl Probe for MuteProbe {
+            fn exists(&self, absolute_path: &str) -> bool {
+                absolute_path == "/usr/bin/sudo"
+            }
+            fn version_banner(&self, _absolute_path: &str) -> Option<String> {
+                Some("Sudo version 1.9.17p2\n".to_owned())
+            }
+            fn directory_exists(&self, _absolute_path: &str) -> bool {
+                true
+            }
+            fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
+                false
+            }
+            fn honours_scoped_directive(&self, _path: &str, _directive: &str) -> bool {
+                false
+            }
+            fn validates_named_file(&self, _path: &str) -> bool {
+                false
+            }
+            fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+                false
+            }
+        }
+        let fx = fixture("cli-install-mute");
+        let (code, _, err) = run_probe_full(&fx, &MuteProbe, &["install", "--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("no usable backend"), "{err}");
+    }
+
+    #[test]
+    fn every_plan_step_reports_the_text_it_would_write_or_none() {
+        // step_contents must stay exhaustive: a step added later that writes a
+        // file and is not listed here would print nothing under
+        // --show-contents, which is the one flag whose job is to show it.
+        let writes = [
+            PlanStep::WriteCandidate {
+                path: "/p".to_owned(),
+                contents: "body".to_owned(),
+                mode: 0o440,
+            },
+            PlanStep::AppendBlock {
+                path: "/p".to_owned(),
+                block: "body".to_owned(),
+                mode: 0o440,
+            },
+            PlanStep::Notice {
+                text: "body".to_owned(),
+            },
+        ];
+        for step in &writes {
+            assert_eq!(step_contents(step), "body", "{step:?}");
+        }
+        let silent = [
+            PlanStep::CreateGroup {
+                name: "aido".to_owned(),
+            },
+            PlanStep::Validate { argv: Vec::new() },
+            PlanStep::ValidateBySubstitution {
+                candidate: "/c".to_owned(),
+                reason: "r".to_owned(),
+            },
+            PlanStep::Install {
+                from: "/a".to_owned(),
+                to: "/b".to_owned(),
+            },
+            PlanStep::RemoveBlock {
+                path: "/p".to_owned(),
+                begin: "b".to_owned(),
+                end: "e".to_owned(),
+            },
+            PlanStep::Remove {
+                path: "/p".to_owned(),
+            },
+            PlanStep::FunctionalProbe {
+                argv: Vec::new(),
+                expectation: "e".to_owned(),
+            },
+        ];
+        for step in &silent {
+            assert_eq!(step_contents(step), "", "{step:?}");
+        }
     }
 
     #[test]
@@ -1687,7 +1998,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn doctor_names_the_capabilities_a_backend_lacks() {
-        // A doas port: no drop-in directory, no per-command defaults.
+        // A doas port: no drop-in directory, so it appends a delimited block to
+        // a shared file instead. It does scope its settings — doas options live
+        // on the rule itself — so it stays usable.
         struct DoasProbe;
         impl Probe for DoasProbe {
             fn exists(&self, absolute_path: &str) -> bool {
@@ -1702,11 +2015,28 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
                 true
             }
+
+            fn honours_scoped_directive(&self, path: &str, directive: &str) -> bool {
+                self.honours_directive(path, directive)
+            }
+
+            fn validates_named_file(&self, _path: &str) -> bool {
+                true
+            }
+
+            fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+                true
+            }
         }
+        // Asked directly: doas capabilities are derived from the doas probe, so
+        // the sudo-family questions are never put to this double by the command.
+        assert!(DoasProbe.honours_scoped_directive("/usr/bin/doas", "pty"));
+        assert!(DoasProbe.validates_named_file("/usr/bin/doas"));
+        assert!(DoasProbe.accepts_argument_wildcard("/usr/bin/doas"));
+
         let out = run_probe(&fixture("cli-doctor-doas"), &DoasProbe, &["doctor"]);
         assert!(out.contains("backend      doas"), "{out}");
         assert!(out.contains("absent: drop-in directory"), "{out}");
-        assert!(out.contains("absent: per-command defaults"), "{out}");
     }
 
     #[test]
@@ -1723,6 +2053,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 true
             }
             fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
+                true
+            }
+
+            fn honours_scoped_directive(&self, path: &str, directive: &str) -> bool {
+                self.honours_directive(path, directive)
+            }
+
+            fn validates_named_file(&self, _path: &str) -> bool {
+                true
+            }
+
+            fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
@@ -1757,6 +2099,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             }
             fn honours_directive(&self, _absolute_path: &str, directive: &str) -> bool {
                 directive != "use_pty"
+            }
+
+            fn honours_scoped_directive(&self, path: &str, directive: &str) -> bool {
+                self.honours_directive(path, directive)
+            }
+
+            fn validates_named_file(&self, _path: &str) -> bool {
+                true
+            }
+
+            fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+                true
             }
         }
         let out = run_probe(&fixture("cli-doctor-deaf"), &DeafSudoProbe, &["doctor"]);

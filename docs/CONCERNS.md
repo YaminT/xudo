@@ -263,6 +263,77 @@ policy authorised.
 Confirmed on the host: program named plus permitted argv → ALLOW; same argv with
 `/bin/sh` substituted → `exe_mismatch`; no program named → `unknown_action`.
 
+### The container matrix ran, and it falsified three things in the code
+
+Docker on `yamin.lol` runs as root without a password (that user is in the
+`docker` group), so the sudo / sudo-rs / doas matrix finally ran against real
+parsers. Three assumptions in `aido-backend` were wrong, and all three were the
+same mistake: a property inferred from an implementation's *name* instead of
+asked.
+
+**1. sudo-rs was invisible.** Ubuntu's `sudo-rs` package installs
+`/usr/bin/sudo-rs` and `/usr/bin/visudo-rs`, and does **not** provide
+`/usr/bin/sudo`. `detect` probed only `/usr/bin/sudo`, so on a host whose one
+privilege tool was the stricter of the two implementations aido exists to
+support, `aido doctor` said *"no backend found — aido cannot operate on this
+machine."* Fail-closed, so not a hole; useless, though, on exactly the
+configuration the probe was written for. `BackendKind::SUDO_CANDIDATES` now lists
+both paths, `Backend` records the one it was found at, and every probe is asked
+of that path — because a probe that guesses the path interrogates a binary that
+is not installed and gets "no" to everything.
+
+**2. Every sudo-rs probe was failing for an invisible reason.** The probe
+fragment used `Defaults!AIDO_PROBE <directive>`, and sudo-rs 0.2.2 supports
+**only global `Defaults`**. Measured, one directive at a time:
+
+```
+Defaults timestamp_timeout=0        ACCEPTED
+Defaults use_pty                    ACCEPTED
+Defaults!ALIAS timestamp_timeout=0  REJECTED: unknown setting: 'ALIAS'
+Defaults:%aido timestamp_timeout=0  REJECTED: expected parameter
+Defaults>root  timestamp_timeout=0  REJECTED: expected parameter
+Defaults@ALL   timestamp_timeout=0  REJECTED: expected parameter
+Defaults !setenv                    REJECTED: unknown setting: 'setenv'
+```
+
+So the scope question and the setting question had been asked in one fragment
+that fails for two independent reasons, and nothing could tell them apart. They
+are now separate: `honours_directive` asks the global form, and
+`honours_scoped_directive` asks the scoped one.
+
+That splits out the real finding. **`PerCommandDefaults` is now a required
+capability**, because without a scope the only way to apply `timestamp_timeout=0`
+and `use_pty` is to apply them to *every sudo user on the host* — and an
+installer that silently changes unrelated sudo behaviour is doing something the
+operator did not ask for. sudo-rs 0.2.2 is therefore refused, by name, with that
+reason. It is not weaker at enforcement; it cannot scope the directives aido
+depends on.
+
+Making it required immediately broke the doas path, which was the useful part:
+doas carries its options **on the rule itself**, so it has the property more
+directly than sudo does. That proved the capability is a *property, not a
+syntax* — `Defaults!ALIAS` is one way to have it, and doas's shape is the better
+one. Both satisfy it; only sudo-rs fails.
+
+**3. Two capabilities were recorded backwards.** `sudo-rs`'s
+`visudo -c -f <file>` validates any named file (the code said it could not), and
+sudo-rs *accepts* an argument wildcard (the code said it refuses them). Both are
+now probed. The lesson is the one this crate was built around and still got
+wrong in two places: **ask the backend.**
+
+`aido install --dry-run` exists so any of this could be checked at all — the plan
+and the generated snippet had no way out of the process. It refuses without
+`--dry-run`, because a subcommand named `install` that silently did nothing would
+be worse than no subcommand. `--show-contents` prints the file. Verified with the
+real `visudo`: the generated snippet is `parsed OK`, and `/etc/sudoers` still
+parses after it is installed.
+
+**Open, not fixed:** OpenDoas reports `UNUSABLE` in the container with an empty
+version string, which means `version_banner` came back empty and the doas probes
+answered no. OpenDoas prints its banner to stderr and exits non-zero, so this is
+probably the banner read rather than a capability. Not investigated further, and
+not guessed at.
+
 ### Still not done in phase 2
 
 `aido-gate` itself, `openat2` resolution (the ancestor ownership walk it needs

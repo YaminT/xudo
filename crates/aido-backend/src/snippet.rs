@@ -320,6 +320,7 @@ mod tests {
 
     fn sudo() -> Backend {
         Backend {
+            exe: "/usr/bin/sudo".to_owned(),
             kind: BackendKind::Sudo,
             version: "Sudo version 1.9.17p2".to_owned(),
             capabilities: CapabilityMatrix::from_supported([
@@ -334,6 +335,7 @@ mod tests {
 
     fn sudo_rs() -> Backend {
         Backend {
+            exe: "/usr/bin/sudo".to_owned(),
             kind: BackendKind::SudoRs,
             version: "sudo-rs 0.2.8".to_owned(),
             capabilities: CapabilityMatrix::from_supported([
@@ -350,6 +352,7 @@ mod tests {
         let mut caps = CapabilityMatrix::from_supported([
             Capability::DisableCredentialCache,
             Capability::AllocatePty,
+            Capability::PerCommandDefaults,
             Capability::ValidateNamedFile,
         ]);
         if drop_in {
@@ -357,6 +360,7 @@ mod tests {
         }
         Backend {
             kind: BackendKind::Doas,
+            exe: "/usr/bin/doas".to_owned(),
             version: "doas (OpenDoas) 6.8.2".to_owned(),
             capabilities: caps,
         }
@@ -509,6 +513,7 @@ mod tests {
     #[test]
     fn a_backend_missing_a_required_control_gets_no_snippet_at_all() {
         let crippled = Backend {
+            exe: "/usr/bin/sudo".to_owned(),
             kind: BackendKind::Sudo,
             version: "Sudo version 0.0".to_owned(),
             capabilities: CapabilityMatrix::from_supported([Capability::AllocatePty]),
@@ -584,6 +589,7 @@ mod tests {
     #[test]
     fn a_crippled_doas_backend_gets_no_snippet() {
         let crippled = Backend {
+            exe: "/usr/bin/doas".to_owned(),
             kind: BackendKind::Doas,
             version: "doas 0.0".to_owned(),
             capabilities: CapabilityMatrix::empty(),

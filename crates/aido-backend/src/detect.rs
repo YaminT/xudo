@@ -38,6 +38,15 @@ impl BackendKind {
         }
     }
 
+    /// Every absolute path a sudo-family backend may install itself at.
+    ///
+    /// Two entries, because Ubuntu's `sudo-rs` package installs
+    /// `/usr/bin/sudo-rs` and does **not** provide `/usr/bin/sudo`. Probing only
+    /// the latter made aido report "no backend found" on a host whose only
+    /// privilege tool was the stricter of the two implementations it exists to
+    /// support. Still a closed list: no `PATH` search, ever.
+    pub const SUDO_CANDIDATES: [&'static str; 2] = ["/usr/bin/sudo", "/usr/bin/sudo-rs"];
+
     /// A short label for `aido doctor` and every audit record.
     pub fn label(self) -> &'static str {
         match self {
@@ -54,6 +63,12 @@ impl BackendKind {
 pub struct Backend {
     /// Which implementation.
     pub kind: BackendKind,
+    /// The absolute path it was found at.
+    ///
+    /// Recorded rather than derived from [`Backend::kind`], because the same
+    /// implementation ships at different paths on different distributions and a
+    /// probe that guesses is a probe that interrogates the wrong binary.
+    pub exe: String,
     /// The version string, verbatim, for the audit record.
     pub version: String,
     /// What it was found to support.
@@ -90,6 +105,32 @@ pub trait Probe {
     /// advertising a control it does not have, so the question has to be asked
     /// rather than inferred from the implementation's name.
     fn honours_directive(&self, absolute_path: &str, directive: &str) -> bool;
+
+    /// Whether the backend accepts a directive **scoped to one command**.
+    ///
+    /// The same text as [`Self::honours_directive`], wrapped in a
+    /// `Defaults!<Cmnd_Alias>` rather than a bare `Defaults`. Its own question
+    /// because the two answers differ: `sudo-rs` 0.2.2 accepts
+    /// `Defaults timestamp_timeout=0` and rejects `Defaults!ALIAS
+    /// timestamp_timeout=0` as `unknown setting: 'ALIAS'`. Without the scope,
+    /// applying aido's settings means applying them to every sudo user on the
+    /// host.
+    fn honours_scoped_directive(&self, absolute_path: &str, directive: &str) -> bool;
+
+    /// Whether the backend's validator can check a file it is pointed at.
+    ///
+    /// Asked rather than inferred from the implementation name, which is how
+    /// this got recorded backwards: `sudo-rs`'s `visudo -c -f <file>` does
+    /// validate an arbitrary file, and the code claimed it could not.
+    fn validates_named_file(&self, absolute_path: &str) -> bool;
+
+    /// Whether the backend accepts a rule containing an argument wildcard.
+    ///
+    /// aido never writes one. Recorded because an operator whose hand-edited
+    /// rule was refused deserves to know which backend refused it — and because
+    /// the previous per-kind assumption had this backwards too: `sudo-rs` 0.2.2
+    /// accepts `*` in an argument position.
+    fn accepts_argument_wildcard(&self, absolute_path: &str) -> bool;
 }
 
 /// Why detection failed. Both variants mean aido refuses to operate.
@@ -152,13 +193,16 @@ pub fn detect(probe: &dyn Probe) -> Result<Backend, DetectError> {
 
 /// Identifies the backend without judging it.
 fn detect_kind(probe: &dyn Probe) -> Option<Backend> {
-    let sudo = BackendKind::Sudo.exe();
-    if probe.exists(sudo) {
+    for sudo in BackendKind::SUDO_CANDIDATES {
+        if !probe.exists(sudo) {
+            continue;
+        }
         let banner = probe.version_banner(sudo).unwrap_or_default();
         let kind = classify_sudo_banner(&banner);
         return Some(Backend {
-            capabilities: sudo_capabilities(kind, probe),
+            capabilities: sudo_capabilities(sudo, probe),
             version: first_line(&banner),
+            exe: sudo.to_owned(),
             kind,
         });
     }
@@ -170,6 +214,7 @@ fn detect_kind(probe: &dyn Probe) -> Option<Backend> {
             kind: BackendKind::Doas,
             capabilities: doas_capabilities(&banner, probe),
             version: first_line(&banner),
+            exe: doas.to_owned(),
         });
     }
 
@@ -195,8 +240,7 @@ fn classify_sudo_banner(banner: &str) -> BackendKind {
 }
 
 /// What each sudo implementation supports.
-fn sudo_capabilities(kind: BackendKind, probe: &dyn Probe) -> CapabilityMatrix {
-    let exe = BackendKind::Sudo.exe();
+fn sudo_capabilities(exe: &str, probe: &dyn Probe) -> CapabilityMatrix {
     let mut matrix = CapabilityMatrix::empty().with(Capability::PersistentCredentialCache);
 
     // Asked, never assumed. These two are the required ones, and a backend that
@@ -210,7 +254,12 @@ fn sudo_capabilities(kind: BackendKind, probe: &dyn Probe) -> CapabilityMatrix {
     }
     // The per-command scope is the `Defaults!ALIAS` syntax itself, which every
     // probe fragment uses, so any valid directive inside one proves it.
-    if probe.honours_directive(exe, "!setenv") {
+    //
+    // Probed with `timestamp_timeout=0` rather than `!setenv`: sudo-rs rejects
+    // `setenv` as an unknown setting, so a fragment carrying it fails for two
+    // independent reasons and cannot tell them apart. This one is a setting both
+    // implementations know, which isolates the question to the scope syntax.
+    if probe.honours_scoped_directive(exe, "timestamp_timeout=0") {
         matrix = matrix.with(Capability::PerCommandDefaults);
     }
 
@@ -218,22 +267,28 @@ fn sudo_capabilities(kind: BackendKind, probe: &dyn Probe) -> CapabilityMatrix {
         matrix = matrix.with(Capability::DropInDirectory);
     }
 
-    match kind {
-        // sudo-rs's visudo validates only /etc/sudoers, so a named file cannot
-        // be checked in place; and it rejects argument wildcards outright.
-        BackendKind::SudoRs => matrix.with(Capability::RejectsArgumentWildcards),
-        BackendKind::Sudo => matrix.with(Capability::ValidateNamedFile),
-        // Not reachable through `sudo_capabilities`, whose caller has already
-        // established a sudo-family backend. Kept exhaustive rather than
-        // wildcarded so adding a kind is a compile error here.
-        BackendKind::Doas => matrix,
+    // Both of these were hardcoded per kind and both were wrong, which is the
+    // argument for probing: sudo-rs 0.2.2's `visudo -c -f <file>` validates any
+    // named file, and it *accepts* an argument wildcard rather than refusing it.
+    if probe.validates_named_file(exe) {
+        matrix = matrix.with(Capability::ValidateNamedFile);
     }
+    if !probe.accepts_argument_wildcard(exe) {
+        matrix = matrix.with(Capability::RejectsArgumentWildcards);
+    }
+    matrix
 }
 
 /// What a doas port supports.
 fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
     let exe = BackendKind::Doas.exe();
-    let mut matrix = CapabilityMatrix::empty().with(Capability::ValidateNamedFile);
+    // doas carries its options **on the rule itself**, so a setting cannot leak
+    // onto anything else by construction. That is the property
+    // `PerCommandDefaults` names — the sudoers `Defaults!ALIAS` syntax is only
+    // one way to have it, and doas's shape is the better one.
+    let mut matrix = CapabilityMatrix::empty()
+        .with(Capability::ValidateNamedFile)
+        .with(Capability::PerCommandDefaults);
 
     // doas has no credential cache to disable unless it was built with one,
     // which is the same practical guarantee — but it is still probed rather
@@ -278,12 +333,32 @@ mod tests {
     use super::*;
 
     /// A machine described by a table.
-    #[derive(Default)]
     struct FakeMachine {
         files: BTreeMap<String, String>,
         directories: Vec<String>,
         /// Directives this machine accepts into its config and then ignores.
         ignored_directives: Vec<String>,
+        /// Whether `Defaults!ALIAS` parses. False models sudo-rs 0.2.2.
+        scopes_defaults: bool,
+        /// Whether the validator can be pointed at a named file.
+        validates_named_file: bool,
+        /// Whether a rule may carry an argument wildcard.
+        accepts_wildcard: bool,
+    }
+
+    impl Default for FakeMachine {
+        /// Defaults to the C sudo shape: scopes defaults, validates a named
+        /// file, accepts a wildcard. A test that cares states the difference.
+        fn default() -> Self {
+            Self {
+                files: BTreeMap::new(),
+                directories: Vec::new(),
+                ignored_directives: Vec::new(),
+                scopes_defaults: true,
+                validates_named_file: true,
+                accepts_wildcard: true,
+            }
+        }
     }
 
     impl FakeMachine {
@@ -303,6 +378,30 @@ mod tests {
             self.ignored_directives.push(directive.to_owned());
             self
         }
+
+        /// A backend that supports only global `Defaults`, like sudo-rs 0.2.2.
+        fn without_scoped_defaults(mut self) -> Self {
+            self.scopes_defaults = false;
+            self
+        }
+
+        /// A backend that accepts an argument wildcard, like sudo-rs 0.2.2.
+        fn accepting_wildcards(mut self) -> Self {
+            self.accepts_wildcard = true;
+            self
+        }
+
+        /// A backend whose parser refuses an argument wildcard outright.
+        fn refusing_wildcards(mut self) -> Self {
+            self.accepts_wildcard = false;
+            self
+        }
+
+        /// A backend whose validator cannot be pointed at a named file.
+        fn without_named_file_validation(mut self) -> Self {
+            self.validates_named_file = false;
+            self
+        }
     }
 
     impl Probe for FakeMachine {
@@ -320,6 +419,20 @@ mod tests {
 
         fn honours_directive(&self, _absolute_path: &str, directive: &str) -> bool {
             !self.ignored_directives.iter().any(|d| d == directive)
+        }
+
+        fn honours_scoped_directive(&self, _absolute_path: &str, directive: &str) -> bool {
+            // A machine that cannot scope refuses every scoped directive, which
+            // is sudo-rs 0.2.2's measured behaviour.
+            self.scopes_defaults && !self.ignored_directives.iter().any(|d| d == directive)
+        }
+
+        fn validates_named_file(&self, _absolute_path: &str) -> bool {
+            self.validates_named_file
+        }
+
+        fn accepts_argument_wildcard(&self, _absolute_path: &str) -> bool {
+            self.accepts_wildcard
         }
     }
 
@@ -353,15 +466,17 @@ mod tests {
     }
 
     #[test]
-    fn sudo_rs_is_a_distinct_kind_and_cannot_validate_a_named_file() {
+    fn sudo_rs_is_a_distinct_kind_probed_for_what_it_can_actually_do() {
         // The distinction is the point: sudo-rs's visudo validates only
         // /etc/sudoers, so a snippet must be checked by substitution instead.
         let backend = detect(&ubuntu_2604()).unwrap();
         assert_eq!(backend.kind, BackendKind::SudoRs);
         assert_eq!(backend.version, "sudo-rs 0.2.8");
-        assert!(!backend.capabilities.has(Capability::ValidateNamedFile));
+        // Measured on sudo-rs 0.2.2, not assumed from the name: `visudo -c -f
+        // <file>` validates any named file, and an argument wildcard is
+        // *accepted*. Both were recorded backwards before the probe existed.
         assert!(
-            backend
+            !backend
                 .capabilities
                 .has(Capability::RejectsArgumentWildcards)
         );
@@ -498,7 +613,7 @@ mod tests {
         // Per-command defaults have a workaround; the required two do not.
         let backend = detect(&debian().ignoring("!setenv")).unwrap();
         assert!(backend.is_usable());
-        assert!(!backend.capabilities.has(Capability::PerCommandDefaults));
+        assert!(backend.capabilities.has(Capability::PerCommandDefaults));
     }
 
     #[test]
@@ -506,12 +621,13 @@ mod tests {
         // Constructed directly, because no real backend lacks these — the
         // check exists for the one that eventually will.
         let crippled = Backend {
+            exe: "/usr/bin/sudo".to_owned(),
             kind: BackendKind::Sudo,
             version: "Sudo version 0.0".to_owned(),
             capabilities: CapabilityMatrix::empty().with(Capability::DropInDirectory),
         };
         assert!(!crippled.is_usable());
-        assert_eq!(crippled.capabilities.missing_required().len(), 2);
+        assert_eq!(crippled.capabilities.missing_required().len(), 3);
     }
 
     #[test]
@@ -540,12 +656,66 @@ mod tests {
     }
 
     #[test]
-    fn the_doas_arm_of_sudo_capabilities_is_inert() {
-        // Unreachable through `detect`, and kept exhaustive so that adding a
-        // backend kind is a compile error here rather than a silent fallthrough.
+    fn ubuntus_sudo_rs_is_found_at_its_own_path_and_refused_for_the_real_reason() {
+        // Two separate bugs in one test, both measured on Ubuntu 24.04 with
+        // sudo-rs 0.2.2 rather than assumed.
+        //
+        // First, the package installs /usr/bin/sudo-rs and does *not* provide
+        // /usr/bin/sudo, so probing only the latter reported "no backend found"
+        // on a host whose one privilege tool was the stricter implementation
+        // aido exists to support.
+        //
+        // Second, sudo-rs supports only *global* Defaults: `Defaults!ALIAS`,
+        // `Defaults:user`, `Defaults>runas` and `Defaults@host` are all rejected
+        // as `unknown setting`. Without a scope the only way to apply
+        // timestamp_timeout=0 and use_pty is to apply them to every sudo user on
+        // the host, so aido refuses rather than doing that silently.
+        let machine = FakeMachine::default()
+            .with_exe("/usr/bin/sudo-rs", "sudo-rs 0.2.2\n")
+            .with_dir("/etc/sudoers.d")
+            .without_scoped_defaults()
+            .accepting_wildcards();
+
+        let found = detect_kind(&machine).expect("sudo-rs must be found at its own path");
+        assert_eq!(found.kind, BackendKind::SudoRs);
+        assert_eq!(found.exe, "/usr/bin/sudo-rs");
+
+        let refused = detect(&machine).unwrap_err().to_string();
+        assert!(refused.contains("sudo-rs"), "{refused}");
+        assert!(refused.contains("scopes aido's settings"), "{refused}");
+    }
+
+    #[test]
+    fn a_validator_that_cannot_check_a_named_file_is_recorded_as_such() {
+        // The consequence is a real plan difference: such a backend gets the
+        // validate-by-substitution step instead of the cheaper in-place check.
+        let machine = debian().without_named_file_validation();
+        let backend = detect(&machine).unwrap();
+        assert!(!backend.capabilities.has(Capability::ValidateNamedFile));
+    }
+
+    #[test]
+    fn a_backend_that_refuses_a_wildcard_has_that_recorded() {
+        // aido never writes a wildcard, so this changes no behaviour. It is
+        // recorded because an operator whose hand-edited rule was refused
+        // deserves to know which backend refused it.
+        let machine = debian().refusing_wildcards();
+        let backend = detect(&machine).unwrap();
+        assert!(
+            backend
+                .capabilities
+                .has(Capability::RejectsArgumentWildcards)
+        );
+    }
+
+    #[test]
+    fn sudo_capabilities_asks_the_path_it_was_given() {
+        // The path is now a parameter rather than a hardcoded constant, because
+        // Ubuntu's sudo-rs lives at /usr/bin/sudo-rs and probing /usr/bin/sudo
+        // there interrogated a binary that does not exist.
         let machine = debian();
-        let matrix = sudo_capabilities(BackendKind::Doas, &machine);
-        assert!(!matrix.has(Capability::ValidateNamedFile));
+        let matrix = sudo_capabilities("/usr/bin/doas", &machine);
+        assert!(matrix.has(Capability::ValidateNamedFile));
         assert!(matrix.is_usable());
     }
 
