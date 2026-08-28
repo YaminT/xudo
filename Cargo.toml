@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/aido-audit",
   "crates/aido-backend",
   "crates/aido-config",
   "crates/aido-policy",

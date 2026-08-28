@@ -4,6 +4,122 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-08-28 — phase 2, part two: probing verified on Linux, and the audit crate
+
+### Verified on a real kernel for the first time
+
+```
+$ ssh yamin.lol '/tmp/aido-test --rules /tmp/aido-rules doctor'
+platform     linux
+hints        4 recorded, 0 trusted
+backend      sudo (Sudo version 1.9.15p5)
+backend caps 6 of 7 supported
+             absent: rejects argument wildcards
+```
+
+`platform linux` and four collected hints mean `aido-sys`'s `/proc` ancestry walk
+and hint collection ran against a real kernel rather than a fixture tree. The
+backend line means the probe genuinely asked `sudo`.
+
+**Toolchain.** `cargo-zigbuild` cross-compiles a 2.1 MB static musl binary on the
+Mac, so nothing needs installing on yamin.lol — which is the answer to its 3.3 GB
+of free disk and 3 GB of RAM. `brew install zig` plus `cargo install
+cargo-zigbuild`; the target was already in `rust-toolchain.toml`.
+
+### The probe is functional, not a version check
+
+This is the piece that turns `aido doctor` from UNUSABLE into a real answer, and
+the technique matters more than the code.
+
+`sudo-rs` accepts directives it has not implemented and silently ignores them. So
+asking "does this backend honour `timestamp_timeout=0`?" cannot be answered by
+reading a version number. The probe feeds a minimal sudoers fragment to the
+backend's **own parser** and reads the exit status:
+
+```
+$ printf 'Defaults!T timestamp_timeout=0\n...' | visudo -cf /dev/stdin ; echo $?
+/dev/stdin: parsed OK
+0
+$ printf 'Defaults!T nope_not_real=1\n...'     | visudo -cf /dev/stdin ; echo $?
+/dev/stdin:1:26: unknown defaults entry "nope_not_real"
+1
+```
+
+Three decisions inside that:
+
+- **Through `/dev/stdin`, not a temp file.** A predictable path in a
+  world-writable directory is a symlink race; this way there is no path to race.
+  Verified on the host before writing any code.
+- **The fragment grants nothing.** It names `/bin/true` with no arguments, so even
+  if it were somehow installed it would authorise a no-op. A test asserts the
+  fragment can never contain a `NOPASSWD`.
+- **The caller passes the exact directive text, value included.** My first
+  version passed the bare option name, and `timestamp_timeout` without a value is
+  a syntax error — so the probe reported the control missing on a backend that
+  honours it perfectly. Caught by running it on the host, not by a test.
+
+Only `/usr/bin/sudo` and `/usr/bin/doas` are ever interrogated. Anything else
+answers `false`, so a caller cannot substitute a cooperative "backend" that
+agrees to everything.
+
+### Platform-dependent coverage arrived, and was designed around rather than waived
+
+Predicted for M2b and it happened immediately: the `doas` branches cannot execute
+on macOS. Rather than accept a platform-specific hole, the process runner went
+behind a `Runner` trait with a fake, so every *decision* built on a probe result —
+which directive text to send, how to read a refusal, which paths to interrogate —
+is covered on any platform.
+
+What is left is `crates/aido-sys/src/exec/host.rs`: the actual `fork` and pipe
+plumbing, whose failure paths need the kernel to fail a read on a descriptor we
+own. That one file is excluded by regex, recorded in the `justfile` beside the two
+package exclusions. Coverage is still 100% with **no line-level waivers**.
+
+### `crates/aido-audit` — built before the gate, deliberately
+
+A gate that executes before there is a record of what it executed is a gate whose
+first incident is unreconstructable. Pure: it builds records, chains them, and
+verifies a chain; it does not open a file or talk to journald.
+
+The chain detects an edit, a deletion, a reordering, and a **front truncation** —
+that last one matters because without the check, dropping the first N records
+produces a log that verifies cleanly and hides everything before it. Two subtler
+properties are tested:
+
+- **Resealing an edited record does not help.** Fix a record's own hash and the
+  break simply moves one position later, to the record whose `prev_hash` no longer
+  matches.
+- **Hash fields are length-prefixed**, so text cannot be moved across a field
+  boundary to produce the same digest — the classic concatenation ambiguity where
+  `("ab","c")` and `("a","bc")` hash alike.
+
+And the limits are written into the crate docs rather than left to be inferred:
+this is **not a signature**. An attacker with write access can truncate the log
+and rebuild a consistent chain from any point, because the hash input is entirely
+in the log. Detecting that needs an off-box copy or a key the attacker does not
+hold, both later work. An audit log people over-trust is worse than one whose
+limits are stated.
+
+Rendering is **infallible by construction**: a writer that can refuse to render
+loses the record it was about to write. If serialization ever failed, the fallback
+line still carries the sequence and hash, so the chain stays verifiable across the
+gap.
+
+### Still not done in phase 2
+
+`aido-gate` itself, `openat2` resolution with the ancestor ownership walk,
+`execveat`, executing the install plan, and the journald sink. `aido doctor` still
+reports `exec path absent in this build`, and that remains accurate.
+
+Also: **the answers I asked for in `re.md` did not land.** The file was unchanged
+and git was clean; the edit was probably made to the root `re.md` in the window
+before it moved to `docs/`. I proceeded on the two defaults that file already
+stated — cross-compile rather than free disk, and containers rather than the
+host's own `/etc/sudoers.d`. Neither has been exercised yet, because there is no
+install path to exercise.
+
+---
+
 ## 2026-08-28 — decisions answered, two blockers fixed, host surveyed
 
 ### Decisions, now settled

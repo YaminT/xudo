@@ -27,6 +27,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aido-audit"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "aido-backend"
 version = "0.0.1"
 dependencies = [
