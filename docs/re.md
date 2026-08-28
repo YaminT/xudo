@@ -2,51 +2,53 @@
 
 Only things that stop work. Full inventory in `todo/` and `CONCERNS.md`.
 
+## One blocker
+
+**Root on `49.13.25.232`.** You said I may write `/etc/sudoers.d` there. I cannot:
+`batman` is in the `sudo` group but every `sudo` call wants a password I do not
+have, `/etc/sudoers.d` is unreadable, there is no `docker` or `podman`, and user
+namespaces are disabled (`unshare --user` → `Operation not permitted`), so there
+is no unprivileged fallback either.
+
+Any one of these unblocks it. Run it yourself with `! <command>`:
+
+```sh
+# simplest: let this one account run without a password
+echo 'batman ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/batman-nopasswd
+sudo chmod 0440 /etc/sudoers.d/batman-nopasswd
+
+# or install a container runtime, which also gives the sudo/sudo-rs/doas matrix
+sudo apt-get install -y podman
+
+# or just tell me the password for batman
+```
+
+Blocks: executing the install plan, `aido-gate`, and the differential compliance
+matrix — everything left in phase 2.
+
 ## Answered — closed
 
-1. **Linux environment.** `yamin@yamin.lol` reachable. Ubuntu 24.04.4, kernel
-   6.8.0, sudo 1.9.15p5, Docker 29.5.1 usable unprivileged, cgroup v2, `sudo-rs
-   0.2.2` in apt. Plan in `CONCERNS.md`. Two caveats below.
-2. **`ido add` collision** — decided: `ido add` writes `AGENTS.md`, `ido queue`
-   buffers a command.
-3. **Packaging** — one package. `ido` ships with `aido` and is not separately
-   installable.
-4. **Distribution** — signed `.deb` on GitHub Releases. No apt repo yet.
-5. **Queue file** — `$XDG_STATE_HOME`, as already implemented.
-6. **`CLAUDE.md` stale guidance** — fixed.
-7. **`aido-config` not wired to the engine** — fixed. A settings file now changes
-   a decision, and a broken one fails closed on the deciding path too.
+- **Host.** Moved to `batman@49.13.25.232` (Ubuntu 24.04.3, kernel 6.8.0-90,
+  4 CPUs, 7.6 GB RAM, 57 GB free). The old disk pressure is gone. Still
+  cross-compiling from the Mac with `cargo-zigbuild` — a 2.1 MB static musl
+  binary, no toolchain on the host, and it already runs there.
+- **Kernel 5.** Done. Attestation is a ladder, not a floor: 6.13 / 6.5 / 5.3 /
+  older, reported by `doctor`. 5.4, 5.10 and 5.14 all keep the agent path.
+  `SO_PEERCRED` alone does **not** — a pid can be recycled, so it withholds
+  passwordless operation rather than authorising a race. `openat2` degrades to a
+  per-component `O_NOFOLLOW` walk and loses nothing. Written up in `CONCERNS.md`.
+- **`ido add` collision** — `ido add` writes `AGENTS.md`, `ido queue` buffers.
+- **Packaging** — one package; `ido` is not separately installable.
+- **Distribution** — signed `.deb` on GitHub Releases, no apt repo yet.
+- **Queue file** — `$XDG_STATE_HOME`.
+- **`CLAUDE.md` stale guidance**, **`aido-config` not wired to the engine** —
+  both fixed.
 
-## Still blocking
+## macOS
 
-**A. Disk and RAM on yamin.lol.** 3.3 GB free of 38 GB (91% used), 3 GB RAM with
-~0 available. A Rust toolchain plus target dir is 2–4 GB, and containers for the
-distro matrix need more. Either free ~10 GB, or confirm the alternative:
-cross-compile on the Mac and ship only the binary over. I will take the
-cross-compile route unless you free space.
-
-   switch to ssh batman@49.13.25.232
-
-**B. Whether I may write `/etc/sudoers.d` on yamin.lol.** Blocks M2b's install
-path. My plan avoids it: run privileged tests in Docker containers on that host,
-which also gives the sudo / sudo-rs / doas matrix. Say so if you want it on the
-host itself.
-
-YOu can write here.
-
-**C. `PIDFD_GET_INFO` needs kernel 6.13; yamin.lol has 6.8.** `SO_PEERPIDFD`
-works. Not a blocker — the `SO_PEERCRED` + `(pid, starttime)` fallback exists for
-this — but it means the primary attestation path cannot be tested there. A
-newer-kernel container will not help; this needs a VM or a newer host eventually.
-
-Make sure that it does support kernel v5 too.
-
-## macOS support
-
-You asked. Short answer: **partial is easy, full is not possible as designed.**
-`aido explain`/`check`/`list`/`config` already work. The human path could work —
-macOS has `sudo` and `/etc/sudoers.d`. The **agent path cannot**: it rests on a
-root-created cgroup scope under `aido.slice`, and macOS has no cgroups, no
-`/proc`, no `openat2`, no `execveat`, no pidfds. Attesting a caller there needs a
-different mechanism entirely (Endpoint Security, or audit tokens over XPC), which
-is its own design. Planned, not built. Written up in `CONCERNS.md`.
+Partial is easy and already works (`explain`, `check`, `list`, `config`, `audit`).
+The human path could work: macOS has `sudo` and `/etc/sudoers.d`. The **agent
+path cannot** — it rests on a root-created cgroup scope, and macOS has no
+cgroups, no `/proc`, no `openat2`, no `execveat`, no pidfds. Attesting a caller
+there needs Endpoint Security or audit tokens over XPC, which is its own design.
+Planned, not built.
