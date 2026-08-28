@@ -107,4 +107,4 @@ real bug in argv canonicalization on its first run; the story is in
 
 ## Licence
 
-Apache-2.0 OR MIT.
+Apache-2.0. See [LICENSE](LICENSE).
