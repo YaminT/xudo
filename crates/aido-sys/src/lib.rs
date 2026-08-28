@@ -40,6 +40,7 @@ pub mod probe;
 pub mod proc;
 pub mod provenance;
 pub mod source;
+pub mod trust;
 
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
@@ -48,6 +49,7 @@ pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints};
 pub use source::{DirSource, MapSource, ProcSource};
+pub use trust::{PathFacts, TrustError, verify_path};
 
 // Re-exported so a consumer does not need to depend on aido-policy just to
 // name the types this crate returns.

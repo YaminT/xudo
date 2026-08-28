@@ -137,9 +137,55 @@ bind the message before asserting. That is the project rule working as intended 
 prefer deleting an unreachable branch to waiving it — and it left 100% with no
 line-level waivers.
 
+### `aido-sys/trust.rs` — the precondition every other guarantee rests on
+
+The policy engine is a pure function of the ruleset. So whoever can edit the
+ruleset decides what an agent may run, and checking the file's own owner and mode
+is not enough:
+
+- A **symlink** anywhere on the path redirects the load. `/etc/aido` owned by root
+  but *reachable* through a directory a user can write is a directory a user can
+  replace.
+- A **writable ancestor** is the same attack one level up. If `/etc/aido` is
+  immaculate but `/etc` is group-writable, that group renames `aido` aside and
+  puts its own there. Nothing about the final file looks wrong afterwards.
+- A **group- or world-writable** file needs no attack at all.
+
+So the check walks from `/` down to the target and demands all three of every
+component. Four details are deliberate:
+
+- **A symlink is refused, not followed.** Following it means the path that was
+  checked and the path that gets read are different paths, which is the entire
+  trick. Kind is checked *before* uid, and a separate test asserts a root-owned
+  symlink is still refused, so nobody reorders it as an optimisation.
+- **`.` and `..` are refused rather than normalised**, for the same reason.
+  `Path::components` silently drops `.`, so that one is caught on the raw bytes
+  before `components()` is consulted; `..` survives and is refused there.
+- **The outermost failure is the one reported.** Fixing the inner problem while
+  the outer one stands fixes nothing, and an error naming the rule file sends an
+  operator to inspect the wrong thing.
+- **The sticky and setuid bits are ignored.** Only `0o022` matters. Refusing
+  `1755` would reject paths that are perfectly safe to read through.
+
+`doctor` now prints a `rules trust` line, and in a development checkout it reads
+`UNTRUSTED: … is owned by uid 501, not root`, which is the honest answer. It
+**reports** rather than enforces on purpose: the enforcement point is the
+executor, and a check the unprivileged front-end "passes" is a check an attacker
+races — nothing stops the ruleset changing between that stat and a later read.
+
+Two coverage notes worth keeping, both the same lesson as the audit crate. A
+`let … else { return None }` leaves a region llvm-cov never marks covered even
+when the branch runs, because the diverging value is its own region; moving the
+refusal into a small helper returning `Option` fixed it. And `Kind::Other` was
+dead until a test made a **real** socket with `UnixListener::bind` — dead code in
+a trust check is a branch nobody has ever seen behave, so it was worth the four
+lines rather than a waiver.
+
 ### Still not done in phase 2
 
-`aido-gate` itself, `openat2` resolution with the ancestor ownership walk,
+`aido-gate` itself, `openat2` resolution (the ancestor ownership walk it needs
+now exists in `trust.rs`, but `openat2`'s `RESOLVE_NO_SYMLINKS` is what closes the
+race between checking and opening),
 `execveat`, executing the install plan, and the journald sink. `aido doctor` still
 reports `exec path absent in this build`, and that remains accurate.
 

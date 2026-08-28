@@ -215,6 +215,17 @@ pub fn run_with(
     }
 }
 
+/// One line saying whether the ruleset path belongs to root.
+///
+/// A development checkout is expected to fail this, so the wording says which
+/// situation it is rather than printing a bare FAIL an operator has to decode.
+fn trust_line(rules: &Path) -> String {
+    match aido_sys::verify_path(rules) {
+        Ok(()) => "root-owned, no writable component".to_owned(),
+        Err(source) => format!("UNTRUSTED: {source}"),
+    }
+}
+
 /// Verifies the audit log, naming the first position that does not hold.
 ///
 /// Reads only; it cannot repair a log, because a tool that can rewrite the
@@ -482,6 +493,12 @@ fn doctor(
             );
         }
     }
+
+    // Reported here rather than enforced here. `doctor` is diagnostic, and the
+    // enforcement point is the executor, which does not exist yet — a check the
+    // front-end could "pass" would be a check an attacker races against, since
+    // nothing stops the ruleset changing between this stat and a later read.
+    let _ = writeln!(out, "rules trust  {}", trust_line(&cli.rules));
 
     match ops.classify(std::process::id()) {
         Ok(facts) => {
@@ -773,6 +790,28 @@ mod tests {
                 String::from_utf8_lossy(&err).into_owned(),
             )
         }
+    }
+
+    #[test]
+    fn doctor_reports_the_ruleset_as_untrusted_in_a_checkout() {
+        // A development checkout is owned by the developer, not root, so the
+        // honest answer is UNTRUSTED. A doctor that said otherwise here would
+        // be telling operators the check works when it does not.
+        let fx = fixture("cli-doctor-trust");
+        let (code, out, _) = fx.run(&["doctor"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("rules trust  UNTRUSTED"), "{out}");
+    }
+
+    #[test]
+    fn the_trust_line_reports_a_root_owned_path_as_trusted() {
+        // Not a claim about aido's own directory: a claim that the line can say
+        // yes at all, so a bug that always refuses cannot hide behind the test
+        // above.
+        assert_eq!(
+            trust_line(Path::new("/")),
+            "root-owned, no writable component"
+        );
     }
 
     #[test]
