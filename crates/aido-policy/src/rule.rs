@@ -157,7 +157,10 @@ pub enum ConfirmPolicy {
 
 /// A single allowlisted action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Keys are kebab-case, the vocabulary every other rule-file construct uses
+// (`one-of`, `int-range`, `path-under`). `rename_all` rather than a `rename` per
+// field so a field added later cannot reintroduce a snake_case key.
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Action {
     /// The action's stable id.
     pub id: ActionId,
@@ -589,6 +592,36 @@ mod tests {
     }
 
     #[test]
+    fn denies_the_snake_case_spelling_of_a_human_only_rule() {
+        // The keys are kebab-case; `deny_unknown_fields` makes the old spelling
+        // a hard parse failure rather than a silently ignored directive. That is
+        // the point: `agent_allowed = false` quietly dropped would publish a
+        // human-only action to agents.
+        let snake = toml::from_str::<Action>(
+            r#"
+            id = "aido.svc.stop"
+            tier = "svc-control"
+            exe = "/usr/bin/systemctl"
+            agent_allowed = false
+            "#,
+        );
+        assert!(snake.is_err(), "a snake_case key must not parse");
+
+        let kebab = toml::from_str::<Action>(
+            r#"
+            id = "aido.svc.stop"
+            tier = "svc-control"
+            exe = "/usr/bin/systemctl"
+            agent-allowed = false
+            env-allow = ["TERM"]
+            "#,
+        )
+        .unwrap();
+        assert!(!kebab.agent_allowed);
+        assert_eq!(kebab.env_allow, ["TERM"]);
+    }
+
+    #[test]
     fn actions_load_from_toml_with_defaults() {
         let parsed: Action = toml::from_str(
             r#"
@@ -603,7 +636,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.confirm, ConfirmPolicy::Default);
-        assert!(parsed.agent_allowed, "agent_allowed must default to true");
+        assert!(parsed.agent_allowed, "agent-allowed must default to true");
         assert!(parsed.env_allow.is_empty());
         assert_eq!(parsed.args.len(), 1);
         // Provenance is the loader's to assign, so a bare Action carries the

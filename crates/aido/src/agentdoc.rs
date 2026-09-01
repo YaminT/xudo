@@ -142,7 +142,7 @@ args = [{ name = "pkg", matcher = { name = "deb-name" } }]
 id = "aido.mount"
 tier = "critical"
 exe = "/usr/bin/mount"
-agent_allowed = false
+agent-allowed = false
 args = [{ name = "t", matcher = { literal = "/mnt" } }]
 "#,
         )

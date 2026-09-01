@@ -400,7 +400,7 @@ args = [
 id = "aido.human.only"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
-agent_allowed = false
+agent-allowed = false
 args = [
   { name = "verb", matcher = { literal = "stop" } },
   { name = "unit", matcher = { name = "unit-name" } },

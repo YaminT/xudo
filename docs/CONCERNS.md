@@ -40,20 +40,31 @@ shape of a bypass, not a typo).
 Neither is exploitable. Both are the kind of wrongness that misleads the next
 reader, which in a privilege broker is its own cost.
 
-1. **`aido-policy/src/decision.rs` claims exit codes 17, 18 and 19 "sit above
+1. **`aido-policy/src/decision.rs` claimed exit codes 17, 18 and 19 "sit above
    the range shells use for signals so they cannot be confused with a killed
-   child".** That is backwards. The shell convention is `128 + signal`, which is
-   129–192 — *above* aido's codes, not below. The codes are still fine (they sit
-   below 128 and outside the 0–2 band most tools use), but the stated reason is
-   false and should be rewritten to say what is actually true: they are reserved
-   values below the signal range that no allowlisted program is expected to
-   return.
-2. **`Action`'s TOML keys `agent_allowed` and `env_allow` are snake_case, while
+   child".** Backwards: the shell convention is `128 + signal`, i.e. 129–192,
+   which is *above* aido's codes. The codes themselves are fine — above the
+   `0`/`1`/`2` band a program uses for its own failures and below 128 — so the
+   fix is the sentence, not the numbers. **Fixed**, along with the test that
+   encoded the same error in its name and asserted only `> 16`; it now pins both
+   bounds and is called
+   `a_refusal_cannot_be_read_as_a_child_that_ran_or_was_killed`.
+2. **`Action`'s TOML keys `agent_allowed` and `env_allow` were snake_case, while
    `CLAUDE.md` states "the vocabulary is kebab-case throughout"** (`one-of`,
    `int-range`, `path-under`, `deb-name`, `unit-name`). No shipped rule file
-   under `rules/` uses either key, so renaming them to `agent-allowed` and
-   `env-allow` is free **today** and stops being free the moment an operator
-   writes a rule file against the current spelling.
+   under `rules/` used either key, so the rename was free that day and would not
+   have been free once an operator wrote a rule file against the old spelling.
+   **Fixed** with `rename_all = "kebab-case"` on the struct rather than a
+   `rename` per field, so a field added later cannot reintroduce a snake_case
+   key. With `deny_unknown_fields` the old spelling is now a hard parse failure,
+   which is the whole point — `agent_allowed = false` silently ignored would
+   publish a human-only action to agents. Pinned by
+   `denies_the_snake_case_spelling_of_a_human_only_rule`.
+
+   Note for whoever reads this next: the JSON envelopes (`Decision`, `Record`,
+   `PendingRequest`) are snake_case **deliberately**, and so are the keys in
+   `aido-config`'s settings file. Kebab-case is the *rule-file* vocabulary, not a
+   workspace-wide serialization style. Do not "fix" the others to match.
 
 ### A `matches!` with one arm is an uncovered region
 

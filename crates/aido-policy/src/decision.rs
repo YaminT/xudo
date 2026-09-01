@@ -209,8 +209,12 @@ pub enum ExitCode {
 impl ExitCode {
     /// The numeric exit status.
     ///
-    /// `17`, `18`, and `19` sit above the range shells use for signals so they
-    /// cannot be confused with a killed child.
+    /// `17`, `18` and `19` are reserved values chosen to collide with nothing a
+    /// caller already reads: above the `0`/`1`/`2` band a program uses for its
+    /// own failures, and below `128`, where the shell convention for a killed
+    /// child (`128 + signal`, so `129`–`192`) begins. A refusal by `aido` is
+    /// therefore distinguishable from both a command that ran and failed and a
+    /// command that was killed.
     pub fn as_i32(self) -> i32 {
         match self {
             Self::Delegated => 0,
@@ -412,13 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_sit_above_the_signal_range() {
+    fn a_refusal_cannot_be_read_as_a_child_that_ran_or_was_killed() {
         assert_eq!(ExitCode::Delegated.as_i32(), 0);
         for code in [ExitCode::Denied, ExitCode::NotConfirmed, ExitCode::Unusable] {
-            assert!(
-                code.as_i32() > 16,
-                "{code:?} could be mistaken for a signal"
-            );
+            let status = code.as_i32();
+            assert!(status > 2, "{code:?} reads as a program's own failure");
+            // 128 + signal is the shell convention for a killed child, so the
+            // signal range is *above* these codes, not below them.
+            assert!(status < 128, "{code:?} could be mistaken for a signal");
         }
         let json = serde_json::to_string(&ExitCode::Denied).unwrap();
         assert_eq!(
