@@ -2,41 +2,38 @@
 
 Only things that stop work. Full inventory in `todo/` and `CONCERNS.md`.
 
-## One blocker
+## None
 
-**Root on `49.13.25.232`.** You said I may write `/etc/sudoers.d` there. I cannot:
-`batman` is in the `sudo` group but every `sudo` call wants a password I do not
-have, `/etc/sudoers.d` is unreadable, there is no `docker` or `podman`, and user
-namespaces are disabled (`unshare --user` → `Operation not permitted`), so there
-is no unprivileged fallback either.
+Nothing stops phase 2 today.
 
-Any one of these unblocks it. Run it yourself with `! <command>`:
+The last blocker — a host where I can be root — is resolved by Docker on
+`yamin@yamin.lol`: `docker run` there gives uid 0 in a container, which is
+enough to write `/etc/sudoers.d`, execute the install plan, and run the
+sudo / sudo-rs / OpenDoas matrix.
 
-```sh
-# simplest: let this one account run without a password
-echo 'batman ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/batman-nopasswd
-sudo chmod 0440 /etc/sudoers.d/batman-nopasswd
+The `rustix` question is not a blocker either. `openat2` and `execveat` have no
+`std` wrapper, but `rustix` exposes both through a **safe** API, so
+`#![forbid(unsafe_code)]` stays intact workspace-wide and no waiver is needed.
+`docs/design-plan.md` already names `rustix` as the syscall dependency.
 
-# or install a container runtime, which also gives the sudo/sudo-rs/doas matrix
-sudo apt-get install -y podman
+## One correction, for the record
 
-# or just tell me the password for batman
-```
-
-Blocks: executing the install plan, `aido-gate`, and the differential compliance
-matrix — everything left in phase 2.
+`49.13.25.232` still has **no podman** (`podman: command not found`, checked
+2026-08-31), and its `sudo` still wants a password I do not have. It is
+therefore a build-and-run host only, not a privileged test host. Nothing needs
+it — the matrix lives on `yamin.lol`. If you want the bigger host in the matrix
+later, `sudo apt-get install -y podman` there is all it takes.
 
 ## Answered — closed
 
-- **Host.** Moved to `batman@49.13.25.232` (Ubuntu 24.04.3, kernel 6.8.0-90,
-  4 CPUs, 7.6 GB RAM, 57 GB free). The old disk pressure is gone. Still
-  cross-compiling from the Mac with `cargo-zigbuild` — a 2.1 MB static musl
-  binary, no toolchain on the host, and it already runs there.
+- **Host.** Build/run on `batman@49.13.25.232` (Ubuntu 24.04.3, kernel 6.8.0-90).
+  Privileged tests in Docker on `yamin@yamin.lol`. Cross-compiled from the Mac
+  with `cargo-zigbuild`: a 2.1 MB static musl binary, no toolchain on the host.
 - **Kernel 5.** Done. Attestation is a ladder, not a floor: 6.13 / 6.5 / 5.3 /
   older, reported by `doctor`. 5.4, 5.10 and 5.14 all keep the agent path.
   `SO_PEERCRED` alone does **not** — a pid can be recycled, so it withholds
   passwordless operation rather than authorising a race. `openat2` degrades to a
-  per-component `O_NOFOLLOW` walk and loses nothing. Written up in `CONCERNS.md`.
+  per-component `O_NOFOLLOW` walk and loses nothing.
 - **`ido add` collision** — `ido add` writes `AGENTS.md`, `ido queue` buffers.
 - **Packaging** — one package; `ido` is not separately installable.
 - **Distribution** — signed `.deb` on GitHub Releases, no apt repo yet.

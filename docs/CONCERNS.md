@@ -4,6 +4,100 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-09-01 — phase 2, part three: the gate decides for itself
+
+### `aido-gate` is the second policy engine, and it reads the ruleset itself
+
+The gate is reached through `sudo` with **no arguments**, so it is written to
+one assumption: a hostile local user in the `aido` group runs it right now, with
+an empty argv, a hand-built environment, and a spool entry they wrote
+themselves. Four pure modules — `request` (is this a live entry from *this*
+caller?), `decide` (does root's ruleset permit it?), `env` (a constant child
+environment, nothing inherited), `status` (report the child's fate unsoftened).
+
+One design change happened while writing it, and it matters more than it looks.
+`decide()` originally read the authorized program and the rule provenance off
+the `Decision` the engine returned, where both are `Option`. That left an arm no
+test could reach — a permitted decision always carries them — and per this
+project's own rule ("prefer deleting an unreachable branch to waiving it") the
+fix was to restructure rather than waive. `decide()` now does its own
+`rules.get(&action_id)` **before** evaluating, so:
+
+- the `None` arm is reachable and tested (`unknown_action`), and
+- the program that gets exec'd comes from the ruleset the gate loaded, not from
+  a field on a decision object. That is what "second independent policy engine"
+  is supposed to mean, and the first version quietly was not it.
+
+Three refusals exist only in the gate: no pending request, an unconfirmed action
+under a confirming rule (`gate_confirmation_missing` — invariant 3 forbids the
+gate reading an approval from a terminal in the requester's process tree, so it
+refuses instead of prompting), and a program that is not the rule's program
+(`exe_mismatch`, kept distinct from an argument complaint because it is the
+shape of a bypass, not a typo).
+
+### Two documentation defects found in already-committed code
+
+Neither is exploitable. Both are the kind of wrongness that misleads the next
+reader, which in a privilege broker is its own cost.
+
+1. **`aido-policy/src/decision.rs` claims exit codes 17, 18 and 19 "sit above
+   the range shells use for signals so they cannot be confused with a killed
+   child".** That is backwards. The shell convention is `128 + signal`, which is
+   129–192 — *above* aido's codes, not below. The codes are still fine (they sit
+   below 128 and outside the 0–2 band most tools use), but the stated reason is
+   false and should be rewritten to say what is actually true: they are reserved
+   values below the signal range that no allowlisted program is expected to
+   return.
+2. **`Action`'s TOML keys `agent_allowed` and `env_allow` are snake_case, while
+   `CLAUDE.md` states "the vocabulary is kebab-case throughout"** (`one-of`,
+   `int-range`, `path-under`, `deb-name`, `unit-name`). No shipped rule file
+   under `rules/` uses either key, so renaming them to `agent-allowed` and
+   `env-allow` is free **today** and stops being free the moment an operator
+   writes a rule file against the current spelling.
+
+### A `matches!` with one arm is an uncovered region
+
+Worth writing down because it cost time twice. `assert!(matches!(x, Pat))` in a
+test expands to a `match` whose `_ => false` arm never runs, and `llvm-cov`
+counts it. Same for `let Pat = x else { panic!() }` — the panic arm is dead by
+construction if the test passes. Both patterns read as normal test code and both
+put the crate under 100%.
+
+The fix that keeps the assertion honest is a small helper returning `Option`,
+called with a matching *and* a non-matching value, so both arms execute and the
+test asserts something extra while it is there — `refused_decision()` in
+`decide.rs` and `malformed_reason()` in `request.rs`. Where a variant is
+identified by a stable string code, comparing the code is simpler still, since
+codes are one-to-one with variants.
+
+`PendingRequest::to_json` got the treatment `Record::to_jsonl` already had: the
+`{}` fallback is a value handed to a free function, not a closure, so a test can
+hand it a genuine `serde_json` error and exercise the arm.
+
+### `cargo deny` rejects a path dependency with no version
+
+A new crate declaring `aido-policy = { path = "../aido-policy" }` fails
+`cargo deny check bans` as a **wildcard dependency**, which is not obvious from
+the error's wording. Every in-workspace dependency needs
+`{ path = "...", version = "0.0.1" }`, exactly as the older crates already do.
+
+### The Mac's Rust toolchain was broken, and I repaired it
+
+Not a project concern, but it happened inside this repo and the next person on
+this machine should know. `cargo` was not on `PATH` at all: `~/.cargo/bin` held
+only cargo *subcommands* (no `cargo` proxy), and `/opt/homebrew/bin` had only
+`rustup`. Symlinking homebrew's `rustup` as `cargo` does not work — it resolves
+its proxy identity from its real path, not `argv[0]`, so it prints its own
+version banner.
+
+What works, and what is now in place: symlinks in `~/.local/bin` (already on
+`PATH`) pointing at the real per-tool wrappers in
+`/opt/homebrew/Cellar/rustup/1.29.0_2/bin/` — `cargo`, `rustc`, `rustdoc`,
+`rustfmt`, `cargo-fmt`, `cargo-clippy`, `clippy-driver`, `cargo-miri`. A
+homebrew upgrade of rustup will move that Cellar path and break the symlinks;
+the honest long-term fix is a rustup-managed install owning `~/.cargo/bin`.
+
+
 ## 2026-08-28 — phase 2, part two: probing verified on Linux, and the audit crate
 
 ### Verified on a real kernel for the first time
