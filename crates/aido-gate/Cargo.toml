@@ -1,0 +1,19 @@
+[package]
+name = "aido-gate"
+description = "The privileged gate's decision core: a second, independent policy engine that assumes a hostile local user invoked it directly. Pure — no syscalls, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
+aido-policy = { path = "../aido-policy", version = "0.0.1" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -65,6 +65,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aido-gate"
+version = "0.0.1"
+dependencies = [
+ "aido-audit",
+ "aido-policy",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aido-policy"
 version = "0.0.1"
 dependencies = [
