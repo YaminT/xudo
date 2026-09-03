@@ -1,0 +1,26 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "frozen",
+  "remediation": "an administrator froze the agent path; the human path still works, so hand this action to a person",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": null,
+  "resolved_argv": [
+    "restart",
+    "nginx.service"
+  ],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "restart nginx.service",
+        "after": "restart nginx.service"
+      }
+    }
+  ]
+}

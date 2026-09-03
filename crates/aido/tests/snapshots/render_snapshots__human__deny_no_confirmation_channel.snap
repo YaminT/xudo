@@ -1,0 +1,10 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    no_confirmation_channel
+
+  trace
+
+  next      this action needs human approval and no channel is live; ask the operator to run `aido watch` in a terminal they control

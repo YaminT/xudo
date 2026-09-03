@@ -4,6 +4,61 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-09-03 — every rendered decision is now a snapshot
+
+### The commit-rule debt is paid
+
+`CLAUDE.md` has required snapshot tests of every decision record and every
+confirmation-prompt string since M1, flagged *(Still unwritten)* once the
+blocker (no renderer) was gone. They exist now, in two files:
+
+- **`aido-policy/tests/contract_snapshots.rs`** pins the strings a caller acts
+  on independent of any renderer: the denial-code wire contract (numeric code,
+  string code, remediation — all three append-only) and every
+  `ConfirmReason::explain()` prompt sentence.
+- **`aido/tests/render_snapshots.rs`** pins every verdict shape through both
+  rendered surfaces, `render::human` and `render::json`: the allow, all three
+  confirmation reasons, and all eight denial codes — 24 snapshots.
+
+Both are **exhaustive by construction**, not by discipline: each file carries a
+wildcard-free `match` over the enum, so adding a `DenialCode` or a
+`ConfirmReason` is a compile failure until it has a fixture, and a fixture is a
+snapshot. The fixtures produce each decision the way the real producer does —
+through `evaluate` with a realistic ruleset — except `policy_unloadable` and
+`no_confirmation_channel`, which no layer produces yet (the loader's failure
+envelope and M3's channel check); those two are pinned through
+`Decision::deny`, the constructor their eventual producers will use, so the
+producer inherits a pinned record rather than inventing one.
+
+Accepting a deliberate change: `cargo insta review`, or
+`INSTA_UPDATE=always cargo test`, then commit the `.snap` diff — which is the
+point, because that diff is where review sees a policy or UX surface move.
+
+### The first snapshot found a defect the existing tests could not see
+
+`DenialCode::ExeMismatch`'s remediation contained an eighteen-space run from a
+mis-wrapped string literal (a line break without the `\` continuation every
+neighbouring arm uses). Every existing test asserted `contains(...)` on
+substrings, which is exactly the assertion shape that cannot notice broken
+whitespace between two valid fragments. A snapshot cannot miss it. Fixed in the
+same change, and it is a fair one-line argument for why exact-surface pinning
+earns its maintenance cost.
+
+### Writing the critical-tier fixture ran into the deny-list twice, correctly
+
+The fixture needed a critical-tier action that *reaches* the confirmation
+decision. The first two attempts — `/usr/sbin/poweroff`, then
+`systemctl mask` — both came back `deny_listed` (`PowerState` and
+`UnitDefinitionMutation`), because the deny-list evaluates before confirmation
+and both verbs sit on it by capability class. That is the engine's ordering
+working as designed — a deny-listed command must never get as far as asking a
+human — and it is worth recording that the natural examples of "critical" are
+mostly things the deny-list refuses outright. The fixture that works is
+`apt-get dist-upgrade`: unbounded scope, so honestly critical, and a plain verb
+the deny-list has no reason to touch.
+
+---
+
 ## 2026-09-01 — phase 2, part three: the gate decides for itself
 
 ### `aido-gate` is the second policy engine, and it reads the ruleset itself

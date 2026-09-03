@@ -1,0 +1,15 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+ALLOW, after a human confirms
+  command   /usr/bin/apt-get dist-upgrade
+  action    aido.pkg.dist-upgrade
+  rule      snapshot-fixture.toml:23
+  confirm   the matched rule is in a critical tier
+
+  trace
+    canonicalized: unchanged (dist-upgrade)
+    matched aido.pkg.dist-upgrade at snapshot-fixture.toml:23
+    deny-list v1: no capability class matched
+    confirmation required: the matched rule is in a critical tier

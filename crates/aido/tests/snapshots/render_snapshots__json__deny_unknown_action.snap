@@ -1,0 +1,29 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "unknown_action",
+  "remediation": "no rule defines this action; run `aido list` to see what is permitted, or ask an administrator to add a rule",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": null,
+  "resolved_argv": [],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "",
+        "after": ""
+      }
+    },
+    {
+      "action_rejected": {
+        "action": "aido.absent",
+        "reason": "no action with this id is defined in the ruleset"
+      }
+    }
+  ]
+}

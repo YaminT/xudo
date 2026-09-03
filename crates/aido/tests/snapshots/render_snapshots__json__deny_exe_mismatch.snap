@@ -1,0 +1,32 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "exe_mismatch",
+  "remediation": "this action runs a different program than the one requested; run `aido list` to find the action that names this program",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": "/bin/sh",
+  "resolved_argv": [
+    "restart",
+    "nginx.service"
+  ],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "restart nginx.service",
+        "after": "restart nginx.service"
+      }
+    },
+    {
+      "action_rejected": {
+        "action": "aido.svc.restart",
+        "reason": "this action runs /usr/bin/systemctl, not the requested program"
+      }
+    }
+  ]
+}

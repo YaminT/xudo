@@ -1,0 +1,13 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   restart nginx
+  reason    argv_rejected
+
+  trace
+    canonicalized: unchanged (restart nginx)
+    skipped aido.svc.restart: argv does not match the rule's argument list: argument 1 ("nginx") does not satisfy unit (UnitName)
+
+  next      the action exists but these arguments are not permitted; run `aido explain -- <argv>` to see which position was rejected

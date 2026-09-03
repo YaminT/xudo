@@ -1,0 +1,14 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   -c
+  reason    deny_listed
+
+  trace
+    canonicalized: unchanged (-c)
+    matched aido.oops.shell at snapshot-fixture.toml:36
+    deny-list v1: SpawnsShell: executable sh
+
+  next      this is permanently denied by a compiled-in rule and no configuration can allow it; do not retry, and do not look for a variant that slips past

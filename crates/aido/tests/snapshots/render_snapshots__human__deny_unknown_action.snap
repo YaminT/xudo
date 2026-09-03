@@ -1,0 +1,12 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    unknown_action
+
+  trace
+    canonicalized: unchanged ()
+    skipped aido.absent: no action with this id is defined in the ruleset
+
+  next      no rule defines this action; run `aido list` to see what is permitted, or ask an administrator to add a rule

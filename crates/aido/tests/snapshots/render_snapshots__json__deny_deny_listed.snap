@@ -1,0 +1,39 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "deny_listed",
+  "remediation": "this is permanently denied by a compiled-in rule and no configuration can allow it; do not retry, and do not look for a variant that slips past",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": null,
+  "resolved_argv": [
+    "-c"
+  ],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "-c",
+        "after": "-c"
+      }
+    },
+    {
+      "action_matched": {
+        "action": "aido.oops.shell",
+        "source": "snapshot-fixture.toml:36"
+      }
+    },
+    {
+      "deny_list_evaluated": {
+        "version": 1,
+        "matched": [
+          "SpawnsShell: executable sh"
+        ]
+      }
+    }
+  ]
+}

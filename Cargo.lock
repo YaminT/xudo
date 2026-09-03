@@ -21,6 +21,7 @@ dependencies = [
  "aido-policy",
  "aido-sys",
  "clap",
+ "insta",
  "serde",
  "serde_json",
  "sha2",

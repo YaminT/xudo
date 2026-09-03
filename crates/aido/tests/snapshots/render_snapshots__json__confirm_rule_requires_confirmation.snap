@@ -1,0 +1,50 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "allow_with_confirmation",
+  "denial": null,
+  "remediation": null,
+  "action": "aido.pkg.autoremove",
+  "rule_source": {
+    "file": "snapshot-fixture.toml",
+    "line": 12
+  },
+  "resolved_exe": "/usr/bin/apt-get",
+  "resolved_argv": [
+    "autoremove"
+  ],
+  "confirm": {
+    "required": {
+      "reason": "rule_requires_confirmation"
+    }
+  },
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "autoremove",
+        "after": "autoremove"
+      }
+    },
+    {
+      "action_matched": {
+        "action": "aido.pkg.autoremove",
+        "source": "snapshot-fixture.toml:12"
+      }
+    },
+    {
+      "deny_list_evaluated": {
+        "version": 1,
+        "matched": []
+      }
+    },
+    {
+      "confirmation_decided": {
+        "required": true,
+        "reason": "the matched rule always requires confirmation"
+      }
+    }
+  ]
+}

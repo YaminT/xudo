@@ -1,0 +1,14 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+ALLOW
+  command   /usr/bin/systemctl restart nginx.service
+  action    aido.svc.restart
+  rule      snapshot-fixture.toml:3
+
+  trace
+    canonicalized: unchanged (restart nginx.service)
+    matched aido.svc.restart at snapshot-fixture.toml:3
+    deny-list v1: no capability class matched
+    confirmation not required: no confirmation requirement applies

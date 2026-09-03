@@ -1,0 +1,10 @@
+---
+source: crates/aido-policy/tests/contract_snapshots.rs
+expression: prompts
+---
+AgentActionsConfirmed
+    an enrolled agent requested a privileged action and confirm_agent_actions is on
+RuleRequiresConfirmation
+    the matched rule always requires confirmation
+CriticalTier
+    the matched rule is in a critical tier

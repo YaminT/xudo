@@ -1,0 +1,10 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    policy_unloadable
+
+  trace
+
+  next      the ruleset is invalid and aido is failing closed; an administrator must run `aido check` and repair it

@@ -1,0 +1,50 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "allow_with_confirmation",
+  "denial": null,
+  "remediation": null,
+  "action": "aido.pkg.dist-upgrade",
+  "rule_source": {
+    "file": "snapshot-fixture.toml",
+    "line": 23
+  },
+  "resolved_exe": "/usr/bin/apt-get",
+  "resolved_argv": [
+    "dist-upgrade"
+  ],
+  "confirm": {
+    "required": {
+      "reason": "critical_tier"
+    }
+  },
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "dist-upgrade",
+        "after": "dist-upgrade"
+      }
+    },
+    {
+      "action_matched": {
+        "action": "aido.pkg.dist-upgrade",
+        "source": "snapshot-fixture.toml:23"
+      }
+    },
+    {
+      "deny_list_evaluated": {
+        "version": 1,
+        "matched": []
+      }
+    },
+    {
+      "confirmation_decided": {
+        "required": true,
+        "reason": "the matched rule is in a critical tier"
+      }
+    }
+  ]
+}

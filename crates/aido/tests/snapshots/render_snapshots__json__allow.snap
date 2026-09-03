@@ -1,0 +1,47 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "allow",
+  "denial": null,
+  "remediation": null,
+  "action": "aido.svc.restart",
+  "rule_source": {
+    "file": "snapshot-fixture.toml",
+    "line": 3
+  },
+  "resolved_exe": "/usr/bin/systemctl",
+  "resolved_argv": [
+    "restart",
+    "nginx.service"
+  ],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "restart nginx.service",
+        "after": "restart nginx.service"
+      }
+    },
+    {
+      "action_matched": {
+        "action": "aido.svc.restart",
+        "source": "snapshot-fixture.toml:3"
+      }
+    },
+    {
+      "deny_list_evaluated": {
+        "version": 1,
+        "matched": []
+      }
+    },
+    {
+      "confirmation_decided": {
+        "required": false,
+        "reason": "no confirmation requirement applies"
+      }
+    }
+  ]
+}

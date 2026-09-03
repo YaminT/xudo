@@ -1,0 +1,13 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   upgrade
+  reason    human_path_only
+
+  trace
+    canonicalized: unchanged (upgrade)
+    matched aido.pkg.upgrade at snapshot-fixture.toml:29
+
+  next      this action is never available to an agent; hand it to a person

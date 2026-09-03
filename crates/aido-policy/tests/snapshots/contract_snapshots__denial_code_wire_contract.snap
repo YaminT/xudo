@@ -1,0 +1,20 @@
+---
+source: crates/aido-policy/tests/contract_snapshots.rs
+expression: table
+---
+ 1  unknown_action
+    no rule defines this action; run `aido list` to see what is permitted, or ask an administrator to add a rule
+ 2  argv_rejected
+    the action exists but these arguments are not permitted; run `aido explain -- <argv>` to see which position was rejected
+ 3  deny_listed
+    this is permanently denied by a compiled-in rule and no configuration can allow it; do not retry, and do not look for a variant that slips past
+ 4  policy_unloadable
+    the ruleset is invalid and aido is failing closed; an administrator must run `aido check` and repair it
+ 5  frozen
+    an administrator froze the agent path; the human path still works, so hand this action to a person
+ 6  no_confirmation_channel
+    this action needs human approval and no channel is live; ask the operator to run `aido watch` in a terminal they control
+ 7  human_path_only
+    this action is never available to an agent; hand it to a person
+ 8  exe_mismatch
+    this action runs a different program than the one requested; run `aido list` to find the action that names this program

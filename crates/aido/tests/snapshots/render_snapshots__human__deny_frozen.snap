@@ -1,0 +1,12 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   restart nginx.service
+  reason    frozen
+
+  trace
+    canonicalized: unchanged (restart nginx.service)
+
+  next      an administrator froze the agent path; the human path still works, so hand this action to a person

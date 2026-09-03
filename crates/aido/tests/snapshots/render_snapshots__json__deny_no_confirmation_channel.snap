@@ -1,0 +1,16 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "no_confirmation_channel",
+  "remediation": "this action needs human approval and no channel is live; ask the operator to run `aido watch` in a terminal they control",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": null,
+  "resolved_argv": [],
+  "confirm": "not_required",
+  "trace": []
+}

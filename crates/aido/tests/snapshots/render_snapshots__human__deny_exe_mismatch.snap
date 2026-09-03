@@ -1,0 +1,13 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   /bin/sh restart nginx.service
+  reason    exe_mismatch
+
+  trace
+    canonicalized: unchanged (restart nginx.service)
+    skipped aido.svc.restart: this action runs /usr/bin/systemctl, not the requested program
+
+  next      this action runs a different program than the one requested; run `aido list` to find the action that names this program
