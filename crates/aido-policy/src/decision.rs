@@ -182,7 +182,8 @@ impl DenialCode {
                 "this action is never available to an agent; hand it to a person"
             }
             Self::ExeMismatch => {
-                "this action runs a different program than the one requested; run `aido list`                  to find the action that names this program"
+                "this action runs a different program than the one requested; run `aido list` \
+                 to find the action that names this program"
             }
         }
     }
