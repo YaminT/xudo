@@ -10,6 +10,7 @@ members = [
   "crates/aido",
   "crates/aido-bin",
   "crates/aido-tests",
+  "crates/term-sanitize",
 ]
 
 # `fuzz` stays out of the workspace: cargo-fuzz needs nightly, its own release

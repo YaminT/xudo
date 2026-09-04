@@ -1,0 +1,17 @@
+[package]
+name = "term-sanitize"
+description = "Sanitizes untrusted text bound for a terminal: strips ANSI/C0/C1 escapes and bidi overrides, flags homoglyphs, clamps width. Display-only — its output must never be compared or executed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
