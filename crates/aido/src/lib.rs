@@ -12,8 +12,8 @@
 //! Every module here is driven directly by unit tests, because a decision path
 //! that can only be reached by spawning a process is a decision path that gets
 //! tested less carefully than it deserves. The five-line `main` sits in
-//! `aido-bin`, and `aido-tests` asserts the exit status a shell actually
-//! receives.
+//! `aido-bin`, whose own integration tests assert the exit status a shell
+//! actually receives.
 //!
 //! The split is also what makes coverage honest: a package that is both a
 //! library and a binary compiles every module twice, so each file is measured

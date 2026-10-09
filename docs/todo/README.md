@@ -20,7 +20,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 | `aido-config` | Layered configuration: precedence, origin tracking, the narrowing-only project layer, and XDG path resolution (phase 5 part 1) |
 | `aido` | The unprivileged front-end library |
 | `aido-bin` | The five-line `aido` entry point, in its own package so the library is measured exactly once |
-| `aido-tests` | The real binary run as a process; the future differential matrix |
+| `aido-tests` | The future differential matrix (binary process tests live in `aido-bin/tests`) |
 
 `aido explain`, `why-not`, `check`, `list`, `doctor`, and `agentdoc` all work. Four starter rule files ship and are tested as code.
 

@@ -67,26 +67,25 @@ no-ignored-passes:
 
 # --- coverage ---------------------------------------------------------------
 
-# Two packages are excluded, and both exclusions are load-bearing rather than
-# convenient:
+# One package and one file are excluded, and both exclusions are load-bearing
+# rather than convenient:
 #
-#   aido-tests  spawns the built `aido` binary, which the coverage harness
-#               relocates, so `cargo_bin` cannot find it. It is a correctness
-#               gate (`just test` runs it), not a coverage source.
 #   exec/host.rs is the only file that starts a child process. Its failure paths
 #               need the kernel to fail a `fork` or a pipe read on a descriptor
 #               we own, which a test cannot arrange. Every decision built on a
 #               probe result sits behind the `Runner` trait and is fully covered
 #               against a fake, so what is excluded is process plumbing only.
-#   aido-bin    is the five-line entry point. `aido-tests` asserts its exit
-#               statuses through a real process — 0, 17, and 19 — which is the
-#               only place that behaviour exists. Excluding one tiny package is
-#               honest; a line-level waiver inside a shared file is not.
+#   aido-bin    is the five-line entry point. Its own `tests/binary.rs` asserts
+#               its exit statuses through a real process — 0, 17, and 19 — which
+#               is the only place that behaviour exists. It is a correctness gate
+#               (`just test` runs it), not a coverage source. Excluding one tiny
+#               package is honest; a line-level waiver inside a shared file is
+#               not.
 #
-# Everything else is 100% with no waivers. Do not add a third exclusion without
+# Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude aido-tests --exclude aido-bin --all-features \
+    cargo llvm-cov --workspace --exclude aido-bin --all-features \
         --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
         --fail-under-regions {{cov_regions}} \
@@ -99,11 +98,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-tests --exclude aido-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude aido-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-tests --exclude aido-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude aido-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 

@@ -124,7 +124,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Confirm the matrix is still tracked
         run: |
-          # aido-tests now exists and runs the binary as a process, but there
+          # aido-bin/tests now runs the binary as a process, but there
           # is still no privileged path to compare across backends. This job
           # fails deliberately once a gate binary appears, so the matrix cannot
           # be forgotten at the moment it starts to matter.

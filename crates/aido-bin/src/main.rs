@@ -3,7 +3,7 @@
 //! Deliberately the whole of it. Everything worth testing lives in the `aido`
 //! library and is driven by unit tests; what remains here is argument parsing
 //! and the exit status a shell receives, both asserted end to end by
-//! `aido-tests`.
+//! `tests/binary.rs`.
 
 #![forbid(unsafe_code)]
 

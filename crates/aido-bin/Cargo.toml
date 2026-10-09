@@ -19,5 +19,16 @@ path = "src/main.rs"
 aido = { path = "../aido", version = "0.0.1" }
 clap.workspace = true
 
+# `tests/binary.rs` runs the binary as a process. It lives in this package, not
+# in `aido-tests`, because Cargo builds a binary for — and sets
+# `CARGO_BIN_EXE_aido` in — only the integration tests of the package that owns
+# it. From any other package `cargo_bin` falls back to whatever `aido` happens
+# to be sitting in the target directory: missing on a clean CI runner, and
+# silently stale on a developer's machine.
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

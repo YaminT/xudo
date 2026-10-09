@@ -27,7 +27,8 @@ Every commit must satisfy all of the following. `just verify` runs the whole gat
 - A waiver is a `#[cfg_attr(coverage_nightly, coverage(off))]` attribute (or a `llvm-cov` exclusion) **plus** a `// COVERAGE-WAIVER(<who>): <why>` comment on the same item naming a concrete reason — not "hard to test".
 - `just coverage` fails under the thresholds declared at the top of the `justfile` (`cov_lines`, `cov_regions`, `cov_functions`). Do not lower one to make a build pass; either write the test or write the waiver.
 - Untestable-by-construction code (a syscall that cannot be faked) is the reason `aido-sys` exists: put the syscall behind the trait, fake the trait, and test the logic. If you are reaching for a waiver in `aido-policy`, you have put logic in the wrong crate.
-- **Two packages are excluded from the measurement, and no lines are.** `aido-tests` spawns the built binary, which the coverage harness relocates out from under `cargo_bin`; `aido-bin` is the five-line entry point whose exit statuses `aido-tests` asserts through a real process. Both are recorded in the `justfile` with their reasons. Adding a third exclusion means writing down why, in the same place.
+- **One package is excluded from the measurement.** `aido-bin` is the five-line entry point whose exit statuses its own `tests/binary.rs` asserts through a real process. It is recorded in the `justfile` with its reason, alongside the one excluded file. Adding another exclusion means writing down why, in the same place.
+- **Process-level tests of a binary live in the package that owns it.** Cargo sets `CARGO_BIN_EXE_<name>`, and guarantees a fresh build, only for that package's integration tests. From anywhere else `cargo_bin` silently picks up whatever stale binary sits in `target/` — or nothing, on a clean CI runner.
 - **Purge coverage data before measuring** (`just coverage-clean`, already part of `just verify`). Stale profile data from a previous layout reads as a sudden unexplained drop, and the temptation is then to lower a threshold rather than to clean.
 - **Prefer deleting an unreachable branch to waiving it.** Three were removed while building M1 — two `ok_or_else` arms on slice ranges that always exist, and a `split().next()` that can never be `None`. A fourth, a serializer error on a plain data struct, became reachable by making the fallback a *denial envelope* and testing it through a generic helper. A branch that cannot be tested usually cannot be reasoned about either.
 
@@ -132,7 +133,7 @@ Two things to know before writing one:
 | `aido-policy` | Pure. **Zero syscalls, zero I/O.** If it needs the filesystem, it belongs in `aido-sys`. Builds and tests natively on macOS. |
 | `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. The only crate allowed `unsafe`, confined to `raw`. |
 | `aido` | Unprivileged front-end **library**. Holds no secret, makes no decision. |
-| `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. |
+| `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. Its `tests/` run the real binary as a process. Excluded from coverage, never from `just test`. |
 | `aido-gate` | Privileged executor and *second independent policy engine*. Assume a hostile local user invokes it directly with no arguments. |
 | `aidod` | Root broker. The authority on classification and confirmation. |
-| `aido-tests` | Runs the real binary as a process, and the future container/VM matrix. Excluded from coverage, never from `just test`. |
+| `aido-tests` | The future container/VM differential matrix. Empty until M2. |
