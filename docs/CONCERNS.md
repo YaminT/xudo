@@ -4,6 +4,63 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-09-23 — CI had been red since 2026-08-28, for two reasons
+
+Every run on `main` failed from `ec666f5` onward. Neither cause was a code
+defect; both were test infrastructure lying about what it was testing.
+
+### The binary tests were running whatever `aido` happened to be lying around
+
+`aido-tests/tests/binary.rs` called `Command::cargo_bin("aido")`, but the
+`aido` binary belongs to `aido-bin`. Cargo sets `CARGO_BIN_EXE_aido`, and
+builds the binary at all, only for the integration tests of the package that
+owns it. From `aido-tests`, `assert_cmd` fell back to probing `target/debug/aido`:
+
+- **on a clean CI runner** nothing was there, and all nine tests panicked with
+  `` `CARGO_BIN_EXE_aido` is unset ``;
+- **on a developer machine** a binary from some earlier `cargo build` usually
+  was there, so the tests passed — against a stale build. Deleting it locally
+  reproduced the CI failure exactly.
+
+The second is the worse of the two: an exit-code test that asserts an old
+binary proves nothing about the current one. The tests now live in
+`aido-bin/tests/binary.rs`, where Cargo guarantees a fresh build and sets the
+variable. `aido-bin` was already excluded from coverage, so measurement is
+unchanged, and `aido-tests` no longer needs an exclusion. It stays as an empty
+package reserved for the M2 differential matrix. This also corrects the
+2026-08-27 note below: `cargo_bin` failing "under the coverage harness" was the
+same cross-package problem, not something llvm-cov did.
+
+### cargo-fuzz was building for musl
+
+A cargo-fuzz installed as a prebuilt binary (`taiki-e/install-action`) is
+statically linked against musl, and cargo-fuzz defaults `--target` to the
+triple it was compiled for. AddressSanitizer refuses a static libc:
+`sanitizer is incompatible with statically linked libc`. `just fuzz` now passes
+the host triple from `rustc +nightly -vV` explicitly, and the nightly long run
+calls the same recipe (`just fuzz 1800`) instead of its own copy of the loop.
+
+### Coverage in `term-sanitize` was passing by luck
+
+Found while verifying the two fixes above. Three branches of the escape
+stripper — a bare C0 control other than ESC, an escape with more than one
+intermediate byte, and an intermediate followed by a non-final character —
+were reached only when proptest happened to generate them, so `just coverage`
+came out anywhere from 99.46% to 100% run to run. Each now has a deterministic
+test named for what it stops, starting with
+`a_carriage_return_cannot_overwrite_what_was_shown`: `rm -rf /\rls` renders as
+`ls` on a raw terminal. The unit tests alone now cover the crate fully; the
+property tests are back to checking invariants rather than carrying coverage.
+
+### Heads-up: the differential job will fail on the next push, on purpose
+
+`crates/aido-gate` landed locally in `fc878d0` but was never pushed. The
+`differential compliance (M2)` job exits 1 the moment a gate crate exists, so
+the sudo / sudo-rs / doas matrix cannot be forgotten. That failure is the
+tripwire working, not a regression.
+
+---
+
 ## 2026-09-03 — every rendered decision is now a snapshot
 
 ### The commit-rule debt is paid
