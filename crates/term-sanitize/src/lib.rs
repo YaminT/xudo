@@ -491,6 +491,31 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_charset_escape_is_consumed_through_every_intermediate() {
+        // ESC $ ( B — two intermediates before the final byte. Stopping after
+        // the first would leave "(B" on screen.
+        let clean = display_str("a\u{1B}$(Bb", wide());
+        assert_eq!(clean.text, "ab");
+        assert_eq!(clean.findings, vec![Finding::AnsiEscapes { count: 1 }]);
+    }
+
+    #[test]
+    fn a_malformed_intermediate_escape_does_not_swallow_the_next_character() {
+        // 'é' is not a valid final byte, so the sequence ends before it and it
+        // is judged on its own merits.
+        let clean = display_str("a\u{1B}(éb", wide());
+        assert_eq!(clean.text, "aéb");
+    }
+
+    #[test]
+    fn a_carriage_return_cannot_overwrite_what_was_shown() {
+        // "rm -rf /\rls" renders as "ls" on a raw terminal.
+        let clean = display_str("rm -rf /\rls", wide());
+        assert_eq!(clean.text, "rm -rf /ls");
+        assert_eq!(clean.findings, vec![Finding::ControlChars { count: 1 }]);
+    }
+
+    #[test]
     fn a_malformed_csi_does_not_swallow_the_rest_of_the_line() {
         // A CSI whose "parameters" include a byte outside the CSI grammar must
         // stop consuming there, not eat to end of string.
