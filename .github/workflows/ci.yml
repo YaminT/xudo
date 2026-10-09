@@ -108,10 +108,7 @@ jobs:
         run: just fuzz-smoke
       - name: Fuzz (nightly, long)
         if: github.event_name == 'schedule'
-        run: |
-          for target in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$target" -- -max_total_time=1800
-          done
+        run: just fuzz 1800
 
   # Placeholder for the differential compliance matrix that lands with M2, when
   # there is a privileged path to compare across sudo, sudo-rs, and OpenDoas.

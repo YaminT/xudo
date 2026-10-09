@@ -117,12 +117,18 @@ miri:
 # --- fuzzing ----------------------------------------------------------------
 
 # Smoke run for CI. Nightly runs these for hours instead of seconds.
-fuzz-smoke:
+fuzz-smoke: (fuzz "60")
+
+# `--target` is the host triple, stated explicitly. cargo-fuzz otherwise
+# defaults to the triple it was itself compiled for, and the prebuilt CI
+# binary is static musl — a target AddressSanitizer refuses outright.
+fuzz seconds:
     #!/usr/bin/env bash
     set -euo pipefail
+    host=$(rustc +nightly -vV | sed -n 's/^host: //p')
     for target in $(cargo +nightly fuzz list); do
         echo "fuzzing $target"
-        cargo +nightly fuzz run "$target" -- -max_total_time=60
+        cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time={{seconds}}
     done
 
 # --- supply chain -----------------------------------------------------------
