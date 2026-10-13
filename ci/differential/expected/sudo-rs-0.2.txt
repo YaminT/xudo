@@ -1,0 +1,4 @@
+backend      UNUSABLE: sudo-rs <version> is missing a required control (REQUIRED: scopes aido's settings to aido's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); aido refuses to install rather than install something weaker than it advertises
+install      exit 19
+refused      sudo-rs <version> is missing a required control
+check        exit 0

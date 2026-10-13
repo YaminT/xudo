@@ -1,0 +1,114 @@
+# /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.svc.lifecycle",
+exit 0
+
+# /usr/bin/systemctl restart nginx.service
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/systemctl --no-pager --no-ask-password restart nginx
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service --now
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/systemctl --no-pager --no-ask-password enable nginx.service
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/systemctl --no-pager --full status nginx.service
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.svc.status",
+exit 0
+
+# /usr/bin/journalctl --no-pager -u nginx.service -n 100
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.svc.logs",
+exit 0
+
+# /usr/bin/journalctl --no-pager -u nginx.service -n 100000
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/ss -tulpnH
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.net.listeners",
+exit 0
+
+# /usr/bin/apt-get -y --no-install-recommends install -- curl
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.pkg.install",
+exit 0
+
+# /usr/bin/apt-get -y --no-install-recommends install -- ./evil.deb
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends install -- curl
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/apt-get -y remove -- build-essential
+  "verdict": "allow_with_confirmation",
+  "denial": null,
+  "action": "aido.pkg.remove",
+exit 18
+
+# /usr/sbin/sysctl -q -w vm.max_map_count 262144
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.sysctl.max-map-count",
+exit 0
+
+# /usr/sbin/sysctl -q -w kernel.core_pattern |/bin/sh
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/sbin/sysctl -p
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/timedatectl set-ntp false
+  "verdict": "allow",
+  "denial": null,
+  "action": "aido.time.set-ntp",
+exit 0
+
+# /bin/sh -c id
+  "verdict": "deny",
+  "denial": "unknown_action",
+  "action": null,
+exit 17
+
+# /bin/busybox sh
+  "verdict": "deny",
+  "denial": "unknown_action",
+  "action": null,
+exit 17
+

@@ -1,0 +1,11 @@
+# Static musl builds for the differential matrix (`just differential`).
+#
+# The musl targets ship their own crt and libc, so the only piece a macOS host
+# lacks is a linker that emits ELF: rustc's bundled rust-lld, which rustc finds
+# in its own sysroot. On Linux the system cc would also do, but one linker on
+# both hosts means one build to reason about and one output to compare.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

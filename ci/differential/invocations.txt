@@ -1,0 +1,35 @@
+# One argv per line, split on whitespace, so every token must be free of
+# spaces. Chosen to cross every verdict shape the engine has — allow, allow with
+# confirmation, and each denial class — on the rules that actually ship. Every
+# row of the matrix must produce byte-identical answers for all of them; the
+# backend underneath is not a policy input.
+
+# svc-control: the shipped lifecycle rule, then the ways it must refuse.
+/usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
+/usr/bin/systemctl restart nginx.service
+/usr/bin/systemctl --no-pager --no-ask-password restart nginx
+/usr/bin/systemctl --no-pager --no-ask-password restart nginx.service --now
+/usr/bin/systemctl --no-pager --no-ask-password enable nginx.service
+
+# diag-read
+/usr/bin/systemctl --no-pager --full status nginx.service
+/usr/bin/journalctl --no-pager -u nginx.service -n 100
+/usr/bin/journalctl --no-pager -u nginx.service -n 100000
+/usr/bin/ss -tulpnH
+
+# pkg-install / pkg-remove: a package name, a local file, a hook injection,
+# and a removal that must demand confirmation.
+/usr/bin/apt-get -y --no-install-recommends install -- curl
+/usr/bin/apt-get -y --no-install-recommends install -- ./evil.deb
+/usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends install -- curl
+/usr/bin/apt-get -y remove -- build-essential
+
+# sys-tunable: an enumerated key in range, a code-execution key, a file-driven form.
+/usr/sbin/sysctl -q -w vm.max_map_count 262144
+/usr/sbin/sysctl -q -w kernel.core_pattern |/bin/sh
+/usr/sbin/sysctl -p
+/usr/bin/timedatectl set-ntp false
+
+# Nothing names a shell, and no spelling of one may ever match.
+/bin/sh -c id
+/bin/busybox sh

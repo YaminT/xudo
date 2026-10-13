@@ -20,7 +20,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 | `aido-config` | Layered configuration: precedence, origin tracking, the narrowing-only project layer, and XDG path resolution (phase 5 part 1) |
 | `aido` | The unprivileged front-end library |
 | `aido-bin` | The five-line `aido` entry point, in its own package so the library is measured exactly once |
-| `aido-tests` | The future differential matrix (binary process tests live in `aido-bin/tests`) |
+| `aido-tests` | Reserved for the executing half of the differential matrix; the unprivileged half is `ci/differential/`, run by `just differential` (binary process tests live in `aido-bin/tests`) |
 
 `aido explain`, `why-not`, `check`, `list`, `doctor`, and `agentdoc` all work. Four starter rule files ship and are tested as code.
 
@@ -105,7 +105,9 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        project layer, XDG paths, `aido config [--schema]`.
 4. Phase 4             ido. No privilege at all. Highest value per unit of risk.
 5. M2b                 BLOCKED ON A VM — the gate's syscalls, the real sudo hop,
-                       the functional probe, the differential matrix.
+                       the functional probe, the executing half of the
+                       differential matrix. The unprivileged half runs in CI
+                       today (`just differential`) and trips when exec appears.
 6. Phase 3             beta .deb + publish, human path only, no NOPASSWD shipped.
 7. M3                  broker + out-of-band confirmation.
 8. M4                  enrollment + the passwordless path.

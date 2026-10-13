@@ -4,6 +4,86 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-13 — the differential matrix is wired, and it found two more bugs of one kind
+
+### The tripwire fired, as designed, and is now a job
+
+`differential compliance (M2)` had been the only red job since `fc878d0`
+pushed `crates/aido-gate`: it exited 1 the moment a gate crate existed, so the
+matrix could not be forgotten. It is now real. `just differential` builds a
+static musl `aido` and `ci/differential/run.sh` drives it in Docker through
+five rows — Ubuntu 24.04 with sudo, Ubuntu 24.04 with sudo-rs 0.2.2, Ubuntu
+26.04 with sudo-rs 0.2.13, Alpine 3.22 with OpenDoas 6.8.2, and Alpine with no
+escalator at all. Each row pins which backend was found and every capability
+it was probed to have (`expected/<row>.txt`, versions normalized out), feeds
+the snippet aido would write to that backend's own parser, and records the
+verdict for nineteen invocations over the shipped rules
+(`expected/verdicts.txt`). Every row must produce that file byte for byte: a
+backend is not a policy input.
+
+What it does not do: execute. The binary has no exec path, and `row.sh` fails
+the moment `aido doctor` stops saying so, because then the comparison that
+matters — the same ruleset *executed* through each backend, identical
+outcomes — is due. The tripwire moved from "does a gate crate exist" to "does
+the binary say it can exec", which is the question that actually decides when
+the second half must be written. `aido-tests` stays reserved for that half.
+
+### Two defects, both "is root permitted?" where the question was "does this parse?"
+
+**The OpenDoas probe.** `doas -C <file>` parses a config and exits 0 or 1.
+`doas -C <file> <command>` additionally evaluates whether the *invoking* user
+is permitted and prints `deny`, exit 1, otherwise. The probe passed `/bin/true`
+as a command; the probe rule names group `aido`; root is not in it; so every
+real OpenDoas answered no to every probe, and detection reported it UNUSABLE
+with an empty version. That is the "open, not fixed" item from 2026-08-28,
+explained. No unit test could see it because the fake runner did not model the
+difference. It does now, and
+`a_doas_probe_asks_the_parser_not_whether_the_probing_user_is_permitted` fails
+against the old code. The doas row is usable: 5 of 7 capabilities, absent only
+wildcard rejection (a sudo-family question doas is never asked) and the
+persistent credential cache (which OpenDoas has only when built
+`--with-timestamp`).
+
+**The doas install plan's validate step** had the same shape:
+`doas -C {candidate} /usr/libexec/aido/aido-gate-auth`. The installer is root,
+root is not in `aido`, so on a perfectly valid file the step would have printed
+`deny`, exited 1, and — correctly, every non-notice step is fatal — aborted the
+install. The command is gone;
+`the_doas_validation_command_asks_the_parser_only` pins it. `row.sh` takes the
+validator argv from the plan's own output rather than choosing one, so a plan
+that names a validator the distribution lacks, or hands it an argument that
+changes the question, fails in the row that has that distribution.
+
+The version banner was never the problem: OpenDoas has no version flag at all,
+and `doctor` now says `no version banner` rather than the stale
+`version not probed yet`.
+
+### sudo-rs on Ubuntu 26.04 is usable, and lives at `/usr/bin/sudo`
+
+Measured, not assumed: sudo-rs 0.2.13 accepts `Defaults!ALIAS
+timestamp_timeout=0`, and its `visudo` accepts `-cf /dev/stdin`. The 26.04
+package installs `/usr/bin/sudo` and `/usr/sbin/visudo` through alternatives,
+so detection finds it at the C sudo's path, classifies it from its banner, and
+probes it through `/usr/sbin/visudo` — which is visudo-rs there, and works. The
+24.04 package (0.2.2) still installs only `/usr/bin/sudo-rs`, still lacks the
+per-command scope, and is still refused by name with that reason; that row
+pins the refusal and will say so the day the package changes.
+
+Two things the matrix pins that are not pretty: the UNUSABLE line reads
+`sudo-rs sudo-rs 0.2.2`, because the banner already carries the name, and the
+doas snippet header says `doas ()`. Both are cosmetic and both are now
+snapshots, so fixing either is a reviewed diff rather than a drift.
+
+### Reproducing it on a Mac
+
+Static musl, linked with rustc's own `rust-lld` (`.cargo/config.toml`), so
+nothing beyond the pinned toolchain is needed; `aarch64-unknown-linux-musl`
+joined the pinned targets for Apple Silicon, and `just` picks the triple from
+the host architecture so Docker runs the image natively. `cargo-zigbuild` was
+not installed on this machine any more and is not needed.
+
+---
+
 ## 2026-09-23 — CI had been red since 2026-08-28, for two reasons
 
 Every run on `main` failed from `ec666f5` onward. Neither cause was a code

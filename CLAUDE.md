@@ -105,12 +105,13 @@ crossed both whitespace and `/`. Adds denies_glob_crossing_separator.
 | Fuzz smoke | `cargo fuzz run <target> -- -max_total_time=60` | no crash |
 | TOML format | `taplo fmt --check` | no diff |
 | GTFOBins gate | `just gtfobins` | every allowlisted shell-capable binary has a reviewed waiver |
+| Differential | `just differential` | the static binary inside real distributions: every backend report matches `ci/differential/expected/`, every verdict identical in every row. Needs Docker; runs in CI, not in `verify` |
 
 `rust-toolchain.toml` pins the toolchain; MSRV is declared in the workspace manifest and checked in CI. Nightly is used **only** for `cargo fuzz`, `cargo miri`, and region coverage — never for a shipped build.
 
 ## Platform
 
-macOS is a **development and unit-test platform only**. `aido-sys::MacOsStub` returns `Unsupported` for every syscall so a macOS developer cannot accidentally validate a Linux-only assumption; every privileged path must fail closed there. Privileged integration tests run in Linux containers and VMs (`aido-tests`), across sudo / sudo-rs / OpenDoas.
+macOS is a **development and unit-test platform only**. `aido-sys::MacOsStub` returns `Unsupported` for every syscall so a macOS developer cannot accidentally validate a Linux-only assumption; every privileged path must fail closed there. The differential matrix (`just differential`, `ci/differential/`) drives the static binary in Linux containers across sudo / sudo-rs / OpenDoas and a host with no escalator; the executing half, once a gate binary exists, belongs in `aido-tests` and the matrix fails loudly until it is written.
 
 ## Rule files
 
@@ -136,4 +137,4 @@ Two things to know before writing one:
 | `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. Its `tests/` run the real binary as a process. Excluded from coverage, never from `just test`. |
 | `aido-gate` | Privileged executor and *second independent policy engine*. Assume a hostile local user invokes it directly with no arguments. |
 | `aidod` | Root broker. The authority on classification and confirmation. |
-| `aido-tests` | The future container/VM differential matrix. Empty until M2. |
+| `aido-tests` | Reserved for the executing half of the differential matrix. The half that exists today is `ci/differential/`, a shell harness, because its job is to start containers. |

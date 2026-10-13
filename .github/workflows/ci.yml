@@ -110,23 +110,26 @@ jobs:
         if: github.event_name == 'schedule'
         run: just fuzz 1800
 
-  # Placeholder for the differential compliance matrix that lands with M2, when
-  # there is a privileged path to compare across sudo, sudo-rs, and OpenDoas.
-  # Kept here, failing loudly if it ever silently disappears, because "we will
-  # add it later" is how it never gets added.
+  # The differential compliance matrix: the static binary and the shipped
+  # ruleset driven inside real distributions against real sudo, sudo-rs,
+  # OpenDoas, and no escalator at all. ci/differential/run.sh pins what each
+  # backend is probed to support, asks each backend's own parser to accept the
+  # snippet aido would write, and requires every verdict to be identical in
+  # every row.
+  #
+  # It compares only what the unprivileged binary does, and says so: row.sh
+  # fails the moment `aido doctor` stops reporting the exec path as absent,
+  # because then the same ruleset must be *executed* through each backend and
+  # compared, and "we will add it later" is how it never gets added.
   differential:
-    name: differential compliance (M2)
+    name: differential compliance
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Confirm the matrix is still tracked
-        run: |
-          # aido-bin/tests now runs the binary as a process, but there
-          # is still no privileged path to compare across backends. This job
-          # fails deliberately once a gate binary appears, so the matrix cannot
-          # be forgotten at the moment it starts to matter.
-          if [ -e crates/aido-gate ] || [ -e crates/aidod ]; then
-            echo "a privileged path exists; wire the sudo / sudo-rs / doas matrix into this job"
-            exit 1
-          fi
-          echo "M1: no privileged path yet, so there is nothing to compare. Tracked for M2."
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Drive the static binary through sudo, sudo-rs, OpenDoas, and no escalator
+        run: just differential

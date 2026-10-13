@@ -203,6 +203,24 @@ gtfobins:
     if (( fail )); then exit 1; fi
     echo "gtfobins: every allowlisted shell-capable binary has a reviewed waiver"
 
+# --- differential compliance ------------------------------------------------
+
+# The static Linux binary the matrix drives: musl, for whichever architecture
+# Docker on this host runs natively. Linked with rustc's bundled rust-lld (see
+# .cargo/config.toml) so the same build works from a Mac and from the runner.
+musl_triple := if arch() == "aarch64" { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
+
+# One binary and the shipped ruleset, driven inside real distributions against
+# the real sudo, sudo-rs (the version Ubuntu 24.04 ships and the one 26.04
+# does), OpenDoas, and a container with no escalator at all. Every backend's
+# detection and probed capabilities are pinned, its own parser is asked to
+# accept the snippet aido would write, and every verdict must be identical in
+# every row. Needs Docker. ci/differential/run.sh says what is compared and
+# what is deliberately not yet.
+differential:
+    cargo build -p aido-bin --release --target {{musl_triple}}
+    ci/differential/run.sh target/{{musl_triple}}/release/aido
+
 # --- developer setup --------------------------------------------------------
 
 # Point git at the tracked hooks directory, so the gate runs before every
@@ -220,7 +238,7 @@ setup: install-hooks
 # --- convenience ------------------------------------------------------------
 
 # What CI runs on a pull request, including the slow lanes.
-ci: verify check-linux miri
+ci: verify check-linux miri differential
 
 clean:
     cargo clean

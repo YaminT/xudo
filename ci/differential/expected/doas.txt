@@ -1,0 +1,8 @@
+backend      doas (<version>)
+backend caps 5 of 7 supported
+             absent: rejects argument wildcards
+             absent: persistent credential cache
+install      exit 0
+plan for     doas
+snippet      accepted by /usr/bin/doas -C /dev/stdin
+check        exit 0

@@ -9,4 +9,7 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
   "x86_64-unknown-linux-musl",
+  # The static binary `just differential` drives through Docker, for an Apple
+  # Silicon host and for the x86_64 runner respectively.
+  "aarch64-unknown-linux-musl",
 ]

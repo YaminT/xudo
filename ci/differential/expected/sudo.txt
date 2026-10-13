@@ -1,0 +1,7 @@
+backend      sudo (<version>)
+backend caps 6 of 7 supported
+             absent: rejects argument wildcards
+install      exit 0
+plan for     sudo
+snippet      accepted by /usr/sbin/visudo -cf /dev/stdin
+check        exit 0

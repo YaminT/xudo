@@ -1,6 +1,6 @@
 [package]
 name = "aido-tests"
-description = "The future differential compliance matrix across sudo, sudo-rs, and OpenDoas."
+description = "Reserved for the executing half of the differential compliance matrix across sudo, sudo-rs, and OpenDoas."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,11 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
-# Home of the M2 differential compliance matrix: the same ruleset driven
-# against sudo, sudo-rs, and OpenDoas across the distro grid. Empty until then.
+# The differential matrix that exists today lives in `ci/differential/` and is
+# run by `just differential`: a shell harness, because its job is to start
+# containers and drive the static binary inside them. This package is reserved
+# for the half that needs a gate binary — the same ruleset *executed* through
+# each backend — and is empty until then.
 #
 # The end-to-end tests of the `aido` binary are not here. They live in
 # `aido-bin/tests`, because only the package that owns a binary gets
