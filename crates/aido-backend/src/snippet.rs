@@ -291,11 +291,15 @@ impl DoasSnippet {
             contents,
             path,
             is_drop_in,
+            // `-C <file>` alone: parse, exit 0 or 1. Naming a command after it
+            // makes doas also ask whether the *invoking* user is permitted —
+            // and at install time that is root, who is not in the aido group,
+            // so a correct file would answer `deny`, exit 1, and abort the
+            // install. Found by the differential matrix on real OpenDoas.
             validate_argv: vec![
                 "/usr/bin/doas".to_owned(),
                 "-C".to_owned(),
                 "{candidate}".to_owned(),
-                GATE_AUTH.to_owned(),
             ],
         })
     }
@@ -573,11 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn the_doas_validation_command_checks_the_candidate() {
+    fn the_doas_validation_command_asks_the_parser_only() {
         let snippet = DoasSnippet::human_only(&doas(true)).unwrap();
-        assert_eq!(snippet.validate_argv[0], "/usr/bin/doas");
-        assert_eq!(snippet.validate_argv[1], "-C");
-        assert_eq!(snippet.validate_argv[2], "{candidate}");
+        assert_eq!(
+            snippet.validate_argv,
+            ["/usr/bin/doas", "-C", "{candidate}"],
+            "a command after -C makes doas evaluate the rule for the invoking \
+             user — root at install time, who is not in the aido group — so a \
+             valid file would be reported as `deny` and the install aborted"
+        );
     }
 
     #[test]

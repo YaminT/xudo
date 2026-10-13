@@ -758,11 +758,11 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
 
 /// Reports the privilege backend, or why there is none.
 ///
-/// Detection is pure and lives in `aido-backend`; this only renders it. The
-/// version banner is not yet readable — running the backend needs the process
-/// handling that lands with the rest of M2 — so the detector assumes the
-/// stricter implementation, which is the safe direction and is said out loud
-/// rather than hidden.
+/// Detection is pure and lives in `aido-backend`; this only renders it. A
+/// backend with no readable banner — `OpenDoas` has no version flag at all —
+/// is reported as exactly that, rather than given a version invented from a
+/// package name. For a sudo-family backend the detector then assumes the
+/// stricter implementation, which is the safe direction.
 fn report_backend(probe: &dyn Probe, out: &mut dyn Write) {
     match detect(probe) {
         Ok(backend) => {
@@ -771,7 +771,7 @@ fn report_backend(probe: &dyn Probe, out: &mut dyn Write) {
                 "backend      {} ({})",
                 backend.kind.label(),
                 if backend.version.is_empty() {
-                    "version not probed yet"
+                    "no version banner"
                 } else {
                     backend.version.as_str()
                 }
@@ -2069,7 +2069,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             }
         }
         let out = run_probe(&fixture("cli-doctor-mute"), &MuteSudoProbe, &["doctor"]);
-        assert!(out.contains("version not probed yet"), "{out}");
+        assert!(out.contains("no version banner"), "{out}");
         // An unreadable banner is assumed to be the stricter implementation.
         assert!(out.contains("backend      sudo-rs"), "{out}");
     }

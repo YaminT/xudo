@@ -173,6 +173,15 @@ fn sudo_honours(runner: &dyn Runner, absolute_path: &str, directive: &str) -> bo
 ///
 /// doas has per-rule options rather than a `Defaults` section, so the directive
 /// is spliced into the rule itself.
+///
+/// `-C <file>` with **no command** is the parse check. With a command, doas
+/// also asks whether the *invoking* user would be permitted, and the probe
+/// rule names a group the probing process is never in — so the first version
+/// of this function, which passed `/bin/true`, got `deny` and exit 1 from
+/// every real `OpenDoas`, and detection reported the backend unusable on the
+/// one distribution that ships it. Found by the differential matrix
+/// (`ci/differential/`), not by a unit test, because the fake runner at the
+/// time did not model the difference. It does now.
 fn doas_honours(runner: &dyn Runner, directive: &str) -> bool {
     // Neither required control maps to a doas keyword: doas has no credential
     // cache unless built --with-timestamp, so the *absence* of `persist` is the
@@ -188,7 +197,7 @@ fn doas_honours(runner: &dyn Runner, directive: &str) -> bool {
     runner
         .run(
             "/usr/bin/doas",
-            &["-C", "/dev/stdin", "/bin/true"],
+            &["-C", "/dev/stdin"],
             Some(rule.as_bytes()),
         )
         .is_ok_and(|out| out.success)
@@ -247,6 +256,20 @@ mod tests {
                     } else {
                         String::new()
                     },
+                });
+            }
+            // Real OpenDoas: `-C <file>` alone parses and exits 0; `-C <file>
+            // <command>` additionally asks whether the *invoking* user is
+            // permitted, and answers `deny` with exit 1 for a rule naming a
+            // group that user is not in — which is every probe rule. Modelled
+            // here so a probe that passes a command fails on a laptop, not in a
+            // container.
+            if absolute_exe == "/usr/bin/doas" && args.len() > 2 {
+                return Ok(Output {
+                    success: false,
+                    code: Some(1),
+                    stdout: "deny\n".to_owned(),
+                    stderr: String::new(),
                 });
             }
             let fed = String::from_utf8_lossy(stdin.unwrap_or_default()).into_owned();
@@ -425,6 +448,32 @@ mod tests {
             "/usr/bin/doas",
             "bogus"
         ));
+    }
+
+    #[test]
+    fn a_doas_probe_asks_the_parser_not_whether_the_probing_user_is_permitted() {
+        // The shape of the bug the matrix found: with a command after `-C`,
+        // real OpenDoas evaluates the rule against the invoking user and says
+        // `deny` — exit 1 — for a perfectly valid rule, because root is not in
+        // the `aido` group. The fake reproduces that, so the probe passes only
+        // if it asks the parse-only question.
+        let doas = FakeRunner {
+            accepts: vec![("doas", "permit :aido as root cmd /bin/true args")],
+            ..FakeRunner::default()
+        };
+        let with_command = doas
+            .run(
+                "/usr/bin/doas",
+                &["-C", "/dev/stdin", "/bin/true"],
+                Some(b"permit :aido as root cmd /bin/true args\n"),
+            )
+            .unwrap();
+        assert!(!with_command.success, "the fake must model OpenDoas's deny");
+        assert_eq!(with_command.stdout, "deny\n");
+
+        assert!(honours_directive_with(&doas, "/usr/bin/doas", "nopersist"));
+        assert!(honours_directive_with(&doas, "/usr/bin/doas", "pty"));
+        assert!(validates_named_file_with(&doas, "/usr/bin/doas"));
     }
 
     #[test]
