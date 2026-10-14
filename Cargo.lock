@@ -100,6 +100,7 @@ dependencies = [
  "aido-backend",
  "aido-policy",
  "bstr",
+ "rustix",
  "thiserror",
 ]
 

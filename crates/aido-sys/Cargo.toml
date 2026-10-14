@@ -12,6 +12,10 @@ authors.workspace = true
 aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
 bstr.workspace = true
+# Descriptor-relative opens and `fstat`, through rustix's safe API, so the
+# ruleset is verified on the descriptors it is read through. Already in the
+# tree; `forbid(unsafe_code)` is untouched.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 thiserror.workspace = true
 
 [lints]

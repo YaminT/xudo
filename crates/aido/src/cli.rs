@@ -234,13 +234,22 @@ pub fn run_with(
     }
 }
 
-/// One line saying whether the ruleset path belongs to root.
+/// One line saying whether the ruleset, and every rule file in it, belongs to
+/// root.
+///
+/// Checked the way the gate must load it: every component opened through its
+/// parent's descriptor without following a link, and every rule file checked
+/// on its own descriptor. A path-only check of the directory would call a
+/// group-writable rule file inside a root-owned directory trusted.
 ///
 /// A development checkout is expected to fail this, so the wording says which
 /// situation it is rather than printing a bare FAIL an operator has to decode.
 fn trust_line(rules: &Path) -> String {
-    match aido_sys::verify_path(rules) {
-        Ok(()) => "root-owned, no writable component".to_owned(),
+    match aido_sys::read_trusted_dir(rules) {
+        Ok(files) => format!(
+            "root-owned, no writable component; {} rule file(s) checked on their descriptors",
+            files.len()
+        ),
         Err(source) => format!("UNTRUSTED: {source}"),
     }
 }
@@ -963,8 +972,8 @@ mod tests {
         // yes at all, so a bug that always refuses cannot hide behind the test
         // above.
         assert_eq!(
-            trust_line(Path::new("/")),
-            "root-owned, no writable component"
+            trust_line(Path::new("/usr/bin")),
+            "root-owned, no writable component; 0 rule file(s) checked on their descriptors"
         );
     }
 

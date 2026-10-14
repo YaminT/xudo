@@ -4,19 +4,20 @@
 //! because the front-end is allowed to touch the filesystem and the policy
 //! engine is not.
 //!
-//! # What this does not check yet
+//! # What this does not check, and where that check lives
 //!
-//! Ownership and mode. The design requires refusing to load if any path
-//! *component* is group- or world-writable, is a symlink, or sits on a
-//! filesystem mounted by a non-root user, verified on the opened descriptor via
-//! `fstat` rather than on the path string. That check needs `openat2` and the
-//! ancestor walk, which arrive with M2 in `aido-sys`.
+//! Ownership and mode. This loader is the unprivileged front-end's, and it reads
+//! by path so `aido explain` works on a checkout. The check the privileged gate
+//! must use is `aido_sys::read_trusted_dir`: every component opened through its
+//! parent's descriptor without following a link, every rule file checked on its
+//! own descriptor, and the bytes read through that same descriptor. `aido
+//! doctor` already reports through it.
 //!
-//! It is safe to omit today only because nothing here can execute anything: the
-//! worst a tampered ruleset can currently do is make `aido explain` print a
-//! wrong answer to a human who asked a question. The moment an exec path exists,
-//! this becomes a hole, so it is a stated precondition of M2 rather than a
-//! nice-to-have.
+//! Reading by path here is safe only because nothing here can execute anything:
+//! the worst a tampered ruleset can do through this loader is make `aido
+//! explain` print a wrong answer to a human who asked a question. When the gate
+//! binary is written, it loads through `read_trusted_dir` and nothing else.
+//! Still not checked by either: a filesystem mounted by a non-root user.
 
 use std::path::{Path, PathBuf};
 

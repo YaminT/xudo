@@ -26,8 +26,14 @@
 //! [`stat_path`], which is the only part that touches a filesystem. The split is
 //! what makes every refusal reachable from a test without needing to be root.
 
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{AtFlags, CWD, Dir, Mode, OFlags, fstat, openat, statat};
 
 /// Who may own a trusted path.
 ///
@@ -218,40 +224,53 @@ pub fn verify(chain: &[(PathBuf, Result<PathFacts, String>)]) -> Result<(), Trus
     let last_index = chain.len().saturating_sub(1);
 
     for (index, (path, facts)) in chain.iter().enumerate() {
-        let at = path.display().to_string();
         let facts = match facts {
             Ok(facts) => facts,
             Err(reason) => {
                 return Err(TrustError::Unreadable {
-                    at,
+                    at: path.display().to_string(),
                     reason: reason.clone(),
                 });
             }
         };
-
-        // Kind first: a symlink's uid and mode are meaningless, because the
-        // thing that would be read is whatever it points at.
-        match facts.kind {
-            Kind::Symlink => return Err(TrustError::Symlink { at }),
-            Kind::Other => return Err(TrustError::WrongKind { at }),
-            Kind::File if index != last_index => {
-                return Err(TrustError::AncestorNotDirectory { at });
-            }
-            Kind::File | Kind::Directory => {}
-        }
-
-        if facts.uid != TRUSTED_UID {
-            return Err(TrustError::NotRootOwned { at, uid: facts.uid });
-        }
-
-        if facts.mode & FORBIDDEN_WRITE_BITS != 0 {
-            return Err(TrustError::Writable {
-                at,
-                mode: facts.mode,
-            });
-        }
+        check_component(path, facts, index == last_index, TRUSTED_UID)?;
     }
 
+    Ok(())
+}
+
+/// Checks one component: what it is, who owns it, and who can write it.
+///
+/// `owner` is always [`TRUSTED_UID`] outside this module's tests; it is a
+/// parameter only so the descriptor-reading code below can be exercised on a
+/// directory a test created, without root.
+fn check_component(
+    path: &Path,
+    facts: &PathFacts,
+    is_last: bool,
+    owner: u32,
+) -> Result<(), TrustError> {
+    let at = path.display().to_string();
+
+    // Kind first: a symlink's uid and mode are meaningless, because the thing
+    // that would be read is whatever it points at.
+    match facts.kind {
+        Kind::Symlink => return Err(TrustError::Symlink { at }),
+        Kind::Other => return Err(TrustError::WrongKind { at }),
+        Kind::File if !is_last => return Err(TrustError::AncestorNotDirectory { at }),
+        Kind::File | Kind::Directory => {}
+    }
+
+    if facts.uid != owner {
+        return Err(TrustError::NotRootOwned { at, uid: facts.uid });
+    }
+
+    if facts.mode & FORBIDDEN_WRITE_BITS != 0 {
+        return Err(TrustError::Writable {
+            at,
+            mode: facts.mode,
+        });
+    }
     Ok(())
 }
 
@@ -301,6 +320,172 @@ pub fn verify_path(target: &Path) -> Result<(), TrustError> {
         })
         .collect();
     verify(&facts)
+}
+
+/// The facts in a `stat` result.
+///
+/// `st_mode` is a `u32` on Linux and a `u16` on macOS, so the widening below
+/// is a real conversion on one platform and an identity on the other.
+#[allow(clippy::useless_conversion)]
+fn facts_of(stat: &rustix::fs::Stat) -> PathFacts {
+    let raw = stat.st_mode;
+    let kind = match rustix::fs::FileType::from_raw_mode(raw) {
+        rustix::fs::FileType::Directory => Kind::Directory,
+        rustix::fs::FileType::RegularFile => Kind::File,
+        rustix::fs::FileType::Symlink => Kind::Symlink,
+        _ => Kind::Other,
+    };
+    PathFacts {
+        uid: stat.st_uid,
+        mode: u32::from(rustix::fs::Mode::from_raw_mode(raw).bits()) & 0o7777,
+        kind,
+    }
+}
+
+/// Shapes any failure to read something already judged trustworthy.
+fn or_unreadable<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    at: &Path,
+) -> Result<T, TrustError> {
+    result.map_err(|e| TrustError::Unreadable {
+        at: at.display().to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// Opens `name` under `base` without following a link, and checks it on the
+/// descriptor just opened.
+///
+/// When the open itself fails, the component is examined — still without
+/// following — so a link is reported as a link and a file where a directory
+/// must be is reported as that, rather than as a bare `ELOOP` or `ENOTDIR`.
+fn open_checked(
+    base: BorrowedFd<'_>,
+    name: &OsStr,
+    path: &Path,
+    directory: bool,
+    is_last: bool,
+    owner: u32,
+) -> Result<OwnedFd, TrustError> {
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    match openat(base, name, flags, Mode::empty()).and_then(|fd| fstat(&fd).map(|st| (fd, st))) {
+        Ok((fd, stat)) => {
+            check_component(path, &facts_of(&stat), is_last, owner)?;
+            Ok(fd)
+        }
+        Err(errno) => {
+            if let Ok(stat) = statat(base, name, AtFlags::SYMLINK_NOFOLLOW) {
+                check_component(path, &facts_of(&stat), is_last, owner)?;
+            }
+            or_unreadable(Err(errno), path)
+        }
+    }
+}
+
+/// Opens `target` read-only, having verified every component on the
+/// descriptor it was opened through.
+///
+/// The walk starts at `/` and opens one component at a time relative to its
+/// parent's descriptor, never following a link, so the thing checked is the
+/// thing opened: there is no window in which a component can be swapped after
+/// its check. This is the per-component `O_NOFOLLOW` walk; `openat2`'s
+/// `RESOLVE_NO_SYMLINKS` would do the same in one call where the kernel has it,
+/// and nothing is lost without it.
+///
+/// # Errors
+///
+/// [`TrustError::NotAbsolute`] for a path that cannot be walked as written, and
+/// otherwise the first component that fails, as [`verify`] would report it.
+pub fn open_trusted(target: &Path) -> Result<OwnedFd, TrustError> {
+    open_trusted_as(target, TRUSTED_UID)
+}
+
+fn open_trusted_as(target: &Path, owner: u32) -> Result<OwnedFd, TrustError> {
+    let not_absolute = TrustError::NotAbsolute {
+        at: target.display().to_string(),
+    };
+    let chain = chain_to(target).ok_or(not_absolute.clone())?;
+    let last = chain.len().saturating_sub(1);
+    let mut current: Option<OwnedFd> = None;
+    for (index, path) in chain.iter().enumerate() {
+        // The first component is `/` itself; every other is a plain name.
+        let name = path.file_name().unwrap_or(path.as_os_str());
+        let base = current.as_ref().map_or(CWD, AsFd::as_fd);
+        current = Some(open_checked(
+            base,
+            name,
+            path,
+            index < last,
+            index == last,
+            owner,
+        )?);
+    }
+    current.ok_or(not_absolute)
+}
+
+/// One rule file, read through a verified descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedFile {
+    /// Its name within the directory, as the bytes the kernel returned.
+    pub name: OsString,
+    /// Its contents.
+    pub bytes: Vec<u8>,
+}
+
+/// Reads every `*.toml` file in `dir`, each through a descriptor checked on
+/// open, with `dir` and every component above it verified the same way.
+///
+/// This is how the privileged gate must load the ruleset. Verifying the path
+/// and then reading it by name leaves a window in which any component can be
+/// swapped; reading through descriptors that were themselves checked does not.
+/// Files are returned sorted by name, the order rules are evaluated in.
+///
+/// # Errors
+///
+/// The first component or file that fails, or any read failure.
+pub fn read_trusted_dir(dir: &Path) -> Result<Vec<TrustedFile>, TrustError> {
+    let fd = open_trusted(dir)?;
+    read_toml_at(fd.as_fd(), dir, TRUSTED_UID)
+}
+
+/// The descriptor half of [`read_trusted_dir`], for a directory already open.
+fn read_toml_at(
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    owner: u32,
+) -> Result<Vec<TrustedFile>, TrustError> {
+    let names = or_unreadable(
+        Dir::read_from(dir).and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|e| e.file_name().to_bytes().to_vec()))
+                .collect::<Result<Vec<Vec<u8>>, _>>()
+        }),
+        path,
+    )?;
+    let mut names: Vec<Vec<u8>> = names
+        .into_iter()
+        .filter(|name| name.ends_with(b".toml"))
+        .collect();
+    names.sort();
+
+    let mut files = Vec::new();
+    for name in names {
+        let name = OsString::from_vec(name);
+        let file_path = path.join(&name);
+        let fd = open_checked(dir, &name, &file_path, false, true, owner)?;
+        // The component check refuses a link, a socket, a device, and a fifo.
+        // A directory named `*.toml` passes it, because a directory may be the
+        // last component of a path; it is refused here instead, by the read,
+        // which fails with EISDIR. Nothing else that passes the check can fail
+        // to read, so one refusal path covers both.
+        let mut bytes = Vec::new();
+        or_unreadable(std::fs::File::from(fd).read_to_end(&mut bytes), &file_path)?;
+        files.push(TrustedFile { name, bytes });
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -634,5 +819,180 @@ mod tests {
         assert!(format!("{error:?}").contains("NotAbsolute"));
         assert!(format!("{:?}", Kind::Symlink).contains("Symlink"));
         assert_eq!(Kind::File, Kind::File);
+    }
+
+    // --- the descriptor walk --------------------------------------------
+
+    /// A root-owned regular file whose every ancestor is root's, on every
+    /// platform this builds for.
+    const TRUSTED_FILE: &str = "/usr/bin/true";
+
+    /// A directory only root may search.
+    #[cfg(target_os = "linux")]
+    const ROOT_ONLY: &str = "/root";
+    #[cfg(not(target_os = "linux"))]
+    const ROOT_ONLY: &str = "/private/var/root";
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join(format!("tw-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open_dir(dir: &Path) -> OwnedFd {
+        rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap()
+    }
+
+    #[test]
+    fn a_root_owned_file_opens_through_verified_descriptors() {
+        let fd = open_trusted(Path::new(TRUSTED_FILE)).unwrap();
+        assert_eq!(facts_of(&fstat(&fd).unwrap()).kind, Kind::File);
+        assert!(read_trusted_dir(Path::new("/usr/bin")).is_ok());
+    }
+
+    #[test]
+    fn a_path_through_a_symlink_is_refused_on_the_descriptor_walk() {
+        // Merged-/usr Linux has /bin -> usr/bin; macOS has /tmp -> private/tmp.
+        let through_link = ["/bin/sh", "/tmp", "/etc/hosts"]
+            .into_iter()
+            .find(|candidate| {
+                chain_to(Path::new(candidate))
+                    .unwrap()
+                    .iter()
+                    .any(|c| std::fs::symlink_metadata(c).is_ok_and(|m| m.is_symlink()))
+            })
+            .expect("this host has no symlink on any candidate path");
+        let err = open_trusted(Path::new(through_link)).unwrap_err();
+        assert!(
+            err.to_string().contains("symbolic link"),
+            "{through_link}: {err}"
+        );
+    }
+
+    #[test]
+    fn a_file_where_a_directory_must_be_is_refused_on_the_walk() {
+        let err = open_trusted(&Path::new(TRUSTED_FILE).join("rules.d")).unwrap_err();
+        assert_eq!(
+            err,
+            TrustError::AncestorNotDirectory {
+                at: TRUSTED_FILE.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unsearchable_component_fails_closed() {
+        let err = open_trusted(Path::new("/usr/definitely-not-here")).unwrap_err();
+        assert!(err.to_string().contains("cannot be inspected"), "{err}");
+
+        // Root may search anything, so the refusal is only observable without it.
+        let searchable = std::fs::read_dir(ROOT_ONLY).is_ok();
+        let outcome = open_trusted(&Path::new(ROOT_ONLY).join("rules.d"));
+        assert!(
+            searchable || outcome.is_err_and(|e| e.to_string().contains("cannot be inspected")),
+            "an unsearchable directory must refuse"
+        );
+
+        assert!(
+            open_trusted(Path::new("relative/rules.d"))
+                .unwrap_err()
+                .to_string()
+                .contains("not absolute")
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_not_root_owned_on_the_walk() {
+        let err = open_trusted(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap_err();
+        assert!(err.to_string().contains("not root"), "{err}");
+    }
+
+    #[test]
+    fn reading_a_file_as_a_directory_fails_closed() {
+        let err = read_trusted_dir(Path::new(TRUSTED_FILE)).unwrap_err();
+        assert!(err.to_string().contains("cannot be inspected"), "{err}");
+    }
+
+    #[test]
+    fn rule_files_are_read_in_order_through_their_own_descriptors() {
+        let dir = scratch_dir("ordered");
+        std::fs::write(dir.join("20-b.toml"), "b").unwrap();
+        std::fs::write(dir.join("10-a.toml"), "a").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let files = read_toml_at(open_dir(&dir).as_fd(), &dir, me).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                TrustedFile {
+                    name: "10-a.toml".into(),
+                    bytes: b"a".to_vec()
+                },
+                TrustedFile {
+                    name: "20-b.toml".into(),
+                    bytes: b"b".to_vec()
+                },
+            ]
+        );
+        // Someone else's files are refused, named by file.
+        let err = read_toml_at(open_dir(&dir).as_fd(), &dir, me.wrapping_add(1)).unwrap_err();
+        assert!(err.to_string().contains("10-a.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_file_that_is_a_link_a_directory_or_a_socket_is_refused() {
+        let cases: [(&str, &str); 3] = [
+            ("link", "symbolic link"),
+            ("dir", "Is a directory"),
+            ("sock", "not a directory or a regular file"),
+        ];
+        for (shape, expect) in cases {
+            let dir = scratch_dir(&format!("shape-{shape}"));
+            let target = dir.join("10-x.toml");
+            match shape {
+                "link" => {
+                    std::fs::write(dir.join("real"), "x").unwrap();
+                    std::os::unix::fs::symlink(dir.join("real"), &target).unwrap();
+                }
+                "dir" => std::fs::create_dir(&target).unwrap(),
+                _ => drop(std::os::unix::net::UnixListener::bind(&target).unwrap()),
+            }
+            let me = std::fs::metadata(&dir).unwrap().uid();
+            let err = read_toml_at(open_dir(&dir).as_fd(), &dir, me).unwrap_err();
+            assert!(err.to_string().contains(expect), "{shape}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_writable_or_unreadable_rule_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("writable");
+        let file = dir.join("10-x.toml");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let err = read_toml_at(open_dir(&dir).as_fd(), &dir, me).unwrap_err();
+        assert!(
+            err.to_string().contains("writable by group or world"),
+            "{err}"
+        );
+
+        // Unreadable: the check passes on what `stat` sees, and the open still
+        // refuses. Root reads anything, so this is only observable without it.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read(&file).is_ok();
+        let outcome = read_toml_at(open_dir(&dir).as_fd(), &dir, me);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            readable || outcome.is_err_and(|e| e.to_string().contains("cannot be inspected")),
+            "an unreadable rule file must refuse"
+        );
     }
 }

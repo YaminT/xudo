@@ -51,7 +51,7 @@ pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints};
 pub use source::{DirSource, MapSource, ProcSource};
-pub use trust::{PathFacts, TrustError, verify_path};
+pub use trust::{PathFacts, TrustError, TrustedFile, open_trusted, read_trusted_dir, verify_path};
 
 // Re-exported so a consumer does not need to depend on aido-policy just to
 // name the types this crate returns.
