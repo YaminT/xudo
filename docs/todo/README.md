@@ -8,7 +8,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 ## Where the project actually stands
 
-> **Status, 2026-08-28.** M1 complete. M2 split: **M2a done**, M2b blocked on a Linux VM. **Phase 5 part 1 done** (`aido-config`). Next unblocked item is **phase 4, `ido`**. Read `../CONCERNS.md` first — it carries the blocker, the decisions, and what is still open.
+> **Status, 2026-10-14.** M1 complete. M2 split: **M2a done**, M2b not started. **Phase 5 part 1 done** (`aido-config`). **Phase 4 done** (`ido`, `ido-bin`, `term-sanitize`). The differential matrix runs in CI and trips the day an exec path appears. Next is **M2b**: Docker now gives a real Linux kernel to run privileged tests in, so the old "blocked on a VM" no longer holds for most of it. Read `../CONCERNS.md` first — it carries the decisions and what is still open.
 
 **Done.** Six crates, and a working executable.
 
@@ -20,6 +20,9 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 | `aido-config` | Layered configuration: precedence, origin tracking, the narrowing-only project layer, and XDG path resolution (phase 5 part 1) |
 | `aido` | The unprivileged front-end library |
 | `aido-bin` | The five-line `aido` entry point, in its own package so the library is measured exactly once |
+| `ido` | The buffered human-run command queue: queue file, derived status, picker state machine, runner, `AGENTS.md` splicer (phase 4) |
+| `ido-bin` | The `ido` executable and its raw terminal, tested through real processes and a pseudo-terminal |
+| `term-sanitize` | Display-only sanitizer for agent-written terminal text, shared by `ido` and the future `aido` prompt |
 | `aido-tests` | Reserved for the executing half of the differential matrix; the unprivileged half is `ci/differential/`, run by `just differential` (binary process tests live in `aido-bin/tests`) |
 
 `aido explain`, `why-not`, `check`, `list`, `doctor`, and `agentdoc` all work. Four starter rule files ship and are tested as code.
@@ -103,7 +106,8 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
 2. M2a                 DONE — backend model, snippets, install plan. No syscalls.
 3. Phase 5 (part 1)    DONE — aido-config: precedence, origins, narrowing-only
                        project layer, XDG paths, `aido config [--schema]`.
-4. Phase 4             ido. No privilege at all. Highest value per unit of risk.
+4. Phase 4             DONE 2026-10-14 — ido: queue, picker, runner, `ido add`,
+                       the willyoumarryme acceptance test, man pages.
 5. M2b                 BLOCKED ON A VM — the gate's syscalls, the real sudo hop,
                        the functional probe, the executing half of the
                        differential matrix. The unprivileged half runs in CI

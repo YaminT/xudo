@@ -1,5 +1,11 @@
 # Phase 4 — `ido`, the buffered human-run command queue
 
+> **DONE 2026-10-14.** Every deliverable below exists, with two deliberate
+> departures recorded in `../CONCERNS.md`: the picker is built on `rustix`
+> termios rather than `ratatui` + `crossterm`, and the `AGENTS.md` splicer is a
+> module of `ido` rather than its own crate. § 8, the integration with `aido`,
+> is not built.
+
 An agent queues the commands it cannot or should not run. The human runs `ido`, sees the queue in a full-screen picker, chooses what to run, and runs it in their own terminal.
 
 ---

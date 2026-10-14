@@ -4,6 +4,82 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-14 — phase 4 done: `ido`
+
+### What exists
+
+`ido` is the queue an agent writes and a human reads. `crates/ido` is the
+library, at 100% lines, regions, and functions with no waivers; `crates/ido-bin`
+is the executable, excluded from coverage like `aido-bin` and tested through
+real processes instead. Every command in `todo/phase-4-ido.md` § 2 exists:
+`queue`, `add`, `list`, `run`, `drop`, `log`, `celebrate`, and the bare picker.
+`willyoumarryme` is the same binary under a second name. Every row of the
+adversarial table in § 7 is a test, the acceptance test is
+`an_agent_queues_and_the_human_runs_it`, and
+`the_picker_runs_the_selection_on_a_real_terminal` types into the real picker on
+a pseudo-terminal, on macOS and in a Linux container. `ido(1)` and
+`ido-queue(5)` are in `docs/man/`, and a test fails if a subcommand is missing
+from the page.
+
+### The half-built crate had never compiled
+
+`crates/ido` had sat untracked since 2026-09-04 with `lib.rs` naming two modules
+that did not exist. Two of its tests were wrong in ways a compiler run would
+have shown at once: one asserted that the two-character message `no` was longer
+than five characters, and the queue was described as safe from other users
+without anything checking. Both are fixed; the second is now a real check.
+
+### Decisions worth knowing
+
+- **No `ratatui`, no `crossterm`.** `deny.toml` forbids a second version of any
+  crate, and those two bring a large tree. Raw mode needs three calls, and
+  `rustix` — already in the lockfile through `tempfile` and `terminal_size` —
+  exposes them safely, so `forbid(unsafe_code)` holds in `ido-bin` too. The
+  picker itself is a pure state machine in the library: keys in, actions and a
+  text frame out.
+- **The lock is never held while a command runs.** A `terraform apply` can take
+  twenty minutes, and an agent's `ido queue` in that window must not fail. So
+  each entry is re-read and re-checked under the lock immediately before it
+  starts, and the result is recorded under the lock afterwards. A step whose
+  predecessor just failed, or an entry dropped from another terminal, is skipped
+  rather than run on a decision made before the facts changed.
+- **Another user's queue is refused, not read.** A queue directory or file owned
+  by someone else, or writable by group or world, is refused, checked on the
+  opened descriptor. Whoever can write the queue chooses what the human runs
+  next. The uid comes from the binary, so the refusal is testable.
+- **A `--dry-run-of` preview is shown, never run automatically.** The spec asked
+  for its cached output at selection time. But the preview is a command the
+  agent wrote, and running it when the human merely highlights an entry is
+  executing agent input without consent. The picker shows it, labelled.
+- **"Unblock and continue" is dropping the failed step.** The spec asked for an
+  explicit override. Dropping is already explicit, already confirmed with `y`,
+  and leaves no flag that skips a dependency silently. `run --all` leaves
+  failed entries alone; retrying one is `ido run <id>`.
+- **Typed confirmation** — the word `run` — is required for more than one entry
+  and for anything that elevates, drives a cloud CLI, or has a lookalike
+  command name. A single low-consequence entry runs on space then enter.
+  `ido run` outside the picker asks for the same word on a terminal; `--yes` is
+  refused there and required without one.
+- **What is refused rather than altered:** argv that is not UTF-8, an identical
+  command already queued (it answers with the existing id), and a relative
+  `ido add` path that leaves the current directory.
+- **`ido list --json` is pure ASCII.** The argv is exact, but every non-ASCII
+  character is a `\u` escape, so the JSON cannot carry a bidi override to the
+  terminal it is printed on.
+- **The splicer is a module, not an `ido-doc` crate.** It has one consumer.
+
+### Not done
+
+- § 8, the integration with `aido`: denials that queue themselves, and queued
+  entries run through `aido exec`. `aido exec` does not exist yet.
+- Cloud profiles that come from the environment (`AWS_PROFILE`) are not shown;
+  only the ones in the argv are. Showing them means reading the human's
+  environment at render time, which the library deliberately does not do.
+- `queued_by` recognises only `CLAUDECODE`. It is a hint, shown as unverified.
+- Packaging the second name as a hardlink is phase 3's job.
+
+---
+
 ## 2026-10-13 — the differential matrix is wired, and it found two more bugs of one kind
 
 ### The tripwire fired, as designed, and is now a job
