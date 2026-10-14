@@ -1,0 +1,68 @@
+.TH IDO-QUEUE 5 "2026-10-14" "ido 0.0.1" "File Formats"
+.SH NAME
+ido-queue \- the queue file read by ido
+.SH LOCATION
+.I $XDG_STATE_HOME/ido/queue.jsonl
+(default
+.IR ~/.local/state/ido/queue.jsonl ).
+Under state rather than runtime, so a queue survives a logout.
+The lock is
+.IR $XDG_RUNTIME_DIR/ido/lock ,
+or a directory under state when that variable is unset.
+Nothing is ever placed under
+.IR /tmp .
+.PP
+One queue per user.
+There is no shared queue: a shared queue is a way for one user to get another
+user to run their command.
+.SH PERMISSIONS
+The directory is created
+.B 0700
+and the file
+.BR 0600 .
+.B ido
+refuses to read a queue directory or file that belongs to another user or is
+writable by group or world, checked on the opened descriptor.
+.SH FORMAT
+One JSON object per line.
+A line this version cannot parse refuses the whole file; unknown keys are an
+error, never ignored.
+.TP
+.B schema_version
+Always 1 in this version.
+.TP
+.B id
+Monotonic, unique within the file's history.
+.TP
+.B argv
+The command, as an array of strings, executed exactly as stored with no shell.
+.TP
+.BR reason ", " group ", " step ", " needs ", " cwd ", " dry_run_of
+As given to
+.BR "ido queue" .
+All are untrusted text and are sanitized before display.
+.TP
+.B queued_at
+Unix seconds.
+.TP
+.B queued_by
+Who queued it, by the caller's own claim; shown as unverified.
+.TP
+.BR attempts ", " last_exit
+Set when a run fails.
+A successful run removes the entry.
+.PP
+Status is never stored.
+Whether an entry is ready, blocked, halted, failed, or stale is derived from
+the queue each time it is read, so it cannot drift from the facts.
+An entry older than seven days is shown as stale and is never removed
+automatically;
+.B ido drop \-\-stale
+removes stale entries.
+.SH WRITING
+Queueing appends one line under the lock.
+Every other change writes a temporary file beside the queue, syncs it, and
+renames it into place.
+The lock is held for milliseconds and never while a command runs.
+.SH SEE ALSO
+.BR ido (1)

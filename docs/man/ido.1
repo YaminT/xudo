@@ -1,0 +1,213 @@
+.TH IDO 1 "2026-10-14" "ido 0.0.1" "User Commands"
+.SH NAME
+ido \- a queue of commands an agent asked you to run
+.SH SYNOPSIS
+.B ido
+.br
+.B ido queue
+.RB [ \-m
+.IR text ]
+.RB [ \-\-group
+.IR name ]
+.RB [ \-\-step
+.IR n ]
+.RB [ \-\-needs
+.IR id ]...
+.RB [ \-\-cwd
+.IR dir ]
+.RB [ \-\-dry\-run\-of
+.IR arg ]...
+.B \-\-
+.I command
+.RI [ arg ...]
+.br
+.B ido add
+.RI [ path ]
+.br
+.B ido list
+.RB [ \-\-json ]
+.br
+.B ido run
+.RI { id ...
+|
+.B \-\-group
+.I name
+|
+.BR \-\-all }
+.RB [ \-\-yes ]
+.RB [ \-\-no\-animation ]
+.br
+.B ido drop
+.RI { id ...
+|
+.B \-\-all
+|
+.BR \-\-stale }
+.br
+.B ido log
+.RB [ \-n
+.IR count ]
+.br
+.B ido celebrate
+.RB [ \-\-no\-animation ]
+.SH DESCRIPTION
+An agent queues the commands it cannot or should not run.
+You run
+.BR ido ,
+see the queue, and choose what to run, in your own terminal.
+Nothing runs without a keystroke from you.
+.PP
+.B ido
+holds no privilege.
+It gates on consequence, not on uid: a queued
+.B sudo
+command asks for your password as it always would, and a cloud command that
+needs no root is shown with the profile, region, or project it would act on.
+.PP
+Every field in the queue was written by the agent.
+Before anything is shown, escape sequences, control characters,
+bidirectional overrides, and invisible characters are removed, and a command
+name containing non-ASCII characters is flagged as a possible lookalike.
+The command is shown token by token and executed exactly as stored, with no
+shell involved.
+.SH COMMANDS
+.TP
+.B ido
+On a terminal, opens the picker.
+Without a terminal on both standard input and standard output, behaves as
+.B ido list
+and runs nothing.
+.TP
+.B queue
+Buffers one command and prints its id.
+Never waits.
+The command is a real argument vector after
+.BR \-\- ;
+a shell string is not accepted.
+The same command, directory, group, and step already queued is not queued
+again.
+A
+.B \-\-needs
+id must already be queued, so a dependency cycle cannot be written.
+.TP
+.B add
+Writes the agent instructions between
+.B <!\-\- ido:begin
+and
+.B <!\-\- ido:end \-\->
+markers in
+.BR AGENTS.md ,
+or in the named
+.BR CLAUDE.md ,
+.BR GEMINI.md ,
+.BR .cursorrules ,
+or
+.BR copilot\-instructions.md .
+A second run updates the block; text outside the markers is kept byte for
+byte.
+The first change backs the original up to
+.IB file .ido\-backup .
+A relative path may not leave the current directory, and a symlink is
+refused.
+.TP
+.B list
+Prints the queue.
+.B \-\-json
+prints the exact argv of each entry, as ASCII JSON.
+.TP
+.B run
+Runs entries in order and stops at the first failure.
+On a terminal, shows what will run and asks you to type
+.BR run ;
+.B \-\-yes
+skips that and is refused on a terminal.
+Without a terminal,
+.B \-\-yes
+is required.
+.B \-\-all
+leaves failed entries for an explicit retry by id.
+.TP
+.B drop
+Discards entries.
+Dropping an entry satisfies whatever depends on it.
+.TP
+.B log
+Shows what was run and how it exited, from a hash-chained log that
+.B aido audit
+can verify.
+.TP
+.B celebrate
+Plays a short abstract animation and prints
+.BR "ido works." .
+The same binary installed as
+.B willyoumarryme
+does the same, so that name works as a queued command.
+.SH THE PICKER
+.TP
+.BR \(ua " " \(da " " j " " k
+Move.
+.TP
+.B space
+Select or unselect.
+A blocked or halted entry cannot be selected, and the reason is shown.
+.TP
+.B g
+Select every step of the highlighted entry's group.
+.TP
+.B enter
+Run the selection.
+With nothing selected, nothing runs.
+More than one entry, or any entry that elevates, drives a cloud CLI, or has a
+lookalike command name, needs the word
+.B run
+typed out.
+.TP
+.B d
+Drop the selection, or the highlighted entry, after
+.BR y .
+.TP
+.B p
+Show the highlighted entry token by token, with its directory.
+A
+.B \-\-dry\-run\-of
+preview is shown, never run automatically.
+.TP
+.BR q ", " esc
+Quit.
+.SH GROUPS
+Steps of a group run one at a time, in step order.
+A step is blocked until the step before it has exited 0.
+If a step fails, the rest of its group is halted; retry the failed step by id,
+or drop it to unblock the rest.
+.SH EXIT STATUS
+.TP
+.B 0
+Everything asked for happened.
+.TP
+.B 1
+A command failed, an entry was not runnable when its turn came, the
+confirmation was not given, or a file could not be read or written.
+.TP
+.B 2
+The request was refused before anything ran.
+.SH ENVIRONMENT
+.TP
+.BR XDG_STATE_HOME ", " XDG_RUNTIME_DIR
+Where the queue and its lock live; see
+.BR ido\-queue (5).
+.TP
+.B NO_COLOR
+Disables colour.
+.TP
+.B IDO_NO_ANIMATION
+Disables the celebration animation.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/ido/queue.jsonl
+The queue.
+.TP
+.I $XDG_STATE_HOME/ido/log.jsonl
+The run log.
+.SH SEE ALSO
+.BR ido\-queue (5),
+.BR aido (1)

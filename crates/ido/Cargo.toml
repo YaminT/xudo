@@ -1,0 +1,21 @@
+[package]
+name = "ido"
+description = "Buffered human-run command queue: an agent queues what it cannot or should not run, the human picks and runs it in their own terminal. No root, no broker, no policy engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
+aido-config = { path = "../aido-config", version = "0.0.1" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+term-sanitize = { path = "../term-sanitize", version = "0.0.1" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

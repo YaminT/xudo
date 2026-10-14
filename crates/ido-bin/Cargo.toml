@@ -1,0 +1,42 @@
+[package]
+name = "ido-bin"
+description = "The `ido` executable: collects the environment once, owns the raw terminal, and hands everything else to the ido library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package for the same reason as `aido-bin`: the library is compiled,
+# and therefore measured, exactly once. Excluded from coverage in the justfile;
+# its behaviour is asserted through real processes in `tests/`, including a
+# pseudo-terminal test that drives the picker with keystrokes.
+[[bin]]
+name = "ido"
+path = "src/main.rs"
+
+[dependencies]
+ido = { path = "../ido", version = "0.0.1" }
+# Raw mode, window size, and the uid, through rustix's safe API, so the
+# workspace-wide `forbid(unsafe_code)` holds here too. Already in the tree
+# through `tempfile` and `terminal_size`; no new crate.
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "termios",
+  "process",
+] }
+
+[dev-dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "termios",
+  "process",
+  "pty",
+  "fs",
+] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
