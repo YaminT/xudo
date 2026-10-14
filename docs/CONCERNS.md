@@ -4,6 +4,68 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-14 — M2b, first slice: the ruleset is checked on the descriptors it is read through
+
+### The hole this closes
+
+`trust.rs` verified the rules path by `lstat`-ing each component, and the loader
+then read the files by name. Between the two, any component could be swapped.
+`aido doctor` also checked only the *directory*, so a group-writable rule file
+inside a root-owned directory was reported trusted. CONCERNS has called this "a
+stated precondition of M2b" since 2026-08-28.
+
+`aido_sys::open_trusted` walks from `/` one component at a time, each opened
+relative to its parent's descriptor with `O_NOFOLLOW` (and `O_DIRECTORY` for
+ancestors), and runs the existing check on what `fstat` reports for the
+descriptor just opened. `aido_sys::read_trusted_dir` does that for the rules
+directory and then for every `*.toml` file in it, and reads the bytes through
+the same descriptor that was checked. The thing checked is the thing read.
+When an open fails, the component is examined with `fstatat` and no follow, so
+a link is still reported as a link and a file where a directory must be as
+that, rather than as a bare `ELOOP` or `ENOTDIR`.
+
+`aido doctor` reports through it now. The gate must load through it and nothing
+else; the front-end loader still reads by path so `aido explain` works on a
+checkout, and says so in its module documentation.
+
+### How it is tested without root
+
+The per-component check is now one pure function that `verify` and the
+descriptor walk share. The directory half takes an already-open descriptor and
+an owner, so a test can point it at a directory it created and name its own
+uid; the public functions always pass `TRUSTED_UID`, which stays a constant. The
+walk itself is tested against paths every supported host has: `/usr/bin/true`
+for the trusted case, `/bin` (merged-`/usr` Linux) or `/tmp` (macOS) for a link,
+`/root` or `/private/var/root` for a directory the caller may not search.
+
+`openat2` with `RESOLVE_NO_SYMLINKS` would do the walk in one call where the
+kernel has it. The per-component walk loses nothing without it and runs on
+every kernel this supports, so it is the only path for now.
+
+### Two test-environment facts worth knowing
+
+- **Docker Desktop's bind mount is not a faithful filesystem.** Run as root in a
+  container, the checkout appears root-owned, which breaks every "a checkout is
+  not root's" test, including one that predates this change. Run as a normal
+  user, a directory created a moment earlier can read as missing while sibling
+  directories are created and deleted in parallel: 1 run in 3 failed that way.
+  Copied onto the container's own filesystem, the same tests passed 15 times out
+  of 15. Run Linux tests as a non-root user, on a copy, not on the mount.
+- **One unexplained failure on macOS.** During one `just verify`, the `ido`
+  acceptance test saw `ido queue` exit non-zero with nothing on stderr. It did
+  not recur in five isolated runs or in two later full gates. A process killed
+  by a signal leaves no stderr, which fits a Docker build writing to the same
+  checkout at that moment, but that is unproven. If it recurs, look there first.
+
+### Not done in M2b
+
+The gate binary, the sudo hop, the functional post-install probe, `close_range`,
+`execveat` on a pinned descriptor, `PR_SET_NO_NEW_PRIVS`, the journald sink,
+executing the install plan, and the check for a filesystem mounted by a
+non-root user. Docker on this machine gives a real kernel for all of them.
+
+---
+
 ## 2026-10-14 — phase 4 done: `ido`
 
 ### What exists

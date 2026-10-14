@@ -108,7 +108,8 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        project layer, XDG paths, `aido config [--schema]`.
 4. Phase 4             DONE 2026-10-14 — ido: queue, picker, runner, `ido add`,
                        the willyoumarryme acceptance test, man pages.
-5. M2b                 BLOCKED ON A VM — the gate's syscalls, the real sudo hop,
+5. M2b                 STARTED 2026-10-14 — the ruleset is read through verified
+                       descriptors. Left: the gate's syscalls, the real sudo hop,
                        the functional probe, the executing half of the
                        differential matrix. The unprivileged half runs in CI
                        today (`just differential`) and trips when exec appears.
