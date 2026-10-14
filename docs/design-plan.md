@@ -2,6 +2,17 @@
 
 **Plan only. No code in this phase.**
 
+> **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
+>
+> - Twelve crates, not five. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase.
+> - No `unsafe` anywhere yet. `aido-sys::raw` arrives with M2b holding exactly four syscalls; rustix wraps the rest safely.
+> - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
+> - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
+> - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.
+> - Canonicalization does not split `--key=value`; fuzzing killed that in M1.
+> - Attestation on kernels before 6.5 is a ladder (`aido-sys::kernel`), not a single fallback.
+> - Linux verification is Docker, locally and in CI, not Lima; a VM is for the kernel-version matrix and M4's systemd scopes.
+
 ## Context
 
 AI coding agents (Claude Code, Codex CLI, Gemini CLI, Aider) constantly hit commands that need root: package installs, service restarts, `/etc/hosts` edits, sysctl tweaks. Today there are two options and both are bad. Either a human babysits every `sudo` password prompt — which destroys unattended agent work — or the user grants blanket `NOPASSWD: ALL`, which is a standing root backdoor available to *any* process running as that user.

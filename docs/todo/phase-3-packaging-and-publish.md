@@ -25,7 +25,7 @@ A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then t
 
 Therefore the beta package:
 
-- installs `/usr/bin/aido` and `/usr/libexec/aido/aido-gate-auth` only;
+- installs `/usr/bin/aido`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/aido/aido-gate` with `aido-gate-auth` as its hardlink, and `/usr/libexec/aido/aidod` with its socket unit — the broker mints requests and grants nothing a password did not;
 - installs the `PASSWD:` sudoers rule only;
 - does **not** install `aido-gate-nopass`, its hardlink, or its `NOPASSWD:` rule — those files are not in the package at all, rather than present-but-unreferenced;
 - does **not** add any user to the `aido` group (see § 3);
@@ -212,9 +212,9 @@ Run in containers, per distro, on both architectures.
 ## Deliverables
 
 - `debian/` packaging with hand-written maintainer scripts, or `cargo-deb` metadata plus script overrides.
-- `aido-keyring` package and a signed apt repository published to `gh-pages`.
+- Signed `.deb` artifacts on GitHub Releases. The `aido-keyring` package and the apt repository are deferred (open decision 3 in `README.md`); § 4's one-line install is written for the Releases form until then.
 - `.rpm`, `APKBUILD`, `PKGBUILD`, Nix module.
 - Signed release artifacts, SBOM, `cargo-auditable` build.
 - README, `SECURITY.md`, `CITATION.cff`, `AGENTS.md`, `llms.txt`, docs site with JSON-LD.
 - The container install/remove/purge matrix wired into CI.
-- Man pages for `aido(1)` and `aido-rules(5)`.
+- Man pages for `aido(1)` and `aido-rules(5)`; `ido(1)` and `ido-queue(5)` exist in `../man/` and a test keeps `ido(1)` in step with the command surface.

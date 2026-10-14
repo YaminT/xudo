@@ -67,15 +67,24 @@ Exit criterion: `aido explain -- apt-get install ripgrep` prints a matched rule 
 
 **M2a — done.** `crates/aido-backend`: the capability matrix, runtime backend detection, sudoers and doas snippet generation, and the ordered install/uninstall plan. All pure, all 100% covered. `aido doctor` now reports the backend, and correctly reports it as *unusable* on a host where a required directive cannot be confirmed.
 
-**M2b — needs a Linux VM.** Everything below.
+**M2b — in progress.** The first slice landed 2026-10-14: the ruleset is read through verified descriptors (`aido_sys::read_trusted_dir`), and `aido doctor` reports through it. What is left, in the order to build it:
 
-A hardened, always-prompting sudo front-end, complete without any agent concept. Backend adapter with runtime capability probing across sudo / sudo-rs / OpenDoas; snippet generation with `visudo -cf` on aido's own temp copy, inode verification, atomic rename, and a **functional** post-install probe rather than a file-existence check. `aido-gate` as the second independent policy engine with the full hardening set (`close_range` first, `/dev/null` substitution for closed fds, `statfs` `/proc` check, ancestor ownership walk from a pinned dirfd, `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`, `O_PATH` + `fstat` + digest pin + `execveat(fd, "", AT_EMPTY_PATH)`, environment rebuilt from an allowlist, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation). Audit subsystem: journald primary, `AF_UNIX /dev/log` fallback, hash-chained JSONL secondary with `fdatasync` before returning. `aido doctor [--json] [--fix]` including the every-other-path-to-root report.
+0. **A Linux test harness, before any syscall code.** `just linux-test`: the workspace copied into a Docker container and the suite run there as a non-root user. Not on the bind mount, which misreports the checkout as root-owned and intermittently loses a directory created a moment earlier; and not as root, under which file modes are not enforced and every refusal test passes vacuously. Containers give a real kernel for everything in M2b and M3. A VM is needed only for the kernel-version matrix and for M4's systemd scopes.
+1. **`aido-sys::raw`**, the planned unsafe module, now with a known contents list. rustix 1.1 wraps `openat2`, `pidfd_open`, `fstatfs`, and `PR_SET_NO_NEW_PRIVS` safely. It does not wrap `close_range`, `SO_PEERPIDFD`, or `PIDFD_GET_INFO`, and its `execveat` is `unsafe`. Those four go in `raw`, each behind the `PrivilegedOps` trait with an in-memory fake, with the line budget in the module docs. Nothing else in the workspace lifts `forbid(unsafe_code)`.
+2. **A minimal `aidod`, pulled forward from M3.** The gate as built refuses with `NoPendingRequest` unless a root-minted entry exists under `/run/aido/req`, and only a root daemon can mint one, so the human path cannot work without a broker. M2b's `aidod` does exactly this: accept a connection on `/run/aido/broker.sock` (systemd socket activation), identify the peer by the attestation ladder in `kernel.rs`, classify it `Unattested` (no cgroup lookup until M4), evaluate, mint the entry, return the nonce. No confirmation channel, no `freeze`, no cgroup classification.
+3. **`aido exec -- <argv>`** in the front-end: the same matching as `explain`, then the broker round-trip, then exec of `sudo /usr/libexec/aido/aido-gate-auth` (or `doas`), with the backend's exit status passed through. A denial whose remediation is "a human must run this" prints the exact `ido queue` line to run instead. That is phase 4 § 8, first half; the second half (`ido` running an entry through `aido exec`) is M6.
+4. **`aido-gate-bin`**: the executable, in its own package like `aido-bin`, installed as `/usr/libexec/aido/aido-gate` with `aido-gate-auth` as a hardlink; `aido-gate-nopass` is not shipped until M4. `close_range` first, `/dev/null` substitution for closed standard descriptors, the `statfs` check on `/proc`, the lineage walk gate → sudo/doas → `aido` pinned by `(pid, starttime)`, the ruleset through `read_trusted_dir`, `O_PATH` + `fstat` + digest pin, `execveat(fd, "", AT_EMPTY_PATH)`, the environment from `aido_gate::child_environment`, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation.
+5. **Executing the install plan**: `aido install` without `--dry-run`. `visudo -cf` on the candidate, inode check, atomic rename, and the functional post-install probe the plan already describes.
+6. **Audit sinks**: the hash-chained JSONL file under `/var/lib/aido` with `fdatasync` before returning (the chain itself exists and `ido` already writes one), and the journald sink.
+7. **The one trust check still missing**: a ruleset on a filesystem mounted by a non-root user, from `/proc/self/mountinfo`.
+8. **The executing half of the differential matrix**, in `aido-tests`: the same ruleset run *through* sudo, sudo-rs, and OpenDoas with identical outcomes. `ci/differential/row.sh` fails the build demanding it the moment `doctor` stops reporting the exec path as absent.
 
-Needs a Linux VM in the loop for the first time (Lima locally, containers in CI).
+One decision, recorded here because the gate's code depends on it: **on the password path, the password is the confirmation.** A rule with `confirm = "always"` yields `allow_with_confirmation`. On the agent path that goes to the out-of-band channel (M3). On the human path it is satisfied by sudo's PAM conversation on the fresh pty, a channel the requesting process tree cannot answer without the secret. The gate knows which path it is on from `argv[0]`: `aido-gate-auth` means a password was typed, so `aido_gate::demanded_confirmation` bites on the `-nopass` name only.
 
-### M3 — broker and out-of-band confirmation
 
-Still no passwordless path. `aidod` socket-activated, `SO_PEERPIDFD` + `PIDFD_GET_INFO` peer identification with the `SO_PEERCRED` + `(pid, starttime)` fallback, namespace-divergence guard, gate-lineage walking. One-use nonce records with absolute monotonic deadlines. The confirmation channel layer: `aido watch`, the ownership-verified session TTY, `aido approve|deny|pending`, and **DENY when no channel is live**. Full prompt-integrity work: ANSI/C0/C1 and bidi-override stripping, typed-token responses, a human reaction-time floor, request de-duplication with exponential backoff. `aido freeze`/`thaw`.
+### M3 — out-of-band confirmation
+
+Still no passwordless path. The broker and its one-use nonce records arrive with M2b; this milestone adds the confirmation state machine to it. The namespace-divergence guard. The channel layer: `aido watch`, the ownership-verified session TTY, `aido approve|deny|pending`, and **DENY when no channel is live**. Prompt integrity: every agent-written string through `term-sanitize` (built, shared with `ido`), typed-token responses, a human reaction-time floor, request de-duplication with exponential backoff. Absolute monotonic deadlines; timeout → deny, with the front-end receiving a structured pending-then-denied envelope rather than a hang. `aido freeze`/`thaw`.
 
 Confirmation is purely additive here — every path still needs a password — so this ships as a safety upgrade with no new authentication surface, and it proves the hardest architectural claim before anything depends on it.
 
@@ -109,12 +118,14 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
 4. Phase 4             DONE 2026-10-14 — ido: queue, picker, runner, `ido add`,
                        the willyoumarryme acceptance test, man pages.
 5. M2b                 STARTED 2026-10-14 — the ruleset is read through verified
-                       descriptors. Left: the gate's syscalls, the real sudo hop,
-                       the functional probe, the executing half of the
-                       differential matrix. The unprivileged half runs in CI
-                       today (`just differential`) and trips when exec appears.
+                       descriptors. Left, in order: the Linux test harness,
+                       aido-sys::raw, a minimal aidod (minting only), `aido exec`,
+                       aido-gate-bin, executing the install plan, the audit
+                       sinks, the executing half of the differential matrix.
 6. Phase 3             beta .deb + publish, human path only, no NOPASSWD shipped.
-7. M3                  broker + out-of-band confirmation.
+                       Ships aidod too: without the nopass hardlink it grants
+                       nothing a password did not.
+7. M3                  out-of-band confirmation on the broker from M2b.
 8. M4                  enrollment + the passwordless path.
 9. M5, M6              narrowing, grants, verbs, harness integration.
 10. Phase 5 (part 2)   predefined profiles, config introspection.
@@ -123,7 +134,8 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
 
 M2b moved down the list on purpose: writing syscall code that has never executed
 is the one thing most likely to produce a root exploit in this project, and
-`cargo check --target` is not evidence it works. The reasoning is in
+`cargo check --target` is not evidence it works. That is why the Linux test
+harness is M2b's step 0 and not an afterthought. The reasoning is in
 `../CONCERNS.md`.
 
 **Config layering moved earlier, and is now done.** The reasoning below is kept because it is why:
@@ -146,3 +158,8 @@ is the one thing most likely to produce a root exploit in this project, and
    signed `.deb` on Releases, no apt repo yet. Original text: or only signed `.deb` artifacts on GitHub Releases. The one-line install reads very differently in each case.
 4. ~~**Whether `ido` and `aido` are one package or two.**~~ **DECIDED:** one
    package; `ido` is not separately installable. Original text: They share the audit and config crates but have completely different privilege stories, and `ido` is installable by someone who does not want `aido` at all.
+5. **DECIDED 2026-10-14: the broker's minting half is M2b, not M3.** The gate acts only on a root-minted request, so a human path with no broker is a human path that cannot execute. M3 keeps the confirmation channels, `freeze`, and the namespace guard.
+6. **DECIDED 2026-10-14: on the password path, the password is the confirmation.** `confirm = "always"` reaches the out-of-band channel only on the passwordless path. See M2b above.
+7. **DECIDED 2026-10-14: the gate executable is `aido-gate-bin`**, the same shape as `aido-bin` and `ido-bin`, so the pure `aido-gate` library stays measured at 100% and the binary is tested through real processes.
+8. **DECIDED 2026-10-14: Linux tests run in Docker, as a non-root user, on a copy of the checkout.** A VM is for the kernel-version matrix and for M4's systemd scopes only. The old "blocked on a VM" was true of the machine, not of the work.
+9. **DECIDED 2026-10-14: `aido-sys::raw` holds exactly four syscalls** — `execveat`, `close_range`, `SO_PEERPIDFD`, `PIDFD_GET_INFO` — because rustix 1.1 wraps everything else the gate and broker need without `unsafe`.

@@ -4,6 +4,57 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-14 — plan review against the goal, and four corrections
+
+The eight requirements in `design-plan.md` were checked against the code. Two
+are met in full (the root-owned rule set; the tooling). Two — the sudo-like
+CLI that delegates to the backend, and the human being prompted — are M2b and
+are now the whole of the project's critical path; everything agent-related sits
+behind them. `ido` is outside the eight and done. The review found four places
+where the plan and the code had quietly parted, and the plan was wrong each
+time.
+
+**The gate cannot act without the broker, and the broker was a milestone
+later.** `aido-gate::decide` refuses with `NoPendingRequest` unless a
+root-minted entry exists under `/run/aido/req`, and only root can mint one.
+M2 was defined as "complete without any agent concept" with `aidod` in M3, so
+M2 as written could not execute anything. The minting half of the broker is
+now M2b; M3 keeps the confirmation channels. The alternative — the gate reading
+the question from its parent's `/proc/<pid>/cmdline` — was rejected: it would
+replace the one-use, generation-pinned record the gate was built and tested
+against with a caller-rewritable string, to save writing a daemon that the
+passwordless path needs anyway.
+
+**`confirm = "always"` on the human path had no answer.** The gate refuses an
+unconfirmed action under a confirming rule, and the only thing that can set
+`confirmed` is the broker after an out-of-band approval. For a human who just
+typed a password that is a second prompt with no channel to appear on.
+Decided: the password is the confirmation on the password path, known to the
+gate from `argv[0]`. The out-of-band channel is for the path where no secret
+was typed.
+
+**"Blocked on a VM" was true of the machine, not the work.** Docker gives a
+real kernel with real `sudo`, `sudo-rs`, and `OpenDoas`; the differential
+matrix already runs in it. Recorded with the two hazards found this week: the
+bind mount misreports ownership and loses fresh directories, and root does not
+enforce file modes. So: a copy, a non-root user.
+
+**The unsafe budget had no contents list.** Checked against rustix 1.1.4:
+`openat2`, `pidfd_open`, `fstatfs`, and `PR_SET_NO_NEW_PRIVS` are safe
+wrappers; `close_range`, `SO_PEERPIDFD`, and `PIDFD_GET_INFO` are absent and
+`execveat` is `unsafe`. `aido-sys::raw` therefore holds exactly those four, and
+the claim "no `unsafe` outside `raw`" stays checkable.
+
+Smaller corrections in the same pass: the gate executable gets its own package
+(`aido-gate-bin`) like the other two entry points; phase 3's deliverables
+claimed an apt repository that open decision 3 had already deferred; phase 4
+§ 8 (the `ido` ↔ `aido` integration) had no milestone and now splits between
+M2b's `aido exec` and M6; `re.md` still pointed at remote hosts nobody needs;
+and `design-plan.md` carries a dated deviations block so a reader meets the
+differences before the text that predates them.
+
+---
+
 ## 2026-10-14 — M2b, first slice: the ruleset is checked on the descriptors it is read through
 
 ### The hole this closes
