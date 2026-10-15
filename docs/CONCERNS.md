@@ -4,6 +4,57 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-15 — second review: the code against the goal
+
+Yesterday's pass compared the plan with the code at milestone level. This one
+read the code against the goal and the three invariants, and ran the
+documentation's own examples. Findings, worst first.
+
+**Overlapping rules resolve by file order, and order can skip a human.**
+`best_match` returns the first permitted action in declaration order. Two
+actions that accept the same argv with different `confirm` settings therefore
+let the sort order of two rule files decide whether anyone is asked. No test
+covers it and `check` does not report it. Harmless today, because nothing
+executes, and the plan's own answer — sudoers-style last-match-wins with
+negation — would make it worse: negation is a way to widen by reordering. The
+fix goes before `aido exec` in M2b: strictest confirmation across every
+matching action, an overlap report in `check`, and a new standing property,
+*adding a rule never removes a confirmation*.
+
+**`doctor` was credited with a report it does not produce.** `README.md`,
+`SECURITY.md`, and the design plan all said `doctor` lists every other path to
+root — `NOPASSWD` entries, group memberships, writable unit directories and
+`PATH` entries. It lists none of them, and yesterday's rewrite of M2b dropped
+the item that would build them. Both documents now say so, and the item is
+back as M2b 4b together with `--json` and `--fix`, the latter already named by
+the generated sudoers comment as the thing to run.
+
+**Two of the three `README` examples could not work.** They omitted the
+program, so `explain` reported no matching action for a command the ruleset
+allows. Replaced with the lines that were actually run. The `--help` text named
+a `rule` subcommand that does not exist; it now names the ones that do.
+
+**What held.** All five standing invariants from `CLAUDE.md` exist as property
+tests in `aido-policy/tests/invariants.rs`, plus five more (hints never change
+a verdict; the agent path is never broader than the human path; declared yolo
+never removes a confirmation; every denial is actionable; evaluation never
+panics). No `#[ignore]`d test. A rule with no `args` permits zero arguments.
+`check` refuses a ruleset that names a shell. The gate's child environment is
+a fixed allowlist and `LD_*`, `GCONV_PATH`, `PYTHONPATH` are refused by name.
+The audit chain detects an edit and a truncation. Hints are recorded and
+compared nowhere.
+
+**`ido run --yes` from an agent.** Reachable: no terminal, so `--yes` is
+accepted. It grants nothing — `ido` holds no privilege, the agent could run
+the command directly, and a queued `sudo` has no terminal to prompt on — but
+the `AGENTS.md` block should forbid it in words. Planned as its v2, in M6.
+
+A verification tracker now sits in `todo/README.md`, one row per item of the
+design plan's checklist, so the next review starts from a table rather than
+from memory.
+
+---
+
 ## 2026-10-14 — plan review against the goal, and four corrections
 
 The eight requirements in `design-plan.md` were checked against the code. Two

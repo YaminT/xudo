@@ -40,7 +40,8 @@ pub enum Format {
     about = "Agent-aware privilege broker for Linux (beta: introspection only, executes nothing)",
     long_about = "aido decides whether a privileged command is permitted by a root-owned \
                   allowlist.\n\nThis build contains no privileged path: `explain`, `check`, \
-                  `rule`, `doctor`, and `agentdoc` inspect the policy and execute nothing. \
+                  `why-not`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, and \
+                  `agentdoc` inspect the policy and execute nothing. \
                   Passwordless agent execution arrives with the broker."
 )]
 pub struct Cli {

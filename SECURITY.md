@@ -34,10 +34,11 @@ one you know you lack.
 - **One overbroad allowlist entry voids the design.** A single allowlisted shell,
   interpreter, pager, exec proxy, or `apt-get -o DPkg::Pre-Invoke::=` is
   unrestricted root regardless of how the arguments are written.
-- **`aido` cannot protect a host that already has other paths to root.** Run
-  `aido doctor`: it reports pre-existing `NOPASSWD` entries, `wheel` / `sudo` /
-  `docker` / `lxd` membership, writable unit directories, writable `PATH`
-  entries, and writable shell rc files. Any one of them makes `aido` decorative.
+- **`aido` cannot protect a host that already has other paths to root.**
+  Pre-existing `NOPASSWD` entries, `wheel` / `sudo` / `docker` / `lxd`
+  membership, writable unit directories, writable `PATH` entries, writable shell
+  rc files: any one of them makes `aido` decorative. `aido doctor` does **not**
+  report these yet; that report is part of M2b. Until then, check by hand.
 - **Rule-file ownership and mode are not yet verified.** Survivable only because
   nothing can execute: a tampered ruleset currently makes `aido explain` print a
   wrong answer to a human who asked a question. This is a stated precondition of

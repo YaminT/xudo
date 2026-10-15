@@ -53,11 +53,10 @@ Milestones M1(remainder)–M7 are listed below rather than in separate files, be
 
 Nothing here needs Linux or privilege, so it all runs on the macOS dev host.
 
-- **`crates/aido-sys`** — every syscall behind a `ProvenanceSource` / `PrivilegedOps` trait. Three implementations: `LinuxProcFs` with an injectable procfs root so fixture trees drive unit tests, `LinuxKernel` (`openat2`, `execveat`, `close_range`, `pidfd_open`, `SO_PEERPIDFD`, `PIDFD_GET_INFO`, `statfs`), and `MacOsStub` returning `Unsupported` for everything so a macOS developer cannot accidentally validate a Linux-only assumption. This is the only crate permitted `unsafe`, confined to a `raw` module with a published line budget.
-- **`crates/aido` front-end** — `aido explain [--json]`, `aido explain --why-not <rule-id>`, `aido check [--fuzz]`, `aido rule list|test`, `aido agentdoc --format claude|agents|codex`. `clap` compiled **without** the `env` feature. `main` stays a thin shim over a fully-tested library so the 100% floor holds; if a waiver is ever needed, `main.rs` is the honest place for the first one.
-- **Exit-code taxonomy wired to a real process exit** — the `ExitCode` enum exists and is tested, but nothing calls `std::process::exit` yet.
-- ~~**`insta` snapshots** — of every decision record and every rendered explain output.~~ **DONE 2026-09-03:** `aido-policy/tests/contract_snapshots.rs` (wire contract, prompt strings) and `aido/tests/render_snapshots.rs` (every verdict shape through both renderers), exhaustive by construction. See `../CONCERNS.md`.
-- **Install nightly + `cargo-fuzz`** and actually run the three fuzz targets. They have only ever been compile-checked.
+- ~~**`crates/aido-sys`**~~ **DONE.** `PrivilegedOps` with `LinuxOps` and `MacOsStub`, procfs parsing from fixture trees, the attestation ladder, the backend probe, and now the descriptor-verified ruleset walk. No `unsafe` yet; `raw` arrives with M2b.
+- ~~**`crates/aido` front-end**~~ **DONE, with three gaps:** `explain`, `why-not`, `check`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, `agentdoc` exist. Not built: `check --fuzz`, `rule list|test` (the `[[test]]` blocks of SUGGESTIONS #10), and `doctor --json`. The first two are M6; `doctor --json` is M2b, because verification item 1 needs it.
+- ~~**Exit-code taxonomy wired to a real process exit**~~ **DONE.** `aido-bin/tests/binary.rs` asserts 0, 17, 18, and 19 through a real process.
+- ~~**Install nightly + `cargo-fuzz`**~~ **DONE.** Three targets run on every push and for thirty minutes nightly.
 
 Exit criterion: `aido explain -- apt-get install ripgrep` prints a matched rule with `file:line`; `aido explain -- /bin/sh -c id` prints a deny naming the capability class; `aido check` exits 0 on the shipped ruleset. Still executes nothing.
 
@@ -72,8 +71,10 @@ Exit criterion: `aido explain -- apt-get install ripgrep` prints a matched rule 
 0. **A Linux test harness, before any syscall code.** `just linux-test`: the workspace copied into a Docker container and the suite run there as a non-root user. Not on the bind mount, which misreports the checkout as root-owned and intermittently loses a directory created a moment earlier; and not as root, under which file modes are not enforced and every refusal test passes vacuously. Containers give a real kernel for everything in M2b and M3. A VM is needed only for the kernel-version matrix and for M4's systemd scopes.
 1. **`aido-sys::raw`**, the planned unsafe module, now with a known contents list. rustix 1.1 wraps `openat2`, `pidfd_open`, `fstatfs`, and `PR_SET_NO_NEW_PRIVS` safely. It does not wrap `close_range`, `SO_PEERPIDFD`, or `PIDFD_GET_INFO`, and its `execveat` is `unsafe`. Those four go in `raw`, each behind the `PrivilegedOps` trait with an in-memory fake, with the line budget in the module docs. Nothing else in the workspace lifts `forbid(unsafe_code)`.
 2. **A minimal `aidod`, pulled forward from M3.** The gate as built refuses with `NoPendingRequest` unless a root-minted entry exists under `/run/aido/req`, and only a root daemon can mint one, so the human path cannot work without a broker. M2b's `aidod` does exactly this: accept a connection on `/run/aido/broker.sock` (systemd socket activation), identify the peer by the attestation ladder in `kernel.rs`, classify it `Unattested` (no cgroup lookup until M4), evaluate, mint the entry, return the nonce. No confirmation channel, no `freeze`, no cgroup classification.
+2b. **Overlapping rules resolve to the strictest, and `check` says when they overlap.** Today `best_match` returns the first permitted action in declaration order, so if two actions match the same argv and only one demands confirmation, the order of two files decides whether a human is asked. Nothing executes yet, so it is a wrong answer from `explain` rather than a hole, but it must be closed before `aido exec` exists: the confirmation requirement becomes the strictest across every matching action, `check` reports any two actions that can accept the same argv, and a standing property joins the invariants — *adding a rule never removes a confirmation*. The design plan's "last-match-wins with explicit negation" is not built and is not wanted: negation is a way to widen by reordering.
 3. **`aido exec -- <argv>`** in the front-end: the same matching as `explain`, then the broker round-trip, then exec of `sudo /usr/libexec/aido/aido-gate-auth` (or `doas`), with the backend's exit status passed through. A denial whose remediation is "a human must run this" prints the exact `ido queue` line to run instead. That is phase 4 § 8, first half; the second half (`ido` running an entry through `aido exec`) is M6.
 4. **`aido-gate-bin`**: the executable, in its own package like `aido-bin`, installed as `/usr/libexec/aido/aido-gate` with `aido-gate-auth` as a hardlink; `aido-gate-nopass` is not shipped until M4. `close_range` first, `/dev/null` substitution for closed standard descriptors, the `statfs` check on `/proc`, the lineage walk gate → sudo/doas → `aido` pinned by `(pid, starttime)`, the ruleset through `read_trusted_dir`, `O_PATH` + `fstat` + digest pin, `execveat(fd, "", AT_EMPTY_PATH)`, the environment from `aido_gate::child_environment`, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation.
+4b. **`aido doctor --json`, `--fix`, and the every-other-path-to-root report**, dropped from this list by mistake on 2026-10-14. The report names pre-existing `NOPASSWD` entries, `wheel` / `sudo` / `docker` / `lxd` membership, writable unit directories, writable `PATH` entries, and writable shell rc files; `SECURITY.md` says plainly that it does not exist yet. `--fix` is what the generated sudoers comment and the install notice already tell operators to run, so it has to exist before `install` does.
 5. **Executing the install plan**: `aido install` without `--dry-run`. `visudo -cf` on the candidate, inode check, atomic rename, and the functional post-install probe the plan already describes.
 6. **Audit sinks**: the hash-chained JSONL file under `/var/lib/aido` with `fdatasync` before returning (the chain itself exists and `ido` already writes one), and the journald sink.
 7. **The one trust check still missing**: a ruleset on a filesystem mounted by a non-root user, from `/proc/self/mountinfo`.
@@ -98,7 +99,25 @@ The milestone the product exists for, deliberately last among the load-bearing o
 
 ### M6 — ergonomics, profiles, harness integration
 
-The verb surface (`aido pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previews rendered into the confirmation prompt, `aido init`, `aido mcp`, EPERM shell hints, audit query with session replay.
+The verb surface (`aido pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previews rendered into the confirmation prompt, `aido init`, `aido mcp`, EPERM shell hints, audit query with session replay, `check --fuzz`, `rule list|test`, and `ido` running a queued entry through `aido exec` (phase 4 § 8, second half). The `AGENTS.md` block becomes v2 and gains one line: *never run `ido run` or `ido drop`*. An agent that runs them gains nothing it could not do by running the command itself — `ido` holds no privilege, and a queued `sudo` has no terminal to prompt on — but the block should say so rather than rely on it.
+
+### Verification checklist, against `../design-plan.md` § Verification
+
+| # | Item | State |
+|---|---|---|
+| M1 | Everything listed | Done; `just verify` is the gate |
+| 1 | `doctor --json` with backend, implementation, capabilities, other paths to root | Backend and capabilities yes; `--json` and other paths no (M2b 4b) |
+| 2 | Human path prompts, under `rexpect` on a real pty | M2b |
+| 3 | Snippet functionally in effect; dotted-filename regression | M2b 5 |
+| 4 | Hostile direct gate invocation does nothing privileged | Decision core tested (`aido-gate`); binary M2b 4 |
+| 5 | Nonce is one-use | Validation tested; consumption needs the broker (M2b 2) |
+| 6–10 | Enrolled agent path, yolo, self-approval, timeout, cgroup spoofing | M3 and M4 |
+| 11 | Env scrubbing with real payloads in the child's `/proc/self/environ` | Allowlist built and tested in `aido-gate::env`; child assertion M2b 4 |
+| 12 | Symlink and TOCTOU resistance on ruleset, exec target, audit log | Ruleset done 2026-10-14; exec target and log M2b 4 and 6 |
+| 13 | Deny-list non-overridable; `check` refuses a rule naming a shell | Done |
+| 14 | Differential compliance | Unprivileged half done and in CI; executing half M2b 8 |
+| 15 | Audit chain verifies and detects truncation | Done |
+| 16 | `freeze` / `thaw` | Engine honours `frozen`; the commands are M3 |
 
 ### M7 — confinement, supply chain, external audit
 
