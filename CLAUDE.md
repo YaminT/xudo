@@ -105,6 +105,7 @@ crossed both whitespace and `/`. Adds denies_glob_crossing_separator.
 | Fuzz smoke | `cargo fuzz run <target> -- -max_total_time=60` | no crash |
 | TOML format | `taplo fmt --check` | no diff |
 | GTFOBins gate | `just gtfobins` | every allowlisted shell-capable binary has a reviewed waiver |
+| Linux tests | `just linux-test` | the whole suite on a real Linux kernel in Docker, as a non-root user, on a copy of the checkout. Required before committing syscall code; not in `verify` because it needs Docker |
 | Differential | `just differential` | the static binary inside real distributions: every backend report matches `ci/differential/expected/`, every verdict identical in every row. Needs Docker; runs in CI, not in `verify` |
 
 `rust-toolchain.toml` pins the toolchain; MSRV is declared in the workspace manifest and checked in CI. Nightly is used **only** for `cargo fuzz`, `cargo miri`, and region coverage — never for a shipped build.

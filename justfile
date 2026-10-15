@@ -209,6 +209,16 @@ gtfobins:
     if (( fail )); then exit 1; fi
     echo "gtfobins: every allowlisted shell-capable binary has a reviewed waiver"
 
+# --- linux -----------------------------------------------------------------
+
+# The workspace's tests on a real Linux kernel, through Docker, as a non-root
+# user, on a copy of the checkout rather than the bind mount. Run it before
+# committing anything that touches a syscall: `cargo check --target` proves
+# only that Linux code compiles. Arguments go to `cargo test`, e.g.
+# `just linux-test -p aido-sys`.
+linux-test *args:
+    ci/linux-test.sh {{args}}
+
 # --- differential compliance ------------------------------------------------
 
 # The static Linux binary the matrix drives: musl, for whichever architecture

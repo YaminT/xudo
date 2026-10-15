@@ -4,6 +4,31 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-15 — M2b step 0: `just linux-test`
+
+The suite now runs on a real Linux kernel from the Mac in one command, with the
+two hazards found on 2026-10-14 designed out rather than remembered:
+
+- **A copy, not the mount.** The checkout is mounted read-only and copied onto
+  the container's own filesystem before anything runs, so ownership is real and
+  no directory goes missing under parallel tests.
+- **Not root.** The copy and the caches are prepared as root, then the suite
+  runs as uid 1000 through `setpriv`, and the script refuses to start if that
+  user is root, because under root every mode check passes vacuously.
+
+The image is `rust:<channel>-slim` with the channel read from
+`rust-toolchain.toml`, so it cannot drift from the pinned toolchain. Registry
+and target caches are named volumes: the first run builds everything, a rerun
+of one package took 11 seconds. Arguments go straight to `cargo test` as
+separate words. First full run: every test in the workspace passed on Linux
+6.12 aarch64 as uid 1000, including the `ido` pseudo-terminal test.
+
+It is not part of `just verify`, because `verify` must run on a machine without
+Docker and CI already runs the suite natively on two Linux architectures. It is
+the required local check for syscall code, and `CLAUDE.md`'s gate table says so.
+
+---
+
 ## 2026-10-15 — second review: the code against the goal
 
 Yesterday's pass compared the plan with the code at milestone level. This one
