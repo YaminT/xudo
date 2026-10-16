@@ -33,6 +33,29 @@ fi
 image="rust:${channel}-slim"
 uid=1000
 
+# One run at a time per machine, from any checkout. Every worktree shares the
+# two cache volumes and the Docker VM's memory, and parallel agents working in
+# separate worktrees would otherwise race both: the target volume rebuilt from
+# under each other, and enough concurrent rustc processes to get one killed
+# with no message. A directory is the lock because mkdir is atomic everywhere
+# and macOS ships no flock(1); a lock whose holder has died is taken over.
+lock="${TMPDIR:-/tmp}/aido-linux-test.lock"
+announced=0
+until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then
+        rm -rf "$lock"
+        continue
+    fi
+    if [[ $announced == 0 ]]; then
+        echo "linux-test: waiting for another run (pid ${holder:-starting})" >&2
+        announced=1
+    fi
+    sleep 2
+done
+echo $$ >"$lock/pid"
+trap 'rm -rf "$lock"' EXIT
+
 # Arguments are passed to `cargo test` as separate words, never re-parsed.
 docker run --rm -i \
     -v "$root:/src:ro" \
