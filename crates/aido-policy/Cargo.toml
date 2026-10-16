@@ -12,6 +12,8 @@ authors.workspace = true
 bstr.workspace = true
 regex.workspace = true
 serde.workspace = true
+# The ruleset generation: one hash every reader computes the same way.
+sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 

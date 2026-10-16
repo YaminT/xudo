@@ -65,7 +65,7 @@ impl TempHome {
 
     fn read_queue(&self) -> Vec<serde_json::Value> {
         let listed = self.run(&["list", "--json"]);
-        assert!(listed.status.success());
+        assert!(listed.status.success(), "{}", text(&listed.stderr));
         serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout).unwrap()
     }
 
@@ -132,7 +132,7 @@ fn the_second_name_is_the_celebration() {
 fn argv_is_never_passed_through_a_shell() {
     let home = TempHome::new("no-shell");
     let queued = home.run(&["queue", "--", "/bin/echo", "$(id)", "a;b", "`id`", "*"]);
-    assert!(queued.status.success());
+    assert!(queued.status.success(), "{}", text(&queued.stderr));
     let run = home.run(&["run", "--all", "--yes"]);
     assert!(run.status.success(), "{}", text(&run.stderr));
     // Every token arrives literally: no substitution, no splitting, no glob.
@@ -148,7 +148,7 @@ fn no_tty_falls_back_to_list_and_runs_nothing() {
     let home = TempHome::new("no-tty");
     home.run(&["queue", "--", "touch", "should-not-exist"]);
     let bare = home.run(&[]);
-    assert!(bare.status.success());
+    assert!(bare.status.success(), "{}", text(&bare.stderr));
     assert!(
         text(&bare.stdout).contains("#1 ready"),
         "{}",

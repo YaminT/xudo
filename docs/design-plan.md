@@ -10,6 +10,8 @@
 > - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
 > - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.
 > - Canonicalization does not split `--key=value`; fuzzing killed that in M1.
+> - `/run/aido` is `0755`, not `0700`: a `0700` directory would put `broker.sock` out of every user's reach. The socket is `0660 root:aido`; `req/` and `sessions/` are the `0700` directories (2026-10-16).
+> - The policy generation is a framed SHA-256 over the rule files, computed by one function (`aido_policy::load_rule_files`) for the front-end, the broker, and the gate. Not yet the install-time counter described below (2026-10-16).
 > - Attestation on kernels before 6.5 is a ladder (`aido-sys::kernel`), not a single fallback.
 > - Linux verification is Docker, locally and in CI, not Lima; a VM is for the kernel-version matrix and M4's systemd scopes.
 
@@ -137,7 +139,9 @@ All of `/etc/aido` is `root:root` and **refuses to load** if any path *component
 /etc/sudoers.d/aido              0440  NO DOT, NO trailing ~ — sudo silently ignores such files.
 /etc/doas.d/60-aido.conf         0400  Or a sentinel-delimited block in /etc/doas.conf under flock.
 
-/run/aido/                       0700  broker.sock, sessions/<id>, req/<id> (0600, O_EXCL)
+/run/aido/                       0755  broker.sock (0660 root:aido, socket-activated)
+/run/aido/req/                   0700  <nonce> pending requests (0600, O_EXCL, renamed into place)
+/run/aido/sessions/              0700  <id> enrolled sessions (M4)
 /var/lib/aido/                   0700  grants, rate buckets, novelty baselines, nonce ledger,
                                        policy generations + rollback copies
 /var/log/aido/audit.jsonl        0600  hash-chained secondary sink (journald is primary)

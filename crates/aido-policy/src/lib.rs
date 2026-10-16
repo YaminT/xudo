@@ -51,6 +51,7 @@ pub mod caller;
 pub mod decision;
 pub mod deny;
 pub mod engine;
+pub mod files;
 pub mod matcher;
 pub mod rule;
 
@@ -59,5 +60,9 @@ pub use caller::{CallerFacts, Classification, Hint, HintSource};
 pub use decision::{Confirm, Decision, DenialCode, ExitCode, TraceStep, Verdict};
 pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_list};
 pub use engine::{Request, evaluate};
+pub use files::{
+    Generation, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError, is_rule_file_name,
+    load_rule_files,
+};
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use rule::{Action, ActionId, RuleSet, RuleSetError, Source, Tier};

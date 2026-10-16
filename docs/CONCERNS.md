@@ -4,6 +4,48 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-16 — One generation for every reader, and a reachable broker socket
+
+Two things found while reading for M2b step 2, fixed before the broker is
+built so that the broker and the gate are written against them rather than
+around them.
+
+**Three readers, three chances to disagree.** The front-end computed the
+policy generation itself, in `crates/aido/src/rules.rs`; nothing else did. The
+broker is about to write a generation into every spool entry and the gate to
+refuse an entry whose generation is not current, so each of them would have
+grown its own copy of the hash and its own idea of which directory entries are
+rule files. Two copies that drift make every request look stale, or worse,
+make two different rulesets look like one. Now there is one function,
+`aido_policy::load_rule_files`, pure, which takes the files as read and owns
+the selection predicate (`is_rule_file_name`: `<name>.toml`, so a bare `.toml`
+is no longer a rule file to the descriptor-verified reader either), the order
+(byte order of names), the UTF-8 refusals, and the hash. The front-end reads
+by path and calls it; `aido_sys::load_trusted_rules` reads through verified
+descriptors and calls it. The broker and the gate use the second and compare
+`Generation::id()`, the first eight bytes of the digest.
+
+**The old hash could not tell two rulesets apart.** It fed each file's name
+and contents to SHA-256 back to back, so `1.toml` holding `#a2.toml#b` hashed
+the same as `1.toml` holding `#a` beside `2.toml` holding `#b`. Only root can
+write the rules, so this was not an attack, but it was a generation check that
+could pass across a real policy change. The new hash is domain-separated
+(`aido.ruleset.generation.v1`) and length-prefixes every field.
+`two_rulesets_that_concatenate_alike_have_different_generations` pins it, a
+digest of a fixed ruleset is asserted exactly, and
+`the_generation_depends_on_the_files_not_on_their_read_order` joins the
+standing properties. The front-end's printed generation changes value once;
+nothing persisted the old one.
+
+**The socket was unreachable as designed.** The design plan's file table put
+`broker.sock` in a `0700` `/run/aido`, a directory no user can traverse, so no
+user could ever have connected. Now `/run/aido` is `0755`, the socket `0660
+root:aido` (the same group the sudoers rule names), and `req/` and `sessions/`
+are the `0700` directories. The gate's `SPOOL_DIR` already described `req/` as
+root-owned `0700`, so no code changes.
+
+---
+
 ## 2026-10-15 — M2b step 0: `just linux-test`
 
 The suite now runs on a real Linux kernel from the Mac in one command, with the

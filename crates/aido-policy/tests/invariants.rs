@@ -11,8 +11,9 @@
 
 use aido_policy::{
     Action, ActionId, Arg, Argv, CallerFacts, Classification, Decision, DenialCode, Hint,
-    HintSource, Matcher, NameKind, Request, RuleSet, Source, Tier, Verdict,
+    HintSource, Matcher, NameKind, Request, RuleFile, RuleSet, Source, Tier, Verdict,
     engine::Settings,
+    load_rule_files,
     matcher::{ArgSpec, Repeat},
     rule::ConfirmPolicy,
 };
@@ -458,5 +459,34 @@ proptest! {
         if frozen && agent {
             prop_assert_eq!(d.denial, Some(DenialCode::Frozen));
         }
+    }
+
+    /// The generation is a function of the files, never of the order a reader
+    /// happened to list them in.
+    ///
+    /// The broker and the gate each list the rules directory themselves. If
+    /// order leaked into the generation, a request minted by one would read as
+    /// stale to the other for no reason but readdir order; if names and
+    /// contents could run together, two different rulesets could share one.
+    #[test]
+    fn the_generation_depends_on_the_files_not_on_their_read_order(
+        files in prop::collection::btree_map("[a-z0-9-]{1,8}", "#[ -~]{0,16}", 0..6),
+        rotate in 0usize..6,
+    ) {
+        let as_files = |pairs: &[(String, String)]| -> Vec<RuleFile> {
+            pairs
+                .iter()
+                .map(|(name, text)| RuleFile {
+                    name: format!("{name}.toml").into_bytes(),
+                    bytes: text.clone().into_bytes(),
+                })
+                .collect()
+        };
+        let mut pairs: Vec<(String, String)> = files.into_iter().collect();
+        let sorted = load_rule_files(as_files(&pairs)).unwrap().generation;
+        let by = rotate.min(pairs.len());
+        pairs.rotate_left(by);
+        pairs.reverse();
+        prop_assert_eq!(load_rule_files(as_files(&pairs)).unwrap().generation, sorted);
     }
 }

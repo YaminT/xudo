@@ -33,6 +33,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
+use aido_policy::{LoadedRuleSet, RuleFile, RuleFilesError, is_rule_file_name, load_rule_files};
 use rustix::fs::{AtFlags, CWD, Dir, Mode, OFlags, fstat, openat, statat};
 
 /// Who may own a trusted path.
@@ -451,6 +452,50 @@ pub fn read_trusted_dir(dir: &Path) -> Result<Vec<TrustedFile>, TrustError> {
     read_toml_at(fd.as_fd(), dir, TRUSTED_UID)
 }
 
+/// Why the root-owned ruleset could not be loaded. Every variant fails closed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TrustedRulesError {
+    /// A component of the path, or a rule file, failed the trust walk.
+    #[error(transparent)]
+    Trust(#[from] TrustError),
+    /// The files were trusted but are not a ruleset.
+    #[error(transparent)]
+    Rules(#[from] RuleFilesError),
+}
+
+/// Loads the ruleset the way a privileged binary must: every component and
+/// every rule file verified on the descriptor it is read through, then handed
+/// to [`aido_policy::load_rule_files`], the function the front-end uses too.
+///
+/// The broker mints requests against this and the gate re-decides against it,
+/// so the two compute the same [`aido_policy::Generation`] from the same bytes
+/// and a spool entry is refused exactly when the rules really changed.
+///
+/// # Errors
+///
+/// [`TrustedRulesError::Trust`] for the first component or file that fails the
+/// walk, and [`TrustedRulesError::Rules`] for files that are not a ruleset.
+pub fn load_trusted_rules(dir: &Path) -> Result<LoadedRuleSet, TrustedRulesError> {
+    let fd = open_trusted(dir)?;
+    load_rules_at(fd.as_fd(), dir, TRUSTED_UID)
+}
+
+/// The descriptor half of [`load_trusted_rules`], for a directory already open.
+fn load_rules_at(
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    owner: u32,
+) -> Result<LoadedRuleSet, TrustedRulesError> {
+    let files = read_toml_at(dir, path, owner)?
+        .into_iter()
+        .map(|file| RuleFile {
+            name: file.name.into_vec(),
+            bytes: file.bytes,
+        })
+        .collect();
+    Ok(load_rule_files(files)?)
+}
+
 /// The descriptor half of [`read_trusted_dir`], for a directory already open.
 fn read_toml_at(
     dir: BorrowedFd<'_>,
@@ -467,7 +512,7 @@ fn read_toml_at(
     )?;
     let mut names: Vec<Vec<u8>> = names
         .into_iter()
-        .filter(|name| name.ends_with(b".toml"))
+        .filter(|name| is_rule_file_name(name))
         .collect();
     names.sort();
 
@@ -943,6 +988,53 @@ mod tests {
         // Someone else's files are refused, named by file.
         let err = read_toml_at(open_dir(&dir).as_fd(), &dir, me.wrapping_add(1)).unwrap_err();
         assert!(err.to_string().contains("10-a.toml"), "{err}");
+    }
+
+    #[test]
+    fn the_trusted_ruleset_carries_the_generation_every_reader_computes() {
+        let dir = scratch_dir("trusted-rules");
+        std::fs::write(dir.join("10-a.toml"), "# a").unwrap();
+        std::fs::write(dir.join(".toml"), "not selected by any reader").unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let loaded = load_rules_at(open_dir(&dir).as_fd(), &dir, me).unwrap();
+        let expected = load_rule_files(vec![RuleFile {
+            name: b"10-a.toml".to_vec(),
+            bytes: b"# a".to_vec(),
+        }])
+        .unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn a_trusted_but_malformed_ruleset_is_refused_naming_the_file() {
+        let dir = scratch_dir("trusted-malformed");
+        std::fs::write(dir.join("10-a.toml"), "[[action]\nid =").unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let err = load_rules_at(open_dir(&dir).as_fd(), &dir, me).unwrap_err();
+        assert!(err.to_string().contains("10-a.toml"), "{err}");
+        assert!(format!("{err:?}").starts_with("Rules("), "{err:?}");
+    }
+
+    #[test]
+    fn an_untrusted_ruleset_is_refused_before_it_is_parsed() {
+        // Someone else's file: the walk refuses it, and the parser never sees
+        // bytes that are not root's.
+        let dir = scratch_dir("trusted-foreign");
+        std::fs::write(dir.join("10-a.toml"), "[[action]\nid =").unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let err = load_rules_at(open_dir(&dir).as_fd(), &dir, me.wrapping_add(1)).unwrap_err();
+        assert!(format!("{err:?}").starts_with("Trust("), "{err:?}");
+
+        // And the public entry point walks from `/`: a file is not a directory
+        // of rules, whoever owns it.
+        let err = load_trusted_rules(Path::new(TRUSTED_FILE)).unwrap_err();
+        assert!(err.to_string().contains("cannot be inspected"), "{err}");
+        assert!(
+            load_trusted_rules(Path::new(env!("CARGO_MANIFEST_DIR")))
+                .unwrap_err()
+                .to_string()
+                .contains("not root"),
+        );
     }
 
     #[test]
