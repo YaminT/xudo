@@ -275,10 +275,11 @@ file before acting on it.
 ## Where the build stands
 
 M1 (policy core, explain) done. M2a (backend model) done. M2b in progress:
-the Linux harness, the audited unsafe syscall layer, and strictest
-overlapping-rule resolution are on main; the broker (`aidod`), the gate
-binary, the doctor report, the audit sinks, and the mount-trust check are in
-review. Nothing can execute as root yet. Then: M3 out-of-band confirmation,
+the Linux harness, the audited unsafe syscall layer, strictest
+overlapping-rule resolution, the mount-trust check, and the audit sinks
+(hash-chained file plus journald mirror, not yet called by the broker or the
+gate) are on main; the broker (`aidod`) and the doctor report are in review,
+and the gate binary is not yet built. Nothing can execute as root yet. Then: M3 out-of-band confirmation,
 M4 enrollment and the passwordless path, M5 narrowing and bounded grants
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.
