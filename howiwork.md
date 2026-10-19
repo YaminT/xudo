@@ -96,7 +96,8 @@ why the rule makes the technique unreachable.
 | `aido` | user | The front-end agents and humans call. Explains, checks, asks the broker. Decides nothing. |
 | `aidod` | root | The authority. Identifies the peer, classifies, evaluates policy, mints one-use requests, owns confirmation. |
 | `aido-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
-| `ido` | user | The buffered human-run queue (below). |
+| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: aido ships no setuid bit anywhere. Two rules point at two hardlinks of the gate: `aido-gate-nopass` (`NOPASSWD`, the approved agent path) and `aido-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. |
+| `ido` | user | The buffered human-run queue (below). Where the human's password is entered. |
 | `airead` | user | The read-only surface (below). |
 | `pasban` | root (scheduled) | The watchman (below). |
 
@@ -107,13 +108,21 @@ Every request resolves to exactly one of:
 1. **Rejected** — the deny-list matched, no rule accepts the command, the
    context forbids it, or a required confirmation has no live channel. Every
    error path lands here: aido fails closed.
-2. **Approved** — a rule accepts it and the requirements are met. For a human
-   that means a password (on the password path, the password *is* the
-   confirmation). For an enrolled agent it means attestation plus whatever
-   confirmation the strictest matching rule demands, delivered on a channel
-   the agent's process tree cannot answer.
+2. **Approved** — an enrolled agent, attested by the kernel, asks for
+   something a rule accepts, and every requirement is met, including whatever
+   out-of-band confirmation the strictest matching rule demands. **An approved
+   request needs no human password: the approval is the authorization.** It
+   runs through the `NOPASSWD` hop. A caller the kernel cannot attest is never
+   approved this way (invariant 2): it takes the human path below.
+   *Not built yet:* the passwordless hop and enrollment are M4. The beta ships
+   only the `PASSWD` hop, so today nothing runs without a password.
 3. **Run with ido** — aido cannot or should not run it now, so it is handed to
-   a human as reviewable work instead of being silently dropped.
+   a human as reviewable work instead of being silently dropped. **This is
+   where the human password lives**: the human runs the entry, and the
+   privileged step goes through the `PASSWD` hop, which asks for it once.
+
+A human who runs `aido` directly is on the same human path: always prompted,
+because a human is exactly what the kernel cannot attest as an enrolled agent.
 
 When several rules accept the same command, the **strictest requirement wins**
 — file order can never decide whether a human is asked.
@@ -126,8 +135,8 @@ reason, and an identifier; `ido {id}` runs one entry, `ido` opens the picker.
 The admin is told when unfinished tasks exist.
 
 Running an entry is a *human* act: it executes with the human's own authority,
-and anything privileged goes through aido's human path, where the backend
-prompts for the password once. ido itself holds no privilege and never will —
+and anything privileged goes through aido's human path, where the `PASSWD` hop
+(`aido-gate-auth`) prompts for the password once. ido itself holds no privilege and never will —
 "running ido is equivalent to sudo" is achieved by routing through the same
 gate as everything else, not by making ido a second sudo. Every rendered field
 of an entry is sanitized for the terminal (agent text cannot forge the UI), and
@@ -189,19 +198,35 @@ pasban's next run reports exactly where.
 ## How a request flows
 
 ```
-agent/human ── aido ──► aidod (root broker)
-                          ├ who is asking? (kernel-attested)
-                          ├ which rules accept it? strictest wins
-                          ├ deny-list (compiled in, non-overridable)
-                          ├ confirmation needed? channel live? (else deny)
-                          ├ outcome: Reject │ Approve │ ido-queue
-                          └ Approve → mint one-use request record
-            sudo/doas ──► aido-gate (root)
-                          ├ re-decides everything from root-owned state
-                          ├ consumes the nonce (one use, ever)
-                          └ execs the validated file descriptor
-                              └ audit record before and after
+enrolled agent ── aido ──► aidod (root broker)
+                             ├ who is asking? (kernel-attested)
+                             ├ which rules accept it? strictest wins
+                             ├ deny-list (compiled in, non-overridable)
+                             ├ confirmation needed? channel live? (else deny)
+                             └ outcome: Reject │ Approve │ ido-queue
+
+  Approve ─► mint one-use record ─► sudo/doas, NOPASSWD ─► aido-gate-nopass
+                                    (uid transition only,       │
+                                     no password)               │
+  Run with ido ─► human reviews, runs entry ─► aido (human path)│
+                  ─► sudo/doas, PASSWD ─────► aido-gate-auth    │
+                  (the human types the password here)           │
+                                                                ▼
+                                        aido-gate (root, the same binary)
+                                          ├ re-decides from root-owned state
+                                          ├ consumes the nonce (one use, ever)
+                                          └ execs the validated file descriptor
+                                              └ audit record before and after
 ```
+
+Why the hop exists at all when approval needs no password: it is the only
+place a uid transition happens, because aido has no setuid bit. It also gives
+the gate a real pty (`use_pty`, the TIOCSTI defence), faithful exit status, and
+the operator's existing sudo/doas logging. Take it away and the choice is a
+setuid binary, which this project refuses, or having the root daemon execute
+commands itself, which makes the broker, the parser, and the executor one
+process. Two hardlinks keep the password rule and the passwordless rule from
+ever naming the same command: `NOPASSWD` attaches only to the agent-path name.
 
 ## Mismatches resolved (pasted vision → merged truth)
 
@@ -219,7 +244,14 @@ Recorded so the reconciliation is visible, not silent:
 4. *"Permission sets in YAML and JSON"* → native engine format stays TOML
    (tested, shipped); YAML/JSON are import formats converted and reviewed
    before install.
-5. *"airead as a separate app"* → same engine, structurally restricted to
+5. *"If something is approved, no human password is needed"* → true for an
+   approved, attested agent request, which takes the `NOPASSWD` hop. The
+   password moved next to ido: it belongs to the human path (the human running
+   an ido entry, or running `aido` directly), because an unattested caller,
+   including a human, is never silently downgraded to passwordless
+   (invariant 2). The `sudo`/`doas` hop itself stays: it is the uid transition,
+   not the password mechanism.
+6. *"airead as a separate app"* → same engine, structurally restricted to
    read-class capabilities, so the read/write separation cannot drift between
    two codebases.
 
