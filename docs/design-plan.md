@@ -18,6 +18,7 @@
 > - The policy generation is a framed SHA-256 over the rule files, computed by one function (`aido_policy::load_rule_files`) for the front-end, the broker, and the gate. Not yet the install-time counter described below (2026-10-16).
 > - Attestation on kernels before 6.5 is a ladder (`aido-sys::kernel`), not a single fallback.
 > - Linux verification is Docker, locally and in CI, not Lima; a VM is for the kernel-version matrix and M4's systemd scopes.
+> - The audit chain is `/var/lib/aido/audit.jsonl`, not `/var/log/aido`: Ubuntu's `/var/log` is `root:syslog 0775` and fails the ancestor walk. The file is the chain's authority and journald a required mirror, reached through its native protocol over rustix rather than the `systemd-journal-logger` crate, and written under the file's lock so an append lands on both or neither; only journal entries with `_UID=0` count; there is no syslog fallback yet (2026-10-19).
 
 ## Context
 
@@ -148,7 +149,7 @@ All of `/etc/aido` is `root:root` and **refuses to load** if any path *component
 /run/aido/sessions/              0700  <id> enrolled sessions (M4)
 /var/lib/aido/                   0700  grants, rate buckets, novelty baselines, nonce ledger,
                                        policy generations + rollback copies
-/var/log/aido/audit.jsonl        0600  hash-chained secondary sink (journald is primary)
+/var/lib/aido/audit.jsonl        0600  hash-chained log, the chain's authority; journald mirrors it
 ```
 
 Rate buckets and grant counters **must** live on disk, not in-process: each `aido` invocation is a fresh short-lived process. Grant TTLs are monotonic-clock-anchored so a clock change cannot extend a window.
@@ -317,7 +318,7 @@ Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactl
 | Patterns | `regex` (linear-time hybrid NFA/DFA — no ReDoS from an admin-added pattern) |
 | Byte-exact argv | `bstr` + `std::ffi::OsStr` — one `to_string_lossy()` in the matcher is a policy bypass |
 | Errors | `thiserror` everywhere; `anyhow` **banned** from the gate and any decision path (its context strings leak paths) |
-| Audit sinks | `systemd-journal-logger` primary; `syslog` (AF_UNIX `/dev/log`) fallback for Alpine/OpenRC — a **socket**, not a symlinkable path |
+| Audit sinks | The hash-chained file is the authority (opened through the root-owned descriptor walk, never by a path string); journald is a required mirror, reached through its native protocol over `rustix` — no `systemd-journal-logger`, and no `syslog` fallback yet. A journald entry counts only with `_UID=0` (`aido_audit::journal::query`) |
 | Secrets | `zeroize` + `secrecy` |
 | Digest pinning | `sha2`, verified on the already-open `O_PATH` fd immediately before exec |
 | Capabilities | `caps` |
@@ -374,7 +375,7 @@ Each is independently shippable.
 → Named actions expanding to fixed argv · no intra-argument globs anywhere · flags deny-by-default per binary · deny-list compiled in and enumerated by capability class · **feature omission as the primary security property**, written down as a refusal list · CI gate against a vendored GTFOBins list.
 
 **5. Self-widening writes and TOCTOU/symlink races.** CVE-2021-3156's exploitation raced sudo's `ts_mkdirs()` with a symlink; sudo-rs's own audit found a path traversal (GHSA-2r3c-m6v7-9354). And because aido is deliberately **not** setuid, `ld.so` never sees `AT_SECURE` and does **no** `LD_*` scrubbing for it — that is entirely aido's problem.
-→ Enforce paths by **resolution, never by string prefix**: `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` from a pinned dirfd, reject `..`, reject any symlink or non-root-owned component, reject `st_nlink>1` on write targets, verify ownership/mode **after** opening via `fstat`, and walk **every ancestor** (one writable ancestor defeats all per-file checks). **Exec the fd you validated, not the path you validated.** Audit to a socket, not a path. Build the child environment from an **allowlist**, never a denylist, and regression-test each hazard's removal with a real payload.
+→ Enforce paths by **resolution, never by string prefix**: `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` from a pinned dirfd, reject `..`, reject any symlink or non-root-owned component, reject `st_nlink>1` on write targets, verify ownership/mode **after** opening via `fstat`, and walk **every ancestor** (one writable ancestor defeats all per-file checks). **Exec the fd you validated, not the path you validated.** Audit to a log opened through the same descriptor walk, never by a path string, and to journald's socket. Build the child environment from an **allowlist**, never a denylist, and regression-test each hazard's removal with a real payload.
 
 ---
 
@@ -437,7 +438,7 @@ Beyond the eight stated requirements. Ranked by value-to-effort; explanations fo
 
 **10. `aido check`.** A security policy nobody can test is a security policy nobody trusts. Executable `[[test]]` blocks inside the ruleset — `argv X must be allowed by rule Y`, `argv Z must be denied` — turn policy edits into a CI-gated change like any other code. Distinct exit codes for lint-warning vs lint-error vs test-failure so a pipeline can gate each independently. Include the shadowing lint: rules unreachable because an earlier deny matched, and rules that *shadow a later deny*, which is the ordering bug everyone makes with last-match-wins semantics.
 
-**11. Hash-chained audit.** Two sinks, both independent: journald for structured querying, and a hash-chained JSONL file where each record carries `seq`/`prev_hash`/`hash` so a deletion or an edit is detectable rather than invisible. `fdatasync` before returning the exec result — an audit record written after the action completes is an audit record that a crash loses. Both the broker *and* the gate emit independently, so a direct gate invocation that bypasses the front-end still leaves a trace.
+**11. Hash-chained audit.** Two sinks, one authority: a hash-chained JSONL file where each record carries `seq`/`prev_hash`/`hash` so a deletion or an edit is detectable rather than invisible, and journald, a required mirror for structured querying, written under the file's lock so an append lands on both or on neither. Only journal entries with `_UID=0` count — any local user can send one carrying every other field. `fdatasync` before returning the exec result — an audit record written after the action completes is an audit record that a crash loses. Both the broker *and* the gate emit independently, so a direct gate invocation that bypasses the front-end still leaves a trace.
 
 **12. Time-boxed grants.** The real workflow need: "I'm about to let the agent do twenty minutes of Docker work, stop asking me." A grant scoped to a profile, a project, a max use count, and a hard monotonic expiry gives that without becoming permanent. Two invariants make it safe: the counter is decremented and persisted *before* exec, and an **agent-path invocation can never mint or extend a grant** — only the human path can.
 

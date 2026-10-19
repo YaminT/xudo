@@ -31,9 +31,11 @@ dependencies = [
 name = "aido-audit"
 version = "0.0.1"
 dependencies = [
+ "insta",
  "serde",
  "serde_json",
  "sha2",
+ "term-sanitize",
  "thiserror",
 ]
 
@@ -97,7 +99,10 @@ dependencies = [
 name = "aido-sys"
 version = "0.0.1"
 dependencies = [
+ "aido-audit",
  "aido-backend",
+ "aido-config",
+ "aido-gate",
  "aido-policy",
  "aido-sys-raw",
  "bstr",

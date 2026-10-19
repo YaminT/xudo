@@ -922,6 +922,7 @@ mod tests {
             "/etc/systemd/system/evil.service",
             "/etc/apt/sources.list.d/evil.list",
             "/var/log/aido/audit.jsonl",
+            "/var/lib/aido/audit.jsonl",
         ] {
             assert!(
                 classes("/usr/bin/true", &[path]).contains(&CapabilityClass::SelfModification),

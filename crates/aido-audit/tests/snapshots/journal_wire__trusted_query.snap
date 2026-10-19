@@ -1,0 +1,6 @@
+---
+source: crates/aido-audit/tests/journal_wire.rs
+expression: "format!(\"{}\\n{}\\n\", query(&[]),\nquery(&[\"AIDO_DECISION=denied\", \"PRIORITY=1\"]))"
+---
+journalctl _UID=0 MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e
+journalctl _UID=0 MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e AIDO_DECISION=denied PRIORITY=1

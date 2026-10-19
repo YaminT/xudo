@@ -358,6 +358,11 @@ fn step_contents(step: &PlanStep) -> &str {
 /// evidence is a tool an attacker can use to launder it.
 /// Takes the path already resolved, so "there is no log path" is a case a test
 /// can produce on a machine that has a home directory.
+///
+/// Reads bytes, so a line that is not UTF-8 is reported by its number, and
+/// checks the end of the log as a privileged writer does
+/// (`aido_audit::verify_log`), so every damaged ending that writer refuses is
+/// reported here too.
 fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let Some(path) = log else {
         let _ = writeln!(
@@ -367,7 +372,7 @@ fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> Exit
         return ExitCode::Unusable;
     };
 
-    let contents = match std::fs::read_to_string(&path) {
+    let contents = match std::fs::read(&path) {
         Ok(contents) => contents,
         Err(source) => {
             let _ = writeln!(err, "aido: cannot read {}: {source}", path.display());
@@ -378,7 +383,7 @@ fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> Exit
         }
     };
 
-    match aido_audit::Chain::from_jsonl(&contents) {
+    match aido_audit::verify_log(&contents) {
         Ok(chain) => {
             let _ = writeln!(
                 out,
@@ -1086,6 +1091,57 @@ mod tests {
         let (code, _, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Denied);
         assert!(err.contains("line 1 is not an audit record"), "{err}");
+    }
+
+    #[test]
+    fn audit_reports_an_ending_the_privileged_writer_refuses_instead_of_calling_it_intact() {
+        // More than 128 KiB of blank space after the last record: every record
+        // verifies, and the broker and the gate still refuse every decision
+        // over it, sending the operator here. "chain intact" would contradict
+        // the refusal that sent them.
+        let fx = Fixture::new("audit-blank-tail");
+        let mut chain = aido_audit::Chain::new();
+        chain.append(
+            aido_audit::Decision::Denied,
+            vec!["/bin/sh".to_owned()],
+            "unattested",
+        );
+        let mut bytes = chain.to_jsonl().into_bytes();
+        bytes.extend(std::iter::repeat_n(b' ', aido_audit::TAIL_WINDOW + 1));
+        bytes.push(b'\n');
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, bytes).unwrap();
+
+        let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(err.contains("is not intact"), "{err}");
+        assert!(
+            err.contains("every record verifies, but a privileged writer refuses"),
+            "{err}"
+        );
+        assert!(err.contains("the last 131072 bytes"), "{err}");
+    }
+
+    #[test]
+    fn audit_names_the_line_of_a_tail_that_is_not_text() {
+        // Read as text, a stray non-UTF-8 byte made the whole log "unreadable"
+        // with no position; read as bytes, it is damage at a line.
+        let fx = Fixture::new("audit-binary-tail");
+        let mut chain = aido_audit::Chain::new();
+        chain.append(
+            aido_audit::Decision::Allowed,
+            vec!["/usr/bin/systemctl".to_owned()],
+            "human",
+        );
+        let mut bytes = chain.to_jsonl().into_bytes();
+        bytes.extend_from_slice(b"\0\xff\xfe\n");
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, bytes).unwrap();
+
+        let (code, _, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
+        assert_eq!(code, ExitCode::Denied);
+        assert!(err.contains("line 2 is not an audit record"), "{err}");
     }
 
     #[test]

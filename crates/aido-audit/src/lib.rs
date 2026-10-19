@@ -4,10 +4,11 @@
 //! whose first incident is unreconstructable. So this crate exists before the
 //! gate does, and the gate will not ship without it.
 //!
-//! Pure: it builds records, chains them, and verifies a chain. It does not open
-//! a file, talk to journald, or decide where anything goes — that is
-//! `aido-sys`'s job, and keeping it out of here is what makes the chaining
-//! logic testable without a filesystem.
+//! Pure: it builds records, chains them, and verifies a chain; it decides
+//! where a writer picks a chain up ([`tail`]) and what bytes journald receives
+//! for a record ([`journal`]). It does not open a file, send a datagram, or
+//! decide where anything goes — that is `aido-sys`'s job, and keeping it out of
+//! here is what makes the chaining logic testable without a filesystem.
 //!
 //! # What the chain does and does not give you
 //!
@@ -33,7 +34,13 @@
 #![forbid(unsafe_code)]
 
 pub mod chain;
+pub mod journal;
 pub mod record;
+pub mod tail;
 
-pub use chain::{Chain, ChainError, verify};
-pub use record::{Decision, Outcome, Record, Sequence};
+pub use chain::{Chain, ChainError, ChainReadError, LogError, follows, verify, verify_log};
+pub use record::{Approval, Decision, Outcome, Record, Sequence};
+pub use tail::{
+    Continuation, MAX_RECORD_BYTES, TAIL_WINDOW, TailError, continuation, continuation_of,
+    window_start,
+};

@@ -4,6 +4,316 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 6: the audit sinks
+
+**What exists.** `aido-sys::audit`: the contract the broker and the gate will
+write through, and the two sinks behind it. Wired to neither binary; that is
+steps 2 and 4.
+
+- **The contract carries the rule.** `AuditSink::append` takes a function that
+  builds the record from the chain's last record, calls it while the sink holds
+  the log, and checks the result with `aido_audit::follows` — the verifier's
+  own rule for one position, now shared by `verify` and every writer — before
+  a byte is written. It returns an `AuditReceipt`, which only a sink in
+  `aido-sys` can make. `authorize(sink, approval, build)` moves the approval in
+  and hands it back as `Authorized<T>` only with that receipt, and only for a
+  record that describes it — its command and governing action
+  (`aido_audit::Approval`), checked before the write (review finding 6). On
+  any error the approval given is dropped, and a record that says `denied`
+  authorizes nothing (`RecordedAsRefusal`). The drop is not the guarantee —
+  `Approved` is `Clone` — the types are: the broker's mint and the gate's exec
+  are to take an `Authorized<_>`, so acting on an unrecorded approval is a
+  type error rather than a review comment. A refusal needs no receipt: it is
+  appended best-effort and stands either way.
+- **`JsonlLog`, the chain's authority, at `/var/lib/aido/audit.jsonl`.** The
+  directory through `open_trusted` (root-owned and not group- or
+  world-writable from `/` down, no link); the file by `openat` on that
+  descriptor, `O_RDWR|O_APPEND|O_CREAT|O_NOFOLLOW|O_CLOEXEC` at `0600`; `fstat`
+  on the descriptor must show a regular file owned by root with no group or
+  other bits and `st_nlink == 1`; an exclusive `flock`, waited for at most 5 s;
+  the last record found in the last 128 KiB (`aido_audit::continuation`); the
+  new record built, checked, and refused over 64 KiB; one write, `fdatasync`,
+  an `fsync` of the directory with a log's first record, and the record sent
+  to the trail's mirrors — all under the lock. Any failure from the write on
+  cuts the log back to where it ended, and syncs the cut, before the lock is
+  released.
+- **`JournaldSink`**: one native-protocol datagram per record to
+  `/run/systemd/journal/socket`, through rustix's safe `socket_with` and
+  `sendto`, with a 2 s send timeout. `MESSAGE` is one escaped,
+  `term-sanitize`d, bounded line; `PRIORITY` is 5 for an authorization, 4 for a
+  refusal, 1 for a refusal carrying the gate's `severity=high`;
+  `SYSLOG_FACILITY=10`, a fixed `MESSAGE_ID`, `AIDO_*` index fields, and
+  `AIDO_RECORD`, the file's line byte for byte, so the entries root sent can be
+  compared with the file record by record. The encoder is pure
+  (`aido-audit::journal`), snapshot-tested, and checked by a decoder written
+  from the protocol description. Every query of it starts from
+  `aido_audit::journal::query`, which matches `_UID=0` (review finding 1,
+  below).
+- `AuditTrail::system(identifier)` is the log, then journald, both required.
+  `FakeAuditSink` exists only under the `fake` feature, which only test builds
+  enable.
+
+**Decisions.**
+
+1. **`/var/lib/aido`, not `/var/log/aido`.** The design plan's file table and
+   `todo/README.md` disagreed. On Ubuntu `/var/log` is `root:syslog 0775`, so
+   nothing beneath it passes the ancestor walk — rightly, since the `syslog`
+   group can rename `/var/log/aido` aside. `/var/log` is also where rotation
+   truncates and where log2ram keeps files that never reach a disk. `aido-config`
+   names the path (`SystemPaths::audit_log`) and its unused `log` field is
+   gone; the design-plan table and deviations block and the phase 3 packaging
+   notes say the same. The deny-list already protected `/var/lib/aido`
+   (`writing_anything_that_decides_is_denied` now lists the file) and keeps
+   `/var/log/aido` as a former location.
+2. **The file is the authority and journald a required mirror**, the reverse of
+   the plan's "journald primary". Only a file has a last record to continue
+   from, and journald rate-limits without telling the sender. The send happens
+   while the log is still locked, and a failed one cuts the record back out of
+   the log (review finding 2): an append lands on the whole trail or on none
+   of it, so a host without journald records nothing, refusals included.
+3. **A cap, not `memfd`, for oversized entries.** The writer refuses a record
+   over 64 KiB before writing anything, so an entry stays near 70 KiB at most,
+   under `PAYLOAD_MAX` (96 KiB) and the stock ~208 KiB socket send buffer. A
+   host tuned below that gets `EMSGSIZE`, which fails closed. Replayed into a
+   real `systemd-journald` (Debian stable, in Docker): all three snapshotted
+   payloads were stored with every field, and each `AIDO_RECORD` parsed back.
+4. **No `systemd-journal-logger` and no `/dev/log` fallback**, against the
+   plan's dependency table: the protocol is a few dozen lines over rustix,
+   already a dependency. The cost is open item 4.
+5. **Damage stops the writer.** A torn, edited, foreign-schema, or overlong
+   last line is refused (`TailError`): never continued past, never answered
+   with a fresh `seq 1`. The one tolerated irregularity is a complete record
+   missing its final newline. Repair is a person's: move the log aside, which
+   starts a new chain deliberately and keeps the evidence. `aido audit --log`
+   reports the same damage, or the first damage before it (review finding 4);
+   the refusal names that command, because the front-end has no `verify`
+   subcommand whatever older text calls it.
+6. Found by the snapshot: a newline in a quoted value ended `MESSAGE` there and
+   dropped the outcome. Every quoted value is now escaped.
+
+**Review, and how each finding was resolved.** An independent review of the
+step found no fail-open path — every error it could cause came back `Err`, and
+no receipt preceded `fdatasync` — and eight defects, resolved before merge
+below (its journald-mirror defect is resolved by the same change as the
+durability one, item 2), and two hardening notes (item 8, and open item 10):
+
+1. **Anyone could forge an entry the documented query returned.** Any local
+   user can send journald a datagram with aido's `MESSAGE_ID`, `PRIORITY=1`,
+   and every `AIDO_*` field; reproduced against a real journald, where
+   `journalctl MESSAGE_ID=… AIDO_DECISION=denied` returned uid 1000's entry.
+   *Fixed:* `aido_audit::journal::query` renders the one query every alert
+   rule and comparison starts from, `journalctl _UID=0 MESSAGE_ID=…`, and it
+   excludes that entry (re-run: root's entry returned, uid 1000's not).
+   `_UID` is the field journald takes from the kernel's credentials on the
+   datagram. Only entries passing it count, and the journal is never the
+   authority — root, which it still admits, can rewrite the file as easily.
+   Pinned by `a_forged_entry_from_an_unprivileged_sender_fails_every_documented_query`,
+   `the_query_in_the_module_docs_is_the_one_the_code_renders`, and the
+   `trusted_query` snapshot. **Not** narrowed by `_EXE` or `_SYSTEMD_UNIT`, as
+   the review suggested: journald reads those from `/proc` after the datagram
+   arrives. Measured against systemd 257's journald, from root: of 300 entries
+   whose sender exited at once, 299 had no `_EXE`; of 300 whose sender exec'd
+   at once, 86 carried the exec'd program's. The gate exits as soon as it
+   refuses and will exec as soon as it records, so that filter would drop its
+   alerts — the entries it exists for. `_SYSTEMD_UNIT` is read the same way,
+   and the gate runs in its caller's scope besides.
+2. **A record that failed after its write stayed in the log, and the next
+   writer chained onto it.** Only a failed write was cut back. After a failed
+   `fdatasync` the "allowed" line stayed, and Linux reports a writeback error
+   once, so the next writer's own `fdatasync` could succeed over a page that
+   never landed; after a failed directory `fsync` the next writer saw a record,
+   never synced the directory, and issued receipts a crash could erase with
+   the file; and a failed journald send left an "allowed" record that nothing
+   distinguished from one that ran. *Fixed:* the mirrors are sent to inside
+   the log's write, under its lock, and any failure from the write on cuts the
+   log back to its size before the write and `fdatasync`s the cut. For a first
+   record that means no record at all, so the next writer syncs the directory
+   itself. The review's two reproductions are kept, inverted:
+   `a_record_whose_fdatasync_fails_is_cut_back_before_any_writer_chains_on_it`
+   and `a_first_record_whose_directory_sync_fails_is_cut_back_so_the_next_writer_syncs_it`;
+   also `a_mirror_that_refuses_gets_the_record_cut_back_under_the_lock`,
+   `a_mirror_that_refuses_leaves_no_record_for_the_next_writer_to_chain_onto`,
+   and `the_record_reaches_the_mirrors_while_the_log_is_still_locked`. What
+   cannot be closed: if the cut itself fails, the next writer finds what is
+   left — a torn tail it refuses, or a whole record it continues from.
+3. **The log was checked before the lock and not after it.** A writer waiting
+   up to 5 s for the lock while root moved the log aside (as the damaged-tail
+   refusal says to) or deleted it went on to lock the old file and return a
+   receipt for a record in a file that was no longer the chain, or in none —
+   reproduced on macOS and Linux. *Fixed:* once the lock is held, `fstat`
+   again (one name) and `statat` the name without following it (same device
+   and inode); otherwise close and reopen, within the same bound, and refuse
+   if the log is still changing when it runs out. The review's two races are
+   kept as regressions with honest names,
+   `a_log_deleted_while_a_writer_waits_never_takes_the_record_with_it` and
+   `a_log_moved_aside_while_a_writer_waits_keeps_its_evidence_untouched`, with
+   `a_log_replaced_while_a_writer_waits_is_written_in_its_replacement` and
+   `a_log_that_keeps_changing_under_the_writer_is_refused_once_the_wait_runs_out`;
+   all three races fail with the check removed. A rename or delete *after* the
+   check, while the lock is held, still lands the record in the moved file or
+   in none — root's to do at any time, receipt or not.
+4. **The writer refused endings the verifier called intact, and the refusal
+   promised the verifier would name the line.** Past 128 KiB of blank space,
+   or a last line longer than the window, the writer refused every decision
+   while `aido audit --log` printed "chain intact"; a non-UTF-8 tail it
+   reported as an unreadable file, with no line. *Fixed:* one shared check.
+   `aido_audit::verify_log` — what `aido audit` now runs, on the file's bytes —
+   verifies every record and then asks `continuation_of` about the end: the
+   writer's function, on the window `window_start` gives both of them. So
+   every ending the writer refuses is reported, as the line when the damage
+   is a line and as the writer's own refusal when it is not, and a non-UTF-8
+   line is named by number (`Chain::from_jsonl_bytes`). The refusal now says
+   `aido audit --log` "reports it, or the first damage before it", which is
+   what it does. The review's reproduction, inverted:
+   `a_blank_tail_the_writer_refuses_is_reported_by_the_verifier_too`; with
+   `the_writer_and_the_verifier_agree_on_every_ending` (eleven endings, both
+   answers), `audit_reports_an_ending_the_privileged_writer_refuses_instead_of_calling_it_intact`,
+   and `audit_names_the_line_of_a_tail_that_is_not_text`. A consequence to
+   know: `aido audit` applies the privileged writer's end rule to whatever log
+   it reads, so an `ido` log whose last record runs past 128 KiB — `ido` caps
+   none — is reported, though `ido` itself would continue it.
+5. **`FakeAuditSink` did not enforce `MAX_RECORD_BYTES`.** A builder padded
+   past 64 KiB passed every test against the fake and failed with `TooLarge`
+   only in production. *Fixed:* every sink builds, chains, and sizes its record
+   through one function, `next_record`, so the fake refuses exactly what the
+   log refuses. `the_fake_sink_refuses_exactly_the_records_too_long_for_the_real_log`
+   pins it at the byte: a line of exactly 64 KiB is accepted by both, one more
+   byte refused by both with the same error.
+6. **`authorize` did not tie the record to the approval.** It checked only
+   that the record was not `denied`, so a builder that recorded another argv
+   or action still produced `Authorized<T>`; and "the approval is dropped" was
+   claimed as a guarantee though `Approved` is `Clone` with public fields.
+   *Fixed, minimally:* `authorize` takes `T: aido_audit::Approval` — the
+   command and the governing action an approval must be recorded with,
+   implemented by `aido_gate::Approved` and used by its own
+   `authorization_record` for `argv` — and passes `AuditSink::append_checked`
+   a check that the built record carries exactly those, run after the record
+   chains and before anything is written (`AuditError::Misrecorded`). The
+   docs now say the drop is not the guarantee; executors taking
+   `Authorized<_>` is. Tests: `an_authorization_recorded_for_another_command_authorizes_nothing`,
+   `an_authorization_recorded_under_another_action_authorizes_nothing`,
+   `a_misrecorded_authorization_never_reaches_the_log_or_a_mirror`,
+   `a_gate_record_built_for_another_approval_authorizes_nothing`, and
+   `a_record_for_another_command_or_action_does_not_describe_the_approval`.
+   The deeper design is open item 9.
+7. **Documents still disagreed.** The design plan's dependency table still
+   said `systemd-journal-logger` primary with a `/dev/log` fallback, its
+   rationale "two sinks, both independent", and its TOCTOU section "audit to a
+   socket, not a path"; `Chain::replace_tail` still called editing an outcome
+   in place "the one legitimate mutation". *Fixed:* the plan (and the same
+   paragraph in `SUGGESTIONS.md`) now says one authority, journald a required
+   mirror written under the file's lock, only `_UID=0` entries counting, and
+   a log opened through the descriptor walk. `replace_tail` is deleted —
+   nothing called it, on any branch, and its only purpose contradicted the
+   append-only log — and
+   `an_outcome_is_a_record_of_its_own_and_filling_one_in_is_tampering` pins
+   the rule instead. The two cuts the file cannot show — truncation to zero,
+   which restarts the chain at `seq 1`, and a cut at a record boundary, which
+   is continued — are stated as open item 5, and in `aido_audit::tail`.
+8. The `open_trusted` `O_DIRECTORY` hardening note is left to step 7, whose
+   branch changes that function.
+
+**How the broker and the gate are to call it** (the module docs carry the same
+sketch): open `AuditTrail::system("aidod")` or `("aido-gate")`. On a refusal,
+`append` the record `refusal_record` builds and refuse whatever comes back. On
+an approval, `authorize` with `authorization_record`, act only through the
+`Authorized<_>`, and refuse when it errs. The receipt's `seq` is the audit id a
+spool entry or a decision envelope can cite.
+
+**Tests**, named for the attack: on a real file, the symlink, dangling-symlink,
+second-name, foreign-owner, and readable-mode refusals
+(`a_dangling_symlink_cannot_make_the_writer_create_a_file_elsewhere`,
+`a_log_with_a_second_name_is_refused`); a torn and an edited tail on disk, each
+refused by the writer and named by the verifier
+(`an_edited_last_record_on_disk_stops_the_writer_and_the_verifier_names_it`);
+`concurrent_writers_never_fork_the_chain`; through a fake file, the order write
+→ `fdatasync` → directory `fsync` and each failure among them
+(`the_first_record_starts_the_chain_and_reaches_the_disk`,
+`a_record_whose_fdatasync_fails_is_cut_back_before_any_writer_chains_on_it`,
+`a_write_that_fails_part_way_is_cut_back_to_where_the_log_ended`);
+`an_approval_that_cannot_be_recorded_leaves_nothing_to_act_on`;
+`an_argv_cannot_forge_a_log_line_or_drive_the_terminal_through_the_message`;
+and on Linux, the transport against datagram sockets bound under `target/`:
+delivered whole, refused by a dead or a stalled receiver within the timeout,
+and `the_journal_receives_the_line_the_log_holds_byte_for_byte` through the
+real trail. Where there is no journald, as in the container,
+`the_system_sink_reaches_journald_exactly_when_the_host_has_one` asserts the
+refusal; on a CI runner, the delivery.
+
+**Open.**
+
+1. **Wiring (steps 2 and 4).** Neither binary has a refusal for "the record
+   could not be written": no `DenialCode`, no gate `Refusal` variant. Adding
+   one changes the pinned denial contract, so it is a reviewed snapshot change.
+2. **Outcomes.** An outcome learnt after exec is a second record naming the
+   authorization (`authorization_record`'s doc said the record is "updated";
+   it now says append-only). `Record` has no field to name it with yet, and
+   whether the gate learns an outcome at all is step 4's process-model call.
+3. **A refusal over 64 KiB goes unrecorded.** A caller can pad an argv until
+   its refusal record is too large to write. The broker should cap a request's
+   size, and both callers should fall back to a bounded refusal (argv elided,
+   its length as evidence); there is no helper for that yet.
+4. **No `audit_sink` setting.** A host or container without journald —
+   including the devcontainers agents often run in — refuses every privileged
+   request. Phase 3 still says `Recommends: systemd`; decide before the beta
+   `.deb` whether that becomes `Depends`, or the setting comes first.
+5. **Two cuts the file cannot show, and nothing cross-checks it against the
+   journal.** A log truncated to zero bytes — or to nothing but blank lines —
+   holds no record, so the next writer silently starts a fresh chain at
+   `seq 1`: it cannot tell an emptied log from a new one. A log cut back at a
+   record boundary ends in a good record, so the next writer silently
+   continues from it, and the verifier calls it intact. Both need root or a
+   disk fault, and neither is detected today. The `AIDO_SEQ` and `AIDO_HASH`
+   of the journal entries the trusted query finds would show both, but no tool
+   compares them; pasban is where that comparison belongs. `aido audit`
+   checks one file, defaults to `ido`'s per-user log, and needs
+   `--log /var/lib/aido/audit.jsonl` and root for the chain.
+6. **The directory's own mode.** The walk demands root-owned and not group- or
+   world-writable, not the table's `0700`. Loosened to `0755` on a host with
+   `fs.protected_hardlinks=0`, a local user can hard-link the log and so make
+   the writer refuse every decision: fail closed, availability only. Step 7's
+   mount check should cover `/var/lib/aido` as well as the ruleset.
+7. On a host with journald, the suite leaves one `SYSLOG_IDENTIFIER=aido-test`
+   entry per run, under the real `MESSAGE_ID`. It carries the runner's `_UID`,
+   so the trusted query excludes it; only a suite run as root, which
+   `just linux-test` and CI never do, would leave one the query counts.
+8. `ido`'s per-user run log keeps its whole-log read and verify on every
+   append. It shares `Record` and `Chain::from_jsonl` with the privileged
+   writer and has no need of a tail window.
+9. **The approval-to-record binding is minimal.** `authorize` checks the
+   command and the governing action only; the rule source, the caller's
+   classification, the confirmation channel, and the nonce are the builder's
+   to get right. The fuller shape is for the approval to build its own record
+   (`authorize<T: Recordable>`), or for the receipt to carry a digest the
+   executor compares. And while `Approved` is `Clone` with public fields, the
+   guarantee rests entirely on every executor taking `Authorized<_>`; a
+   constructor-only `Approved` is step 4's call, when the executor exists.
+10. **`0600` keeps the file from other users, not the records.** The same
+    record, argv and all, goes to the system journal, which members of `adm`
+    and `systemd-journal` can read. The mode is what keeps everyone else from
+    writing — or reading — the file; it is not confidentiality from those
+    groups. Found by the review, as were two quirks of the record hash outside
+    this step, left for a schema bump: `None` and `Some("")` hash alike, and an
+    `Outcome` is hashed through its `Debug` output, which no toolchain
+    promises to keep stable.
+11. **The production path has no committed test as root.** Every real-file
+    test opens its directory itself (`LogDir::Opened`), because the suite runs
+    unprivileged by design. The production path was run by hand as root in
+    Docker instead — by the review, and again after these fixes (see
+    "Measured").
+
+Measured, after the review fixes: `just verify` at 100% lines, regions, and
+functions on macOS; `just check-linux` and clippy over every target for both
+Linux triples clean; `just linux-test` green on Linux 6.12 aarch64 as uid
+1000, the three lock races, the create race, and the socket tests included.
+The production path by hand as root in the same container, with no journald:
+`JsonlLog::system()` created `/var/lib/aido/audit.jsonl` `0600`, root's, one
+name; `AuditTrail::system` refused and left the log's size as it was; the
+next append was `seq 2`, and `verify_log` read two records. Not yet seen on
+the CI runners' 6.17.
+
+---
+
 ## 2026-10-19 — M2b step 7: a ruleset on a mount a non-root user made
 
 ### The hole this closes

@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
 aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
 # The four system calls that need `unsafe`. The only crate that may depend on
@@ -20,10 +21,6 @@ bstr.workspace = true
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 thiserror.workspace = true
 
-# The mountinfo parser is held to the kernel's escaping for arbitrary bytes.
-[dev-dependencies]
-proptest.workspace = true
-
 # The Linux tests start a real peer process and bound its connection with
 # SO_RCVTIMEO, so a connector that fails cannot hang the suite.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -32,6 +29,31 @@ rustix = { version = "1.1", default-features = false, features = [
   "fs",
   "net",
 ] }
+
+
+# The journald audit mirror: one datagram per record to journald's native
+# socket, through rustix's safe socket API. Linux only, as journald is.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "fs",
+  "net",
+] }
+
+[features]
+# `FakeAuditSink`, for the tests of code that must record before it acts. A
+# sink that issues receipts without writing anything must not be linkable into
+# a shipped binary, so it exists only where a test build asks for it.
+fake = []
+
+[dev-dependencies]
+# The system log's path must be the one the configuration crate names, and the
+# journal's alert priority must meet the gate's high-severity mark; both are
+# checked against the other crate rather than restated.
+aido-config = { path = "../aido-config", version = "0.0.1" }
+aido-gate = { path = "../aido-gate", version = "0.0.1" }
+# The mountinfo parser is held to the kernel's escaping for arbitrary bytes.
+proptest.workspace = true
 
 [lints]
 workspace = true

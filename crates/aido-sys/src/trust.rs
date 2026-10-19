@@ -422,7 +422,7 @@ pub fn verify_path(target: &Path) -> Result<(), TrustError> {
 /// `st_mode` is a `u32` on Linux and a `u16` on macOS, so the widening below
 /// is a real conversion on one platform and an identity on the other.
 #[allow(clippy::useless_conversion)]
-fn facts_of(stat: &rustix::fs::Stat) -> PathFacts {
+pub(crate) fn facts_of(stat: &rustix::fs::Stat) -> PathFacts {
     let raw = stat.st_mode;
     let kind = match rustix::fs::FileType::from_raw_mode(raw) {
         rustix::fs::FileType::Directory => Kind::Directory,

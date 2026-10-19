@@ -1,0 +1,20 @@
+---
+source: crates/aido-audit/tests/journal_wire.rs
+expression: "render(&datagram(&authorization(), \"aidod\").unwrap())"
+---
+MESSAGE=allowed: [\"/usr/bin/systemctl\",\"restart\",\"nginx.service\"] (caller human, action aido.svc.restart, rule 20-services.toml:15, audit seq 2)\n
+PRIORITY=5\n
+SYSLOG_FACILITY=10\n
+SYSLOG_IDENTIFIER=aidod\n
+MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e\n
+AIDO_SCHEMA_VERSION=1\n
+AIDO_SEQ=2\n
+AIDO_HASH=57a7ee0ff84501b9b5caf225487ca0a0a9d23b4f8e82b13cd1d301a555e08dfc\n
+AIDO_PREV_HASH=1a44a17000387efdf3b4511e7e7414ddb83331aa656c5d609b394eb8bc849f2d\n
+AIDO_DECISION=allowed\n
+AIDO_OUTCOME=not_executed\n
+AIDO_CLASSIFICATION=human\n
+AIDO_ACTION=aido.svc.restart\n
+AIDO_RULE_SOURCE=20-services.toml:15\n
+AIDO_PROGRAM=/usr/bin/systemctl\n
+AIDO_RECORD={\"schema_version\":1,\"seq\":2,\"prev_hash\":\"1a44a17000387efdf3b4511e7e7414ddb83331aa656c5d609b394eb8bc849f2d\",\"hash\":\"57a7ee0ff84501b9b5caf225487ca0a0a9d23b4f8e82b13cd1d301a555e08dfc\",\"decision\":\"allowed\",\"denial\":null,\"action\":\"aido.svc.restart\",\"rule_source\":\"20-services.toml:15\",\"argv\":[\"/usr/bin/systemctl\",\"restart\",\"nginx.service\"],\"classification\":\"human\",\"evidence\":[\"gate_caller_pid=4242\"],\"deny_list_version\":1,\"outcome\":\"not_executed\"}\n

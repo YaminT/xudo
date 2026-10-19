@@ -1,0 +1,18 @@
+---
+source: crates/aido-audit/tests/journal_wire.rs
+expression: "render(&datagram(&hostile_refusal(), \"aido-gate\").unwrap())"
+---
+MESSAGE=denied: [] (caller unattested, refused gate_no_pending_request, audit seq 1)\n
+PRIORITY=1\n
+SYSLOG_FACILITY=10\n
+SYSLOG_IDENTIFIER=aido-gate\n
+MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e\n
+AIDO_SCHEMA_VERSION=1\n
+AIDO_SEQ=1\n
+AIDO_HASH=b0fc517c74b460971226ea6387bcd40fc6c22e3c284c94496097a52900980ac0\n
+AIDO_PREV_HASH=\n
+AIDO_DECISION=denied\n
+AIDO_OUTCOME=not_executed\n
+AIDO_CLASSIFICATION=unattested\n
+AIDO_DENIAL=gate_no_pending_request\n
+AIDO_RECORD={\"schema_version\":1,\"seq\":1,\"prev_hash\":\"\",\"hash\":\"b0fc517c74b460971226ea6387bcd40fc6c22e3c284c94496097a52900980ac0\",\"decision\":\"denied\",\"denial\":\"gate_no_pending_request\",\"action\":null,\"rule_source\":null,\"argv\":[],\"classification\":\"unattested\",\"evidence\":[\"severity=high\",\"gate_caller_pid=77\"],\"deny_list_version\":0,\"outcome\":\"not_executed\"}\n

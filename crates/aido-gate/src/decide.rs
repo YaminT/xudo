@@ -29,7 +29,7 @@
 //! audit sink can route on it, and it is derived from the refusal rather than
 //! chosen at each call site, where it would drift.
 
-use aido_audit::record::{Decision as AuditDecision, Outcome, Record};
+use aido_audit::record::{Approval, Decision as AuditDecision, Outcome, Record};
 use aido_policy::{
     ActionId, Arg, Argv, CallerFacts, Confirm, Decision, DenialCode, ExitCode, Request, RuleSet,
     Verdict, engine,
@@ -189,6 +189,22 @@ pub struct Approved {
     pub nonce: String,
 }
 
+/// What the record of this approval must say: the program the ruleset spells
+/// and the operands, and the action that governed. `aido_sys::authorize`
+/// refuses a record that says otherwise, and [`authorization_record`] builds
+/// its `argv` from here, so the two cannot drift.
+impl Approval for Approved {
+    fn command(&self) -> Vec<String> {
+        let mut argv = vec![self.program.clone()];
+        argv.extend(self.argv.iter().cloned());
+        argv
+    }
+
+    fn action(&self) -> &str {
+        &self.action
+    }
+}
+
 /// Decides whether the gate may execute, and exactly what.
 ///
 /// # Errors
@@ -325,17 +341,18 @@ pub fn refusal_record(
 
 /// The audit record for an authorization, before the child runs.
 ///
-/// Written *before* execution, and updated with the outcome afterwards. The
-/// order matters: a record written only after the child exits is a record that a
-/// crash — or a kill — erases, which loses exactly the events worth keeping.
+/// Written *before* execution. The order matters: a record written only after
+/// the child exits is a record that a crash — or a kill — erases, which loses
+/// exactly the events worth keeping. The log is append-only
+/// (`aido_sys::AuditSink`), so an outcome learnt afterwards is a second record
+/// naming this one, never an edit of it.
 pub fn authorization_record(
     previous: Option<&Record>,
     approved: &Approved,
     caller: &GateCaller,
     confirmed_by: Option<&str>,
 ) -> Record {
-    let mut argv = vec![approved.program.clone()];
-    argv.extend(approved.argv.iter().cloned());
+    let argv = approved.command();
 
     let mut evidence = vec![format!("gate_caller_pid={}", caller.pin.pid)];
     if let Some(channel) = confirmed_by {
@@ -815,11 +832,16 @@ args = [
 
     #[test]
     fn an_authorization_is_recorded_before_the_child_runs() {
-        // Written first and updated after. A record written only on exit is one
-        // that a crash or a kill erases — losing exactly the events worth having.
+        // Written first; an outcome is a later record. A record written only on
+        // exit is one that a crash or a kill erases — losing exactly the events
+        // worth having.
         let approved = decide(&rules(), &human(77), Some(&status_request(77)), context()).unwrap();
         let record = authorization_record(None, &approved, &human(77), None);
 
+        // The record describes the approval it is for: the binding
+        // `aido_sys::authorize` refuses to write without.
+        assert_eq!(record.describes(&approved), Ok(()));
+        assert_eq!(record.argv, approved.command());
         assert_eq!(record.decision, AuditDecision::Allowed);
         assert_eq!(record.action.as_deref(), Some("aido.svc.status"));
         assert_eq!(record.rule_source.as_deref(), Some("test-rules.toml:3"));
@@ -957,6 +979,10 @@ args = [
         let record =
             authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
         assert_eq!(record.action.as_deref(), Some("aido.reload.confirmed"));
+        // And the binding `authorize` checks before writing holds on the
+        // governing action, not the requested one.
+        assert_eq!(record.describes(&approved), Ok(()));
+        assert_eq!(Approval::action(&approved), "aido.reload.confirmed");
         assert_eq!(
             record.rule_source.as_deref(),
             Some(approved.rule_source.as_str())

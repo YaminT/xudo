@@ -1,0 +1,20 @@
+---
+source: crates/aido-audit/tests/journal_wire.rs
+expression: render(&payload)
+---
+MESSAGE=allowed: [\"/usr/bin/true\"] (caller human, action aido.x, rule evil.toml:1\\nPRIORITY=7, exited 0, audit seq 1)\n
+PRIORITY=5\n
+SYSLOG_FACILITY=10\n
+SYSLOG_IDENTIFIER=aidod\n
+MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e\n
+AIDO_SCHEMA_VERSION=1\n
+AIDO_SEQ=1\n
+AIDO_HASH=b2920bef3aed2d4273bd845e0911d4b68e871543e57dc4f5b4e12b2659f25a84\n
+AIDO_PREV_HASH=\n
+AIDO_DECISION=allowed\n
+AIDO_OUTCOME=exited\n
+AIDO_CLASSIFICATION=human\n
+AIDO_ACTION=aido.x\n
+AIDO_RULE_SOURCE\n\x16\x00\x00\x00\x00\x00\x00\x00evil.toml:1\nPRIORITY=7\n
+AIDO_PROGRAM=/usr/bin/true\n
+AIDO_RECORD={\"schema_version\":1,\"seq\":1,\"prev_hash\":\"\",\"hash\":\"b2920bef3aed2d4273bd845e0911d4b68e871543e57dc4f5b4e12b2659f25a84\",\"decision\":\"allowed\",\"denial\":null,\"action\":\"aido.x\",\"rule_source\":\"evil.toml:1\\nPRIORITY=7\",\"argv\":[\"/usr/bin/true\"],\"classification\":\"human\",\"evidence\":[],\"deny_list_version\":0,\"outcome\":{\"exited\":{\"code\":0}}}\n

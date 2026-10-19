@@ -61,7 +61,7 @@ Control fields:
 | `Priority` | `optional` | |
 | `Architecture` | `amd64`, `arm64` | Native runners for both; no QEMU in the release path |
 | `Depends` | `sudo \| opendoas`, `${shlibs:Depends}`, `${misc:Depends}` | An alternation, because the doas lane is real |
-| `Recommends` | `systemd` | journald is the primary audit sink; degrades to `/dev/log` |
+| `Recommends` | `systemd` | journald mirrors every audit record and the mirror is required: a host or container without journald refuses every privileged request until an `audit_sink` setting exists to leave it out (`../CONCERNS.md`, 2026-10-19). No `/dev/log` fallback yet |
 | `Conflicts` | — | Deliberately none; `aido` does not replace `sudo` |
 
 ### 2.1 The `aido` group
@@ -92,7 +92,7 @@ The dangerous part. Each step exists because of a specific failure mode.
 
 ### prerm / postrm
 
-**An uninstall that leaves a sudoers rule behind is a security defect, not a cosmetic one.** `postrm remove` must delete `/etc/sudoers.d/aido`; `postrm purge` must additionally remove `/etc/aido`, `/var/lib/aido`, `/var/log/aido`, and the `aido` group. The doas path must remove exactly its own sentinel-delimited block and nothing else. Both are asserted in the container matrix.
+**An uninstall that leaves a sudoers rule behind is a security defect, not a cosmetic one.** `postrm remove` must delete `/etc/sudoers.d/aido`; `postrm purge` must additionally remove `/etc/aido`, `/var/lib/aido` (which holds the audit chain, `audit.jsonl`), and the `aido` group. The package creates `/var/lib/aido` `0700 root:root`; the audit writer creates its log there and never creates the directory. The doas path must remove exactly its own sentinel-delimited block and nothing else. Both are asserted in the container matrix.
 
 ---
 

@@ -41,6 +41,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod error;
 pub mod exec;
 pub mod kernel;
@@ -53,6 +54,12 @@ pub mod source;
 pub mod syscall;
 pub mod trust;
 
+#[cfg(any(test, feature = "fake"))]
+pub use audit::FakeAuditSink;
+pub use audit::{
+    AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
+    AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
+};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};

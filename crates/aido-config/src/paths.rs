@@ -40,8 +40,6 @@ pub struct SystemPaths {
     pub state: PathBuf,
     /// `/run/aido`.
     pub runtime: PathBuf,
-    /// `/var/log/aido`.
-    pub log: PathBuf,
 }
 
 impl Default for SystemPaths {
@@ -50,7 +48,6 @@ impl Default for SystemPaths {
             etc: PathBuf::from("/etc/aido"),
             state: PathBuf::from("/var/lib/aido"),
             runtime: PathBuf::from("/run/aido"),
-            log: PathBuf::from("/var/log/aido"),
         }
     }
 }
@@ -72,6 +69,16 @@ impl SystemPaths {
         self.etc.join("trust.d")
     }
 
+    /// The hash-chained audit log the broker and the gate append to.
+    ///
+    /// Under state, not `/var/log`: on Ubuntu `/var/log` is `root:syslog
+    /// 0775`, so nothing beneath it passes the ancestor walk a privileged
+    /// write target must pass, and rotation and RAM-backed log directories
+    /// would cut or lose a chain. `aido-sys` writes it and checks it agrees.
+    pub fn audit_log(&self) -> PathBuf {
+        self.state.join("audit.jsonl")
+    }
+
     /// Every path that must be root-owned and not group- or world-writable.
     ///
     /// Enumerated here so the ownership check in `aido-sys` has one list to walk
@@ -83,8 +90,8 @@ impl SystemPaths {
             self.rules_dir(),
             self.trust_dir(),
             self.state.clone(),
+            self.audit_log(),
             self.runtime.clone(),
-            self.log.clone(),
         ]
     }
 }
@@ -229,7 +236,21 @@ mod tests {
         assert_eq!(paths.trust_dir(), PathBuf::from("/etc/aido/trust.d"));
         assert_eq!(paths.state, PathBuf::from("/var/lib/aido"));
         assert_eq!(paths.runtime, PathBuf::from("/run/aido"));
-        assert_eq!(paths.log, PathBuf::from("/var/log/aido"));
+        assert_eq!(
+            paths.audit_log(),
+            PathBuf::from("/var/lib/aido/audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn the_audit_chain_is_never_under_var_log() {
+        // Ubuntu's /var/log is group-writable by syslog: a chain beneath it
+        // could be swapped by that group, and fails the ancestor walk.
+        let paths = SystemPaths::default();
+        assert!(paths.audit_log().starts_with(&paths.state));
+        for path in paths.must_be_root_owned() {
+            assert!(!path.starts_with("/var/log"), "{path:?}");
+        }
     }
 
     #[test]
@@ -255,8 +276,8 @@ mod tests {
             paths.rules_dir(),
             paths.trust_dir(),
             paths.state.clone(),
+            paths.audit_log(),
             paths.runtime.clone(),
-            paths.log.clone(),
         ] {
             assert!(listed.contains(&expected), "{expected:?} is not checked");
         }

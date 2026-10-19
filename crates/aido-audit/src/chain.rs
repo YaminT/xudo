@@ -1,11 +1,12 @@
 //! Verifying that a log has not been edited.
 //!
-//! `aido audit verify` is this function. It answers one question — has anything
+//! `aido audit` runs [`verify_log`]. It answers one question — has anything
 //! in this log changed since it was written — and it answers it precisely,
 //! naming the position where the chain first stops matching rather than saying
 //! "invalid".
 
 use crate::record::{Record, Sequence};
+use crate::tail::{TailError, continuation_of};
 
 /// Where and how a chain stopped being consistent.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -98,16 +99,6 @@ impl Chain {
         seq
     }
 
-    /// Replaces the tail, re-sealing it.
-    ///
-    /// For the one legitimate mutation: filling in an outcome once the child has
-    /// finished. Everything else about a record is known before it is written.
-    pub fn replace_tail(&mut self, record: Record) {
-        if let Some(tail) = self.records.last_mut() {
-            *tail = record;
-        }
-    }
-
     /// The records, in order.
     pub fn records(&self) -> &[Record] {
         &self.records
@@ -142,13 +133,27 @@ impl Chain {
     /// Returns [`ChainError`] naming the first position that does not hold, or a
     /// `serde_json` error for a line that is not a record.
     pub fn from_jsonl(text: &str) -> Result<Self, ChainReadError> {
+        Self::from_jsonl_bytes(text.as_bytes())
+    }
+
+    /// [`Self::from_jsonl`] for a log read as bytes, as a file is.
+    ///
+    /// A line that is not UTF-8 is a line that is not a record, reported by
+    /// its number — not a file that cannot be read. Lines split at `\n`, as a
+    /// writer finds them; a `\r` before it is blank space to the parser, as it
+    /// is to [`str::lines`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_jsonl`].
+    pub fn from_jsonl_bytes(log: &[u8]) -> Result<Self, ChainReadError> {
         let mut records = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
+        for (index, line) in log.split(|byte| *byte == b'\n').enumerate() {
+            if std::str::from_utf8(line).is_ok_and(is_blank) {
                 continue;
             }
             let record: Record =
-                serde_json::from_str(line).map_err(|source| ChainReadError::Malformed {
+                serde_json::from_slice(line).map_err(|source| ChainReadError::Malformed {
                     line: index.saturating_add(1),
                     reason: source.to_string(),
                 })?;
@@ -157,6 +162,43 @@ impl Chain {
         verify(&records).map_err(ChainReadError::Inconsistent)?;
         Ok(Self { records })
     }
+}
+
+/// Verifies a whole log the way `aido audit` does: every record, in order,
+/// then the end of the log as a privileged writer reads it.
+///
+/// The second half is what keeps the verifier and the writer from
+/// disagreeing. A writer reads only the end of the log; every ending it
+/// refuses, this reports — through the records when the damage is a record,
+/// and through [`continuation_of`], the writer's own function on the writer's
+/// own window, when it is not: a log that ends in more than
+/// [`crate::TAIL_WINDOW`] bytes without a complete line verifies record by
+/// record, and is still a log no privileged writer will continue.
+///
+/// # Errors
+///
+/// [`LogError::Chain`] for the first record that does not parse or does not
+/// follow; [`LogError::End`] when every record does and the end is one a
+/// writer refuses.
+pub fn verify_log(log: &[u8]) -> Result<Chain, LogError> {
+    let chain = Chain::from_jsonl_bytes(log)?;
+    continuation_of(log)?;
+    Ok(chain)
+}
+
+/// Why a log does not verify.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LogError {
+    /// A record does not parse, or the chain does not hold.
+    #[error(transparent)]
+    Chain(#[from] ChainReadError),
+    /// Every record verifies, and the end of the log is one a privileged
+    /// writer refuses to continue from.
+    #[error(
+        "every record verifies, but a privileged writer refuses to continue from the end of the \
+         log: {0}"
+    )]
+    End(#[from] TailError),
 }
 
 impl Default for Chain {
@@ -195,55 +237,78 @@ pub fn verify(records: &[Record]) -> Result<(), ChainError> {
     let mut previous: Option<&Record> = None;
 
     for record in records {
-        if record.schema_version != crate::record::RECORD_SCHEMA_VERSION {
-            return Err(ChainError::UnknownSchema {
-                seq: record.seq.get(),
-                found: record.schema_version,
-                supported: crate::record::RECORD_SCHEMA_VERSION,
-            });
-        }
-        if !record.is_sealed() {
-            return Err(ChainError::Edited {
-                seq: record.seq.get(),
-            });
-        }
-
-        match previous {
-            None => {
-                if !record.prev_hash.is_empty() {
-                    return Err(ChainError::TruncatedFront {
-                        prev_hash: record.prev_hash.clone(),
-                    });
-                }
-                if record.seq != Sequence::first() {
-                    return Err(ChainError::OutOfOrder {
-                        seq: record.seq.get(),
-                        previous: 0,
-                    });
-                }
-            }
-            Some(prior) => {
-                if record.seq != prior.seq.next() {
-                    return Err(ChainError::OutOfOrder {
-                        seq: record.seq.get(),
-                        previous: prior.seq.get(),
-                    });
-                }
-                if record.prev_hash != prior.hash {
-                    return Err(ChainError::Broken {
-                        seq: record.seq.get(),
-                        expected_seq: prior.seq.get(),
-                        found_prev: record.prev_hash.clone(),
-                        expected_prev: prior.hash.clone(),
-                    });
-                }
-            }
-        }
-
+        follows(previous, record)?;
         previous = Some(record);
     }
 
     Ok(())
+}
+
+/// Whether `record` may stand where it does: directly after `previous`, or
+/// first in a log when `previous` is `None`.
+///
+/// The one check behind [`verify`] and behind a writer about to append, so a
+/// writer can never put down a record the verifier would reject at that
+/// position: the two share this function rather than two copies of the rule.
+///
+/// # Errors
+///
+/// The same [`ChainError`] that [`verify`] reports for this position.
+pub fn follows(previous: Option<&Record>, record: &Record) -> Result<(), ChainError> {
+    if record.schema_version != crate::record::RECORD_SCHEMA_VERSION {
+        return Err(ChainError::UnknownSchema {
+            seq: record.seq.get(),
+            found: record.schema_version,
+            supported: crate::record::RECORD_SCHEMA_VERSION,
+        });
+    }
+    if !record.is_sealed() {
+        return Err(ChainError::Edited {
+            seq: record.seq.get(),
+        });
+    }
+
+    match previous {
+        None => {
+            if !record.prev_hash.is_empty() {
+                return Err(ChainError::TruncatedFront {
+                    prev_hash: record.prev_hash.clone(),
+                });
+            }
+            if record.seq != Sequence::first() {
+                return Err(ChainError::OutOfOrder {
+                    seq: record.seq.get(),
+                    previous: 0,
+                });
+            }
+        }
+        Some(prior) => {
+            if record.seq != prior.seq.next() {
+                return Err(ChainError::OutOfOrder {
+                    seq: record.seq.get(),
+                    previous: prior.seq.get(),
+                });
+            }
+            if record.prev_hash != prior.hash {
+                return Err(ChainError::Broken {
+                    seq: record.seq.get(),
+                    expected_seq: prior.seq.get(),
+                    found_prev: record.prev_hash.clone(),
+                    expected_prev: prior.hash.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a line of a log is blank.
+///
+/// Every reader skips blank lines — [`Chain::from_jsonl`] and a writer looking
+/// for the record to continue from — and they share this predicate so a stray
+/// newline is never damage to one and a record boundary to the other.
+pub(crate) fn is_blank(line: &str) -> bool {
+    line.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -303,23 +368,26 @@ mod tests {
     }
 
     #[test]
-    fn an_outcome_can_be_filled_in_afterwards_without_breaking_the_chain() {
-        // The one legitimate mutation: the child's exit status is not known when
-        // the record is written.
-        let mut chain = chain_of(2);
-        let finished = chain.records()[1]
-            .clone()
-            .with_outcome(Outcome::Exited { code: 0 });
-        chain.replace_tail(finished);
-        verify(chain.records()).unwrap();
-        assert!(chain.records()[1].outcome.executed());
-    }
+    fn an_outcome_is_a_record_of_its_own_and_filling_one_in_is_tampering() {
+        // The log is append-only. The child's exit status, learnt after the
+        // authorization was written, is a new record after it; written into
+        // the authorization instead, it is an edit, and the verifier says so.
+        // That is why `Chain` has no way to replace its tail.
+        let chain = chain_of(2);
+        let mut records = chain.records().to_vec();
+        let outcome = Record::after(
+            records.last(),
+            Decision::Allowed,
+            records[1].argv.clone(),
+            "unattested",
+        )
+        .with_outcome(Outcome::Exited { code: 0 });
+        records.push(outcome);
+        verify(&records).unwrap();
 
-    #[test]
-    fn replacing_the_tail_of_an_empty_chain_does_nothing() {
-        let mut chain = Chain::new();
-        chain.replace_tail(Record::first(Decision::Allowed, Vec::new(), "h"));
-        assert!(chain.is_empty());
+        let mut filled_in = chain.records().to_vec();
+        filled_in[1].outcome = Outcome::Exited { code: 0 };
+        assert_eq!(verify(&filled_in), Err(ChainError::Edited { seq: 2 }));
     }
 
     #[test]
@@ -452,6 +520,98 @@ mod tests {
             err.to_string().starts_with("line 3 is not an audit record"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_writer_checks_one_link_with_the_rule_the_verifier_uses() {
+        // `follows` is `verify` for one position: a record built after the
+        // tail passes, and one that ignores the tail fails exactly as the
+        // verifier would fail it there.
+        let chain = chain_of(2);
+        let tail = chain.records().last();
+        let next = Record::after(tail, Decision::Denied, vec!["x".to_owned()], "human");
+        assert_eq!(follows(tail, &next), Ok(()));
+        assert_eq!(follows(None, &chain.records()[0]), Ok(()));
+
+        let restart = Record::first(Decision::Allowed, vec!["x".to_owned()], "human");
+        assert_eq!(
+            follows(tail, &restart),
+            Err(ChainError::OutOfOrder {
+                seq: 1,
+                previous: 2
+            })
+        );
+        let mut both = chain.records().to_vec();
+        both.push(restart);
+        assert_eq!(
+            verify(&both).unwrap_err(),
+            follows(tail, &both[2]).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn a_torn_final_record_is_reported_by_the_verifier_at_its_line() {
+        // What a crash mid-write leaves. `aido audit` runs this function,
+        // through `verify_log`, so the damage a privileged writer refuses to
+        // continue past is damage the verifier names.
+        let text = chain_of(3).to_jsonl();
+        let torn = &text[..text.len().saturating_sub(20)];
+        let err = Chain::from_jsonl(torn).unwrap_err();
+        assert!(
+            err.to_string().starts_with("line 3 is not an audit record"),
+            "{err}"
+        );
+        // A complete last record missing only its newline is not damage.
+        assert_eq!(Chain::from_jsonl(text.trim_end()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_line_that_is_not_text_is_named_by_its_number_not_hidden_as_an_unreadable_file() {
+        // What a filesystem leaves behind a crash, or what someone with the
+        // file wrote. Read as text, the whole log was "unreadable" and the
+        // damage had no position; read as bytes, it is a line like any other.
+        let mut log = chain_of(2).to_jsonl().into_bytes();
+        log.extend_from_slice(b"\xff\xfe{}\n");
+        let err = Chain::from_jsonl_bytes(&log).unwrap_err();
+        assert!(
+            err.to_string().starts_with("line 3 is not an audit record"),
+            "{err}"
+        );
+        assert!(verify_log(&log).is_err());
+    }
+
+    #[test]
+    fn reading_bytes_and_reading_text_find_the_same_chain() {
+        // Including the line endings `str::lines` forgives.
+        let crlf = chain_of(3).to_jsonl().replace('\n', "\r\n");
+        let from_text = Chain::from_jsonl(&crlf).unwrap();
+        assert_eq!(from_text.len(), 3);
+        assert_eq!(Chain::from_jsonl_bytes(crlf.as_bytes()).unwrap(), from_text);
+        assert_eq!(verify_log(crlf.as_bytes()).unwrap(), from_text);
+    }
+
+    #[test]
+    fn the_verifier_reports_the_first_bad_record_before_the_end_of_the_log() {
+        let mut records = chain_of(3).records().to_vec();
+        records[0].argv.push("smuggled".to_owned());
+        let mut text = String::new();
+        for record in &records {
+            text.push_str(&record.to_jsonl());
+            text.push('\n');
+        }
+        let err = verify_log(text.as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            LogError::Chain(ChainReadError::Inconsistent(ChainError::Edited { seq: 1 }))
+        );
+        assert!(err.to_string().starts_with("record 1 was edited"), "{err}");
+        let end = LogError::End(TailError::Edited { seq: 2 });
+        assert!(
+            end.to_string()
+                .starts_with("every record verifies, but a privileged writer refuses"),
+            "{end}"
+        );
+        assert_eq!(end.clone(), end);
     }
 
     #[test]

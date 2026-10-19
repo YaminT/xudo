@@ -60,6 +60,20 @@ pub enum Decision {
     Denied,
 }
 
+impl Decision {
+    /// The label this decision is serialized as.
+    ///
+    /// For the journald index field and the summary line, so a query written
+    /// against the journal and one written against the file use one word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::Denied => "denied",
+        }
+    }
+}
+
 /// What actually happened afterwards.
 ///
 /// Separate from [`Decision`] because they answer different questions and
@@ -96,6 +110,31 @@ impl Outcome {
     pub fn executed(&self) -> bool {
         matches!(self, Self::Exited { .. } | Self::Signalled { .. })
     }
+
+    /// The label of this outcome's kind, as it is serialized.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotExecuted => "not_executed",
+            Self::Exited { .. } => "exited",
+            Self::Signalled { .. } => "signalled",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// An approval, as the record written to authorize it must describe it.
+///
+/// The minimal binding between an approval and its record: the command and the
+/// action that governed it. `aido_sys::authorize` checks a record against it
+/// before writing, so a builder that records another command or another
+/// action authorizes nothing, however well its record chains. The rest of the
+/// record — the rule source, the caller, the evidence — is not bound yet.
+pub trait Approval {
+    /// The command, program first, as the record's `argv` must carry it.
+    fn command(&self) -> Vec<String>;
+    /// The action that governed the decision, as the record's `action` must
+    /// name it.
+    fn action(&self) -> &str;
 }
 
 /// One audit record, before it is chained.
@@ -257,6 +296,22 @@ impl Record {
     /// Whether this record's hash still covers its contents.
     pub fn is_sealed(&self) -> bool {
         self.hash == self.content_hash()
+    }
+
+    /// Whether this record describes `approval`: the same command, and the
+    /// same governing action.
+    ///
+    /// # Errors
+    ///
+    /// The name of the first field that does not match, `argv` or `action`.
+    pub fn describes(&self, approval: &(impl Approval + ?Sized)) -> Result<(), &'static str> {
+        if self.argv != approval.command() {
+            return Err("argv");
+        }
+        if self.action.as_deref() != Some(approval.action()) {
+            return Err("action");
+        }
+        Ok(())
     }
 
     /// Renders the record as one JSON line, for an append-only log.
@@ -421,6 +476,48 @@ mod tests {
         assert_ne!(c.hash, d.hash);
     }
 
+    /// An approval of `/usr/bin/systemctl restart nginx.service` under
+    /// `aido.svc.restart`.
+    struct Restart;
+
+    impl Approval for Restart {
+        fn command(&self) -> Vec<String> {
+            ["/usr/bin/systemctl", "restart", "nginx.service"]
+                .map(str::to_owned)
+                .to_vec()
+        }
+
+        fn action(&self) -> &'static str {
+            "aido.svc.restart"
+        }
+    }
+
+    #[test]
+    fn a_record_for_another_command_or_action_does_not_describe_the_approval() {
+        // The binding `authorize` checks before it writes: an authorization
+        // record must name what was approved, not what some builder chose.
+        let honest = Record::first(Decision::Allowed, Restart.command(), "human")
+            .with_rule("aido.svc.restart", "20-services.toml:15");
+        assert_eq!(honest.describes(&Restart), Ok(()));
+
+        let other_unit = Record::first(
+            Decision::Allowed,
+            ["/usr/bin/systemctl", "restart", "sshd.service"]
+                .map(str::to_owned)
+                .to_vec(),
+            "human",
+        )
+        .with_rule("aido.svc.restart", "20-services.toml:15");
+        assert_eq!(other_unit.describes(&Restart), Err("argv"));
+
+        let quieter_rule = Record::first(Decision::Allowed, Restart.command(), "human")
+            .with_rule("aido.svc.restart.quiet", "20-services.toml:40");
+        assert_eq!(quieter_rule.describes(&Restart), Err("action"));
+
+        let no_rule = Record::first(Decision::Allowed, Restart.command(), "human");
+        assert_eq!(no_rule.describes(&Restart), Err("action"));
+    }
+
     #[test]
     fn identical_content_hashes_identically() {
         // Determinism, so a record can be re-derived and compared rather than
@@ -503,6 +600,37 @@ mod tests {
             let json = serde_json::to_string(&outcome).unwrap();
             assert_eq!(serde_json::from_str::<Outcome>(&json).unwrap(), outcome);
             assert!(format!("{outcome:?}").len() > 5);
+        }
+    }
+
+    #[test]
+    fn every_label_is_the_name_the_record_is_serialized_under() {
+        // The journal indexes on these words and the file stores the serde
+        // names; a query that works against one must work against the other.
+        for decision in [
+            Decision::Allowed,
+            Decision::AwaitingConfirmation,
+            Decision::Denied,
+        ] {
+            let json = serde_json::to_string(&decision).unwrap();
+            assert_eq!(json, format!("\"{}\"", decision.as_str()));
+        }
+        assert_eq!(
+            serde_json::to_string(&Outcome::NotExecuted).unwrap(),
+            format!("\"{}\"", Outcome::NotExecuted.kind())
+        );
+        for outcome in [
+            Outcome::Exited { code: 0 },
+            Outcome::Signalled { signal: 9 },
+            Outcome::Failed {
+                reason: "r".to_owned(),
+            },
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(
+                json.starts_with(&format!("{{\"{}\":", outcome.kind())),
+                "{json}"
+            );
         }
     }
 }
