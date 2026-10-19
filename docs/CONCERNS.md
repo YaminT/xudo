@@ -821,7 +821,7 @@ order. It changes which rule is cited, never what is demanded.
 
 ## 2026-10-19 — M2b step 1: `aido-sys-raw`, and what review found
 
-The workspace's only `unsafe`: four system calls, five blocks, in a crate of
+The workspace's only `unsafe`: four system calls, five blocks (a fifth call and sixth block, `SO_PEERCRED`, followed the same day; see the entry at the end of this file), in a crate of
 their own, reached through a `Syscalls` trait in `aido-sys` with a real
 implementation and a scripted fake.
 
@@ -2265,3 +2265,13 @@ Two package-level exclusions remain, both recorded in the `justfile` with reason
 ### The property that makes M1 safe to have shipped
 
 `classify()` returns `Unattested` for every caller, on every platform, because there is no broker yet. Unattested requires a password, so the gap fails in the only acceptable direction. A test asserts that a forged `CLAUDECODE=1` is recorded as a hint and changes nothing.
+
+---
+
+## 2026-10-19 — the sixth `unsafe` block: `SO_PEERCRED`
+
+**Decided by the user.** `aido-sys-raw` gains `getsockopt(SO_PEERCRED)` as its fifth call and sixth block, and the published budget in `sys.rs` goes from 5 to 6 in the same commit.
+
+**Why.** rustix 1.1.x decodes `SO_PEERCRED` with `assume_init` into a `UCred` whose `pid` is a `Pid(NonZeroI32)`. The kernel reports pid 0 for a datagram socket and for a peer outside the caller's pid namespace, so a safe rustix call is undefined behaviour on an answer the broker can be handed (verified against rustix 1.1.4 and 1.1.5 source in an earlier review). A broker that decodes a hostile peer's credentials must not have UB on the answer "nobody". The new call reads into a `#[repr(C)]` `PeerCred { pid: i32, uid: u32, gid: u32 }` (size and offsets asserted against `libc::ucred`, length checked after the call, a record the kernel never wrote refused), so zero is a value, not a trap. It is exposed as `Syscalls::peer_cred`; it does not decide what pid 0 means, which is the broker's call (step 2 switches to it).
+
+**Tests.** `a_peer_cred_pid_of_zero_is_reported_as_zero_never_a_panic`, `a_peer_cred_is_refused_on_something_that_is_not_a_socket`, `a_peer_cred_is_refused_on_a_directory_and_on_a_device`, and a fake-driven pid-0 test on every platform. Measured on a 6.12 kernel: a datagram socket is not refused, it answers success with pid 0 and uid and gid `u32::MAX`, which is the real-kernel pid-0 case the test pins; only a non-socket is an errno (`ENOTSOCK`).

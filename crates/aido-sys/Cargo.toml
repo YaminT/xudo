@@ -12,7 +12,7 @@ authors.workspace = true
 aido-audit = { path = "../aido-audit", version = "0.0.1" }
 aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
-# The four system calls that need `unsafe`. The only crate that may depend on
+# The five system calls that need `unsafe`. The only crate that may depend on
 # it; everything else reaches those calls through `Syscalls`.
 aido-sys-raw = { path = "../aido-sys-raw", version = "0.0.1" }
 bstr.workspace = true

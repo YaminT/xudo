@@ -1,6 +1,6 @@
 [package]
 name = "aido-sys-raw"
-description = "The four system calls aido cannot make without unsafe, behind a published block budget. The only crate in the workspace that does not forbid unsafe_code."
+description = "The five system calls aido cannot make without unsafe, behind a published block budget. The only crate in the workspace that does not forbid unsafe_code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

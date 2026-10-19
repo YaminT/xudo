@@ -34,7 +34,7 @@
 //! # `unsafe`
 //!
 //! None here, and the compiler holds that: this crate forbids `unsafe_code`
-//! like every other. The four system calls that cannot be made without it
+//! like every other. The five system calls that cannot be made without it
 //! live in `aido-sys-raw`, behind a published block budget, and the rest of
 //! the workspace reaches them only through [`Syscalls`], where a fake can stand
 //! in for the kernel.

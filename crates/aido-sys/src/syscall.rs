@@ -1,7 +1,9 @@
-//! The four system calls that need `unsafe`, behind a trait with a fake.
+//! The five system calls that need `unsafe`, behind a trait with a fake.
 //!
-//! rustix wraps almost every call the broker and the gate make, safely. Four it
-//! does not: `close_range`, `getsockopt(SO_PEERPIDFD)`, `ioctl(PIDFD_GET_INFO)`,
+//! rustix wraps almost every call the broker and the gate make, safely. Five it
+//! does not: `close_range`, `getsockopt(SO_PEERPIDFD)`, `getsockopt(SO_PEERCRED)`
+//! (which rustix wraps, but decodes with a pid that cannot be zero, so a peer
+//! the kernel reports as pid 0 is undefined behaviour), `ioctl(PIDFD_GET_INFO)`,
 //! and `execveat` (which rustix offers only as `unsafe`). Those live in the
 //! `aido-sys-raw` crate, the one crate in the workspace allowed `unsafe`, and
 //! reach the rest of the code only through [`Syscalls`].
@@ -9,15 +11,15 @@
 //! The trait is the seam. [`HostSyscalls`] is the real thing on Linux and
 //! answers [`SysError::Unsupported`] everywhere else, so a macOS developer
 //! cannot exercise a privileged path by accident. [`FakeSyscalls`] scripts the
-//! answer to each of the four calls and records every call, so the broker and
+//! answer to each of the five calls and records every call, so the broker and
 //! the gate can be tested on any platform, including the answers a real kernel
 //! will not produce on demand.
 //!
-//! It covers these four calls and nothing more. The lower rungs of the
-//! attestation ladder also need `SO_PEERCRED`, `pidfd_open`, and a liveness
-//! check on a pidfd, all of them safe in rustix; they get a seam of their own
-//! with the broker that uses them (M2b step 2), and this trait stays the list
-//! of calls that need `unsafe`.
+//! It covers these five calls and nothing more. The lower rungs of the
+//! attestation ladder also need `pidfd_open` and a liveness check on a pidfd,
+//! both safe in rustix; they get a seam of their own with the broker that uses
+//! them (M2b step 2), and this trait stays the list of calls that need
+//! `unsafe`.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
@@ -25,7 +27,7 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 
 pub use aido_sys_raw::{
-    Creds, PIDFD_INFO_CGROUPID, PIDFD_INFO_CREDS, PIDFD_INFO_PID, PidfdInfo, ProcessIds,
+    Creds, PIDFD_INFO_CGROUPID, PIDFD_INFO_CREDS, PIDFD_INFO_PID, PeerCred, PidfdInfo, ProcessIds,
 };
 
 use crate::error::SysError;
@@ -77,6 +79,31 @@ pub trait Syscalls {
     /// it answers `ESRCH`. A pidfd from this call is therefore not proof that
     /// the peer is alive.
     fn peer_pidfd(&self, socket: BorrowedFd<'_>) -> Result<OwnedFd, SysError>;
+
+    /// The pid, uid and gid the kernel recorded for the other end of a Unix
+    /// socket when the connection was made.
+    ///
+    /// `getsockopt(SO_PEERCRED)`. Plain integers: the pid is an `i32` that can
+    /// be 0, which the kernel reports for a socket that keeps no peer
+    /// credentials (a datagram socket, with uid and gid `u32::MAX`) and for a
+    /// peer outside the caller's pid namespace. A pid of 0 is an answer here,
+    /// not an error and not a panic; it names no process, so a caller must
+    /// never look it up or treat it as one, and a uid and gid of `u32::MAX`
+    /// are no identity either. The numbers are a snapshot taken at connect time and
+    /// a pid number can be reissued once its process is reaped, so they pin
+    /// nothing: pin the peer with [`Self::peer_pidfd`].
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::Os`] with:
+    ///
+    /// * `ENOTSOCK` if `socket` is not a socket, and `EBADF` if it is not open.
+    ///   Deny.
+    /// * No errno at all if the call reported success without writing the
+    ///   record (a syscall filter returning 0 without running it). Deny.
+    ///
+    /// Every error means deny.
+    fn peer_cred(&self, socket: BorrowedFd<'_>) -> Result<PeerCred, SysError>;
 
     /// Asks the kernel about the process a pidfd refers to.
     ///
@@ -187,6 +214,10 @@ impl Syscalls for HostSyscalls {
         aido_sys_raw::sys::peer_pidfd(socket).map_err(SysError::from)
     }
 
+    fn peer_cred(&self, socket: BorrowedFd<'_>) -> Result<PeerCred, SysError> {
+        aido_sys_raw::sys::peer_cred(socket).map_err(SysError::from)
+    }
+
     fn pidfd_info(&self, pidfd: BorrowedFd<'_>, mask: u64) -> Result<PidfdInfo, SysError> {
         on_pidfs(pidfd)?;
         aido_sys_raw::sys::pidfd_info(pidfd, mask)
@@ -211,6 +242,10 @@ impl Syscalls for HostSyscalls {
         ))
     }
 
+    fn peer_cred(&self, _socket: BorrowedFd<'_>) -> Result<PeerCred, SysError> {
+        Err(SysError::unsupported("SO_PEERCRED on a non-Linux platform"))
+    }
+
     fn pidfd_info(&self, _pidfd: BorrowedFd<'_>, _mask: u64) -> Result<PidfdInfo, SysError> {
         Err(SysError::unsupported(
             "PIDFD_GET_INFO on a non-Linux platform",
@@ -229,6 +264,8 @@ pub enum FakeCall {
     MarkCloexecFrom(u32),
     /// [`Syscalls::peer_pidfd`].
     PeerPidfd,
+    /// [`Syscalls::peer_cred`].
+    PeerCred,
     /// [`Syscalls::pidfd_info`] with this mask.
     PidfdInfo(u64),
     /// [`Syscalls::exec_fd`].
@@ -247,7 +284,8 @@ pub enum FakeCall {
 ///
 /// Unscripted, it answers like the oldest kernel the ladder knows: no
 /// `close_range` (`ENOSYS`), no `SO_PEERPIDFD` (`ENOPROTOOPT`), no
-/// `PIDFD_GET_INFO` (`ENOTTY`), each with the errno a real one would give, so a
+/// `PIDFD_GET_INFO` (`ENOTTY`), and no peer credentials (`SO_PEERCRED`,
+/// `ENOPROTOOPT`), each with the errno a real one would give, so a
 /// test that forgets to script an answer takes the branch a real old kernel
 /// would send it down. `exec_fd` never replaces anything; it records the call
 /// and returns the scripted error.
@@ -256,6 +294,7 @@ pub struct FakeSyscalls {
     calls: RefCell<Vec<FakeCall>>,
     cloexec: Result<(), SysError>,
     peer: RefCell<Option<Result<OwnedFd, SysError>>>,
+    cred: Result<PeerCred, SysError>,
     info: Result<PidfdInfo, SysError>,
     exec: SysError,
 }
@@ -280,6 +319,11 @@ impl FakeSyscalls {
                 "no close_range scripted",
             )),
             peer: RefCell::new(None),
+            cred: Err(missing(
+                "getsockopt(SO_PEERCRED)",
+                rustix::io::Errno::NOPROTOOPT,
+                "no peer credentials scripted",
+            )),
             info: Err(missing(
                 "ioctl(PIDFD_GET_INFO)",
                 rustix::io::Errno::NOTTY,
@@ -301,6 +345,14 @@ impl FakeSyscalls {
     #[must_use]
     pub fn with_peer(self, peer: Result<OwnedFd, SysError>) -> Self {
         self.peer.replace(Some(peer));
+        self
+    }
+
+    /// Scripts every [`Syscalls::peer_cred`] answer. A record is passed through
+    /// as scripted, a pid of 0 included, as the real call does.
+    #[must_use]
+    pub fn with_peer_cred(mut self, answer: Result<PeerCred, SysError>) -> Self {
+        self.cred = answer;
         self
     }
 
@@ -359,6 +411,11 @@ impl Syscalls for FakeSyscalls {
                 "no peer pidfd scripted, or it was already taken",
             ))
         })
+    }
+
+    fn peer_cred(&self, _socket: BorrowedFd<'_>) -> Result<PeerCred, SysError> {
+        self.record(FakeCall::PeerCred);
+        self.cred.clone()
     }
 
     fn pidfd_info(&self, _pidfd: BorrowedFd<'_>, mask: u64) -> Result<PidfdInfo, SysError> {
@@ -426,6 +483,10 @@ mod tests {
             Some(Errno::NOPROTOOPT.raw_os_error())
         );
         assert_eq!(
+            fake.peer_cred(a.as_fd()).unwrap_err().os_code(),
+            Some(Errno::NOPROTOOPT.raw_os_error())
+        );
+        assert_eq!(
             fake.pidfd_info(a.as_fd(), PidfdInfo::ATTESTATION_MASK)
                 .unwrap_err()
                 .os_code(),
@@ -438,6 +499,7 @@ mod tests {
             vec![
                 FakeCall::MarkCloexecFrom(3),
                 FakeCall::PeerPidfd,
+                FakeCall::PeerCred,
                 FakeCall::PidfdInfo(PidfdInfo::ATTESTATION_MASK),
                 FakeCall::Exec {
                     program: identity(a.as_fd()),
@@ -480,6 +542,38 @@ mod tests {
         assert!(fake.peer_pidfd(a.as_fd()).is_ok());
         let again = fake.peer_pidfd(a.as_fd()).unwrap_err();
         assert!(again.to_string().contains("already taken"), "{again}");
+    }
+
+    #[test]
+    fn a_fake_reports_a_peer_pid_of_zero_as_zero_not_as_a_panic() {
+        // The kernel reports pid 0 for a socket with no peer and for a peer
+        // outside the caller's pid namespace. rustix decodes that into a
+        // NonZeroI32, which is undefined behaviour; here it is a number.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let nobody = PeerCred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        };
+        let fake = FakeSyscalls::new().with_peer_cred(Ok(nobody));
+        assert_eq!(fake.peer_cred(a.as_fd()), Ok(nobody));
+        assert_eq!(
+            fake.peer_cred(a.as_fd()),
+            Ok(nobody),
+            "scripted for every ask"
+        );
+        assert_eq!(fake.calls(), vec![FakeCall::PeerCred, FakeCall::PeerCred]);
+    }
+
+    #[test]
+    fn a_fake_returns_a_scripted_peer_cred_error_unchanged() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let enotsock = SysError::os(
+            "getsockopt(SO_PEERCRED)",
+            &std::io::Error::from_raw_os_error(88),
+        );
+        let fake = FakeSyscalls::new().with_peer_cred(Err(enotsock.clone()));
+        assert_eq!(fake.peer_cred(a.as_fd()), Err(enotsock));
     }
 
     #[test]
@@ -527,6 +621,7 @@ mod tests {
         let refusals = [
             host.mark_cloexec_from(3).unwrap_err(),
             host.peer_pidfd(a.as_fd()).unwrap_err(),
+            host.peer_cred(a.as_fd()).unwrap_err(),
             host.pidfd_info(a.as_fd(), PidfdInfo::ATTESTATION_MASK)
                 .unwrap_err(),
             host.exec_fd(a.as_fd(), &[c"/bin/true"], &[]),
@@ -712,6 +807,63 @@ mod tests {
                     .and_then(SysError::os_code),
                 stale.then_some(Errno::SRCH.raw_os_error())
             );
+        }
+
+        #[test]
+        fn a_socketpair_reports_this_process_as_its_own_peer_cred() {
+            let (a, b) = UnixStream::pair().unwrap();
+            let expected = PeerCred {
+                pid: i32::try_from(std::process::id()).unwrap(),
+                uid: status_ids("Uid:")[1],
+                gid: status_ids("Gid:")[1],
+            };
+            assert_eq!(HostSyscalls.peer_cred(a.as_fd()), Ok(expected));
+            assert_eq!(HostSyscalls.peer_cred(b.as_fd()), Ok(expected));
+        }
+
+        #[test]
+        fn a_peer_cred_names_the_connecting_process_not_this_one() {
+            let (mut child, stream) = connected_peer("peer-cred");
+            let cred = HostSyscalls.peer_cred(stream.as_fd()).unwrap();
+            assert_eq!(cred.pid, i32::try_from(child.id()).unwrap());
+            assert_ne!(cred.pid, i32::try_from(std::process::id()).unwrap());
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        }
+
+        #[test]
+        fn a_peer_cred_is_refused_on_something_that_is_not_a_socket() {
+            let file = std::fs::File::open("/proc/self/status").unwrap();
+            let err = HostSyscalls.peer_cred(file.as_fd()).unwrap_err();
+            assert_eq!(err.os_code(), Some(Errno::NOTSOCK.raw_os_error()));
+        }
+
+        #[test]
+        fn a_peer_cred_pid_of_zero_is_reported_as_zero_never_a_panic() {
+            // A datagram socket keeps no connection credentials, so the kernel
+            // answers success with pid 0 and uid and gid -1. rustix decodes
+            // that pid into a NonZeroI32 with assume_init, which is undefined
+            // behaviour; here it is a record, and it names no one.
+            let dir = scratch("peer-cred-dgram");
+            let server = std::os::unix::net::UnixDatagram::bind(dir.join("s.sock")).unwrap();
+            let client = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            client.connect(dir.join("s.sock")).unwrap();
+            let expected = PeerCred {
+                pid: 0,
+                uid: u32::MAX,
+                gid: u32::MAX,
+            };
+            assert_eq!(HostSyscalls.peer_cred(client.as_fd()), Ok(expected));
+            assert_eq!(HostSyscalls.peer_cred(server.as_fd()), Ok(expected));
+        }
+
+        #[test]
+        fn a_peer_cred_is_refused_on_a_directory_and_on_a_device() {
+            for path in ["/", "/dev/null"] {
+                let file = std::fs::File::open(path).unwrap();
+                let err = HostSyscalls.peer_cred(file.as_fd()).unwrap_err();
+                assert_eq!(err.os_code(), Some(Errno::NOTSOCK.raw_os_error()), "{path}");
+            }
         }
 
         #[test]

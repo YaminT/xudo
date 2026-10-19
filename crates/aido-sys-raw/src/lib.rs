@@ -1,5 +1,5 @@
-//! The four system calls `aido` cannot make without `unsafe`, and the record
-//! the kernel writes for one of them.
+//! The five system calls `aido` cannot make without `unsafe`, and the records
+//! the kernel writes for two of them.
 //!
 //! This is the only crate in the workspace whose lint table does not forbid
 //! `unsafe_code`. It denies it here, at the crate root, and allows it in one
@@ -9,9 +9,9 @@
 //! `unsafe` outright, so the compiler keeps it here, not a reviewer.
 //!
 //! The data types live here rather than in `aido-sys` because the kernel
-//! writes [`PidfdInfo`] directly: its layout is part of the unsafe contract,
-//! and it is checked field by field against the kernel's struct beside the
-//! call that fills it.
+//! writes [`PidfdInfo`] and [`PeerCred`] directly: their layout is part of the
+//! unsafe contract, and it is checked against the kernel's structs beside the
+//! calls that fill them.
 //!
 //! `tests/unsafe_budget.rs` holds the rest of the line: no `unsafe` token
 //! anywhere else in the workspace, no lint attribute that lifts `unsafe_code`
@@ -70,6 +70,29 @@ pub struct PidfdInfo {
     fsgid: u32,
     // PIDFD_INFO_EXIT. Never requested: the broker asks about live peers only.
     _exit_code: i32,
+}
+
+/// What `getsockopt(SO_PEERCRED)` reported: the peer's pid, uid and gid as the
+/// kernel recorded them when the connection was made.
+///
+/// Laid out exactly as the kernel's `struct ucred`, because the kernel writes
+/// into it directly; [`sys`] asserts size and offsets against `libc::ucred` at
+/// compile time. Plain integers on purpose: the pid is an `i32`, never a
+/// `NonZero`, because the kernel reports pid 0 for a datagram socket and for
+/// a peer outside the caller's pid namespace, and a type that cannot hold zero
+/// would make that answer undefined behaviour instead of a refusal. A uid or gid
+/// of `u32::MAX` is the kernel's "no such id". What any of it means is for the
+/// caller to decide; zero here is not an identity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    /// The peer's process id in the caller's pid namespace, or 0 if it has none
+    /// there.
+    pub pid: i32,
+    /// The peer's effective user id, mapped into the caller's user namespace.
+    pub uid: u32,
+    /// The peer's effective group id, mapped into the caller's user namespace.
+    pub gid: u32,
 }
 
 /// The process ids `PIDFD_GET_INFO` reports.

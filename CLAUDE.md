@@ -135,8 +135,8 @@ Two things to know before writing one:
 | Crate | Rule |
 |---|---|
 | `aido-policy` | Pure. **Zero syscalls, zero I/O.** If it needs the filesystem, it belongs in `aido-sys`. Builds and tests natively on macOS. |
-| `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. Forbids `unsafe` like every other crate; the four calls that need it come from `aido-sys-raw`. |
-| `aido-sys-raw` | The four system calls that cannot be made without `unsafe` — `close_range`, `SO_PEERPIDFD`, `PIDFD_GET_INFO`, `execveat` — and the kernel-written `PidfdInfo`. The only crate that does not forbid `unsafe_code`: it is allowed only in `sys`, within a published block budget. Only `aido-sys` may depend on it. |
+| `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. Forbids `unsafe` like every other crate; the five calls that need it come from `aido-sys-raw`. |
+| `aido-sys-raw` | The five system calls that cannot be made safely — `close_range`, `SO_PEERPIDFD`, `SO_PEERCRED`, `PIDFD_GET_INFO`, `execveat` — and the kernel-written `PidfdInfo` and `PeerCred`. The only crate that does not forbid `unsafe_code`: it is allowed only in `sys`, within a published block budget. Only `aido-sys` may depend on it. |
 | `aido` | Unprivileged front-end **library**. Holds no secret, makes no decision. |
 | `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. Its `tests/` run the real binary as a process. Excluded from coverage, never from `just test`. |
 | `aido-gate` | Privileged executor and *second independent policy engine*. Assume a hostile local user invokes it directly with no arguments. |

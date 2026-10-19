@@ -1,22 +1,23 @@
 //! The only `unsafe` code in the workspace.
 //!
-//! Four system calls, each because rustix 1.1 cannot make it safely:
+//! Five system calls, each because rustix 1.1 cannot make it safely:
 //!
 //! | Call | Why it is here |
 //! |---|---|
 //! | `close_range(first, ~0, CLOSE_RANGE_CLOEXEC)` | not wrapped by rustix |
 //! | `getsockopt(SO_PEERPIDFD)` | not wrapped by rustix |
+//! | `getsockopt(SO_PEERCRED)` | rustix decodes pid 0 into a `NonZeroI32`: undefined behaviour |
 //! | `ioctl(PIDFD_GET_INFO)` | not wrapped by rustix |
 //! | `execveat(fd, "", AT_EMPTY_PATH)` | rustix wraps it, but as `unsafe` |
 //!
-//! These are the four the broker and the gate are known to need. Two more are
+//! These are the five the broker and the gate are known to need. Two more are
 //! foreseeable and deliberately not here yet: `fork`, if the gate is built to
 //! outlive the command it runs rather than to exec in place, and a per-
 //! descriptor `fcntl` fallback for kernels before 5.11, if the gate is to run
 //! there. Both are decided with the gate (M2b step 4); either one is a change to
 //! the budget below, reviewed as such.
 //!
-//! **Budget: 5 `unsafe` blocks.** One per call, plus one to take ownership of
+//! **Budget: 6 `unsafe` blocks.** One per call, plus one to take ownership of
 //! the descriptor `SO_PEERPIDFD` returns. Each block holds exactly one unsafe
 //! operation (`clippy::multiple_unsafe_ops_per_block`) and a `SAFETY` comment
 //! (`clippy::undocumented_unsafe_blocks`). There is no `unsafe fn` and no
@@ -37,7 +38,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use libc::{c_char, c_int, c_long, c_uint};
 
-use crate::{OsError, PidfdInfo};
+use crate::{OsError, PeerCred, PidfdInfo};
 
 // The ioctl number encodes the size of the struct it writes, and the kernel
 // writes each field at its own offset. A `PidfdInfo` that differed from the
@@ -62,9 +63,23 @@ const _: () = {
     assert!(offset_of!(PidfdInfo, _exit_code) == offset_of!(libc::pidfd_info, exit_code));
 };
 
+// `SO_PEERCRED` fills a `struct ucred`; the kernel writes each field at its own
+// offset and the length is passed as the struct's size, so a `PeerCred` that
+// differed in either would hand the broker one id in another's place.
+const _: () = {
+    assert!(size_of::<PeerCred>() == size_of::<libc::ucred>());
+    assert!(size_of::<PeerCred>() == 12);
+    assert!(offset_of!(PeerCred, pid) == offset_of!(libc::ucred, pid));
+    assert!(offset_of!(PeerCred, uid) == offset_of!(libc::ucred, uid));
+    assert!(offset_of!(PeerCred, gid) == offset_of!(libc::ucred, gid));
+};
+
 // The SO_PEERPIDFD option is an `int`; its length is passed as a literal.
 const C_INT_LEN: libc::socklen_t = 4;
 const _: () = assert!(size_of::<c_int>() == 4);
+
+// The length of the `struct ucred` `SO_PEERCRED` writes.
+const CRED_LEN: libc::socklen_t = 12;
 
 /// Turns a raw return value into a result, reading `errno` immediately.
 fn check(operation: &'static str, rc: c_long) -> Result<(), OsError> {
@@ -140,6 +155,56 @@ pub fn peer_pidfd(socket: BorrowedFd<'_>) -> Result<OwnedFd, OsError> {
         // there is.
         unsafe { OwnedFd::from_raw_fd(fd) }
     })
+}
+
+/// `getsockopt(socket, SOL_SOCKET, SO_PEERCRED)`.
+///
+/// Returns what the kernel wrote, as plain integers: a pid of 0 is a value here,
+/// not a panic. Whether it is an identity is the caller's to decide.
+///
+/// # Errors
+///
+/// The kernel's errno, or an error with no errno if the kernel reported
+/// success without writing the record.
+pub fn peer_cred(socket: BorrowedFd<'_>) -> Result<PeerCred, OsError> {
+    let operation = "getsockopt(SO_PEERCRED)";
+    // Started as a record the kernel never reports: it never writes a negative
+    // pid, so a success that wrote nothing is told from an answer instead of
+    // reading as root. (A datagram socket reports pid 0 with uid and gid
+    // `u32::MAX`, which differs in the pid.)
+    let unwritten = PeerCred {
+        pid: -1,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut cred = unwritten;
+    let mut len = CRED_LEN;
+    // SAFETY: `cred` and `len` are live locals for the whole call, `len` states
+    // the size of `cred` exactly (asserted against `libc::ucred` above), and
+    // `socket` is a borrowed, open descriptor. The kernel writes at most `len`
+    // bytes, and every bit pattern is a valid `PeerCred`: plain integers.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    check(operation, c_long::from(rc))?;
+    // Checked without an early return, for the reason `peer_pidfd` gives: no
+    // real kernel takes it, and a return no test can reach is a region no test
+    // can cover.
+    let written = len == CRED_LEN && cred != unwritten;
+    let refusal = OsError {
+        operation,
+        error: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the kernel reported success without writing the credentials",
+        ),
+    };
+    written.then_some(cred).ok_or(refusal)
 }
 
 /// `ioctl(pidfd, PIDFD_GET_INFO)`.
