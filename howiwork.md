@@ -279,7 +279,7 @@ the Linux harness, the audited unsafe syscall layer, strictest
 overlapping-rule resolution, the mount-trust check, and the audit sinks
 (hash-chained file plus journald mirror, not yet called by the broker or the
 gate) are on main; the broker (`aidod`) and the doctor report are in review,
-and the gate binary is not yet built. Nothing can execute as root yet. Then: M3 out-of-band confirmation,
+and the gate binary (`aido-gate-bin`, exec in place, `-auth` name only) is built and lands after the broker. Nothing can execute as root until both are on main. Then: M3 out-of-band confirmation,
 M4 enrollment and the passwordless path, M5 narrowing and bounded grants
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.

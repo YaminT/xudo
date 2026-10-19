@@ -4,6 +4,212 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 4: `aido-gate-bin`, the root executor
+
+**What exists.** The `aido-gate` executable, in its own package (`aido-gate-bin`,
+the shape of `aido-bin` and `ido-bin`: five lines of `main`, excluded from
+coverage with its reason in the `justfile`, `tests/binary.rs` running the real
+binary), to be installed as `/usr/libexec/aido/aido-gate` with `aido-gate-auth`
+as a hardlink. Only the `-auth` name runs. The sequence it hands off to is
+`aido_gate::run`, a module of the `aido-gate` library written against traits
+(`GateHost`) with no syscall of its own, and fully covered. It is built and
+tested; it lands after the broker (step 2), because it refuses with
+`NoPendingRequest` until a root-minted entry exists.
+
+**The order, each step refusing and stopping everything after it.**
+
+1. `close_range(3, ~0, CLOEXEC)`. 2. `/dev/null` for closed 0 to 2. 3.
+`PR_SET_NO_NEW_PRIVS`. 4. The invocation: no arguments, `argv[0]` named
+`aido-gate-auth`. 5. `/proc` opened and proved procfs on that descriptor. 6.
+The lineage walk. 7. The ruleset through `load_trusted_rules`, the generation
+`generation.id()`. 8. The spool through `open_trusted`; the clock. 9. Exactly
+one entry matching an ancestor's pin; `validate`; `decide`; **consume**. 10.
+The program opened, judged, hashed. 11. The authorization recorded through
+`authorize`. 12. `execveat` on the validated descriptor. `run` returns only
+when it did not exec, always with a refusal, already on the trail where it
+could be written, and prints one line to standard error: the stable code and the
+severity, nothing the caller supplied.
+
+**Decisions** (the step-1 "open for step 4" items, and the rest this step had
+to make):
+
+1. **Process model: exec in place.** The alternative, fork and wait, was
+   rejected for three reasons. `fork` has no safe wrapper, so it would be a
+   further `unsafe` block in the one crate with a published budget, for a
+   benefit that is only a record the gate then has nothing to write. A waiting
+   root parent keeps every descriptor it inherited, and `close_range` marks
+   rather than closes. And exec in place gives the faithful exit status and
+   signal for free: `sudo`'s own parent reaps the command. The cost is an outcome
+   record. The authorization is written before the exec, nothing follows it, and
+   the one outcome the gate can learn, an exec that fails, is a second record
+   (`exec_failure_record`) naming the first by `authorization_seq=` in its
+   evidence, because the log is append-only and `Record` has no field to name
+   it with (step 6, open item 2).
+2. **Before 5.11 the gate refuses.** `CLOSE_RANGE_CLOEXEC` is the whole of step
+   1, and the per-descriptor `fcntl` fallback is another `unsafe` block in the
+   budget for a kernel older than the beta supports. The refusal is
+   `gate_failed_descriptors`, at normal severity, exit 19. The unscripted
+   `FakeSyscalls` answers `ENOSYS` exactly as such a kernel does, so the test
+   needs no special case.
+3. **The exec vector is the canonical argv bytes.** `Approved::exec_argv` holds
+   `Argv::canonicalize()`'s operands as bytes and `execute` builds the vector
+   from them; `Approved::argv`, which came through the renderer, is for the
+   record. `exec_vector` refuses an interior NUL rather than hand the kernel a
+   prefix; the entry's own NULs are refused much earlier by `validate`.
+4. **`PR_SET_NO_NEW_PRIVS` is set early, not at the exec.** It is irreversible,
+   inherited, and nothing the gate does before the exec depends on it being
+   unset, so setting it before anything is consumed means a host that refuses
+   costs the caller nothing. A test pins that a refusal there leaves the spool
+   and the program untouched.
+5. **On `-auth` the password is the confirmation**, as the plan decided on
+   2026-10-14: `GateContext::password_confirms`, true only for that name,
+   satisfies `AllowWithConfirmation` in `decide`, and the record says so
+   (`confirmation=password ...`). It widens nothing else: an expired, stale,
+   or policy-refused entry is refused with the flag set
+   (`a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say`).
+6. **The caller is identified by a pin match, never by a name.** `lineage`
+   (new, in `aido-sys`) reads the gate and up to eight processes above it,
+   quietly stopping at the bound where `ancestry` refuses a deep tree, because
+   a deep session is ordinary here. The ancestors' `(pid, starttime)` pairs are
+   what a spool entry must match; the names go in the record as
+   `lineage=` and are branched on nowhere. This is shape-agnostic on purpose:
+   `sudo` and `sudo-rs` with `use_pty` put a monitor between the gate and
+   `aido`, and OpenDoas execs without a fork, so the distance is one to three
+   and the walk does not need to know which. **Not measured** against the real
+   three here: the lineage is tested against the tree those programs are
+   documented to make, and the matrix's executing half (step 8) is where it
+   becomes a fact.
+7. **Zero matches is `NoPendingRequest`; more than one is refused**
+   (`request_ambiguous`); an entry that matches the pin but whose content nonce
+   disagrees with its name is refused (`request_forged_nonce`). Entries that
+   are not named by a nonce, cannot be read, are not UTF-8, or do not parse are
+   passed over: they cannot be matched to anyone, and refusing on one would let
+   a stray file in a root-only directory lock every caller out. The only way a
+   passed-over entry changes the outcome is by being the one that should have
+   matched, and then the outcome is `NoPendingRequest`, which refuses.
+8. **Consume after `decide`, before the program is touched.** An entry is
+   unlinked only when the gate would otherwise go on to run it. A refusal by
+   policy, expiry or a stale generation leaves the entry for the broker's
+   reaper; a refusal after the consume (a program that fails the walk, a record
+   that cannot be written) burns it, and the caller must ask again. That is the
+   fail-closed direction, and `an_entry_is_consumed_exactly_once_so_a_second_gate_finds_nothing`
+   and `an_entry_that_was_already_gone_when_the_gate_consumed_it_runs_nothing`
+   pin both ends: the second gate to unlink gets `ENOENT` and runs nothing.
+9. **The program is opened by `open_trusted`, not as a bare `O_PATH`
+   descriptor.** The walk opens every component `O_PATH` and the target
+   `O_PATH`, then reopens the target read-only and refuses it unless it is the
+   inode that passed; SHA-256 needs the contents, which `O_PATH` cannot give. The
+   one descriptor is then `fstat`ed (regular, owner, no group or world write,
+   an execute bit), hashed with `pread`, and the same descriptor is what
+   `execveat` runs. `Program::from_fd` asks the descriptor the owner and mode
+   questions again, so a program is never run on a check made on something
+   else. A `#!` is refused first, as `Script`, with the reason in the record:
+   through a close-on-exec descriptor the kernel could not have run it anyway.
+10. **A refusal for "could not do a step" is a `Refusal::Failed`, not a new
+    `DenialCode`.** Step 6 open item 1 (a refusal for "the record could not be
+    written") is `Stage::Audit`, code `gate_failed_audit`; `Stage` names every
+    step that can fail without the request being at fault, with a stable code
+    each, and `Invocation`, `Spool` and `Program` report at high severity
+    because they fail only when somebody is making them. The pinned denial
+    contract in `aido-policy` is untouched. The record of a `Failed` refusal
+    carries `detail=`, the step's own words bounded to 200 characters.
+11. **The clock seam is `aido_sys::{Clock, HostClock, FakeClock}`**, a minimal
+    one added because main has none: `HostClock` reads `CLOCK_MONOTONIC` in whole
+    seconds through rustix and cannot fail. **It must be unified with the
+    broker's at merge** (the broker branch adds its own `HostClock`): the two
+    must read the same clock in the same units, since a deadline is minted by one
+    and judged by the other.
+12. **The gate reads no `config.toml` yet**, so `engine::Settings::default()`
+    is what it decides with (`confirm_agent_actions` on, `frozen` off). That is
+    safe today: `frozen` only bites an enrolled agent, and the gate attests no
+    one (every caller is `Unattested`, so the human path), but M3's `aido
+    freeze` needs the gate to read root's settings, and the broker and the gate
+    must agree on them as they do on the generation.
+13. **No new crate.** `aido-gate` now depends on `aido-sys` (and `aido-sys`
+    dev-depends on `aido-gate` for its contract test, which Cargo allows);
+    `aido-sys` takes the workspace's `sha2` and four more rustix features
+    (`process`, `stdio`, `thread`, `time`). `Cargo.lock` gains edges, not
+    packages. The unsafe budget is untouched: no new `unsafe` anywhere.
+
+**Found while building it.** Rust's runtime already replaces closed standard
+descriptors before `main` on Unix, so step 2 is the second line of defence, not
+the first. It is kept: the guarantee must not rest on a runtime detail, the gate
+must hold it for whatever builds it, and it is cheap. That also means the
+process test for closed descriptors can show only that the gate behaves the
+same with 0, 1 and 2 closed; the ordering ("before any open") is pinned by the
+library tests, where the fake table records it.
+
+**Tests, named for the attack.** In `aido-gate::run`:
+`a_direct_hostile_invocation_with_no_entry_does_nothing_and_exits_unusable_at_high_severity`,
+`arguments_are_refused_because_the_sudoers_rule_grants_none`,
+`an_unexpected_argv0_is_refused` (ten spellings, `aido-gate-nopass` and
+`aido-gate-auth/` among them),
+`an_argv0_that_could_drive_a_terminal_reaches_the_record_escaped`,
+`an_entry_minted_for_someone_else_is_not_this_callers`,
+`a_reissued_pid_does_not_borrow_the_entry_of_the_process_that_had_it`,
+`two_entries_pinned_to_one_lineage_are_refused_and_neither_is_consumed`,
+`an_entry_whose_content_disagrees_with_its_name_is_forged_and_refused`,
+`an_expired_entry_is_refused_at_normal_severity`,
+`an_entry_from_before_the_rules_changed_is_refused`,
+`a_program_that_fails_the_trust_walk_is_refused_and_nothing_is_recorded_as_authorized`
+(symlink, writable, script), `a_gate_that_cannot_write_its_record_refuses_and_executes_nothing`,
+and one `stops_at` test per step proving nothing after it ran (a kernel without
+`close_range`, streams that cannot be replaced, `no_new_privs` refused, a `/proc`
+that is not procfs, a lineage that cannot be walked, a ruleset or spool that fails
+the trust walk, a clock that cannot be read). In `aido-sys`:
+`an_entry_that_is_a_symlink_is_never_followed`,
+`an_entry_anyone_else_can_write_is_refused`, `an_entry_with_a_second_name_is_refused`,
+`a_directory_with_too_many_names_is_not_listed`,
+`a_script_is_refused_with_that_reason_and_never_hashed`,
+`a_program_anyone_else_can_write_is_refused`, `a_symlinked_program_is_refused_by_the_walk`,
+`a_read_that_fails_after_the_first_bytes_is_a_refusal_not_a_short_hash`,
+`a_file_that_is_not_on_procfs_is_refused_wherever_it_sits_under_proc`. In
+`aido-gate-bin/tests/binary.rs`, through real processes and hardlinks: the same
+refusals by exit status and the one line, closed and leaked descriptors, and
+that the environment is never read.
+
+**Open.**
+
+1. **The root-run half.** Everything above runs unprivileged, as the hostile
+   user does, and `exec_fd` is a fake in the library tests: the gate has not
+   yet exec'd anything for real, as root, through a real `sudo`. That is the
+   executing half of the differential matrix (`aido-tests`, step 8), and
+   checklist items 4 and 11 stay half-open until it exists (the child's own
+   `/proc/self/environ`, the real lineage under sudo, sudo-rs and OpenDoas).
+2. **`argv[0]` is the name, not `/proc/self/exe`.** `sudo` sets `argv[0]` to
+   the command it was asked for, so the `-auth` name is as trustworthy as the
+   sudoers rule that attaches the password to that path, and no more. When M4
+   ships `-nopass`, where the name decides whether a password was typed in the
+   other direction, the name should be read from the kernel's record of which
+   dentry was exec'd instead.
+3. **The caller's uid is recorded as unknown** (`u32::MAX`, not 0, which would
+   read as root). The decision does not use it. `SO_PEERCRED` at the broker is
+   where it is known; the entry does not carry it.
+4. **The program's digest is recorded, not compared.** There is nothing to
+   compare it with until a rule can pin one.
+5. **A refusal record over 64 KiB goes unwritten** (step 6, open item 3): an
+   entry may be 64 KiB, and its argv is echoed into the refusal's `argv`. The
+   refusal stands and the gate still exits; only the record is lost. A bounded
+   fallback record belongs with the broker's, which has the same problem.
+6. **`Approved` is still `Clone` with public fields**, so the guarantee that
+   nothing runs unrecorded rests on `execute` taking an `Authorized<Approved>`,
+   which it does and nothing else can make (step 6, open item 9).
+7. **A policy refusal leaves the entry in the spool** for the broker to reap;
+   until step 2 exists nothing does, and entries accumulate up to the 4096 the
+   gate will list.
+
+**Measured.** `just verify` at 100% lines, regions and functions on macOS with
+no waiver and no threshold moved; `just check-linux` clean for both Linux
+triples; `just linux-test` green on Linux 6.12 aarch64 as uid 1000, the
+binary's process tests included. The Linux half of the coverage was measured
+once, by hand, with `cargo llvm-cov` inside the same container: the gate's code
+and `aido-sys`'s new modules had no gap there. The only misses were lines of
+`aido-sys/src/probe.rs` that need the `sudo` and `doas` programs the slim image
+does not have, which CI's runners do; none of this step's code is in them. Not
+yet seen on the CI runners' 6.17.
+
+---
+
 ## 2026-10-19 — M2b step 6: the audit sinks
 
 **What exists.** `aido-sys::audit`: the contract the broker and the gate will
