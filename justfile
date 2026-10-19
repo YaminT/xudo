@@ -237,6 +237,19 @@ differential:
     cargo build -p aido-bin --release --target {{musl_triple}}
     ci/differential/run.sh target/{{musl_triple}}/release/aido
 
+# --- install, for real, as root ----------------------------------------------
+
+# `aido install` and `aido install --uninstall` run as real root inside
+# containers this starts and discards, against real sudo, sudo-rs, and OpenDoas:
+# the file lands 0440/0400 root:root, validated by the backend's own parser;
+# an operator's file is never replaced or removed; a rejected candidate leaves
+# the old state alone; uninstall removes exactly what install wrote. Not in
+# `linux-test`, which is non-root on purpose. Needs Docker. It does not prove
+# the rule is in effect: that is the functional probe, which needs the gate.
+install-root:
+    cargo build -p aido-bin --release --target {{musl_triple}}
+    ci/install/run.sh target/{{musl_triple}}/release/aido
+
 # --- developer setup --------------------------------------------------------
 
 # Point git at the tracked hooks directory, so the gate runs before every

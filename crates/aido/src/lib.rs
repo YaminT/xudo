@@ -32,5 +32,5 @@ pub mod cli;
 pub mod render;
 pub mod rules;
 
-pub use cli::{Cli, Command, Format, run, run_with};
+pub use cli::{Cli, Command, Format, run, run_with, run_with_installer};
 pub use rules::{LoadError, LoadedRules};
