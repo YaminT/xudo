@@ -3,8 +3,8 @@
 #
 #   ci/linux-test.sh [cargo test arguments]        (or: just linux-test ...)
 #
-# Two hazards decide the shape, both found the hard way (docs/CONCERNS.md,
-# 2026-10-14):
+# Three hazards decide the shape, all found the hard way (docs/CONCERNS.md,
+# 2026-10-14 and 2026-10-19):
 #
 # * Never on the bind mount. Docker Desktop's mount misreports the checkout as
 #   root-owned to a root process, and intermittently reports a directory
@@ -14,6 +14,13 @@
 #   refused" test passes vacuously. The copy and the caches are prepared as
 #   root, then the suite runs as an unprivileged user, and the script refuses to
 #   continue if that user turns out to be root.
+# * Never with the checkout's own mtimes. Every checkout is copied to the same
+#   /work and builds into the same target volume, and cargo decides freshness
+#   by comparing mtimes. A worktree whose files are older than the last build
+#   from a different worktree would be tested against that other worktree's
+#   code, silently. So the copy is extracted with the current time on every
+#   file, and every run rebuilds the workspace's own crates; the registry
+#   crates, which are the slow part, stay cached.
 #
 # The toolchain is the one rust-toolchain.toml pins. Registry and target caches
 # live in named volumes so a second run does not rebuild the world.
@@ -65,7 +72,7 @@ docker run --rm -i \
     "$image" bash -s -- "$@" <<'INNER'
 set -euo pipefail
 mkdir -p /work
-(cd /src && tar --exclude=./target --exclude=./fuzz/target -cf - .) | tar -xf - -C /work
+(cd /src && tar --exclude=./target --exclude=./fuzz/target -cf - .) | tar -xmf - -C /work
 chown -R "$TEST_UID:$TEST_UID" /work /cache/cargo /cache/target
 
 run() {
