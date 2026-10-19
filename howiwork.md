@@ -223,6 +223,23 @@ Recorded so the reconciliation is visible, not silent:
    read-class capabilities, so the read/write separation cannot drift between
    two codebases.
 
+## Derived views
+
+Everything below is generated from this file and must never be edited as if it
+were the source:
+
+| View | Where | How it stays true |
+|---|---|---|
+| README | `README.md` | Opens by naming this file as the source; its product claims are copied from here, never extended |
+| FigJam overview | FigJam board `zfZBwQ4rf9rks1sUl50XEd` (private to the owner's account; drafts folder) | A banner on the board stamps the `howiwork.md` commit it was built from. A board whose stamp differs from the current commit of this file is stale |
+
+The rule: **edit this file first, then bring the views up to date, in the same
+change where possible.** When a view and this file disagree, this file is right
+and the view is the bug. Agents and humans reading a view should open this
+file before acting on it.
+
+---
+
 ## Where the build stands
 
 M1 (policy core, explain) done. M2a (backend model) done. M2b in progress:
