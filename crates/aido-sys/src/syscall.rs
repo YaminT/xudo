@@ -844,13 +844,21 @@ mod tests {
             // kernel refuses with ENOENT rather than let anything reopen the
             // script by name. If it ever ran, the exit status would fail the
             // suite instead of passing it silently.
+            //
+            // The kernel checks for open writers before it looks at the
+            // interpreter line. Another test in this process can hold a write
+            // descriptor open across a fork at the moment this exec runs, and
+            // then the answer is ETXTBSY instead: seen once on a CI runner,
+            // never locally. Both refuse the script before anything runs, so
+            // both are the property under test.
             let path = scratch("exec-script").join("script");
             std::fs::write(&path, b"#!/bin/sh\nexit 97\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             let file = std::fs::File::open(&path).unwrap();
             assert!(cloexec(&file));
             let err = HostSyscalls.exec_fd(file.as_fd(), &[c"script"], &[]);
-            assert_eq!(err.os_code(), Some(Errno::NOENT.raw_os_error()));
+            let refused = [Errno::NOENT, Errno::TXTBSY].map(|e| Some(e.raw_os_error()));
+            assert!(refused.contains(&err.os_code()), "{err}");
         }
 
         #[test]
