@@ -242,16 +242,29 @@ pub fn run_with(
 /// root.
 ///
 /// Checked the way the gate must load it: every component opened through its
-/// parent's descriptor without following a link, and every rule file checked
-/// on its own descriptor. A path-only check of the directory would call a
-/// group-writable rule file inside a root-owned directory trusted.
+/// parent's descriptor without following a link, every rule file checked on its
+/// own descriptor, and the mount under each of them matched in
+/// `/proc/thread-self/mountinfo`. A path-only check of the directory would call
+/// a group-writable rule file inside a root-owned directory trusted; an
+/// ownership check alone would believe a FUSE daemon a user is running.
 ///
 /// A development checkout is expected to fail this, so the wording says which
 /// situation it is rather than printing a bare FAIL an operator has to decode.
+/// A refused mount names the component, the filesystem, where it is mounted,
+/// and why, so the operator knows which mount to look at.
 fn trust_line(rules: &Path) -> String {
-    match aido_sys::read_trusted_dir(rules) {
+    trust_report(&aido_sys::read_trusted_dir(rules))
+}
+
+/// The words for a trust walk's outcome.
+///
+/// Split out so both outcomes are reachable from a test on every platform: off
+/// Linux there is no mount table, so the walk itself can never succeed there.
+fn trust_report(outcome: &Result<Vec<aido_sys::TrustedFile>, aido_sys::TrustError>) -> String {
+    match outcome {
         Ok(files) => format!(
-            "root-owned, no writable component; {} rule file(s) checked on their descriptors",
+            "root-owned, no writable component, no user-made mount; {} rule file(s) checked on \
+             their descriptors",
             files.len()
         ),
         Err(source) => format!("UNTRUSTED: {source}"),
@@ -946,6 +959,7 @@ mod tests {
         assert!(out.contains("rules trust  UNTRUSTED"), "{out}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_trust_line_reports_a_root_owned_path_as_trusted() {
         // Not a claim about aido's own directory: a claim that the line can say
@@ -953,8 +967,61 @@ mod tests {
         // above.
         assert_eq!(
             trust_line(Path::new("/usr/bin")),
-            "root-owned, no writable component; 0 rule file(s) checked on their descriptors"
+            "root-owned, no writable component, no user-made mount; 0 rule file(s) checked on \
+             their descriptors"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_names_the_mount_that_makes_a_ruleset_untrusted() {
+        // /proc/sys passes every ownership check; the mount under /proc is
+        // what refuses it, and the line says which mount and why.
+        let cli = Cli::try_parse_from(["aido", "--rules", "/proc/sys", "doctor"]).unwrap();
+        let mut out = Vec::new();
+        let code = run_with(
+            &cli,
+            host_ops().as_ref(),
+            &HostProbe,
+            &mut out,
+            &mut Vec::new(),
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            out.contains(
+                "rules trust  UNTRUSTED: /proc is on proc at /proc, mounted nosuid, the mark of \
+                 removable media and of mounts a user may make, so what is on it need not be \
+                 root's"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_trusted_walk_is_reported_with_how_many_files_it_checked() {
+        let files = vec![aido_sys::TrustedFile {
+            name: "10-a.toml".into(),
+            bytes: Vec::new(),
+        }];
+        assert_eq!(
+            trust_report(&Ok(files)),
+            "root-owned, no writable component, no user-made mount; 1 rule file(s) checked on \
+             their descriptors"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_trust_line_cannot_say_yes_off_linux() {
+        // No mount table, so no mount can be judged, so nothing is trusted —
+        // and the line says that is why, rather than blaming the ruleset.
+        let line = trust_line(Path::new("/usr/bin"));
+        assert!(
+            line.starts_with("UNTRUSTED: the mount table cannot be checked"),
+            "{line}"
+        );
+        assert!(line.contains("not supported on this platform"), "{line}");
     }
 
     #[test]

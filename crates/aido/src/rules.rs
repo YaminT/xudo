@@ -6,18 +6,18 @@
 //!
 //! # What this does not check, and where that check lives
 //!
-//! Ownership and mode. This loader is the unprivileged front-end's, and it reads
-//! by path so `aido explain` works on a checkout. The check the privileged gate
-//! must use is `aido_sys::read_trusted_dir`: every component opened through its
-//! parent's descriptor without following a link, every rule file checked on its
-//! own descriptor, and the bytes read through that same descriptor. `aido
-//! doctor` already reports through it.
+//! Ownership, mode, and mounts. This loader is the unprivileged front-end's, and
+//! it reads by path so `aido explain` works on a checkout. The check the
+//! privileged gate must use is `aido_sys::read_trusted_dir`: every component
+//! opened through its parent's descriptor without following a link, every rule
+//! file checked on its own descriptor, the mount under each refused if a
+//! non-root user could have made it, and the bytes read through that same
+//! descriptor. `aido doctor` already reports through it.
 //!
 //! Reading by path here is safe only because nothing here can execute anything:
 //! the worst a tampered ruleset can do through this loader is make `aido
 //! explain` print a wrong answer to a human who asked a question. When the gate
 //! binary is written, it loads through `read_trusted_dir` and nothing else.
-//! Still not checked by either: a filesystem mounted by a non-root user.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;

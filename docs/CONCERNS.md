@@ -4,6 +4,335 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 7: a ruleset on a mount a non-root user made
+
+### The hole this closes
+
+The trust walk checked each component's owner and mode on the descriptor it
+opened, and believed what the filesystem reported. A FUSE filesystem reports
+whatever its daemon says, and any user can mount one through the set-user-ID
+`fusermount3`. So: a directory on the path to the rules is the user's by
+mistake; the user mounts sshfs over it; the daemon answers every `stat` with
+`root:root 0755`; the walk passes and the daemon serves the rules. The ownership
+checks cannot see this. Only the mount table can.
+
+`open_trusted`, `read_trusted_dir`, and `load_trusted_rules` now match every
+descriptor they open — each path component and each rule file — to its mount,
+and judge the mount (`crates/aido-sys/src/mounts.rs`) before anything else the
+filesystem says about the component is believed. Each component is opened
+`O_PATH`, which asks its filesystem nothing — crossing into the root of a FUSE
+mount does not reach the daemon — then its mount is judged, and only then are
+its kind, owner, and mode read from that descriptor; nothing beneath a
+component is looked up until it has passed. So a user's daemon is never asked
+anything. It cannot choose the refusal the operator sees, by answering `stat`
+with an owner of its choosing or, without `allow_other`, by refusing root
+outright; and it cannot stall the walk. The refusal names the outermost
+component at fault, and where one component fails both ways its mount is what
+is reported (`the_owner_a_daemon_reports_is_never_asked_for_before_its_mount_is_refused`,
+and on Linux `on_linux_a_component_nobody_may_open_is_still_refused_for_its_mount`).
+The directory's mount is judged before the directory is listed, so a FUSE
+daemon chooses neither the names read from it nor, through a file it reports
+as writable, which refusal is shown
+(`a_directory_on_a_refused_mount_is_not_listed_so_its_daemon_cannot_pick_the_refusal`).
+Rule files are opened `O_PATH` and their mounts judged together — a file can be
+a mount point of its own — before any is checked or read:
+`a_rule_file_on_a_refused_mount_is_refused_before_any_file_is_read` proves it
+with a directory named `20-b.toml`, whose read would fail with `EISDIR` and
+does not get the chance. Nothing can be read through `O_PATH`, so the target
+and each rule file are opened once more, by name, in a directory that has
+passed, and refused (`TrustError::Replaced`) unless the device and inode are
+the probe's; the probe stays open meanwhile, so its inode cannot be freed and
+reused (`a_rule_file_replaced_after_it_passed_is_refused_rather_than_read`,
+`a_target_swapped_after_it_passed_is_refused_rather_than_opened`). A file named
+as the rules directory passes as the walk's last component and is refused by
+that reopen, which asks for a directory.
+
+### Deviation: matched by mount id, not by `st_dev`
+
+The step was proposed as "match each component by `st_dev`, and where that is
+ambiguous take the longest matching mount point". Measured on Linux 6.12 in a
+throwaway privileged container (a loop-backed btrfs with one subvolume, mounted
+twice): mountinfo listed both mounts as `0:72`, while `stat` reported `0:73`
+for the top-level subvolume and `0:74` for the other. btrfs gives every
+subvolume an anonymous device of its own, and none of them appears in
+mountinfo, so on a btrfs root — Fedora's default — an `st_dev` match finds
+nothing at all and would refuse every install. overlayfs also reports
+per-layer devices for some files. And two mounts of one filesystem share a
+device while differing in exactly the per-mount options that matter.
+
+What is exact is `mnt_id` in `/proc/thread-self/fdinfo/<fd>`, present since
+Linux 3.15 and equal to mountinfo's first field. In the same container it told
+the two mounts of device `0:74` apart (`198` and `199`). An open descriptor
+keeps its mount alive, so the id cannot be reissued to another mount while the
+walk holds it; a mount detached after the open is simply no longer listed, and
+an unlisted mount is refused. `devices_that_mountinfo_cannot_tell_apart_the_mount_id_can`
+pins the btrfs case.
+
+### What is refused, and why
+
+The kernel does not record who asked for a mount. In the initial user
+namespace every mount needs `CAP_SYS_ADMIN`, so a non-root user mounts only
+through something running as root for them, and each leaves a mark:
+
+- **FUSE** (`fuse`, `fuseblk`, `fuse.<subtype>`) unless it names exactly one
+  `user_id` and that is `0`. `fusermount3` writes the invoking user's uid
+  there. Missing, duplicated, or non-numeric is refused too: who serves the
+  mount cannot be told. The daemon chooses only what follows the dot in the
+  type; the kernel writes `fuse` before it. A FUSE mount that root made is then
+  judged like any other mount: a stick a desktop automounts through a root-run
+  `ntfs-3g` (`fuseblk … user_id=0`) is still refused for the ruleset by the
+  `nosuid` udisks2 gave it
+  (`a_root_mounted_fuse_still_carries_the_marks_of_a_user_mount`).
+- **`nosuid` or `noexec`, for the ruleset only**: on every component of the
+  path to the rules and every rule file, as the design plan asks of
+  `/etc/aido` (`MountPolicy::Ruleset`, used by `read_trusted_dir` and
+  `load_trusted_rules`). `fusermount3` and udisks2 mount `nosuid`; fstab's
+  `user` and `users` imply `nosuid,noexec`, `owner` and `group` imply
+  `nosuid`. The real user FUSE mount in the probe read
+  `rw,nosuid,nodev,noatime - fuse.fuse-overlayfs ... user_id=1000`, so it is
+  refused on two independent counts. `nodev` alone is not refused: half the
+  mounts on a normal host carry it. `open_trusted`, which any other root-owned
+  path goes through, does not refuse these two (`MountPolicy::RootPath`):
+  root's own mounts carry them — systemd mounts `/run` `nosuid,nodev` on every
+  host, the gate's spool is `/run/aido/req`, and `/var`, with `/var/lib/aido`,
+  is `nosuid` on some — so there they say nothing about who made the mount
+  (`a_spool_on_a_nosuid_mount_opens_while_rules_there_are_refused`; on Linux,
+  `procfs_is_refused_as_a_home_for_rules_by_its_mount` opens `/proc/sys`
+  through `open_trusted` and refuses it to `read_trusted_dir`).
+- **`idmapped`**, to every reader: the owners it reports are a mapping chosen
+  at mount time, not what is on disk.
+- **A mount the table does not list**, and **a table that cannot be read or
+  does not parse**, to every reader.
+- **Everything, when the thread is outside the initial user namespace**, read
+  as the `ns/user` link and compared with the kernel's fixed
+  `PROC_USER_INIT_INO` (`user:[4026531837]`). There, uid 0 means the
+  namespace's owner; and the kernel prints a FUSE mount's `user_id` relative
+  to the user namespace the mount was made in, which mountinfo does not name.
+  In the initial namespace, a mount owned by another can only arrive by root's
+  hand (propagation out of a less privileged mount namespace is one-way, and
+  `move_mount` needs `CAP_SYS_ADMIN` over the target). A kernel built without
+  `CONFIG_USER_NS` lists no `user` entry in `ns/` and has no namespace but the
+  initial one, so `ENOENT` for that entry, in an `ns` directory already proven
+  to be procfs, is read as the initial namespace; any other failure is refused
+  (`a_kernel_without_user_namespaces_is_not_refused_as_unreadable`). This is
+  also the design plan's "namespaced root" refusal, for the trust walk only;
+  the broker and the gate should still check their own identity (steps 2 and
+  4).
+
+### What is accepted, and why
+
+Anything else root mounted, because root chose to put the rules there:
+root-mounted FUSE (`user_id=0`, e.g. `lxcfs`); network and virtual
+filesystems (NFS, CIFS, 9p, virtiofs), which delegate trust to a server or a
+hypervisor that root picked — and refusing them would refuse every diskless
+NFS-root host outright; filesystems with no ownership model (vfat, exfat)
+mounted by root, whose owner comes from mount options root wrote. A user's
+mount of the same media carries `nosuid` from udisks2 or from fstab's `user`.
+An allowlist of filesystem types was considered and rejected: it would refuse
+bcachefs, erofs, nilfs2, ZFS and every type added later, and the plan's
+criterion is who made the mount, not what it is.
+
+### The table, and how it is believed
+
+Read from `/proc/thread-self/` — `mountinfo`, `fdinfo/<fd>`, and the `ns`
+directory — every file through a descriptor `fstatfs` reports as procfs, so a
+mount over `/proc` cannot hand back a table of its choosing
+(`a_forged_proc_is_refused_before_its_table_is_read`). `thread-self`, not
+`self`: the walk resolved its paths in this thread's mount namespace, and the
+descriptors are in this thread's table. Opening through `thread-self` follows
+procfs's own link; the `fstatfs` on the final descriptor is the check.
+`openat2(RESOLVE_NO_XDEV)` would pin the read to the verified mount itself, and
+needs 5.6. `mnt_id` is in fdinfo since 3.15 and `thread-self` exists since
+3.17; on an older kernel the read fails, and refuses.
+
+The table is read once per component, after that component's `O_PATH` open
+and while it is held, and once more for all the rule files together: five
+reads for `/etc/aido/rules.d` with no rule file in it. Never once up front: a
+mount id is handed to a new mount as soon as its old one is gone, and only an
+open descriptor keeps the mount it names alive, so a table read before the
+descriptor was opened could describe a different mount under the same id.
+
+`parse_mountinfo` reverses an M1 decision. It used to skip lines it did not
+understand, which suited discovery; as evidence in a trust decision a skipped
+line is a mount nobody looked at, so any malformed line now refuses the whole
+table, as does a table that ends mid-line. Fields are split on spaces before
+the kernel's octal escapes are decoded, so a directory named `a - b` cannot
+move a field; decoding is byte-exact, and a backslash the kernel's escaper did
+not write is kept as written. `aido-sys/tests/mountinfo.rs` renders arbitrary
+bytes exactly as `show_mountinfo` does and requires them back unchanged, and
+requires that no input can panic the parser.
+
+### Decisions worth knowing
+
+- **Off Linux, nothing is trusted.** There is no mount table, so the three
+  functions refuse everything on macOS, at `/`, and `aido doctor` there says
+  the mount table cannot be checked. The walk and the judgement are tested on
+  every platform through a scripted table (`mounts::fake`); the real `/proc` is
+  tested on Linux. macOS has no `O_PATH` either, so its probe is a read-only,
+  non-blocking open: a link or a socket there is refused as something that
+  cannot be opened rather than for what it is, and the tests expect each
+  platform's wording. The kind check itself is exercised on both
+  (`the_stat_of_a_link_or_a_socket_is_never_taken_for_a_file`).
+- **The target is reopened by name, not through `/proc/thread-self/fd/<n>`.**
+  Both give a descriptor that can be read; the name needs no procfs and runs
+  the same on macOS, and the device-and-inode comparison against the held
+  probe closes the window the second lookup opens. The directory is one that
+  passed, so only root can rename within it, and the comparison holds even
+  against root.
+- **The host reader is written as `and_then` chains, not `?`.** Each failure is
+  still propagated, and each is reached by a test of the function that produces
+  it, which a `?` after an infallible-in-practice read would not be.
+- **A refusal shows the mount's bytes escaped.** A FUSE daemon names its own
+  subtype, the kernel escapes only space, tab, newline, and backslash in it,
+  and the parser decodes those back. `TrustError::UntrustedMount` keeps the
+  decoded bytes for anything that compares them and renders the type and the
+  mount point through `escape_ascii`, so an escape sequence, or a newline
+  forging a line of `aido doctor`'s report, reaches the terminal as visible
+  text (`a_fuse_subtype_cannot_write_to_the_terminal_that_shows_its_refusal`).
+  The component path is rendered as before: it comes from the operator's path,
+  or from a listing on a mount that has already passed.
+- **Mutants run against the tests**, each killed: judging only a mount's first
+  listing; mount-checking the directory but not its rule files; skipping the
+  user-namespace check; taking the first `user_id` rather than demanding
+  exactly one; decoding escapes before splitting the line; listing the
+  directory before judging its mount; rendering the type unescaped. Another,
+  reading the files before the check, does not compile: the read consumes the
+  descriptors the check borrows. Two more that review found surviving every
+  test are now killed — accepting a root-made FUSE mount without judging its
+  marks, and not judging the mount of the target itself — and, after the
+  review fixes, so are: `fstat` before the mount is judged; dropping the
+  device-and-inode comparison; not judging the mounts above the target, or
+  the rule files' mounts, or the target's; judging the rules directory or its
+  ancestors, or the rule files, without `nosuid`/`noexec`; holding
+  `open_trusted` to them; and refusing them to every root-owned path, or
+  `idmapped` to none.
+- **Recovered work.** The first implementation was interrupted by an API
+  outage before it was committed. It was rebased onto step 2b (only this log
+  conflicted), and a review pass then added three things above: the escaped
+  rendering, the directory judged before it is listed, and `O_DIRECTORY` on a
+  directory reader's target (now on the reopen it is listed through). Step 2b
+  had meanwhile fixed the macOS socket-path test in its own way, so this
+  step's workaround for it was dropped. An independent review then found the
+  five things below; it was rebased onto `howiwork.md` first, again with only
+  this log in conflict.
+
+### What review should look at
+
+1. Accepting root-mounted FUSE and network filesystems. Stricter is a one-line
+   change in `mounts::refusal`; the cost is NFS-root hosts and lxcfs users.
+2. `nosuid` and `noexec` judged on every component of the path to the rules,
+   not only on the directory holding them: if `/` or `/etc` is ever `nosuid`
+   — a host that layers `/etc` from `systemd-confext` images may be one —
+   nothing loads. And not judged at all on other root-owned paths, which is
+   where a future caller that opens a rule file through `open_trusted` would
+   lose them.
+3. The user-namespace refusal living inside the trust walk.
+4. Strict parsing: a kernel that prints a line this parser does not expect
+   refuses every ruleset on that host, loudly, until the parser learns it.
+5. The table is read once per component and once for the rule files, five
+   times for `/etc/aido/rules.d`, rather than once; see above for why it
+   cannot be read up front.
+
+### Still open
+
+- **Overlay layers are not walked.** A root-built overlay whose upper directory
+  a user can write lets that user rearrange root's files in the merged view.
+  Only root can build one in the initial namespace, and the layer paths are in
+  root's mount namespace, not necessarily this one.
+- **fstab `user` semantics are seen only through `nosuid`/`noexec`.** libmount
+  records the mounting user in `/run/mount/utab`, a private format the kernel
+  does not attest; an fstab line that re-enables `exec,suid` for a user mount
+  is invisible here, and is root's own choice.
+- **Before Linux 5.8 a mountinfo read is not atomic** across `read` calls while
+  mounts change: a mount can be listed twice (every listing must pass) or not
+  at all (refused). Transient, and fail-closed.
+- **No fuzz target** for `parse_mountinfo`; the property tests cover panics and
+  round trips. Adding one costs a minute of every CI run.
+- `verify_path`, the path-based report, has no mount check; nothing calls it.
+- **A root-made mount of a writable device is accepted.** The design plan
+  refuses `/etc/aido` on a "user-writable mount" (its line 161), and nothing
+  here checks what backs a mount: a root-made mount of a block device a user
+  can write, or of a loop device whose backing file is the user's, passes,
+  and that user can rewrite the filesystem under the kernel. mountinfo names
+  the source (`/dev/sdb1`, `/dev/loop0`); checking it means resolving the
+  device to its node and, for a loop device, to
+  `/sys/block/loopN/loop/backing_file`, and walking that file's ownership. A
+  block device's own node is `root:disk 0660` on most distributions, so
+  "group-writable" cannot be the test. New design; recorded, not built.
+- **`aidod`'s unit must not add `nosuid` or `noexec` to the path to the
+  rules** — systemd's `NoExecPaths=` would, for one — or nothing loads. To be
+  recorded where the unit is written (step 2).
+- ~~**A user's FUSE daemon can stall the walk.**~~ Closed by the review fix
+  below: no component's filesystem is asked anything before its mount has
+  passed.
+
+### What review found, and how each was resolved
+
+An independent review of the recovered commit found no path that fails open,
+confirmed the core claim against real mounts, and found five things. Each was
+confirmed here before it was fixed: by a test or a mutant the old code fails,
+by a real-kernel probe, or, for the kernel without user namespaces, by the
+code and the kernel's own table of `ns` entries.
+
+1. **`open_trusted` refused every path under `/run`.** `nosuid` and `noexec`
+   were refused to every caller, and systemd mounts `/run` `nosuid,nodev`: the
+   gate's spool, `/run/aido/req`, would have been refused on every real host
+   while `just linux-test` passed, Docker's `/run` being a directory on the
+   container's root. **Fixed**: a `MountPolicy` — the ruleset readers refuse
+   the two marks, `open_trusted` keeps every other refusal and not those.
+   `a_spool_on_a_nosuid_mount_opens_while_rules_there_are_refused` pins both
+   halves, the rules directory refused above and at itself;
+   `a_rule_file_bound_nosuid_over_the_ruleset_is_refused` pins the files.
+2. **Two behaviours no test pinned**, each mutant passing every test and
+   clippy. **Fixed**: `a_root_mounted_fuse_still_carries_the_marks_of_a_user_mount`
+   (a root-run FUSE stick with `nosuid`, `noexec`, `idmapped`) and
+   `a_user_mount_over_the_target_file_itself_is_refused` (only the target on
+   the user's mount). Both mutants were re-run and are killed, and the claim
+   above that every mutant was killed now lists what was tried.
+3. **The walk asked a user's FUSE daemon before judging its mount**, so the
+   daemon picked the refusal shown — "Permission denied" without
+   `allow_other`, an owner of its choosing with it — contradicting this
+   entry's claim, and a stopped daemon stalled the walk. **Fixed** by the
+   reorder described at the top of this entry: `O_PATH`, the mount, then
+   `fstat`, and a reopen checked against the probe. Measured in a throwaway
+   privileged container on Linux 6.12, `fuse-overlayfs` mounted by uid 1000
+   on a root-owned `/opt/aido` and probed as root, before and after: without
+   `allow_other` the old walk said "cannot be inspected: Permission denied",
+   with it "is owned by uid 1000", and with the daemon stopped by `SIGSTOP` it
+   hung until killed; the new walk reported the user's FUSE mount in all
+   three, the last at once. Tests:
+   `the_owner_a_daemon_reports_is_never_asked_for_before_its_mount_is_refused`,
+   `on_linux_a_component_nobody_may_open_is_still_refused_for_its_mount`, and
+   the two `Replaced` tests.
+4. **A kernel without `CONFIG_USER_NS` refused everything**, its missing
+   `ns/user` read as "(unreadable)". **Fixed** as described above:
+   `ENOENT` there is the initial namespace, every other failure still refuses;
+   `a_kernel_without_user_namespaces_is_not_refused_as_unreadable` feeds the
+   decision every answer and checks a real procfs `ns` directory answers
+   `ENOENT` for an entry it does not list.
+5. **Documentation.** `SECURITY.md` still said rule-file ownership and mode
+   were not verified; it now says what `aido explain` does not check, what the
+   privileged loader does, and what no check covers yet. `mounts.rs` now says
+   `/proc/thread-self` needs 3.17, and that a FUSE `user_id` is relative to the
+   namespace the mount was made in. The design plan's "user-writable mount"
+   criterion — a backing device a user can write — is an open item above, not
+   built. `howiwork.md` lists this check as in review, which it is, and is
+   unchanged.
+
+Measured after the review fixes, on `howiwork.md` (113ed0f): `just verify`
+passes on macOS with 100% lines, regions, and functions; `just check-linux`
+is clean; `just linux-test` passes on Linux 6.12 (aarch64) as uid 1000, where
+`/proc/sys` opens through `open_trusted` and is refused to
+`read_trusted_dir` for its `nosuid` procfs mount, and `/usr/bin/true` is
+trusted on the overlay root. CI's coverage command, run the same way in
+Docker, measures `mounts.rs`, `trust.rs`, `proc.rs`, and `aido/src/cli.rs` at
+100% on Linux; the only gaps in that container are in files this step does
+not touch and belong to the container, not the code — `probe.rs`'s sudo
+probes (the image has no sudo) and one `PIDFD_GET_INFO` path in `syscall.rs`
+(Linux 6.12 lacks the call; CI's kernel has it).
+
+---
+
 ## 2026-10-19 — `howiwork.md`: the product source of truth, and the merged vision
 
 A product vision document arrived (permission sets and PRS, `airead`,

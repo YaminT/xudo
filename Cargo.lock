@@ -101,6 +101,7 @@ dependencies = [
  "aido-policy",
  "aido-sys-raw",
  "bstr",
+ "proptest",
  "rustix",
  "thiserror",
 ]

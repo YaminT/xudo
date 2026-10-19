@@ -39,10 +39,20 @@ one you know you lack.
   membership, writable unit directories, writable `PATH` entries, writable shell
   rc files: any one of them makes `aido` decorative. `aido doctor` does **not**
   report these yet; that report is part of M2b. Until then, check by hand.
-- **Rule-file ownership and mode are not yet verified.** Survivable only because
-  nothing can execute: a tampered ruleset currently makes `aido explain` print a
-  wrong answer to a human who asked a question. This is a stated precondition of
-  the privileged path, not a nice-to-have.
+- **`aido explain` does not verify the rules it reads.** It reads them by path,
+  so that it works on a checkout; a tampered ruleset makes it print a wrong
+  answer to the human who asked. Survivable only because nothing can execute.
+  The privileged loader, `aido_sys::load_trusted_rules`, refuses a ruleset with
+  any component that is not root's, is writable by group or world, is a
+  symbolic link, or is on a mount a non-root user could have made — checked on
+  the descriptors the rules are read through — and `aido doctor` reports
+  through it. The broker and the gate are not written yet; loading through it,
+  and nothing else, is a stated precondition of the privileged path.
+- **Not every user-writable filesystem is refused yet.** A mount that root made
+  from a block device or loop file a user can write passes, and so does an
+  overlay whose upper layer a user can write: what is checked is who made the
+  mount and the marks it carries, not what backs it (`docs/CONCERNS.md`,
+  2026-10-19).
 
 ## No telemetry
 
