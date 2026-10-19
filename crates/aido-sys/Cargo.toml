@@ -11,12 +11,23 @@ authors.workspace = true
 [dependencies]
 aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
+# The four system calls that need `unsafe`. The only crate that may depend on
+# it; everything else reaches those calls through `Syscalls`.
+aido-sys-raw = { path = "../aido-sys-raw", version = "0.0.1" }
 bstr.workspace = true
 # Descriptor-relative opens and `fstat`, through rustix's safe API, so the
-# ruleset is verified on the descriptors it is read through. Already in the
-# tree; `forbid(unsafe_code)` is untouched.
+# ruleset is verified on the descriptors it is read through.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 thiserror.workspace = true
+
+# The Linux tests start a real peer process and bound its connection with
+# SO_RCVTIMEO, so a connector that fails cannot hang the suite.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "fs",
+  "net",
+] }
 
 [lints]
 workspace = true

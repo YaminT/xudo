@@ -5,7 +5,8 @@
 > **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
 >
 > - Twelve crates, not five. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase.
-> - No `unsafe` anywhere yet. `aido-sys::raw` arrives with M2b holding exactly four syscalls; rustix wraps the rest safely.
+> - `unsafe` exists only in the crate `aido-sys-raw`, in its `sys` module: four syscalls in five blocks, budget enforced by a test; every other crate, `aido-sys` included, forbids it. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only (2026-10-19).
+> - A pidfd pins *which* process connected, not its pid number and not its credentials at connect time. Connect-time identity comes from `SO_PEERCRED` on every rung; `PIDFD_GET_INFO` reports current credentials; every read of `/proc/<pid>` is followed by a liveness check through the pidfd. The 5.3 `pidfd_open` rung withholds the agent path: its pin cannot be bound to the connection, so the passwordless path needs Linux 6.5 (2026-10-19).
 > - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
 > - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
 > - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.

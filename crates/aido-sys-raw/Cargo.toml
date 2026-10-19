@@ -1,0 +1,48 @@
+[package]
+name = "aido-sys-raw"
+description = "The four system calls aido cannot make without unsafe, behind a published block budget. The only crate in the workspace that does not forbid unsafe_code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree through rustix's own dependencies, so no new crate to
+# audit.
+libc = { version = "0.2.189", default-features = false }
+
+[dev-dependencies]
+toml.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
+# Not `workspace = true`. This is the one crate that must lower `unsafe_code`
+# from `forbid`, which no inner `allow` can lift, to `deny`, so that its `sys`
+# module alone can allow it. Cargo cannot override one inherited lint, so the
+# table is a copy, and `tests/unsafe_budget.rs` fails if it differs from
+# `[workspace.lints]` in anything but that line.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"
+arithmetic_side_effects = "deny"
+disallowed_methods = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"

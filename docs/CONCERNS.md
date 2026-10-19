@@ -4,6 +4,125 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 1: `aido-sys-raw`, and what review found
+
+The workspace's only `unsafe`: four system calls, five blocks, in a crate of
+their own, reached through a `Syscalls` trait in `aido-sys` with a real
+implementation and a scripted fake.
+
+| Call | Purpose | Kernel |
+|---|---|---|
+| `close_range(first, ~0, CLOSE_RANGE_CLOEXEC)` | the gate's first act | 5.11 |
+| `getsockopt(SO_PEERPIDFD)` | which process is on the other end of the broker's socket | 6.5 |
+| `ioctl(PIDFD_GET_INFO)` | that process's ids, credentials, and cgroup in one call | 6.13 |
+| `execveat(fd, "", AT_EMPTY_PATH)` | exec the descriptor that was validated | 3.19 |
+
+The first version put these in a module, `aido-sys::raw`, lowered the whole of
+`aido-sys` from `forbid` to `deny` to allow it, and guarded the rest with a
+test that matched substrings. A five-lens adversarial review (FFI soundness,
+kernel facts against kernel source, enforcement bypass, test adequacy, fit for
+steps 2 and 4) took it apart, and every finding below was checked against
+kernel source or by mutation before it was acted on. The review's own verifier
+stage failed on infrastructure errors, so nothing here rests on its votes.
+
+**The enforcement was beatable five ways.** `unsafe{`, `#[expect(unsafe_code)]`,
+`#[allow(dead_code, unsafe_code)]`, `#[unsafe(no_mangle)]`, and two blocks on
+one line all passed, as did `unsafe` in `aido-sys/tests/` and in a `build.rs`,
+which inherited the liftable `deny`. Each was proven with a compiling PoC.
+Now: the calls live in the crate `aido-sys-raw`, `aido-sys` forbids `unsafe`
+again, and the compiler confines it. The test that remains,
+`aido-sys-raw/tests/unsafe_budget.rs`, is the backstop: it lexes every Rust file
+of every workspace member plus `fuzz/` — comments, raw strings, byte and C
+strings, and character literals understood, so text cannot hide code and code
+cannot hide behind text — and fails on any `unsafe` token or lift of
+`unsafe_code` outside `sys.rs`, on `include!` or `#[path]`, on a block count
+other than the published budget, and on any crate but `aido-sys` depending on
+`aido-sys-raw`. The four PoCs that beat the old test all fail the new one.
+
+**Five gaps in the tests, each proven by a surviving mutant:** a `close_range`
+that ignored its floor, or stopped at it; an exec of the working directory
+instead of the descriptor; a pidfd with close-on-exec cleared; and a pidfd for
+the wrong process. The peer tests used a socketpair, whose "peer" is always the
+test process itself, so they could not tell a right answer from a wrong one.
+Now the floor test checks below, at, above, and far above; the exec tests
+expect `ENOEXEC` and `ENOENT` that only the handed descriptor can produce; and
+the peer tests connect a separate process. All five mutants are killed.
+
+**Kernel facts that were wrong or missing**, all now documented on the trait
+where step 2 will read them, and the version-dependent ones pinned by tests that
+predict the answer from the version without a branch:
+
+- A pidfd pins the process, **not its pid number**: the number is released at
+  reap and can be reissued while the pidfd is held. Every rung that reads
+  `/proc/<pid>` by number must re-check through the pidfd afterwards; the ladder
+  said only the `pidfd_open` rung needed to.
+- `PIDFD_GET_INFO` reports credentials and cgroup **at the moment of the
+  call**. A peer that connects and then execs a set-user-ID program reports that
+  program's ids. Connect-time identity comes from `SO_PEERCRED`, on every rung.
+- The **5.3 `pidfd_open` rung cannot bind its pin to the connection**:
+  `SO_PEERCRED` reports the connector's pid number even after the connector is
+  reaped and the number reissued, and nothing else is left to compare. So it no
+  longer carries the agent path; passwordless operation needs 6.5. A re-check
+  through `sock_diag` that finds the socket in the pinned process could restore
+  it, and is M4's to build or not. The human path is unaffected.
+- A missing `PIDFD_GET_INFO` answers `ENOTTY` before 6.11 and **`EINVAL` on 6.11
+  and 6.12** (found on the first Linux run). RHEL 9 and 10 carry the call below
+  6.13, so the broker should ask the kernel once rather than trust the version.
+- `SO_PEERPIDFD` on a reaped peer is `EINVAL` before 6.16; **from 6.16 it hands
+  out a pidfd for the dead process**, and `PIDFD_GET_INFO` on it answers `ESRCH`.
+- From 6.12 the `PIDFD_GET_INFO` request number is also `NS_MNT_GET_NEXT` to a
+  mount-namespace descriptor, which answers success and, with `CAP_SYS_ADMIN`,
+  installs a new descriptor. `HostSyscalls::pidfd_info` now refuses anything not
+  on pidfs before the ioctl is sent.
+- `PIDFD_INFO_CGROUPID` is reported whether or not the unified hierarchy is
+  mounted; its presence says nothing about whether a host can attest.
+
+**Results that must never read as root.** A call reported successful that never
+ran — a syscall filter returning 0 — left the request record, every requested
+bit set and every field zero, to be read as root's credentials, and left `-1` in
+`SO_PEERPIDFD`'s output for `OwnedFd` to panic on. `PidfdInfo::is_answer` refuses
+the first in the real and the fake implementation alike, and `peer_pidfd`
+refuses the second without adopting it.
+
+**The CI runners are on 6.17**, not older than Docker's 6.12 as first written.
+So every CI run executes the `PIDFD_GET_INFO` success path and the 6.16 stale
+pidfd path, and the success test checks every field — ids, all eight
+credentials, and the cgroup id against the inode of this process's cgroup — so
+a field declared out of order fails there. Each field's offset is also asserted
+against libc's `pidfd_info` at compile time.
+
+**The harness was testing the wrong code.** `just linux-test` copies each
+checkout to the same `/work` and shares one target volume, and cargo judges
+freshness by mtime: a worktree with older files than the last build from another
+tree ran that other tree's code. Found when an unmutated tree failed with a
+mutant's symptoms. The copy is now extracted with fresh mtimes.
+
+Decisions worth knowing before building on it:
+
+- **`close_range` marks, it does not close.** A safe wrapper around a real close
+  would be unsound: it can close a descriptor an `OwnedFd` still holds. Marked
+  descriptors close at the next exec; sudo and doas already `closefrom(3)`
+  before the gate runs.
+- **Open for step 4: the gate's process model.** Exec in place gives faithful
+  exit status for free and leaves no root parent holding inherited
+  descriptors, but no outcome to record afterwards; fork and wait needs `fork`,
+  which has no safe API and would be a sixth block. Also open: a kernel before
+  5.11 refuses `CLOSE_RANGE_CLOEXEC`; whether the gate refuses there or marks
+  descriptors one by one (another block) is the gate's call. And the gate's
+  exec vector should be built from the canonical argv bytes, not from
+  `Decision::resolved_argv`, which comes from a display renderer.
+- **Open for step 2:** `SO_PEERCRED`, `pidfd_open`, and the liveness check are
+  safe in rustix and need a seam of their own; this trait stays the list of
+  calls that need `unsafe`. Socket activation with `Accept=yes` and
+  `StandardInput=socket` puts the connection on fd 0, reachable safely, with no
+  `LISTEN_FDS` to parse.
+
+Measured: 100% on macOS (`just verify`); the whole suite passes on Linux 6.12 in
+Docker as uid 1000 on fresh builds; `aido-sys-raw` compiles for 64-bit Linux
+only, and says so in words on anything else.
+
+---
+
 ## 2026-10-16 — One generation for every reader, and a reachable broker socket
 
 Two things found while reading for M2b step 2, fixed before the broker is

@@ -30,6 +30,14 @@
 //! `Unattested` to every classification, so a developer on macOS cannot
 //! accidentally validate a Linux-only assumption: every decision path they
 //! exercise is the fail-closed one.
+//!
+//! # `unsafe`
+//!
+//! None here, and the compiler holds that: this crate forbids `unsafe_code`
+//! like every other. The four system calls that cannot be made without it
+//! live in `aido-sys-raw`, behind a published block budget, and the rest of
+//! the workspace reaches them only through [`Syscalls`], where a fake can stand
+//! in for the kernel.
 
 #![forbid(unsafe_code)]
 
@@ -41,6 +49,7 @@ pub mod probe;
 pub mod proc;
 pub mod provenance;
 pub mod source;
+pub mod syscall;
 pub mod trust;
 
 pub use error::SysError;
@@ -51,6 +60,7 @@ pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints};
 pub use source::{DirSource, MapSource, ProcSource};
+pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,
     read_trusted_dir, verify_path,

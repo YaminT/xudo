@@ -42,7 +42,7 @@ Every commit must satisfy all of the following. `just verify` runs the whole gat
 
 ### Banned in privileged code
 
-`aido-policy`, `aido-sys`, `aido-gate`, and `aidod` are privileged crates. Clippy enforces most of this; the rest is on review.
+`aido-policy`, `aido-sys`, `aido-sys-raw`, `aido-gate`, and `aidod` are privileged crates. Clippy enforces most of this; the rest is on review.
 
 | Banned | Why |
 |---|---|
@@ -51,7 +51,7 @@ Every commit must satisfy all of the following. `just verify` runs the whole gat
 | `shlex::split` (splitting a string into argv) | Re-parsing a rendered command string is how you reintroduce injection. `shlex` is for one-way *display* quoting only. |
 | `Command::new` with a non-absolute path | No `PATH` search, ever. Resolve absolutely, then exec the fd you validated. |
 | `anyhow` | Context strings leak paths into output. Use `thiserror` enums so every failure mode is exhaustively matchable. |
-| `unsafe` | `#![forbid(unsafe_code)]` everywhere except `aido-sys::raw`, which has a published unsafe-line budget in its module docs. Raising the budget is a reviewed change. |
+| `unsafe` | `#![forbid(unsafe_code)]` everywhere except the `aido-sys-raw` crate, which denies it at its root and allows it only in its `sys` module, under an unsafe-block budget published in that module's docs. `aido-sys-raw/tests/unsafe_budget.rs` lexes every Rust file in the workspace and fails on any `unsafe` token or lift of `unsafe_code` outside `sys`, on a block count other than the budget, and on any second crate depending on `aido-sys-raw`. Raising the budget is a reviewed change. |
 | `unwrap` / `expect` / panicking indexing in a decision path | A panic in the broker is a denial of service; a panic in the gate is undefined policy. Return a typed error and fail closed. |
 | Reading policy from any non-root-owned path | Verify ownership and mode on the **opened fd** via `fstat`, never on the path string. |
 
@@ -133,7 +133,8 @@ Two things to know before writing one:
 | Crate | Rule |
 |---|---|
 | `aido-policy` | Pure. **Zero syscalls, zero I/O.** If it needs the filesystem, it belongs in `aido-sys`. Builds and tests natively on macOS. |
-| `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. The only crate allowed `unsafe`, confined to `raw`. |
+| `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. Forbids `unsafe` like every other crate; the four calls that need it come from `aido-sys-raw`. |
+| `aido-sys-raw` | The four system calls that cannot be made without `unsafe` — `close_range`, `SO_PEERPIDFD`, `PIDFD_GET_INFO`, `execveat` — and the kernel-written `PidfdInfo`. The only crate that does not forbid `unsafe_code`: it is allowed only in `sys`, within a published block budget. Only `aido-sys` may depend on it. |
 | `aido` | Unprivileged front-end **library**. Holds no secret, makes no decision. |
 | `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. Its `tests/` run the real binary as a process. Excluded from coverage, never from `just test`. |
 | `aido-gate` | Privileged executor and *second independent policy engine*. Assume a hostile local user invokes it directly with no arguments. |

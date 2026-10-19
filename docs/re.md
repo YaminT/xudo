@@ -18,8 +18,9 @@ systemd scopes.
 - **Host.** Local Docker. The remote hosts recorded earlier are no longer
   needed for anything.
 - **Kernel 5.** Attestation is a ladder, not a floor: 6.13 / 6.5 / 5.3 / older,
-  reported by `doctor`. `SO_PEERCRED` alone withholds passwordless operation
-  rather than authorising a race.
+  reported by `doctor`. Below 6.5 passwordless operation is withheld: `SO_PEERCRED`
+  alone authorises a race, and the 5.3 `pidfd_open` rung pins a process it cannot
+  bind to the connection (amended 2026-10-19). The human path works everywhere.
 - **The gate without a broker** cannot execute, so the broker's minting half is
   M2b. See `todo/README.md` open decision 5.
 - **`ido add` collision** — `ido add` writes `AGENTS.md`, `ido queue` buffers.

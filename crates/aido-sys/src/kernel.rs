@@ -9,25 +9,52 @@
 //!
 //! | Rung | Since | What the broker learns about its peer |
 //! |---|---|---|
-//! | [`Attestation::PeerPidfdInfo`] | 6.13 | A pidfd *and* its creds and cgroup id in one race-free `PIDFD_GET_INFO` |
-//! | [`Attestation::PeerPidfd`] | 6.5 | A pidfd straight from the socket via `SO_PEERPIDFD`; creds read through it |
+//! | [`Attestation::PeerPidfdInfo`] | 6.13 | A pidfd straight from the socket, then its pid and cgroup id through `PIDFD_GET_INFO` |
+//! | [`Attestation::PeerPidfd`] | 6.5 | A pidfd straight from the socket via `SO_PEERPIDFD` |
 //! | [`Attestation::PidfdOpen`] | 5.3 | A pid from `SO_PEERCRED`, then `pidfd_open` on it, then a re-check |
 //! | [`Attestation::PeerCredOnly`] | 2.2 | A pid, and no way to stop it being reused |
+//!
+//! On every rung the peer's uid and gid come from `SO_PEERCRED`, which the
+//! kernel captured when the peer connected. `PIDFD_GET_INFO` also reports
+//! credentials, but **current** ones, read at the moment of the call: a peer
+//! that connected and then exec'd a set-user-ID program would report that
+//! program's ids. What a pidfd makes race-free is *which process* it names,
+//! not what that process's credentials or cgroup were at connect time.
 //!
 //! The distinction that matters is not convenience, it is whether the process
 //! can be **pinned**. `SO_PEERCRED` hands back a pid, and a pid is a name that
 //! can be recycled: the process that connected may have exited and its number
 //! been reissued to something else before the broker looks at `/proc`. A pidfd
-//! is a handle to that specific process — once it is open, the number cannot
-//! come to mean anything else.
+//! is a handle to that specific process, and it never comes to refer to
+//! another one.
 //!
-//! On [`Attestation::PidfdOpen`] the window is narrow but real, so the pidfd is
-//! opened and then the identity is *re-read through it* and compared. If it
-//! changed, the caller that connected is gone and the request is denied.
+//! It does **not** hold on to the process's number. The kernel releases a pid
+//! number when the process is reaped, even while a pidfd still refers to the
+//! process, and the next process may be issued it. So whatever the broker reads
+//! from `/proc/<pid>` by number — the start time that pins a request to its
+//! caller, and on 6.5 to 6.12 the cgroup too — may describe a different
+//! process, unless the broker confirms through the pidfd *after* the last such
+//! read that the process it pinned is still unreaped. Every rung that holds a
+//! pidfd re-checks this way; see [`Attestation::needs_recheck_after_pinning`].
 //!
-//! On [`Attestation::PeerCredOnly`] there is no way to close the window at all.
-//! That rung therefore **cannot carry the agent path**: see
-//! [`Attestation::can_attest_an_agent`]. This is invariant 2 of the project —
+//! On [`Attestation::PidfdOpen`] the pidfd is opened and the identity is then
+//! *re-read through it* and compared, which closes the gap between the
+//! broker's first look and the pin. It does not close the gap before that:
+//! `SO_PEERCRED` reports the pid number the peer had at connect time, the
+//! kernel returns that number to the allocator once the peer is reaped, and a
+//! same-uid process that is issued it afterwards looks identical to every
+//! re-check, because nothing the connection carries besides the number and the
+//! uid is left to compare against. So the pin names *a* process, not provably
+//! the one that connected. That is enough for an audit record and for binding
+//! a human-path request, where the password is the authority; it is not enough
+//! to grant root without one.
+//!
+//! On [`Attestation::PeerCredOnly`] there is no pin at all. Neither rung can
+//! **carry the agent path**: see [`Attestation::can_attest_an_agent`]. A
+//! re-check that binds the pinned process to *this* connection — finding the
+//! client end of the accepted socket in the pinned process's descriptor table,
+//! through `sock_diag` — could restore it on 5.3 to 6.4, and is M4's to build
+//! or not. This is invariant 2 of the project —
 //! misclassification may only withhold capability — applied to the kernel
 //! itself. An old kernel loses passwordless operation. It does not lose `aido`;
 //! the human path still works, because a human typing a password is not relying
@@ -161,28 +188,43 @@ pub enum Attestation {
 impl Attestation {
     /// Whether this rung can carry the passwordless agent path.
     ///
-    /// False for exactly one rung, and the reason is the whole point of the
-    /// ladder: without a pidfd the peer cannot be **pinned**, so the broker
-    /// cannot know that the `/proc` entry it inspected belongs to the process
-    /// that connected rather than to a reused pid. Granting root without a
-    /// password on that basis would be authorising a race.
+    /// Only where the kernel hands over a pidfd for the peer itself, from the
+    /// socket. Below that, the broker cannot know that the process it pinned
+    /// is the process that connected rather than one issued a reused pid, and
+    /// granting root without a password on that basis would be authorising a
+    /// race. See the module docs for why the `pidfd_open` re-check does not
+    /// close it.
     ///
     /// A false here withholds capability and never adds it, which is invariant 2
     /// applied to the kernel.
     pub fn can_attest_an_agent(self) -> bool {
+        self.withheld_because().is_none()
+    }
+
+    /// Why this rung cannot carry the agent path, for `doctor`, or `None` if
+    /// it can.
+    pub fn withheld_because(self) -> Option<&'static str> {
         match self {
-            Self::PeerCredOnly => false,
-            Self::PidfdOpen | Self::PeerPidfd | Self::PeerPidfdInfo => true,
+            Self::PeerCredOnly => Some("no pidfd, so a peer cannot be pinned"),
+            Self::PidfdOpen => Some(
+                "the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the \
+                 pin is not bound to the connection",
+            ),
+            Self::PeerPidfd | Self::PeerPidfdInfo => None,
         }
     }
 
-    /// Whether the peer's identity has to be re-read and compared after pinning.
+    /// Whether the broker must confirm, through the pidfd, after its last read
+    /// of `/proc/<pid>`, that the process it pinned has not been reaped.
     ///
-    /// Only on [`Self::PidfdOpen`], where the pid arrives before the pin and the
-    /// gap between them is the race. The higher rungs receive the pidfd itself,
-    /// so there is no gap to close.
+    /// True on every rung that holds a pidfd. A pidfd pins the process, not its
+    /// number: once the process is reaped its number can be reissued, and a
+    /// read of `/proc/<pid>` after that describes whoever got it. Every rung
+    /// reads `/proc/<pid>` at least once, for the start time a request is
+    /// pinned by. [`Self::PeerCredOnly`] has no pidfd to check through, which is
+    /// one more reason it cannot attest anyone.
     pub fn needs_recheck_after_pinning(self) -> bool {
-        self == Self::PidfdOpen
+        self != Self::PeerCredOnly
     }
 
     /// The syscall or socket option this rung rests on.
@@ -227,9 +269,11 @@ impl Resolution {
 
 /// The oldest kernel on which `aido` offers the passwordless agent path.
 ///
-/// 5.3, where `pidfd_open` arrived. Below it `aido` still runs — the human path
-/// needs no attestation — but an agent gets a password prompt like anyone else.
-pub const OLDEST_ATTESTING_KERNEL: KernelVersion = KernelVersion::new(5, 3);
+/// 6.5, where `SO_PEERPIDFD` arrived: the first kernel that hands the broker a
+/// pidfd for its peer straight from the socket. Below it `aido` still runs —
+/// the human path needs no attestation — but an agent gets a password prompt
+/// like anyone else.
+pub const OLDEST_ATTESTING_KERNEL: KernelVersion = KernelVersion::new(6, 5);
 
 /// What a given kernel supports, as one value for the audit record and `doctor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,11 +312,10 @@ impl KernelSupport {
     /// is in play; "kernel too old" sends them to upgrade when the real problem
     /// may be elsewhere.
     pub fn summary(self) -> String {
-        let agent = if self.agent_path_available() {
-            "agent path available"
-        } else {
-            "agent path WITHHELD: no pidfd, so a peer cannot be pinned"
-        };
+        let agent = self.attestation.withheld_because().map_or_else(
+            || "agent path available".to_owned(),
+            |why| format!("agent path WITHHELD: {why}"),
+        );
         format!(
             "{} via {} ({})",
             self.version,
@@ -370,18 +413,29 @@ mod tests {
     }
 
     #[test]
-    fn only_the_unpinnable_rung_withholds_the_agent_path() {
-        // The security claim of this module, asserted directly: a kernel without
-        // a pidfd cannot pin its peer, so it cannot authorise root without a
-        // password. Everything above it can.
-        assert!(!Attestation::PeerCredOnly.can_attest_an_agent());
-        for rung in [
-            Attestation::PidfdOpen,
-            Attestation::PeerPidfd,
-            Attestation::PeerPidfdInfo,
-        ] {
-            assert!(rung.can_attest_an_agent(), "{rung:?}");
+    fn only_a_pidfd_from_the_socket_carries_the_agent_path() {
+        // The security claim of this module, asserted directly. Without a pidfd
+        // there is no pin; with one from pidfd_open the pin may name a process
+        // issued a reused pid. Only SO_PEERPIDFD binds the pin to the
+        // connection.
+        for rung in [Attestation::PeerCredOnly, Attestation::PidfdOpen] {
+            assert!(!rung.can_attest_an_agent(), "{rung:?}");
+            assert!(rung.withheld_because().is_some(), "{rung:?}");
         }
+        for rung in [Attestation::PeerPidfd, Attestation::PeerPidfdInfo] {
+            assert!(rung.can_attest_an_agent(), "{rung:?}");
+            assert_eq!(rung.withheld_because(), None, "{rung:?}");
+        }
+    }
+
+    #[test]
+    fn a_reissued_pid_is_why_pidfd_open_withholds_the_agent_path() {
+        // Ubuntu 20.04, Debian 11, RHEL 9: aido works, an agent is prompted,
+        // and doctor says why in words an operator can act on.
+        let summary = KernelSupport::parse("5.14.0-427.el9.x86_64").summary();
+        assert!(summary.contains("WITHHELD"), "{summary}");
+        assert!(summary.contains("reissued"), "{summary}");
+        assert!(summary.contains("SO_PEERCRED + pidfd_open"), "{summary}");
     }
 
     #[test]
@@ -408,17 +462,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_pid_first_rung_needs_a_recheck_after_pinning() {
-        // On PidfdOpen the pid arrives before the pin, and that gap is the race.
-        // The higher rungs are handed the pidfd itself, so there is no gap.
-        assert!(Attestation::PidfdOpen.needs_recheck_after_pinning());
+    fn every_rung_with_a_pidfd_rechecks_after_reading_proc_by_number() {
+        // A pidfd pins the process, not its number. A read of /proc/<pid> that
+        // is not followed by a liveness check through the pidfd can describe a
+        // process that was issued the number after the peer was reaped — on
+        // the top rung as much as on the bottom one, because every rung reads
+        // the start time from /proc.
         for rung in [
-            Attestation::PeerCredOnly,
+            Attestation::PidfdOpen,
             Attestation::PeerPidfd,
             Attestation::PeerPidfdInfo,
         ] {
-            assert!(!rung.needs_recheck_after_pinning(), "{rung:?}");
+            assert!(rung.needs_recheck_after_pinning(), "{rung:?}");
         }
+        assert!(!Attestation::PeerCredOnly.needs_recheck_after_pinning());
     }
 
     #[test]
@@ -448,10 +505,15 @@ mod tests {
         // Deliberate: the ruleset walk refuses a symlinked component rather than
         // resolving it, and refuses `..`, so O_NOFOLLOW per component gives the
         // same guarantee in more syscalls. Only attestation gates the agent
-        // path.
-        let old = KernelSupport::parse("5.4.0-1103-aws");
-        assert_eq!(old.resolution, Resolution::NofollowWalk);
-        assert!(old.agent_path_available());
+        // path. No real kernel has SO_PEERPIDFD without openat2, so the
+        // combination is built by hand to keep the claim tested.
+        let support = KernelSupport {
+            version: KernelVersion::new(6, 5),
+            attestation: Attestation::PeerPidfd,
+            resolution: Resolution::NofollowWalk,
+        };
+        assert!(support.agent_path_available());
+        assert!(!KernelSupport::parse("5.4.0-1103-aws").agent_path_available());
     }
 
     #[test]

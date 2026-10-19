@@ -223,9 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn a_kernel_five_host_gets_the_pidfd_open_rung_and_keeps_the_agent_path() {
-        // The reason this ladder exists: Ubuntu 20.04, Debian 11 and RHEL 9 are
-        // all still in service and all predate SO_PEERPIDFD.
+    fn a_kernel_five_host_gets_the_pidfd_open_rung_but_not_the_agent_path() {
+        // Ubuntu 20.04, Debian 11 and RHEL 9 are all still in service and all
+        // predate SO_PEERPIDFD. They pin the peer with pidfd_open, which is
+        // enough for the audit record and the human path, and not enough to
+        // grant root without a password: the pin cannot be bound to the
+        // connection.
         for release in ["5.4.0-1103-aws", "5.10.0-21-amd64", "5.14.0-427.el9.x86_64"] {
             let source = MapSource::new().with("sys/kernel/osrelease", release);
             let support = LinuxOps::with_source(source).kernel();
@@ -234,7 +237,7 @@ mod tests {
                 crate::kernel::Attestation::PidfdOpen,
                 "{release}"
             );
-            assert!(support.agent_path_available(), "{release}");
+            assert!(!support.agent_path_available(), "{release}");
             assert!(
                 support.attestation.needs_recheck_after_pinning(),
                 "{release} must re-read the peer after pinning it"

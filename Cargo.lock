@@ -99,9 +99,19 @@ version = "0.0.1"
 dependencies = [
  "aido-backend",
  "aido-policy",
+ "aido-sys-raw",
  "bstr",
  "rustix",
  "thiserror",
+]
+
+[[package]]
+name = "aido-sys-raw"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "rustix",
+ "toml",
 ]
 
 [[package]]

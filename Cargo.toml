@@ -7,6 +7,7 @@ members = [
   "crates/aido-gate",
   "crates/aido-policy",
   "crates/aido-sys",
+  "crates/aido-sys-raw",
   "crates/aido",
   "crates/aido-bin",
   "crates/aido-tests",
@@ -79,6 +80,10 @@ indexing_slicing = "deny"
 integer_division = "deny"
 arithmetic_side_effects = "deny"
 disallowed_methods = "deny"
+# Inert everywhere but aido-sys::raw, and set here so the copy in aido-sys's
+# manifest stays identical to this table.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 # Correctness and clarity.
 pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "warn"

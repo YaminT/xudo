@@ -145,7 +145,11 @@ impl Hint {
 pub struct CallerFacts {
     /// The broker's classification. The only field with authorization weight.
     pub classification: Classification,
-    /// The caller's real uid, from `SO_PEERCRED`/`PIDFD_GET_INFO`.
+    /// The caller's effective uid when it connected, from `SO_PEERCRED`.
+    ///
+    /// Not from `PIDFD_GET_INFO`, whose credentials are read at the moment of
+    /// the call: a peer can connect and then exec a set-user-ID program, and
+    /// would then report that program's ids.
     pub uid: u32,
     /// The project root the request is scoped to, if any.
     pub project_root: Option<String>,

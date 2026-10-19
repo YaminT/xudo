@@ -42,6 +42,20 @@ pub enum SysError {
         /// The limit that was hit.
         limit: usize,
     },
+    /// A system call failed.
+    ///
+    /// Carries the errno as well as the text, because some callers must tell
+    /// "this kernel lacks the call" from "the call refused", and the number is
+    /// the only stable way to do that.
+    #[error("{operation} failed: {reason}")]
+    Os {
+        /// The system call, named as the kernel documents it.
+        operation: String,
+        /// The errno, when the failure carried one.
+        code: Option<i32>,
+        /// The operating system's account of why.
+        reason: String,
+    },
 }
 
 impl SysError {
@@ -67,6 +81,30 @@ impl SysError {
             operation: operation.into(),
         }
     }
+
+    /// Builds a system-call failure from the error the call returned.
+    pub fn os(operation: impl Into<String>, error: &std::io::Error) -> Self {
+        Self::Os {
+            operation: operation.into(),
+            code: error.raw_os_error(),
+            reason: error.to_string(),
+        }
+    }
+
+    /// The errno of a failed system call, and `None` for every other failure,
+    /// including a system call that failed without one.
+    pub fn os_code(&self) -> Option<i32> {
+        match self {
+            Self::Os { code, .. } => *code,
+            _ => None,
+        }
+    }
+}
+
+impl From<aido_sys_raw::OsError> for SysError {
+    fn from(failed: aido_sys_raw::OsError) -> Self {
+        Self::os(failed.operation, &failed.error)
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +126,7 @@ mod tests {
             SysError::malformed("1/stat", "no closing parenthesis in comm"),
             SysError::unsupported("resolve_exe"),
             SysError::AncestryTooDeep { limit: 64 },
+            SysError::os("execveat", &std::io::Error::from_raw_os_error(13)),
         ];
         for err in &cases {
             let rendered = err.to_string();
@@ -98,6 +137,32 @@ mod tests {
         assert!(cases[1].to_string().contains("malformed"));
         assert!(cases[2].to_string().contains("not supported"));
         assert!(cases[3].to_string().contains("depth limit of 64"));
+        assert!(cases[4].to_string().starts_with("execveat failed: "));
+    }
+
+    #[test]
+    fn only_a_system_call_failure_carries_an_errno() {
+        // Callers branch on the number to tell a missing syscall from a refusal,
+        // so no other variant may be mistaken for one.
+        let os = SysError::os("close_range", &std::io::Error::from_raw_os_error(38));
+        assert_eq!(os.os_code(), Some(38));
+        let synthetic = SysError::os("x", &std::io::Error::other("no errno"));
+        assert_eq!(synthetic.os_code(), None);
+        assert_eq!(SysError::unsupported("x").os_code(), None);
+    }
+
+    #[test]
+    fn a_raw_failure_keeps_its_call_and_its_errno() {
+        let raw = aido_sys_raw::OsError {
+            operation: "getsockopt(SO_PEERPIDFD)",
+            error: std::io::Error::from_raw_os_error(92),
+        };
+        let err = SysError::from(raw);
+        assert_eq!(err.os_code(), Some(92));
+        assert!(
+            err.to_string()
+                .starts_with("getsockopt(SO_PEERPIDFD) failed: ")
+        );
     }
 
     #[test]
