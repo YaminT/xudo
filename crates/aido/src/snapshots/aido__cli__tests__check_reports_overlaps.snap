@@ -1,0 +1,8 @@
+---
+source: crates/aido/src/cli.rs
+expression: out
+---
+ok: 4 action(s) in 3 file(s), generation 7ee72b1747ad
+overlap: aido.pkg.remove-toolchain (10-a.toml:3) and aido.pkg.remove-quick (20-b.toml:3) both accept /usr/bin/apt-get remove gcc
+possible overlap: aido.net.lookup-internal (30-c.toml:3) and aido.net.lookup-any (30-c.toml:9): cannot compare `host` (pattern "[a-z]+\\.internal") against `target` (pattern "[a-z.]+") exactly
+2 overlapping pair(s): a command more than one action accepts is refused to an agent if any of them is human-only, and confirmed as strictly as the strictest demands

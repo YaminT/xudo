@@ -170,10 +170,18 @@ pub struct Approved {
     pub argv: Vec<String>,
     /// The complete environment for the child.
     pub environment: Vec<String>,
-    /// The action that matched.
+    /// The action whose requirement governed the decision: of every action
+    /// that accepts this command, the strictest. This is the rule that
+    /// authorized the command, and the one an audit record must cite.
     pub action: String,
-    /// Where the matching rule lives, as `file:line`.
+    /// Where the governing rule lives, as `file:line`.
     pub rule_source: String,
+    /// The action the request named. The caller's choice, relayed by the
+    /// broker; it differs from [`Self::action`] when a stricter rule accepts
+    /// the same command, and is recorded beside it, never instead of it.
+    pub requested_action: String,
+    /// Where the requested action's rule lives, as `file:line`.
+    pub requested_rule_source: String,
     /// The nonce to consume before executing.
     ///
     /// Carried so the caller cannot forget: consuming it is what makes the grant
@@ -238,15 +246,31 @@ pub fn decide(
         Verdict::Allow | Verdict::AllowWithConfirmation => {}
     }
 
+    // The engine cites the governing action on every allowing decision. The
+    // defaults are the requested action, eagerly built, so there is no arm
+    // here that only a broken engine could reach.
+    let governing_action = decision
+        .action
+        .as_ref()
+        .map_or(action.id.as_str(), ActionId::as_str)
+        .to_owned();
+    let governing_source = decision
+        .rule_source
+        .as_ref()
+        .map_or(action.source.to_string(), ToString::to_string);
+
     Ok(Approved {
         // The rule's spelling, not the request's. `evaluate` compared the two
-        // byte-for-byte and denied `ExeMismatch` on any difference, so this is
+        // byte-for-byte and denied `ExeMismatch` on any difference, and every
+        // action that accepts the command names the same program, so this is
         // the same bytes — taken from the copy that carries authority.
         program: action.exe.clone(),
         argv: decision.resolved_argv,
         environment: child_environment(),
-        action: action.id.as_str().to_owned(),
-        rule_source: action.source.to_string(),
+        action: governing_action,
+        rule_source: governing_source,
+        requested_action: action.id.as_str().to_owned(),
+        requested_rule_source: action.source.to_string(),
         nonce: pending.nonce.clone(),
     })
 }
@@ -316,6 +340,16 @@ pub fn authorization_record(
     let mut evidence = vec![format!("gate_caller_pid={}", caller.pin.pid)];
     if let Some(channel) = confirmed_by {
         evidence.push(format!("confirmed_by={channel}"));
+    }
+    // The rule cited is the one that governed. When the caller named a
+    // different action that accepts the same command, that name is evidence:
+    // "asked for the quiet duplicate, governed by the confirming rule" is what
+    // an investigator needs to read.
+    if approved.requested_action != approved.action {
+        evidence.push(format!(
+            "requested_action={} at {}",
+            approved.requested_action, approved.requested_rule_source
+        ));
     }
 
     let decision = if confirmed_by.is_some() {
@@ -851,6 +885,126 @@ args = [
             decide(&rules(), &hinted, Some(&pending), context()),
             decide(&rules(), &human(77), Some(&pending), context())
         );
+    }
+
+    /// Rules where two actions accept one command: a confirming rule and a
+    /// duplicate that never asks, and a human-only rule and a duplicate open
+    /// to agents.
+    fn overlapping_rules() -> RuleSet {
+        RuleSet::from_toml(
+            "overlap-rules.toml",
+            r#"
+[[action]]
+id = "aido.reload.confirmed"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+confirm = "always"
+args = [{ name = "verb", matcher = { literal = "daemon-reload" } }]
+
+[[action]]
+id = "aido.reload.quiet"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+confirm = "never"
+args = [{ name = "verb", matcher = { literal = "daemon-reload" } }]
+
+[[action]]
+id = "aido.stop.by-hand"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+agent-allowed = false
+args = [
+  { name = "verb", matcher = { literal = "stop" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[action]]
+id = "aido.stop.open"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "verb", matcher = { literal = "stop" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_entry_naming_a_permissive_duplicate_still_needs_the_stricter_confirmation() {
+        // The gate re-decides from root's ruleset, and the action an entry
+        // names is the caller's choice relayed by the broker. Naming the
+        // duplicate that never asks must not drop the confirmation the other
+        // rule demands for the same command.
+        let rules = overlapping_rules();
+        let mut pending = request(77, "aido.reload.quiet", &["daemon-reload"]);
+        let refusal = decide(&rules, &human(77), Some(&pending), context()).unwrap_err();
+        assert_eq!(refusal.code(), "gate_confirmation_missing");
+        assert_eq!(
+            refused_decision(&refusal).and_then(|decision| decision.action.clone()),
+            Some(ActionId::new("aido.reload.confirmed"))
+        );
+        pending.confirmed = true;
+        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
+
+        // The authorization cites the rule that demanded the approval, not the
+        // permissive one the caller named, and records the name beside it.
+        assert_eq!(approved.action, "aido.reload.confirmed");
+        assert_eq!(approved.requested_action, "aido.reload.quiet");
+        assert_ne!(approved.rule_source, approved.requested_rule_source);
+        let record =
+            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        assert_eq!(record.action.as_deref(), Some("aido.reload.confirmed"));
+        assert_eq!(
+            record.rule_source.as_deref(),
+            Some(approved.rule_source.as_str())
+        );
+        let requested = format!(
+            "requested_action=aido.reload.quiet at {}",
+            approved.requested_rule_source
+        );
+        assert!(
+            record.evidence.contains(&requested),
+            "{:?}",
+            record.evidence
+        );
+    }
+
+    #[test]
+    fn an_authorization_for_the_governing_rule_records_no_requested_duplicate() {
+        // Asked under the governing rule's own name, there is nothing beside it
+        // to record.
+        let rules = overlapping_rules();
+        let mut pending = request(77, "aido.reload.confirmed", &["daemon-reload"]);
+        pending.confirmed = true;
+        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
+        assert_eq!(approved.action, approved.requested_action);
+        let record =
+            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("requested_action=")),
+            "{:?}",
+            record.evidence
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_an_agent_open_duplicate_cannot_reach_a_human_only_command() {
+        let rules = overlapping_rules();
+        let pending = request(77, "aido.stop.open", &["stop", "nginx.service"]);
+        assert_eq!(
+            decide(&rules, &agent(77), Some(&pending), context())
+                .unwrap_err()
+                .code(),
+            "human_path_only"
+        );
+        assert!(decide(&rules, &human(77), Some(&pending), context()).is_ok());
     }
 
     #[test]

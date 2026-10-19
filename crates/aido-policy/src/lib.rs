@@ -38,6 +38,11 @@
 //! 4. **Rule order cannot rescue a deny.** Reordering the ruleset can change
 //!    which rule matched, never whether the deny-list fired.
 //! 5. **Canonicalization is idempotent.**
+//! 6. **Adding a rule never removes a confirmation**, and rule order never
+//!    changes whether one is demanded. Every action that accepts a command
+//!    contributes its requirement and the strictest applies, so a permissive
+//!    duplicate, wherever it sorts and whichever name a caller asks under,
+//!    cannot weaken a confirming rule. See [`engine`] and [`overlap`].
 //!
 //! # Failure posture
 //!
@@ -53,16 +58,18 @@ pub mod deny;
 pub mod engine;
 pub mod files;
 pub mod matcher;
+pub mod overlap;
 pub mod rule;
 
 pub use argv::{Arg, Argv};
 pub use caller::{CallerFacts, Classification, Hint, HintSource};
 pub use decision::{Confirm, Decision, DenialCode, ExitCode, TraceStep, Verdict};
 pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_list};
-pub use engine::{Request, evaluate};
+pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{
     Generation, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError, is_rule_file_name,
     load_rule_files,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
+pub use overlap::Overlap;
 pub use rule::{Action, ActionId, RuleSet, RuleSetError, Source, Tier};

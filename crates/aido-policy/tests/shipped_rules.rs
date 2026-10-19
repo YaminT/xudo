@@ -322,37 +322,43 @@ fn package_removal_always_confirms_even_for_a_human() {
     );
 }
 
+/// A command each shipped action accepts. Every shipped action must have one:
+/// an action with no example here fails the tests that walk the ruleset.
+fn example(id: &str) -> Vec<&'static str> {
+    match id {
+        "aido.svc.lifecycle" => vec![
+            "--no-pager",
+            "--no-ask-password",
+            "restart",
+            "nginx.service",
+        ],
+        "aido.svc.status" => vec!["--no-pager", "--full", "status", "nginx.service"],
+        "aido.svc.show" => vec!["--no-pager", "show", "nginx.service"],
+        "aido.svc.logs" => vec!["--no-pager", "-u", "nginx.service"],
+        "aido.svc.reset-failed" => vec!["--no-pager", "reset-failed", "nginx.service"],
+        "aido.svc.reload-units" => vec!["--no-pager", "daemon-reload"],
+        "aido.dmesg" => vec!["--no-pager", "-k"],
+        "aido.net.listeners" => vec!["-tulpnH"],
+        "aido.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
+        "aido.pkg.update" => vec!["update"],
+        "aido.pkg.remove" => vec!["-y", "remove", "--", "ripgrep"],
+        "aido.pkg.dry-run-install" => vec!["-s", "install", "--", "ripgrep"],
+        "aido.sysctl.max-map-count" => vec!["-q", "-w", "vm.max_map_count", "262144"],
+        "aido.sysctl.inotify-watches" => {
+            vec!["-q", "-w", "fs.inotify.max_user_watches", "524288"]
+        }
+        "aido.time.set-ntp" => vec!["set-ntp", "true"],
+        other => panic!("shipped action {other} has no example in this test; add one"),
+    }
+}
+
 #[test]
 fn a_yolo_agent_is_confirmed_on_every_shipped_action() {
     // The headline requirement, checked against the real ruleset rather than a
     // fixture: nothing an enrolled agent can run goes through unattended.
     let rules = load_all();
     for action in rules.actions() {
-        let argv = match action.id.as_str() {
-            "aido.svc.lifecycle" => vec![
-                "--no-pager",
-                "--no-ask-password",
-                "restart",
-                "nginx.service",
-            ],
-            "aido.svc.status" => vec!["--no-pager", "--full", "status", "nginx.service"],
-            "aido.svc.show" => vec!["--no-pager", "show", "nginx.service"],
-            "aido.svc.logs" => vec!["--no-pager", "-u", "nginx.service"],
-            "aido.svc.reset-failed" => vec!["--no-pager", "reset-failed", "nginx.service"],
-            "aido.svc.reload-units" => vec!["--no-pager", "daemon-reload"],
-            "aido.dmesg" => vec!["--no-pager", "-k"],
-            "aido.net.listeners" => vec!["-tulpnH"],
-            "aido.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
-            "aido.pkg.update" => vec!["update"],
-            "aido.pkg.remove" => vec!["-y", "remove", "--", "ripgrep"],
-            "aido.pkg.dry-run-install" => vec!["-s", "install", "--", "ripgrep"],
-            "aido.sysctl.max-map-count" => vec!["-q", "-w", "vm.max_map_count", "262144"],
-            "aido.sysctl.inotify-watches" => {
-                vec!["-q", "-w", "fs.inotify.max_user_watches", "524288"]
-            }
-            "aido.time.set-ntp" => vec!["set-ntp", "true"],
-            other => panic!("shipped action {other} has no coverage in this test; add it"),
-        };
+        let argv = example(action.id.as_str());
         let d = aido_policy::evaluate(
             &rules,
             &agent(),
@@ -365,6 +371,89 @@ fn a_yolo_agent_is_confirmed_on_every_shipped_action() {
             "{} with {argv:?} gave {:?}",
             action.id,
             d.verdict
+        );
+    }
+}
+
+/// Overlaps the shipped ruleset carries on purpose: `(first id, second id,
+/// why)`. Empty, because the shipped rules are disjoint. An entry needs a
+/// reason an operator could act on, and an entry for a pair that no longer
+/// overlaps fails the test, so reasons cannot outlive what they excuse.
+const DELIBERATE_OVERLAPS: &[(&str, &str, &str)] = &[];
+
+#[test]
+fn the_shipped_rules_overlap_only_where_a_reason_is_written_down() {
+    // Overlaps resolve to the strictest, so one is not a hole. But in the
+    // rules that ship, every interaction between two rules is a decision
+    // somebody has to have made, so an undeclared one fails here. Possible
+    // overlaps count: the shipped rules use no pattern, so every pair is
+    // decided exactly, and an undecidable one would need a reason too.
+    let rules = load_all();
+    let found: Vec<(String, String, String)> = rules
+        .overlaps()
+        .iter()
+        .map(|o| {
+            (
+                o.first.id.to_string(),
+                o.second.id.to_string(),
+                o.to_string(),
+            )
+        })
+        .collect();
+
+    for (first, second, why) in DELIBERATE_OVERLAPS {
+        assert!(
+            why.len() >= 80,
+            "the reason for {first} / {second} does not argue the case: {why}"
+        );
+        assert!(
+            found.iter().any(|(a, b, _)| a == first && b == second),
+            "stale entry: {first} and {second} no longer overlap; remove it"
+        );
+    }
+    let undeclared: Vec<&str> = found
+        .iter()
+        .filter(|(a, b, _)| {
+            !DELIBERATE_OVERLAPS
+                .iter()
+                .any(|(first, second, _)| a == first && b == second)
+        })
+        .map(|(_, _, report)| report.as_str())
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "shipped rules overlap with no written reason; narrow one of them, or add the pair to \
+         DELIBERATE_OVERLAPS with the reason:\n{}",
+        undeclared.join("\n")
+    );
+}
+
+#[test]
+fn searching_each_shipped_example_finds_its_own_action_and_only_it() {
+    // The same command line `aido explain` and the broker will see, searched
+    // across the whole shipped ruleset rather than asked of one action. With
+    // disjoint rules, each example is accepted by exactly the action it was
+    // written for.
+    let rules = load_all();
+    for action in rules.actions() {
+        let argv = Argv::new(example(action.id.as_str()));
+        let d = aido_policy::evaluate_command(
+            &rules,
+            &human(),
+            &aido_policy::Arg::from(action.exe.as_str()),
+            &argv,
+            Settings::default(),
+        );
+        assert_eq!(d.action.as_ref(), Some(&action.id), "{d:?}");
+        let matched = d
+            .trace
+            .iter()
+            .filter(|step| matches!(step, aido_policy::TraceStep::ActionMatched { .. }))
+            .count();
+        assert_eq!(
+            matched, 1,
+            "{} is accepted by more than one action",
+            action.id
         );
     }
 }

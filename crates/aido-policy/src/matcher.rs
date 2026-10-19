@@ -65,7 +65,7 @@ pub enum Repeat {
 
 impl Repeat {
     /// Returns the inclusive `(min, max)` bounds, clamped to [`MAX_REPEAT`].
-    fn bounds(self) -> (usize, usize) {
+    pub(crate) fn bounds(self) -> (usize, usize) {
         match self {
             Self::One => (1, 1),
             Self::Optional => (0, 1),
@@ -304,6 +304,102 @@ impl Matcher {
             Self::Name(kind) => format!("{kind:?}"),
             Self::Pattern(p) => format!("pattern {:?}", p.source()),
         }
+    }
+
+    /// Arguments worth trying when looking for one this matcher shares with
+    /// another.
+    ///
+    /// For a finite matcher, everything it accepts. For the others, the
+    /// arguments that [`exhausts`] relies on: if two matchers share any
+    /// argument at all, they share one of these, for every pair of types it
+    /// claims to decide.
+    fn probes(&self) -> Vec<Arg> {
+        match self {
+            Self::Literal(want) => vec![Arg::from(want.as_str())],
+            Self::OneOf(options) => options.iter().map(|o| Arg::from(o.as_str())).collect(),
+            Self::IntRange { lo, hi } => {
+                // `parse_i64` never yields `i64::MIN`, so the lowest value a
+                // range can accept is `-i64::MAX`. Two ranges that intersect
+                // share the larger of their floors; a range that reaches zero
+                // or above holds a bare decimal, which most name kinds accept.
+                let floor = (*lo).max(i64::MAX.saturating_neg());
+                [floor, floor.max(0)]
+                    .into_iter()
+                    .filter(|value| value <= hi)
+                    .map(|value| Arg::new(value.to_string()))
+                    .collect()
+            }
+            Self::PathUnder { prefix } => {
+                // Two prefixes that share a path share the longer prefix
+                // itself, or the path just beneath it.
+                let base = prefix.strip_suffix('/').unwrap_or(prefix);
+                vec![Arg::from(base), Arg::new(format!("{base}/x"))]
+            }
+            // Every name kind accepts one of these. Not relied on to prove two
+            // kinds disjoint; see `exhausts`.
+            Self::Name(_) => vec![Arg::from("a"), Arg::from("a.service")],
+            // A pattern's language cannot be enumerated here.
+            Self::Pattern(_) => Vec::new(),
+        }
+    }
+}
+
+/// What two matchers have in common, as far as this crate can decide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Meet {
+    /// No argument satisfies both.
+    Disjoint,
+    /// This argument satisfies both.
+    Common(Arg),
+    /// Could not be decided. Treated as a possible overlap, never as disjoint:
+    /// silence from the overlap report must mean there is none.
+    Undecided,
+}
+
+/// Whether one argument can satisfy both matchers.
+///
+/// Tries every probe either matcher offers against both, through the same
+/// [`Matcher::accepts`] the engine matches with, so a [`Meet::Common`] is
+/// checked rather than inferred.
+pub(crate) fn meet(a: &Matcher, b: &Matcher) -> Meet {
+    let mut probes = a.probes().into_iter().chain(b.probes());
+    match probes.find(|probe| a.accepts(probe) && b.accepts(probe)) {
+        Some(common) => Meet::Common(common),
+        None if exhausts(a, b) => Meet::Disjoint,
+        None => Meet::Undecided,
+    }
+}
+
+/// Whether two matchers that share none of their probes share nothing at all.
+///
+/// Each arm is an argument about what the two accept, and the probes are
+/// chosen to make it hold. The name-kind arms rest on three facts about
+/// [`NameKind::accepts`] — no kind accepts a leading `-`, no kind accepts a
+/// `/`, and every kind but unit-name accepts a bare decimal — which
+/// `name_kinds_hold_what_overlap_detection_relies_on` pins, so a change to a
+/// kind fails a test before it can make this lie.
+fn exhausts(a: &Matcher, b: &Matcher) -> bool {
+    use Matcher::{IntRange, Literal, Name, OneOf, PathUnder, Pattern};
+
+    match (a, b) {
+        // A finite matcher's probes are everything it accepts.
+        (Literal(_) | OneOf(_), _)
+        | (_, Literal(_) | OneOf(_))
+        // Ranges: both probe their floor, and the larger floor lies in both
+        // whenever they intersect. Against a name kind: names never start
+        // with `-`, so only a value of zero or more can be shared, and the
+        // smallest such value is probed; unit-name accepts no decimal at all.
+        // Against a path: a path starts with `/`, an integer never does.
+        | (IntRange { .. }, IntRange { .. } | Name(_) | PathUnder { .. })
+        | (Name(_) | PathUnder { .. }, IntRange { .. })
+        // Paths: every name kind refuses `/`. Two prefixes share a path only
+        // if one lies beneath the other, and then the longer prefix, or the
+        // path just under it when it ends in `/`, is accepted by both.
+        | (PathUnder { .. }, PathUnder { .. } | Name(_))
+        | (Name(_), PathUnder { .. }) => true,
+        // Two name kinds are compared through representatives only, and a
+        // pattern not at all: failing the probes proves nothing.
+        (Name(_), Name(_)) | (Pattern(_), _) | (_, Pattern(_)) => false,
     }
 }
 
@@ -1118,6 +1214,150 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("string"), "{err}");
+    }
+
+    #[test]
+    fn name_kinds_hold_what_overlap_detection_relies_on() {
+        // `exhausts` decides an integer range against a name kind, and a path
+        // against one, from these facts. If one stops holding, this fails, and
+        // `exhausts` must be argued again before anything else changes: a
+        // wrong `true` there is an overlap `aido check` stays silent about.
+        let kinds = [
+            NameKind::DebName,
+            NameKind::RpmName,
+            NameKind::ArchName,
+            NameKind::ApkName,
+            NameKind::UnitName,
+            NameKind::Hostname,
+            NameKind::SysctlKey,
+        ];
+        for kind in kinds {
+            for refused in ["-1", "-0", "/a", "a/b", "/"] {
+                assert!(!kind.accepts(refused.as_bytes()), "{kind:?} {refused}");
+            }
+            for decimal in ["0", "7", "10", "65535", "9223372036854775807"] {
+                assert_eq!(
+                    kind.accepts(decimal.as_bytes()),
+                    kind != NameKind::UnitName,
+                    "{kind:?} {decimal}"
+                );
+            }
+            assert!(kind.accepts(b"a") || kind.accepts(b"a.service"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_finite_matcher_meets_exactly_what_it_lists() {
+        assert_eq!(
+            meet(&lit("stop"), &lit("stop")),
+            Meet::Common("stop".into())
+        );
+        assert_eq!(meet(&lit("stop"), &lit("start")), Meet::Disjoint);
+        let verbs = Matcher::OneOf(vec!["Stop".into(), "stop".into()]);
+        assert_eq!(
+            meet(&verbs, &Matcher::Name(NameKind::DebName)),
+            Meet::Common("stop".into())
+        );
+        // Decided even against a pattern, because a finite side can be listed.
+        let digits = Matcher::Pattern(AnchoredPattern::new("[0-9]+").unwrap());
+        assert_eq!(meet(&digits, &verbs), Meet::Disjoint);
+        assert_eq!(meet(&digits, &lit("42")), Meet::Common("42".into()));
+    }
+
+    #[test]
+    fn integer_ranges_meet_at_the_larger_floor_or_not_at_all() {
+        let range = |lo, hi| Matcher::IntRange { lo, hi };
+        assert_eq!(meet(&range(1, 10), &range(5, 20)), Meet::Common("5".into()));
+        assert_eq!(meet(&range(5, 20), &range(1, 10)), Meet::Common("5".into()));
+        assert_eq!(meet(&range(1, 4), &range(5, 9)), Meet::Disjoint);
+        // `parse_i64` cannot produce i64::MIN, so this range accepts nothing.
+        assert_eq!(
+            meet(&range(i64::MIN, i64::MIN), &range(i64::MIN, 0)),
+            Meet::Disjoint
+        );
+        assert_eq!(
+            meet(&range(i64::MIN, -3), &range(-9, 0)),
+            Meet::Common("-9".into())
+        );
+        // Both start at i64::MIN, which no argument parses to: the floor they
+        // share is -i64::MAX, and probing i64::MIN would find nothing.
+        assert_eq!(
+            meet(&range(i64::MIN, -3), &range(i64::MIN, -9)),
+            Meet::Common("-9223372036854775807".into())
+        );
+        // A name never starts with `-`, so only zero and above can be shared.
+        let deb = Matcher::Name(NameKind::DebName);
+        assert_eq!(meet(&range(-5, 5), &deb), Meet::Common("0".into()));
+        assert_eq!(meet(&range(-5, -1), &deb), Meet::Disjoint);
+        assert_eq!(
+            meet(&range(1, 9), &Matcher::Name(NameKind::UnitName)),
+            Meet::Disjoint
+        );
+        let opt = Matcher::PathUnder {
+            prefix: "/opt".into(),
+        };
+        assert_eq!(meet(&range(0, 9), &opt), Meet::Disjoint);
+        assert_eq!(meet(&opt, &range(0, 9)), Meet::Disjoint);
+    }
+
+    #[test]
+    fn path_prefixes_meet_only_when_one_lies_beneath_the_other() {
+        let under = |prefix: &str| Matcher::PathUnder {
+            prefix: prefix.into(),
+        };
+        assert_eq!(
+            meet(&under("/etc"), &under("/etc/nginx")),
+            Meet::Common("/etc/nginx".into())
+        );
+        assert_eq!(meet(&under("/etc"), &under("/var")), Meet::Disjoint);
+        assert_eq!(meet(&under("/etc"), &under("/etcetera")), Meet::Disjoint);
+        // "/" holds every absolute path but itself, so the probe is beneath it.
+        assert_eq!(meet(&under("/"), &under("/")), Meet::Common("/x".into()));
+        // A doubled trailing slash keeps one, so the shared path is under it.
+        assert_eq!(
+            meet(&under("/a"), &under("/a//")),
+            Meet::Common("/a//x".into())
+        );
+        // A prefix with a traversal component accepts nothing.
+        assert_eq!(meet(&under("/a/../b"), &under("/a")), Meet::Disjoint);
+        assert_eq!(
+            meet(&under("/etc"), &Matcher::Name(NameKind::Hostname)),
+            Meet::Disjoint
+        );
+        assert_eq!(
+            meet(&Matcher::Name(NameKind::Hostname), &under("/etc")),
+            Meet::Disjoint
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_decided_is_undecided_rather_than_disjoint() {
+        let pattern = |source| Matcher::Pattern(AnchoredPattern::new(source).unwrap());
+        assert_eq!(
+            meet(&pattern("[a-z]+"), &pattern("[a-z]+")),
+            Meet::Undecided
+        );
+        assert_eq!(
+            meet(&pattern("[0-9]{3}"), &Matcher::Name(NameKind::UnitName)),
+            Meet::Undecided
+        );
+        assert_eq!(
+            meet(&Matcher::IntRange { lo: 1, hi: 9 }, &pattern("x")),
+            Meet::Undecided
+        );
+        // A probe that lands decides it, whatever the types.
+        assert_eq!(
+            meet(&pattern("[a-z]+"), &Matcher::Name(NameKind::DebName)),
+            Meet::Common("a".into())
+        );
+        assert_eq!(
+            meet(
+                &Matcher::Name(NameKind::UnitName),
+                &Matcher::Name(NameKind::SysctlKey)
+            ),
+            Meet::Common("a.service".into())
+        );
+        assert!(format!("{:?}", Meet::Undecided).contains("Undecided"));
     }
 
     #[test]

@@ -141,7 +141,8 @@ fn doctor_succeeds_and_states_that_nothing_is_executed() {
 
 #[test]
 fn check_succeeds_on_the_shipped_ruleset() {
-    // The rules that actually ship, run through the real binary.
+    // The rules that actually ship, run through the real binary: valid, and
+    // no two of them accept the same command.
     let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -151,7 +152,7 @@ fn check_succeeds_on_the_shipped_ruleset() {
         .args(["--rules", shipped.to_str().unwrap(), "check"])
         .assert()
         .success()
-        .stdout(contains("ok:"));
+        .stdout(contains("ok:").and(contains("overlap").not()));
 }
 
 #[test]

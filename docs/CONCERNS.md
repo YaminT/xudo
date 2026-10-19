@@ -4,6 +4,168 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 2b: overlapping rules resolve to the strictest
+
+**The hole.** `best_match`, in the front-end, returned the first permitting
+action in declaration order. Two actions that accept one command with
+different requirements therefore let the sort order of two rule files decide
+whether a human is asked; and since a request names its action, a caller could
+also just name the permissive one. Nothing executed, so it was a wrong answer
+from `explain`, but the broker and the gate were about to inherit it.
+
+**What exists now.**
+
+- **A requirement belongs to the command, not to the name it is asked under.**
+  `aido_policy::evaluate` gathers every action that runs the same program,
+  byte for byte, and accepts the canonical operands, the named one included.
+  If any of them is human-only, an enrolled agent is refused; otherwise the
+  confirmation is the strictest any of them demands. Because `evaluate` itself
+  does this, the gate, which re-decides the action a spool entry names,
+  inherits it with no change of its own, and naming a permissive duplicate
+  gains nothing (`an_entry_naming_a_permissive_duplicate_still_needs_the_stricter_confirmation`).
+- **`aido_policy::evaluate_command`** asks the same question of a command that
+  names no action, and replaces `best_match`, so the front-end no longer
+  decides which rule governs a command. **The broker (step 2) and `aido exec`
+  (step 3) must call it, or `evaluate` with the named action, and never iterate
+  the actions themselves**: a second search is a second chance to get this
+  wrong.
+- **Strictness is a total order**, ranked by what it takes to lift:
+  critical tier, then `confirm = "always"`, then the agent setting, then none
+  (`ConfirmReason::strictness`). Two different reasons never tie, so the
+  requirement *and its reason* are independent of declaration order; only the
+  cited action can differ between equally strict ones.
+- **Which action a decision cites:** the one whose requirement it carries.
+  Among equals, the action asked for, or, when none was, the first declared.
+  The brief said declaration order breaks ties; for a request that names an
+  action, the named one wins instead, so a decision only cites something other
+  than what was asked when another rule is strictly stricter. Denials still
+  cite no action, as before; the trace names every accepting action, and for a
+  human-only refusal reached through an overlap it names the rule that
+  reserved the command.
+- **`RuleSet::overlaps`** (new module `aido-policy::overlap`) lists every pair
+  of actions that can accept one command, and `aido check` prints it. Each pair
+  of positions is intersected by probing: candidate arguments from both
+  matchers, tried through the engine's own `Matcher::accepts`. A shared probe
+  is a certain meet. No shared probe is *disjoint* only where an argument
+  proves the probes complete — any literal or enumeration, two ranges, a range
+  against a name kind or a path, two path prefixes, a path against a name kind
+  (`matcher::exhausts`, one argument per arm, and
+  `name_kinds_hold_what_overlap_detection_relies_on` pins the three facts about
+  name kinds those arguments use). Anything else — a pattern, two name kinds
+  that share no representative — is *undecided* and reported as a possible
+  overlap. The argument lists are then run as two automata in step, a
+  breadth-first search over pairs of states; a pair with more than 2^18 states
+  is reported as possible rather than searched. A certain overlap carries a
+  witness, re-checked with `match_argv` and in canonical form; a witness that
+  is not canonical (it ends in a bare `--`) downgrades to possible.
+- **`check` reports overlaps and still exits 0**: the engine resolves them
+  safely, and an operator's broad-plus-narrow pair can be deliberate. The
+  shipped rules have none, decided exactly (they use no pattern), and
+  `the_shipped_rules_overlap_only_where_a_reason_is_written_down` fails on any
+  undeclared one; `DELIBERATE_OVERLAPS` beside it is empty and refuses a thin
+  or stale entry, the way the GTFOBins waivers do.
+- No last-match-wins and no negation. The design plan's line saying otherwise
+  now has a deviation entry.
+
+**Standing properties**, in `tests/invariants.rs`, never to be deleted:
+`adding_a_rule_never_removes_a_confirmation` (nor lifts a human-only
+reservation or a deny-list hit, searched or asked under every name, with the
+new rule inserted anywhere in declaration order) and its twin
+`rule_order_never_changes_whether_a_confirmation_is_demanded`; with them,
+`naming_an_overlapping_action_never_weakens_the_decision`,
+`deny_list_always_wins_over_every_overlapping_rule`, and three for the report
+having no false negatives. Adversarial examples through real rule files:
+`a_later_permissive_duplicate_cannot_weaken_an_earlier_confirming_rule`, its
+mirror, `reordering_rule_files_cannot_drop_a_confirmation`,
+`naming_the_permissive_duplicate_cannot_skip_the_confirmation`,
+`a_permissive_duplicate_cannot_hand_a_human_only_command_to_an_agent`.
+
+**The tests were mutated to prove they bite.** Five mutants, each killed:
+first-match citation, human-only checked on the named action only, patterns
+called disjoint, the path-beneath-prefix probe removed, and the range floor at
+the unparseable `i64::MIN`. Two of them first survived. The adding-a-rule
+property appended the new rule at the end, where first-match never lets it
+win, so it now inserts anywhere; and the report properties' vocabulary rarely
+paired matchers that overlap without sharing a probe, so it gained such
+patterns, a single-position property, and a parametric one over awkward range
+bounds and path prefixes. The minimal counterexamples are kept in
+`invariants.proptest-regressions`, so those regressions fail deterministically.
+
+**Contract snapshots.** No existing decision record or rendering changed: all
+24 render snapshots and both contract snapshots are byte-identical. New pinned
+surfaces: the two shapes overlaps add (a confirmation decided by a stricter
+action than the one named; an agent refused through an overlapping human-only
+action), the overlap report, and `check` with overlaps. Three things `explain`
+without `--action` now says differently, none pinned before: a refusal lists
+every same-program rule's reason, not the first; a command no rule runs gets a
+full record naming the program, where the front-end printed an empty one; and
+a frozen agent with an empty ruleset reads `frozen`, not `unknown_action`.
+`ci/differential/expected/verdicts.txt` is unaffected: every verdict, denial,
+and action field is the same.
+
+**Outside the step, needed to run the gate here.**
+`a_rule_file_that_is_a_link_a_directory_or_a_socket_is_refused` bound a socket
+at a path spelled through `crates/aido-sys/../..`, 128 bytes in a git worktree
+against macOS's 104-byte `sun_path`. It now binds the same file by a path
+relative to the package directory. Every worktree hits this.
+
+**What review should look at.** The `exhausts` arms, since a wrong `true`
+there is an overlap `check` stays silent about. The decision to extend
+"strictest" from confirmation to human-only. Whether CI should be able to fail
+on overlaps (`check --deny-overlaps`), which is not built.
+
+**Open.**
+
+1. **One program, two names.** The engine compares a rule's program byte for
+   byte, so rules for `/bin/systemctl` and `/usr/bin/systemctl` never overlap
+   in its terms — yet on merged-`/usr` they are one file, and the caller picks
+   the spelling and so the rule. The pure crate cannot see it; `check` or the
+   gate could compare `(st_dev, st_ino)` of every rule's program.
+2. **`env_allow` is parsed and used nowhere.** When the gate builds a child
+   environment from it, overlapping actions must intersect their lists, or a
+   caller names the duplicate with the widest one.
+3. ~~The gate's `Approved` and its authorization record cite the action the
+   entry named.~~ Fixed after review, below.
+4. Resolution is per command. A broad rule still grants commands a narrow one
+   never accepts — removing `gcc make` together, when the narrow rule accepts
+   one package (`the_strictest_rule_binds_the_commands_it_accepts_and_no_others`).
+   That is what an allowlist is; the overlap report is how an operator finds it.
+5. A pattern against a pattern is always *possible*. Exact would need
+   automaton intersection; not worth it until a shipped rule uses a pattern.
+6. ~~`CLAUDE.md`'s list of standing invariants should name the new one.~~
+   Added at the merge, with its order twin.
+7. Seen, not changed: a denial after the program check (`argv_rejected`,
+   `human_path_only`, `deny_listed`) carries no `resolved_exe`, so its rendered
+   command omits the program, against what `Decision::resolved_exe` promises.
+   The existing snapshots pin it that way; changing it is a deliberate
+   snapshot change of its own.
+
+**What review found** (an independent pass over the recovered branch, both
+reproduced before fixing):
+
+- **A critical rule could lose its critical rank.** The engine asked "does the
+  rule say `always`?" before "is it critical?", so a critical action that also
+  said `always` reported an ordinary rule requirement, tied with an ordinary
+  always-confirming duplicate, and was cited in its place. Confirmation was
+  still demanded, but with the wrong reason and the wrong rule. The tier is now
+  checked first. `a_critical_rule_outranks_an_ordinary_always_rule_whatever_its_own_confirm_says`
+  covers critical with and without `always`, four declaration orders, both
+  callers, searched and named — including naming the duplicate that never asks
+  — and fails on the old order.
+- **The gate's record cited the permissive rule.** `Approved` took its action
+  and provenance from the entry's named action, so an authorization that a
+  stricter rule's confirmation had made necessary was recorded against the
+  rule that asks for nothing. `Approved` now carries the governing action (the
+  one the decision cites) and the requested one; the authorization record cites
+  the governing rule and records the requested one as evidence when they
+  differ.
+
+Accepted as a deliberate deviation from the brief: on equal strictness a named
+request keeps the action it named, rather than the earliest in declaration
+order. It changes which rule is cited, never what is demanded.
+
+---
+
 ## 2026-10-19 — M2b step 1: `aido-sys-raw`, and what review found
 
 The workspace's only `unsafe`: four system calls, five blocks, in a crate of

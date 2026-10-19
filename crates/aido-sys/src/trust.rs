@@ -1053,7 +1053,18 @@ mod tests {
                     std::os::unix::fs::symlink(dir.join("real"), &target).unwrap();
                 }
                 "dir" => std::fs::create_dir(&target).unwrap(),
-                _ => drop(std::os::unix::net::UnixListener::bind(&target).unwrap()),
+                // `sun_path` holds 104 bytes on macOS, and `target` spelled
+                // through `crates/aido-sys/../..` under a deep checkout — a
+                // git worktree — is longer. Cargo runs tests from the package
+                // directory, so the same file is bound by a relative path.
+                _ => drop(
+                    std::os::unix::net::UnixListener::bind(
+                        Path::new("../../target/test-tmp")
+                            .join(format!("tw-shape-{shape}"))
+                            .join("10-x.toml"),
+                    )
+                    .unwrap(),
+                ),
             }
             let me = std::fs::metadata(&dir).unwrap().uid();
             let err = read_toml_at(open_dir(&dir).as_fd(), &dir, me).unwrap_err();

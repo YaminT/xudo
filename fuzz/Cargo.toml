@@ -11,6 +11,8 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 aido-policy = { path = "../crates/aido-policy" }

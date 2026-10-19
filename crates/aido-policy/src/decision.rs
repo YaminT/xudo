@@ -83,6 +83,24 @@ impl ConfirmReason {
             Self::CriticalTier => "the matched rule is in a critical tier",
         }
     }
+
+    /// How hard the requirement is to lift, for choosing among overlapping
+    /// actions.
+    ///
+    /// When several actions accept one command, the decision carries the
+    /// strictest requirement among them (see [`crate::engine`]). Ranked by what
+    /// it would take to remove: no rule-level setting removes a critical tier's
+    /// confirmation; a rule that always confirms binds every caller whatever
+    /// the settings say; the agent-path confirmation follows a global setting.
+    /// A total order with no ties between reasons, so the requirement a
+    /// decision carries never depends on the order rules were declared in.
+    pub(crate) fn strictness(self) -> u8 {
+        match self {
+            Self::AgentActionsConfirmed => 1,
+            Self::RuleRequiresConfirmation => 2,
+            Self::CriticalTier => 3,
+        }
+    }
 }
 
 /// A stable, append-only denial code.
@@ -544,6 +562,20 @@ mod tests {
             );
             assert!(format!("{reason:?}").len() > 3);
         }
+    }
+
+    #[test]
+    fn confirmation_reasons_rank_by_how_hard_they_are_to_lift() {
+        // A total order: two different reasons never tie, so which requirement
+        // a decision over overlapping actions carries cannot depend on which
+        // of them was declared first.
+        let ranked = [
+            ConfirmReason::AgentActionsConfirmed,
+            ConfirmReason::RuleRequiresConfirmation,
+            ConfirmReason::CriticalTier,
+        ]
+        .map(ConfirmReason::strictness);
+        assert_eq!(ranked, [1, 2, 3]);
     }
 
     #[test]

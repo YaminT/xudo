@@ -11,6 +11,7 @@
 > - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
 > - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.
 > - Canonicalization does not split `--key=value`; fuzzing killed that in M1.
+> - Overlapping actions resolve to the strictest, not last-match-wins: every action that accepts a command contributes its requirement — any human-only one refuses an agent, the strongest confirmation applies — and `aido check` reports every pair that can overlap. There is no negation; it widens by reordering (2026-10-19).
 > - `/run/aido` is `0755`, not `0700`: a `0700` directory would put `broker.sock` out of every user's reach. The socket is `0660 root:aido`; `req/` and `sessions/` are the `0700` directories (2026-10-16).
 > - The policy generation is a framed SHA-256 over the rule files, computed by one function (`aido_policy::load_rule_files`) for the front-end, the broker, and the gate. Not yet the install-time counter described below (2026-10-16).
 > - Attestation on kernels before 6.5 is a ladder (`aido-sys::kernel`), not a single fallback.

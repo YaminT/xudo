@@ -2,13 +2,20 @@
 //!
 //! ```text
 //! canonicalize argv
+//!   -> frozen agent path               (agent, frozen   -> deny)
 //!   -> look up the named action        (unknown action  -> deny)
+//!   -> compare the program             (exe mismatch    -> deny)
 //!   -> match the typed argument list   (argv rejected   -> deny)
-//!   -> agent-path eligibility          (human-only      -> deny)
+//!   -> gather every action that accepts the same command
+//!   -> agent-path eligibility          (any human-only  -> deny)
 //!   -> COMPILED-IN DENY-LIST           (any class hit   -> deny)
-//!   -> confirmation requirement        (required        -> allow-with-confirmation)
+//!   -> confirmation requirement        (the strictest   -> allow-with-confirmation)
 //!   -> allow
 //! ```
+//!
+//! [`evaluate_command`] is the same pipeline for a command that names no
+//! action: it gathers every action that runs the program and accepts the
+//! arguments, and decides over all of them.
 //!
 //! # Why the deny-list runs last
 //!
@@ -21,7 +28,37 @@
 //! its verdict cannot be reached by any other path.
 //!
 //! It is also why *deny always wins*: there is no branch in which a matched
-//! allow rule causes the deny-list to be skipped.
+//! allow rule causes the deny-list to be skipped, and overlapping actions do
+//! not change that — every action that accepts a command names the same
+//! program and accepts the same arguments, so the deny-list sees one tuple
+//! whichever of them the command was asked under.
+//!
+//! # Overlapping actions resolve to the strictest
+//!
+//! Two actions can accept the same command: a broad rule and a narrow one, or
+//! one rule file repeating another. A requirement belongs to the command, not
+//! to the name it was asked under. The caller chooses which action to name, so
+//! a requirement that bound only the named action would let the caller pick
+//! the weakest rule; and a search that stopped at the first permitting action
+//! would let the sort order of two file names decide whether a human is asked.
+//! So every action that accepts the command contributes:
+//!
+//! * if any of them is human-only, an enrolled agent is refused;
+//! * the confirmation requirement is the strictest any of them demands, ranked
+//!   by what it takes to lift: a critical tier, then a rule that always
+//!   confirms, then the agent-path setting, then none.
+//!
+//! Adding a rule can grant a command that no rule accepted before; for a
+//! command some rule already accepts, it can only make the answer stricter.
+//! Reordering rules changes nothing but which of two equally strict actions a
+//! decision cites. Both are standing properties in `tests/invariants.rs`.
+//!
+//! A permitted decision cites the action whose requirement it carries. Among
+//! actions that tie, it cites the one that was asked for, or, when none was,
+//! the first in declaration order.
+//!
+//! There is no last-match-wins and no negation: a negated rule is a way to
+//! widen by reordering, which is what this resolution exists to rule out.
 
 use crate::argv::{Arg, Argv};
 use crate::caller::CallerFacts;
@@ -30,7 +67,7 @@ use crate::decision::{
 };
 use crate::deny::{deny_list_version, evaluate_deny_list};
 use crate::matcher::match_argv;
-use crate::rule::{ActionId, ConfirmPolicy, RuleSet};
+use crate::rule::{Action, ActionId, ConfirmPolicy, RuleSet};
 
 /// A request to evaluate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,38 +135,36 @@ impl Default for Settings {
     }
 }
 
-/// Evaluates a request. The whole crate exists to implement this function.
+/// Evaluates a request that names an action. The whole crate exists to
+/// implement this function and [`evaluate_command`].
 ///
 /// Every path through it either returns [`Verdict::Deny`] or has explicitly
 /// established that the action is allowlisted, its arguments fit a typed
-/// matcher, the caller is eligible, and no deny-list class matched.
+/// matcher, the caller is eligible under every action that accepts the same
+/// command, and no deny-list class matched.
+///
+/// The named action must accept the command itself; every other action that
+/// accepts it contributes its requirement too (see the [module
+/// documentation](crate::engine)), so naming a more permissive duplicate gains
+/// nothing.
 pub fn evaluate(
     rules: &RuleSet,
     caller: &CallerFacts,
     request: &Request,
     settings: Settings,
 ) -> Decision {
-    let canonical = request.argv.canonicalize();
-    let resolved_argv: Vec<String> = canonical.as_slice().iter().map(Arg::display).collect();
+    let mut run = Run::start(caller, settings, &request.argv);
 
-    let mut trace = vec![TraceStep::Canonicalized {
-        before: request.argv.display(),
-        after: canonical.display(),
-    }];
-
-    // A frozen agent path denies before anything else is considered, so that
-    // freezing is instant and cannot be raced by a request already in flight.
-    // The human path stays open: an operator must always be able to recover.
-    if settings.frozen && caller.classification.is_enrolled_agent() {
-        return Decision::deny(DenialCode::Frozen, resolved_argv, trace);
+    if run.frozen_out() {
+        return run.deny(DenialCode::Frozen);
     }
 
     let Some(action) = rules.get(&request.action) else {
-        trace.push(TraceStep::ActionRejected {
+        run.trace.push(TraceStep::ActionRejected {
             action: request.action.to_string(),
             reason: "no action with this id is defined in the ruleset".to_owned(),
         });
-        return Decision::deny(DenialCode::UnknownAction, resolved_argv, trace);
+        return run.deny(DenialCode::UnknownAction);
     };
 
     // The program is checked before the arguments. A caller asking to run
@@ -141,88 +176,282 @@ pub fn evaluate(
     if let Some(requested_exe) = &request.exe
         && requested_exe.as_bytes() != action.exe.as_bytes()
     {
-        trace.push(TraceStep::ActionRejected {
+        run.trace.push(TraceStep::ActionRejected {
             action: action.id.to_string(),
             reason: format!("this action runs {}, not the requested program", action.exe),
         });
-        return Decision::deny(DenialCode::ExeMismatch, resolved_argv, trace)
+        return run
+            .deny(DenialCode::ExeMismatch)
             .about_program(requested_exe.display());
     }
 
-    if let Err(err) = match_argv(&action.args, &canonical) {
-        trace.push(TraceStep::ActionRejected {
+    if let Err(err) = match_argv(&action.args, &run.canonical) {
+        run.trace.push(TraceStep::ActionRejected {
             action: action.id.to_string(),
             reason: err.to_string(),
         });
-        return Decision::deny(DenialCode::ArgvRejected, resolved_argv, trace);
+        return run.deny(DenialCode::ArgvRejected);
     }
 
-    trace.push(TraceStep::ActionMatched {
-        action: action.id.to_string(),
-        source: action.source.to_string(),
-    });
+    let accepting = run.accepting(rules, action.exe.as_bytes());
+    run.settle(action, &accepting)
+}
 
-    if !action.agent_allowed && caller.classification.is_enrolled_agent() {
-        return Decision::deny(DenialCode::HumanPathOnly, resolved_argv, trace);
+/// Evaluates a command against every action in the ruleset, without naming
+/// one.
+///
+/// What `aido explain` asks when no `--action` is given, and what anything
+/// holding only a command line must ask. Every action that runs `program`,
+/// byte for byte, and accepts `argv` takes part; the decision is the strictest
+/// they reach together, and cites the action whose requirement it carries, the
+/// first in declaration order among equals.
+///
+/// When none accepts the command, the refusal says why: every action that runs
+/// the program is listed in the trace with the reason it refused, and when no
+/// action runs it at all the decision names the program, because there is no
+/// rule to cite instead.
+pub fn evaluate_command(
+    rules: &RuleSet,
+    caller: &CallerFacts,
+    program: &Arg,
+    argv: &Argv,
+    settings: Settings,
+) -> Decision {
+    let mut run = Run::start(caller, settings, argv);
+
+    if run.frozen_out() {
+        return run.deny(DenialCode::Frozen);
     }
 
-    // The deny-list sees the exact tuple that would be executed.
-    let findings = evaluate_deny_list(action.exe.as_bytes(), &canonical);
-    trace.push(TraceStep::DenyListEvaluated {
-        version: deny_list_version(),
-        matched: findings
+    let accepting = run.accepting(rules, program.as_bytes());
+    if let Some((first, _)) = accepting.split_first() {
+        return run.settle(first, &accepting);
+    }
+
+    let refusals = run.refusals(rules, program.as_bytes());
+    if refusals.is_empty() {
+        return run
+            .deny(DenialCode::UnknownAction)
+            .about_program(program.display());
+    }
+    run.trace.extend(refusals);
+    run.deny(DenialCode::ArgvRejected)
+}
+
+/// One evaluation in progress: who is asking, the command's operands in
+/// canonical form, and the trace so far.
+struct Run<'c> {
+    caller: &'c CallerFacts,
+    settings: Settings,
+    canonical: Argv,
+    trace: Vec<TraceStep>,
+}
+
+impl<'c> Run<'c> {
+    /// Canonicalizes the operands, once, and opens the trace with it.
+    fn start(caller: &'c CallerFacts, settings: Settings, argv: &Argv) -> Self {
+        let canonical = argv.canonicalize();
+        let trace = vec![TraceStep::Canonicalized {
+            before: argv.display(),
+            after: canonical.display(),
+        }];
+        Self {
+            caller,
+            settings,
+            canonical,
+            trace,
+        }
+    }
+
+    /// Whether a freeze refuses this caller before anything else is
+    /// considered.
+    ///
+    /// A frozen agent path denies first, so that freezing is instant and
+    /// cannot be raced by a request already in flight. The human path stays
+    /// open: an operator must always be able to recover.
+    fn frozen_out(&self) -> bool {
+        self.settings.frozen && self.caller.classification.is_enrolled_agent()
+    }
+
+    /// The canonical operands, rendered for the decision record.
+    fn resolved_argv(&self) -> Vec<String> {
+        self.canonical.as_slice().iter().map(Arg::display).collect()
+    }
+
+    /// Ends the evaluation with a refusal.
+    fn deny(self, code: DenialCode) -> Decision {
+        Decision::deny(code, self.resolved_argv(), self.trace)
+    }
+
+    /// Every action that runs `exe` and accepts the operands, in declaration
+    /// order.
+    fn accepting<'r>(&self, rules: &'r RuleSet, exe: &[u8]) -> Vec<&'r Action> {
+        rules
+            .actions()
             .iter()
-            .map(|f| format!("{:?}: {}", f.class, f.evidence))
-            .collect(),
-    });
-    if !findings.is_empty() {
-        return Decision::deny(DenialCode::DenyListed, resolved_argv, trace);
+            .filter(|action| {
+                action.exe.as_bytes() == exe && match_argv(&action.args, &self.canonical).is_ok()
+            })
+            .collect()
     }
 
-    let confirm_reason = if action.confirm == ConfirmPolicy::Always {
-        Some(ConfirmReason::RuleRequiresConfirmation)
-    } else if action.tier.always_confirms() {
-        // A critical tier confirms even when the rule asked not to. `RuleSet`
-        // refuses that combination at load time; this is the second, redundant
-        // check, because a tier promise that depends on the loader having run
-        // is not a promise.
+    /// Why each action that runs `exe` refuses the operands, in declaration
+    /// order. Asked only when none accepts them.
+    fn refusals(&self, rules: &RuleSet, exe: &[u8]) -> Vec<TraceStep> {
+        rules
+            .actions()
+            .iter()
+            .filter(|action| action.exe.as_bytes() == exe)
+            .filter_map(|action| {
+                match_argv(&action.args, &self.canonical).err().map(|err| {
+                    TraceStep::ActionRejected {
+                        action: action.id.to_string(),
+                        reason: err.to_string(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Decides over every action that accepts the command.
+    ///
+    /// `accepting` is in declaration order and includes `seed`, the action
+    /// that wins a tie: the one asked for, or the first that accepts.
+    fn settle(mut self, seed: &Action, accepting: &[&Action]) -> Decision {
+        for action in accepting {
+            self.trace.push(TraceStep::ActionMatched {
+                action: action.id.to_string(),
+                source: action.source.to_string(),
+            });
+        }
+
+        // Human-only binds the command: when any action that accepts it is
+        // reserved for a person, no other action can hand it to an agent.
+        if self.caller.classification.is_enrolled_agent()
+            && let Some(reserving) = accepting.iter().find(|action| !action.agent_allowed)
+        {
+            for other in accepting.iter().filter(|action| action.agent_allowed) {
+                self.trace.push(TraceStep::ActionRejected {
+                    action: other.id.to_string(),
+                    reason: format!(
+                        "{} at {} accepts this command too and reserves it for the human path",
+                        reserving.id, reserving.source
+                    ),
+                });
+            }
+            return self.deny(DenialCode::HumanPathOnly);
+        }
+
+        // The deny-list sees the exact tuple that would be executed: every
+        // accepting action names the same program as `seed`.
+        let findings = evaluate_deny_list(seed.exe.as_bytes(), &self.canonical);
+        self.trace.push(TraceStep::DenyListEvaluated {
+            version: deny_list_version(),
+            matched: findings
+                .iter()
+                .map(|f| format!("{:?}: {}", f.class, f.evidence))
+                .collect(),
+        });
+        if !findings.is_empty() {
+            return self.deny(DenialCode::DenyListed);
+        }
+
+        let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
+        self.trace.push(TraceStep::ConfirmationDecided {
+            required: reason.is_some(),
+            reason: confirmation_text(reason, accepting.len()),
+        });
+
+        let (verdict, confirm) = match reason {
+            Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
+            None => (Verdict::Allow, Confirm::NotRequired),
+        };
+
+        Decision {
+            schema_version: ENVELOPE_SCHEMA_VERSION,
+            verdict,
+            denial: None,
+            remediation: None,
+            action: Some(cited.id.clone()),
+            rule_source: Some(cited.source.clone()),
+            // The rule's own program, not the caller's spelling of it. They are
+            // byte-identical by the time execution is permitted — the program
+            // check guarantees it — and taking the rule's copy means an allowed
+            // decision records the path policy authorised rather than the one
+            // that was typed.
+            resolved_exe: Some(cited.exe.clone()),
+            resolved_argv: self.resolved_argv(),
+            confirm,
+            trace: self.trace,
+        }
+    }
+}
+
+/// What one action demands before it runs a command for this caller,
+/// considered on its own.
+fn confirmation_for(
+    action: &Action,
+    caller: &CallerFacts,
+    settings: Settings,
+) -> Option<ConfirmReason> {
+    if action.tier.always_confirms() {
+        // Checked first, so a critical action reports the critical reason
+        // whatever its own `confirm` says: with `always`, ranking it as an
+        // ordinary always-confirming rule would let an ordinary duplicate tie
+        // with it and be cited instead. And it confirms even when the rule
+        // asked not to — `RuleSet` refuses that at load time, and this is the
+        // second check, because a tier promise that depends on the loader
+        // having run is not a promise.
         Some(ConfirmReason::CriticalTier)
+    } else if action.confirm == ConfirmPolicy::Always {
+        Some(ConfirmReason::RuleRequiresConfirmation)
     } else if action.confirm == ConfirmPolicy::Never {
         None
     } else if caller.classification.is_enrolled_agent() && settings.confirm_agent_actions {
         Some(ConfirmReason::AgentActionsConfirmed)
     } else {
         None
-    };
+    }
+}
 
-    trace.push(TraceStep::ConfirmationDecided {
-        required: confirm_reason.is_some(),
-        reason: confirm_reason.map_or_else(
-            || "no confirmation requirement applies".to_owned(),
-            |r| r.explain().to_owned(),
+/// The action whose requirement is strictest, and that requirement.
+///
+/// A candidate replaces the current choice only when strictly stricter, and
+/// the fold starts from `seed` and walks declaration order, so a tie cites the
+/// action asked for, or else the earliest.
+fn strictest<'a>(
+    seed: &'a Action,
+    accepting: &[&'a Action],
+    caller: &CallerFacts,
+    settings: Settings,
+) -> (&'a Action, Option<ConfirmReason>) {
+    let rank = |reason: Option<ConfirmReason>| reason.map_or(0, ConfirmReason::strictness);
+    accepting.iter().fold(
+        (seed, confirmation_for(seed, caller, settings)),
+        |(cited, reason), &action| {
+            let candidate = confirmation_for(action, caller, settings);
+            if rank(candidate) > rank(reason) {
+                (action, candidate)
+            } else {
+                (cited, reason)
+            }
+        },
+    )
+}
+
+/// The trace's account of the requirement, which says so when more than one
+/// action accepted the command.
+fn confirmation_text(reason: Option<ConfirmReason>, accepting: usize) -> String {
+    match (reason, accepting) {
+        (Some(reason), 1) => reason.explain().to_owned(),
+        (None, 1) => "no confirmation requirement applies".to_owned(),
+        (Some(reason), count) => format!(
+            "{}; the strictest requirement among the {count} actions that accept this command",
+            reason.explain()
         ),
-    });
-
-    let (verdict, confirm) = match confirm_reason {
-        Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
-        None => (Verdict::Allow, Confirm::NotRequired),
-    };
-
-    Decision {
-        schema_version: ENVELOPE_SCHEMA_VERSION,
-        verdict,
-        denial: None,
-        remediation: None,
-        action: Some(action.id.clone()),
-        rule_source: Some(action.source.clone()),
-        // The rule's own program, not the caller's spelling of it. They are
-        // byte-identical by the time execution is permitted — the check above
-        // guarantees it — and taking the rule's copy means an allowed decision
-        // records the path policy authorised rather than the one that was typed.
-        resolved_exe: Some(action.exe.clone()),
-        resolved_argv,
-        confirm,
-        trace,
+        (None, count) => {
+            format!("none of the {count} actions that accept this command requires confirmation")
+        }
     }
 }
 
@@ -730,5 +959,372 @@ mod tests {
             evaluate(&rules(), &unattested, &restart_request(), frozen).verdict,
             Verdict::Allow
         );
+    }
+
+    // --- overlapping actions resolve to the strictest -----------------------
+
+    /// `apt-get -y remove <pkg>`, demanding nothing beyond the agent setting.
+    fn remove(id: &str, line: u32) -> Action {
+        Action {
+            id: ActionId::new(id),
+            tier: Tier::PkgRemove,
+            exe: "/usr/bin/apt-get".into(),
+            args: vec![
+                ArgSpec::one("y", Matcher::Literal("-y".into())),
+                ArgSpec::one("verb", Matcher::Literal("remove".into())),
+                ArgSpec::one("pkg", Matcher::Name(NameKind::DebName)),
+            ],
+            confirm: ConfirmPolicy::Default,
+            agent_allowed: true,
+            env_allow: Vec::new(),
+            source: Source::new("30-packages.toml", line),
+        }
+    }
+
+    /// The same command, under a rule that always confirms.
+    fn confirming_remove(id: &str, line: u32) -> Action {
+        Action {
+            confirm: ConfirmPolicy::Always,
+            ..remove(id, line)
+        }
+    }
+
+    fn apt_get() -> Arg {
+        Arg::from("/usr/bin/apt-get")
+    }
+
+    fn remove_ripgrep() -> Argv {
+        Argv::new(["-y", "remove", "ripgrep"])
+    }
+
+    fn matched_ids(decision: &Decision) -> Vec<String> {
+        decision
+            .trace
+            .iter()
+            .filter_map(|step| match step {
+                TraceStep::ActionMatched { action, .. } => Some(action.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn confirmation_reason(decision: &Decision) -> String {
+        decision
+            .trace
+            .iter()
+            .filter_map(|step| match step {
+                TraceStep::ConfirmationDecided { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_later_permissive_duplicate_cannot_weaken_an_earlier_confirming_rule() {
+        // The hole this resolution closes. With the first permitting action
+        // winning, whichever of these two was declared first decided whether a
+        // human was asked; now both orders demand the confirmation, and cite
+        // the rule that demands it.
+        for declared in [
+            vec![
+                confirming_remove("aido.pkg.remove", 3),
+                remove("aido.pkg.remove-quiet", 9),
+            ],
+            vec![
+                remove("aido.pkg.remove-quiet", 3),
+                confirming_remove("aido.pkg.remove", 9),
+            ],
+        ] {
+            let set = RuleSet::load(declared).unwrap();
+            let d = evaluate_command(
+                &set,
+                &human(),
+                &apt_get(),
+                &remove_ripgrep(),
+                Settings::default(),
+            );
+            assert_eq!(d.verdict, Verdict::AllowWithConfirmation);
+            assert_eq!(
+                d.confirm,
+                Confirm::Required {
+                    reason: ConfirmReason::RuleRequiresConfirmation
+                }
+            );
+            assert_eq!(d.action, Some(ActionId::new("aido.pkg.remove")));
+            assert_eq!(d.resolved_exe.as_deref(), Some("/usr/bin/apt-get"));
+            // Both actions are on the record, and the trace says why the
+            // stricter one decided.
+            assert_eq!(matched_ids(&d).len(), 2, "{:?}", d.trace);
+            assert!(
+                confirmation_reason(&d).contains("strictest requirement among the 2 actions"),
+                "{:?}",
+                d.trace
+            );
+        }
+    }
+
+    #[test]
+    fn naming_the_permissive_duplicate_cannot_skip_the_confirmation() {
+        // The caller chooses which action to name. A requirement that bound
+        // only the named action would let it name the weakest one.
+        let set = RuleSet::load(vec![
+            confirming_remove("aido.pkg.remove", 3),
+            remove("aido.pkg.remove-quiet", 9),
+        ])
+        .unwrap();
+        let d = evaluate(
+            &set,
+            &human(),
+            &Request::for_program("aido.pkg.remove-quiet", apt_get(), remove_ripgrep()),
+            Settings::default(),
+        );
+        assert_eq!(d.verdict, Verdict::AllowWithConfirmation);
+        // Cited: the rule whose requirement the decision carries, not the one
+        // that was named, so the human approving sees why they were asked.
+        assert_eq!(d.action, Some(ActionId::new("aido.pkg.remove")));
+        assert_eq!(
+            d.rule_source.as_ref().map(ToString::to_string),
+            Some("30-packages.toml:3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_permissive_duplicate_cannot_hand_a_human_only_command_to_an_agent() {
+        let reserved = Action {
+            agent_allowed: false,
+            ..remove("aido.pkg.remove-by-hand", 3)
+        };
+        let set = RuleSet::load(vec![reserved, remove("aido.pkg.remove-quiet", 9)]).unwrap();
+        let named = evaluate(
+            &set,
+            &agent(),
+            &Request::for_program("aido.pkg.remove-quiet", apt_get(), remove_ripgrep()),
+            Settings::default(),
+        );
+        let searched = evaluate_command(
+            &set,
+            &agent(),
+            &apt_get(),
+            &remove_ripgrep(),
+            Settings::default(),
+        );
+        for d in [&named, &searched] {
+            assert_eq!(d.denial, Some(DenialCode::HumanPathOnly));
+            // The permissive duplicate is set aside by name, with the rule
+            // that reserved the command, so an operator can see which one did.
+            let set_aside = d.trace.iter().any(|step| {
+                matches!(
+                    step,
+                    TraceStep::ActionRejected { action, reason }
+                        if action == "aido.pkg.remove-quiet"
+                            && reason.contains("aido.pkg.remove-by-hand at 30-packages.toml:3")
+                )
+            });
+            assert!(set_aside, "{:?}", d.trace);
+        }
+        // Misclassification may only withhold: a person is still served.
+        let person = evaluate_command(
+            &set,
+            &human(),
+            &apt_get(),
+            &remove_ripgrep(),
+            Settings::default(),
+        );
+        assert_eq!(person.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn the_hardest_requirement_to_lift_wins_whatever_the_order() {
+        let critical = Action {
+            tier: Tier::Critical,
+            ..remove("aido.pkg.remove-critical", 5)
+        };
+        for declared in [
+            vec![
+                remove("aido.pkg.remove", 1),
+                confirming_remove("aido.pkg.remove-always", 3),
+                critical.clone(),
+            ],
+            vec![
+                critical.clone(),
+                confirming_remove("aido.pkg.remove-always", 3),
+                remove("aido.pkg.remove", 1),
+            ],
+        ] {
+            let set = RuleSet::load(declared).unwrap();
+            let d = evaluate_command(
+                &set,
+                &agent(),
+                &apt_get(),
+                &remove_ripgrep(),
+                Settings::default(),
+            );
+            assert_eq!(
+                d.confirm,
+                Confirm::Required {
+                    reason: ConfirmReason::CriticalTier
+                }
+            );
+            assert_eq!(d.action, Some(ActionId::new("aido.pkg.remove-critical")));
+        }
+    }
+
+    #[test]
+    fn a_tie_cites_the_named_action_or_else_the_first_declared() {
+        let set = RuleSet::load(vec![
+            remove("aido.pkg.remove", 3),
+            remove("aido.pkg.remove-again", 9),
+        ])
+        .unwrap();
+        let searched = evaluate_command(
+            &set,
+            &agent(),
+            &apt_get(),
+            &remove_ripgrep(),
+            Settings::default(),
+        );
+        assert_eq!(searched.action, Some(ActionId::new("aido.pkg.remove")));
+        let named = evaluate(
+            &set,
+            &agent(),
+            &Request::for_program("aido.pkg.remove-again", apt_get(), remove_ripgrep()),
+            Settings::default(),
+        );
+        assert_eq!(named.action, Some(ActionId::new("aido.pkg.remove-again")));
+        // A tie is a tie: the requirement is the same either way.
+        assert_eq!(searched.confirm, named.confirm);
+        assert_eq!(searched.verdict, Verdict::AllowWithConfirmation);
+    }
+
+    #[test]
+    fn overlapping_actions_that_demand_nothing_say_so() {
+        let set = RuleSet::load(vec![
+            remove("aido.pkg.remove", 3),
+            remove("aido.pkg.remove-again", 9),
+        ])
+        .unwrap();
+        let d = evaluate_command(
+            &set,
+            &human(),
+            &apt_get(),
+            &remove_ripgrep(),
+            Settings::default(),
+        );
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert_eq!(
+            confirmation_reason(&d),
+            "none of the 2 actions that accept this command requires confirmation"
+        );
+    }
+
+    #[test]
+    fn the_deny_list_still_wins_over_every_overlapping_allow() {
+        let shell = |id: &str| Action {
+            id: ActionId::new(id),
+            tier: Tier::DiagRead,
+            exe: "/bin/sh".into(),
+            args: vec![ArgSpec::one("c", Matcher::Literal("-c".into()))],
+            confirm: ConfirmPolicy::Never,
+            agent_allowed: true,
+            env_allow: Vec::new(),
+            source: Source::new("99-oops.toml", 1),
+        };
+        let set = RuleSet::load(vec![shell("aido.oops.one"), shell("aido.oops.two")]).unwrap();
+        let d = evaluate_command(
+            &set,
+            &human(),
+            &Arg::from("/bin/sh"),
+            &Argv::new(["-c"]),
+            Settings::default(),
+        );
+        assert_eq!(d.denial, Some(DenialCode::DenyListed));
+        assert_eq!(matched_ids(&d), ["aido.oops.one", "aido.oops.two"]);
+    }
+
+    #[test]
+    fn a_command_no_action_runs_is_refused_naming_the_program() {
+        let d = evaluate_command(
+            &rules(),
+            &human(),
+            &Arg::from("/bin/sh"),
+            &Argv::new(["-c", "id"]),
+            Settings::default(),
+        );
+        assert_eq!(d.denial, Some(DenialCode::UnknownAction));
+        // There is no rule to cite, so the record carries the command itself.
+        assert_eq!(d.resolved_command(), ["/bin/sh", "-c", "id"]);
+        assert_eq!(d.trace.len(), 1, "{:?}", d.trace);
+    }
+
+    #[test]
+    fn a_command_every_candidate_refuses_lists_each_refusal() {
+        let set =
+            RuleSet::load(vec![svc_restart(), restart_action_named("aido.svc.again")]).unwrap();
+        let d = evaluate_command(
+            &set,
+            &human(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(["restart", "nginx"]),
+            Settings::default(),
+        );
+        assert_eq!(d.denial, Some(DenialCode::ArgvRejected));
+        let refused: Vec<&str> = d
+            .trace
+            .iter()
+            .filter_map(|step| match step {
+                TraceStep::ActionRejected { action, .. } => Some(action.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["aido.svc.restart", "aido.svc.again"]);
+    }
+
+    /// `restart_action` under another id, so two actions accept one command.
+    fn restart_action_named(id: &str) -> Action {
+        Action {
+            id: ActionId::new(id),
+            ..restart_action()
+        }
+    }
+
+    #[test]
+    fn a_frozen_agent_is_refused_before_any_action_is_consulted() {
+        let frozen = Settings {
+            confirm_agent_actions: true,
+            frozen: true,
+        };
+        // Even with nothing in the ruleset: the freeze is the answer, not a
+        // missing rule that would send an operator hunting.
+        let d = evaluate_command(
+            &RuleSet::default(),
+            &agent(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(["restart", "nginx.service"]),
+            frozen,
+        );
+        assert_eq!(d.denial, Some(DenialCode::Frozen));
+        assert_eq!(d.resolved_argv, ["restart", "nginx.service"]);
+    }
+
+    #[test]
+    fn searching_and_naming_agree_on_a_command_only_one_action_accepts() {
+        let searched = evaluate_command(
+            &rules(),
+            &agent(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(["restart", "nginx.service"]),
+            Settings::default(),
+        );
+        let named = evaluate(
+            &rules(),
+            &agent(),
+            &Request::for_program(
+                "aido.svc.restart",
+                "/usr/bin/systemctl",
+                Argv::new(["restart", "nginx.service"]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(searched, named);
     }
 }

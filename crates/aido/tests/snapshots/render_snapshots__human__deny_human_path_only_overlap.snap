@@ -1,0 +1,15 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   stop nginx.service
+  reason    human_path_only
+
+  trace
+    canonicalized: unchanged (stop nginx.service)
+    matched aido.svc.stop-by-hand at snapshot-overlap.toml:17
+    matched aido.svc.stop at snapshot-overlap.toml:27
+    skipped aido.svc.stop: aido.svc.stop-by-hand at snapshot-overlap.toml:17 accepts this command too and reserves it for the human path
+
+  next      this action is never available to an agent; hand it to a person

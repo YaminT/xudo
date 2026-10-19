@@ -1,0 +1,10 @@
+---
+source: crates/aido-policy/tests/overlaps.rs
+expression: "report.join(\"\\n\")"
+---
+overlap: aido.pkg.remove (overlaps.toml:4) and aido.pkg.remove-toolchain (overlaps.toml:15) both accept /usr/bin/apt-get -y remove -- gcc
+overlap: aido.svc.status (overlaps.toml:35) and aido.svc.status-full (overlaps.toml:45) both accept /usr/bin/systemctl status --full a.service
+overlap: aido.sysctl.watches-low (overlaps.toml:67) and aido.sysctl.watches-high (overlaps.toml:76) both accept /usr/sbin/sysctl fs.inotify.max_user_watches 65536
+overlap: aido.dir.claim-srv (overlaps.toml:86) and aido.dir.claim-app (overlaps.toml:92) both accept /usr/local/bin/claim /srv/app
+possible overlap: aido.net.lookup-internal (overlaps.toml:105) and aido.net.lookup-any (overlaps.toml:111): cannot compare `host` (pattern "[a-z]+\\.internal") against `target` (pattern "[a-z.]+") exactly
+possible overlap: aido.sep.one (overlaps.toml:119) and aido.sep.two (overlaps.toml:128): both accept `run --` position by position, but not as a canonical argument list, which is all the engine matches

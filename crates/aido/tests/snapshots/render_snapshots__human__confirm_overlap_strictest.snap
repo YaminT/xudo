@@ -1,0 +1,16 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+ALLOW, after a human confirms
+  command   /usr/bin/apt-get autoremove
+  action    aido.pkg.autoremove
+  rule      snapshot-overlap.toml:3
+  confirm   the matched rule always requires confirmation
+
+  trace
+    canonicalized: unchanged (autoremove)
+    matched aido.pkg.autoremove at snapshot-overlap.toml:3
+    matched aido.pkg.autoremove-quick at snapshot-overlap.toml:10
+    deny-list v1: no capability class matched
+    confirmation required: the matched rule always requires confirmation; the strictest requirement among the 2 actions that accept this command

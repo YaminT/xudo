@@ -5,7 +5,10 @@
 //! either is a policy or UX change (`CLAUDE.md` § Tests are adversarial).
 //! Every verdict shape is pinned — the allow, all three confirmation reasons,
 //! and all eight denial codes — each through a decision produced the way the
-//! real caller produces it wherever a producer exists.
+//! real caller produces it wherever a producer exists. So are the two shapes
+//! overlapping rules add: a confirmation decided by a stricter action than the
+//! one asked for, and an agent refused because an overlapping action is
+//! human-only.
 //!
 //! To accept a deliberate change: `INSTA_UPDATE=always cargo test -p aido`
 //! (or `cargo insta review`), then commit the changed `.snap` files so review
@@ -243,6 +246,97 @@ fn every_confirmation_shape_is_pinned() {
         insta::assert_snapshot!(format!("human__confirm_{slug}"), render::human(&decision));
         insta::assert_snapshot!(format!("json__confirm_{slug}"), render::json(&decision));
     }
+}
+
+/// Actions that accept one command between them: a confirming rule and its
+/// permissive duplicate, and an agent-allowed rule overlapping one reserved
+/// for a person. Kept apart from [`FIXTURE`] so the shapes above stay
+/// single-action.
+const OVERLAP_FIXTURE: &str = r#"
+[[action]]
+id = "aido.pkg.autoremove"
+tier = "pkg-remove"
+confirm = "always"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "autoremove" } }]
+
+[[action]]
+id = "aido.pkg.autoremove-quick"
+tier = "pkg-remove"
+confirm = "never"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "autoremove" } }]
+
+[[action]]
+id = "aido.svc.stop-by-hand"
+tier = "svc-control"
+agent-allowed = false
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "verb", matcher = { literal = "stop" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[action]]
+id = "aido.svc.stop"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "verb", matcher = { literal = "stop" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+fn overlap_rules() -> RuleSet {
+    RuleSet::from_toml("snapshot-overlap.toml", OVERLAP_FIXTURE).unwrap()
+}
+
+#[test]
+fn a_confirmation_decided_by_an_overlapping_action_is_pinned() {
+    // Asked under the permissive name, decided by the confirming rule: the
+    // record cites the rule whose requirement it carries, and the trace lists
+    // both and says the strictest applied.
+    let decision = evaluate(
+        &overlap_rules(),
+        &human_caller(),
+        &Request::for_program(
+            "aido.pkg.autoremove-quick",
+            "/usr/bin/apt-get",
+            Argv::new(["autoremove"]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(
+        decision.confirm,
+        Confirm::Required {
+            reason: ConfirmReason::RuleRequiresConfirmation
+        }
+    );
+    insta::assert_snapshot!("human__confirm_overlap_strictest", render::human(&decision));
+    insta::assert_snapshot!("json__confirm_overlap_strictest", render::json(&decision));
+}
+
+#[test]
+fn an_agent_refused_by_an_overlapping_human_only_action_is_pinned() {
+    let decision = evaluate(
+        &overlap_rules(),
+        &agent_caller(),
+        &Request::for_program(
+            "aido.svc.stop",
+            "/usr/bin/systemctl",
+            Argv::new(["stop", "nginx.service"]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(decision.denial, Some(DenialCode::HumanPathOnly));
+    insta::assert_snapshot!(
+        "human__deny_human_path_only_overlap",
+        render::human(&decision)
+    );
+    insta::assert_snapshot!(
+        "json__deny_human_path_only_overlap",
+        render::json(&decision)
+    );
 }
 
 #[test]

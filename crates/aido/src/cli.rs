@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use aido_backend::{Capability, DetectError, InstallPlan, PlanStep, Probe, detect};
 use aido_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use aido_policy::{
-    Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict, engine::Settings,
+    Arg, Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict,
+    engine::Settings,
 };
 use aido_sys::{HostProbe, PrivilegedOps, host_ops};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -65,7 +66,9 @@ pub struct Cli {
 /// Arguments shared by the commands that evaluate an argv.
 #[derive(Debug, Args)]
 pub struct EvalArgs {
-    /// Evaluate only this action, instead of every action in the ruleset.
+    /// Ask about this action instead of searching the ruleset for one. Every
+    /// other action that accepts the same command still contributes its
+    /// requirement: overlapping rules resolve to the strictest.
     #[arg(long, value_name = "ACTION_ID")]
     pub action: Option<String>,
 
@@ -439,18 +442,27 @@ fn explain(
             &requested,
             settings,
         )
-    } else if let Some(found) = best_match(loaded.rules(), &caller, program, &requested, settings) {
-        found
     } else {
-        // Nothing in the ruleset resembles this command, which only happens
-        // with an empty ruleset. Reported as an unknown action rather than by
-        // inventing a rule that refused it.
-        let _ = writeln!(
-            err,
-            "aido: no action in {} matches this command",
-            cli.rules.display()
+        // Every action that accepts the command decides it together, and the
+        // engine does the searching: which rule governs a command is a
+        // decision, and this crate makes none. Overlapping rules resolve to
+        // the strictest, so the sort order of two rule files cannot decide
+        // whether a human is asked.
+        let decision = aido_policy::evaluate_command(
+            loaded.rules(),
+            &caller,
+            &Arg::from(program),
+            &requested,
+            settings,
         );
-        Decision::deny(DenialCode::UnknownAction, Vec::new(), Vec::new())
+        if decision.denial == Some(DenialCode::UnknownAction) {
+            let _ = writeln!(
+                err,
+                "aido: no action in {} runs {program}",
+                cli.rules.display()
+            );
+        }
+        decision
     };
 
     emit(cli, &decision, out)
@@ -479,12 +491,6 @@ fn why_not(
     emit(cli, &decision, out)
 }
 
-/// Tries every action, returning the most favourable outcome.
-///
-/// "Most favourable" means a permitted verdict wins, and otherwise the first
-/// refusal that got furthest — an argv-shape rejection is more informative than
-/// an unknown action, because it means the operator picked the right rule and
-/// the wrong arguments.
 /// Splits a command into its program and its operands.
 ///
 /// The program is `argv[0]`. There is no `PATH` search and no resolution: the
@@ -494,51 +500,6 @@ fn split_program(argv: &[String]) -> (&str, &[String]) {
     const NOTHING: &[String] = &[];
     argv.split_first()
         .map_or(("", NOTHING), |(first, rest)| (first.as_str(), rest))
-}
-
-fn best_match(
-    rules: &RuleSet,
-    caller: &CallerFacts,
-    program: &str,
-    argv: &Argv,
-    settings: Settings,
-) -> Option<Decision> {
-    let mut best: Option<Decision> = None;
-    for action in rules.actions() {
-        let decision = aido_policy::evaluate(
-            rules,
-            caller,
-            &Request::for_program(action.id.clone(), program, argv.clone()),
-            settings,
-        );
-        if decision.verdict.is_permitted() {
-            return Some(decision);
-        }
-        // A freeze is a property of the broker's state, not of this argv, so
-        // every action returns it and the first one is the whole answer.
-        // Reporting "unknown action" instead would send an operator hunting for
-        // a missing rule while the real cause is that they froze the agent path.
-        if decision.denial == Some(DenialCode::Frozen) {
-            return Some(decision);
-        }
-        // Keep the first refusal, whatever it is. An earlier version listed the
-        // codes it considered informative, which meant a code added later would
-        // be silently dropped and reported as "unknown action" — exactly the
-        // failure the freeze case above was fixing.
-        //
-        // One exception: a program mismatch says nothing about this argv, only
-        // that this rule runs something else. Reporting it would name whichever
-        // rule happened to sort first and send the operator to an unrelated
-        // action, so a real refusal from a rule that *does* name this program
-        // takes precedence.
-        if decision.denial == Some(DenialCode::ExeMismatch) {
-            continue;
-        }
-        if best.is_none() {
-            best = Some(decision);
-        }
-    }
-    best
 }
 
 fn evaluate_one(
@@ -581,6 +542,24 @@ fn check(loaded: &LoadedRules, out: &mut dyn Write, err: &mut dyn Write) -> Exit
         loaded.files().len(),
         loaded.generation().get(..12).unwrap_or(loaded.generation())
     );
+
+    // Reported, not refused: the engine resolves a command more than one
+    // action accepts to the strictest of them, so an overlap is not a hole.
+    // It is still two rules whose interaction nobody wrote down, and the
+    // report never stays silent about a pair it cannot decide.
+    let overlaps = loaded.rules().overlaps();
+    for overlap in &overlaps {
+        let _ = writeln!(out, "{overlap}");
+    }
+    if !overlaps.is_empty() {
+        let _ = writeln!(
+            out,
+            "{} overlapping pair(s): a command more than one action accepts is refused to an \
+             agent if any of them is human-only, and confirmed as strictly as the strictest \
+             demands",
+            overlaps.len()
+        );
+    }
     ExitCode::Delegated
 }
 
@@ -1399,10 +1378,10 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
-    fn the_first_real_refusal_is_kept_when_several_rules_name_the_program() {
-        // Two rules for the same binary, both refusing. The first refusal is the
-        // answer; the second must not overwrite it, or the reported position
-        // would depend on rule ordering.
+    fn every_rule_for_the_program_reports_why_it_refused() {
+        // Two rules for the same binary, both refusing. Each one's reason is
+        // in the trace, in declaration order, so the answer does not depend on
+        // which happened to sort first.
         let fx = Fixture::new("cli-two-rules").write(
             "10-two.toml",
             r#"
@@ -1422,7 +1401,120 @@ args = [{ name = "verb", matcher = { literal = "stop" } }]
         let (code, out, _) = fx.run(&["explain", "--", "/usr/bin/systemctl", "reload"]);
         assert_eq!(code, ExitCode::Denied);
         assert!(out.contains("argv_rejected"), "{out}");
-        assert!(out.contains("aido.svc.aaa"), "{out}");
+        let first = out.find("skipped aido.svc.aaa").expect("the first refusal");
+        let second = out
+            .find("skipped aido.svc.bbb")
+            .expect("the second refusal");
+        assert!(first < second, "{out}");
+    }
+
+    /// Two rule files that accept the same command: one always confirms, the
+    /// other does not ask at all.
+    const CONFIRMING: &str = r#"
+[[action]]
+id = "aido.pkg.remove-toolchain"
+tier = "pkg-remove"
+confirm = "always"
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "remove" } },
+  { name = "pkg", matcher = { one-of = ["gcc", "make"] } },
+]
+"#;
+
+    const PERMISSIVE: &str = r#"
+[[action]]
+id = "aido.pkg.remove-quick"
+tier = "pkg-remove"
+confirm = "never"
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "remove" } },
+  { name = "pkg", matcher = { name = "deb-name" } },
+]
+"#;
+
+    #[test]
+    fn reordering_rule_files_cannot_drop_a_confirmation_from_explain() {
+        // The hole step 2b closed, through the command an operator runs: with
+        // the first permitting action winning, renaming one file so it sorted
+        // first turned "a human confirms" into a bare allow.
+        for (name, files) in [
+            (
+                "cli-overlap-forward",
+                [("10-a.toml", CONFIRMING), ("20-b.toml", PERMISSIVE)],
+            ),
+            (
+                "cli-overlap-backward",
+                [("10-a.toml", PERMISSIVE), ("20-b.toml", CONFIRMING)],
+            ),
+        ] {
+            let fx = files
+                .iter()
+                .fold(Fixture::new(name), |fx, (file, body)| fx.write(file, body));
+            let (code, out, _) = fx.run(&["explain", "--", "/usr/bin/apt-get", "remove", "gcc"]);
+            assert_eq!(code, ExitCode::NotConfirmed, "{name}: {out}");
+            assert!(out.starts_with("ALLOW, after a human confirms"), "{out}");
+            assert!(out.contains("action    aido.pkg.remove-toolchain"), "{out}");
+            assert!(out.contains("matched aido.pkg.remove-quick"), "{out}");
+            assert!(out.contains("strictest requirement among the 2"), "{out}");
+
+            // Naming the permissive rule does not help either.
+            let (code, _, _) = fx.run(&[
+                "explain",
+                "--action",
+                "aido.pkg.remove-quick",
+                "--",
+                "/usr/bin/apt-get",
+                "remove",
+                "gcc",
+            ]);
+            assert_eq!(code, ExitCode::NotConfirmed, "{name}");
+        }
+    }
+
+    #[test]
+    fn check_reports_actions_that_can_accept_the_same_command() {
+        let fx = Fixture::new("cli-check-overlap")
+            .write("10-a.toml", CONFIRMING)
+            .write("20-b.toml", PERMISSIVE)
+            .write(
+                "30-c.toml",
+                r#"
+[[action]]
+id = "aido.net.lookup-internal"
+tier = "diag-read"
+exe = "/usr/bin/host"
+args = [{ name = "host", matcher = { pattern = "[a-z]+\\.internal" } }]
+
+[[action]]
+id = "aido.net.lookup-any"
+tier = "diag-read"
+exe = "/usr/bin/host"
+args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
+"#,
+            );
+        let (code, out, err) = fx.run(&["check"]);
+        // Reported, not refused: the engine resolves an overlap safely.
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        insta::assert_snapshot!("check_reports_overlaps", out);
+    }
+
+    #[test]
+    fn check_reports_no_overlap_in_the_shipped_rules() {
+        let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("rules");
+        let cli =
+            Cli::try_parse_from(["aido", "--rules", shipped.to_str().unwrap(), "check"]).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.starts_with("ok: "), "{out}");
+        assert!(!out.contains("overlap"), "{out}");
     }
 
     #[test]
