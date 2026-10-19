@@ -4,6 +4,73 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-16 — M2b step 1: `aido-sys::raw`
+
+The workspace's only `unsafe`: four system calls, five blocks, behind a
+`Syscalls` trait with a real implementation and a scripted fake.
+
+| Call | Purpose | Kernel |
+|---|---|---|
+| `close_range(first, ~0, CLOSE_RANGE_CLOEXEC)` | the gate's first act | 5.11 |
+| `getsockopt(SO_PEERPIDFD)` | race-free peer identity for the broker | 6.5 |
+| `ioctl(PIDFD_GET_INFO)` | creds and cgroup id in one call | 6.13 |
+| `execveat(fd, "", AT_EMPTY_PATH)` | exec the descriptor that was validated | 3.19 |
+
+Decisions worth knowing before building on it:
+
+- **`close_range` marks, it does not close.** Closing a descriptor some
+  `OwnedFd` in the process still holds is a use-after-close, so a safe wrapper
+  around a real close would be unsound. `CLOSE_RANGE_CLOEXEC` closes nothing
+  now and every marked descriptor at the gate's exec, which is the only point
+  at which an inherited descriptor could do harm. sudo and doas already
+  `closefrom(3)` before they run the gate; this is the layer for when they do
+  not. **Open, for step 4:** before 5.11 the call fails with `EINVAL` (or
+  `ENOSYS` before 5.9). Whether the gate then refuses, or marks descriptors one
+  at a time with `fcntl` (a sixth block), is decided with the gate.
+- **A missing `PIDFD_GET_INFO` has two errnos.** Found on the first Linux run:
+  6.11 and 6.12 answer `EINVAL`, not `ENOTTY`, because the pidfd ioctl handler
+  added for the namespace ioctls refuses any non-zero argument before it looks
+  at the command. The broker must read both as "drop a rung". The test predicts
+  the exact errno from the kernel version and fails if the ladder in
+  `kernel.rs` disagrees with what the kernel does.
+- **The success path of `PIDFD_GET_INFO` has never run.** Docker Desktop is
+  6.12 and the CI runners are older. `raw::pidfd_info` is written without a
+  branch after the call, so coverage does not depend on the runner's kernel, and
+  its test asserts the success fields on the first 6.13+ machine without any
+  edit. Until one runs it, the layout is backed by compile-time size checks
+  against libc's `pidfd_info` and nothing more.
+- **`execveat` is proven only by its failures here.** A successful exec
+  replaces the test process, and its coverage counters with it. The tests exec a
+  directory and a mode-0444 file, both of which root is refused too. The success
+  path is proven by `aido-gate-bin`'s process tests in step 4, or not at all.
+- **A narrow trait, not `PrivilegedOps`.** `PrivilegedOps` is driven by `/proc`
+  fixtures; folding kernel fakes into it would couple two fakes for no gain.
+  `raw` returns `SysError` directly so the host implementation is a plain
+  forward, with no `map_err` closure that runs on only one kernel.
+- **Unreported is not zero.** `PidfdInfo` exposes nothing the kernel's
+  returned mask does not vouch for. The kernel zero-fills what it skipped, and
+  zero is root.
+- **Enforced, not promised.** `aido-sys` cannot inherit the workspace lints:
+  `forbid` cannot be lifted by an inner `allow`, so its table is a copy with
+  `unsafe_code = "deny"`. `tests/unsafe_budget.rs` fails if that copy drifts, if
+  any other crate stops inheriting the workspace table, if `unsafe` or
+  `allow(unsafe_code)` appears outside `raw.rs` anywhere in the workspace, if
+  `raw` becomes public, or if the block count differs from the number published
+  in `raw.rs`'s docs. Mutation-checked: lowering the published budget to 4
+  fails it. `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block`
+  are now workspace lints.
+
+`libc` becomes a direct dependency of `aido-sys` on Linux only. It was already
+in the lockfile, so `cargo deny` sees no new crate.
+
+Measured: 100% on macOS (`just verify`), and on Linux 6.12 in Docker `raw.rs`,
+`syscall.rs`, and `error.rs` are 100%. The Linux run is short of 100% in one
+other file, `probe.rs`, which this change does not touch: its `HostProbe`
+methods only run where a sudo-family binary exists, and the slim image has
+none. The CI runners have sudo.
+
+---
+
 ## 2026-10-15 — M2b step 0: `just linux-test`
 
 The suite now runs on a real Linux kernel from the Mac in one command, with the

@@ -30,8 +30,18 @@
 //! `Unattested` to every classification, so a developer on macOS cannot
 //! accidentally validate a Linux-only assumption: every decision path they
 //! exercise is the fail-closed one.
+//!
+//! # `unsafe`
+//!
+//! This is the one crate that does not forbid `unsafe`, and it denies it
+//! everywhere but the private `raw` module: four system calls rustix cannot
+//! make safely, with a published block budget. The rest of the workspace sees
+//! them only through [`Syscalls`]. `tests/unsafe_budget.rs` fails the build if
+//! `unsafe` appears anywhere else, if the budget is exceeded, or if this
+//! crate's lint table drifts from the workspace's in anything but that one
+//! lint.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod error;
 pub mod exec;
@@ -40,7 +50,10 @@ pub mod platform;
 pub mod probe;
 pub mod proc;
 pub mod provenance;
+#[cfg(target_os = "linux")]
+mod raw;
 pub mod source;
+pub mod syscall;
 pub mod trust;
 
 pub use error::SysError;
@@ -51,6 +64,7 @@ pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints};
 pub use source::{DirSource, MapSource, ProcSource};
+pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{PathFacts, TrustError, TrustedFile, open_trusted, read_trusted_dir, verify_path};
 
 // Re-exported so a consumer does not need to depend on aido-policy just to

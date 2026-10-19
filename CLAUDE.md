@@ -51,7 +51,7 @@ Every commit must satisfy all of the following. `just verify` runs the whole gat
 | `shlex::split` (splitting a string into argv) | Re-parsing a rendered command string is how you reintroduce injection. `shlex` is for one-way *display* quoting only. |
 | `Command::new` with a non-absolute path | No `PATH` search, ever. Resolve absolutely, then exec the fd you validated. |
 | `anyhow` | Context strings leak paths into output. Use `thiserror` enums so every failure mode is exhaustively matchable. |
-| `unsafe` | `#![forbid(unsafe_code)]` everywhere except `aido-sys::raw`, which has a published unsafe-line budget in its module docs. Raising the budget is a reviewed change. |
+| `unsafe` | `#![forbid(unsafe_code)]` everywhere except `aido-sys::raw`, which has a published unsafe-block budget in its module docs, enforced by `aido-sys/tests/unsafe_budget.rs`. Raising the budget is a reviewed change. |
 | `unwrap` / `expect` / panicking indexing in a decision path | A panic in the broker is a denial of service; a panic in the gate is undefined policy. Return a typed error and fail closed. |
 | Reading policy from any non-root-owned path | Verify ownership and mode on the **opened fd** via `fstat`, never on the path string. |
 
