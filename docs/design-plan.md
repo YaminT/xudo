@@ -5,7 +5,7 @@
 > **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
 >
 > - Twelve crates, not five. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase.
-> - No `unsafe` anywhere yet. `aido-sys::raw` arrives with M2b holding exactly four syscalls; rustix wraps the rest safely.
+> - `unsafe` exists only in `aido-sys::raw` (M2b, 2026-10-16): four syscalls in five blocks, budget enforced by a test; rustix wraps the rest safely. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only.
 > - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
 > - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
 > - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.

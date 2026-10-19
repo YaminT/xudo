@@ -100,8 +100,10 @@ dependencies = [
  "aido-backend",
  "aido-policy",
  "bstr",
+ "libc",
  "rustix",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
