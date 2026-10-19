@@ -42,15 +42,20 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod clock;
 pub mod error;
 pub mod exec;
+pub mod hygiene;
 pub mod kernel;
 mod mounts;
 pub mod platform;
 pub mod probe;
 pub mod proc;
+pub mod procfs;
+pub mod program;
 pub mod provenance;
 pub mod source;
+pub mod spool;
 pub mod syscall;
 pub mod trust;
 
@@ -60,15 +65,20 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
+pub use clock::{Clock, FakeClock, HostClock};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use mounts::MountRefusal;
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
-pub use provenance::{Ancestry, ProcRef, ancestry, hints};
+pub use procfs::VerifiedProc;
+pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
+pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
 pub use source::{DirSource, MapSource, ProcSource};
+pub use spool::{DirSpool, MAX_ENTRY_BYTES, MAX_ENTRY_NAMES, Spool};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,

@@ -23,7 +23,8 @@
 //!   half — each privileged action, the broker minting a spool entry and the
 //!   gate executing, is to take an `Authorized<_>`, which only `authorize`
 //!   makes, so that acting on an approval nobody recorded does not compile.
-//!   Neither takes one yet (M2b steps 2 and 4).
+//!   The gate's exec takes one (M2b step 4, `aido_gate::run`); the broker's
+//!   mint is to (step 2).
 //!
 //! A refusal needs no receipt: it stands whether or not its record lands.
 //! Write it with [`AuditSink::append`] anyway; a failure there changes nothing
@@ -31,7 +32,8 @@
 //!
 //! # How the broker and the gate call it
 //!
-//! Neither is wired yet (M2b steps 2 and 4). This is the shape both are
+//! The gate is wired (M2b step 4, `aido_gate::run`); the broker is not yet
+//! (step 2). This is the shape both are
 //! expected to take, with the record builders `aido-gate` already has:
 //!
 //! ```text

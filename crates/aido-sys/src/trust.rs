@@ -609,7 +609,7 @@ pub fn open_trusted(target: &Path) -> Result<OwnedFd, TrustError> {
 /// [`open_trusted`], with the owner and the mount table as parameters so a test
 /// can point it at what no test host has. The public functions always pass
 /// [`TRUSTED_UID`] and the host's mounts.
-fn open_trusted_with(
+pub(crate) fn open_trusted_with(
     target: &Path,
     owner: u32,
     view: &dyn MountView,

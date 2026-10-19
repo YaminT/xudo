@@ -116,13 +116,46 @@ impl Ancestry {
 /// hop that fails part-way through is **not** an error: the parent may simply
 /// have exited, so the walk stops and reports `reached_root: false`.
 pub fn ancestry(source: &dyn ProcSource, pid: u32, limit: usize) -> Result<Ancestry, SysError> {
+    let (chain, truncated) = walk(source, pid, limit)?;
+    if truncated {
+        return Err(SysError::AncestryTooDeep { limit });
+    }
+    Ok(chain)
+}
+
+/// Walks from `pid` towards pid 1, and stops quietly after `process_count`
+/// processes (`pid` itself included) instead of failing.
+///
+/// For a caller that wants only the nearest ancestors, and for whom a deep
+/// tree is ordinary: the gate looks for the process it was started on behalf
+/// of within a few hops, and does not care how far the rest of the session
+/// goes on. `reached_root` is false when the walk stopped at the bound.
+///
+/// # Errors
+///
+/// Returns [`SysError::Read`] if `pid` itself cannot be read, and
+/// [`SysError::Malformed`] for a `stat` line that is not one. An ancestor that
+/// cannot be read ends the walk, as in [`ancestry`].
+pub fn lineage(
+    source: &dyn ProcSource,
+    pid: u32,
+    process_count: usize,
+) -> Result<Ancestry, SysError> {
+    walk(source, pid, process_count).map(|(chain, _truncated)| chain)
+}
+
+/// The walk both [`ancestry`] and [`lineage`] make, and whether it stopped at
+/// the bound before the chain ended.
+fn walk(source: &dyn ProcSource, pid: u32, limit: usize) -> Result<(Ancestry, bool), SysError> {
     let mut chain: Vec<ProcRef> = Vec::new();
     let mut current = pid;
     let mut reached_root = false;
+    let mut truncated = false;
 
     loop {
         if chain.len() >= limit {
-            return Err(SysError::AncestryTooDeep { limit });
+            truncated = true;
+            break;
         }
         let path = format!("{current}/stat");
         let bytes = match source.read(&path) {
@@ -152,10 +185,13 @@ pub fn ancestry(source: &dyn ProcSource, pid: u32, limit: usize) -> Result<Ances
         current = parent;
     }
 
-    Ok(Ancestry {
-        chain,
-        reached_root,
-    })
+    Ok((
+        Ancestry {
+            chain,
+            reached_root,
+        },
+        truncated,
+    ))
 }
 
 /// Collects every unauthenticated claim about `pid` that is worth recording.
@@ -345,6 +381,45 @@ mod tests {
         let ok = ancestry(&source, 200, 512).unwrap();
         assert_eq!(ok.len(), 200);
         assert!(ok.reached_root);
+    }
+
+    #[test]
+    fn a_lineage_stops_quietly_at_its_bound_where_ancestry_refuses() {
+        // The gate wants the nearest few ancestors and nothing about how deep
+        // the session goes on: a deep tree is ordinary there, not an error.
+        let mut source = MapSource::new();
+        for pid in 1..=200u32 {
+            source = source.with(
+                format!("{pid}/stat"),
+                stat(pid, "deep", pid.saturating_sub(1), u64::from(pid)),
+            );
+        }
+        let near = lineage(&source, 200, 4).unwrap();
+        assert_eq!(
+            near.chain.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![200, 199, 198, 197]
+        );
+        assert!(!near.reached_root, "stopped at the bound, not at the root");
+        // Every hop is pinned, as ancestry pins them.
+        assert_eq!(near.chain.last().map(|p| p.starttime), Some(197));
+        // A bound beyond the tree reaches it.
+        let all = lineage(&source, 200, 512).unwrap();
+        assert_eq!(all.len(), 200);
+        assert!(all.reached_root);
+        // A bound of nothing walks nothing.
+        assert!(lineage(&source, 200, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lineage_from_an_unreadable_or_malformed_process_fails_closed() {
+        assert!(lineage(&MapSource::new(), 412, 4).is_err());
+        let broken = MapSource::new()
+            .with("412/stat", stat(412, "bash", 411, 5000))
+            .with("411/stat", "garbage with no parens");
+        assert!(lineage(&broken, 412, 4).is_err());
+        // A parent that exited ends the walk without an error.
+        let partial = MapSource::new().with("412/stat", stat(412, "bash", 411, 5000));
+        assert_eq!(lineage(&partial, 412, 4).unwrap().len(), 1);
     }
 
     #[test]

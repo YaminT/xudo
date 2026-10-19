@@ -1,0 +1,28 @@
+[package]
+name = "aido-gate-bin"
+description = "The `aido-gate` executable, installed as /usr/libexec/aido/aido-gate with aido-gate-auth as a hardlink. A five-line entry point over the aido-gate library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package, for the reason `aido-bin` is: the library is compiled, and
+# so measured, exactly once, and `tests/binary.rs` runs the real binary.
+[[bin]]
+name = "aido-gate"
+path = "src/main.rs"
+
+[dependencies]
+aido-gate = { path = "../aido-gate", version = "0.0.1" }
+
+# `tests/binary.rs` runs the binary as a process, under each name a hardlink
+# could give it. It lives in this package because Cargo builds the binary for,
+# and sets `CARGO_BIN_EXE_aido-gate` in, only this package's integration tests.
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+
+[lints]
+workspace = true
