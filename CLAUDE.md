@@ -109,6 +109,7 @@ crossed both whitespace and `/`. Adds denies_glob_crossing_separator.
 | GTFOBins gate | `just gtfobins` | every allowlisted shell-capable binary has a reviewed waiver |
 | Linux tests | `just linux-test` | the whole suite on a real Linux kernel in Docker, as a non-root user, on a copy of the checkout. Required before committing syscall code; not in `verify` because it needs Docker |
 | Differential | `just differential` | the static binary inside real distributions: every backend report matches `ci/differential/expected/`, every verdict identical in every row. Needs Docker; runs in CI, not in `verify` |
+| Install as root | `just install-root` | `aido install` and `--uninstall` as real root in throwaway containers (sudo, sudo-rs, OpenDoas): modes, owners, validation before rename, an operator's file never replaced or removed, a rejected candidate leaves the old state. Needs Docker; runs in CI, not in `verify`; the suite's own harness is non-root and cannot write `/etc` |
 
 `rust-toolchain.toml` pins the toolchain; MSRV is declared in the workspace manifest and checked in CI. Nightly is used **only** for `cargo fuzz`, `cargo miri`, and region coverage — never for a shipped build.
 

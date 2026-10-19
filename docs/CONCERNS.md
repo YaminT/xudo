@@ -4,6 +4,111 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — M2b step 5: executing the install plan (in progress; the probe is missing)
+
+**What exists.** `aido_sys::install`: `execute(plan, ops, probe)`, the executor
+for the plan `aido-backend` already builds, behind `InstallOps` (every effect)
+and `InstallProbe` (the post-install check). `HostInstallOps` is the real
+filesystem; a `FakeInstallOps` drives every path in the executor. `aido
+install` now performs the plan, and `aido install --uninstall` removes what it
+wrote. `run_with` (what every test drives) holds a `RefusingInstaller`, so no
+test can write under `/etc`, as root or otherwise; only `run` holds the real one.
+
+**Not done, and not claimed done: the functional probe.** It needs the gate
+binary (step 4, on another branch). `PendingGateProbe` is the production
+implementation and answers *unavailable*, so a finished install is
+`Verification::Unverified`, `aido install` says `NOT VERIFIED` and exits 19, and
+the container harness asserts the output never says "verified". A file in
+`/etc/sudoers.d` proves nothing (`sudo-rs` ignores directives it does not
+support, and `sudo` ignores a badly named file), which is why the plan ends in a
+probe at all. Wiring the real one is one `impl InstallProbe`; whoever lands step
+4 owns it. Held for merge: this lands after the gate.
+
+**Decisions.**
+
+- **The executor refuses on its own before it runs a step.** Not root: refused
+  first, before the plan is read. A path that is not one of the five aido
+  writes (or the candidate beside one): refused, so a hand-built plan is not a
+  root write primitive and `/etc/sudoers` is unreachable. A destination `sudo`
+  silently ignores (a dot, a trailing `~`): refused — the guard the request
+  said to keep, now enforced where the rename happens, with a test that names
+  the attack. Any mode beyond `0440`: refused. A validator that does not name
+  `{candidate}` exactly once, or is not an absolute path: refused, because it
+  would check something else. All of it is checked for the whole plan before
+  the first effect.
+- **Validate before install is structural, not a convention.** `Install` is
+  refused unless this run wrote that candidate and this run validated it; the
+  inode after validation must be the inode written, checked again at the rename.
+  A candidate that is no longer the inode written is *left in place*: removing
+  it would delete a file aido did not write.
+- **"A file aido wrote" has a definition.** A regular file, root's, one name,
+  beginning with `# Managed by aido.` (`MANAGED_MARKER`; a test holds both
+  generated headers to it), opened `O_NOFOLLOW` and checked on the descriptor.
+  A symlink, a hard link, a directory, or an operator's own `aido` is refused
+  by both install (will not replace) and uninstall (will not remove). The
+  candidate name is fixed by the plan and created `O_EXCL`: a stale one blocks
+  the install loudly instead of being overwritten, and uninstall removes it only
+  if it carries the marker.
+- **A missing `/etc/sudoers.d` is "nothing to remove", not an error**, so
+  `--uninstall` works on a doas-only machine and after the backend was removed
+  first. It needs no backend detection and runs both backends' removals. The
+  directory walk reports a missing directory as absent only when the path really
+  does not exist; a symlink, a writable ancestor, or a bad mount still refuses.
+- **doas.** The shared file is edited under `flock` (bounded wait, then refuse),
+  the lock re-checked against the name once held, a merged copy written beside
+  it `O_EXCL`, `doas -C` run on that copy, then renamed over. Removal
+  takes exactly the lines between the sentinels and every other byte as it was
+  (`blocks.rs`, with property tests: removal undoes insertion exactly; insertion
+  is idempotent; no operator byte is lost). Sentinels that do not pair are
+  refused, never guessed at. Matching is whole-line and byte-exact: a CRLF
+  marker is not aido's. The result is `root:root` and the plan's `0400`; the
+  operator's original mode is not preserved on install, because the plan says
+  the file must end up `0400`.
+- **A failed probe removes what the run installed**, in reverse; a refused
+  removal is reported as what was left behind. An integration that is installed
+  and not in effect looks installed.
+- **A backend that cannot validate a named file is refused**
+  (`ValidateBySubstitution` has no honest implementation: `sudo-rs`'s validator
+  checks only `/etc/sudoers`). Both real `sudo-rs` versions tested are either
+  refused at detection (0.2) or validate a named file (26.04), so this is
+  reachable only from a hand-built plan.
+
+**What the container run found.** `just install-root` runs the real binary as
+real root in throwaway containers for `sudo`, `sudo-rs` 0.2, `sudo-rs` 26.04
+and OpenDoas. It caught two harness faults, not product ones: the 26.04 image
+ships `/etc/sudoers` `0644`, which `visudo -c` refuses, and my first
+rejecting-`visudo` wrapper exec'd itself. It also confirmed three facts the code
+relies on: `sudo-rs` 0.2 is refused at detection, before any write, for both root
+and non-root; Alpine's doas has `/etc/doas.d` (so the block path is exercised by
+removing it); and `visudo -c` accepts the whole configuration after install and
+after uninstall.
+
+**Coverage, and a trap.** Every `?` on a call that cannot fail in a test is an
+uncovered region, and `matches!(x, Pat { .. })` in measured test code is one too
+(the false arm never runs). The host code chains the steps on a just-opened
+descriptor (`and_then`) rather than writing `?` after each, so the only branches
+that exist are ones a test takes; the executor's tests live in
+`install/tests.rs`, which `cargo llvm-cov` does not measure. No threshold was
+touched and no waiver added.
+
+**Open.**
+
+- The probe (above).
+- `fsync` of the directory after the rename is best effort: its failure cannot
+  un-install anything, and the file's data is synced before the rename.
+- `remove_managed` checks, then unlinks by name. The directory was walked as
+  root's and nobody else can write it, so the window is closed to everyone who
+  could not already do worse; an `unlinkat` on the checked descriptor does not
+  exist.
+- A crash between creating the candidate and removing it leaves
+  `aido.candidate`; the next install refuses on it and says why, and uninstall
+  removes it. Nothing clears it automatically.
+- The group is created with `groupadd --system` or `addgroup -S` and never
+  removed, never populated; a `purge` that removes it is the package's job.
+- `aido install` exits 19 on every successful-but-unverified install. The
+  `postinst` that calls it must treat that as the documented state until the
+  probe lands.
+
 ## 2026-10-19 — M2b step 6: the audit sinks
 
 **What exists.** `aido-sys::audit`: the contract the broker and the gate will

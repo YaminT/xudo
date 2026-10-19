@@ -44,6 +44,7 @@
 pub mod audit;
 pub mod error;
 pub mod exec;
+pub mod install;
 pub mod kernel;
 mod mounts;
 pub mod platform;
@@ -62,6 +63,10 @@ pub use audit::{
 };
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+pub use install::{
+    HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,
+    Installer, PendingGateProbe, ProbeResult, RefusingInstaller, Verification, execute,
+};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use mounts::MountRefusal;
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};

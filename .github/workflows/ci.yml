@@ -133,3 +133,22 @@ jobs:
           tool: just
       - name: Drive the static binary through sudo, sudo-rs, OpenDoas, and no escalator
         run: just differential
+
+  # `aido install` and `--uninstall` run for real, as root, in containers the
+  # job starts and discards: the file lands with the right owner and mode, the
+  # backend's own parser accepts it first, an operator's file is never replaced
+  # or removed, a rejected candidate leaves the old state alone. The functional
+  # probe is not covered here because it needs the gate binary; the harness
+  # asserts the install says it is unverified rather than claiming otherwise.
+  install-root:
+    name: install as root
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Install and uninstall through sudo, sudo-rs, and OpenDoas
+        run: just install-root
