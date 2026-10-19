@@ -4,6 +4,20 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-19 — `howiwork.md`: the product source of truth, and the merged vision
+
+A product vision document arrived (permission sets and PRS, `airead`,
+vision/blind mode, `pasban`, ido's three outcomes, a distro ambition) and was
+merged with the existing design into `howiwork.md`, now the authoritative
+statement of product behaviour. README and every diagram derive from it. Four
+parts of the vision collided with the invariants and were reconciled rather
+than adopted, each recorded in that file's "Mismatches resolved" section — the
+load-bearing one: in vision mode an AI may reject, defer, or annotate, never
+approve, because a component that can be prompt-injected must not be a
+component that can grant root. Engineering rules stay in `CLAUDE.md`.
+
+---
+
 ## 2026-10-19 — M2b step 2b: overlapping rules resolve to the strictest
 
 **The hole.** `best_match`, in the front-end, returned the first permitting

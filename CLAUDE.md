@@ -2,6 +2,8 @@
 
 `aido` is a privilege broker: it decides whether a privileged command runs as root. A bug here is a root exploit, not a crash. Every rule below exists because of a specific historical CVE or a specific documented escape. Follow them exactly.
 
+Product source of truth: `howiwork.md` — what the system is and how it behaves; derived views (README, diagrams) follow it. This file owns the engineering and security rules below; the three invariants appear in both and may be weakened by neither.
+
 Design plan: `docs/design-plan.md`. Enhancement backlog: `docs/SUGGESTIONS.md`. Decision log: `docs/CONCERNS.md`.
 
 ---

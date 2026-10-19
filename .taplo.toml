@@ -5,7 +5,11 @@
 # prove the rule loader refuses them. Letting the formatter walk into that
 # directory makes `taplo fmt --check` fail for reasons that have nothing to do
 # with the repository's own formatting.
-exclude = ["target/**", "fuzz/target/**"]
+#
+# `.claude/` holds other agents' git worktrees, each a whole checkout with its
+# own fixtures and its own gate. This checkout's check must not fail on
+# theirs.
+exclude = ["target/**", "fuzz/target/**", ".claude/**"]
 
 [formatting]
 align_entries = false

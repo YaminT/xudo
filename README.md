@@ -4,6 +4,10 @@
 privileged commands without a password, while always prompting humans.**
 Root-owned rule set, compiled-in deny-list, full decision trace. Rust, Linux.
 
+> This README is a derived view. The source of truth for what aido is and how
+> the system behaves is [howiwork.md](howiwork.md); where the two disagree,
+> that file is right and this one is the bug.
+
 > ## Beta. Not externally audited. No privileged path yet.
 >
 > This build **cannot execute anything as root.** `aido explain`, `check`,
@@ -99,6 +103,7 @@ real bug in argv canonicalization on its first run; the story is in
 
 | File | What it is |
 |---|---|
+| [howiwork.md](howiwork.md) | **The source of truth.** Product behaviour, components, modes, outcomes — everything else derives from it |
 | [docs/re.md](docs/re.md) | Current blockers |
 | [docs/CONCERNS.md](docs/CONCERNS.md) | Running decision log — read this before changing anything |
 | [docs/design-plan.md](docs/design-plan.md) | Full architecture and threat model |
