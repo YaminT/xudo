@@ -4,6 +4,72 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-21 — Agent pipelines moved to boof
+
+All agent pipelines for this repository now run through boof-runner: planner
+(Opus), developer (Sonnet), observer (Opus) with bounded developer fix rounds,
+then reviewer (Fable). The chain is described in `docs/todo/m2b-finish-plan.md`
+§ "How work moves".
+
+**Why.** One runner instead of per-lane scripts and hand-kept `RECOVERY-*.txt`
+files. Task records are durable under `~/.boof/aido/<lane>`. Branches are kept
+as `boof-runner/<task-id>`, and a failed task keeps its worktree for a retry.
+Today boof puts the task worktrees under `.boof-runner-worktrees/` in the main
+checkout (ignored by `.gitignore`); they move outside it once boof supports a
+configurable worktree root.
+Each verdict gates the next step, and a missing verdict stops the task, so the
+gate fails closed.
+
+**What the hook guarantees.** After the reviewer's final `APPROVE`, boof runs
+`ci/boof-integrate.sh`. Exit 0 marks the task done; anything else fails it and
+keeps the branch and worktree. In order: the environment is complete and the
+worktree is clean and on its branch; integrations are serialized by a
+machine-wide lock; every commit on `origin/main..HEAD` is a Conventional Commit
+of at most 50 characters, with no `wip`, `fixup!`, `squash!` or `boof-runner:`
+subject; every Actions run on origin/main's head has succeeded; the branch
+rebases onto origin/main (a conflict aborts); `just verify` and `just
+linux-test` pass on the rebased head, which the gate must not change; the push
+is without force, retried up to 3 times if main moved; every Actions run on the
+pushed commit is watched, and a failure is reported as "main is now red" with
+the run URLs (a `gh` error is retried with backoff, keeps the last observation,
+and never produces "red" or "no runs"; CI that cannot be confirmed in time is
+reported as "not confirmed", with the commit already on main); the main checkout is fast-forwarded when it is clean on main.
+`ci/boof-integrate-test.sh` demonstrates each refusal against a fake origin,
+`gh` and `just`.
+
+**Trust decision.** Only the main checkout's copy of the hook runs, and the
+copy inside the task worktree refuses to (symlinks resolved first), so a branch
+cannot weaken the hook itself. That is all it protects. On a push, GitHub
+Actions runs the workflow files of the pushed commit, so a branch that edits
+`.github/workflows/` changes the CI that judges it; the `justfile`, `ci/` and
+`.githooks/` that `just verify` and `just linux-test` run are likewise the
+branch's own. The hook does not make them trusted. Before the gate it prints a
+`GATE FILES CHANGED` block listing every changed path (a rename under both
+names, matched case-insensitively) under `justfile`, `.justfile`, `*.just`,
+`ci/`, `.github/`, `.githooks/`, `deny.toml`, `clippy.toml`,
+`rust-toolchain.toml` and `.taplo.toml`, into the task log beside the reviewers' verdicts. It warns and
+does not refuse, because lanes legitimately change these files (B4 edits
+`ci.yml`); review of the diff is the control. GitHub Actions remains the CI
+gate; the hook adds local checks before the push and does not replace it.
+
+`BOOF_BASE` is the task's base commit sha and is informational: the hook
+always lands on `origin/main` and compares it with nothing. A red main refuses
+at step e, so a fix-forward task needs `--allow-red-main`, an argument (never
+an environment variable) that skips step e only and says so. It is for a
+dedicated hotfix data root whose `onApproved` argv includes it; normal lanes
+never pass it.
+
+**Known limits.**
+
+- `ci.yml` sets `cancel-in-progress: true`, so a later push that bypasses the
+  hook cancels the watched run, and step i reports it as red.
+- Waiting for main's CI gives up after 90 minutes.
+- Scheduled runs on the same sha are waited on too.
+- A red main after the push is reported, not reverted.
+- The lock is per machine and per `TMPDIR`.
+
+---
+
 ## 2026-10-21 — M2b step 4 (B3): `aido-gate-bin`, the root executor, reconciled with the broker
 
 Built 2026-10-19 on `aebfd15`, before the broker was on main. Finished

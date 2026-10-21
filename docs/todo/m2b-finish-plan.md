@@ -13,13 +13,37 @@ left. When the two disagree, fix this one, it is newer.
 
 ## How work moves
 
-Every code step runs the same chain, and the roles are fixed: **Sonnet
-develops, Opus observes, Fable reviews.** A step merges only after the Fable
-review approves it as matching its request, only onto a main head whose CI
-finished green, and the push is watched to completion. Review findings are
-reproduced before they are fixed, and every fix lands with a test named for the
-attack it closes. Each lane keeps a `RECOVERY-*.txt` in its worktree so an
-interrupted run resumes from its last checkpoint.
+Every step runs through boof-runner, one chain per task: the planner (Opus)
+writes the plan, **Sonnet develops, Opus observes, Fable reviews.** The
+observer sends the developer back for fix rounds, a bounded number of them,
+until it approves; only then does the Fable review run. Each verdict gates the
+next step, and a missing or non-`APPROVE` verdict stops the task: the gate fails
+closed. Review findings are reproduced before they are fixed, and every fix
+lands with a test named for the attack it closes.
+
+Each lane has a data root, `~/.boof/aido/<lane>`, holding the durable task
+records. Today boof creates the task worktrees under `.boof-runner-worktrees/`
+in the main checkout, which `.gitignore` ignores and `.taplo.toml` excludes;
+they will move outside the checkout once boof supports a configurable worktree
+root. A task's branch is kept as `boof-runner/<task-id>`; a failed task keeps its
+branch and worktree so a retry resumes from them.
+
+After the final `APPROVE`, boof runs `ci/boof-integrate.sh` (the main
+checkout's copy; the one in the worktree refuses to run). It guarantees, in
+order: a clean worktree on the task branch; Conventional Commit subjects of at
+most 50 characters; every Actions run on origin/main's head green; a rebase
+onto origin/main; `just verify` and `just linux-test` on the rebased head; a
+push without force, at most 3 attempts if main moves; every Actions run on the
+pushed commit watched to completion; the main checkout fast-forwarded. Exit 0
+marks the task done. `ci/boof-integrate-test.sh` proves each refusal. A change
+to `justfile`, `ci/`, `.github/` or the other gate files is printed as a
+`GATE FILES CHANGED` block in the task log, a warning for the reviewers, not a
+refusal; a rename lists both the old and the new path, and the match ignores
+case. A `gh` error while waiting for CI is retried with backoff and is never
+read as a red or an absent run; when CI cannot be confirmed the hook says "not
+confirmed" instead. A red main refuses the hook; a fix-forward task runs from a dedicated
+hotfix data root whose hook argv adds `--allow-red-main`, which skips only that
+check.
 
 ## What "M2b done" means
 
