@@ -110,6 +110,50 @@ jobs:
         if: github.event_name == 'schedule'
         run: just fuzz 1800
 
+  # Every systemd unit under packaging/, checked by systemd's own tools in a
+  # Debian trixie container: `systemd-analyze verify` must say nothing, and
+  # `systemd-analyze security --offline` must score each service within the
+  # ceiling the justfile names. The lane first shows it can fail, against a
+  # control unit it damages one way at a time. It skips, and says so, while
+  # packaging/ holds no unit. Blocking from the start: once a unit exists there
+  # is nothing to wait for.
+  units:
+    name: systemd units
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: systemd-analyze verify and security, offline, in Debian trixie
+        run: just units
+
+  # The tests that must run as uid 0, run as real root in a throwaway container,
+  # on a copy of the checkout, and nothing else (ci/root-test.sh says why not the
+  # whole suite). Until the install executor's own root tests land (M2b step 5)
+  # the lane runs only its own checks that a run which says it is root behaves
+  # like one, so it is NON-BLOCKING: `continue-on-error` below is what makes a
+  # red lane leave the run green.
+  #
+  # THE SWITCH, in the commit that merges the install executor's root tests:
+  #   1. delete `continue-on-error: true` below;
+  #   2. add `root-test` to the `ci` recipe in the justfile;
+  #   3. if branch protection lists required checks, add this job's name.
+  # docs/CONCERNS.md, 2026-10-21, has the reasoning.
+  root-tests:
+    name: root tests (container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Root tests, as uid 0, on a copy of the checkout
+        run: just root-test
+
   # The differential compliance matrix: the static binary and the shipped
   # ruleset driven inside real distributions against real sudo, sudo-rs,
   # OpenDoas, and no escalator at all. ci/differential/run.sh pins what each

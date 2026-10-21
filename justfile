@@ -10,6 +10,18 @@ cov_lines := "100"
 cov_regions := "100"
 cov_functions := "100"
 
+# The most `systemd-analyze security` may score any service under packaging/,
+# where 0.0 is nothing left open and 10.0 is everything. The broker's service
+# scores 1.1; the ceiling leaves 0.1 for systemd re-weighting a check, and sits
+# below what dropping any one of its network, namespace, capability, or
+# system-call restrictions costs. Like the coverage floor, it is changed only by
+# a reviewed change that says why: fix the unit, or argue that the exposure is
+# the price of what the service must do. The lane's self-test drops
+# `PrivateNetwork=` from a control that scores 1.1 and requires the 1.5 that
+# results to be refused, so a ceiling of 1.5 or more fails the self-test until
+# the self-test is changed on purpose (ci/units/check.sh).
+unit_exposure_max := "1.2"
+
 default: verify
 
 # The full gate. Run before every commit.
@@ -219,6 +231,26 @@ gtfobins:
 linux-test *args:
     ci/linux-test.sh {{args}}
 
+# The mirror of `linux-test`: the tests that must run as uid 0 (every
+# `tests/root_*.rs`, behind the `root-tests` feature), as real root in a
+# throwaway container, on a copy of the checkout, and nothing else. The rest of
+# the suite assumes an unprivileged user and is not run as root. Shares
+# `linux-test`'s lock and cache volumes. Needs Docker. Arguments go to
+# `cargo test`. In CI it does not yet block: see the `root-tests` job.
+root-test *args:
+    ci/root-test.sh {{args}}
+
+# --- systemd units ----------------------------------------------------------
+
+# Every unit file under packaging/, by systemd's own tools in a Debian trixie
+# container: `systemd-analyze verify` must say nothing, and `systemd-analyze
+# security --offline` must score each service no worse than `unit_exposure_max`.
+# The lane first shows it can fail, against a control unit it damages one way at
+# a time. Skips, and says so, while packaging/ holds no unit. Needs Docker and
+# the network. ci/units/check.sh says what each check is for.
+units:
+    ci/units/run.sh {{unit_exposure_max}}
+
 # --- differential compliance ------------------------------------------------
 
 # The static Linux binary the matrix drives: musl, for whichever architecture
@@ -253,8 +285,9 @@ setup: install-hooks
 
 # --- convenience ------------------------------------------------------------
 
-# What CI runs on a pull request, including the slow lanes.
-ci: verify check-linux miri differential
+# What CI runs on a pull request, including the slow lanes. `root-test` joins it
+# when its CI job stops being non-blocking (see the `root-tests` job).
+ci: verify check-linux miri units differential
 
 clean:
     cargo clean

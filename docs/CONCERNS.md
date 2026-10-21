@@ -4,6 +4,142 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-21 — D5: the unit checks and the root tests are CI lanes now
+
+Finish-plan item D5. Two checks that had been done by hand in a Docker session
+now run on every pull request: systemd's own verdict on the unit files, and the
+tests that must be uid 0. Neither is in `just verify`, which has to run on a
+machine without Docker; both need it.
+
+**The unit lane: `just units`, `ci/units/`.** Every unit file under `packaging/`,
+in a `debian:trixie-slim` container (systemd 257.13), through `systemd-analyze
+verify` and `systemd-analyze security --offline`. It blocks from the start.
+Until B1 lands there is no `packaging/`; the lane says so and skips, so it
+merges first. Run against the broker's `aidod.socket` and `aidod@.service` as
+they stand on its branch (`7dcc41a`; its `tmpfiles.d/aido.conf` is not a unit
+and is ignored) it passes, and that closes the broker's open item "The unit
+check is manual": its merge should replace that item with a pointer here. What
+building it measured, which is why it is built the way it is:
+
+1. **`verify` exits 0 for a misspelled directive and for a value it cannot
+   parse.** `NoNewPrivilegs=yes` and `RuntimeMaxSec=banana` each print one
+   warning, are ignored, and leave the exit status 0. A hardening line that is
+   ignored is a unit that starts without it, which is the case
+   `aidod/tests/units.rs` guards by refusing keys it does not know. So the check
+   is that `verify` exits 0 *and says nothing*. It does exit 1 for a dependency no
+   unit provides and for a missing section header.
+2. **`security` applies to services only.** Given a socket it scores what the
+   socket does not declare: `aidod.socket` came out 9.6 UNSAFE. A socket's keys
+   are held by `verify` and by `units.rs`, and by nothing else.
+3. **The ceiling is 1.2** (`unit_exposure_max`, at the top of the justfile;
+   `--threshold` takes whole tenths). The broker's service scores 1.1, on arm64
+   and, under emulation, on amd64. Measured, dropping one line from it costs:
+   `CapabilityBoundingSet=` 2.9; `RestrictAddressFamilies=` and
+   `RestrictNamespaces=` 1.8; `PrivateNetwork=` 1.5; the two `SystemCallFilter=`
+   lines 1.4 and 1.3; `PrivateDevices=` 1.3. All are over the ceiling. The small
+   ones (`NoNewPrivileges=`, `ProtectSystem=`, `ProtectHome=`, and the like, 1.2
+   or 1.1) are not, and stay `units.rs`'s to catch line by line: the score is a
+   net under that test, not a replacement for it. Raising the ceiling is a
+   reviewed change that says why, and a ceiling of 1.5 or more fails the
+   self-test below until that is changed on purpose.
+4. **The lane tests itself first.** `ci/units/control/` is a service and a socket
+   it must accept. Six edits to them, one each, must each be refused *by the
+   check named for it*: a misspelled directive, an unparsable value, a hardening
+   directive under the wrong heading, a dependency nobody provides, a misspelled
+   socket directive (all `verify`), and `PrivateNetwork=` removed (exposure). An
+   edit that alters nothing fails the self-test, so a control that drifts from
+   its own mutations cannot make it pass for want of anything to test. On the
+   broker's real service, a typo fails `verify` with systemd's own warning, and
+   dropping `PrivateNetwork=` fails the ceiling at 1.5 with the costly lines
+   listed.
+5. **The programs are stubbed.** `verify` refuses a unit whose `ExecStart=` is
+   not an executable file, and the programs are not in the repository, so each
+   absolute path a unit names gets a stand-in. What is checked is the unit, not
+   that the package installs `/usr/libexec/aido/aidod` there; that is phase 3's
+   test of the package. A template is verified under systemd's dummy instance
+   (`aidod@test_instance.service`), which is the "and an instance" the by-hand
+   check did separately.
+
+Not covered, and still by hand: `systemd-tmpfiles` creating the two directories
+with their modes from `tmpfiles.d/aido.conf` (the textual lines are
+`units.rs`'s), and anything about `sysusers.d` once it exists.
+
+**The root lane: `just root-test`, `ci/root-test.sh`.** The mirror of
+`linux-test`: real root in a throwaway container, on a copy of the checkout
+with the checkout mounted read-only, for what only root can observe.
+
+1. **Only `root_*` test targets, not the whole workspace.** D5 as written named
+   `cargo test --workspace --features root-tests`, which would run the existing
+   suite as root. Measured: five `aido-sys` unit tests fail there
+   (`a_checkout_is_not_root_owned_on_the_walk`,
+   `a_real_directory_owned_by_the_test_user_is_refused`,
+   `an_untrusted_ruleset_is_refused_before_it_is_parsed`,
+   `the_directory_must_pass_the_walk_from_the_root`,
+   `a_log_that_refuses_reaches_no_mirror`), every one because it takes the
+   checkout or the caller to be someone other than root, and the rest passing as
+   root says nothing about the mode checks root ignores (2026-10-15). So the
+   lane runs `cargo test --workspace --features root-tests --test 'root_*'`, one
+   test at a time, with their output shown.
+2. **A cargo feature selects the tests; nothing reads the environment.** The
+   feature is `root-tests`, declared in `aido-sys`, which the install executor
+   lives in. The suites that enable every feature (`just test`, `just
+   linux-test`, coverage) build the root tests and run them as an ordinary user,
+   where they return early and print `SKIPPED:`, the idiom of the `nix` crate.
+   Root tests are integration tests under `tests/`, which `cargo llvm-cov` leaves
+   out of its report, so a skip path costs no coverage (checked: the report is
+   100% and lists no file under `tests/`). The lane makes a skip a failure: it
+   reads the output for `SKIPPED:`, and counts passing tests from cargo's own
+   summaries, so a lane that ran none fails too. A `[[test]]` entry with
+   `required-features` means a run that forgot the feature errors ("requires the
+   features") rather than running an empty binary and passing.
+3. **What it holds today is its own tripwire**, `aido-sys/tests/root_lane.rs`:
+   real, effective, saved, and filesystem uid and gid all 0; a mode-0000 file
+   readable, which is the reason `linux-test` never runs as root; a file given to
+   another owner and moded 0440, then handed back (`CAP_CHOWN` and `CAP_FOWNER`,
+   which an install depends on). Measured to fail where it should: run as uid
+   1000, the lane fails listing the three skips; with a filter matching nothing,
+   "no root test ran"; in a container without `CAP_CHOWN`, `give a file to
+   another owner: Operation not permitted`.
+4. **The lock is shared by construction.** It moved from `linux-test.sh` into
+   `ci/lib/machine-lock.sh`, which both scripts source; the protocol and the
+   path are unchanged, so a run from another worktree's older copy still takes
+   turns with it (measured: turn-taking, and a dead holder's lock taken over).
+   The two share the cache volumes, and the root run leaves root-owned files in
+   them that `linux-test`'s opening `chown` takes back. The lane asks rustup for
+   the toolchain from outside the checkout, because asked from inside it rustup
+   reads `rust-toolchain.toml` and downloads the cross targets and tools the
+   file lists, on every run of a container that forgets them. It has no cache on
+   a runner, so each job builds what its tests need from nothing: little while it
+   holds three tests, worth revisiting when B4's make it slow.
+
+**It does not block yet, and when it does.** Until the install executor's own
+root tests land, a red lane would be about the lane, so the `root-tests` job
+carries `continue-on-error: true`. **The switch, in the commit that merges B4's
+root tests:** delete that line; add `root-test` to the `ci` recipe in the
+justfile; and, if branch protection lists required checks, add the job's name.
+It is written in the job's comment and in the finish plan's B4 item. B4's tests
+are `tests/root_<name>.rs` in the crate that owns the code, behind
+`#![cfg(feature = "root-tests")]`, each beginning by asking `root_or_skip` and
+returning if it says no; the header of `root_lane.rs` says so.
+
+**No longer manual, and what still is.** The unit checks are no longer manual.
+The root tests are no longer manual as a mechanism: a test that must be root is
+a file and a lane, not a Docker session. What the lane does not yet hold is the
+install executor's tests (B4) and the audit production path, which step 6's open
+item 11 records as run by hand as root; that is the next thing to move in.
+Neither lane has run on a GitHub runner yet (amd64, Ubuntu 24.04, a fresh
+Docker). The units lane is a skip there until B1; the root lane is non-blocking,
+which is the second reason it is.
+
+Measured, on this host: `just verify` green at 100% lines, regions, and
+functions; `just check-linux`, and clippy over every target for both Linux
+triples, clean; `just linux-test` green on Linux 6.12.76 aarch64 as uid 1000
+(1076 tests, the lock library in use); `just root-test` green as uid 0 (three
+root tests, none skipped); `just units` against the broker branch's units green,
+and the failing cases above shown failing.
+
+---
+
 ## 2026-10-21 — M2b reviewed; the plan to finish it is written down
 
 A Fable review of the milestone against main at `829f41d` (three of four

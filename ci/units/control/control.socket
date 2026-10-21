@@ -1,0 +1,14 @@
+# The units lane's control socket, the partner of control.service: a socket unit
+# the lane must accept, and the base for the mutation of a socket's own keys
+# (ci/units/check.sh). `systemd-analyze security` does not apply to a socket, so
+# a misspelled key here is caught by `verify` or by nothing. It is never
+# installed.
+
+[Unit]
+Description=aido units lane control socket
+
+[Socket]
+ListenStream=/run/aido-control.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0660

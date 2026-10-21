@@ -79,7 +79,10 @@ exit. Packaging stays in phase 3.
   `Authorized<_>` from the step-6 contract. Merge.
 - **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). Finish the executor;
   make the post-install probe real against the merged gate (a safe no-op
-  request that must execute as uid 0); dotted-filename regression; merge.
+  request that must execute as uid 0); dotted-filename regression; merge. Its
+  real-file tests that need uid 0 join the root lane (`tests/root_*.rs`, run
+  by `just root-test`), and that lane stops being non-blocking in the same
+  commit: the three-step switch is written in the `root-tests` job in `ci.yml`.
 
 ### C. New builds *(after B; C1 before C2)*
 

@@ -45,6 +45,17 @@ rustix = { version = "1.1", default-features = false, features = [
 # sink that issues receipts without writing anything must not be linkable into
 # a shipped binary, so it exists only where a test build asks for it.
 fake = []
+# The tests that must run as uid 0: every `tests/root_*.rs`. Only
+# `ci/root-test.sh` (`just root-test`) runs them as root. The suites that enable
+# every feature build them and let them skip, loudly, as anyone else. Nothing
+# shipped reads this feature; it selects tests and changes no behaviour.
+root-tests = []
+
+# Without the feature the target does not exist, so a run that forgot it fails
+# ("requires the features") rather than running an empty binary and passing.
+[[test]]
+name = "root_lane"
+required-features = ["root-tests"]
 
 [dev-dependencies]
 # The system log's path must be the one the configuration crate names, and the
