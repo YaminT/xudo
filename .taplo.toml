@@ -6,10 +6,15 @@
 # directory makes `taplo fmt --check` fail for reasons that have nothing to do
 # with the repository's own formatting.
 #
-# `.claude/` holds other agents' git worktrees, each a whole checkout with its
-# own fixtures and its own gate. This checkout's check must not fail on
-# theirs.
-exclude = ["target/**", "fuzz/target/**", ".claude/**"]
+# `.claude/` and `.boof-runner-worktrees/` hold other agents' git worktrees, each
+# a whole checkout with its own fixtures and its own gate. This checkout's check
+# must not fail on theirs.
+exclude = [
+  "target/**",
+  "fuzz/target/**",
+  ".claude/**",
+  ".boof-runner-worktrees/**",
+]
 
 [formatting]
 align_entries = false
