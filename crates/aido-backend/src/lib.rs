@@ -34,10 +34,11 @@
 
 pub mod capability;
 pub mod detect;
+pub mod paths_to_root;
 pub mod plan;
 pub mod snippet;
 
 pub use capability::{Capability, CapabilityMatrix};
-pub use detect::{Backend, BackendKind, DetectError, Probe, detect};
+pub use detect::{Backend, BackendKind, DetectError, Probe, detect, identify, judge};
 pub use plan::{InstallPlan, PlanStep, uninstall_plan};
 pub use snippet::{DoasSnippet, SnippetError, SudoersSnippet};

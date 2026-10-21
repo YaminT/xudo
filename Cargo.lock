@@ -24,6 +24,7 @@ dependencies = [
  "insta",
  "serde",
  "serde_json",
+ "term-sanitize",
  "thiserror",
 ]
 
