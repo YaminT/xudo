@@ -106,7 +106,31 @@ pub fn json_of<T: serde::Serialize>(value: &T) -> String {
 
 /// Serializes anything, degrading to a denial envelope on failure.
 fn to_pretty<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|e| fallback(&e))
+    ascii_only(&serde_json::to_string_pretty(value).unwrap_or_else(|e| fallback(&e)))
+}
+
+/// JSON text with every byte outside printable ASCII written as a `\uXXXX`
+/// escape.
+///
+/// `serde_json` escapes only the C0 control characters, so a string holding
+/// U+009B (an 8-bit CSI), DEL, or U+202E (a right-to-left override) would
+/// reach a terminal that is shown the output raw. Outside a string JSON is
+/// ASCII, and inside one `\uXXXX` is the same character, so the result parses
+/// to the same value; an astral character becomes its surrogate pair, as JSON
+/// requires.
+fn ascii_only(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for character in json.chars() {
+        if character.is_ascii() && character != '\u{7f}' {
+            out.push(character);
+            continue;
+        }
+        let mut units = [0u16; 2];
+        for unit in character.encode_utf16(&mut units) {
+            let _ = write!(out, "\\u{unit:04x}");
+        }
+    }
+    out
 }
 
 /// The envelope emitted when serialization itself fails.
@@ -365,5 +389,29 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         for step in &steps {
             assert!(trace_line(step).len() > 5, "{step:?}");
         }
+    }
+
+    #[test]
+    fn denies_raw_c1_del_and_bidi_controls_in_json() {
+        // serde_json writes these through untouched; a terminal would act on
+        // them. U+009B is an 8-bit CSI, U+202E reverses what follows, and an
+        // astral character becomes the surrogate pair JSON requires.
+        let value = vec!["a\u{9b}31m\u{7f}\u{202e}b\u{1f600}\"\\ \n\u{1b}"];
+        let text = json_of(&value);
+        assert!(
+            text.bytes()
+                .all(|byte| byte == b'\n' || (b' '..=b'~').contains(&byte)),
+            "{text}"
+        );
+        assert!(
+            text.contains("\\u009b") && text.contains("\\u007f"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\\u202e") && text.contains("\\ud83d\\ude00"),
+            "{text}"
+        );
+        let back: Vec<String> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, value);
     }
 }

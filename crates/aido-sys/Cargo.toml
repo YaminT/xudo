@@ -17,8 +17,13 @@ aido-policy = { path = "../aido-policy", version = "0.0.1" }
 aido-sys-raw = { path = "../aido-sys-raw", version = "0.0.1" }
 bstr.workspace = true
 # Descriptor-relative opens and `fstat`, through rustix's safe API, so the
-# ruleset is verified on the descriptors it is read through.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# ruleset is verified on the descriptors it is read through; and this
+# process's own ids and groups, for `doctor`'s report of other paths to root.
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "fs",
+  "process",
+] }
 thiserror.workspace = true
 
 # The Linux tests start a real peer process and bound its connection with

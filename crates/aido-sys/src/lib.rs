@@ -45,6 +45,7 @@ pub mod audit;
 pub mod error;
 pub mod exec;
 pub mod kernel;
+pub mod live;
 mod mounts;
 pub mod platform;
 pub mod probe;
@@ -63,6 +64,7 @@ pub use audit::{
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
+pub use live::LiveHost;
 pub use mounts::MountRefusal;
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;

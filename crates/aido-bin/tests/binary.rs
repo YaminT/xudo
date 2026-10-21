@@ -139,6 +139,73 @@ fn doctor_succeeds_and_states_that_nothing_is_executed() {
         );
 }
 
+/// The `paths_to_root` check that reports on the caller's `PATH`.
+fn user_path_check(envelope: &serde_json::Value) -> &serde_json::Value {
+    envelope["paths_to_root"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check"] == "user_path")
+        .unwrap()
+}
+
+#[test]
+fn doctor_json_reports_on_the_path_the_process_was_started_with() {
+    // The binary is the one place the environment is read, so this is the one
+    // place it can be shown that the PATH a shell exported is the PATH the
+    // report judged: a directory this user owns, ahead of /usr/bin, is a
+    // place an agent could plant a `sudo` that captures the next password.
+    let planted = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bin-doctor-path-bin");
+    let _ = std::fs::remove_dir_all(&planted);
+    std::fs::create_dir_all(&planted).unwrap();
+    let planted = std::fs::canonicalize(&planted).unwrap();
+    let path = format!("{}:/usr/bin:/bin", planted.display());
+    let output = aido(&rules_dir("bin-doctor-json"))
+        .env("PATH", &path)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["exec_path"], "absent");
+    let check = user_path_check(&envelope);
+    assert_eq!(check["status"], "found", "{check}");
+    assert_eq!(
+        check["findings"][0]["path"],
+        planted.display().to_string(),
+        "{check}"
+    );
+    assert_eq!(envelope["proposals"], serde_json::Value::Null);
+}
+
+#[test]
+fn doctor_without_a_path_says_it_could_not_look_rather_than_clean() {
+    let output = aido(&rules_dir("bin-doctor-nopath"))
+        .env_remove("PATH")
+        .args(["--output", "json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = user_path_check(&envelope);
+    assert_eq!(check["status"], "unverified", "{check}");
+    assert_eq!(check["unverified"][0]["path"], "$PATH", "{check}");
+}
+
+#[test]
+fn doctor_fix_prints_proposals_and_changes_nothing() {
+    aido(&rules_dir("bin-doctor-fix"))
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(
+            contains("other paths to root")
+                .and(contains("proposed fixes: aido applies none of them"))
+                .and(contains("Nothing was changed.")),
+        );
+}
+
 #[test]
 fn check_succeeds_on_the_shipped_ruleset() {
     // The rules that actually ship, run through the real binary: valid, and

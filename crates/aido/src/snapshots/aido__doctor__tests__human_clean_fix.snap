@@ -1,0 +1,37 @@
+---
+source: crates/aido/src/doctor.rs
+expression: human(&fixed)
+---
+platform     test
+kernel       6.8 via SO_PEERPIDFD (agent path available)
+rules dir    /usr/bin
+ruleset      1 action(s), 1 file(s), generation 07c5344ec90d
+rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
+classified   unattested
+password     required
+hints        1 recorded, 0 trusted
+backend      sudo (Sudo version 1.9.17p2)
+backend caps 6 of 7 supported
+             absent: rejects argument wildcards
+exec path    absent in this build
+
+other paths to root, as yamin (uid 1000): none found
+  any one of these is a way to root that does not go through aido
+  passwordless rules    clean, 2 examined
+  group memberships     clean, 9 examined
+  unit directories      clean, 18 examined
+  root's PATH           clean, 8 examined
+    note: the directories /etc/sudoers names in secure_path, and the stock ones
+  your PATH             clean, 0 examined
+    note: the entries from /usr/bin on (2) were not examined: nothing there is found before /usr/bin/sudo
+  root's shell startup  clean, 24 examined
+  aido group            exists (gid 998); you are in it
+
+proposed fixes: aido applies none of them. Each is for a human to run, in a shell they started;
+a command that needs root starts with the backend, which asks for their password.
+  nothing to propose
+
+Nothing was changed.
+
+This build performs no privileged operation. Agent detection is not a
+security boundary; the allowlist and the compiled-in deny-list are.
