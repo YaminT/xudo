@@ -79,7 +79,7 @@ no-ignored-passes:
 
 # --- coverage ---------------------------------------------------------------
 
-# Three packages and one file are excluded, and every exclusion is load-bearing
+# Four packages and one file are excluded, and every exclusion is load-bearing
 # rather than convenient:
 #
 #   exec/host.rs is the only file that starts a child process. Its failure paths
@@ -93,6 +93,14 @@ no-ignored-passes:
 #               (`just test` runs it), not a coverage source. Excluding one tiny
 #               package is honest; a line-level waiver inside a shared file is
 #               not.
+#   aido-gate-bin is the same shape for the root executor: `main` collects argv,
+#               hands `aido_gate::run` the real host, writes the one line it
+#               returns, and exits with its status. Its `tests/binary.rs` runs
+#               the real binary under each name a hardlink could give it, with
+#               closed and leaked descriptors and a hostile argv, and asserts
+#               the status and the line. The whole sequence, every refusal in
+#               it, and every fake it runs against are in the `aido-gate` and
+#               `aido-sys` libraries, at 100% like everything else.
 #   ido-bin     is the same shape for `ido`, plus the raw terminal: reading the
 #               environment once, termios raw mode, and the alternate screen.
 #               None of that can run without a real terminal, so its
@@ -109,7 +117,7 @@ no-ignored-passes:
 # Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features \
+    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features \
         --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
         --fail-under-regions {{cov_regions}} \
@@ -122,11 +130,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 

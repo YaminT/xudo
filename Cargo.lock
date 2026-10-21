@@ -74,10 +74,21 @@ name = "aido-gate"
 version = "0.0.1"
 dependencies = [
  "aido-audit",
+ "aido-config",
  "aido-policy",
+ "aido-sys",
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "aido-gate-bin"
+version = "0.0.1"
+dependencies = [
+ "aido-gate",
+ "assert_cmd",
+ "predicates",
 ]
 
 [[package]]
@@ -108,6 +119,7 @@ dependencies = [
  "bstr",
  "proptest",
  "rustix",
+ "sha2",
  "thiserror",
 ]
 

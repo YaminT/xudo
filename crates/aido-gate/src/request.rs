@@ -154,6 +154,32 @@ pub enum RequestError {
         /// The generation now in force.
         current: u64,
     },
+    /// More than one entry in the spool is pinned to this caller's lineage.
+    ///
+    /// The broker mints one entry per request, and a caller waits for the gate
+    /// it started, so two means something else wrote an entry or the broker
+    /// is broken. Which one the caller meant cannot be told, and guessing is
+    /// choosing what runs as root, so the gate runs neither.
+    #[error(
+        "{matches} spool entries are pinned to this caller's lineage: which one was meant cannot \
+         be told, so none is run"
+    )]
+    Ambiguous {
+        /// How many entries matched.
+        matches: usize,
+    },
+    /// An entry pinned to this lineage is not the one its name says it is.
+    ///
+    /// The name is the nonce, and the broker writes the nonce inside the entry
+    /// too. An entry whose content disagrees with its name was not minted by
+    /// the broker's one code path.
+    #[error(
+        "spool entry {name} carries a different nonce than its name: it was not minted by the broker"
+    )]
+    ForgedNonce {
+        /// The entry's file name, which is a valid nonce.
+        name: String,
+    },
 }
 
 impl RequestError {
@@ -173,6 +199,8 @@ impl RequestError {
             Self::WrongCaller { .. } => "request_wrong_caller",
             Self::UnattributedConfirmation => "request_unattributed_confirmation",
             Self::StaleGeneration { .. } => "request_stale_generation",
+            Self::Ambiguous { .. } => "request_ambiguous",
+            Self::ForgedNonce { .. } => "request_forged_nonce",
         }
     }
 }
@@ -742,6 +770,10 @@ mod tests {
             RequestError::StaleGeneration {
                 minted: 1,
                 current: 2,
+            },
+            RequestError::Ambiguous { matches: 2 },
+            RequestError::ForgedNonce {
+                name: NONCE.to_owned(),
             },
         ];
 

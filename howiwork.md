@@ -349,11 +349,14 @@ file before acting on it.
 M1 (policy core, explain) done. M2a (backend model) done. M2b in progress:
 the Linux harness, the audited unsafe syscall layer, strictest
 overlapping-rule resolution, the mount-trust check, and the audit sinks
-(hash-chained file plus journald mirror, not yet called by the broker or the
-gate) are on main, and so is the broker (`aidod`), which mints the entries the
-gate will act on and writes its records to the journal, not yet to that chain;
-the doctor report is in review, and the gate binary is not yet built. Nothing
-can execute as root yet. Then: M3 out-of-band confirmation,
+(hash-chained file plus journald mirror; the gate writes through them, the
+broker not yet) are on main, and so are the broker (`aidod`), which mints the
+entries the gate will act on and writes its records to the journal, not yet to
+that chain, and the gate (`aido-gate-bin`: it consumes an entry, records the
+authorization, and execs the command, on the `-auth` name only); the doctor
+report is in review. Neither privileged half has yet run as root through
+`sudo`: nothing asks the broker (`aido exec`) and nothing installs the rule
+that reaches the gate. Then: M3 out-of-band confirmation,
 M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.

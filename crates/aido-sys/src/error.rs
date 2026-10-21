@@ -101,6 +101,23 @@ impl SysError {
     }
 }
 
+/// Lifts the errno a rustix call returned into the crate's error, naming the
+/// call, so the number survives for the callers that must tell one refusal
+/// from another.
+pub(crate) fn lift<T>(
+    operation: &str,
+    result: Result<T, rustix::io::Errno>,
+) -> Result<T, SysError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(errno) => Err(SysError::Os {
+            operation: operation.to_owned(),
+            code: Some(errno.raw_os_error()),
+            reason: errno.to_string(),
+        }),
+    }
+}
+
 impl From<aido_sys_raw::OsError> for SysError {
     fn from(failed: aido_sys_raw::OsError) -> Self {
         Self::os(failed.operation, &failed.error)
@@ -163,6 +180,14 @@ mod tests {
             err.to_string()
                 .starts_with("getsockopt(SO_PEERPIDFD) failed: ")
         );
+    }
+
+    #[test]
+    fn a_rustix_failure_is_lifted_with_its_errno_and_a_success_passes_through() {
+        let err = lift("dup2", Err::<(), _>(rustix::io::Errno::BADF)).unwrap_err();
+        assert_eq!(err.os_code(), Some(rustix::io::Errno::BADF.raw_os_error()));
+        assert!(err.to_string().starts_with("dup2 failed: "), "{err}");
+        assert_eq!(lift("dup2", Ok::<_, rustix::io::Errno>(7)), Ok(7));
     }
 
     #[test]

@@ -44,21 +44,26 @@
 //! | [`mod@decide`] | Does root's ruleset permit it, and what exactly may run? |
 //! | [`mod@env`] | What environment does the child get? (a fixed one, built here) |
 //! | [`status`] | How is the child's fate reported back faithfully? |
+//! | [`mod@run`] | In what order does the gate do all of it, and what stops it? |
 //!
-//! All four are pure. The syscalls that surround them — `close_range`, the
-//! `statfs` check on `/proc`, the `openat2` walk, `execveat` — live in
-//! `aido-sys` behind its trait, which is what lets every refusal below be
-//! reached by a test on a developer's laptop without root.
+//! The first four are pure. The syscalls that surround them — `close_range`,
+//! the `statfs` check on `/proc`, the trust walk, `execveat` — live in
+//! `aido-sys` behind its traits, which is what lets every refusal below be
+//! reached by a test on a developer's laptop without root. [`mod@run`] is the
+//! sequence written against those traits and holds no syscall of its own;
+//! `aido-gate-bin` is five lines that hand it the real host.
 
 pub mod decide;
 pub mod env;
 pub mod request;
+pub mod run;
 pub mod status;
 
 pub use decide::{
-    Approved, GateCaller, GateContext, Refusal, Severity, authorization_record, decide,
-    demanded_confirmation, refusal_record,
+    Approved, GateCaller, GateContext, Refusal, Severity, Stage, UNKNOWN_UID, authorization_record,
+    decide, demanded_confirmation, exec_failure_record, refusal_record,
 };
 pub use env::child_environment;
 pub use request::{PendingRequest, RequestError, SPOOL_DIR};
+pub use run::{GateExit, GateHost, SystemHost, run};
 pub use status::Termination;

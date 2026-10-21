@@ -47,12 +47,15 @@ pub mod connection;
 pub mod entropy;
 pub mod error;
 pub mod exec;
+pub mod hygiene;
 pub mod kernel;
 mod mounts;
 pub mod peer;
 pub mod platform;
 pub mod probe;
 pub mod proc;
+pub mod procfs;
+pub mod program;
 pub mod provenance;
 pub mod source;
 pub mod spool;
@@ -73,6 +76,7 @@ pub use connection::{
 pub use entropy::{Entropy, FakeEntropy, HostEntropy};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use mounts::MountRefusal;
 pub use peer::{
@@ -83,7 +87,9 @@ pub use peer::{
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
-pub use provenance::{Ancestry, ProcRef, ancestry, hints};
+pub use procfs::VerifiedProc;
+pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
+pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
 pub use source::{DirSource, MapSource, ProcSource};
 pub use spool::{FakeSpool, Spool, SpoolCall, SpoolDir, SpoolError, TEMP_PREFIX};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};

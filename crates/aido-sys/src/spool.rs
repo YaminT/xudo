@@ -21,6 +21,13 @@
 //! * **Under one lock.** [`Spool::lock`] takes `flock(LOCK_EX)` on the
 //!   directory, so concurrent brokers (`Accept=yes` starts one per
 //!   connection) prune and publish one at a time.
+//! * **Taken by an unlink, exactly once.** The gate does not lock: two gates
+//!   may read the same entry, and the unlink is what decides between them.
+//!   [`Spool::consume`] is therefore the one operation here whose "already
+//!   gone" is a *refusal* ([`SpoolError::Gone`]) and not a success, where the
+//!   broker's tidying, [`Spool::remove`], treats the same answer as the
+//!   outcome it wanted. A gate that read a missing name as consumed would run
+//!   the command a second time.
 //!
 //! The owner is a parameter of the descriptor half only, as in `trust.rs`:
 //! [`SpoolDir::open`] always demands root, and the tests point the descriptor
@@ -105,6 +112,16 @@ pub enum SpoolError {
         /// The name.
         name: String,
     },
+    /// The entry to consume is not there: somebody else took it first.
+    ///
+    /// Only [`Spool::consume`] reports it. The consumer is claiming the right
+    /// to act on what the entry authorizes, the unlink is the claim, and the
+    /// claimant who finds the name already gone lost.
+    #[error("{name} is already gone from the spool: another consumer took it first")]
+    Gone {
+        /// The name.
+        name: String,
+    },
     /// A system call on the spool failed.
     #[error("{operation} in {at} failed: {reason}")]
     Io {
@@ -153,11 +170,30 @@ pub trait Spool {
     /// Removes one entry. A name that is already gone is not an error: the
     /// gate may have consumed it a moment ago.
     ///
+    /// This is the broker's tidying, and the opposite of [`Self::consume`] on
+    /// exactly that point: here a missing name is the outcome that was wanted.
+    ///
     /// # Errors
     ///
     /// [`SpoolError::Io`] if it exists and cannot be removed, and
     /// [`SpoolError::InvalidName`] for a name that is not one component.
     fn remove(&self, name: &[u8]) -> Result<(), SpoolError>;
+
+    /// Takes one entry, so that it can be acted on at most once.
+    ///
+    /// The gate's operation. The unlink is the claim: two gates that read the
+    /// same entry both reach it, and exactly one succeeds. The one that finds
+    /// the name already gone **lost the race** and must run nothing, so a
+    /// missing name is [`SpoolError::Gone`], never `Ok`. That is the whole
+    /// difference from [`Self::remove`], which treats the same answer as
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// [`SpoolError::Gone`] if the name is not there,
+    /// [`SpoolError::Io`] if it exists and cannot be removed, and
+    /// [`SpoolError::InvalidName`] for a name that is not one component.
+    fn consume(&self, name: &[u8]) -> Result<(), SpoolError>;
 
     /// Writes `bytes` as the entry `name`, atomically and without replacing
     /// anything.
@@ -269,6 +305,15 @@ impl SpoolDir {
                 "mode {mode:04o} gives group or other access"
             )));
         }
+        // One name, because the unlink that consumes an entry removes only
+        // the name it is given: an entry that is also known by another name
+        // would outlive its own consumption.
+        let names = link_count(stat);
+        if names != 1 {
+            return Err(refuse(format!(
+                "{names} names, and an entry has exactly one"
+            )));
+        }
         Ok(())
     }
 
@@ -282,6 +327,19 @@ impl SpoolDir {
             self.failure("publish", error)
         }
     }
+
+    /// Unlinks `name` through the directory descriptor, and says whether there
+    /// was a name to unlink.
+    ///
+    /// The one unlink behind both [`Spool::remove`] and [`Spool::consume`], so
+    /// that what they disagree about is only what to make of `false`.
+    fn unlink_entry(&self, name: &[u8]) -> Result<bool, SpoolError> {
+        match unlinkat(&self.dir, plain(name)?, AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(errno) => Err(self.failure("unlinkat", &errno.into())),
+        }
+    }
 }
 
 /// The permission bits in a stat, masked to `0o7777`.
@@ -291,6 +349,16 @@ impl SpoolDir {
 #[allow(clippy::useless_conversion)]
 fn mode_bits(stat: &Stat) -> u32 {
     u32::from(Mode::from_raw_mode(stat.st_mode).bits()) & 0o7777
+}
+
+/// How many names a stat says the file has.
+///
+/// `st_nlink` is a `u64` on x86-64 Linux, a `u32` on arm Linux, and a `u16` on
+/// macOS: a real widening on two and an identity on the third, as `st_mode`
+/// is for [`mode_bits`].
+#[allow(clippy::useless_conversion)]
+fn link_count(stat: &Stat) -> u64 {
+    u64::from(stat.st_nlink)
 }
 
 /// Whether `name` is one plain component: non-empty, no `/`, not `.` or `..`.
@@ -377,9 +445,16 @@ impl Spool for SpoolDir {
     }
 
     fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
-        match unlinkat(&self.dir, plain(name)?, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-            Err(errno) => Err(self.failure("unlinkat", &errno.into())),
+        self.unlink_entry(name).map(|_| ())
+    }
+
+    fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
+        if self.unlink_entry(name)? {
+            Ok(())
+        } else {
+            Err(SpoolError::Gone {
+                name: name.as_bstr().to_string(),
+            })
         }
     }
 
@@ -433,6 +508,8 @@ pub enum SpoolCall {
     Read(Vec<u8>),
     /// [`Spool::remove`] of this name.
     Remove(Vec<u8>),
+    /// [`Spool::consume`] of this name.
+    Consume(Vec<u8>),
     /// [`Spool::publish`] under this name.
     Publish(String),
 }
@@ -441,7 +518,8 @@ pub enum SpoolCall {
 ///
 /// Behaves as [`SpoolDir`] does where it matters to a caller — publishing over
 /// a taken name is [`SpoolError::Exists`], removing a missing name succeeds,
-/// a read past the limit is [`SpoolError::TooLarge`] — and can be told to fail
+/// consuming one is [`SpoolError::Gone`], a read past the limit is
+/// [`SpoolError::TooLarge`] — and can be told to fail
 /// any operation, so every refusal a broker makes on a spool error is
 /// reachable without a broken filesystem. Every call is recorded in order.
 #[derive(Debug, Default)]
@@ -452,6 +530,7 @@ pub struct FakeSpool {
     names_error: Option<SpoolError>,
     unreadable: BTreeSet<Vec<u8>>,
     remove_error: Option<SpoolError>,
+    consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
 }
 
@@ -493,6 +572,13 @@ impl FakeSpool {
     #[must_use]
     pub fn failing_remove(mut self, error: SpoolError) -> Self {
         self.remove_error = Some(error);
+        self
+    }
+
+    /// Makes [`Spool::consume`] fail, leaving the entry where it is.
+    #[must_use]
+    pub fn failing_consume(mut self, error: SpoolError) -> Self {
+        self.consume_error = Some(error);
         self
     }
 
@@ -568,6 +654,17 @@ impl Spool for FakeSpool {
         scripted(self.remove_error.as_ref())?;
         self.files.borrow_mut().remove(name);
         Ok(())
+    }
+
+    fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
+        self.record(SpoolCall::Consume(name.to_vec()));
+        scripted(self.consume_error.as_ref())?;
+        match self.files.borrow_mut().remove(name) {
+            Some(_) => Ok(()),
+            None => Err(SpoolError::Gone {
+                name: name.as_bstr().to_string(),
+            }),
+        }
     }
 
     fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), SpoolError> {
@@ -813,6 +910,7 @@ mod tests {
             };
             assert_eq!(spool.read(name, 64).unwrap_err(), invalid);
             assert_eq!(spool.remove(name).unwrap_err(), invalid);
+            assert_eq!(spool.consume(name).unwrap_err(), invalid);
         }
         assert!(spool.publish("../escape", b"x").is_err());
     }
@@ -839,6 +937,25 @@ mod tests {
             assert!(err.to_string().contains(reason), "{err}");
         }
         assert_eq!(spool.read(b"real", 64).unwrap(), b"x");
+    }
+
+    #[test]
+    fn an_entry_anyone_else_can_write_is_unreadable() {
+        // The gate runs what an entry says as root, so an entry that group or
+        // world could have written is refused before it is read, whichever
+        // write bit it is, and so is one they can merely read.
+        let (spool, dir) = spool("writable");
+        for mode in [0o620, 0o602, 0o660, 0o606, 0o666, 0o644, 0o604] {
+            std::fs::write(dir.join("e"), "x").unwrap();
+            std::fs::set_permissions(dir.join("e"), std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = spool.read(b"e", 64).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("mode {mode:04o}")),
+                "{mode:o}: {err}"
+            );
+        }
+        std::fs::set_permissions(dir.join("e"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(spool.read(b"e", 64).unwrap(), b"x");
     }
 
     #[test]
@@ -887,6 +1004,51 @@ mod tests {
         std::fs::create_dir(dir.join("d")).unwrap();
         let err = spool.remove(b"d").unwrap_err();
         assert!(err.to_string().starts_with("unlinkat in"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_that_is_known_by_a_second_name_is_unreadable() {
+        // The unlink that consumes an entry removes one name. An entry with
+        // another name would outlive its own consumption, so it is refused
+        // before anything reads it.
+        let (spool, dir) = spool("second-name");
+        spool.publish("abc", b"{}").unwrap();
+        assert_eq!(spool.read(b"abc", 64).unwrap(), b"{}");
+        std::fs::hard_link(dir.join("abc"), dir.join("alias")).unwrap();
+        for name in [&b"abc"[..], b"alias"] {
+            let err = spool.read(name, 64).unwrap_err();
+            assert!(err.to_string().contains("2 names"), "{err}");
+        }
+    }
+
+    #[test]
+    fn consuming_an_entry_takes_it_and_the_second_consumer_is_told_it_is_gone() {
+        // Two gates read the same entry; the unlink decides. The loser must
+        // not be told it succeeded, because it would run the command again.
+        let (spool, dir) = spool("consume");
+        spool.publish("abc", b"x").unwrap();
+        spool.consume(b"abc").unwrap();
+        assert!(!dir.join("abc").exists());
+        assert_eq!(
+            spool.consume(b"abc").unwrap_err(),
+            SpoolError::Gone {
+                name: "abc".to_owned()
+            }
+        );
+        // The broker's tidying, on the same missing name, succeeds: the two
+        // operations differ in exactly this.
+        spool.remove(b"abc").unwrap();
+    }
+
+    #[test]
+    fn consuming_something_that_cannot_be_unlinked_is_an_error_and_not_a_claim() {
+        // A directory is not an entry; the unlink fails for a reason that is
+        // not "already gone", and that is reported as what it is.
+        let (spool, dir) = spool("consume-dir");
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let err = spool.consume(b"d").unwrap_err();
+        assert!(err.to_string().starts_with("unlinkat in"), "{err}");
+        assert!(dir.join("d").is_dir());
     }
 
     #[test]
@@ -961,6 +1123,9 @@ mod tests {
             SpoolError::Exists {
                 name: "x".to_owned(),
             },
+            SpoolError::Gone {
+                name: "x".to_owned(),
+            },
             SpoolError::Io {
                 operation: "x".to_owned(),
                 at: "y".to_owned(),
@@ -995,6 +1160,15 @@ mod tests {
         );
         fake.remove(b"a").unwrap();
         fake.remove(b"a").unwrap();
+        // Consuming takes an entry once, and a missing one is gone, as the
+        // directory says.
+        fake.consume(b"b").unwrap();
+        assert_eq!(
+            fake.consume(b"b").unwrap_err(),
+            SpoolError::Gone {
+                name: "b".to_owned()
+            }
+        );
         fake.publish("c", b"3").unwrap();
         assert_eq!(
             fake.publish("c", b"4").unwrap_err(),
@@ -1005,10 +1179,7 @@ mod tests {
         fake.unlock();
         assert_eq!(
             fake.files(),
-            BTreeMap::from([
-                (b"b".to_vec(), b"22".to_vec()),
-                (b"c".to_vec(), b"3".to_vec())
-            ])
+            BTreeMap::from([(b"c".to_vec(), b"3".to_vec())])
         );
         assert_eq!(
             fake.calls(),
@@ -1020,6 +1191,8 @@ mod tests {
                 SpoolCall::Read(b"zz".to_vec()),
                 SpoolCall::Remove(b"a".to_vec()),
                 SpoolCall::Remove(b"a".to_vec()),
+                SpoolCall::Consume(b"b".to_vec()),
+                SpoolCall::Consume(b"b".to_vec()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Unlock,
@@ -1041,6 +1214,7 @@ mod tests {
             .failing_names(broken.clone())
             .failing_read("a")
             .failing_remove(broken.clone())
+            .failing_consume(broken.clone())
             .failing_publish(broken.clone());
         assert_eq!(fake.lock(), Err(broken.clone()));
         assert_eq!(fake.names(), Err(broken.clone()));
@@ -1051,6 +1225,10 @@ mod tests {
                 .contains("scripted")
         );
         assert_eq!(fake.remove(b"a"), Err(broken.clone()));
+        assert_eq!(fake.consume(b"a"), Err(broken.clone()));
+        // A scripted failure leaves the entry where it was, as an unlink that
+        // failed does.
+        assert_eq!(fake.files().len(), 1);
         assert_eq!(fake.publish("b", b"2"), Err(broken));
         assert!(format!("{fake:?}").contains("FakeSpool"));
     }

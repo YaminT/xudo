@@ -87,6 +87,14 @@ pub const MAX_ENTRY_BYTES: usize = 32 * 1024;
 // An entry the broker wrote must always be one it can read back.
 const _: () = assert!(MAX_ENTRY_BYTES > aido_wire::MAX_REQUEST_BYTES);
 
+// And a spool kept within the broker's limits must be one the gate will walk
+// and read: it refuses a spool with more names than `MAX_SPOOL_NAMES` and
+// reads no entry past its own `MAX_ENTRY_BYTES`. The broker's ceilings sit
+// well below the gate's, so the gate's bounds only ever bite on a spool the
+// broker did not keep.
+const _: () = assert!(MAX_SPOOL_ENTRIES < aido_gate::run::MAX_SPOOL_NAMES);
+const _: () = assert!(MAX_ENTRY_BYTES <= aido_gate::run::MAX_ENTRY_BYTES);
+
 /// Random bytes in a nonce: 32, so 64 hex characters.
 const NONCE_BYTES: usize = 32;
 
