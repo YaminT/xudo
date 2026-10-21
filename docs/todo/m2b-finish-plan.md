@@ -133,6 +133,9 @@ exit. Packaging stays in phase 3.
   providers, YAML/JSON permission-set import, pasban's schedule and log
   verification, `airead`. *Decision: proposed homes M5/M6/phase 5.*
 
+Temporary permissions (requested 2026-10-21) are specified in `howiwork.md`
+and scheduled as the first part of M5 in `README.md`; they are not M2b work.
+
 ## Estimates
 
 Measured burn this cycle: about 2M agent tokens and 2–2.5 hours per completed

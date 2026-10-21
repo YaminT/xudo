@@ -581,6 +581,38 @@ and the failing cases above shown failing.
 
 ---
 
+## 2026-10-21 — Temporary permissions, planned for M5
+
+Requested: time-limited permissions that let a harness run something for a
+while without asking each time, default 30 minutes, for a single permission or
+a whole permission set (`aido set-temp nginx-reload 30m`, `... 24h`). Folded
+into the time-boxed grants M5 already planned, instead of a second mechanism,
+and specified in `howiwork.md` § Temporary permissions, spelled
+`aido grant <name> [duration]` to match the existing `grants`/`revoke` verbs.
+
+The decisions that keep it inside the invariants: a grant can only activate
+what root's rules already define (a permission, a set, or a `grant-only`
+dormant action), never invent or widen one; it is minted by a human on the
+password path, never by an agent and never from inside a grant; it lifts only
+the per-call confirmation, never the deny-list, a human-only action, the
+critical tier's confirmation, or the rate limits; a duration over the ceiling
+is refused rather than shortened; expiry is checked at every use, not left to
+pasban's sweep. It needs M4 to mean anything and needs permission sets to
+become a rule-file construct first, so it lands as the first part of M5, with
+five new standing properties listed in `docs/todo/README.md`.
+
+A Fable review of the spec found it met the request and returned four gaps,
+all closed before commit: the grantee is an M4 registry identity matched to
+the requester's kernel-attested scope at every use, never a name-based hint
+(invariant 1), and a bare grant's default grantee is written down; the spec
+now argues invariant 3 explicitly (the password-gated grant *is* the
+out-of-band confirmation, given in advance and time-boxed); a grant records
+the policy generation it was minted under and dies when the rules change; and
+a design-plan deviation now says which old CLI text it supersedes. It also
+made "live" mean both decision points, broker at mint and gate at exec.
+
+---
+
 ## 2026-10-21 — M2b reviewed; the plan to finish it is written down
 
 A Fable review of the milestone against main at `829f41d` (three of four

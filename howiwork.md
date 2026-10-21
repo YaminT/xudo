@@ -89,6 +89,70 @@ Every shipped set is tested as code and checked against the GTFOBins gate —
 a set that allowlists something shell-capable needs a written waiver naming
 why the rule makes the technique unreachable.
 
+### Temporary permissions
+
+A **temporary permission** lets a harness use a defined permission, or a whole
+permission set, without asking the human each time, for a bounded window that
+ends on its own.
+
+```
+aido grant nginx-reload              # 30 minutes, the default
+aido grant web-admin 24h             # a whole permission set
+aido grant nginx-reload 2h --agent claude-code --project /srv/site --max 20
+aido grants                          # what is live, who granted it, when it ends
+aido revoke <grant-id>               # end one early
+```
+
+What makes it safe:
+
+- **Only what root already defined.** A grant names an action or a set that
+  exists in root's rules. It cannot invent a permission or widen a matcher,
+  and the compiled-in deny-list is evaluated after it exactly as without it.
+- **Minted by a human, never by an agent.** Granting runs through the human
+  path: the `PASSWD` hop, where the human types the password, with the prompt
+  saying exactly what is granted, to whom, and until when. That password
+  prompt is the out-of-band confirmation for the whole window, given in
+  advance on a channel the requesting process tree cannot answer: a grant does
+  not skip invariant 3's confirmation, it *is* that confirmation, time-boxed
+  and recorded. An agent may *ask* for a grant (the request is shown to the
+  human, who mints it on the password path or declines); an attested agent
+  trying to mint or extend one itself is refused. The real boundary is that
+  minting always needs the human-path password; refusing a mint from inside a
+  live grant is a second guard, not the boundary.
+- **What it changes during the window**, for the named harness (and project,
+  if given). The harness is an enrolled identity from M4's registry, and at
+  every use the broker matches it to the requester's kernel-attested enrolled
+  scope: the name is how the human picks the grantee, never how a requester is
+  identified. A grant without `--agent` covers the sole enrolled agent, and
+  `--agent` is required when more than one is enrolled. During the window: the per-call out-of-band confirmation of the granted actions is
+  lifted, and actions marked `grant-only` (defined and reviewed, but dormant)
+  become usable. It does **not** lift a human-only action, does not lift the
+  critical tier's confirmation, and does not bypass rate limits: a burst still
+  forces confirmation even under a grant, then denies.
+- **Bounded.** The default is 30 minutes. Each permission or set may declare
+  a ceiling (`max-grant = "24h"`), a global ceiling caps all of them, and a
+  request above a ceiling is refused, not silently shortened. Deadlines are
+  monotonic, so moving the clock cannot extend one. An optional use count is
+  persisted before each execution.
+- **Expiry is enforced twice:** at every use — at both decision points, the
+  broker when it mints a request and the gate when it re-decides before
+  executing, so a request minted under a grant that expires before the gate
+  runs it is refused — and by pasban, which removes expired grants and reports
+  any grant it finds that should not exist.
+- **A grant never outlives the rules it named.** Each grant records the policy
+  generation it was minted under; installing new rules bumps the generation
+  and invalidates every outstanding grant.
+- **Visible and recorded.** Granting, every use under a grant, expiry, and
+  revocation each write an audit record, and while any grant is live, aido
+  shows a banner naming it.
+
+Grants are stored root-owned under `/var/lib/aido/grants` and read only
+through the trust walk. Standing, reviewed narrowing over days or weeks stays
+in `trust.d`; a grant is its time-boxed sibling, the short window an operator
+opens from the command line. Grants only mean something once the passwordless path exists (M4):
+until then every request asks for a password anyway. They are scheduled for
+M5, with permission sets becoming a construct in the rule files first.
+
 ## The components
 
 | Component | Privilege | Role |
@@ -254,6 +318,14 @@ Recorded so the reconciliation is visible, not silent:
 6. *"airead as a separate app"* → same engine, structurally restricted to
    read-class capabilities, so the read/write separation cannot drift between
    two codebases.
+7. *"Temp permissions: `aido set-temp nginx-reload 30m`, `aido set-temp
+   nginx-perm-set 24h`, default 30 minutes"* → adopted as temporary
+   permissions, spelled `aido grant <name> [duration]` to match the existing
+   `grants`/`revoke` verbs, default 30 minutes. A grant activates something
+   root already defined, for a named harness, minted by a human on the
+   password path; it lifts only the per-call confirmation, and never the
+   deny-list, a human-only action, the critical tier, or rate limits
+   (invariants 2 and 3).
 
 ## Derived views
 
@@ -282,6 +354,6 @@ gate) are on main, and so is the broker (`aidod`), which mints the entries the
 gate will act on and writes its records to the journal, not yet to that chain;
 the doctor report is in review, and the gate binary is not yet built. Nothing
 can execute as root yet. Then: M3 out-of-band confirmation,
-M4 enrollment and the passwordless path, M5 narrowing and bounded grants
+M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.
