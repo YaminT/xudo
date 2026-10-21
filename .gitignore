@@ -44,6 +44,9 @@ minisign.key
 cosign.key
 
 # Coding-agent and assistant state. Local working context, not project history.
+# boof task worktrees: boof creates them here today, so this entry is required.
+# Remove it once boof's worktree root moves outside the checkout.
+.boof-runner-worktrees/
 .claude/
 .claude-*
 CLAUDE.local.md
