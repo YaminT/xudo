@@ -1,0 +1,27 @@
+[package]
+name = "aidod-bin"
+description = "The `aidod` executable: hands descriptor 0 and standard error to the aidod library and exits with its status. Installed as /usr/libexec/aido/aidod."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package for the same reason as `aido-bin` and `ido-bin`: the library
+# is compiled, and therefore measured, exactly once. Excluded from coverage in
+# the justfile; `tests/broker.rs` runs the real binary as a process, with a
+# real socket on its standard input.
+[[bin]]
+name = "aidod"
+path = "src/main.rs"
+
+[dependencies]
+aidod = { path = "../aidod", version = "0.0.1" }
+
+[dev-dependencies]
+aido-wire = { path = "../aido-wire", version = "0.0.1" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+---
+source: crates/aido-wire/tests/contract_snapshots.rs
+expression: table
+---
+{"schema_version":1,"answer":{"refused":{"code":"request_too_large","remediation":"the request is longer than the broker reads; no rule permits a command this long, so shorten it rather than retrying"}}}
+{"schema_version":1,"answer":{"refused":{"code":"request_timed_out","remediation":"the request did not arrive complete before the broker's timeout; aido sends it in one write, so retry the aido command"}}}
+{"schema_version":1,"answer":{"refused":{"code":"request_unreadable","remediation":"the connection failed while the request was being read; retry the aido command"}}}
+{"schema_version":1,"answer":{"refused":{"code":"request_not_utf8","remediation":"the request is not UTF-8; aido refuses a non-UTF-8 argument before it sends anything, so this request did not come from aido"}}}
+{"schema_version":1,"answer":{"refused":{"code":"request_malformed","remediation":"the request is not a broker request; install aido and aidod from the same release"}}}
+{"schema_version":1,"answer":{"refused":{"code":"request_wrong_schema","remediation":"the request declares a schema this broker does not implement; install aido and aidod from the same release"}}}
+{"schema_version":1,"answer":{"refused":{"code":"program_not_absolute","remediation":"name the program by its absolute path; the broker never searches PATH"}}}
+{"schema_version":1,"answer":{"refused":{"code":"interior_nul","remediation":"an argument contains a NUL byte, which the kernel would cut short; remove it"}}}
+{"schema_version":1,"answer":{"refused":{"code":"peer_unidentified","remediation":"the broker could not establish which process asked; retry, and if it persists run `aido doctor` to see whether this host can identify a caller"}}}
+{"schema_version":1,"answer":{"refused":{"code":"spool_unusable","remediation":"the broker cannot use its spool; an administrator must check that /run/aido/req is a root-owned 0700 directory (systemd-tmpfiles --create)"}}}
+{"schema_version":1,"answer":{"refused":{"code":"spool_full","remediation":"too many requests are pending; wait for them to be used or to expire, then retry the aido command"}}}
+{"schema_version":1,"answer":{"refused":{"code":"policy_unloadable","remediation":"the root-owned ruleset or settings could not be loaded and the broker is failing closed; an administrator must run `aido check` and `aido doctor`"}}}
+{"schema_version":1,"answer":{"refused":{"code":"nonce_collision","remediation":"the broker drew a nonce that already names a request, so its random source is broken; an administrator must investigate before anything is retried"}}}
+{"schema_version":1,"answer":{"refused":{"code":"broker_unusable","remediation":"the broker could not complete the request and failed closed; an administrator should read the broker's audit record in the journal"}}}

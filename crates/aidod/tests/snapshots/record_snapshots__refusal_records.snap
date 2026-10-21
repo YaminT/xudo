@@ -1,0 +1,500 @@
+---
+source: crates/aidod/tests/record_snapshots.rs
+expression: text
+---
+## request_too_large with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_too_large",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "06503e09a48c4c2bf9f51e622059fe66b88b22d19cb3c800ea17d804bcfa2c7c",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## request_timed_out with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_timed_out",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "971ea5285146c9299b448d56c3decb0a4407c4eeea704d155bb0d42233d01cf6",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## request_unreadable with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_unreadable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "a7f94a3360721d3286cf13e26af9c84e21e89d091a1efa7f962fbd9f7817b01a",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## request_not_utf8 with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_not_utf8",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "5fca89953b528b1e29b7637e5e4ac7dc937ea19e374b384e2882470b87b4f79d",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## request_malformed with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_malformed",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "0a730b22a3fc6676d9c106f2a166108bf9f41346a99617fccac2a95238736b0e",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## request_wrong_schema with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_wrong_schema",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "30047ca646a8e8d6fe183a787ca80b93bded1258947c2ebd325d9d62213e6ed8",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## program_not_absolute with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "program_not_absolute",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "8b1e1436be75ced333d40e0dd5b37964e9dbd74bb56a92352a92ea1b5cb59a76",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## interior_nul with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "interior_nul",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=detail of the client's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "996507e71b4c26b6b109e0a3b5028f51a7fee4e279ea96bb6878b071507fc1a7",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## peer_unidentified with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "peer_unidentified",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "35b2ccdf99eacada68d2c23a7b996d7dad8ceeafa5480ec3c0d3453f9353c3f4",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## spool_unusable with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "spool_unusable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "bd7056b3ed64c21c54dd19b66447cef6f92e506061feb7968b8076634a160cd8",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## spool_full with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "spool_full",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "1715e8cc17489e3b74429c7f92e1daa7599e04e55af427a95ecfc08d4b9f17ba",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## policy_unloadable with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "policy_unloadable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "f7a79936118537301e0596c6cfe48551547ad0b68b4e90d40fe20c783af467c7",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## nonce_collision with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "nonce_collision",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "b1095d493e44f9db156aaac7c48455f9a8de37a80401e17f775f0a8bf212cff1",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## broker_unusable with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "broker_unusable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "85969bc7d3319bfea19d4008d741b9e6720bc912f67b663acf0185bc5bf3f9d8",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
+## before anything was known
+{
+  "action": null,
+  "argv": [],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "request_malformed",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=client",
+    "detail=not JSON"
+  ],
+  "hash": "65c76b7735373c2a20f22b46ce195bfa092f2a48264531ba31152d3907450f6f",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}

@@ -1,0 +1,43 @@
+# The broker's socket. systemd listens; each accepted connection starts one
+# aidod@.service instance with the connection as its standard input, so the
+# broker never listens, never parses LISTEN_FDS, and serves exactly one
+# request per process.
+#
+# Only members of the aido group can connect at all: the socket is 0660
+# root:aido in a 0755 /run/aido (docs/design-plan.md, the runtime file table).
+# crates/aidod/tests/units.rs asserts every security-relevant line here.
+
+[Unit]
+Description=aido privilege broker socket
+Documentation=https://github.com/YaminT/aido/blob/main/docs/design-plan.md
+
+[Socket]
+ListenStream=/run/aido/broker.sock
+Accept=yes
+SocketUser=root
+SocketGroup=aido
+SocketMode=0660
+DirectoryMode=0755
+# Bounded, so a group member cannot hold an unbounded number of root processes
+# open. For an AF_UNIX socket the per-source limit is per peer uid.
+#
+# What the per-source limit costs, measured on systemd 257: one connection
+# from a peer whose credentials systemd cannot read, because it is outside
+# systemd's own pid namespace, makes systemd fail this whole socket ("Failed to
+# get peer credentials of socket: No data available") until an administrator
+# restarts it, and the broker never starts. So /run/aido must never be
+# reachable from a pid namespace that systemd cannot see into: not from a
+# sibling container that shares it, and not by running systemd itself in a
+# container with callers outside. A container below systemd's namespace is
+# visible and unaffected. (docs/CONCERNS.md, the broker entry, open item 8.)
+MaxConnections=32
+MaxConnectionsPerSource=8
+# No trigger limit. The default for Accept=yes is 200 activations in 2 seconds,
+# and before systemd 255 hitting it fails the socket until an administrator
+# restarts it: one group member opening connections in a loop would refuse
+# everyone (seen on systemd 252). The two limits above already bound how many
+# brokers run at once, which is what a rate limit would be for.
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=sockets.target

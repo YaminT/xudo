@@ -4,7 +4,7 @@
 
 > **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
 >
-> - Thirteen crates, not five, with more in review for M2b. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the crate that confines `unsafe` (`aido-sys-raw`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase. `aidod` is planned but is not a member yet: it, its entry point `aidod-bin`, its wire protocol `aido-wire`, and the gate's entry point `aido-gate-bin` are in review. § Crate layout is the inventory.
+> - Sixteen crates, not five, with one more in review for M2b. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the crate that confines `unsafe` (`aido-sys-raw`), the entry-point packages (`aido-bin`, `ido-bin`), `ido` with its own phase, and the broker with its entry point `aidod-bin` and its wire protocol `aido-wire` (M2b step 2, built 2026-10-21). The gate's entry point `aido-gate-bin` is in review. § Crate layout is the inventory.
 > - `unsafe` exists only in the crate `aido-sys-raw`, in its `sys` module: five syscalls in six blocks, budget enforced by a test; every other crate, `aido-sys` included, forbids it. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only (2026-10-19). `SO_PEERCRED` is the fifth, added 2026-10-19: rustix decodes it with a `NonZeroI32` pid, which is undefined behaviour when the kernel reports pid 0.
 > - A pidfd pins *which* process connected, not its pid number and not its credentials at connect time. Connect-time identity comes from `SO_PEERCRED` on every rung; `PIDFD_GET_INFO` reports current credentials; every read of `/proc/<pid>` is followed by a liveness check through the pidfd. The 5.3 `pidfd_open` rung withholds the agent path: its pin cannot be bound to the connection, so the passwordless path needs Linux 6.5 (2026-10-19).
 > - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
@@ -114,9 +114,9 @@ The plan began with five crates and the deviations above account for the rest. T
 | `aido-sys-raw` | The five system calls that cannot be made safely, and the kernel-written records for two of them: the one crate that does not forbid `unsafe_code`, within a published block budget |
 | `aido` | The unprivileged front-end library: parses a request, loads the root-owned ruleset, asks `aido-policy` for a decision, and renders it. Decides nothing, holds no secret |
 | `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else |
-| `aido-wire` | **in review (M2b).** The wire protocol between `aido` and `aidod`: the messages and the parser for them |
-| `aidod` | **in review (M2b).** The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `aido explain` uses, and mints bounded one-use requests |
-| `aidod-bin` | **in review (M2b).** The `aidod` executable, socket-activated on `/run/aido/broker.sock` |
+| `aido-wire` | The wire protocol between `aido` and `aidod`: the messages and the parser for them |
+| `aidod` | The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `aido explain` uses, and mints bounded one-use requests. Built; its audit record goes to standard error until plan item D1 routes it through the step-6 trail |
+| `aidod-bin` | The `aidod` executable, socket-activated on `/run/aido/broker.sock` |
 | `aido-gate` | The gate's decision core: a second, independent policy engine that re-decides from root-owned state and trusts nothing it was handed. Pure |
 | `aido-gate-bin` | **in review (M2b).** The gate executable, installed as `aido-gate` with `aido-gate-auth` as a hardlink |
 | `ido` | The buffered human-run command queue: queue, picker state machine, runner, and `AGENTS.md` splicer. Unprivileged |

@@ -1,0 +1,14 @@
+---
+source: crates/aidod/tests/record_snapshots.rs
+expression: text
+---
+broker_unusable (Broker)
+    a permitted decision names no action, so the gate would have nothing to look up
+spool_unusable (Broker)
+    a-name already exists in the spool
+spool_full (Client)
+    the spool holds 64 live entries and 4096 bytes; the limits are 64 entries and 1048576 bytes
+spool_full (Client)
+    uid 1000 already holds 8 live entries; the limit for one uid is 8
+nonce_collision (Broker)
+    nonce abababababababababababababababababababababababababababababababab already names a pending request

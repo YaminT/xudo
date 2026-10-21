@@ -4,6 +4,447 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-21 — M2b step 2 (B1): `aidod`, the broker that mints, final
+
+Built 2026-10-19; this entry was finished when it landed, after the review
+fixes, the safe `SO_PEERCRED` decode (open item 8, resolved), and the decision
+to leave the audit trail unwired (open item 6, which is plan item D1).
+
+**Why it exists.** The gate refuses with `NoPendingRequest` unless a
+root-minted entry exists under `/run/aido/req`, so until now the human path
+could not have executed anything even with a gate binary. The broker is the
+only thing that writes there. It grants nothing a password does not: every
+caller is `Unattested` until M4, and an entry only lets the gate run, through
+`sudo`, what root's ruleset already permits that caller.
+
+**What exists now.**
+
+- **`aidod`** (library, privileged, 100% covered) and **`aidod-bin`** (the
+  entry point, `/usr/libexec/aido/aidod`, excluded from coverage like
+  `aido-bin` and run as a process by `tests/broker.rs`). One connection per
+  process: `serve` identifies the peer, reads one request, checks the spool,
+  loads root's policy, classifies, decides, mints, answers, in that order, so a
+  refusal never describes something not yet established. Every step that fails
+  answers with a refusal and writes an audit record.
+- **`aido-wire`**, a new pure crate (`aido-policy`, `serde`, `thiserror`, no
+  I/O) holding the protocol, so `aido exec` (step 3) links it without linking
+  the broker. A request is `schema_version`, an absolute `program`, `argv` as
+  strings, and `claimed_classification` — a hint the broker records and never
+  reads. At most 16 KiB; not UTF-8, an unknown or missing key, another schema,
+  a relative program, or a NUL anywhere is refused before anything is decided.
+  The answer is either the engine's own versioned `Decision` envelope plus, when
+  minted, `{nonce, deadline, ttl_secs, gate}`, or a `RefusalCode` — fourteen,
+  append-only, numbered like the denial taxonomy — with a fixed remediation
+  sentence. The client never sees a path or an errno; the detail goes to the
+  audit record. `BrokerResponse::parse` also refuses a decision whose envelope
+  version is not this build's.
+- **Peer identification** (`aidod::identify`) asks the kernel down the ladder
+  and never reads its version: `SO_PEERCRED` on every rung, a pid of 0 refused
+  before anything takes a pid; `SO_PEERPIDFD`, and
+  on `ENOPROTOOPT` only, `pidfd_open` on the connect-time pid, and on `ENOSYS`
+  only, no pidfd (`PeerCredOnly`); `PIDFD_GET_INFO` where it answers, dropped on
+  `ENOTTY`/`EINVAL` only, its thread-group id required to equal the connecting
+  pid; the start time from `/proc/<pid>/stat`, which must name that pid; and
+  after the last `/proc` read, a zero-timeout poll on the pidfd, refusing a
+  peer that has exited. Every other errno is a refusal and never a lower rung.
+- **A seam for the rest of the peer calls**, `aido_sys::PeerCalls`
+  (`SO_PEERCRED`, `pidfd_open`, `/proc/<pid>/{stat,status}`, the pidfd poll)
+  with `HostPeer` and a `FakePeer` that scripts a *sequence* per call and
+  records the order, so tests assert that the liveness check follows the last
+  `/proc` read. The
+  `Syscalls` trait stays the calls that need `unsafe`, and `SO_PEERCRED` is one
+  of them: `HostPeer::peer_cred` reads it through `Syscalls::peer_cred`, after
+  its own check of the socket's kind (open item 8). Also new in
+  `aido-sys`, each with a host implementation and a fake: `Connection`
+  (descriptor 0 adopted only if it is a connected `AF_UNIX` `SOCK_STREAM`
+  socket, duplicated rather than taken, `SO_RCVTIMEO` and `SO_SNDTIMEO` of five
+  seconds through rustix, one bounded read, one write), `Spool`, `Clock`
+  (`CLOCK_MONOTONIC` in whole seconds, for the gate to read too), `Entropy`
+  (`getrandom`, a short read refused), and `read_trusted_file` for the
+  optional settings file.
+- **Minting** (`aidod::mint`). Only a permitted decision mints, confirming ones
+  included with `confirmed = false`: on the password path the password is the
+  confirmation. The entry is `aido_gate::PendingRequest` with the generation of
+  the ruleset `load_trusted_rules` returned, the request's program and operands
+  as asked, the pin from the kernel, a 32-byte `getrandom` nonce in lowercase
+  hex, and a deadline `REQUEST_TTL_SECS` (fifteen minutes) past
+  `CLOCK_MONOTONIC`. Under the spool's `flock`: temporary files and unreadable,
+  misnamed, expired, or superseded entries are removed, an older entry for the
+  same `(pid, starttime)` included, so the gate finds one entry per caller;
+  so is an entry whose caller `/proc/<pid>/stat` no longer shows as the pinned
+  `(pid, starttime)` (it can never be consumed, since the gate checks its own
+  caller against the pin); then at most 64 live entries and 1 MiB, and 8 whose
+  live caller runs as the asking uid, or `spool_full`; then
+  `O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` under `.tmp.<nonce>` (no nonce starts
+  with a dot), `fchmod 0600`, and `renameat2(RENAME_NOREPLACE)`, so a colliding
+  nonce is `nonce_collision`, never an overwrite. The spool is opened through
+  the trust walk and must be a root-owned directory giving group and other
+  nothing; the descriptor half takes its owner as a parameter, so the real
+  writer runs in the suite as uid 1000 on Linux.
+- **Root's policy** (`aidod::policy`): the ruleset only through
+  `load_trusted_rules`, settings from `/etc/aido/config.toml` through the same
+  walk or the documented defaults when it is absent — absence decided inside
+  the verified parent directory, where nobody else could have created it — and
+  the decision from `aido_policy::evaluate_command`, the function `explain`
+  calls, so the broker inherits step 2b's strictest-rule resolution instead of
+  searching beside it. A settings file that is present and broken refuses.
+- **Units** in `packaging/`: `aidod.socket` (`Accept=yes`, `0660 root:aido`,
+  `MaxConnections=32`, `MaxConnectionsPerSource=8`, which systemd keys by peer
+  uid on `AF_UNIX`), `aidod@.service` (`StandardInput=socket`; root with an
+  empty `CapabilityBoundingSet`; `NoNewPrivileges`, `ProtectSystem=strict` with
+  `ReadWritePaths=-/run/aido/req` alone, `PrivateTmp`, `PrivateDevices`,
+  `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `ProcSubset=pid`, the
+  kernel and clock protections, `SystemCallFilter=@system-service` minus
+  `@privileged @resources`, `RuntimeMaxSec=30`, `TasksMax=4`, `LimitNOFILE=64`,
+  `CollectMode=inactive-or-failed`), and `tmpfiles.d/aido.conf` (`/run/aido`
+  `0755`, `/run/aido/req` `0700`). `aidod/tests/units.rs` includes all three
+  and asserts every security-relevant line against the constants the code
+  uses, and refuses any key it does not know, because systemd ignores a
+  misspelled directive with a warning. Checked against systemd 257 in
+  Docker: `systemd-analyze verify` is silent on both units and an instance,
+  `systemd-analyze security` rates the service 1.1 (both now run on every pull
+  request by the D5 lane, `just units`, which was run against these units and
+  passed), and `systemd-tmpfiles` creates both directories with those modes,
+  by hand. The phase-3 layout table lists them.
+- **Audit**: one `aido_audit::Record` per connection as a JSON line on
+  standard error, which the unit sends to the journal, each the first of a
+  chain of one. It is **not** routed through step 6's `AuditTrail` and
+  `authorize`: that is plan item D1 (`docs/todo/m2b-finish-plan.md`), left
+  whole rather than half-wired (open item 6). A minted decision is recorded
+  *before* the entry exists, and if the record cannot be written, or standard
+  error is not a connected socket (open item 9), nothing is minted.
+
+**Decisions worth knowing.**
+
+1. **Recovered work.** The first agent on this step died mid-build. Its move of
+   the front-end's `best_match` into `aido-policy` was superseded at the rebase
+   by step 2b's `evaluate_command`, which the broker now calls; nothing else of
+   it was discarded.
+2. **The euid is compared on every rung, not only where `PIDFD_GET_INFO`
+   answers.** Without the record it comes from `/proc/<pid>/status`, confirmed
+   by the same re-check. A peer that connected and then exec'd a set-user-ID
+   program is refused either way. Stricter than the brief.
+3. **`PeerCredOnly` (no pidfd at all) still serves the human path**, recorded
+   `pinned=false`, as `kernel.rs` already argued: the password is the
+   authority there. Nothing on that rung, or on `PidfdOpen`, can become an
+   agent path.
+4. **The peer is identified before its request is read**, so a refusal for a
+   malformed request can name who sent it, and a peer that cannot be named is
+   never read at all.
+5. **Exit status is by fault.** 0 when the broker did its job, whatever it
+   decided — including a malformed request and a client that hung up before
+   its answer; 19 only when the broker or its host is broken (no spool, an
+   unloadable policy, no randomness, an unwritable record, a peer the host
+   cannot name). Otherwise any group member could fill systemd's list of
+   failed units by hanging up, which is also why the instances are collected.
+6. **A filtered system call fails with `EPERM` instead of killing the
+   broker**, so the client still receives a refusal and the journal a record.
+7. **`ReadWritePaths=-/run/aido/req`**: with the dash, a missing spool lets the
+   broker start and answer `spool_unusable` with the remediation, rather than
+   systemd failing the instance before anything can say why. It widens
+   nothing.
+8. **Standard output is the journal, not left to default**: with
+   `StandardInput=socket` it would default to the socket itself.
+9. **The fifteen-minute TTL** is `sudo`'s `passwd_timeout` times
+   `passwd_tries` at their defaults. The entry is bound to one process and
+   consumed on use, so the TTL is not the window in which it can be abused.
+10. **Shaped for coverage, not waived:** `HostPolicy::load` and
+    `SpoolDir::names` map their last fallible call instead of using `?`,
+    because a root-owned broken settings file and a failing `readdir` cannot
+    be produced without root; every failure of those calls is tested where it
+    is made (`settings_from`, `SpoolDir::checked`).
+
+**Tests**, named for the attack. On the wire:
+`denies_a_request_that_tries_to_name_its_own_caller`,
+`denies_non_utf8_bytes_instead_of_replacing_them`,
+`denies_a_lone_surrogate_escape_rather_than_decoding_it`,
+`denies_an_interior_nul_in_the_program_or_any_operand`,
+`denies_a_program_that_would_be_resolved_against_a_path_or_a_cwd`,
+`a_decision_in_an_envelope_of_another_version_is_refused`. Identification, on
+fakes: `denies_a_peer_reaped_before_so_peerpidfd_rather_than_dropping_a_rung`,
+`denies_a_peer_whose_pidfd_outlived_it_from_six_sixteen`,
+`denies_a_kernel_record_nobody_answered`,
+`denies_a_pidfd_that_names_a_different_process`,
+`denies_a_peer_that_exec_d_a_set_user_id_program_after_connecting`,
+`denies_a_peer_that_exited_between_the_proc_read_and_the_re_check`,
+`a_peer_with_pid_zero_is_refused_and_never_looked_up_as_a_process`, and
+`denies_pid_zero_even_when_every_later_answer_would_agree` (every answer past
+`SO_PEERCRED` scripted to agree, so that only the refusal stops it: without
+the refusal `identify` returns an identity pinned to pid 0), every other errno
+of each call, and each rung. Serving:
+`a_peer_the_kernel_reports_as_pid_zero_is_never_minted_for` (without the
+refusal the broker mints),
+`the_claimed_classification_is_recorded_and_changes_nothing`,
+`denied_requests_mint_nothing_and_never_touch_the_spool` (unknown action,
+rejected operand, deny-list hit through a rule that allows a shell),
+`a_colliding_nonce_is_refused_and_never_overwrites_a_pending_request`,
+`nothing_is_minted_whose_audit_record_cannot_be_written`,
+`a_client_that_leaves_before_its_answer_cannot_make_the_broker_fail`. The
+spool: `a_planted_temporary_file_or_link_is_never_written_through`,
+`publishing_over_a_taken_name_is_refused_and_leaves_both_files_alone`,
+`a_spool_reached_through_a_symbolic_link_is_refused_even_a_root_owned_one`.
+On a real kernel with a separate peer process (`aidod/tests/linux.rs`,
+without a branch on the kernel: the expected answer is computed from the
+version): `a_live_peer_is_named_on_the_rung_the_kernel_version_predicts`,
+`a_peer_that_exited_mid_identification_is_refused_while_its_number_is_still_its_own`
+(a zombie, held with `waitid(WNOWAIT)`: every read by number succeeds and only
+the pidfd re-check can tell),
+`a_peer_reaped_before_identification_is_refused_and_never_looked_up_by_number`,
+and `a_real_client_is_identified_decided_and_minted_for_end_to_end`. The
+binary: `a_socket_activation_environment_it_never_asked_for_changes_nothing`
+and `a_descriptor_zero_that_is_not_a_stream_socket_is_refused_with_a_record`.
+The socket-kind check in front of `SO_PEERCRED`, on a real kernel in
+`aido-sys`: `peer_credentials_of_a_connected_datagram_socket_are_refused_rather_than_decoded`,
+`peer_credentials_of_a_tcp_connection_are_refused_rather_than_decoded`, and
+`peer_credentials_of_a_socket_with_no_peer_are_refused_rather_than_decoded`.
+The units: `the_unit_never_puts_the_broker_in_a_pid_namespace_of_its_own` and
+the unknown-directive refusal.
+
+**Outside the step.** `justfile` and CI exclude `aidod-bin` from coverage with
+its reason, and `CLAUDE.md` says three entry points are excluded and lists the
+two new crates. `rustix` in `aido-sys` gains the `net`, `process`, `event`,
+`time`, and `rand` features of the crate already in the tree; no new crate.
+
+**Review fixes.** The independent review found seven things. The socket unit
+gains `TriggerLimitIntervalSec=0`, because systemd before 255 fails an
+`Accept=yes` socket for good at 200 activations in two seconds, which any group
+member could cause (`a_group_member_cannot_fail_the_socket_for_everyone_with_a_burst_of_connections`);
+concurrency stays bounded by `MaxConnections=` and `MaxConnectionsPerSource=`.
+A client that connects and exits is the client's fault, not the broker's:
+`SO_PEERPIDFD` `EINVAL` (6.5 to 6.15), `PIDFD_GET_INFO` and `pidfd_open` `ESRCH`,
+and a full spool exit 0 (`a_client_that_connects_and_exits_cannot_make_the_broker_exit_as_broken`).
+The rest are open items 2, 8, 9 and 10 below, and snapshots for the refusal
+codes, their remediation sentences, and the audit records
+(`aido-wire/tests/contract_snapshots.rs`, `aidod/tests/record_snapshots.rs`;
+`renaming_a_refusal_code_breaks_the_wire_contract_and_this_test`).
+
+**Open.**
+
+1. **The gate's half (step 4).** It must find the entry by its caller's pin,
+   validate it, and remove it, which is what makes the nonce one-use; the
+   broker's "one live entry per caller" relies on that removal. It must read
+   the clock through `aido_sys::HostClock`. `CLOCK_MONOTONIC` is per time
+   namespace; an unprivileged caller cannot be root inside one it created, so
+   the broker and the gate should always read the same clock, but step 4
+   should confirm it rather than assume it.
+2. **Per-uid fairness in the spool: narrowed, not closed.** The review showed
+   the first version of this item was too kind: 64 clients run one after
+   another, each gone before the next, filled the spool for fifteen minutes
+   with nothing alive (`sixty_four_exited_callers_cannot_lock_everyone_else_out`,
+   and through `serve`,
+   `sixty_four_clients_that_ran_and_exited_cannot_lock_another_user_out`). Now
+   an entry counts only while its caller is still the pinned process, and no
+   schema change was needed: the cap of 8 per uid (`MAX_ENTRIES_PER_UID`)
+   reads the uids of each live caller from `/proc/<pid>/status`, real and
+   effective both, so a caller that exec'd a set-user-ID program after minting
+   stays on its user's share (`a_set_uid_caller_stays_on_its_real_users_share`).
+   What remains: eight members of the group, each holding eight live callers,
+   still fill the spool; and a caller that stays alive keeps its entry for the
+   whole fifteen minutes. A real per-user quota would need the uid in the
+   entry (a schema change the gate must accept).
+3. **Run outside systemd**, the broker bounds each read by `SO_RCVTIMEO` but
+   not the whole request, so a client trickling one byte per four seconds holds
+   it for hours; under the unit, `RuntimeMaxSec=30` ends it. As designed, and
+   the binary is never meant to be run by hand.
+4. **A systemd whose `@system-service` predates `pidfd_open`** filters it
+   to `EPERM`, which is a refusal, reachable only on the `PidfdOpen` rung
+   (kernels 5.3 to 6.4). Not checked against old systemd versions.
+5. **Only the units' text is checked by systemd, not the broker under them.**
+   `just units` (D5, `ci/units/`) puts `systemd-analyze verify` and
+   `security --offline` on every unit under `packaging/` in CI, outside
+   `just verify` because it needs Docker and the network. Nothing starts the
+   broker under its own sandbox: phase 3's container tests are where that
+   belongs (see item 10).
+6. **The audit trail is not wired: plan item D1 is the explicit next step
+   (decided 2026-10-21, at B1, not to half-wire it).** Step 7 is wired. Step
+   6, `aido_sys::audit::{AuditTrail, authorize}`, is not: the broker's half of
+   it is not a contained change, which is the finish plan's test for doing it
+   now, and its parts are one piece. The broker keeps its stderr record and
+   mints under the stopgap of open item 9.
+   * **No receipt without the real trail.** `AuditReceipt` and `Authorized`
+     can be made only inside `aido_sys::audit`, so the mint cannot take "an
+     authorization whose record went to standard error" unless a weaker sink
+     is added to that module, and a receipt that sometimes means "the chain
+     holds the record" and sometimes "a line was written" would say less than
+     the type says now. The only honest source of one is
+     `AuditTrail::system("aidod")`.
+   * **The unit must reach the trail**, a sandbox change that cannot be
+     tested here: `/var/lib/aido` writable (`ReadWritePaths=` and a
+     `tmpfiles.d` line making it `0700 root`; the only writable path today is
+     `-/run/aido/req`), the journal socket reachable under
+     `ProtectSystem=strict` (connecting to a socket is not a write to the
+     filesystem, but nothing here has run it), the system-call filter checked
+     against the calls the log and the journal sender make, and the trust walk
+     of `open_trusted` run inside that sandbox, which open item 10 already
+     calls argued, not measured.
+   * `Platform` gains a sink seam (`&mut dyn AuditSink`) and `serve` threads it
+     through every refusal, so every `serve` test that reads the stderr
+     record changes with it.
+   * The record is built from the chain's last record (`Record::after`), not
+     `Record::first`, so `record.rs` and its snapshots change.
+   * The mint takes an `Authorized<MintApproval>` (`impl Approval`: command
+     and governing action), which changes `publish` and `Minting`.
+   * Open item 9's stderr attestation is replaced by the trail itself, and its
+     test with it; the `aidod-bin` process tests, which run unprivileged and
+     read the records from standard error, then need a trail they can reach
+     through a seam the binary does not have.
+   * Whether "the record could not be written" gets a refusal code of its own
+     (today `broker_unusable`, the reason in the record) changes the pinned
+     wire contract, so it is a reviewed snapshot change (step 6, open item 1).
+
+   The order for whoever does it (D1, which also covers the gate): the unit
+   and `tmpfiles` first, measured under systemd in Docker; then the seam; then
+   `authorize` around the mint. Until then no record of the broker is chained
+   or hash-linked, and `aido audit --log` has nothing of the broker to verify.
+7. Seen, not changed: the front-end reads `/etc/aido/config.toml` by path and
+   the broker through the trust walk. They parse it identically; only the
+   broker's reading is trusted, which is as it should be.
+8. **RESOLVED 2026-10-21 (B1). Decision, the user's, 2026-10-19: a sixth
+   `unsafe` block.** rustix's `UCred` holds the pid as a `Pid`, which cannot
+   be zero, filled by `assume_init` from whatever the kernel wrote, and the
+   kernel writes 0 for a socket with no peer, for a socket type that records
+   none (a connected datagram socket, TCP), and for a peer outside the
+   caller's pid namespace: undefined behaviour in 1.1.4 and 1.1.5 alike. The
+   user chose to decode `SO_PEERCRED` into plain integers in `aido-sys-raw`
+   (commit `829f41d`, `Syscalls::peer_cred`; see "the sixth `unsafe` block" at
+   the end of this file), and the broker now reads the record through it:
+   `HostPeer::peer_cred` is the socket-kind check (a connected `AF_UNIX`
+   stream or seqpacket, kept as defence in depth; `UnixConnection::adopt`
+   refuses the same on the broker's descriptor) followed by
+   `HostSyscalls.peer_cred`. rustix's `socket_peercred` is called nowhere in
+   the workspace, and two guards keep it so (below).
+
+   A pid of 0 is its own refusal, `IdentifyError::PeerNotVisible`, raised
+   before any call that takes a pid; a pid that is negative decodes to 0 and
+   is refused the same way. It counts as the broker's fault (exit 19): the
+   broker cannot see its caller, which no unprivileged client can arrange by
+   itself. Four tests fail if the refusal is removed, which was checked by
+   removing it (`identify` then returns an identity pinned to pid 0, and
+   `serve` mints an entry for it):
+   `denies_when_the_socket_has_no_credentials_or_a_peer_outside_the_namespace`,
+   `a_peer_with_pid_zero_is_refused_and_never_looked_up_as_a_process`,
+   `denies_pid_zero_even_when_every_later_answer_would_agree`, and
+   `a_peer_the_kernel_reports_as_pid_zero_is_never_minted_for`. The last two
+   script every later answer to agree with pid 0, so they fail on the
+   consequence and not only on the missing error. The decode is pinned by
+   `a_peer_outside_the_pid_namespace_decodes_as_pid_zero_never_an_identity`.
+
+   **The switch itself needed a guard of its own**, which no test of the
+   decode can be. The review put rustix's call back into
+   `HostPeer::peer_cred` and the whole Linux suite passed: rustix decodes every
+   peer a test can make correctly and goes wrong only on the one it was
+   dropped for. Two guards hold it now, one of which runs on every host.
+   * **`clippy.toml` bans `rustix::net::sockopt::socket_peercred`**
+     (`disallowed-methods`, denied across the workspace), and its reason names
+     `Syscalls::peer_cred` as the replacement. The function exists in rustix
+     only on Linux, so the entry carries `allow-invalid = true`; without it
+     every lint run on a Mac warns that the path names nothing. It bites where
+     clippy sees `HostPeer`'s Linux half, which is the two Linux runners'
+     `just lint`; a Mac's `just verify` never compiles that half. Checked by
+     putting the call back: clippy for `x86_64-unknown-linux-gnu` reports "use
+     of a disallowed method".
+   * **`nothing_reads_so_peercred_through_rustix_anywhere_in_the_workspace`**
+     (`aido-sys-raw/tests/unsafe_budget.rs`) looks for the name as a token,
+     comments and strings aside, in every Rust file of every crate and of the
+     fuzz crate, on every host. Checked by putting the call back: it fails and
+     names `peer.rs`. Beside it,
+     `the_lint_that_bans_rustix_socket_peercred_is_still_in_clippy_toml` fails
+     if the ban leaves the file or stops naming what to use instead, and
+     `the_peercred_scan_finds_every_spelling_of_the_call_and_nothing_that_is_not_one`
+     tests the scanner.
+
+   **The unit-file note that `/run/aido` must not be shared across pid
+   namespaces is kept, for a different reason.** It no longer guards against
+   undefined behaviour: a peer the broker cannot see is a clean refusal.
+   What it guards against is systemd's own behaviour, measured on systemd
+   257.13 (Debian trixie, in Docker, with a second container sharing the
+   socket's volume as the peer). With `MaxConnectionsPerSource=` set, as
+   `aidod.socket` has it, one connection from a peer outside systemd's pid
+   namespace made systemd log "Failed to get peer credentials of socket: No
+   data available" and fail the whole socket (`Result: resources`) until an
+   administrator restarts it, and the broker was never started. Without that
+   setting systemd started an instance, `…@0-unknown.service`, and the
+   broker's own refusal was the only guard. So the broker is safe either way,
+   and the cost of the per-uid bound is stated rather than left to be found:
+   `/run/aido` must never be reachable from a pid namespace that systemd
+   cannot see into (a sibling container sharing it, or systemd itself in a
+   container with a peer outside it). A container whose pid namespace is a
+   descendant of systemd's is visible to it, by how the kernel nests pid
+   namespaces (not measured here), and unaffected. The shipped socket unit
+   says so in the comment directly above the setting, and a test keeps it
+   there: `the_per_source_limit_states_what_it_costs_beside_the_limit` reads
+   only that block of comment, its wrapped lines joined, and requires the
+   measured cost and the rule's own sentence (`/run/aido must never be
+   reachable from a pid namespace`), so that deleting the rule or moving the
+   note away from the limits fails it (checked by deleting the rule). Its
+   first version searched the whole file above the limit, where those words
+   also occur for other reasons, and stayed green with the rule deleted;
+   `a_note_that_was_deleted_moved_or_cut_off_from_the_limits_fails_the_check`
+   tests the check. The other half of the old note stays as its own
+   test, `the_unit_never_puts_the_broker_in_a_pid_namespace_of_its_own`: a
+   private pid namespace for the broker would make every caller pid 0 and
+   every request a refusal, and the broker reads callers' `/proc` entries by
+   number, which works only from a namespace its callers are visible in.
+9. **The audit trail is attested by its descriptor, not by the journal.**
+   "Nothing is minted whose record cannot be written" held only for a
+   `write()` that fails. systemd points standard error at `/dev/null` when it
+   cannot connect a service to the journal ("Failed to connect stderr to the
+   journal socket, ignoring"), and Rust reopens a closed descriptor 2 on
+   `/dev/null`: every write then succeeds and records nothing. The broker now
+   requires standard error to be a connected `AF_UNIX` stream socket before it
+   mints (`Platform::trail`, `aidod::trail_of`;
+   `nothing_is_minted_when_standard_error_does_not_reach_the_journal`); a
+   denial is answered regardless
+   (`a_denial_is_answered_even_when_there_is_no_trail_to_write`). That is what
+   holds, no more: a socket, not proof that it reaches the journal or that
+   something else did not take the other end. The hash-chained sink of step 6
+   is the real answer.
+10. **Step 7's mount-trust check and the unit's sandbox.** Inside the broker's
+   unit, `ReadWritePaths=-/run/aido/req` makes the spool a separate bind mount
+   (mountinfo shows `/aido/req /run/aido/req rw ... tmpfs`) on top of a
+   read-only `/run`, because `ProtectSystem=strict` marks every mount
+   read-only; and `ProcSubset=pid` gives the broker its own `/proc` instance.
+   The gate runs unsandboxed and sees a plain directory. The review's worry was
+   that a mount-layout rule would judge the same spool differently in the
+   broker and the gate, and the broker would refuse every request as
+   `spool_unusable`; and the earlier note that step 7 "applies automatically"
+   was not shown. Read against what step 7 became, it composes, for these
+   reasons and no others. It judges a descriptor by the mount `fdinfo` names,
+   in the mount namespace of the thread that walked, so the broker's walk and
+   the broker's table agree whatever the unit rearranged. It judges a mount by
+   what the filesystem is: FUSE and its `user_id`, `idmapped`, a user
+   namespace. It does not judge by flags or bind roots under a root-owned
+   path (`MountPolicy::RootPath` ignores `nosuid`/`noexec`/`ro`, because
+   `/run` itself is `nosuid`), so the read-only `/run` and the tmpfs bind on
+   it pass; and `tmpfs` is accepted as anything else root mounted is. It reads
+   the table only through a descriptor `fstatfs` shows to be procfs, which the
+   unit's `/proc` instance is, and `/proc/thread-self/{fdinfo,mountinfo}`
+   remain under `ProcSubset=pid`. **What is not shown:** all of that is read
+   from the code and its tests, run outside the unit. No test starts the broker
+   under its own sandbox and walks the spool there; until one does (phase 3's
+   container tests, with open item 5), treat the composition as argued, not
+   measured. Any later tightening of `RootPath` that looks at flags, bind
+   roots, or sources must be tested under the unit first. The unit is not
+   changed here, and no `NoExecPaths=`/`ExecPaths=` is in it.
+
+Measured, on the commit that carries this entry: `just verify` green (100%
+lines, regions, and functions on macOS, through the pre-commit hook);
+`just check-linux` clean for both Linux triples; `just linux-test` green on
+Linux 6.12.76 in Docker as uid 1000, the new Linux tests included; `just units`
+(the D5 lane, added to main while this was in review) green against the two
+units, `verify` silent and the service at 1.1 of the 1.2 ceiling. The same
+`cargo llvm-cov` command `just coverage` runs, run in that container as uid
+1000, is 100% on every file this change adds or touches. It was not before:
+a Linux-only test used `matches!`, whose non-matching arm is a region no test
+reaches, which would have failed the Linux runners' coverage gate and no macOS
+run could show (`spool.rs`, now an `assert_eq!`). Two files this change does
+not touch are below 100% in the container and are left to the runners: `probe.rs`
+(needs `sudo` or `doas` installed, which the container lacks) and `syscall.rs`
+(one test's closure runs only from kernel 6.16, and the container has 6.12; the
+runners have 6.17).
+
+---
+
 ## 2026-10-21 — D5: the unit checks and the root tests are CI lanes now
 
 Finish-plan item D5. Two checks that had been done by hand in a Docker session
@@ -2432,6 +2873,6 @@ Two package-level exclusions remain, both recorded in the `justfile` with reason
 
 **Decided by the user.** `aido-sys-raw` gains `getsockopt(SO_PEERCRED)` as its fifth call and sixth block, and the published budget in `sys.rs` goes from 5 to 6 in the same commit.
 
-**Why.** rustix 1.1.x decodes `SO_PEERCRED` with `assume_init` into a `UCred` whose `pid` is a `Pid(NonZeroI32)`. The kernel reports pid 0 for a datagram socket and for a peer outside the caller's pid namespace, so a safe rustix call is undefined behaviour on an answer the broker can be handed (verified against rustix 1.1.4 and 1.1.5 source in an earlier review). A broker that decodes a hostile peer's credentials must not have UB on the answer "nobody". The new call reads into a `#[repr(C)]` `PeerCred { pid: i32, uid: u32, gid: u32 }` (size and offsets asserted against `libc::ucred`, length checked after the call, a record the kernel never wrote refused), so zero is a value, not a trap. It is exposed as `Syscalls::peer_cred`; it does not decide what pid 0 means, which is the broker's call (step 2 switches to it).
+**Why.** rustix 1.1.x decodes `SO_PEERCRED` with `assume_init` into a `UCred` whose `pid` is a `Pid(NonZeroI32)`. The kernel reports pid 0 for a datagram socket and for a peer outside the caller's pid namespace, so a safe rustix call is undefined behaviour on an answer the broker can be handed (verified against rustix 1.1.4 and 1.1.5 source in an earlier review). A broker that decodes a hostile peer's credentials must not have UB on the answer "nobody". The new call reads into a `#[repr(C)]` `PeerCred { pid: i32, uid: u32, gid: u32 }` (size and offsets asserted against `libc::ucred`, length checked after the call, a record the kernel never wrote refused), so zero is a value, not a trap. It is exposed as `Syscalls::peer_cred`; it does not decide what pid 0 means, which is the broker's call (step 2 switches to it). **Switched 2026-10-21:** the broker reads `SO_PEERCRED` only through it and refuses pid 0 as `PeerNotVisible`; rustix's `socket_peercred` is called nowhere, and is banned in `clippy.toml` and by a scan of every Rust file. See open item 8 of the M2b step 2 entry.
 
 **Tests.** `a_peer_cred_pid_of_zero_is_reported_as_zero_never_a_panic`, `a_peer_cred_is_refused_on_something_that_is_not_a_socket`, `a_peer_cred_is_refused_on_a_directory_and_on_a_device`, and a fake-driven pid-0 test on every platform. Measured on a 6.12 kernel: a datagram socket is not refused, it answers success with pid 0 and uid and gid `u32::MAX`, which is the real-kernel pid-0 case the test pins; only a non-socket is an errno (`ENOTSOCK`).

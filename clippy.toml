@@ -9,6 +9,14 @@ disallowed-methods = [
   { path = "std::env::var_os", reason = "See std::env::var." },
   { path = "std::env::vars", reason = "See std::env::var." },
   { path = "std::process::Command::new", reason = "No PATH search, ever. Resolve absolutely in aido-sys, then exec the fd you validated." },
+  # `socket_peercred` exists in rustix only on Linux, so on any other host the
+  # path names nothing, and `allow-invalid` keeps that from being a warning
+  # there. It also means a rustix that moved the function would leave this
+  # entry banning nothing without a word: re-check the path on an upgrade.
+  # The entry bites where clippy runs for Linux, which is CI's two Linux
+  # runners. aido-sys-raw/tests/unsafe_budget.rs fails if it is removed, and
+  # also scans every Rust file for the name, which is what holds on a Mac.
+  { path = "rustix::net::sockopt::socket_peercred", allow-invalid = true, reason = "rustix decodes the pid into a NonZero type with assume_init: undefined behaviour on the pid 0 the kernel reports for a peer outside the pid namespace. Use aido_sys::Syscalls::peer_cred (CONCERNS, M2b step 2, open item 8)." },
 ]
 
 disallowed-types = [

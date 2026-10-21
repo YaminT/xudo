@@ -20,6 +20,20 @@
 //! their delimiters understood, and what remains is judged as tokens. Outside
 //! `sys.rs` the keyword `unsafe` may not appear at all, in any position, and no
 //! lint attribute may name `unsafe_code` except to deny or forbid it.
+//!
+//! # The reason for the sixth block
+//!
+//! `sys.rs` reads `SO_PEERCRED` itself because rustix's `socket_peercred`
+//! decodes the pid into a type that cannot be zero, and the kernel answers 0 for
+//! a peer outside the caller's pid namespace (docs/CONCERNS.md, the M2b step 2
+//! entry, open item 8). Putting rustix's call back decodes every peer a test
+//! will ever make correctly and fails only on the one it was removed for, so no
+//! behavioural test can tell. The last section of this file therefore looks for
+//! the call's name, as a token, in every Rust file, and checks that the lint
+//! that bans it is still in `clippy.toml`: the lint resolves the call whatever
+//! it is imported as and whatever macro writes it, which a scan of names
+//! cannot, but it names a function that exists only on Linux, so it bites only
+//! where clippy runs for Linux, and the scan is what runs everywhere.
 
 #![allow(
     clippy::unwrap_used,
@@ -580,5 +594,125 @@ fn the_scanner_does_not_lose_code_after_a_literal_that_looks_like_a_comment() {
         "let l = 'a; unsafe { x() }",
     ] {
         assert!(offence(source).is_some(), "{source}");
+    }
+}
+
+// The reason for the sixth block (see the module docs): nothing may read
+// `SO_PEERCRED` through rustix, and no behavioural test can tell if something
+// does. The scan below runs on every host, macOS included, where the lint that
+// bans the call has nothing to resolve.
+
+/// The name rustix's decode goes by. It is one function, in
+/// `rustix::net::sockopt`, and is spelled the same under every import.
+const RUSTIX_DECODE: &str = "socket_peercred";
+
+/// How many times `source` names rustix's decode as code. A comment or a string
+/// that mentions it is not a use.
+fn rustix_peercred_uses(source: &str) -> usize {
+    tokens(source)
+        .iter()
+        .filter(|token| word(Some(*token), RUSTIX_DECODE))
+        .count()
+}
+
+#[test]
+fn nothing_reads_so_peercred_through_rustix_anywhere_in_the_workspace() {
+    let files = every_rust_file();
+    assert!(
+        files.len() > 30,
+        "the scan found too little to be looking in the right place"
+    );
+    let peer = workspace_root()
+        .join("crates/aido-sys/src/peer.rs")
+        .canonicalize()
+        .unwrap();
+    assert!(
+        files.contains(&peer),
+        "the scan must reach the file that reads SO_PEERCRED for the broker"
+    );
+
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|file| rustix_peercred_uses(&fs::read_to_string(file).unwrap()) > 0)
+        .map(|file| file.display().to_string())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "rustix's socket_peercred decodes the pid into a type that cannot be zero, which is \
+         undefined behaviour on the pid 0 the kernel reports for a peer outside the pid \
+         namespace. Read the record through aido_sys::Syscalls::peer_cred instead. Named in:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn the_lint_that_bans_rustix_socket_peercred_is_still_in_clippy_toml() {
+    let root = workspace_root();
+    let clippy = read_toml(&root.join("clippy.toml"));
+    let banned = clippy["disallowed-methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some("rustix::net::sockopt::socket_peercred"))
+        .expect("clippy.toml must ban rustix::net::sockopt::socket_peercred");
+    let reason = banned["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("Syscalls::peer_cred"),
+        "the ban must say what to use instead: {reason}"
+    );
+    // A ban nobody is held to is a comment: every crate lints with it denied.
+    assert_eq!(
+        read_toml(&root.join("Cargo.toml"))["workspace"]["lints"]["clippy"]["disallowed_methods"]
+            .as_str(),
+        Some("deny"),
+        "disallowed_methods must stay denied across the workspace"
+    );
+}
+
+#[test]
+fn the_peercred_scan_finds_every_spelling_of_the_call_and_nothing_that_is_not_one() {
+    for (case, source) in [
+        (
+            "full path",
+            "fn f(s: BorrowedFd<'_>) { let _ = rustix::net::sockopt::socket_peercred(s); }",
+        ),
+        (
+            "through the module",
+            "fn f(s: BorrowedFd<'_>) { let _ = sockopt::socket_peercred(s); }",
+        ),
+        ("imported", "use rustix::net::sockopt::socket_peercred;"),
+        (
+            "imported in a group",
+            "use rustix::net::sockopt::{socket_domain, socket_peercred};",
+        ),
+        (
+            "imported under another name",
+            "use rustix::net::sockopt::socket_peercred as creds;",
+        ),
+        (
+            "after a glob import",
+            "use rustix::net::sockopt::*; fn f(s: BorrowedFd<'_>) { let _ = socket_peercred(s); }",
+        ),
+        (
+            "a raw identifier",
+            "fn f(s: BorrowedFd<'_>) { let _ = r#socket_peercred(s); }",
+        ),
+        (
+            "after a literal that looks like a comment",
+            "let s = \"//\"; let _ = socket_peercred(fd);",
+        ),
+    ] {
+        assert!(rustix_peercred_uses(source) > 0, "{case}: {source}");
+    }
+    for source in [
+        "// rustix::net::sockopt::socket_peercred(s)",
+        "/// rustix's `socket_peercred`, which decodes pid 0 into a NonZero",
+        "/* socket_peercred */",
+        "let s = \"socket_peercred\";",
+        "let s = r#\"socket_peercred\"#;",
+        "let socket_peercred_of = 1; let not_socket_peercred = 2;",
+        "let creds = HostSyscalls.peer_cred(socket);",
+    ] {
+        assert_eq!(rustix_peercred_uses(source), 0, "{source}");
     }
 }

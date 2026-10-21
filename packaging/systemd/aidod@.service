@@ -1,0 +1,67 @@
+# One broker per connection, as root without capabilities, in the tightest
+# sandbox that still lets it do its one job: identify the peer, read root's
+# ruleset, and write one entry under /run/aido/req.
+#
+# crates/aidod/tests/units.rs asserts every security-relevant line here, and
+# refuses any key it does not know: systemd ignores a misspelled directive with
+# a warning, which for a hardening line means silently running without it.
+
+[Unit]
+Description=aido privilege broker (one connection)
+Documentation=https://github.com/YaminT/aido/blob/main/docs/design-plan.md
+# Failed instances are released rather than accumulated: a group member can
+# make connections fail, and each failure is in the journal regardless.
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/libexec/aido/aidod
+# The connection is descriptor 0. Standard output would default to the socket
+# too; the broker writes nothing there, and nothing stray may reach the client.
+StandardInput=socket
+StandardOutput=journal
+# One audit record per connection, as a JSON line, into the journal.
+StandardError=journal
+# Every read and write times out after five seconds; this ends whatever those
+# do not.
+RuntimeMaxSec=30
+
+# Root, but no capabilities at all: every file it reads or writes is root's,
+# /proc/<pid>/stat and status are world-readable, and pidfds need none.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+
+# The whole filesystem read-only except the spool.
+ProtectSystem=strict
+# "-": if tmpfiles has not created it, the broker still starts and answers
+# spool_unusable, rather than failing before it can say why.
+ReadWritePaths=-/run/aido/req
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# No network, and no socket but a Unix one; the connection arrives open.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A filtered call fails rather than killing the broker, so the client still
+# gets a refusal and the journal still gets a record.
+SystemCallErrorNumber=EPERM
+TasksMax=4
+LimitNOFILE=64

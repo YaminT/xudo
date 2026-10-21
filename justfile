@@ -79,7 +79,7 @@ no-ignored-passes:
 
 # --- coverage ---------------------------------------------------------------
 
-# Two packages and one file are excluded, and every exclusion is load-bearing
+# Three packages and one file are excluded, and every exclusion is load-bearing
 # rather than convenient:
 #
 #   exec/host.rs is the only file that starts a child process. Its failure paths
@@ -99,11 +99,17 @@ no-ignored-passes:
 #               `tests/willyoumarryme.rs` drives it through real processes and a
 #               real pseudo-terminal instead. The picker's logic is not here; it
 #               is in the `ido` library, at 100% like everything else.
+#   aidod-bin   is the same shape for the root broker: it borrows descriptor 0
+#               from standard input, where systemd puts the accepted connection,
+#               hands it and standard error to `aidod::run`, and exits with what
+#               that returns. Its `tests/broker.rs` runs the real binary with a
+#               real socket, a file, and nothing at all on descriptor 0. Every
+#               decision is in the `aidod` library, at 100%.
 #
 # Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --all-features \
+    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features \
         --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
         --fail-under-regions {{cov_regions}} \
@@ -116,11 +122,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude aido-bin --exclude ido-bin --exclude aidod-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 

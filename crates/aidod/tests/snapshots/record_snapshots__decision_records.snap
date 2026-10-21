@@ -1,0 +1,102 @@
+---
+source: crates/aidod/tests/record_snapshots.rs
+expression: text
+---
+## minted
+{
+  "action": "aido.svc.restart",
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "allowed",
+  "denial": null,
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=aidod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=0c462193521ac56bc31d18803e7064fe6bafe0fb934f3b5d82030a2f39398450",
+    "nonce=abababababababababababababababababababababababababababababababab",
+    "deadline=1900"
+  ],
+  "hash": "89956a0a3ee2562e2e6606bc576bd71723b87b79cead8bd63ff21159c2dd93fc",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": "20-services.toml:3",
+  "schema_version": 1,
+  "seq": 1
+}
+
+## awaiting confirmation
+{
+  "action": "aido.svc.restart",
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "awaiting_confirmation",
+  "denial": null,
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=aidod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=0c462193521ac56bc31d18803e7064fe6bafe0fb934f3b5d82030a2f39398450"
+  ],
+  "hash": "f23c29a7a82c8995233feea29b1243cd3c35b97379f1813b6115c6711659b126",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": "20-services.toml:3",
+  "schema_version": 1,
+  "seq": 1
+}
+
+## denied
+{
+  "action": null,
+  "argv": [
+    "x"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "argv_rejected",
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=aidod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=0c462193521ac56bc31d18803e7064fe6bafe0fb934f3b5d82030a2f39398450"
+  ],
+  "hash": "f2e47da5ac8f3708c17dfc2adc57aa28d6b7f61ee69c732cd7f0f5317a3d7a58",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}

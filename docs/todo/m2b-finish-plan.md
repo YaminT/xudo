@@ -103,7 +103,10 @@ exit. Packaging stays in phase 3.
   a direct hostile invocation and a denial leave theirs; a failing sink stops
   mint and execution; `aido audit --log` passes on the produced trail and fails
   after truncation. Decide and record how a post-execution outcome is obtained
-  with an exec-in-place gate.
+  with an exec-in-place gate. The broker's half was examined at B1 and left
+  whole, not half-wired: `CONCERNS.md`, the M2b step 2 entry, open item 6,
+  lists what it touches and the order to do it in (the unit's sandbox first,
+  measured under systemd).
 - **D2. Fuzz target** for the `aido-wire` request parser, a trust-boundary
   parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`.
 - **D3. Doctor oracle.** Ask the programs themselves — `sudo -l -U <user>` when

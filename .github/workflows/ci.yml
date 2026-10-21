@@ -58,7 +58,7 @@ jobs:
       - name: Doc tests
         run: just doc-test
 
-      - name: Coverage (100%, two documented package exclusions)
+      - name: Coverage (100%, three documented package exclusions)
         run: just coverage-clean && just coverage
 
       - name: Supply chain

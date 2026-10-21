@@ -42,17 +42,23 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod clock;
+pub mod connection;
+pub mod entropy;
 pub mod error;
 pub mod exec;
 pub mod kernel;
 mod mounts;
+pub mod peer;
 pub mod platform;
 pub mod probe;
 pub mod proc;
 pub mod provenance;
 pub mod source;
+pub mod spool;
 pub mod syscall;
 pub mod trust;
+pub mod trusted_file;
 
 #[cfg(any(test, feature = "fake"))]
 pub use audit::FakeAuditSink;
@@ -60,20 +66,32 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
+pub use clock::{Clock, FixedClock, HostClock};
+pub use connection::{
+    AdoptError, Connection, FakeConnection, ReadFailure, UnixConnection, connected_unix_stream,
+};
+pub use entropy::{Entropy, FakeEntropy, HostEntropy};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use mounts::MountRefusal;
+pub use peer::{
+    FakePeer, HostPeer, PeerCall, PeerCalls, PeerCred, ProcFile, StatusUids, lacks_peer_pidfd,
+    lacks_pidfd_info, lacks_pidfd_open, parse_status_euid, parse_status_uids, peer_was_reaped,
+    process_is_gone,
+};
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
 pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints};
 pub use source::{DirSource, MapSource, ProcSource};
+pub use spool::{FakeSpool, Spool, SpoolCall, SpoolDir, SpoolError, TEMP_PREFIX};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,
     read_trusted_dir, verify_path,
 };
+pub use trusted_file::read_trusted_file;
 
 // Re-exported so a consumer does not need to depend on aido-policy just to
 // name the types this crate returns.

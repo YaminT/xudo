@@ -71,10 +71,15 @@ impl DirSource {
     ///
     /// This is a lexical check, not a resolution: it stops an obvious mistake
     /// rather than a determined attacker, and it does not need to stop one.
-    /// Nothing read through this type can authorize anything, so the worst a
-    /// traversal could achieve is reading a file the caller can already read as
-    /// themselves. The symlink-resistant `openat2` resolution belongs on the
-    /// exec path, where a lie does have consequences.
+    /// Do not mistake it for protection of an authorization decision. The
+    /// broker reads the identity pin (`/proc/<pid>/stat`, `status`) through
+    /// this type, by path, and nothing checks that the root is a procfs: the
+    /// pin is only as true as the `/proc` of the process that reads it. That
+    /// holds because the broker runs in root's own mount namespace, where an
+    /// unprivileged caller cannot replace `/proc`, and because the pidfd
+    /// re-check, not this read, is what ties the number to the process. The
+    /// symlink-resistant `openat2` resolution belongs on the exec path, where
+    /// a lie hands out root.
     fn resolve(&self, relative: &str) -> Result<PathBuf, SysError> {
         if relative.is_empty() {
             return Err(SysError::read(relative, "empty path"));

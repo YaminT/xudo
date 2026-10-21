@@ -42,6 +42,9 @@ Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need h
 ```
 /usr/bin/aido                             0755 root:root   no setuid bit, ever
 /usr/libexec/aido/aido-gate-auth          0755 root:root   no setuid bit, ever
+/usr/libexec/aido/aidod                   0755 root:root   the broker; started per connection, never by hand
+/usr/lib/systemd/system/aidod.socket      0644 root:root   packaging/systemd/aidod.socket: /run/aido/broker.sock, 0660 root:aido
+/usr/lib/systemd/system/aidod@.service    0644 root:root   packaging/systemd/aidod@.service: one sandboxed instance per connection
 /usr/share/doc/aido/                                       README, SECURITY, changelog, copyright
 /usr/share/man/man1/aido.1.gz
 /usr/share/man/man5/aido-rules.5.gz                        the rule-file format
@@ -49,8 +52,10 @@ Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need h
 /etc/aido/rules.d/*.toml                                   conffiles — see § 2.2
 /etc/aido/deny.d/00-catastrophic.toml                      conffile, FOR READING ONLY
 /etc/sudoers.d/aido                       0440 root:root   generated in postinst, never shipped
-/usr/lib/tmpfiles.d/aido.conf
+/usr/lib/tmpfiles.d/aido.conf             0644 root:root   packaging/tmpfiles.d/aido.conf: /run/aido 0755, /run/aido/req 0700
 ```
+
+The three files under `packaging/` are tested as code by `crates/aidod/tests/units.rs`, which refuses any directive it does not know — systemd ignores a misspelled one with a warning — and asserts every security-relevant line against the constants the code uses. The postinst creates the `aido` group before it enables `aidod.socket`, because `SocketGroup=aido` fails without it.
 
 Control fields:
 

@@ -125,6 +125,43 @@ name = "aido-tests"
 version = "0.0.1"
 
 [[package]]
+name = "aido-wire"
+version = "0.0.1"
+dependencies = [
+ "aido-policy",
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "aidod"
+version = "0.0.1"
+dependencies = [
+ "aido-audit",
+ "aido-backend",
+ "aido-config",
+ "aido-gate",
+ "aido-policy",
+ "aido-sys",
+ "aido-wire",
+ "insta",
+ "rustix",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "aidod-bin"
+version = "0.0.1"
+dependencies = [
+ "aido-wire",
+ "aidod",
+ "serde_json",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

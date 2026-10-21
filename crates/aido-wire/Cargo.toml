@@ -1,0 +1,21 @@
+[package]
+name = "aido-wire"
+description = "The broker's wire protocol: what the aido front-end asks aidod, and what aidod answers. Pure data and its parsers, no I/O, so both sides of the privilege boundary link it without linking each other."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aido-policy = { path = "../aido-policy", version = "0.0.1" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+
+[lints]
+workspace = true
