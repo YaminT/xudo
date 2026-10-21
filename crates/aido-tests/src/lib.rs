@@ -1,3 +1,11 @@
+//! Tests that belong to the workspace as a whole rather than to any one crate.
+//!
+//! Today that is `tests/crate_inventory.rs`: the crate tables in `CLAUDE.md`,
+//! `docs/design-plan.md`, and `docs/todo/README.md` must name exactly the
+//! members of the workspace's `Cargo.toml`, with a crate that is built but not
+//! yet merged marked as in review. It reads those files with the standard
+//! library alone, so this package has no dependencies.
+//!
 //! Reserved for the differential compliance matrix once there is something to
 //! execute: the same ruleset run *through* sudo, sudo-rs, and `OpenDoas`, in
 //! containers and VMs, asserting identical outcomes.

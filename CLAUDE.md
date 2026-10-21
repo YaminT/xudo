@@ -132,16 +132,24 @@ Two things to know before writing one:
 
 ## Crate layout
 
-| Crate | Rule |
+One row per member of `Cargo.toml`'s `[workspace]`, plus the crates still in review: a crate built in a lane's worktree and not yet a member, whose row opens with `**in review (M2b).**` and loses it when the crate merges. `crates/aido-tests/tests/crate_inventory.rs` fails the build when this table and the manifest disagree in either direction, and holds the tables in `docs/design-plan.md` and `docs/todo/README.md` to the same.
+
+| Crate | Role and rule |
 |---|---|
-| `aido-policy` | Pure. **Zero syscalls, zero I/O.** If it needs the filesystem, it belongs in `aido-sys`. Builds and tests natively on macOS. |
+| `aido-policy` | The pure policy engine: `(ruleset, caller facts, request) → Decision`, with the deny-list compiled in. **Zero syscalls, zero I/O.** If it needs the filesystem, it belongs in `aido-sys`. Builds and tests natively on macOS. |
+| `aido-backend` | What `aido` asks `sudo`, `sudo-rs`, or `doas` to do: the capability matrix, runtime detection, snippet generation, and the install plan. Pure; running a backend or renaming into `/etc` lives behind `aido-sys`. |
+| `aido-config` | Layered configuration for `aido` and `ido`: one precedence order, nothing security-relevant from the environment, a project layer that may only narrow. Pure: it is handed values and never reads a file, a flag, or the environment. |
+| `aido-audit` | Tamper-evident audit records: builds them, chains them, verifies a chain. Pure: opening the file and writing the journald mirror is `aido-sys`'s job. |
 | `aido-sys` | Every syscall behind a trait, with an in-memory fake for tests. Forbids `unsafe` like every other crate; the five calls that need it come from `aido-sys-raw`. |
 | `aido-sys-raw` | The five system calls that cannot be made safely — `close_range`, `SO_PEERPIDFD`, `SO_PEERCRED`, `PIDFD_GET_INFO`, `execveat` — and the kernel-written `PidfdInfo` and `PeerCred`. The only crate that does not forbid `unsafe_code`: it is allowed only in `sys`, within a published block budget. Only `aido-sys` may depend on it. |
-| `aido` | Unprivileged front-end **library**. Holds no secret, makes no decision. |
+| `aido` | The unprivileged front-end **library**: parses a request, loads the root-owned ruleset, asks `aido-policy`, renders the decision. Holds no secret, makes no decision. |
 | `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else. Its own package so the library is compiled, and therefore measured, exactly once. Its `tests/` run the real binary as a process. Excluded from coverage, never from `just test`. |
-| `aido-gate` | Privileged executor and *second independent policy engine*. Assume a hostile local user invokes it directly with no arguments. |
-| `aidod` | Root broker. The authority on classification and confirmation. |
+| `aido-wire` | **in review (M2b).** The wire protocol between `aido` and `aidod`: the messages and the parser for them. |
+| `aidod` | **in review (M2b).** The root broker, the authority on classification and confirmation: identifies its peer from kernel-attested facts, decides with the engine `aido explain` uses, and mints bounded one-use requests. |
+| `aidod-bin` | **in review (M2b).** The `aidod` executable, socket-activated on `/run/aido/broker.sock`. Its own package, like `aido-bin`. |
+| `aido-gate` | The gate's decision core: a *second independent policy engine* that re-decides from root-owned state and trusts nothing it was handed. Pure. Assume a hostile local user invokes the gate directly with no arguments. |
+| `aido-gate-bin` | **in review (M2b).** The gate executable, installed as `aido-gate` with `aido-gate-auth` as a hardlink. Its own package, like `aido-bin`, so `aido-gate` stays pure and measured. |
 | `ido` | The buffered human-run command queue, as a library: queue, picker state machine, runner, `AGENTS.md` splicer. **Unprivileged** — it holds nothing to leak, so it runs commands with the human's own `PATH` — but every field it renders is agent-written and goes through `term-sanitize`, and argv is executed as stored, never through a shell. Reads no environment; the binary passes it in. |
 | `ido-bin` | The `ido` executable: collects the environment once and owns the raw terminal (via `rustix`, no `unsafe`). Excluded from coverage like `aido-bin`; its `tests/` run real processes and a real pseudo-terminal. |
 | `term-sanitize` | Display-only sanitizer for agent-written text bound for a terminal. Shared by `ido` and, later, `aido`'s confirmation prompt, so the two cannot drift. Its output is never compared or executed. |
-| `aido-tests` | Reserved for the executing half of the differential matrix. The half that exists today is `ci/differential/`, a shell harness, because its job is to start containers. |
+| `aido-tests` | Tests that belong to the workspace as a whole. Today that is `tests/crate_inventory.rs`, the check on this table. Reserved for the executing half of the differential matrix; the half that exists today is `ci/differential/`, a shell harness, because its job is to start containers. |

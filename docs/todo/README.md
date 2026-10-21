@@ -10,20 +10,27 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 > **Status, 2026-10-19.** M1 complete. M2 split: **M2a done**, M2b in progress (steps 0, 1, 2b, and 7 done: the Linux harness, the `aido-sys-raw` syscalls, strictest overlapping-rule enforcement, and the refusal of a ruleset on a mount a non-root user could have made; the privileged execution path is not built). **Phase 5 part 1 done** (`aido-config`). **Phase 4 done** (`ido`, `ido-bin`, `term-sanitize`). The differential matrix runs in CI and trips the day an exec path appears. Next is **M2b**: Docker now gives a real Linux kernel to run privileged tests in, so the old "blocked on a VM" no longer holds for most of it. Read `../CONCERNS.md` first — it carries the decisions and what is still open.
 
-**Done.** Thirteen crates (`aido-audit`, `aido-backend`, `aido-config`, `aido-gate`, `aido-policy`, `aido-sys`, `aido-sys-raw`, `aido`, `aido-bin`, `aido-tests`, `ido`, `ido-bin`, `term-sanitize`), and a working unprivileged executable.
+**Done.** The crates in the table below, and a working unprivileged executable. A row that opens with **in review (M2b).** is a crate built in a lane's worktree and not yet a workspace member; merging it deletes the marker. `crates/aido-tests/tests/crate_inventory.rs` fails the build when this table and `Cargo.toml` disagree.
 
 | Crate | What it is |
 |---|---|
 | `aido-policy` | The pure decision engine: typed per-position matchers with no globs anywhere, the compiled-in deny-list enumerated by capability class, the rule model and TOML loader, the versioned decision envelope with an append-only denial taxonomy |
 | `aido-sys` | Syscalls behind traits, `/proc` parsers, ancestry walking, and the `MacOsStub` that forces every fail-closed branch on a non-Linux host |
+| `aido-sys-raw` | The five system calls that cannot be made safely (`close_range`, `SO_PEERPIDFD`, `SO_PEERCRED`, `PIDFD_GET_INFO`, `execveat`) and the kernel-written records for two of them: the one crate that does not forbid `unsafe_code`, within a published block budget (M2b step 1) |
 | `aido-backend` | The backend capability matrix, runtime detection, snippet generation, and the ordered install plan (M2a) |
 | `aido-config` | Layered configuration: precedence, origin tracking, the narrowing-only project layer, and XDG path resolution (phase 5 part 1) |
+| `aido-audit` | Tamper-evident audit records: builds them, chains them, verifies a chain, and decides where a writer picks a chain up and what journald receives; pure, with the file and the mirror in `aido-sys` (M2b step 6) |
 | `aido` | The unprivileged front-end library |
 | `aido-bin` | The five-line `aido` entry point, in its own package so the library is measured exactly once |
+| `aido-wire` | **in review (M2b).** The wire protocol between `aido` and `aidod`: the messages and the parser for them (steps 2 and 3) |
+| `aidod` | **in review (M2b).** The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `explain` uses, and mints bounded one-use requests (step 2) |
+| `aidod-bin` | **in review (M2b).** The `aidod` executable, socket-activated on `/run/aido/broker.sock` (step 2) |
+| `aido-gate` | The gate's decision core: the second, independent policy engine that re-decides from root-owned state, with spool-entry validation, the child environment, and the exit-status mapping; pure (M2b step 4, the decision half) |
+| `aido-gate-bin` | **in review (M2b).** The gate executable, installed as `aido-gate` with `aido-gate-auth` as a hardlink (step 4) |
 | `ido` | The buffered human-run command queue: queue file, derived status, picker state machine, runner, `AGENTS.md` splicer (phase 4) |
 | `ido-bin` | The `ido` executable and its raw terminal, tested through real processes and a pseudo-terminal |
 | `term-sanitize` | Display-only sanitizer for agent-written terminal text, shared by `ido` and the future `aido` prompt |
-| `aido-tests` | Reserved for the executing half of the differential matrix; the unprivileged half is `ci/differential/`, run by `just differential` (binary process tests live in `aido-bin/tests`) |
+| `aido-tests` | Tests that belong to the workspace as a whole, starting with the check on this table; reserved for the executing half of the differential matrix, whose unprivileged half is `ci/differential/`, run by `just differential` (binary process tests live in `aido-bin/tests`) |
 
 `aido explain`, `why-not`, `check`, `list`, `doctor`, and `agentdoc` all work. Four starter rule files ship and are tested as code.
 

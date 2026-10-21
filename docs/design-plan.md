@@ -4,7 +4,7 @@
 
 > **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
 >
-> - Twelve crates, not five. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase.
+> - Thirteen crates, not five, with more in review for M2b. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the crate that confines `unsafe` (`aido-sys-raw`), the entry-point packages (`aido-bin`, `ido-bin`), and `ido` with its own phase. `aidod` is planned but is not a member yet: it, its entry point `aidod-bin`, its wire protocol `aido-wire`, and the gate's entry point `aido-gate-bin` are in review. § Crate layout is the inventory.
 > - `unsafe` exists only in the crate `aido-sys-raw`, in its `sys` module: five syscalls in six blocks, budget enforced by a test; every other crate, `aido-sys` included, forbids it. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only (2026-10-19). `SO_PEERCRED` is the fifth, added 2026-10-19: rustix decodes it with a `NonZeroI32` pid, which is undefined behaviour when the kernel reports pid 0.
 > - A pidfd pins *which* process connected, not its pid number and not its credentials at connect time. Connect-time identity comes from `SO_PEERCRED` on every rung; `PIDFD_GET_INFO` reports current credentials; every read of `/proc/<pid>` is followed by a liveness check through the pidfd. The 5.3 `pidfd_open` rung withholds the agent path: its pin cannot be bound to the connection, so the passwordless path needs Linux 6.5 (2026-10-19).
 > - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
@@ -100,15 +100,31 @@ A caller is an **agent** if and only if its cgroup id equals a live, root-create
 
 The scope-bound HMAC session token is bookkeeping — non-repudiation, expiry, revocation, and an authenticated channel for the agent to *declare* yolo mode — not a boundary. A token exfiltrated into the human's own shell fails the scope check.
 
-### Crate layout (5 crates, trust boundary drawn on day one)
+### Crate layout (trust boundary drawn on day one)
 
-- `aido-policy` — pure function `(ruleset, caller_facts, action) → Decision{verdict, rule_id, rule_source file:line, resolved_argv, env_plan, trace}`. **Zero syscalls.** Builds and tests natively on macOS. Deny-list compiled in here.
-- `aido-sys` — every Linux syscall behind a trait. Three impls: `LinuxProcFs` (injectable procfs root so fixture trees drive unit tests), `LinuxKernel` (`openat2`, `execveat`, `close_range`, `pidfd_open`, `SO_PEERPIDFD`, cgroup writes, `statfs`), `MacOsStub` (always returns `Unknown`/`Unsupported`, so a macOS dev cannot accidentally validate a Linux-only assumption).
-- `aido` — front-end.
-- `aido-gate` + `aidod` — privileged. Dependency budget capped at sudo-rs's bar: rustix/libc + one audited serialization crate.
-- `aido-tests` — container/VM matrix.
+The plan began with five crates and the deviations above account for the rest. This table is the inventory: one row per member of `Cargo.toml`'s `[workspace]`, plus the crates still in review, whose rows open with `**in review (M2b).**` and lose it when the crate merges. `crates/aido-tests/tests/crate_inventory.rs` fails the build when the table and the manifest disagree.
 
-`#![forbid(unsafe_code)]` everywhere except one audited syscall module with a published unsafe-line budget.
+| Crate | Role |
+|---|---|
+| `aido-policy` | The pure policy engine: `(ruleset, caller facts, request) → Decision`, with the deny-list compiled in. Zero syscalls; builds and tests natively on macOS |
+| `aido-backend` | What `aido` asks `sudo`, `sudo-rs`, or `doas` to do: the capability matrix, runtime detection, snippet generation, and the install plan. Pure, with the Linux half behind `aido-sys` |
+| `aido-config` | Layered configuration for `aido` and `ido`: one precedence order, nothing security-relevant from the environment, a project layer that may only narrow. Pure: it reads no file, flag, or environment |
+| `aido-audit` | Tamper-evident audit records: builds them, chains them, verifies a chain. Pure, with the file and the journald mirror in `aido-sys` |
+| `aido-sys` | Platform abstraction: every syscall and `/proc` read behind a trait with an in-memory fake, and `MacOsStub`, which answers `Unsupported` to every privileged question so a macOS dev cannot accidentally validate a Linux-only assumption |
+| `aido-sys-raw` | The five system calls that cannot be made safely, and the kernel-written records for two of them: the one crate that does not forbid `unsafe_code`, within a published block budget |
+| `aido` | The unprivileged front-end library: parses a request, loads the root-owned ruleset, asks `aido-policy` for a decision, and renders it. Decides nothing, holds no secret |
+| `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else |
+| `aido-wire` | **in review (M2b).** The wire protocol between `aido` and `aidod`: the messages and the parser for them |
+| `aidod` | **in review (M2b).** The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `aido explain` uses, and mints bounded one-use requests |
+| `aidod-bin` | **in review (M2b).** The `aidod` executable, socket-activated on `/run/aido/broker.sock` |
+| `aido-gate` | The gate's decision core: a second, independent policy engine that re-decides from root-owned state and trusts nothing it was handed. Pure |
+| `aido-gate-bin` | **in review (M2b).** The gate executable, installed as `aido-gate` with `aido-gate-auth` as a hardlink |
+| `ido` | The buffered human-run command queue: queue, picker state machine, runner, and `AGENTS.md` splicer. Unprivileged |
+| `ido-bin` | The `ido` executable: collects the environment once and owns the raw terminal |
+| `term-sanitize` | Display-only sanitizer for agent-written text bound for a terminal, shared by `ido` and `aido`'s future confirmation prompt |
+| `aido-tests` | Tests that belong to the workspace as a whole, starting with the check on this table; reserved for the executing half of the differential matrix |
+
+`aido-gate` and `aidod` are the privileged pair, with a dependency budget capped at sudo-rs's bar: rustix/libc plus one audited serialization crate. `#![forbid(unsafe_code)]` holds everywhere except `aido-sys-raw`'s `sys` module, which carries a published block budget.
 
 ---
 
@@ -344,7 +360,7 @@ Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactl
 
 Each is independently shippable.
 
-**M1 — Policy core, matcher, `explain`.** *No privilege, no Linux required.* The 5-crate workspace with the trust boundary drawn on day one. `aido-policy` as a pure function. Typed matchers, no globs. Compiled-in deny-list. `aido-sys` trait layer with `MacOsStub`. Ships as a standalone auditor: `aido explain`, `aido check --fuzz`, `aido rule list|test`, the versioned JSON envelope with a stable append-only exit-code and denial-code taxonomy, `aido agentdoc`. Test discipline established here and enforced forever. **Deliberately absent: any ability to execute anything.**
+**M1 — Policy core, matcher, `explain`.** *No privilege, no Linux required.* The workspace, five crates as planned (§ Crate layout has what it grew into), with the trust boundary drawn on day one. `aido-policy` as a pure function. Typed matchers, no globs. Compiled-in deny-list. `aido-sys` trait layer with `MacOsStub`. Ships as a standalone auditor: `aido explain`, `aido check --fuzz`, `aido rule list|test`, the versioned JSON envelope with a stable append-only exit-code and denial-code taxonomy, `aido agentdoc`. Test discipline established here and enforced forever. **Deliberately absent: any ability to execute anything.**
 
 **M2 — Human path end to end.** *A hardened, always-prompting sudo front-end.* Complete without any agent concept. Backend adapter with runtime capability probing across sudo/sudo-rs/OpenDoas; snippet generation with `visudo -cf`/`doas -C` validation, inode verification, atomic rename, and a **functional** post-install probe. `aido-gate` as the second independent policy engine with the full hardening set (`close_range` first, `/dev/null` substitution, `statfs` `/proc` check, ancestor ownership walk from a pinned dirfd, `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`, `O_PATH` + `fstat` + digest pin + `execveat(fd, "", AT_EMPTY_PATH)`, env from a fixed allowlist, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation). Audit subsystem with hash chain + journald. `aido doctor`. Distro packages. **Every invocation prompts** — exactly what a cautious operator wants to deploy first, and it already delivers the allowlist, the deny-list, and the audit trail.
 

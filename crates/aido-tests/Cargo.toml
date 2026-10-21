@@ -1,6 +1,6 @@
 [package]
 name = "aido-tests"
-description = "Reserved for the executing half of the differential compliance matrix across sudo, sudo-rs, and OpenDoas."
+description = "Tests that belong to the workspace as a whole: the crate inventories name exactly the workspace members. Reserved for the executing half of the differential compliance matrix across sudo, sudo-rs, and OpenDoas."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,9 @@ publish = false
 # run by `just differential`: a shell harness, because its job is to start
 # containers and drive the static binary inside them. This package is reserved
 # for the half that needs a gate binary — the same ruleset *executed* through
-# each backend — and is empty until then.
+# each backend. Until then it holds only the tests that belong to no one crate:
+# `tests/crate_inventory.rs` reads the workspace's own manifest and docs with
+# the standard library alone, so this package still has no dependencies.
 #
 # The end-to-end tests of the `aido` binary are not here. They live in
 # `aido-bin/tests`, because only the package that owns a binary gets
