@@ -10,7 +10,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 > **Status, 2026-10-19.** M1 complete. M2 split: **M2a done**, M2b in progress (steps 0, 1, 2b, and 7 done: the Linux harness, the `aido-sys-raw` syscalls, strictest overlapping-rule enforcement, and the refusal of a ruleset on a mount a non-root user could have made; the privileged execution path is not built). **Phase 5 part 1 done** (`aido-config`). **Phase 4 done** (`ido`, `ido-bin`, `term-sanitize`). The differential matrix runs in CI and trips the day an exec path appears. Next is **M2b**: Docker now gives a real Linux kernel to run privileged tests in, so the old "blocked on a VM" no longer holds for most of it. Read `../CONCERNS.md` first — it carries the decisions and what is still open.
 
-**Done.** Six crates, and a working executable.
+**Done.** Thirteen crates (`aido-audit`, `aido-backend`, `aido-config`, `aido-gate`, `aido-policy`, `aido-sys`, `aido-sys-raw`, `aido`, `aido-bin`, `aido-tests`, `ido`, `ido-bin`, `term-sanitize`), and a working unprivileged executable.
 
 | Crate | What it is |
 |---|---|
@@ -29,7 +29,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 **The gate:** 373 tests, 100% coverage on lines, regions, and functions with **zero line-level waivers**, zero clippy warnings, `cargo deny` clean, miri clean, three fuzz targets clean, a GTFOBins waiver gate, and a pre-commit hook. Nightly and `cargo-fuzz` are installed, so the fuzz and miri lanes have actually run — and fuzzing found a real bug on its first execution (see `../CONCERNS.md`).
 
-**Not done.** Everything with a syscall in it. There is still **no privileged path**: nothing this project builds can execute a command as root, and `classify()` returns `Unattested` for every caller on every platform, so every request routes to the password path.
+**Not done.** The privileged execution path. The syscall primitives exist on main (`aido-sys-raw`, six audited `unsafe` blocks; the trust walk with its mount check; the audit sinks, not yet called by anything), but nothing this project builds can yet execute a command as root: the broker, the gate, `aido exec`, and the install executor are in review or unbuilt. `classify()` returns `Unattested` for every caller on every platform, so every request routes to the password path. The step-by-step plan to close M2b is `m2b-finish-plan.md`.
 
 ---
 
@@ -42,6 +42,7 @@ The design plan numbers **milestones M1–M7** (technical layers). The user numb
 | `phase-3-packaging-and-publish.md` | Debian/Ubuntu `.deb`, apt repository, one-line install, GitHub publication, SEO and AI-crawler discoverability, security disclosures, beta labelling |
 | `phase-4-ido.md` | `ido` — the buffered human-run command queue, its TUI, `AGENTS.md` integration, and the `willyoumarryme` acceptance test |
 | `phase-5-configuration.md` | Configuration layering and precedence for every binary, plus shipped predefined profiles |
+| `m2b-finish-plan.md` | The exit test for M2b and the step-by-step sequence to reach it (written 2026-10-21) |
 
 Milestones M1(remainder)–M7 are listed below rather than in separate files, because each is already specified in the design plan; what follows is the delta and the ordering.
 
@@ -118,7 +119,7 @@ The verb surface (`aido pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previ
 | 12 | Symlink and TOCTOU resistance on ruleset, exec target, audit log | Ruleset done 2026-10-14; audit log done 2026-10-19 (sink built, not yet wired); exec target M2b 4 |
 | 13 | Deny-list non-overridable; `check` refuses a rule naming a shell | Done |
 | 14 | Differential compliance | Unprivileged half done and in CI; executing half M2b 8 |
-| 15 | Audit chain verifies and detects truncation | Done |
+| 15 | Audit chain verifies and detects truncation | Chain and sinks done; end-to-end (broker + gate writing, verify then truncate) is M2b closeout, see `m2b-finish-plan.md` D1 |
 | 16 | `freeze` / `thaw` | Engine honours `frozen`; the commands are M3 |
 
 ### M7 — confinement, supply chain, external audit

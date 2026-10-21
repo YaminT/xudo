@@ -4,6 +4,30 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-21 — M2b reviewed; the plan to finish it is written down
+
+A Fable review of the milestone against main at `829f41d` (three of four
+lanes; the fourth timed out and its ground is covered by the others). Its
+substance: the four in-flight lanes — broker, doctor, gate, install — do not
+close M2b when they merge. `aido exec` (step 3), the executing differential
+(step 8), and the broker-plus-gate audit integration are separate exit
+blockers, and verification row 15 was marked done too early: the chain and the
+sinks are done, the end-to-end trail is not. Three documentation drifts were
+corrected in the same commit: a sentence in the design plan's deviations block
+that read as the opposite of the strictest-wins invariant, a status block that
+still said "no unsafe yet" beside a step marked done, and crate inventories
+that no longer matched the workspace.
+
+`docs/todo/m2b-finish-plan.md` now carries the exit test and the sequence —
+B merge queue in strict order, C new builds, D debts, E decisions — with the
+fixed roles (Sonnet develops, Opus observes, Fable reviews) and the measured
+estimates. One lesson is promoted to a plan item: four review rounds on the
+doctor each found a new way its reading of sudoers/doas differed from the real
+programs, so the real fix is to ask the programs (`sudo -l -U`, `doas -C`)
+rather than re-implement their lexers.
+
+---
+
 ## 2026-10-19 — M2b step 6: the audit sinks
 
 **What exists.** `aido-sys::audit`: the contract the broker and the gate will
