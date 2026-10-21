@@ -1,6 +1,6 @@
 [package]
 name = "aido-gate"
-description = "The privileged gate's decision core: a second, independent policy engine that assumes a hostile local user invoked it directly. Pure — no syscalls, no I/O."
+description = "The privileged gate's library: a second, independent policy engine that assumes a hostile local user invoked it directly. Pure decision modules, plus a `run` sequence that drives the host only through `aido-sys` traits and makes no syscall of its own."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,21 @@ authors.workspace = true
 [dependencies]
 aido-audit = { path = "../aido-audit", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
+# The seams the gate's sequence is written against: syscalls, `/proc`, the
+# trust walk, the spool, the audit sink, the clock. Traits with fakes, so every
+# step is reached by a test on a laptop; `aido-sys` dev-depends on this crate
+# for its own contract test, which cargo allows.
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# `FakeAuditSink`, which exists only where a test build asks for it, and the
+# path the configuration crate names for the rules, which the gate must agree
+# with rather than restate.
+aido-config = { path = "../aido-config", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1", features = ["fake"] }
 
 [lints]
 workspace = true

@@ -31,8 +31,8 @@
 
 use aido_audit::record::{Approval, Decision as AuditDecision, Outcome, Record};
 use aido_policy::{
-    ActionId, Arg, Argv, CallerFacts, Confirm, Decision, DenialCode, ExitCode, Request, RuleSet,
-    Verdict, engine,
+    ActionId, Arg, Argv, CallerFacts, Classification, Confirm, Decision, DenialCode, ExitCode,
+    Request, RuleSet, Verdict, engine,
 };
 
 use crate::env::child_environment;
@@ -51,6 +51,31 @@ pub struct GateCaller {
     pub facts: CallerFacts,
 }
 
+impl GateCaller {
+    /// A caller the gate has not identified, for a refusal made before the
+    /// lineage was walked: this process's own pin is not the caller's, so the
+    /// pin carries pid 0 and no start time, and the attestation says why.
+    pub fn unidentified(gate_pid: u32) -> Self {
+        Self {
+            pin: CallerPin::new(0, 0),
+            facts: CallerFacts::new(
+                Classification::Unattested {
+                    reason: format!(
+                        "the gate (pid {gate_pid}) refused before it identified its caller"
+                    ),
+                },
+                UNKNOWN_UID,
+            ),
+        }
+    }
+}
+
+/// The uid recorded for a caller whose uid the gate did not establish.
+///
+/// Not 0: root's uid in a record reads as a root caller. The gate takes no
+/// decision from the uid, and `SO_PEERCRED` at the broker is where it is read.
+pub const UNKNOWN_UID: u32 = u32::MAX;
+
 /// The state the gate decides against.
 #[derive(Clone, Copy, Debug)]
 pub struct GateContext {
@@ -60,6 +85,15 @@ pub struct GateContext {
     pub now: MonotonicSecs,
     /// Global settings, loaded from the root-owned config.
     pub settings: engine::Settings,
+    /// Whether this invocation proves a human typed a password.
+    ///
+    /// True only for the `aido-gate-auth` name, which `sudo` reaches only after
+    /// a PAM conversation on a fresh pty that the requesting process tree cannot
+    /// answer without the secret. On that path the password **is** the
+    /// confirmation, so a rule that demands one is satisfied by it. Never true
+    /// for a request that was merely approved: that is the broker's
+    /// `confirmed`, which carries the channel that approved it.
+    pub password_confirms: bool,
 }
 
 /// How loudly a refusal should be reported.
@@ -105,6 +139,108 @@ pub enum Refusal {
          channel to ask on"
     )]
     ConfirmationMissing(Box<Decision>),
+    /// The gate could not do one of the steps that come before or after the
+    /// decision, and so did not run anything.
+    ///
+    /// Not a statement about the request: a host that cannot mark its
+    /// descriptors, a rules directory that fails the trust walk, an audit trail
+    /// that will not take the record. Each is a refusal, because the gate's
+    /// alternative to a step it could not take is running something as root
+    /// without it.
+    #[error("the gate could not {stage}: {reason}")]
+    Failed {
+        /// Which step.
+        stage: Stage,
+        /// Why, in words. Display only.
+        reason: String,
+    },
+}
+
+/// The steps of the gate's sequence that can fail without the request being at
+/// fault, in the order the gate takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Mark every inherited descriptor close-on-exec.
+    Descriptors,
+    /// Replace closed standard streams with `/dev/null`.
+    Streams,
+    /// Forbid gaining privilege by exec.
+    Privileges,
+    /// Accept the invocation: no arguments, and the one name that runs.
+    Invocation,
+    /// Open `/proc` and prove it is procfs.
+    Procfs,
+    /// Walk the lineage above the gate.
+    Lineage,
+    /// Load the root-owned ruleset.
+    Rules,
+    /// Read the monotonic clock.
+    Clock,
+    /// Open, list, or consume the spool.
+    Spool,
+    /// Open, judge, and hash the program.
+    Program,
+    /// Write the authorization to the audit trail.
+    Audit,
+    /// Build the exec vector and exec.
+    Exec,
+}
+
+impl Stage {
+    /// What the gate could not do, as the end of "the gate could not ...".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Descriptors => "mark its inherited descriptors close-on-exec",
+            Self::Streams => "settle its standard streams",
+            Self::Privileges => "forbid new privileges",
+            Self::Invocation => "accept this invocation",
+            Self::Procfs => "verify /proc",
+            Self::Lineage => "walk its lineage",
+            Self::Rules => "load the root-owned ruleset",
+            Self::Clock => "read the monotonic clock",
+            Self::Spool => "use the spool",
+            Self::Program => "open the program",
+            Self::Audit => "record the authorization",
+            Self::Exec => "execute the program",
+        }
+    }
+
+    /// The stable code recorded in the audit trail.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Descriptors => "gate_failed_descriptors",
+            Self::Streams => "gate_failed_streams",
+            Self::Privileges => "gate_failed_privileges",
+            Self::Invocation => "gate_failed_invocation",
+            Self::Procfs => "gate_failed_procfs",
+            Self::Lineage => "gate_failed_lineage",
+            Self::Rules => "gate_failed_rules",
+            Self::Clock => "gate_failed_clock",
+            Self::Spool => "gate_failed_spool",
+            Self::Program => "gate_failed_program",
+            Self::Audit => "gate_failed_audit",
+            Self::Exec => "gate_failed_exec",
+        }
+    }
+
+    /// How loudly a failure at this step is reported.
+    ///
+    /// High where a step only fails when somebody is making it: an invocation
+    /// that is not the one `sudo` makes, a spool or a program that is not what
+    /// the broker and the operator left. A host that cannot take a step is
+    /// ordinary.
+    pub fn severity(self) -> Severity {
+        match self {
+            Self::Invocation | Self::Spool | Self::Program => Severity::High,
+            _ => Severity::Normal,
+        }
+    }
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.describe())
+    }
 }
 
 impl Refusal {
@@ -117,6 +253,7 @@ impl Refusal {
                 .denial
                 .map_or("gate_policy_denied", DenialCode::as_str),
             Self::ConfirmationMissing(_) => "gate_confirmation_missing",
+            Self::Failed { stage, .. } => stage.code(),
         }
     }
 
@@ -129,6 +266,7 @@ impl Refusal {
         match self {
             Self::Request(RequestError::Expired { .. } | RequestError::StaleGeneration { .. })
             | Self::Policy(_) => Severity::Normal,
+            Self::Failed { stage, .. } => stage.severity(),
             Self::NoPendingRequest { .. } | Self::Request(_) | Self::ConfirmationMissing(_) => {
                 Severity::High
             }
@@ -137,14 +275,18 @@ impl Refusal {
 
     /// The exit status the gate leaves with.
     ///
-    /// Never zero, and never the child's range: nothing ran, so a status that
-    /// could be mistaken for a command's own would be a lie to the caller's
-    /// script.
+    /// Never zero: nothing ran, so a success status would be a lie to the
+    /// caller's script. 17, 18 and 19 are `aido`'s reserved refusal codes, but
+    /// the gate execs in place, so a child that exits 17, 18 or 19 cannot be
+    /// told from a refusal by status alone. The refusal line on standard error
+    /// is the distinguishing signal, and the front-end must use it.
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Policy(_) => ExitCode::Denied,
             Self::ConfirmationMissing(_) => ExitCode::NotConfirmed,
-            Self::NoPendingRequest { .. } | Self::Request(_) => ExitCode::Unusable,
+            Self::NoPendingRequest { .. } | Self::Request(_) | Self::Failed { .. } => {
+                ExitCode::Unusable
+            }
         }
     }
 }
@@ -166,8 +308,17 @@ pub struct Approved {
     /// The absolute program, as **the ruleset spells it** — not as the request
     /// did. The two were compared; this is the copy that was authorized.
     pub program: String,
-    /// The canonicalized operands.
+    /// The canonicalized operands, rendered for the audit record.
+    ///
+    /// Display only: a record is text. What the kernel is handed is
+    /// [`Self::exec_argv`].
     pub argv: Vec<String>,
+    /// The canonicalized operands as the bytes the kernel will be given.
+    ///
+    /// The exec vector is built from these, never from [`Self::argv`], which
+    /// came through a renderer that escapes: the program must receive exactly
+    /// the bytes the matcher accepted.
+    pub exec_argv: Vec<Vec<u8>>,
     /// The complete environment for the child.
     pub environment: Vec<String>,
     /// The action whose requirement governed the decision: of every action
@@ -256,7 +407,7 @@ pub fn decide(
         // here even though the front-end may already have shown a prompt: the
         // gate's evidence that a human approved is the broker's record, and
         // there isn't one.
-        Verdict::AllowWithConfirmation if !pending.confirmed => {
+        Verdict::AllowWithConfirmation if !pending.confirmed && !context.password_confirms => {
             return Err(Refusal::ConfirmationMissing(Box::new(decision)));
         }
         Verdict::Allow | Verdict::AllowWithConfirmation => {}
@@ -281,6 +432,13 @@ pub fn decide(
         // action that accepts the command names the same program, so this is
         // the same bytes — taken from the copy that carries authority.
         program: action.exe.clone(),
+        exec_argv: request
+            .argv
+            .canonicalize()
+            .as_slice()
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect(),
         argv: decision.resolved_argv,
         environment: child_environment(),
         action: governing_action,
@@ -326,6 +484,17 @@ pub fn refusal_record(
             pending.claimed_classification
         ));
         evidence.push(format!("nonce={}", pending.nonce));
+    }
+    // What the gate could not do, and why, in the operating system's words:
+    // the code says which step, and this says what the step reported.
+    if let Refusal::Failed { reason, .. } = refusal {
+        evidence.push(format!(
+            "detail={}",
+            reason
+                .chars()
+                .take(FAILURE_REASON_CHARS)
+                .collect::<String>()
+        ));
     }
 
     Record::after(
@@ -385,6 +554,40 @@ pub fn authorization_record(
     .with_evidence(evidence)
     .with_outcome(Outcome::NotExecuted)
 }
+
+/// The audit record for an exec that failed after its authorization was
+/// written.
+///
+/// The log is append-only, so the failure is a record of its own naming the
+/// authorization it follows. It carries the outcome the authorization could
+/// not know: the command was allowed, and did not start. `reason` is cut to a
+/// bounded length, because it is an operating system's account of a failure
+/// and the record is a line in a log.
+pub fn exec_failure_record(
+    previous: Option<&Record>,
+    approved: &Approved,
+    caller: &GateCaller,
+    authorization_seq: u64,
+    reason: &str,
+) -> Record {
+    Record::after(
+        previous,
+        AuditDecision::Allowed,
+        approved.command(),
+        caller.facts.classification.label(),
+    )
+    .with_rule(&approved.action, &approved.rule_source)
+    .with_evidence(vec![
+        format!("authorization_seq={authorization_seq}"),
+        format!("gate_caller_pid={}", caller.pin.pid),
+    ])
+    .with_outcome(Outcome::Failed {
+        reason: reason.chars().take(FAILURE_REASON_CHARS).collect(),
+    })
+}
+
+/// The longest failure reason a record carries.
+const FAILURE_REASON_CHARS: usize = 200;
 
 /// The request's command as one argv, program first.
 fn request_argv(pending: &PendingRequest) -> Vec<String> {
@@ -487,6 +690,7 @@ args = [
             generation: GENERATION,
             now: MonotonicSecs(100),
             settings: engine::Settings::default(),
+            password_confirms: false,
         }
     }
 
@@ -523,7 +727,7 @@ args = [
     fn refused_decision(refusal: &Refusal) -> Option<&Decision> {
         match refusal {
             Refusal::Policy(decision) | Refusal::ConfirmationMissing(decision) => Some(decision),
-            Refusal::NoPendingRequest { .. } | Refusal::Request(_) => None,
+            Refusal::NoPendingRequest { .. } | Refusal::Request(_) | Refusal::Failed { .. } => None,
         }
     }
 
@@ -747,6 +951,14 @@ args = [
                 Vec::new(),
                 Vec::new(),
             ))),
+            Refusal::Request(RequestError::Ambiguous { matches: 2 }),
+            Refusal::Request(RequestError::ForgedNonce {
+                name: NONCE.to_owned(),
+            }),
+            Refusal::Failed {
+                stage: Stage::Spool,
+                reason: "the spool refused".to_owned(),
+            },
         ];
         for refusal in &refusals {
             let status = refusal.exit_code().as_i32();
@@ -1037,5 +1249,130 @@ args = [
     fn a_decision_that_asks_for_nothing_is_not_a_confirmation_requirement() {
         let decision = Decision::deny(DenialCode::DenyListed, Vec::new(), Vec::new());
         assert!(!demanded_confirmation(&decision));
+    }
+
+    #[test]
+    fn a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say() {
+        let rules = overlapping_rules();
+        let pending = request(77, "aido.reload.confirmed", &["daemon-reload"]);
+        // Without a password and without the broker's approval: refused.
+        let refused = decide(&rules, &human(77), Some(&pending), context()).unwrap_err();
+        assert_eq!(refused.code(), "gate_confirmation_missing");
+        // On the -auth name the password is the confirmation.
+        let typed = GateContext {
+            password_confirms: true,
+            ..context()
+        };
+        assert!(decide(&rules, &human(77), Some(&pending), typed).is_ok());
+        // It does not widen a refusal that is not about confirmation.
+        let denied = request(77, "aido.reload.confirmed", &["daemon-reload", "--now"]);
+        assert!(decide(&rules, &human(77), Some(&denied), typed).is_err());
+        let expired = GateContext {
+            now: MonotonicSecs(300),
+            ..typed
+        };
+        assert_eq!(
+            decide(&rules, &human(77), Some(&pending), expired)
+                .unwrap_err()
+                .code(),
+            "request_expired"
+        );
+    }
+
+    #[test]
+    fn the_exec_operands_are_taken_from_bytes_not_from_the_rendering() {
+        let approved = decide(&rules(), &human(77), Some(&status_request(77)), context()).unwrap();
+        assert_eq!(
+            approved.exec_argv,
+            [
+                b"--no-pager".to_vec(),
+                b"status".to_vec(),
+                b"nginx.service".to_vec()
+            ]
+        );
+        let rendered: Vec<Vec<u8>> = approved
+            .argv
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+        assert_eq!(approved.exec_argv, rendered);
+    }
+
+    #[test]
+    fn every_stage_has_a_distinct_code_and_a_sentence_and_only_tampering_is_high() {
+        let stages = [
+            Stage::Descriptors,
+            Stage::Streams,
+            Stage::Privileges,
+            Stage::Invocation,
+            Stage::Procfs,
+            Stage::Lineage,
+            Stage::Rules,
+            Stage::Clock,
+            Stage::Spool,
+            Stage::Program,
+            Stage::Audit,
+            Stage::Exec,
+        ];
+        let mut codes: Vec<&str> = stages.iter().map(|stage| stage.code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), stages.len(), "two stages share an audit code");
+        for stage in stages {
+            assert!(stage.code().starts_with("gate_failed_"));
+            assert!(stage.describe().len() > 8);
+            assert_eq!(stage.to_string(), stage.describe());
+            let refusal = Refusal::Failed {
+                stage,
+                reason: "why".to_owned(),
+            };
+            assert_eq!(refusal.code(), stage.code());
+            assert_eq!(refusal.severity(), stage.severity());
+            assert_eq!(refusal.exit_code(), ExitCode::Unusable);
+            assert!(refusal.to_string().contains("could not"), "{refusal}");
+            let high = matches!(stage, Stage::Invocation | Stage::Spool | Stage::Program);
+            assert_eq!(stage.severity() == Severity::High, high, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn a_failure_record_says_which_step_and_what_it_reported() {
+        let refusal = Refusal::Failed {
+            stage: Stage::Rules,
+            reason: "x".repeat(500),
+        };
+        let caller = GateCaller::unidentified(77);
+        let record = refusal_record(None, &refusal, &caller, None);
+        assert_eq!(record.denial.as_deref(), Some("gate_failed_rules"));
+        assert_eq!(record.classification, "unattested");
+        let detail = record
+            .evidence
+            .iter()
+            .find(|line| line.starts_with("detail="))
+            .unwrap();
+        // Bounded: a reason is a line in a log.
+        assert_eq!(detail.len(), "detail=".len() + FAILURE_REASON_CHARS);
+        assert!(record.evidence.contains(&"severity=normal".to_owned()));
+        assert_eq!(caller.facts.uid, UNKNOWN_UID);
+        assert_eq!(caller.pin, CallerPin::new(0, 0));
+    }
+
+    #[test]
+    fn an_exec_that_failed_after_its_authorization_is_a_record_naming_it() {
+        let approved = decide(&rules(), &human(77), Some(&status_request(77)), context()).unwrap();
+        let first = authorization_record(None, &approved, &human(77), None);
+        let record = exec_failure_record(Some(&first), &approved, &human(77), 1, &"y".repeat(500));
+        assert_eq!(record.seq.get(), 2);
+        assert_eq!(record.prev_hash, first.hash);
+        assert_eq!(record.action.as_deref(), Some("aido.svc.status"));
+        assert!(record.evidence.contains(&"authorization_seq=1".to_owned()));
+        assert_eq!(
+            record.outcome,
+            Outcome::Failed {
+                reason: "y".repeat(FAILURE_REASON_CHARS)
+            }
+        );
+        assert!(!record.outcome.executed());
+        assert!(record.describes(&approved).is_ok());
     }
 }

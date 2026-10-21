@@ -4,6 +4,375 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-21 — M2b step 4 (B3): `aido-gate-bin`, the root executor, reconciled with the broker
+
+Built 2026-10-19 on `aebfd15`, before the broker was on main. Finished
+2026-10-21 at the rebase onto the merged broker (`1851c9a`), where the three
+contracts the finish plan names for B3 were reconciled; they are the first
+section below.
+
+**What exists.** The `aido-gate` executable, in its own package (`aido-gate-bin`,
+the shape of `aido-bin`, `ido-bin` and `aidod-bin`: five lines of `main`,
+excluded from coverage with its reason in the `justfile`, `tests/binary.rs`
+running the real binary), to be installed as `/usr/libexec/aido/aido-gate` with
+`aido-gate-auth` as a hardlink. Only the `-auth` name runs. The sequence it hands
+off to is `aido_gate::run`, a module of the `aido-gate` library written against
+traits (`GateHost`) with no syscall of its own, and fully covered. It refuses
+with `NoPendingRequest` until a root-minted entry exists, and the broker is what
+mints one; with the broker on main the two halves now meet at the spool, and
+neither has yet run as root through `sudo` (nothing asks the broker, step 3, and
+nothing installs the rule that reaches the gate, step 5).
+
+**The order, each step refusing and stopping everything after it.**
+
+1. `close_range(3, ~0, CLOEXEC)`. 2. `/dev/null` for closed 0 to 2. 3.
+`PR_SET_NO_NEW_PRIVS`. 4. The invocation: no arguments, `argv[0]` named
+`aido-gate-auth`. 5. `/proc` opened and proved procfs on that descriptor. 6.
+The lineage walk. 7. The ruleset through `load_trusted_rules`, the generation
+`generation.id()`. 8. The broker's spool through `SpoolDir::open`, and the
+broker's clock. 9. Exactly one entry matching an ancestor's pin; `validate`;
+`decide`; **consume**. 10. The program opened, judged, hashed. 11. The
+authorization recorded through `authorize`. 12. `execveat` on the validated
+descriptor. `run` returns only when it did not exec, always with a refusal,
+already on the trail where it could be written, and prints one line to standard
+error: the stable code and the severity, nothing the caller supplied.
+
+**Reconciled with the broker (B1).** Three contracts, as the plan named them,
+and two things the merge showed.
+
+1. **An entry already gone when the gate consumes it is a refusal, never a
+   success.** The broker's `Spool::remove` says the opposite, on purpose: for
+   the broker's tidying, "already gone" is the outcome it wanted, and the gate
+   "may have consumed it a moment ago". For the gate the unlink *is* the claim.
+   Two gates that read the same entry both reach it, exactly one wins, and the
+   one that finds the name gone lost and must run nothing. A gate that took the
+   broker's `remove` would run the command twice. The seam now has both:
+   `Spool::consume` and `SpoolError::Gone`, over one `unlink_entry` that
+   `remove` and `consume` share, so they differ in nothing but what to make of
+   "was not there". `FakeSpool::consume` mirrors it, and
+   `FakeSpool::failing_consume` scripts any other failure. The gate does not
+   hold the whole `Spool`: `GateHost::open_spool` hands it a `RequestSpool`
+   (list, read, consume) over it, so a hostile entry cannot make the gate
+   publish, lock or remove, because the type it holds has no way to say so.
+   Tests, each shown to fail with its protection removed:
+   `consuming_an_entry_takes_it_and_the_second_consumer_is_told_it_is_gone`
+   (aido-sys, on a real directory),
+   `an_entry_that_was_already_gone_when_the_gate_consumed_it_runs_nothing` (a
+   second gate takes the entry the moment the first has read it, through the
+   seam, so the loser's consume is the real answer and not a scripted one),
+   `an_entry_that_cannot_be_unlinked_runs_nothing`.
+2. **One monotonic clock, the broker's.** The gate's own `Clock`, `HostClock`
+   and `FakeClock` were deleted; `aido_sys::{Clock, HostClock, FixedClock}` is
+   what both read, so a deadline is stamped and judged on one `CLOCK_MONOTONIC`
+   in whole seconds. The broker's `Clock` cannot fail, so the gate's step
+   "could not read the clock" and its `FakeClock::broken` test went with the
+   fallibility, not by choice. What replaced it is `read_clock`, which refuses
+   a reading of zero (`gate_failed_clock`, `a_clock_that_reads_zero_stops_the_gate_because_no_deadline_can_be_judged`):
+   `HostClock` answers zero for a negative `tv_sec`, which the kernel never
+   reports. Zero is the fail-closed reading for the broker, which then stamps a
+   deadline already behind it, and it would be the fail-open one at the gate,
+   where every deadline would look still ahead. The gate's own check that its
+   `HostClock` is the monotonic clock and not the wall clock
+   (`the_host_clock_is_seconds_since_boot_and_not_the_wall_clock`) moved to the
+   shared `clock.rs`: the broker's two tests would not have noticed a swap to
+   `ClockId::Realtime`. **B1's open item 1 asked step 4 to confirm the two
+   read the same clock rather than assume it.** Confirmed by construction: it
+   is one function. The one way two processes on one host could read different
+   `CLOCK_MONOTONIC`s is a time namespace, and the premise that closes it is
+   that creating one takes `CAP_SYS_ADMIN` in its owning user namespace, and the
+   set-user-ID bit on `sudo` does nothing inside a user namespace where root is
+   not mapped, so a caller cannot run the gate inside a namespace it made. That
+   premise is the kernel's documented behaviour and is **not measured here**:
+   Docker's default seccomp profile refuses `unshare`. A time namespace root
+   made on purpose, with `/run/aido` reachable from it, is the same kind of
+   configuration as the pid-namespace case B1 recorded (open item 8) and is
+   outside the model.
+3. **The exec path takes `Authorized<_>`, and B1 did not wire the broker's
+   half.** B1 deferred the audit trail to plan item D1 (its open item 6) and
+   kept the stderr record, so there is no broker-side contract to take. The
+   gate's exec already takes an `Authorized<Approved>` that only
+   `aido_sys::authorize` makes, with `AuditTrail::system("aido-gate")`, so it
+   keeps its pre-exec record. **D1 owns what is left:** the end-to-end check
+   (both independent records on a successful execution, a failing sink stopping
+   mint *and* execution, `aido audit --log` passing on the produced trail and
+   failing after truncation), and the decision recorded in decision 1 below, how
+   a post-execution outcome is obtained from an exec-in-place gate. Until D1
+   the trail the gate writes holds the gate's records alone, and a host
+   without journald refuses every gate decision that needs a record
+   (`gate_failed_audit`), which is the fail-closed direction.
+4. **One spool implementation.** The gate had written its own, `DirSpool`, at the
+   same path as the broker's `SpoolDir`; the two were not the same code. The
+   broker's is kept (reviewed, merged), and what the gate's had that it lacked
+   moved into it: an entry with a second name is refused (`st_nlink != 1`, since
+   the unlink that consumes removes one name), for the broker's reader as well.
+   What the broker's has that the gate's lacked now holds for the gate: the
+   spool must be a root-owned directory private to root, not any directory the
+   walk accepts, and an entry may not give group or other *any* access, where
+   the gate's refused only write bits. The gate's old `DirSpool` tests were
+   each carried over or superseded: the write-bit modes are
+   `an_entry_anyone_else_can_write_is_unreadable`, the second name is
+   `an_entry_that_is_known_by_a_second_name_is_unreadable`, the bound on how
+   many names are walked is now the gate's own
+   (`a_spool_holding_more_names_than_the_gate_will_walk_is_refused_not_walked`
+   and its at-the-bound twin), and the rest are the broker's tests of the same
+   reader. The two bounds the gate reads by, `MAX_SPOOL_NAMES` and
+   `MAX_ENTRY_BYTES`, are pinned against the broker's own ceilings by two
+   compile-time assertions in `aidod::mint`: a spool kept within the broker's
+   limits (64 live entries, 32 KiB an entry) is always one the gate will walk
+   and read, so the gate's bounds can only bite on a spool the broker did not
+   keep. The listing itself is bounded too: `Spool::names_up_to(MAX_SPOOL_NAMES
+   + 1)` pulls entries lazily, so a spool someone filled is never read whole to
+   be refused. Tests: `a_listing_with_a_limit_reads_no_further_than_the_limit`,
+   `a_listing_with_a_limit_pulls_no_more_entries_than_the_limit_takes`,
+   `the_fake_lists_up_to_a_limit_as_the_directory_does`,
+   `the_gates_view_of_the_spool_lists_one_name_past_the_bound_and_reads_no_further`.
+   Mutations L1 to L10 were killed.
+5. **The settings the gate decides with.** Decision 12 below said the gate and
+   the broker "must agree" on the settings file once either reads it. The
+   broker now does (`aidod::policy`, `read_trusted_file` and `settings_from`);
+   the gate still decides with `Settings::default()`. That is safe today for the
+   reason it was: `frozen` and `confirm_agent_actions` bite only an enrolled
+   agent (`engine::Settings`), and the gate attests no one, so no decision
+   differs. It stops being safe the day M3's `aido freeze` or M4's enrolment
+   exists. **Open item 8.**
+
+**Decisions** (the step-1 "open for step 4" items, and the rest this step had
+to make):
+
+1. **Process model: exec in place.** The alternative, fork and wait, was
+   rejected for three reasons. `fork` has no safe wrapper, so it would be a
+   further `unsafe` block in the one crate with a published budget, for a
+   benefit that is only a record the gate then has nothing to write. A waiting
+   root parent keeps every descriptor it inherited, and `close_range` marks
+   rather than closes. And exec in place gives the faithful exit status and
+   signal for free: `sudo`'s own parent reaps the command. The cost is an outcome
+   record. The authorization is written before the exec, nothing follows it, and
+   the one outcome the gate can learn, an exec that fails, is a second record
+   (`exec_failure_record`) naming the first by `authorization_seq=` in its
+   evidence, because the log is append-only and `Record` has no field to name
+   it with (step 6, open item 2). A second cost: the exit status. 17, 18 and 19
+   are `aido`'s refusal codes, and a child exec'd in place can exit with them,
+   so status alone cannot tell a refusal from a child; the stderr refusal line
+   is the signal, and C1's front-end must read it.
+2. **Before 5.11 the gate refuses.** `CLOSE_RANGE_CLOEXEC` is the whole of step
+   1, and the per-descriptor `fcntl` fallback is another `unsafe` block in the
+   budget for a kernel older than the beta supports. The refusal is
+   `gate_failed_descriptors`, at normal severity, exit 19. The unscripted
+   `FakeSyscalls` answers `ENOSYS` exactly as such a kernel does, so the test
+   needs no special case.
+3. **The exec vector is the canonical argv bytes.** `Approved::exec_argv` holds
+   `Argv::canonicalize()`'s operands as bytes and `execute` builds the vector
+   from them; `Approved::argv`, which came through the renderer, is for the
+   record. `exec_vector` refuses an interior NUL rather than hand the kernel a
+   prefix; the entry's own NULs are refused much earlier by `validate`.
+4. **`PR_SET_NO_NEW_PRIVS` is set early, not at the exec.** It is irreversible,
+   inherited, and nothing the gate does before the exec depends on it being
+   unset, so setting it before anything is consumed means a host that refuses
+   costs the caller nothing. A test pins that a refusal there leaves the spool
+   and the program untouched.
+5. **On `-auth` the password is the confirmation**, as the plan decided on
+   2026-10-14: `GateContext::password_confirms`, true only for that name,
+   satisfies `AllowWithConfirmation` in `decide`, and the record says so
+   (`confirmation=password ...`). It widens nothing else: an expired, stale,
+   or policy-refused entry is refused with the flag set
+   (`a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say`).
+6. **The caller is identified by a pin match, never by a name.** `lineage`
+   (in `aido-sys`) reads the gate and up to eight processes above it,
+   quietly stopping at the bound where `ancestry` refuses a deep tree, because
+   a deep session is ordinary here. The ancestors' `(pid, starttime)` pairs are
+   what a spool entry must match; the names go in the record as
+   `lineage=` and are branched on nowhere. This is shape-agnostic on purpose:
+   `sudo` and `sudo-rs` with `use_pty` put a monitor between the gate and
+   `aido`, and OpenDoas execs without a fork, so the distance is one to three
+   and the walk does not need to know which. **Not measured** against the real
+   three here: the lineage is tested against the tree those programs are
+   documented to make, and the matrix's executing half (step 8) is where it
+   becomes a fact.
+7. **Zero matches is `NoPendingRequest`; more than one is refused**
+   (`request_ambiguous`); an entry that matches the pin but whose content nonce
+   disagrees with its name is refused (`request_forged_nonce`). Entries that
+   are not named by a nonce, cannot be read, are not UTF-8, or do not parse are
+   passed over: they cannot be matched to anyone, and refusing on one would let
+   a stray file in a root-only directory lock every caller out. The only way a
+   passed-over entry changes the outcome is by being the one that should have
+   matched, and then the outcome is `NoPendingRequest`, which refuses. The
+   broker's temporary files (`.tmp.<nonce>`) are such names: no nonce starts
+   with a dot.
+8. **Consume after `decide`, before the program is touched.** An entry is
+   unlinked only when the gate would otherwise go on to run it. A refusal by
+   policy, expiry or a stale generation leaves the entry for the broker's
+   reaper; a refusal after the consume (a program that fails the walk, a record
+   that cannot be written) burns it, and the caller must ask again. That is the
+   fail-closed direction, and `an_entry_is_consumed_exactly_once_so_a_second_gate_finds_nothing`
+   and `an_entry_that_was_already_gone_when_the_gate_consumed_it_runs_nothing`
+   pin both ends: the second gate to unlink gets `Gone` and runs nothing.
+9. **The program is opened by `open_trusted`, not as a bare `O_PATH`
+   descriptor.** The walk opens every component `O_PATH` and the target
+   `O_PATH`, then reopens the target read-only and refuses it unless it is the
+   inode that passed; SHA-256 needs the contents, which `O_PATH` cannot give. The
+   one descriptor is then `fstat`ed (regular, owner, no group or world write,
+   an execute bit), hashed with `pread`, and the same descriptor is what
+   `execveat` runs. `Program::from_fd` asks the descriptor the owner and mode
+   questions again, so a program is never run on a check made on something
+   else. A `#!` is refused first, as `Script`, with the reason in the record:
+   through a close-on-exec descriptor the kernel could not have run it anyway.
+10. **A refusal for "could not do a step" is a `Refusal::Failed`, not a new
+    `DenialCode`.** Step 6 open item 1 (a refusal for "the record could not be
+    written") is `Stage::Audit`, code `gate_failed_audit`; `Stage` names every
+    step that can fail without the request being at fault, with a stable code
+    each, and `Invocation`, `Spool` and `Program` report at high severity
+    because they fail only when somebody is making them. The pinned denial
+    contract in `aido-policy` is untouched. The record of a `Failed` refusal
+    carries `detail=`, the step's own words bounded to 200 characters.
+11. **No new crate, no new `unsafe`.** `aido-gate` depends on `aido-sys` (and
+    `aido-sys` dev-depends on `aido-gate` for its contract test, which Cargo
+    allows); `aido-sys` takes the workspace's `sha2` and two more rustix
+    features beside the broker's (`stdio`, `thread`). `Cargo.lock` gains edges,
+    not packages. The unsafe budget is untouched: six blocks, enforced by
+    `aido-sys-raw/tests/unsafe_budget.rs`.
+12. **The gate reads no `config.toml` yet**, so `engine::Settings::default()`
+    is what it decides with (`confirm_agent_actions` on, `frozen` off). See
+    reconciliation 5 and open item 8.
+
+**Found while building it.** A filled standard stream was left close-on-exec:
+`dup2(x, x)` does nothing, so a descriptor that was already open as 0, 1 or 2
+and had `FD_CLOEXEC` set stayed so, and the child saw the stream closed.
+`install` now clears `FD_CLOEXEC` by name after the `dup2`, and
+`crates/aido-sys/tests/std_streams.rs` tests it in its own process. Mutations
+H1 to H4 on `install` were each killed. An earlier version of this entry said
+the closed-descriptor path was not mutation-checked; it now is.
+
+Rust's runtime already replaces closed standard
+descriptors before `main` on Unix, so step 2 is the second line of defence, not
+the first. It is kept: the guarantee must not rest on a runtime detail, the gate
+must hold it for whatever builds it, and it is cheap. That also means the
+process test for closed descriptors can show only that the gate behaves the
+same with 0, 1 and 2 closed; the ordering ("before any open") is pinned by the
+library tests, where the fake table records it.
+
+The first `just linux-test` of the rebased tree failed one test it had no part
+in: `exec_runs_the_descriptor_it_is_handed_not_the_working_directory` got
+`ETXTBSY` where it expected `ENOEXEC`. It is the race the script test beside it
+already records (89f7029): the kernel looks for open writers before it looks at
+a file's format, and a fork in another test thread holds a copy of the write
+descriptor `std::fs::write` just closed until the child execs. The broker's new
+Linux tests start processes, which made the window wider. The test now accepts
+`ETXTBSY` as well, which keeps what it discriminates (`EACCES` is what executing
+the working directory would give, and still fails it) and drops the flake. It
+is the second instance of one class, so the retry is not the fix for the class:
+plan item D4 still owns it.
+
+**Tests, named for the attack.** In `aido-gate::run`:
+`a_direct_hostile_invocation_with_no_entry_does_nothing_and_exits_unusable_at_high_severity`,
+`arguments_are_refused_because_the_sudoers_rule_grants_none`,
+`an_unexpected_argv0_is_refused` (ten spellings, `aido-gate-nopass` and
+`aido-gate-auth/` among them),
+`an_argv0_that_could_drive_a_terminal_reaches_the_record_escaped`,
+`an_entry_minted_for_someone_else_is_not_this_callers`,
+`a_reissued_pid_does_not_borrow_the_entry_of_the_process_that_had_it`,
+`two_entries_pinned_to_one_lineage_are_refused_and_neither_is_consumed`,
+`an_entry_whose_content_disagrees_with_its_name_is_forged_and_refused`,
+`an_expired_entry_is_refused_at_normal_severity`,
+`an_entry_from_before_the_rules_changed_is_refused`,
+`a_program_that_fails_the_trust_walk_is_refused_and_nothing_is_recorded_as_authorized`
+(symlink, writable, script), `a_gate_that_cannot_write_its_record_refuses_and_executes_nothing`,
+and one `stops_at` test per step proving nothing after it ran (a kernel without
+`close_range`, streams that cannot be replaced, `no_new_privs` refused, a `/proc`
+that is not procfs, a lineage that cannot be walked, a ruleset or spool that fails
+the trust walk, a spool too crowded to walk, a clock that reads zero). In `aido-sys`:
+the seam's three tests above, `a_script_is_refused_with_that_reason_and_never_hashed`,
+`a_program_anyone_else_can_write_is_refused`, `a_symlinked_program_is_refused_by_the_walk`,
+`a_read_that_fails_after_the_first_bytes_is_a_refusal_not_a_short_hash`,
+`a_file_that_is_not_on_procfs_is_refused_wherever_it_sits_under_proc`. In
+`aido-gate-bin/tests/binary.rs`, through real processes and hardlinks: the same
+refusals by exit status and the one line, closed and leaked descriptors, and
+that the environment is never read.
+
+**Each protection was removed to see that a test notices.** Twenty-nine
+mutations of the gate and its seams, one at a time, each restored: the
+no-entry refusal at normal severity and with the wrong exit, arguments and any
+`argv[0]` accepted, the forged-nonce and ambiguity checks, the pin matched on
+pid alone and on start time alone, the gate's own pin matched as a caller, the
+deadline boundary, a stale generation, a wrong caller, a failed consume
+ignored, consume skipped, consume moved after the program is opened, the exec
+vector built from the rendering and with an emptied environment,
+`no_new_privs`, the standard streams, and `close_range` each dropped, the
+streams moved after the first open, a script, a writable program and a program
+someone else owns accepted, `consume` succeeding on a missing name (the real
+directory and the fake), and a second name accepted; and, in Docker, the procfs
+check made always true and `no_new_privs` set to false. Every one fails at least
+one test, named above (three, for the last two). The real `/dev/null` fill of a
+closed standard stream is not one of them: it is held by a fake table that
+records the order, because Rust's own runtime fills a closed descriptor before
+`main` and a process test cannot tell.
+
+**Open.**
+
+1. **The root-run half.** Everything above runs unprivileged, as the hostile
+   user does, and `exec_fd` is a fake in the library tests: the gate has not
+   yet exec'd anything for real, as root, through a real `sudo`. That is the
+   executing half of the differential matrix (`aido-tests`, step 8), and
+   checklist items 4 and 11 stay half-open until it exists (the child's own
+   `/proc/self/environ`, the real lineage under sudo, sudo-rs and OpenDoas).
+   A root-lane test of the binary (`just root-test`) is not built here, for a
+   reason worth knowing: the gate's audit trail mirrors every record to
+   journald's socket and refuses without it, a container has none, so a real
+   exec in the lane needs a stand-in for that socket. Whoever builds the first
+   root-run test of the gate has to make it; B4's post-install probe is the first
+   that will need to.
+2. **`argv[0]` is the name, not `/proc/self/exe`.** `sudo` sets `argv[0]` to
+   the command it was asked for, so the `-auth` name is as trustworthy as the
+   sudoers rule that attaches the password to that path, and no more. When M4
+   ships `-nopass`, where the name decides whether a password was typed in the
+   other direction, the name should be read from the kernel's record of which
+   dentry was exec'd instead.
+3. **The caller's uid is recorded as unknown** (`u32::MAX`, not 0, which would
+   read as root). The decision does not use it. `SO_PEERCRED` at the broker is
+   where it is known; the entry does not carry it.
+4. **The program's digest is recorded, not compared.** There is nothing to
+   compare it with until a rule can pin one.
+5. **A refusal record over 64 KiB goes unwritten** (step 6, open item 3): an
+   entry may be 64 KiB, and its argv is echoed into the refusal's `argv`. The
+   refusal stands and the gate still exits; only the record is lost. The broker
+   writes at most a 16 KiB request, so this needs an entry the broker did not
+   write. A bounded fallback record belongs with the broker's, which has the
+   same problem.
+6. **`Approved` is still `Clone` with public fields**, so the guarantee that
+   nothing runs unrecorded rests on `execute` taking an `Authorized<Approved>`,
+   which it does and nothing else can make (step 6, open item 9).
+7. **A policy refusal leaves the entry in the spool.** The broker prunes
+   expired, superseded and unusable entries at each mint, so the spool no longer
+   grows without bound, and an entry that is never consumed lives at most its
+   fifteen minutes or until its caller exits; the gate's own ceiling of
+   `MAX_SPOOL_NAMES` (4096, against the broker's 64) is a bound on what a
+   spool someone else filled can make it read, and the listing stops one name
+   past it (`Spool::names_up_to`, reconciliation 4).
+8. **The gate does not read `/etc/aido/config.toml`.** Before M3's `freeze` or
+   M4's enrolment can make `frozen` or `confirm_agent_actions` bite, the gate
+   must read the same file through the same walk and derive the same settings
+   as the broker, and the two must be one function: `settings_from` is in
+   `aidod::policy` today, which `aido-gate` cannot depend on (the dependency
+   runs the other way), so it belongs in `aido-gate` (or lower) and the broker
+   should call it from there.
+9. **The audit trail is the gate's alone until D1** (reconciliation 3), and the
+   post-execution outcome of an exec-in-place gate is D1's to decide.
+10. **A time namespace** is argued, not measured (reconciliation 2).
+
+**Measured**, on the commit that carries this entry: `just verify` green
+through the pre-commit hook (100% lines, regions and functions on macOS, no
+waiver, no threshold moved); `just check-linux` clean for both Linux triples,
+and clippy `-D warnings` clean for both, which `just verify` does not run;
+`just linux-test` green on Linux 6.12.76 (linuxkit, aarch64) in Docker as uid
+1000, with the gate binary's seven process tests and the rebased broker's suite
+in it, after the flake above. The Linux half of the coverage was measured by
+hand, with the command `just coverage` runs, in that container: 100% on every
+file this change adds or touches except the two environment-bound ones B1
+recorded, `probe.rs` (needs `sudo` or `doas` installed, which the runners have)
+and one closure in `syscall.rs` that runs only from kernel 6.16 (the runners
+have 6.17). Not yet seen on the CI runners, nor on x86_64.
+
+---
+
 ## 2026-10-21 — M2b step 2 (B1): `aidod`, the broker that mints, final
 
 Built 2026-10-19; this entry was finished when it landed, after the review

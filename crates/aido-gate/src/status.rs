@@ -6,7 +6,11 @@
 //! between "the package was already installed" (`apt-get` exit 0) and "the
 //! archive is corrupt" (exit 100), and — worse for this project — makes a
 //! *denial* indistinguishable from a command that ran and failed. `aido` reserves
-//! its own exit codes for its own refusals and passes everything else through.
+//! 17 to 19 for its own refusals and passes everything else through. The
+//! exec-in-place gate cannot keep that range apart: a child may exit with the
+//! same numbers, so only the refusal line on standard error says which it was.
+//! [`Termination`] is for a wait-based front-end (plan item C1); the gate
+//! itself never waits and does not use it.
 //!
 //! # The shell convention, and why signals are not exit codes
 //!
