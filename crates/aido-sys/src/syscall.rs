@@ -980,13 +980,24 @@ mod tests {
             // ENOEXEC can only come from the file behind this descriptor: a
             // regular file, executable by mode, on a filesystem that permits
             // exec, whose bytes are no format the kernel loads. Executing the
-            // working directory instead would fail with EACCES.
+            // working directory instead would fail with EACCES, and that is
+            // the answer this test exists to refuse.
+            //
+            // The kernel checks for open writers before it looks at the file's
+            // format. Another test in this process can fork while the write
+            // below has the file open, and the child holds a copy of that
+            // descriptor until it execs, so the answer is ETXTBSY instead:
+            // seen once under `just linux-test`, on 6.12, the same race the
+            // script test below records. ETXTBSY says nothing about which
+            // file was meant, and EACCES still fails, so accepting it keeps
+            // the discrimination and drops the flake.
             let path = scratch("exec-not-a-program").join("not-a-program");
             std::fs::write(&path, b"plain text, no interpreter line\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             let file = std::fs::File::open(&path).unwrap();
             let err = HostSyscalls.exec_fd(file.as_fd(), &[c"not-a-program"], &[]);
-            assert_eq!(err.os_code(), Some(Errno::NOEXEC.raw_os_error()));
+            let from_the_file = [Errno::NOEXEC, Errno::TXTBSY].map(|e| Some(e.raw_os_error()));
+            assert!(from_the_file.contains(&err.os_code()), "{err}");
         }
 
         #[test]

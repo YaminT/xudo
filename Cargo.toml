@@ -5,6 +5,7 @@ members = [
   "crates/aido-backend",
   "crates/aido-config",
   "crates/aido-gate",
+  "crates/aido-gate-bin",
   "crates/aido-policy",
   "crates/aido-sys",
   "crates/aido-sys-raw",

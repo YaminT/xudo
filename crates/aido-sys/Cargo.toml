@@ -20,8 +20,9 @@ bstr.workspace = true
 # ruleset is verified on the descriptors it is read through. The broker's safe
 # calls come from the same crate: the socket checks and `SO_PEERCRED` (net),
 # `pidfd_open` (process), the liveness poll (event), `CLOCK_MONOTONIC` (time),
-# and `getrandom` (rand). Features of a crate already in the tree, not new
-# crates.
+# and `getrandom` (rand). The gate's come from it too: `PR_SET_NO_NEW_PRIVS`
+# (thread) and the `dup2` that fills a closed standard stream (stdio).
+# Features of a crate already in the tree, not new crates.
 rustix = { version = "1.1", default-features = false, features = [
   "std",
   "fs",
@@ -30,7 +31,12 @@ rustix = { version = "1.1", default-features = false, features = [
   "event",
   "time",
   "rand",
+  "stdio",
+  "thread",
 ] }
+# The digest the gate takes of the program it is about to exec, on the
+# descriptor it exec's.
+sha2.workspace = true
 thiserror.workspace = true
 
 # The Linux tests start a real peer process and bound its connection with

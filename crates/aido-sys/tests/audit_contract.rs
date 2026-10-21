@@ -27,6 +27,7 @@ fn approved() -> Approved {
     Approved {
         program: "/usr/bin/systemctl".to_owned(),
         argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+        exec_argv: vec![b"restart".to_vec(), b"nginx.service".to_vec()],
         environment: Vec::new(),
         action: "aido.svc.restart".to_owned(),
         rule_source: "20-services.toml:15".to_owned(),

@@ -52,6 +52,17 @@ mod tests {
     }
 
     #[test]
+    fn the_host_clock_is_seconds_since_boot_and_not_the_wall_clock() {
+        // A deadline anchored to the wall clock is one an operator extends by
+        // correcting the time and an attacker extends by anything that moves
+        // it backwards. The wall clock reads about 1.8 billion; the monotonic
+        // clock reads the host's uptime, and a host is not up for thirty-one
+        // years. A swap to `ClockId::Realtime` fails here and nowhere else.
+        let now = HostClock.monotonic_secs();
+        assert!(now < 1_000_000_000, "{now} looks like wall-clock time");
+    }
+
+    #[test]
     fn a_fixed_clock_reads_what_it_was_given() {
         assert_eq!(FixedClock(1_234).monotonic_secs(), 1_234);
         assert_eq!(FixedClock(7), FixedClock(7));

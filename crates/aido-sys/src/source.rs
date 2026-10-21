@@ -81,26 +81,33 @@ impl DirSource {
     /// symlink-resistant `openat2` resolution belongs on the exec path, where
     /// a lie hands out root.
     fn resolve(&self, relative: &str) -> Result<PathBuf, SysError> {
-        if relative.is_empty() {
-            return Err(SysError::read(relative, "empty path"));
-        }
-        if relative.starts_with('/') {
-            return Err(SysError::read(
-                relative,
-                "path must be relative to the root",
-            ));
-        }
-        if relative
-            .split('/')
-            .any(|c| c == ".." || c == "." || c.is_empty())
-        {
-            return Err(SysError::read(
-                relative,
-                "path must not contain an empty, current, or parent component",
-            ));
-        }
+        check_relative(relative)?;
         Ok(self.root.join(relative))
     }
+}
+
+/// Refuses a path that is empty, absolute, or has an empty, current, or parent
+/// component: the lexical rule every source holds its relative paths to.
+pub(crate) fn check_relative(relative: &str) -> Result<(), SysError> {
+    if relative.is_empty() {
+        return Err(SysError::read(relative, "empty path"));
+    }
+    if relative.starts_with('/') {
+        return Err(SysError::read(
+            relative,
+            "path must be relative to the root",
+        ));
+    }
+    if relative
+        .split('/')
+        .any(|c| c == ".." || c == "." || c.is_empty())
+    {
+        return Err(SysError::read(
+            relative,
+            "path must not contain an empty, current, or parent component",
+        ));
+    }
+    Ok(())
 }
 
 impl ProcSource for DirSource {
