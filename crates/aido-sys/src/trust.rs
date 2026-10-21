@@ -848,6 +848,9 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use super::*;
     use crate::mounts::fake::{EXT4_ROOT, FakeMounts, Ids};
 
@@ -1077,6 +1080,62 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
+    /// What a socket address can hold: `sun_path` is 104 bytes on macOS and 108
+    /// on Linux, and `bind` refuses a path that leaves no room for the closing
+    /// NUL. The smaller figure, so one bound serves both.
+    const SOCKET_ADDRESS_BYTES: usize = 104;
+
+    /// Binds a Unix socket named `name` in `dir`, however long the path to
+    /// `dir` is.
+    ///
+    /// The address `bind` copies into `sun_path` is a path. A checkout in a git
+    /// worktree, or a copy under `/var/folders`, spells `dir` longer than that,
+    /// and `bind` then fails with `path must be shorter than SUN_LEN`: the gate
+    /// passed in one clone and failed in the next. So `bind` is given a short
+    /// relative alias for `dir` — a symlink beside `target/test-tmp`, which the
+    /// kernel follows when it creates the file — and the long path is only ever
+    /// `stat`ed, which has no such limit. Cargo runs every unit test from the
+    /// package directory, which is what lets the alias be spelled relative; the
+    /// alias is gone again before this returns.
+    fn bind_socket(dir: &Path, name: &str) -> UnixListener {
+        static NEXT_ALIAS: AtomicUsize = AtomicUsize::new(0);
+        let alias = Path::new("../../target/test-tmp").join(format!(
+            "sun-{}-{}",
+            std::process::id(),
+            NEXT_ALIAS.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        // A stale alias from a run that died between the two calls below.
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(dir, &alias).unwrap();
+        let bound = UnixListener::bind(alias.join(name));
+        std::fs::remove_file(&alias).unwrap();
+        bound.unwrap()
+    }
+
+    #[test]
+    fn a_test_socket_binds_under_a_path_longer_than_a_socket_address_can_hold() {
+        // A checkout deep enough to overflow `sun_path`, made on purpose: the
+        // fixture is proved against the failure it exists for, not against
+        // whichever clone the suite happens to run in.
+        let mut dir = test_dir("trust-deep");
+        for _ in 0..3 {
+            dir.push("d".repeat(80));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("sock");
+        assert!(socket.as_os_str().len() > 2 * SOCKET_ADDRESS_BYTES);
+
+        // The premise: std itself refuses this path as a socket address.
+        let refused = UnixListener::bind(&socket).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+
+        // The fixture does not, and what it makes is a socket, where it was
+        // asked to make it.
+        let listener = bind_socket(&dir, "sock");
+        assert_eq!(stat_path(&socket).unwrap().kind, Kind::Other);
+        drop(listener);
+    }
+
     #[test]
     fn stat_reports_a_real_directory_and_a_real_file() {
         let dir = test_dir("trust-stat");
@@ -1111,9 +1170,8 @@ mod tests {
         // Other arm is dead code, and dead code in a trust check is a branch
         // nobody has ever seen behave.
         let dir = test_dir("trust-socket");
-        let path = dir.join("sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert_eq!(stat_path(&path).unwrap().kind, Kind::Other);
+        let listener = bind_socket(&dir, "sock");
+        assert_eq!(stat_path(&dir.join("sock")).unwrap().kind, Kind::Other);
         drop(listener);
     }
 
@@ -1129,8 +1187,8 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         let link = dir.join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
+        let listener = bind_socket(&dir, "sock");
         let sock = dir.join("sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let kind = |path: &Path| {
             let stat =
                 rustix::fs::statat(CWD, path, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).unwrap();
@@ -1854,18 +1912,9 @@ mod tests {
                     std::os::unix::fs::symlink(dir.join("real"), &target).unwrap();
                 }
                 "dir" => std::fs::create_dir(&target).unwrap(),
-                // `sun_path` holds 104 bytes on macOS, and `target` spelled
-                // through `crates/aido-sys/../..` under a deep checkout — a
-                // git worktree — is longer. Cargo runs tests from the package
-                // directory, so the same file is bound by a relative path.
-                _ => drop(
-                    std::os::unix::net::UnixListener::bind(
-                        Path::new("../../target/test-tmp")
-                            .join(format!("tw-shape-{shape}"))
-                            .join("10-x.toml"),
-                    )
-                    .unwrap(),
-                ),
+                // Bound through `bind_socket`: under a deep checkout — a git
+                // worktree — the path to `dir` is longer than an address.
+                _ => drop(bind_socket(&dir, "10-x.toml")),
             }
             let err = read_at(&dir, my_uid(&dir), &FakeMounts::ext4()).unwrap_err();
             assert!(err.to_string().contains(expect), "{shape}: {err}");
