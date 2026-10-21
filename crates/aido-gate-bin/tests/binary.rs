@@ -131,9 +131,14 @@ fn the_refusal_line_carries_a_code_and_nothing_the_caller_supplied() {
 #[test]
 fn closed_standard_streams_do_not_change_what_the_gate_does() {
     // Started with descriptors 0, 1 and 2 closed, as a set-user-ID program's
-    // attacker would start it. The gate fills each with /dev/null before it
-    // opens anything, so what it then opens is never standard error, and it
-    // refuses exactly as it does with them open.
+    // attacker would start it. What fills them here is Rust's runtime, which
+    // replaces a closed 0, 1 or 2 with /dev/null before `main` runs, so the
+    // gate's own fill (`aido-sys`, `hygiene`) is never reached from a process
+    // test, and this test cannot show that it works. It shows what a process
+    // can: the gate refuses exactly as it does with them open, and what it
+    // opens afterwards is never standard error. The fill itself, and that a
+    // filled stream survives the exec that follows, is held on the real
+    // descriptors by `aido-sys/tests/std_streams.rs`.
     let link = named("aido-gate-auth");
     let open = Command::new(&link).output().unwrap();
     let closed = Command::new("/bin/sh")

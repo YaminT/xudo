@@ -156,6 +156,21 @@ pub trait Spool {
     /// [`SpoolError::Io`] if the directory cannot be read.
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError>;
 
+    /// At most `limit` names in the spool, `.` and `..` excepted, and no more
+    /// of the directory read than that takes.
+    ///
+    /// For a reader that will refuse a spool with more names than it is
+    /// prepared to walk, and so must not first read all of them: a listing
+    /// that stops one name past the bound is enough to see the bound crossed,
+    /// at a cost that does not grow with the directory. Which names come back,
+    /// when there are more than `limit`, is the directory's order and nothing
+    /// a caller may rely on.
+    ///
+    /// # Errors
+    ///
+    /// [`SpoolError::Io`] if the directory cannot be read.
+    fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError>;
+
     /// Reads one entry: a regular file, owned by the spool's owner, private to
     /// it, and at most `limit` bytes.
     ///
@@ -375,6 +390,24 @@ fn plain(name: &[u8]) -> Result<&OsStr, SpoolError> {
     Ok(OsStr::from_bytes(name))
 }
 
+/// The first `limit` names among a directory's entries, `.` and `..` not
+/// counted, and no more of the entries pulled than that takes.
+///
+/// A directory is read in batches as its iterator is pulled, so stopping the
+/// iterator is what stops the reading: a spool of millions of names costs what
+/// `limit` of them do. `.` and `..` are dropped before the count, so a
+/// directory of exactly `limit` entries comes back whole. An error among the
+/// first `limit` is the error; one beyond them is never reached.
+fn first_names(
+    entries: impl Iterator<Item = rustix::io::Result<Vec<u8>>>,
+    limit: usize,
+) -> rustix::io::Result<Vec<Vec<u8>>> {
+    entries
+        .filter(|name| !matches!(name, Ok(name) if name == b"." || name == b".."))
+        .take(limit)
+        .collect()
+}
+
 /// Reads the outcome of a bounded read as an entry's contents.
 ///
 /// One byte past the limit is read on purpose, so a file that grew after its
@@ -407,17 +440,17 @@ impl Spool for SpoolDir {
     }
 
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
+        self.names_up_to(usize::MAX)
+    }
+
+    fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
         let listed = Dir::read_from(&self.dir).and_then(|entries| {
-            entries
-                .map(|entry| entry.map(|e| e.file_name().to_bytes().to_vec()))
-                .collect::<rustix::io::Result<Vec<Vec<u8>>>>()
+            first_names(
+                entries.map(|entry| entry.map(|e| e.file_name().to_bytes().to_vec())),
+                limit,
+            )
         });
-        self.checked("read the directory", listed).map(|names| {
-            names
-                .into_iter()
-                .filter(|name| name.as_slice() != b"." && name.as_slice() != b"..")
-                .collect()
-        })
+        self.checked("read the directory", listed)
     }
 
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
@@ -504,6 +537,8 @@ pub enum SpoolCall {
     Unlock,
     /// [`Spool::names`].
     Names,
+    /// [`Spool::names_up_to`], with this limit.
+    NamesUpTo(usize),
     /// [`Spool::read`] of this name.
     Read(Vec<u8>),
     /// [`Spool::remove`] of this name.
@@ -554,7 +589,7 @@ impl FakeSpool {
         self
     }
 
-    /// Makes [`Spool::names`] fail.
+    /// Makes [`Spool::names`] and [`Spool::names_up_to`] fail.
     #[must_use]
     pub fn failing_names(mut self, error: SpoolError) -> Self {
         self.names_error = Some(error);
@@ -626,6 +661,12 @@ impl Spool for FakeSpool {
         self.record(SpoolCall::Names);
         scripted(self.names_error.as_ref())?;
         Ok(self.files.borrow().keys().cloned().collect())
+    }
+
+    fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
+        self.record(SpoolCall::NamesUpTo(limit));
+        scripted(self.names_error.as_ref())?;
+        Ok(self.files.borrow().keys().take(limit).cloned().collect())
     }
 
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
@@ -883,6 +924,67 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("abc")).unwrap(), b"first");
         assert_eq!(spool.names().unwrap(), vec![b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn a_listing_with_a_limit_reads_no_further_than_the_limit() {
+        // The gate refuses a spool with more names than it will walk, and must
+        // not read all of a spool it is about to refuse: the listing stops at
+        // the bound, whatever the directory holds.
+        let (spool, _dir) = spool("names-up-to");
+        for index in 0..5 {
+            spool.publish(&format!("entry-{index}"), b"x").unwrap();
+        }
+        // More names than the limit: exactly the limit, all of them entries.
+        let some = spool.names_up_to(3).unwrap();
+        assert_eq!(some.len(), 3);
+        assert!(some.iter().all(|name| name.starts_with(b"entry-")));
+        // Exactly the limit: every name, so `.` and `..` were not counted
+        // against it, and every name is one of the five.
+        let mut all = spool.names_up_to(5).unwrap();
+        all.sort();
+        let mut unbounded = spool.names().unwrap();
+        unbounded.sort();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all, unbounded);
+        // Past the number of names there are, and with no limit at all.
+        assert_eq!(spool.names_up_to(6).unwrap().len(), 5);
+        assert_eq!(spool.names_up_to(usize::MAX).unwrap().len(), 5);
+        // A limit of nothing reads nothing.
+        assert!(spool.names_up_to(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_listing_with_a_limit_pulls_no_more_entries_than_the_limit_takes() {
+        // What makes the bound a bound on the reading and not only on the
+        // answer: the entries are pulled one at a time, and the pulling stops.
+        // A million names stand behind `.` and `..`; three are wanted.
+        let pulled = std::cell::Cell::new(0_u32);
+        let entries = [b".".to_vec(), b"..".to_vec()]
+            .into_iter()
+            .chain((0..1_000_000).map(|index: u32| index.to_string().into_bytes()))
+            .map(|name| {
+                pulled.set(pulled.get() + 1);
+                Ok(name)
+            });
+        let first = first_names(entries, 3).unwrap();
+        assert_eq!(first, [b"0".to_vec(), b"1".to_vec(), b"2".to_vec()]);
+        // `.`, `..`, and the three names: the fourth is never asked for.
+        assert_eq!(pulled.get(), 5);
+
+        // An error among the first names is the answer; one past them is
+        // never reached.
+        let failing = |position: usize| {
+            (0..6).map(move |index| {
+                if index == position {
+                    Err(Errno::IO)
+                } else {
+                    Ok(vec![b'a'; index + 1])
+                }
+            })
+        };
+        assert_eq!(first_names(failing(1), 4), Err(Errno::IO));
+        assert_eq!(first_names(failing(5), 4).unwrap().len(), 4);
     }
 
     #[test]
@@ -1201,6 +1303,30 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_lists_up_to_a_limit_as_the_directory_does() {
+        let fake = FakeSpool::new()
+            .with_file("a", "1")
+            .with_file("b", "2")
+            .with_file("c", "3");
+        assert_eq!(
+            fake.names_up_to(2).unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(fake.names_up_to(3).unwrap().len(), 3);
+        assert_eq!(fake.names_up_to(9).unwrap().len(), 3);
+        assert!(fake.names_up_to(0).unwrap().is_empty());
+        assert_eq!(
+            fake.calls(),
+            vec![
+                SpoolCall::NamesUpTo(2),
+                SpoolCall::NamesUpTo(3),
+                SpoolCall::NamesUpTo(9),
+                SpoolCall::NamesUpTo(0),
+            ]
+        );
+    }
+
+    #[test]
     fn the_fake_fails_exactly_what_it_is_told_to() {
         let broken = SpoolError::Io {
             operation: "x".to_owned(),
@@ -1218,6 +1344,7 @@ mod tests {
             .failing_publish(broken.clone());
         assert_eq!(fake.lock(), Err(broken.clone()));
         assert_eq!(fake.names(), Err(broken.clone()));
+        assert_eq!(fake.names_up_to(1), Err(broken.clone()));
         assert!(
             fake.read(b"a", 8)
                 .unwrap_err()

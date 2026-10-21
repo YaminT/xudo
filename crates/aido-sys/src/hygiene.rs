@@ -9,7 +9,12 @@
 //!   the gate or its child prints is then written into the log, and a child
 //!   that writes to "stdout" writes there too. The classic set-user-ID attack.
 //!   [`Hygiene::ensure_std_streams`] fills each closed one with `/dev/null`
-//!   before the gate opens anything else.
+//!   before the gate opens anything else, and leaves it open across the exec:
+//!   a filled stream that the command then inherits closed would put the hole
+//!   back in the command's own process. Rust's runtime does the same fill
+//!   before `main`, so in a Rust binary this is the second line of defence;
+//!   it is held anyway, because the guarantee must not rest on a runtime
+//!   detail.
 //! * **The process may not gain privilege by exec.** `PR_SET_NO_NEW_PRIVS`
 //!   makes a set-user-ID or file-capability binary run with its caller's
 //!   credentials, so the command the gate runs cannot be anything but what the
@@ -24,7 +29,7 @@ use std::cell::RefCell;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{Mode, OFlags, fstat, open};
-use rustix::io::Errno;
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
 
 use crate::error::{SysError, lift};
 
@@ -78,13 +83,24 @@ impl StdStream {
         }
     }
 
-    /// Makes this descriptor another name for `from`'s open file.
+    /// Makes this descriptor another name for `from`'s open file, and one that
+    /// survives an `exec`.
+    ///
+    /// The second half is not `dup2`'s to promise. A duplicate onto a
+    /// *different* descriptor is never close-on-exec, but `dup2` of a
+    /// descriptor onto itself does nothing at all, and that is the ordinary
+    /// case here: `open` returns the lowest free number, which, when a stream
+    /// is closed, is the stream's own. The `O_CLOEXEC` that `/dev/null` was
+    /// opened with would stay on it, and the command the gate execs would
+    /// start without that stream, the hole the fill exists to close. So the
+    /// flag is cleared by name, whichever descriptor the file arrived on.
     fn install(self, from: BorrowedFd<'_>) -> Result<(), Errno> {
         match self {
             Self::In => rustix::stdio::dup2_stdin(from),
             Self::Out => rustix::stdio::dup2_stdout(from),
             Self::Err => rustix::stdio::dup2_stderr(from),
         }
+        .and_then(|()| fcntl_setfd(self.borrowed(), FdFlags::empty()))
     }
 }
 
@@ -103,7 +119,11 @@ pub trait StdTable {
     /// [`SysError`] when it cannot be opened.
     fn open_null(&self) -> Result<OwnedFd, SysError>;
 
-    /// Makes `stream` another name for `null`'s open file.
+    /// Makes `stream` another name for `null`'s open file, and leaves it open
+    /// across an `exec`: a stream the gate filled and its command then
+    /// inherits closed would be the hole all over again. `null` may be the
+    /// stream's own descriptor, which is what `open` returns when the stream
+    /// is closed.
     ///
     /// # Errors
     ///
