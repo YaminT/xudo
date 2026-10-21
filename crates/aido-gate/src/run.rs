@@ -34,7 +34,9 @@
 //!    value the broker minted against.
 //! 8. **The spool and the clock.** The broker's spool, opened through the trust
 //!    walk and seen through [`RequestSpool`], which can list, read and consume
-//!    and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked. Every
+//!    and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked, and the
+//!    listing is cut off one name past that, so a crowded spool is refused
+//!    without being read to its end. Every
 //!    entry named by a nonce is read on a descriptor of its own. Exactly one
 //!    must be pinned to an ancestor: none is [`Refusal::NoPendingRequest`],
 //!    more than one is refused. The clock is the broker's, [`aido_sys::HostClock`]:
@@ -120,12 +122,19 @@ pub const RULES_DIR: &str = "/etc/aido/rules.d";
 /// can make the gate read, not a size anything legitimate approaches.
 pub const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
-/// The most names the gate lists before it refuses to walk the spool.
+/// The most names the gate will walk, and so the most it reads of a listing.
 ///
 /// The broker keeps at most 64 live entries and removes the rest, so a spool
 /// holding more than this is a broker that is not reaping, or something
-/// wrong. Either way the gate does not read it entry by entry.
+/// wrong. Either way the gate does not read it entry by entry, and does not
+/// read the whole directory to find out: the listing is cut off one name past
+/// this ([`LISTED_NAMES`]), which is all it takes to see the bound crossed.
 pub const MAX_SPOOL_NAMES: usize = 4096;
+
+/// How many names the gate asks the spool for: one more than it will walk, so
+/// that a spool over the bound is seen to be over it without being read to the
+/// end.
+const LISTED_NAMES: usize = MAX_SPOOL_NAMES + 1;
 
 /// Everything the gate touches outside itself.
 ///
@@ -243,7 +252,10 @@ fn into_spool<S: Spool + 'static>(spool: S) -> Box<dyn RequestSpool> {
 /// cannot make the gate write into the directory it reads, because the type
 /// it holds has no way to say so.
 pub trait RequestSpool {
-    /// The names in the spool, as bytes.
+    /// The names in the spool, as bytes: at most [`MAX_SPOOL_NAMES`] and one
+    /// more, the one that shows the spool is over the bound. A listing that
+    /// long is a spool the gate refuses; the rest of the directory is never
+    /// read.
     ///
     /// # Errors
     ///
@@ -275,7 +287,7 @@ struct SpoolEntries<S>(S);
 
 impl<S: Spool> RequestSpool for SpoolEntries<S> {
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
-        self.0.names()
+        self.0.names_up_to(LISTED_NAMES)
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, SpoolError> {
@@ -459,25 +471,14 @@ fn proceed(
     let spool = stage(Stage::Spool, host.open_spool())?;
     let now = read_clock(host.clock())?;
 
-    let pending = find_entry(&*spool, ancestors.chain.get(1..).unwrap_or_default())?;
+    let matched = find_entry(&*spool, ancestors.chain.get(1..).unwrap_or_default())?;
     let own = ancestors
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
-    let caller = GateCaller {
-        pin: pending.as_ref().map_or(own, |found| {
-            CallerPin::new(found.caller_pid, found.caller_starttime)
-        }),
-        facts: CallerFacts::new(
-            Classification::Unattested {
-                reason: "the gate attests no caller: classification is the broker's, and the \
-                         passwordless path is M4"
-                    .to_owned(),
-            },
-            UNKNOWN_UID,
-        ),
-    };
+    let caller = caller_for(matched.as_ref(), own);
     progress.caller = Some(caller.clone());
+    let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
     let context = GateContext {
@@ -555,40 +556,78 @@ fn pin_of(process: &ProcRef) -> CallerPin {
     CallerPin::new(process.pid, process.starttime)
 }
 
-/// The spool entry pinned to one of the `ancestors`, if exactly one is.
+/// A spool entry, and the process the walk matched it to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Matched {
+    /// The entry: the one pinned to a process in the gate's lineage.
+    entry: PendingRequest,
+    /// That process, as the kernel's `/proc` reported it.
+    ///
+    /// Not the entry's own `caller_pid` and `caller_starttime`: those are the
+    /// entry's claim, and [`PendingRequest::validate`] is asked whether the
+    /// claim is true of *this*. A pin made from the claim would be checked
+    /// against itself, and a match that was wrong would sail through.
+    caller: CallerPin,
+}
+
+/// The caller `decide` judges the entry for.
+///
+/// With an entry matched, the process the walk matched it to. Without one
+/// there is no caller to name: the gate's own pin stands in, and `decide`
+/// refuses on the missing entry before it looks at the pin. The attestation
+/// is the same either way, because the gate attests no one.
+fn caller_for(matched: Option<&Matched>, own: CallerPin) -> GateCaller {
+    GateCaller {
+        pin: matched.map_or(own, |found| found.caller),
+        facts: CallerFacts::new(
+            Classification::Unattested {
+                reason: "the gate attests no caller: classification is the broker's, and the \
+                         passwordless path is M4"
+                    .to_owned(),
+            },
+            UNKNOWN_UID,
+        ),
+    }
+}
+
+/// The spool entry pinned to one of the `ancestors`, if exactly one is, and
+/// the ancestor it is pinned to.
 ///
 /// Only names that are nonces are opened. An entry that cannot be read, is
 /// not UTF-8, or does not parse cannot be matched to anyone and is passed
 /// over: refusing on it would let one stray file lock every caller out, and
 /// passing over it can only end in "no pending request".
-fn find_entry(
-    spool: &dyn RequestSpool,
-    ancestors: &[ProcRef],
-) -> Result<Option<PendingRequest>, Refusal> {
+fn find_entry(spool: &dyn RequestSpool, ancestors: &[ProcRef]) -> Result<Option<Matched>, Refusal> {
     let names = stage(Stage::Spool, spool.names())?;
     if names.len() > MAX_SPOOL_NAMES {
+        // The listing stopped one name past the bound, so how many more there
+        // are is not known, and not said.
         return Err(Refusal::Failed {
             stage: Stage::Spool,
             reason: format!(
-                "{} entries, more than the {MAX_SPOOL_NAMES} the gate will walk",
-                names.len()
+                "the spool holds more than the {MAX_SPOOL_NAMES} names the gate will walk"
             ),
         });
     }
-    let matched: Vec<(String, PendingRequest)> = names
+    let matched: Vec<(String, Matched)> = names
         .iter()
         .filter_map(|raw| std::str::from_utf8(raw).ok().filter(|name| is_nonce(name)))
-        .filter_map(|name| read_entry(spool, name).map(|entry| (name.to_owned(), entry)))
-        .filter(|(_, entry)| pinned_to(entry, ancestors))
+        .filter_map(|name| read_entry(spool, name).map(|entry| (name, entry)))
+        .filter_map(|(name, entry)| {
+            pinned_to(&entry, ancestors).map(|caller| (name.to_owned(), Matched { entry, caller }))
+        })
         .collect();
-    if let Some((name, _)) = matched.iter().find(|(name, entry)| entry.nonce != *name) {
+    if let Some((name, _)) = matched
+        .iter()
+        .find(|(name, found)| found.entry.nonce != *name)
+    {
         return Err(Refusal::Request(RequestError::ForgedNonce {
             name: name.clone(),
         }));
     }
     match matched.len() {
         0 => Ok(None),
-        1 => Ok(matched.into_iter().next().map(|(_, entry)| entry)),
+        1 => Ok(matched.into_iter().next().map(|(_, found)| found)),
         count => Err(Refusal::Request(RequestError::Ambiguous { matches: count })),
     }
 }
@@ -603,12 +642,16 @@ fn read_entry(spool: &dyn RequestSpool, name: &str) -> Option<PendingRequest> {
     })
 }
 
-/// Whether an entry was minted for one of these processes: the pid **and**
-/// the start time, because a pid alone is a name the kernel reissues.
-fn pinned_to(entry: &PendingRequest, ancestors: &[ProcRef]) -> bool {
-    ancestors.iter().any(|ancestor| {
-        ancestor.pid == entry.caller_pid && ancestor.starttime == entry.caller_starttime
-    })
+/// The process an entry was minted for, if it is one of these: the pid **and**
+/// the start time, because a pid alone is a name the kernel reissues. The pin
+/// returned is made from the ancestor, not from the entry.
+fn pinned_to(entry: &PendingRequest, ancestors: &[ProcRef]) -> Option<CallerPin> {
+    ancestors
+        .iter()
+        .find(|ancestor| {
+            ancestor.pid == entry.caller_pid && ancestor.starttime == entry.caller_starttime
+        })
+        .map(pin_of)
 }
 
 /// The argument vector and environment, as the C strings the kernel takes.
@@ -790,7 +833,8 @@ args = [
 
     impl RequestSpool for SharedSpool {
         fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
-            self.spool.names()
+            // As the real adapter lists: cut off one name past the bound.
+            self.spool.names_up_to(LISTED_NAMES)
         }
 
         fn read(&self, name: &str) -> Result<Vec<u8>, SpoolError> {
@@ -1210,6 +1254,26 @@ args = [
     }
 
     #[test]
+    fn the_gates_view_of_the_spool_lists_one_name_past_the_bound_and_reads_no_further() {
+        // A spool far fuller than the gate will walk. The directory is not
+        // read to its end to find that out: the listing stops one name past
+        // the bound, which is enough to refuse the spool. A listing that
+        // stopped at the bound could not tell a full spool from a crowded one.
+        let flooded = (0..MAX_SPOOL_NAMES + 100).fold(FakeSpool::new(), |spool, index| {
+            spool.with_file(format!("{index:05}"), "")
+        });
+        let listed = into_spool(flooded).names().unwrap();
+        assert_eq!(listed.len(), MAX_SPOOL_NAMES + 1);
+        // At the bound exactly, the whole spool.
+        let full = (0..MAX_SPOOL_NAMES).fold(FakeSpool::new(), |spool, index| {
+            spool.with_file(format!("{index:05}"), "")
+        });
+        assert_eq!(into_spool(full).names().unwrap().len(), MAX_SPOOL_NAMES);
+        // And what the gate asks for is the constant the refusal compares with.
+        assert_eq!(LISTED_NAMES, MAX_SPOOL_NAMES + 1);
+    }
+
+    #[test]
     fn the_gates_view_of_the_spool_reads_within_a_bound_and_takes_an_entry_once() {
         let at_limit = vec![b'x'; MAX_ENTRY_BYTES];
         let view = into_spool(
@@ -1581,7 +1645,7 @@ args = [
         assert!(
             evidence
                 .iter()
-                .any(|line| line.contains("more than the 4096 the gate will walk")),
+                .any(|line| line.contains("more than the 4096 names the gate will walk")),
             "{evidence:?}"
         );
     }
