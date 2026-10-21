@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# The boof `settings.hooks.onApproved` hook: lands an approved task on main.
+#
+#   /bin/bash <main checkout>/ci/boof-integrate.sh [--allow-red-main]
+#
+# boof runs it from the task worktree with BOOF_TASK_ID, BOOF_BRANCH,
+# BOOF_BASE and BOOF_WORKTREE set. Exit 0 marks the task done; anything else
+# fails it and keeps its branch and worktree. BOOF_BASE is the task's base
+# commit sha: informational only, compared with nothing, because the hook
+# always lands on origin/main whatever the task was based on.
+#
+# --allow-red-main skips step e only, so a fix-forward task can land while main
+# is red. It is for a dedicated hotfix data root whose onApproved argv includes
+# it; normal lanes never pass it. It is argv, never an environment variable.
+#
+# Trust model. The hook must be invoked as the MAIN checkout's copy, never the
+# copy inside the task worktree, so a branch cannot weaken the hook itself.
+# Step a refuses to run from the worktree, symlinks resolved. That is all it
+# protects. On a push, GitHub Actions runs the workflow files of the pushed
+# commit, so a branch that edits .github/workflows/ changes the CI that judges
+# it; likewise `just verify` and `just linux-test` run the branch's own
+# justfile, ci/ and .githooks/. The hook does not make those files trusted. It
+# makes a change to them loud (the GATE FILES CHANGED block, before step g),
+# and review of the diff is the control.
+#
+# Steps, in order. Nothing is pushed before step h.
+#   a  refuse to run from the wrong place or with a variable missing
+#   b  the worktree is clean and on BOOF_BRANCH
+#   c  take the integration lock
+#   d  commit hygiene on origin/main..HEAD
+#   e  wait until every Actions run on origin/main's head succeeded
+#   f  rebase onto origin/main
+#      (then list any changed gate files, a warning, never a refusal)
+#   g  `just verify`, then `just linux-test`
+#   h  push without force; if main moved, back to d, at most 3 attempts
+#   i  watch every Actions run on the pushed commit
+#   j  fast-forward the main checkout
+#   k  one summary line
+#
+# The BOOF_INTEGRATE_* tunables only shorten waits, for the test harness
+# (ci/boof-integrate-test.sh). No environment variable can skip a check; only
+# the --allow-red-main argument skips step e.
+#
+# Runs under /bin/bash, which on macOS is 3.2: no mapfile, no associative
+# arrays, no `wait -n`, and an empty array is expanded as ${a[@]+"${a[@]}"}.
+set -euo pipefail
+
+die() {
+    echo "boof-integrate: step $1: $2" >&2
+    exit 1
+}
+warn() {
+    echo "boof-integrate: step $1: $2" >&2
+}
+
+allow_red=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --allow-red-main) allow_red=1 ;;
+    *) die a "unknown argument '$1'" ;;
+    esac
+    shift
+done
+
+numeric() {
+    local name=$1 value=$2
+    [[ $value =~ ^[0-9]+$ ]] || die a "$name must be a number of seconds, got '$value'"
+}
+POLL=${BOOF_INTEGRATE_POLL:-30}
+MAIN_TIMEOUT=${BOOF_INTEGRATE_MAIN_TIMEOUT:-5400}
+APPEAR_TIMEOUT=${BOOF_INTEGRATE_APPEAR_TIMEOUT:-300}
+numeric BOOF_INTEGRATE_POLL "$POLL"
+numeric BOOF_INTEGRATE_MAIN_TIMEOUT "$MAIN_TIMEOUT"
+numeric BOOF_INTEGRATE_APPEAR_TIMEOUT "$APPEAR_TIMEOUT"
+
+# ---- a. the right place --------------------------------------------------
+for var in BOOF_TASK_ID BOOF_BRANCH BOOF_BASE BOOF_WORKTREE; do
+    [[ -n ${!var:-} ]] || die a "$var is not set"
+done
+
+# Resolve the script's own path through symlinks (bash 3.2: no readlink -f).
+self=${BASH_SOURCE[0]}
+hops=0
+while [[ -L $self ]]; do
+    hops=$((hops + 1))
+    [[ $hops -le 40 ]] || die a "too many symlinks resolving this script"
+    link=$(readlink "$self") || die a "cannot read the link $self"
+    case $link in
+    /*) self=$link ;;
+    *) self="$(dirname "$self")/$link" ;;
+    esac
+done
+self_dir=$(cd "$(dirname "$self")" && pwd -P) || die a "cannot resolve this script's directory"
+wt=$(cd "$BOOF_WORKTREE" && pwd -P) || die a "BOOF_WORKTREE '$BOOF_WORKTREE' is not a directory"
+if [[ $self_dir == "$wt" || $self_dir/ == "$wt"/* ]]; then
+    die a "refusing to run the copy inside the task worktree ($self_dir); run the main checkout's copy"
+fi
+main_repo=$(git -C "$self_dir" rev-parse --show-toplevel) || die a "this script is not inside a git checkout"
+wt_top=$(git -C "$wt" rev-parse --show-toplevel) || die a "BOOF_WORKTREE is not a git checkout"
+[[ $main_repo != "$wt_top" ]] || die a "this script and BOOF_WORKTREE are the same checkout"
+
+g() { git -C "$wt" "$@"; }
+
+# ---- b. the worktree -----------------------------------------------------
+on_branch=$(g symbolic-ref --short HEAD) || die b "the worktree is on a detached HEAD"
+[[ $on_branch == "$BOOF_BRANCH" ]] || die b "the worktree is on '$on_branch', not '$BOOF_BRANCH'"
+dirty=$(g status --porcelain --untracked-files=all)
+[[ -z $dirty ]] || die b "the worktree is not clean:
+$dirty"
+
+# ---- the repository, from the origin remote ------------------------------
+# `config`, not `remote get-url`: the latter applies insteadOf rewrites.
+origin_url=$(g config --get remote.origin.url) || die c "no origin remote"
+url_re='^(git@github\.com:|https://github\.com/|ssh://git@github\.com/)(.+)$'
+[[ $origin_url =~ $url_re ]] || die c "origin '$origin_url' is not a GitHub URL"
+repo=${BASH_REMATCH[2]}
+repo=${repo%.git}
+repo_re='^[^/]+/[^/]+$'
+[[ $repo =~ $repo_re ]] || die c "cannot read owner/name from origin '$origin_url'"
+
+# ---- c. the lock ---------------------------------------------------------
+# Not the machine lock of ci/lib/machine-lock.sh: `just linux-test` takes that
+# one itself, and holding it here would deadlock the gate.
+lock="${TMPDIR:-/tmp}/aido-boof-integrate.lock"
+have_lock=0
+scratch=""
+
+gitpath() {
+    local p
+    p=$(g rev-parse --git-path "$1")
+    case $p in
+    /*) echo "$p" ;;
+    *) echo "$wt/$p" ;;
+    esac
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ -d $(gitpath rebase-merge) || -d $(gitpath rebase-apply) ]]; then
+        g rebase --abort >/dev/null 2>&1 || true
+    fi
+    if [[ -n $scratch ]]; then
+        rm -rf "$scratch"
+    fi
+    if [[ $have_lock == 1 ]]; then
+        rm -rf "$lock"
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+announced=0
+until mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then
+        rm -rf "$lock"
+        continue
+    fi
+    if [[ $announced == 0 ]]; then
+        echo "boof-integrate: waiting for another integration (pid ${holder:-starting})" >&2
+        announced=1
+    fi
+    sleep 1
+done
+have_lock=1
+echo $$ >"$lock/pid"
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/boof-integrate.XXXXXX")
+
+# ---- CI helpers ----------------------------------------------------------
+ci_urls=""
+ci_msg=""
+
+# wait_ci SHA APPEAR TOTAL: wait for every Actions run on SHA to complete.
+# Returns 0 only when at least one run exists and every conclusion is exactly
+# `success`. Leaves the run URLs in ci_urls and the reason in ci_msg.
+wait_ci() {
+    local sha=$1 appear=$2 total=$3
+    local start=$SECONDS out last_err="" n pending bad st co url elapsed
+    while :; do
+        if out=$(gh run list -R "$repo" --commit "$sha" --limit 100 \
+            --json status,conclusion,url \
+            --jq '.[] | [.status, (.conclusion // "-"), .url] | @tsv' 2>"$scratch/gh.err"); then
+            last_err=""
+            n=0 pending=0 bad=0 ci_urls=""
+            while IFS=$'\t' read -r st co url; do
+                [[ -n $st ]] || continue
+                n=$((n + 1))
+                ci_urls="$ci_urls $url"
+                if [[ $st != completed ]]; then
+                    pending=$((pending + 1))
+                elif [[ $co != success ]]; then
+                    bad=$((bad + 1))
+                fi
+            done <<EOF
+$out
+EOF
+            ci_urls=${ci_urls# }
+            if [[ $n -gt 0 && $pending -eq 0 ]]; then
+                if [[ $bad -eq 0 ]]; then
+                    return 0
+                fi
+                ci_msg="$bad of $n runs on ${sha:0:12} did not succeed"
+                return 1
+            fi
+        else
+            last_err=$(cat "$scratch/gh.err")
+            n=0
+        fi
+        elapsed=$((SECONDS - start))
+        if [[ $n -eq 0 && $elapsed -ge $appear ]]; then
+            ci_msg="no Actions run appeared for ${sha:0:12} within ${appear}s${last_err:+ (gh: $last_err)}"
+            return 1
+        fi
+        if [[ $elapsed -ge $total ]]; then
+            ci_msg="Actions runs on ${sha:0:12} did not finish within ${total}s${last_err:+ (gh: $last_err)}"
+            return 1
+        fi
+        sleep "$POLL"
+    done
+}
+
+run_gate() {
+    local name=$1
+    echo "boof-integrate: step g: just $name" >&2
+    if ! (cd "$wt" && just "$name") >"$wt/target/boof-integrate/$name.log" 2>&1; then
+        echo "boof-integrate: last 80 lines of $wt/target/boof-integrate/$name.log:" >&2
+        tail -n 80 "$wt/target/boof-integrate/$name.log" >&2 || true
+        die g "just $name failed"
+    fi
+}
+
+subject_re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: [^ ]'
+
+pushed=""
+attempt=1
+while [[ $attempt -le 3 ]]; do
+    # ---- d. commit hygiene -----------------------------------------------
+    g fetch origin main >&2 || die d "git fetch origin main failed"
+    commits=$(g log --format='%h%x09%s' origin/main..HEAD)
+    [[ -n $commits ]] || die d "no commits on top of origin/main"
+    offenders=""
+    while IFS=$'\t' read -r h s; do
+        why=""
+        if ! [[ $s =~ $subject_re ]]; then
+            why="not a Conventional Commit (type(scope)?: subject)"
+        fi
+        len=$(printf %s "$s" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
+        if [[ $len -gt 50 ]]; then
+            why="${why:+$why; }subject is $len characters, the limit is 50"
+        fi
+        lower=$(printf %s "$s" | tr '[:upper:]' '[:lower:]')
+        case $lower in
+        wip* | fixup!* | squash!* | boof-runner:*)
+            why="${why:+$why; }subject starts with a banned prefix (wip, fixup!, squash!, boof-runner:)"
+            ;;
+        esac
+        if [[ -n $why ]]; then
+            offenders="$offenders  $h $s -- $why
+"
+        fi
+    done <<EOF
+$commits
+EOF
+    if [[ -n $offenders ]]; then
+        printf '%s' "$offenders" >&2
+        die d "commits that fail the hygiene check are listed above"
+    fi
+
+    # ---- e. main is green ------------------------------------------------
+    main_sha=$(g rev-parse origin/main)
+    if [[ $allow_red == 1 ]]; then
+        warn e "skipping step e: --allow-red-main (main's CI not checked)"
+    elif ! wait_ci "$main_sha" "$APPEAR_TIMEOUT" "$MAIN_TIMEOUT"; then
+        die e "main is not green: $ci_msg ${ci_urls}"
+    fi
+
+    # ---- f. rebase -------------------------------------------------------
+    if ! g rebase origin/main >&2; then
+        g rebase --abort >/dev/null 2>&1 || true
+        die f "conflict rebasing onto origin/main"
+    fi
+
+    # ---- gate files: loud, never a refusal -------------------------------
+    gate_changed=""
+    changed=$(g diff --name-only origin/main...HEAD)
+    while IFS= read -r f; do
+        case $f in
+        justfile | ci/* | .github/* | .githooks/* | deny.toml | clippy.toml | rust-toolchain.toml | .taplo.toml)
+            gate_changed="$gate_changed  $f
+"
+            ;;
+        esac
+    done <<EOF
+$changed
+EOF
+    if [[ -n $gate_changed ]]; then
+        {
+            echo "boof-integrate: ==== GATE FILES CHANGED ===="
+            printf '%s' "$gate_changed"
+            echo "boof-integrate: these define the CI and local gate that judge this branch; review the diff"
+            echo "boof-integrate: ============================="
+        } >&2
+    fi
+
+    # ---- g. the gate -----------------------------------------------------
+    before=$(g rev-parse HEAD)
+    mkdir -p "$wt/target/boof-integrate"
+    run_gate verify
+    run_gate linux-test
+    after=$(g rev-parse HEAD)
+    [[ $after == "$before" ]] || die g "the gate moved HEAD from $before to $after"
+    dirty=$(g status --porcelain --untracked-files=all)
+    [[ -z $dirty ]] || die g "the gate left the worktree dirty:
+$dirty"
+
+    # ---- h. push ---------------------------------------------------------
+    if g push origin HEAD:refs/heads/main 2>"$scratch/push.err"; then
+        pushed=$before
+        break
+    fi
+    cat "$scratch/push.err" >&2
+    remote_main=$(g ls-remote origin refs/heads/main | cut -f1) || die h "git push failed and origin could not be read"
+    if [[ -n $remote_main && $remote_main != "$main_sha" ]]; then
+        warn h "push rejected, main moved (attempt $attempt of 3)"
+        attempt=$((attempt + 1))
+        continue
+    fi
+    die h "git push failed (main did not move)"
+done
+[[ -n $pushed ]] || die h "push rejected 3 times"
+
+# ---- i. watch CI on the pushed commit ------------------------------------
+if ! wait_ci "$pushed" "$APPEAR_TIMEOUT" "$MAIN_TIMEOUT"; then
+    {
+        echo "boof-integrate: MAIN IS NOW RED at $pushed: $ci_msg"
+        echo "boof-integrate: runs: ${ci_urls:-none}"
+    } >&2
+    exit 1
+fi
+
+# ---- j. fast-forward the main checkout -----------------------------------
+if git -C "$main_repo" fetch origin main >/dev/null 2>&1; then
+    main_branch=$(git -C "$main_repo" symbolic-ref --short -q HEAD || true)
+    main_dirty=$(git -C "$main_repo" status --porcelain --untracked-files=no)
+    if [[ $main_branch == main && -z $main_dirty ]]; then
+        git -C "$main_repo" merge --ff-only origin/main >&2 ||
+            warn j "could not fast-forward $main_repo"
+    else
+        warn j "$main_repo is not on a clean main; not fast-forwarded"
+    fi
+else
+    warn j "could not fetch origin in $main_repo"
+fi
+
+# ---- k. summary ----------------------------------------------------------
+echo "boof-integrate: landed $pushed on main; base $BOOF_BASE; CI success; $ci_urls"

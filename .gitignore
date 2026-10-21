@@ -44,6 +44,8 @@ minisign.key
 cosign.key
 
 # Coding-agent and assistant state. Local working context, not project history.
+# boof task worktrees. Defensive: aido's boof data roots keep them outside the repo.
+.boof-runner-worktrees/
 .claude/
 .claude-*
 CLAUDE.local.md
