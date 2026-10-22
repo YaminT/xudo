@@ -1,0 +1,691 @@
+---
+source: crates/aido/src/doctor.rs
+expression: "render::json_of(&hostile_report(true))"
+---
+{
+  "schema_version": 1,
+  "aido_version": "0.0.1",
+  "platform": "test",
+  "exec_path": "absent",
+  "kernel": {
+    "version": "5.10",
+    "attestation": "SO_PEERCRED + pidfd_open",
+    "attestation_since": "5.3",
+    "agent_path_available": false,
+    "withheld_because": "the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the pin is not bound to the connection",
+    "resolution": "openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)",
+    "summary": "5.10 via SO_PEERCRED + pidfd_open (agent path WITHHELD: the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the pin is not bound to the connection)"
+  },
+  "ruleset": {
+    "dir": "/etc/aido/rules.d",
+    "loaded": null,
+    "load_error": "cannot read the rules directory /etc/aido/rules.d: No such file or directory (os error 2)",
+    "trust": {
+      "trusted": false,
+      "files_checked": null,
+      "reason": "/etc/aido is owned by uid 1000, not root"
+    }
+  },
+  "caller": {
+    "classification": null,
+    "password_required": true,
+    "hints_recorded": 0,
+    "hints_trusted": 0,
+    "unavailable": "cannot read self/stat: test stub refuses"
+  },
+  "backend": {
+    "status": "unusable",
+    "implementation": "sudo-rs",
+    "exe": "/usr/bin/sudo",
+    "version": "sudo-rs 0.2.2",
+    "capabilities": [
+      {
+        "capability": "drop-in-directory",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "validate-named-file",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "per-command-defaults",
+        "supported": false,
+        "required": true
+      },
+      {
+        "capability": "disable-credential-cache",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "allocate-pty",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "rejects-argument-wildcards",
+        "supported": false,
+        "required": false
+      },
+      {
+        "capability": "persistent-credential-cache",
+        "supported": true,
+        "required": false
+      }
+    ],
+    "missing_required": [
+      "per-command-defaults"
+    ],
+    "refusal": "sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes aido's settings to aido's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); aido refuses to install rather than install something weaker than it advertises"
+  },
+  "paths_to_root": {
+    "subject": {
+      "uid": 1000,
+      "name": "yamin",
+      "is_root": false,
+      "groups": [
+        {
+          "gid": 4,
+          "name": "adm",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 996,
+          "name": "libvirt",
+          "active": true,
+          "listed": false
+        },
+        {
+          "gid": 997,
+          "name": "lxd",
+          "active": false,
+          "listed": true
+        },
+        {
+          "gid": 999,
+          "name": "docker",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 1000,
+          "name": "yamin",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 4242,
+          "name": null,
+          "active": true,
+          "listed": false
+        }
+      ]
+    },
+    "status": "found",
+    "checks": [
+      {
+        "check": "passwordless_rules",
+        "status": "found",
+        "examined": 5,
+        "findings": [
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers",
+            "line": 3,
+            "text": "%adm ALL=(ALL) NOPASSWD: /usr/bin/apt",
+            "grant": "nopasswd",
+            "applies_to_you": "yes"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers",
+            "line": 4,
+            "text": "@include \"/etc/sudoers.l ocal\"",
+            "grant": "include",
+            "applies_to_you": "maybe"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers.d/90 cloud",
+            "line": 1,
+            "text": "alice ALL=(ALL) NOPASSWD:ALL",
+            "grant": "nopasswd",
+            "applies_to_you": "no"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers.d/91-defaults",
+            "line": 1,
+            "text": "Defaults:ADMINS !authenticate",
+            "grant": "no_authenticate",
+            "applies_to_you": "maybe"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/doas.conf",
+            "line": 1,
+            "text": "permit nopass :wheel",
+            "grant": "nopass",
+            "applies_to_you": "maybe"
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers",
+            "reason": "line(s) 4 end in a backslash, or use an escape or quote, that aido does not model, so which lines they join, and so whom a rule near it names, could not be verified"
+          },
+          {
+            "path": "/etc/sudoers.d/99-secret",
+            "at": "/etc/sudoers.d/99-secret",
+            "reason": "Permission denied (os error 13)"
+          },
+          {
+            "path": "/etc/sudoers.l ocal",
+            "at": "/etc/sudoers.l ocal",
+            "reason": "an include names it, and it does not exist"
+          },
+          {
+            "path": "/etc/sudoers.l\\",
+            "at": "/etc/sudoers.l\\",
+            "reason": "an include names it, and it does not exist"
+          }
+        ],
+        "note": null
+      },
+      {
+        "check": "group_memberships",
+        "status": "found",
+        "examined": 9,
+        "findings": [
+          {
+            "kind": "group_membership",
+            "group": "docker",
+            "gid": 999,
+            "passwordless": true,
+            "grants": "the Docker daemon runs as root and starts any container you ask for, including one with / mounted (`docker run -v /:/host`): root, with no password",
+            "listed": true,
+            "active": true
+          },
+          {
+            "kind": "group_membership",
+            "group": "lxd",
+            "gid": 997,
+            "passwordless": true,
+            "grants": "the LXD daemon starts a privileged container with the host's / attached on request: root, with no password",
+            "listed": true,
+            "active": false
+          },
+          {
+            "kind": "group_membership",
+            "group": "libvirt",
+            "gid": 996,
+            "passwordless": true,
+            "grants": "the system libvirt daemon starts a VM with the host's disks attached on request: root, with no password",
+            "listed": false,
+            "active": true
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/group",
+            "at": "/etc/group",
+            "reason": "this process holds gid 4242, which has no name there, so whether it is one of the groups below cannot be told (a directory service is not consulted)"
+          }
+        ],
+        "note": null
+      },
+      {
+        "check": "unit_directories",
+        "status": "found",
+        "examined": 19,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/etc/systemd/system",
+            "at": "/etc/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 4,
+                "name": "adm",
+                "you": true
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/run/systemd/system",
+            "at": "/run/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1001,
+                "name": "alice",
+                "you": false
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/local/lib/systemd/system",
+            "at": "/usr/local/lib/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "you"
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/lib/systemd/system/b.service",
+            "at": "/usr/lib/systemd/system/b.service",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 4242,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "group",
+                "gid": 4243,
+                "name": null,
+                "you": false
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/lib/systemd/system-generators",
+            "at": "/usr/lib/systemd",
+            "via": "missing",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [],
+        "note": null
+      },
+      {
+        "check": "root_path",
+        "status": "found",
+        "examined": 13,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/opt/rootbin",
+            "at": "/opt/rootbin",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1000,
+                "name": "yamin",
+                "you": true
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers.d/99-secret",
+            "reason": "root's secure_path may be set in a sudoers file that could not be read (3 such, the first at /etc/sudoers.d/99-secret); the stock directories were examined instead"
+          },
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers",
+            "reason": "root's secure_path may be set on a line aido does not model, in a sudoers file it read (1 such, the first at /etc/sudoers); the directories it did find in secure_path, and the stock ones, were examined"
+          }
+        ],
+        "note": "the directories /etc/sudoers names in secure_path, and the stock ones"
+      },
+      {
+        "check": "user_path",
+        "status": "found",
+        "examined": 2,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/home/yamin/bin",
+            "at": "/home/yamin",
+            "via": "ancestor",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1000,
+                "name": "yamin",
+                "you": true
+              }
+            ],
+            "shadows": "/usr/bin/sudo"
+          },
+          {
+            "kind": "relative_path_entry",
+            "entry": ""
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/srv/sealed/a/b",
+            "at": "/srv/sealed/a",
+            "reason": "Permission denied (os error 13)"
+          }
+        ],
+        "note": "the entries from /usr/bin on (1) were not examined: nothing there is found before /usr/bin/sudo"
+      },
+      {
+        "check": "root_shell_startup",
+        "status": "found",
+        "examined": 25,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/etc/environment",
+            "at": "/etc/environment",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/etc/profile.d/x\u001b[2Jy.sh",
+            "at": "/etc/profile.d/x\u001b[2Jy.sh",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/root",
+            "at": "/root",
+            "reason": "Permission denied (os error 13): none of the files root's shells read there (.profile, .bash_profile, .bash_login, .bashrc, .zshenv, .zprofile, .zshrc, .zlogin, .config/fish/config.fish) could be examined"
+          }
+        ],
+        "note": null
+      }
+    ],
+    "aido_group": {
+      "exists": true,
+      "gid": 998,
+      "member": false
+    }
+  },
+  "proposals": [
+    {
+      "id": "join-aido",
+      "title": "add yamin to the aido group",
+      "means": "Membership is what lets you ask aido to run an allowlisted command as root. Your backend asks for your password: this release installs no rule that skips it, though a backend that caches a credential (sudo for a few minutes, OpenDoas when it is built with timestamps) may not ask again straight away. It takes effect at your next login, and aido grants it to nobody on its own.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/sbin/usermod",
+          "--append",
+          "--groups",
+          "aido",
+          "yamin"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "leave-docker",
+      "title": "leave the docker group",
+      "means": "Being in the docker group means the Docker daemon runs as root and starts any container you ask for, including one with / mounted (`docker run -v /:/host`): root, with no password. Leaving it removes that path to root. Rootless Docker or Podman runs containers without it. Sessions already open keep the group until they end.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/gpasswd",
+          "--delete",
+          "yamin",
+          "docker"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "leave-lxd",
+      "title": "leave the lxd group",
+      "means": "Being in the lxd group means the LXD daemon starts a privileged container with the host's / attached on request: root, with no password. Leaving it removes that path to root. Containers you manage will need sudo afterwards. Sessions already open keep the group until they end.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/gpasswd",
+          "--delete",
+          "yamin",
+          "lxd"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "leave-libvirt",
+      "title": "leave the libvirt group",
+      "means": "Being in the libvirt group means the system libvirt daemon starts a VM with the host's disks attached on request: root, with no password. Leaving it removes that path to root. Your own session VMs (qemu:///session) keep working without it. Sessions already open keep the group until they end.",
+      "needs_root": true,
+      "commands": [],
+      "by_hand": "This session holds the libvirt group, but /etc/group does not list you in it: it comes from a directory service or from how this session was started. Remove it there, then log in again."
+    },
+    {
+      "id": "review-sudoers-1",
+      "title": "review the passwordless rules in /etc/sudoers",
+      "means": "Opens /etc/sudoers in visudo, as root, so you can remove NOPASSWD or !authenticate from line(s) 3, and rewrite the include on line(s) 4 on one physical line, with no backslash continuation, so it can be checked. Whoever relies on those rules will be asked for a password. aido does not edit another tool's rules: one mistake in sudoers can lock every administrator out, and visudo refuses to save one.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/sbin/visudo",
+          "-f",
+          "/etc/sudoers"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "review-sudoers-2",
+      "title": "review the passwordless rules in /etc/sudoers.d/90 cloud",
+      "means": "Opens /etc/sudoers.d/90 cloud in visudo, as root, so you can remove NOPASSWD or !authenticate from line(s) 1. Whoever relies on those rules will be asked for a password. aido does not edit another tool's rules: one mistake in sudoers can lock every administrator out, and visudo refuses to save one.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/sbin/visudo",
+          "-f",
+          "/etc/sudoers.d/90 cloud"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "review-sudoers-3",
+      "title": "review the passwordless rules in /etc/sudoers.d/91-defaults",
+      "means": "Opens /etc/sudoers.d/91-defaults in visudo, as root, so you can remove NOPASSWD or !authenticate from line(s) 1. Whoever relies on those rules will be asked for a password. aido does not edit another tool's rules: one mistake in sudoers can lock every administrator out, and visudo refuses to save one.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/sbin/visudo",
+          "-f",
+          "/etc/sudoers.d/91-defaults"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "review-doas-1",
+      "title": "review the passwordless rules in /etc/doas.conf",
+      "means": "Removes a standing grant that runs commands as root with no password, from line(s) 1. Whoever relies on it will be asked for one.",
+      "needs_root": true,
+      "commands": [],
+      "by_hand": "Edit /etc/doas.conf as root, remove nopass from line(s) 1, and check the result with `doas -C /etc/doas.conf` before you log out."
+    },
+    {
+      "id": "protect-1",
+      "title": "make /etc/systemd/system writable by root alone",
+      "means": "Only root will be able to change /etc/systemd/system, which root trusts. The group adm (4) can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Whatever it holds now was put there by someone who could write it: review that too.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chmod",
+          "go-w",
+          "/etc/systemd/system"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "protect-2",
+      "title": "make /run/systemd/system writable by root alone",
+      "means": "Only root will be able to change /run/systemd/system, which root trusts. Its owner, alice (1001) can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Whatever it holds now was put there by someone who could write it: review that too.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chown",
+          "root",
+          "/run/systemd/system"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "protect-3",
+      "title": "make /usr/local/lib/systemd/system writable by root alone",
+      "means": "Only root will be able to change /usr/local/lib/systemd/system, which root trusts. You can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Whatever it holds now was put there by someone who could write it: review that too.",
+      "needs_root": true,
+      "commands": [],
+      "by_hand": "An access control list, or a capability, lets you write /usr/local/lib/systemd/system; its mode bits do not show it. Inspect it with `getfacl /usr/local/lib/systemd/system` and remove the entry as root."
+    },
+    {
+      "id": "protect-4",
+      "title": "make /usr/lib/systemd/system/b.service writable by root alone",
+      "means": "Only root will be able to change /usr/lib/systemd/system/b.service, which root trusts. Its owner, 4242 and the group 4243 can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Its contents were written by someone who could write it: inspect them, or reinstall the file from its package, before you rely on it.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chown",
+          "root",
+          "/usr/lib/systemd/system/b.service"
+        ],
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chmod",
+          "go-w",
+          "/usr/lib/systemd/system/b.service"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "protect-5",
+      "title": "take /usr/lib/systemd/system-generators out of /usr/lib/systemd",
+      "means": "The group 0 and everyone can write /usr/lib/systemd, and root trusts /usr/lib/systemd/system-generators through it. /usr/lib/systemd is shared or someone's home, so it is left as it is and what root trusts is moved out of it.",
+      "needs_root": true,
+      "commands": [],
+      "by_hand": "Do not change who owns /usr/lib/systemd. As root, inspect /usr/lib/systemd/system-generators and, if it is yours, move it to a directory only root can write, or remove it."
+    },
+    {
+      "id": "protect-6",
+      "title": "make /opt/rootbin writable by root alone",
+      "means": "Only root will be able to change /opt/rootbin, which root trusts. Its owner, yamin (1000) can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Whatever it holds now was put there by someone who could write it: review that too.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chown",
+          "root",
+          "/opt/rootbin"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "protect-7",
+      "title": "make /etc/environment writable by root alone",
+      "means": "Only root will be able to change /etc/environment, which root trusts. The group 0 and everyone can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Its contents were written by someone who could write it: inspect them, or reinstall the file from its package, before you rely on it.",
+      "needs_root": true,
+      "commands": [
+        [
+          "/usr/bin/sudo",
+          "/usr/bin/chmod",
+          "go-w",
+          "/etc/environment"
+        ]
+      ],
+      "by_hand": null
+    },
+    {
+      "id": "protect-8",
+      "title": "make /etc/profile.d/x\u001b[2Jy.sh writable by root alone",
+      "means": "Only root will be able to change /etc/profile.d/x\u001b[2Jy.sh, which root trusts. The group 0 and everyone can no longer write there; if that was deliberate \u2014 a deploy group, say \u2014 give them a directory root does not run anything from instead. Its contents were written by someone who could write it: inspect them, or reinstall the file from its package, before you rely on it.",
+      "needs_root": true,
+      "commands": [],
+      "by_hand": "As root, make root the owner of /etc/profile.d/x\u001b[2Jy.sh and remove group and other write permission from it."
+    },
+    {
+      "id": "fix-path-1",
+      "title": "take /home/yamin/bin off your PATH, or move it later",
+      "means": "Anything running as you can put a program in /home/yamin/bin, and it comes before /usr/bin/sudo: a program of that name placed there runs instead of the real one, and is handed the password you type to it.",
+      "needs_root": false,
+      "commands": [],
+      "by_hand": "Edit the shell startup file that sets PATH (~/.profile, ~/.bashrc, ~/.zshrc, or fish's config.fish) and remove the entry, or move it after the system directories."
+    },
+    {
+      "id": "fix-path-2",
+      "title": "take the relative entry \"\" off your PATH",
+      "means": "A relative PATH entry is looked up in whatever directory you are in, so the next command you type in an agent's working tree may run a program the agent put there.",
+      "needs_root": false,
+      "commands": [],
+      "by_hand": "Edit the shell startup file that sets PATH (~/.profile, ~/.bashrc, ~/.zshrc, or fish's config.fish) and remove the entry, or move it after the system directories."
+    }
+  ]
+}

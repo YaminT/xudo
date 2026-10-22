@@ -1,0 +1,163 @@
+---
+source: crates/aido/src/doctor.rs
+expression: "render::json_of(&report)"
+---
+{
+  "schema_version": 1,
+  "aido_version": "0.0.1",
+  "platform": "test",
+  "exec_path": "absent",
+  "kernel": {
+    "version": "6.8",
+    "attestation": "SO_PEERPIDFD",
+    "attestation_since": "6.5",
+    "agent_path_available": true,
+    "withheld_because": null,
+    "resolution": "openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)",
+    "summary": "6.8 via SO_PEERPIDFD (agent path available)"
+  },
+  "ruleset": {
+    "dir": "/usr/bin",
+    "loaded": {
+      "actions": 1,
+      "files": 1,
+      "generation": "07c5344ec90d06a42bae1c9a8e234747c79fdefc2d4784d824ab1b291df59318"
+    },
+    "load_error": null,
+    "trust": {
+      "trusted": true,
+      "files_checked": 0,
+      "reason": null
+    }
+  },
+  "caller": {
+    "classification": "unattested",
+    "password_required": true,
+    "hints_recorded": 1,
+    "hints_trusted": 0,
+    "unavailable": null
+  },
+  "backend": {
+    "status": "usable",
+    "implementation": "sudo",
+    "exe": "/usr/bin/sudo",
+    "version": "Sudo version 1.9.17p2",
+    "capabilities": [
+      {
+        "capability": "drop-in-directory",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "validate-named-file",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "per-command-defaults",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "disable-credential-cache",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "allocate-pty",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "rejects-argument-wildcards",
+        "supported": false,
+        "required": false
+      },
+      {
+        "capability": "persistent-credential-cache",
+        "supported": true,
+        "required": false
+      }
+    ],
+    "missing_required": [],
+    "refusal": null
+  },
+  "paths_to_root": {
+    "subject": {
+      "uid": 1000,
+      "name": "yamin",
+      "is_root": false,
+      "groups": [
+        {
+          "gid": 998,
+          "name": "aido",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 1000,
+          "name": "yamin",
+          "active": true,
+          "listed": true
+        }
+      ]
+    },
+    "status": "clean",
+    "checks": [
+      {
+        "check": "passwordless_rules",
+        "status": "clean",
+        "examined": 2,
+        "findings": [],
+        "unverified": [],
+        "note": null
+      },
+      {
+        "check": "group_memberships",
+        "status": "clean",
+        "examined": 9,
+        "findings": [],
+        "unverified": [],
+        "note": null
+      },
+      {
+        "check": "unit_directories",
+        "status": "clean",
+        "examined": 18,
+        "findings": [],
+        "unverified": [],
+        "note": null
+      },
+      {
+        "check": "root_path",
+        "status": "clean",
+        "examined": 8,
+        "findings": [],
+        "unverified": [],
+        "note": "the directories /etc/sudoers names in secure_path, and the stock ones"
+      },
+      {
+        "check": "user_path",
+        "status": "clean",
+        "examined": 0,
+        "findings": [],
+        "unverified": [],
+        "note": "the entries from /usr/bin on (2) were not examined: nothing there is found before /usr/bin/sudo"
+      },
+      {
+        "check": "root_shell_startup",
+        "status": "clean",
+        "examined": 24,
+        "findings": [],
+        "unverified": [],
+        "note": null
+      }
+    ],
+    "aido_group": {
+      "exists": true,
+      "gid": 998,
+      "member": true
+    }
+  },
+  "proposals": null
+}

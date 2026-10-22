@@ -17,8 +17,10 @@ aido-policy = { path = "../aido-policy", version = "0.0.1" }
 aido-sys-raw = { path = "../aido-sys-raw", version = "0.0.1" }
 bstr.workspace = true
 # Descriptor-relative opens and `fstat`, through rustix's safe API, so the
-# ruleset is verified on the descriptors it is read through. The broker's safe
-# calls come from the same crate: the socket checks and `SO_PEERCRED` (net),
+# ruleset is verified on the descriptors it is read through. Two users share
+# the features: the broker's safe calls (below) and `live.rs`, which reads this
+# process's own ids and groups (process) for `doctor`'s report of other paths
+# to root. The broker's calls: the socket checks and `SO_PEERCRED` (net),
 # `pidfd_open` (process), the liveness poll (event), `CLOCK_MONOTONIC` (time),
 # and `getrandom` (rand). The gate's come from it too: `PR_SET_NO_NEW_PRIVS`
 # (thread) and the `dup2` that fills a closed standard stream (stdio).

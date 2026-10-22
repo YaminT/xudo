@@ -49,6 +49,7 @@ pub mod error;
 pub mod exec;
 pub mod hygiene;
 pub mod kernel;
+pub mod live;
 mod mounts;
 pub mod peer;
 pub mod platform;
@@ -78,6 +79,7 @@ pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
+pub use live::LiveHost;
 pub use mounts::MountRefusal;
 pub use peer::{
     FakePeer, HostPeer, PeerCall, PeerCalls, PeerCred, ProcFile, StatusUids, lacks_peer_pidfd,

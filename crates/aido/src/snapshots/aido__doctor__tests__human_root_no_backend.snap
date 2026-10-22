@@ -1,0 +1,41 @@
+---
+source: crates/aido/src/doctor.rs
+expression: human(&report)
+---
+platform     test
+kernel       6.13 via SO_PEERPIDFD + PIDFD_GET_INFO (agent path available)
+rules dir    /usr/bin
+ruleset      1 action(s), 1 file(s), generation 07c5344ec90d
+rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
+classified   unattested
+password     required
+hints        1 recorded, 0 trusted
+backend      NONE — aido cannot operate on this machine
+             aido delegates every uid transition and performs none itself
+exec path    absent in this build
+
+other paths to root, as root (uid 0): 1 found
+  any one of these is a way to root that does not go through aido
+  passwordless rules    clean, 0 examined
+  group memberships     skipped
+    note: you are root, so no group grants you more; run `aido doctor` as the user an agent runs as
+  unit directories      clean, 18 examined
+  root's PATH           clean, 8 examined
+    note: the stock secure_path directories; there is no /etc/sudoers
+  your PATH             clean, 0 examined
+    note: the entries from /usr/bin on (1) were not examined: nothing there is found before /usr/bin
+  root's shell startup  FOUND, 25 examined
+    /etc/profile.d/evil.sh is writable by the group root (gid 0), which you are in, and by everyone
+  aido group            does not exist here: nobody can ask aido for anything yet
+
+proposed fixes: aido applies none of them. Each is for a human to run, in a shell they started;
+a command marked `as root` is for a shell that is root already.
+
+  protect-1: make /etc/profile.d/evil.sh writable by root alone
+    means     Only root will be able to change /etc/profile.d/evil.sh, which root trusts. The group root (0) and everyone can no longer write there; if that was deliberate — a deploy group, say — give them a directory root does not run anything from instead. Its contents were written by someone who could write it: inspect them, or reinstall the file from its package, before you rely on it.
+    as root   /usr/bin/chmod go-w /etc/profile.d/evil.sh
+
+Nothing was changed.
+
+This build performs no privileged operation. Agent detection is not a
+security boundary; the allowlist and the compiled-in deny-list are.
