@@ -53,7 +53,9 @@ Nothing here touches privilege.
 ```
 aido --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
 aido --rules ./rules explain -- /bin/sh -c id   # no rule names a shell, and one that did would be refused
-aido --rules ./rules doctor                     # backend, probed capabilities, whether the rules are root's
+aido --rules ./rules doctor                     # backend, probed capabilities, whether the rules are root's,
+                                                # and the other paths to root it can check (--json, --fix);
+                                                # SECURITY.md lists the ones it cannot
 aido --rules ./rules config --schema            # machine-readable settings schema
 ido queue -m "install ripgrep" -- apt-get install -y ripgrep   # buffer it for a human; `ido` to run it
 ```
