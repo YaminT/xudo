@@ -17,6 +17,9 @@ aido-sys = { path = "../aido-sys", version = "0.0.1" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Paths, rule text, and names in `doctor`'s report come from the machine, and
+# a world-writable directory lets anyone choose a file name.
+term-sanitize = { path = "../term-sanitize", version = "0.0.1" }
 thiserror.workspace = true
 
 [dev-dependencies]

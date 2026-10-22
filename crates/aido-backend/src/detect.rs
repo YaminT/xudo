@@ -173,7 +173,22 @@ pub enum DetectError {
 /// [`DetectError::Unusable`] when the one that is installed lacks a required
 /// capability.
 pub fn detect(probe: &dyn Probe) -> Result<Backend, DetectError> {
-    let backend = detect_kind(probe).ok_or(DetectError::NoBackend)?;
+    identify(probe)
+        .ok_or(DetectError::NoBackend)
+        .and_then(judge)
+}
+
+/// Whether an identified backend is one aido can operate on.
+///
+/// The second half of [`detect`], separate so `aido doctor --json` can report
+/// the full probed matrix of a backend it refuses — the operator needs to see
+/// which control is missing, not only that one is — without asking every
+/// probe twice.
+///
+/// # Errors
+///
+/// [`DetectError::Unusable`] when a required capability is missing.
+pub fn judge(backend: Backend) -> Result<Backend, DetectError> {
     if backend.is_usable() {
         return Ok(backend);
     }
@@ -191,8 +206,11 @@ pub fn detect(probe: &dyn Probe) -> Result<Backend, DetectError> {
     })
 }
 
-/// Identifies the backend without judging it.
-fn detect_kind(probe: &dyn Probe) -> Option<Backend> {
+/// Identifies the backend and probes what it supports, without judging it.
+///
+/// `None` when neither a sudo-family backend nor `doas` is installed. What it
+/// returns may still be unusable; [`judge`] decides that.
+pub fn identify(probe: &dyn Probe) -> Option<Backend> {
     for sudo in BackendKind::SUDO_CANDIDATES {
         if !probe.exists(sudo) {
             continue;
@@ -676,13 +694,33 @@ mod tests {
             .without_scoped_defaults()
             .accepting_wildcards();
 
-        let found = detect_kind(&machine).expect("sudo-rs must be found at its own path");
+        let found = identify(&machine).expect("sudo-rs must be found at its own path");
         assert_eq!(found.kind, BackendKind::SudoRs);
         assert_eq!(found.exe, "/usr/bin/sudo-rs");
 
         let refused = detect(&machine).unwrap_err().to_string();
         assert!(refused.contains("sudo-rs"), "{refused}");
         assert!(refused.contains("scopes aido's settings"), "{refused}");
+    }
+
+    #[test]
+    fn a_refused_backend_still_has_its_whole_matrix_to_report() {
+        // `doctor --json` shows an operator which control is missing, so the
+        // matrix must survive the refusal: identify keeps it, judge refuses it,
+        // and detect is exactly the two in sequence.
+        let machine = FakeMachine::default()
+            .with_exe("/usr/bin/sudo-rs", "sudo-rs 0.2.2\n")
+            .with_dir("/etc/sudoers.d")
+            .without_scoped_defaults();
+        let found = identify(&machine).unwrap();
+        assert!(!found.capabilities.has(Capability::PerCommandDefaults));
+        assert!(found.capabilities.has(Capability::AllocatePty));
+        assert_eq!(
+            judge(found).unwrap_err(),
+            detect(&machine).unwrap_err(),
+            "detect must be identify then judge"
+        );
+        assert_eq!(identify(&FakeMachine::default()), None);
     }
 
     #[test]

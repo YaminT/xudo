@@ -29,8 +29,9 @@
 
 pub mod agentdoc;
 pub mod cli;
+pub mod doctor;
 pub mod render;
 pub mod rules;
 
-pub use cli::{Cli, Command, Format, run, run_with};
+pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with};
 pub use rules::{LoadError, LoadedRules};

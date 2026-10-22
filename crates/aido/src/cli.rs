@@ -5,19 +5,22 @@
 //! saying in the `--help` text too, so nobody installs this expecting it to run
 //! something.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aido_backend::{Capability, DetectError, InstallPlan, PlanStep, Probe, detect};
+use aido_backend::paths_to_root::HostView;
+use aido_backend::{InstallPlan, PlanStep, Probe, detect};
 use aido_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use aido_policy::{
     Arg, Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict,
     engine::Settings,
 };
-use aido_sys::{HostProbe, PrivilegedOps, host_ops};
+use aido_sys::{HostProbe, LiveHost, PrivilegedOps, host_ops};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agentdoc::{self, DocFormat};
+use crate::doctor;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
 
@@ -104,8 +107,22 @@ pub enum Command {
         tier: Option<String>,
     },
 
-    /// Report the platform, the ruleset, and how this caller would be classified.
-    Doctor,
+    /// Report the platform, the ruleset, how this caller would be classified,
+    /// and every other path to root on this machine.
+    ///
+    /// Reads as you. What you cannot read is reported as unverified, never as
+    /// absent: run it as root as well to read what this account cannot.
+    Doctor {
+        /// Print the versioned machine-readable envelope instead of prose.
+        /// The same as `--output json`.
+        #[arg(long)]
+        json: bool,
+
+        /// Also propose a fix for each path to root: what it means, and the
+        /// exact command a human runs. Applies nothing.
+        #[arg(long)]
+        fix: bool,
+    },
 
     /// Show the effective configuration and where each value came from.
     Config {
@@ -167,12 +184,51 @@ impl From<DocFormatArg> for DocFormat {
     }
 }
 
+/// What the entry point collected from the process, once, as data.
+///
+/// The library reads no environment. The one variable it reports on is handed
+/// to it here, by `aido-bin`, so that nothing in a decision path can reach for
+/// another.
+#[derive(Clone, Debug, Default)]
+pub struct Invocation {
+    /// `PATH` as the caller exported it. `doctor` inspects its entries for a
+    /// directory anyone else can write ahead of the backend; nothing searches
+    /// it and nothing decides on it.
+    pub path: Option<OsString>,
+}
+
+/// What a command runs against: this machine, or a test's description of one.
+#[derive(Clone, Copy)]
+pub struct Platform<'a> {
+    /// Classification, kernel facts, and executable resolution.
+    pub ops: &'a dyn PrivilegedOps,
+    /// The backend detector's questions.
+    pub probe: &'a dyn Probe,
+    /// The filesystem and credentials, as the report of other paths to root
+    /// sees them.
+    pub host: &'a dyn HostView,
+    /// `PATH`, as [`Invocation::path`].
+    pub path: Option<&'a OsStr>,
+}
+
 /// Runs a parsed command, writing to `out` and `err`.
 ///
 /// Returns the process exit status. Every failure path returns a non-zero
 /// [`ExitCode`]; there is no path that reports success on an error.
-pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    run_with(cli, host_ops().as_ref(), &HostProbe, out, err)
+pub fn run(
+    cli: &Cli,
+    invocation: &Invocation,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let ops = host_ops();
+    let platform = Platform {
+        ops: ops.as_ref(),
+        probe: &HostProbe,
+        host: &LiveHost,
+        path: invocation.path.as_deref(),
+    };
+    run_with(cli, &platform, out, err)
 }
 
 /// Runs a parsed command against an injected platform.
@@ -183,11 +239,12 @@ pub fn run(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
 /// branch that only gets exercised on a broken machine.
 pub fn run_with(
     cli: &Cli,
-    ops: &dyn PrivilegedOps,
-    probe: &dyn Probe,
+    platform: &Platform<'_>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let ops = platform.ops;
+    let probe = platform.probe;
     // Loaded up front but not unwrapped: `doctor` is the command an operator
     // reaches for precisely when the ruleset is broken, so it must not require
     // the broken thing.
@@ -210,7 +267,14 @@ pub fn run_with(
     }
 
     match &cli.command {
-        Command::Doctor => doctor(cli, ops, probe, loaded.as_ref().ok(), out),
+        Command::Doctor { json, fix } => doctor::run(
+            &cli.rules,
+            loaded.as_ref(),
+            platform,
+            *json || cli.output == Format::Json,
+            *fix,
+            out,
+        ),
         Command::Config { schema } => config(cli, *schema, out, err),
         Command::Install {
             dry_run,
@@ -235,39 +299,6 @@ pub fn run_with(
             );
             ExitCode::Delegated
         }),
-    }
-}
-
-/// One line saying whether the ruleset, and every rule file in it, belongs to
-/// root.
-///
-/// Checked the way the gate must load it: every component opened through its
-/// parent's descriptor without following a link, every rule file checked on its
-/// own descriptor, and the mount under each of them matched in
-/// `/proc/thread-self/mountinfo`. A path-only check of the directory would call
-/// a group-writable rule file inside a root-owned directory trusted; an
-/// ownership check alone would believe a FUSE daemon a user is running.
-///
-/// A development checkout is expected to fail this, so the wording says which
-/// situation it is rather than printing a bare FAIL an operator has to decode.
-/// A refused mount names the component, the filesystem, where it is mounted,
-/// and why, so the operator knows which mount to look at.
-fn trust_line(rules: &Path) -> String {
-    trust_report(&aido_sys::read_trusted_dir(rules))
-}
-
-/// The words for a trust walk's outcome.
-///
-/// Split out so both outcomes are reachable from a test on every platform: off
-/// Linux there is no mount table, so the walk itself can never succeed there.
-fn trust_report(outcome: &Result<Vec<aido_sys::TrustedFile>, aido_sys::TrustError>) -> String {
-    match outcome {
-        Ok(files) => format!(
-            "root-owned, no writable component, no user-made mount; {} rule file(s) checked on \
-             their descriptors",
-            files.len()
-        ),
-        Err(source) => format!("UNTRUSTED: {source}"),
     }
 }
 
@@ -613,80 +644,6 @@ fn list(
     ExitCode::Delegated
 }
 
-/// Reports the platform and how this caller would be classified.
-fn doctor(
-    cli: &Cli,
-    ops: &dyn PrivilegedOps,
-    probe: &dyn Probe,
-    loaded: Option<&LoadedRules>,
-    out: &mut dyn Write,
-) -> ExitCode {
-    let _ = writeln!(out, "platform     {}", ops.platform());
-    let _ = writeln!(out, "kernel       {}", ops.kernel().summary());
-    let _ = writeln!(out, "rules dir    {}", cli.rules.display());
-
-    match loaded {
-        Some(loaded) => {
-            let _ = writeln!(
-                out,
-                "ruleset      {} action(s), {} file(s), generation {}",
-                loaded.rules().len(),
-                loaded.files().len(),
-                loaded.generation().get(..12).unwrap_or("")
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "ruleset      NOT LOADED (run `aido check` for the parse error)"
-            );
-        }
-    }
-
-    // Reported here rather than enforced here. `doctor` is diagnostic, and the
-    // enforcement point is the executor, which does not exist yet — a check the
-    // front-end could "pass" would be a check an attacker races against, since
-    // nothing stops the ruleset changing between this stat and a later read.
-    let _ = writeln!(out, "rules trust  {}", trust_line(&cli.rules));
-
-    match ops.classify(std::process::id()) {
-        Ok(facts) => {
-            let _ = writeln!(out, "classified   {}", facts.classification.label());
-            let _ = writeln!(
-                out,
-                "password     {}",
-                if facts.classification.requires_password() {
-                    "required"
-                } else {
-                    "not required"
-                }
-            );
-            let _ = writeln!(
-                out,
-                "hints        {} recorded, 0 trusted",
-                facts.hints.len()
-            );
-        }
-        Err(e) => {
-            let _ = writeln!(out, "classified   unavailable: {e}");
-            let _ = writeln!(out, "password     required (failing closed)");
-        }
-    }
-
-    report_backend(probe, out);
-
-    let _ = writeln!(out, "exec path    absent in this build");
-    let _ = writeln!(
-        out,
-        "\nThis build performs no privileged operation. Agent detection is not a"
-    );
-    let _ = writeln!(
-        out,
-        "security boundary; the allowlist and the compiled-in deny-list are."
-    );
-    ExitCode::Delegated
-}
-
 /// Loads the settings file and derives the engine's view of it.
 ///
 /// Without this the layered configuration would be reported by `aido config` and
@@ -763,75 +720,6 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
     ExitCode::Delegated
 }
 
-/// Reports the privilege backend, or why there is none.
-///
-/// Detection is pure and lives in `aido-backend`; this only renders it. A
-/// backend with no readable banner — `OpenDoas` has no version flag at all —
-/// is reported as exactly that, rather than given a version invented from a
-/// package name. For a sudo-family backend the detector then assumes the
-/// stricter implementation, which is the safe direction.
-fn report_backend(probe: &dyn Probe, out: &mut dyn Write) {
-    match detect(probe) {
-        Ok(backend) => {
-            let _ = writeln!(
-                out,
-                "backend      {} ({})",
-                backend.kind.label(),
-                if backend.version.is_empty() {
-                    "no version banner"
-                } else {
-                    backend.version.as_str()
-                }
-            );
-            // Reported as a count and then one line per absent capability.
-            // No "all present" special case: 7 of 7 is not reachable for any
-            // real backend — the C sudo does not reject argument wildcards and
-            // sudo-rs cannot validate a named file — so a branch for it would be
-            // dead code pretending to be thoroughness.
-            let missing: Vec<&str> = Capability::ALL
-                .into_iter()
-                .filter(|c| !backend.capabilities.has(*c))
-                .map(capability_label)
-                .collect();
-            let _ = writeln!(
-                out,
-                "backend caps {} of {} supported",
-                backend.capabilities.len(),
-                Capability::ALL.len(),
-            );
-            for absent in missing {
-                let _ = writeln!(out, "             absent: {absent}");
-            }
-        }
-        Err(DetectError::NoBackend) => {
-            let _ = writeln!(
-                out,
-                "backend      NONE — aido cannot operate on this machine"
-            );
-            let _ = writeln!(
-                out,
-                "             aido delegates every uid transition and performs none itself"
-            );
-        }
-        Err(err) => {
-            let _ = writeln!(out, "backend      UNUSABLE: {err}");
-        }
-    }
-}
-
-/// A short name for a capability, for the doctor report.
-fn capability_label(capability: Capability) -> &'static str {
-    match capability {
-        Capability::DropInDirectory => "drop-in directory",
-        Capability::ValidateNamedFile => "validate named file",
-        Capability::PerCommandDefaults => "per-command defaults (REQUIRED)",
-        Capability::DisableCredentialCache => "disable credential cache (REQUIRED)",
-        Capability::AllocatePty => "allocate pty (REQUIRED)",
-        Capability::RejectsArgumentWildcards => "rejects argument wildcards",
-        Capability::PersistentCredentialCache => "persistent credential cache",
-    }
-}
-
 /// Classifies the current process, falling back to a password-requiring caller.
 fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
     match ops.classify(std::process::id()) {
@@ -882,7 +770,27 @@ mod tests {
     )]
 
     use super::*;
+    use aido_backend::Capability;
+    use aido_backend::paths_to_root::{Caller, Lookup, MemoryHost};
     use aido_config::Setting;
+
+    /// Runs `cli` against `ops` and `probe`, with this machine's filesystem and
+    /// no `PATH` to report on.
+    fn run_on(
+        cli: &Cli,
+        ops: &dyn PrivilegedOps,
+        probe: &dyn Probe,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> ExitCode {
+        let platform = Platform {
+            ops,
+            probe,
+            host: &LiveHost,
+            path: None,
+        };
+        run_with(cli, &platform, out, err)
+    }
 
     /// Root for throwaway fixture directories.
     ///
@@ -932,7 +840,7 @@ mod tests {
             let cli = Cli::try_parse_from(full).unwrap();
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let code = run_with(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
+            let code = run_on(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
             (
                 code,
                 String::from_utf8_lossy(&out).into_owned(),
@@ -970,10 +878,152 @@ mod tests {
         // Not a claim about aido's own directory: a claim that the line can say
         // yes at all, so a bug that always refuses cannot hide behind the test
         // above.
+        let cli = Cli::try_parse_from(["aido", "--rules", "/usr/bin", "doctor"]).unwrap();
+        let mut out = Vec::new();
+        let code = run_on(&cli, &BlindOps, &NoBackendProbe, &mut out, &mut Vec::new());
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(
+            out.contains(
+                "rules trust  root-owned, no writable component, no user-made mount; 0 rule \
+                 file(s) checked on their descriptors"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A described machine for the doctor tests that run through the CLI:
+    /// one passwordless group, one writable directory ahead of sudo, and a
+    /// sudoers file this account cannot read.
+    fn described_machine() -> MemoryHost {
+        MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![1000, 999]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file(
+            "/etc/passwd",
+            0,
+            0,
+            0o644,
+            b"root:x:0:0::/root:/bin/sh\nyamin:x:1000:1000::/home/yamin:/bin/sh\n",
+        )
+        .file(
+            "/etc/group",
+            0,
+            0,
+            0o644,
+            b"docker:x:999:yamin\naido:x:998:\nyamin:x:1000:\n",
+        )
+        .unreadable_file("/etc/sudoers", 0, 0, 0o440)
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/bin", 0, 0, 0o755)
+        .file("/usr/bin/sudo", 0, 0, 0o4755, b"")
+        .file("/usr/bin/gpasswd", 0, 0, 0o755, b"")
+        .dir("/usr/sbin", 0, 0, 0o755)
+        .file("/usr/sbin/usermod", 0, 0, 0o755, b"")
+        .sealed_dir("/root", 0, 0, 0o700)
+        .dir("/home", 0, 0, 0o755)
+        .dir("/home/yamin", 1000, 1000, 0o755)
+        .dir("/home/yamin/bin", 1000, 1000, 0o755)
+    }
+
+    /// Runs `doctor` with `args` against `host`, in a fixture of its own: the
+    /// tests run in parallel, and two sharing a directory delete each other's.
+    fn doctor_on(name: &str, host: &MemoryHost, args: &[&str]) -> (ExitCode, String) {
+        let fx = fixture(name);
+        let mut full = vec!["aido", "--rules", fx.dir.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let mut out = Vec::new();
+        let platform = Platform {
+            ops: &BlindOps,
+            probe: &WorkingSudoProbe,
+            host,
+            path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
+        };
+        let code = run_with(&cli, &platform, &mut out, &mut Vec::new());
+        (code, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[test]
+    fn doctor_reports_every_other_path_to_root_it_was_handed() {
+        let (code, out) = doctor_on("cli-doctor-paths", &described_machine(), &["doctor"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(
+            out.contains(
+                "other paths to root, as yamin (uid 1000): 2 found, and 3 check(s) could not be \
+                 completed"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("docker (gid 999)"), "{out}");
+        assert!(
+            out.contains("/home/yamin/bin: /home/yamin, above it"),
+            "{out}"
+        );
+        assert!(out.contains("comes before /usr/bin/sudo"), "{out}");
+        // Unreadable is unverified, never clean, and it says how to see more.
+        assert!(out.contains("cannot verify /etc/sudoers"), "{out}");
+        assert!(out.contains("unverified is not clean"), "{out}");
+        // Without --fix, nothing is proposed.
+        assert!(!out.contains("proposed fixes"), "{out}");
+        // The lines the differential matrix reads are where they were.
+        assert!(
+            out.contains("\nexec path    absent in this build\n"),
+            "{out}"
+        );
+        assert!(out.contains("\nbackend caps 6 of 7 supported\n"), "{out}");
+    }
+
+    #[test]
+    fn doctor_fix_proposes_with_the_exact_command_and_changes_nothing() {
+        let (code, out) = doctor_on("cli-doctor-fix", &described_machine(), &["doctor", "--fix"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(
+            out.contains("proposed fixes: aido applies none of them"),
+            "{out}"
+        );
+        assert!(
+            out.contains("run       /usr/bin/sudo /usr/sbin/usermod --append --groups aido yamin"),
+            "{out}"
+        );
+        assert!(
+            out.contains("run       /usr/bin/sudo /usr/bin/gpasswd --delete yamin docker"),
+            "{out}"
+        );
+        assert!(out.contains("Nothing was changed."), "{out}");
+    }
+
+    #[test]
+    fn doctor_json_is_the_versioned_envelope_and_the_global_flag_agrees() {
+        let (code, out) = doctor_on(
+            "cli-doctor-json",
+            &described_machine(),
+            &["doctor", "--json", "--fix"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["schema_version"], doctor::DOCTOR_SCHEMA_VERSION);
+        assert_eq!(parsed["backend"]["implementation"], "sudo");
+        assert_eq!(parsed["backend"]["status"], "usable");
+        assert_eq!(parsed["paths_to_root"]["status"], "found");
+        assert_eq!(parsed["proposals"][0]["id"], "join-aido");
+        assert_eq!(parsed["exec_path"], "absent");
+        // `--output json` selects the same envelope; without --fix there are
+        // no proposals, which is null rather than an empty list.
+        let (_, global) = doctor_on(
+            "cli-doctor-global",
+            &described_machine(),
+            &["--output", "json", "doctor"],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&global).unwrap();
+        assert_eq!(parsed["proposals"], serde_json::Value::Null);
         assert_eq!(
-            trust_line(Path::new("/usr/bin")),
-            "root-owned, no writable component, no user-made mount; 0 rule file(s) checked on \
-             their descriptors"
+            parsed["paths_to_root"]["checks"][0]["check"],
+            "passwordless_rules"
         );
     }
 
@@ -984,7 +1034,7 @@ mod tests {
         // what refuses it, and the line says which mount and why.
         let cli = Cli::try_parse_from(["aido", "--rules", "/proc/sys", "doctor"]).unwrap();
         let mut out = Vec::new();
-        let code = run_with(
+        let code = run_on(
             &cli,
             host_ops().as_ref(),
             &HostProbe,
@@ -1010,7 +1060,7 @@ mod tests {
             bytes: Vec::new(),
         }];
         assert_eq!(
-            trust_report(&Ok(files)),
+            doctor::trust_line(&doctor::trust_report(&Ok(files))),
             "root-owned, no writable component, no user-made mount; 1 rule file(s) checked on \
              their descriptors"
         );
@@ -1021,7 +1071,9 @@ mod tests {
     fn the_trust_line_cannot_say_yes_off_linux() {
         // No mount table, so no mount can be judged, so nothing is trusted —
         // and the line says that is why, rather than blaming the ruleset.
-        let line = trust_line(Path::new("/usr/bin"));
+        let line = doctor::trust_line(&doctor::trust_report(&aido_sys::read_trusted_dir(
+            Path::new("/usr/bin"),
+        )));
         assert!(
             line.starts_with("UNTRUSTED: the mount table cannot be checked"),
             "{line}"
@@ -1286,7 +1338,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         let cli = Cli::try_parse_from(full).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&cli, ops, &HostProbe, &mut out, &mut err);
+        let code = run_on(&cli, ops, &HostProbe, &mut out, &mut err);
         (
             code,
             String::from_utf8_lossy(&out).into_owned(),
@@ -1633,7 +1685,7 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             Cli::try_parse_from(["aido", "--rules", shipped.to_str().unwrap(), "check"]).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
+        let code = run_on(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
         let out = String::from_utf8_lossy(&out).into_owned();
         assert_eq!(code, ExitCode::Delegated);
         assert!(out.starts_with("ok: "), "{out}");
@@ -1838,7 +1890,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let cli = Cli::try_parse_from(full).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let _ = run_with(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
+        let _ = run_on(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
         String::from_utf8_lossy(&out).into_owned()
     }
 
@@ -1853,7 +1905,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let cli = Cli::try_parse_from(full).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
+        let code = run_on(&cli, host_ops().as_ref(), probe, &mut out, &mut err);
         (
             code,
             String::from_utf8_lossy(&out).into_owned(),
@@ -2065,7 +2117,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let cli = Cli::try_parse_from(full.clone()).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&cli, &AttestingOps, &HostProbe, &mut out, &mut err);
+        let code = run_on(&cli, &AttestingOps, &HostProbe, &mut out, &mut err);
         assert_eq!(code, ExitCode::Denied);
         let rendered = String::from_utf8_lossy(&out).into_owned();
         assert!(rendered.contains("frozen"), "{rendered}");
@@ -2076,7 +2128,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         // And the human path stays open, so an operator can always recover.
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
+        let code = run_on(&cli, host_ops().as_ref(), &HostProbe, &mut out, &mut err);
         assert_eq!(code, ExitCode::Delegated);
 
         // With the file removed the same agent is permitted again, which proves
@@ -2085,7 +2137,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let bare = Cli::try_parse_from(full).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_with(&bare, &AttestingOps, &HostProbe, &mut out, &mut err);
+        let code = run_on(&bare, &AttestingOps, &HostProbe, &mut out, &mut err);
         assert_eq!(code, ExitCode::NotConfirmed);
     }
 
@@ -2368,7 +2420,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn every_capability_has_a_short_label_for_the_report() {
         for capability in Capability::ALL {
-            let label = capability_label(capability);
+            let label = doctor::capability_label(capability);
             assert!(label.len() > 5, "{capability:?}");
             // A required capability must be marked where an operator reads it.
             assert_eq!(
@@ -2411,7 +2463,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let cli = Cli::try_parse_from(["aido", "--rules", "/nonexistent/aido", "check"]).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert_eq!(run(&cli, &mut out, &mut err), ExitCode::Unusable);
+        assert_eq!(
+            run(&cli, &Invocation::default(), &mut out, &mut err),
+            ExitCode::Unusable
+        );
         assert!(String::from_utf8_lossy(&err).contains("cannot read the rules directory"));
     }
 
