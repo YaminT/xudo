@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"refused":{"code":"peer_unidentified","remediation":"the broker could not establish which process asked; retry, and if it persists run `aido doctor` to see whether this host can identify a caller"}}}

@@ -1,7 +1,13 @@
 # Build output
 /target
 /fuzz/target
-/fuzz/corpus
+/fuzz/corpus/*
+!/fuzz/corpus/wire_request/
+!/fuzz/corpus/wire_response/
+/fuzz/corpus/wire_request/*
+/fuzz/corpus/wire_response/*
+!/fuzz/corpus/wire_request/seed-*
+!/fuzz/corpus/wire_response/seed-*
 /fuzz/artifacts
 **/*.rs.bk
 

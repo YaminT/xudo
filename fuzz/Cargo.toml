@@ -1,4 +1,4 @@
-# The three trust-boundary parsers, fuzzed separately.
+# The five trust-boundary parsers, fuzzed separately.
 #
 # Not a workspace member: cargo-fuzz needs nightly and its own profile, and the
 # main workspace must stay buildable on the pinned stable toolchain.
@@ -16,6 +16,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 aido-policy = { path = "../crates/aido-policy" }
+aido-wire = { path = "../crates/aido-wire" }
 arbitrary = { version = "1", features = ["derive"] }
 
 [[bin]]
@@ -35,6 +36,20 @@ bench = false
 [[bin]]
 name = "denylist_eval"
 path = "fuzz_targets/denylist_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_request"
+path = "fuzz_targets/wire_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_response"
+path = "fuzz_targets/wire_response.rs"
 test = false
 doc = false
 bench = false

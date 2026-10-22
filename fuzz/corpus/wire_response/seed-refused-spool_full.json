@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"refused":{"code":"spool_full","remediation":"too many requests are pending; wait for them to be used or to expire, then retry the aido command"}}}

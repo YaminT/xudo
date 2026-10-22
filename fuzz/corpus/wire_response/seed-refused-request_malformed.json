@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"refused":{"code":"request_malformed","remediation":"the request is not a broker request; install aido and aidod from the same release"}}}

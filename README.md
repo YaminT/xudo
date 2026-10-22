@@ -97,7 +97,7 @@ just verify    # the full gate; identical to CI
 ```
 
 The gate is 100% line, region, and function coverage with no line-level waivers,
-zero clippy warnings, `cargo deny`, miri, and three fuzz targets. Fuzzing found a
+zero clippy warnings, `cargo deny`, miri, and five fuzz targets. Fuzzing found a
 real bug in argv canonicalization on its first run; the story is in
 [docs/CONCERNS.md](docs/CONCERNS.md).
 

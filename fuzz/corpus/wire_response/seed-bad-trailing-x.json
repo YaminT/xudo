@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"refused":{"code":"broker_unusable","remediation":"the broker could not complete the request and failed closed; an administrator should read the broker's audit record in the journal"}}}x
