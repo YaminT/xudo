@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"decided":{"decision":{"schema_version":1,"verdict":"deny","denial":"argv_rejected","remediation":"the action exists but these arguments are not permitted; run `aido explain -- <argv>` to see which position was rejected","action":null,"rule_source":null,"resolved_exe":null,"resolved_argv":["x"],"confirm":"not_required","trace":[]},"minted":null}}}

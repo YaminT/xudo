@@ -64,7 +64,7 @@ Nothing here needs Linux or privilege, so it all runs on the macOS dev host.
 - ~~**`crates/aido-sys`**~~ **DONE.** `PrivilegedOps` with `LinuxOps` and `MacOsStub`, procfs parsing from fixture trees, the attestation ladder, the backend probe, and now the descriptor-verified ruleset walk. No `unsafe` yet; `raw` arrives with M2b.
 - ~~**`crates/aido` front-end**~~ **DONE, with three gaps:** `explain`, `why-not`, `check`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, `agentdoc` exist. Not built: `check --fuzz` and `rule list|test` (the `[[test]]` blocks of SUGGESTIONS #10), both M6. `doctor --json` landed with M2b 4b, because verification item 1 needs it.
 - ~~**Exit-code taxonomy wired to a real process exit**~~ **DONE.** `aido-bin/tests/binary.rs` asserts 0, 17, 18, and 19 through a real process.
-- ~~**Install nightly + `cargo-fuzz`**~~ **DONE.** Three targets run on every push and for thirty minutes nightly.
+- ~~**Install nightly + `cargo-fuzz`**~~ **DONE.** Five targets run on every push and for thirty minutes nightly.
 
 Exit criterion: `aido explain -- apt-get install ripgrep` prints a matched rule with `file:line`; `aido explain -- /bin/sh -c id` prints a deny naming the capability class; `aido check` exits 0 on the shipped ruleset. Still executes nothing.
 

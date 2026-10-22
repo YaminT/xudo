@@ -1,0 +1,1 @@
+{"schema_version":1,"answer":{"refused":{"code":"nonce_collision","remediation":"the broker drew a nonce that already names a request, so its random source is broken; an administrator must investigate before anything is retried"}}}

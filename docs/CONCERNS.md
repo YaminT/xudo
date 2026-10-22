@@ -4,6 +4,64 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-22 — M2b D2: fuzzing the aido-wire parsers
+
+`CLAUDE.md` requires every trust-boundary parser to be fuzzed separately. The
+three that existed covered the policy engine; the two that cross the boundary
+between the unprivileged front-end and the root broker had no target. Now they
+do: `wire_request` (`BrokerRequest::parse`, run as root on bytes an unprivileged
+peer chose) and `wire_response` (`BrokerResponse::parse`, run by the front-end on
+bytes from the socket). `cargo fuzz list` reports five targets, so `just fuzz`,
+`just fuzz-smoke` and the nightly job run them with no other change.
+
+**Properties asserted, beyond "never panics".**
+
+- *Round trip.* A parsed message re-encodes through the crate's own `to_json`
+  (no encoder was added) to bytes that parse back to an equal value. A request's
+  encoding must also fit `MAX_REQUEST_BYTES`: what the broker accepts, the
+  front-end can send.
+- *No partial accept.* A valid message plus any one of nine trailing bytes
+  (`x } { ] 0 " ,` NUL `0xff`) is refused. The documented exception is JSON
+  whitespace (space, `\n`, `\t`, `\r`), which `serde_json::from_str` accepts and
+  the crate's own boundary test relies on; the target asserts that whitespace
+  never changes the value.
+- *Bounded.* The valid message padded with spaces to exactly the limit parses;
+  one byte more is refused as `TooLarge`. Refusing otherwise valid content at
+  `limit + 1` shows the length gate runs before any parse work, and an off-by-one
+  shows at the exact-limit check. This is asserted by behaviour: a counting
+  allocator needs `unsafe`, and `aido-sys-raw/tests/unsafe_budget.rs` scans
+  `fuzz/` too.
+
+**Value equality, not a byte fixed point, on the first encode of a response.**
+The `Decision` inside a response has `serde(default)` fields, so input bytes that
+omit one re-encode to bytes that spell it out. The response target asserts equal
+values, then a byte fixed point from the first re-encode on. The request has no
+defaults, so its target asserts the fixed point as well. The response target
+also checks on every run that `FALLBACK_RESPONSE` parses and renders to itself.
+
+**Seeds.** `fuzz/corpus/wire_request/` and `wire_response/` hold `seed-*.json`
+files: valid messages from the crate's test fixtures (generated from `to_json`,
+including a decided response with and without a minted entry, five refusal
+codes, and the fallback) and malformed ones (trailing comma, unknown key, wrong
+schema, wrong envelope, relative program, NUL in argv, duplicate key, invalid
+UTF-8, trailing `x`), plus a valid message with trailing whitespace. `.gitignore`
+used to ignore all of `/fuzz/corpus`; it now ignores everything there except the
+`seed-*` files in those two directories, so libFuzzer's SHA-named finds stay
+untracked and the other targets' corpora are unchanged.
+
+**Run, 600 s each, in parallel, aarch64-apple-darwin, nightly.**
+
+| target | execs | cov | ft | corpus | exec/s |
+|---|---|---|---|---|---|
+| `wire_request` | 26,635,767 | 1409 | 4338 | 1491 / 165 KB | 44,319 |
+| `wire_response` | 30,459,868 | 2815 | 7896 | 3175 / 408 KB | 50,681 |
+
+**Findings: none.** No crash, no assertion fired, and no artifact was written.
+The SHA-named corpus files were deleted afterwards; the seeds are the only
+corpus in the commit.
+
+---
+
 ## 2026-10-21 — Agent pipelines moved to boof
 
 All agent pipelines for this repository now run through boof-runner: planner

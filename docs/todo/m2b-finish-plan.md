@@ -131,8 +131,10 @@ exit. Packaging stays in phase 3.
   whole, not half-wired: `CONCERNS.md`, the M2b step 2 entry, open item 6,
   lists what it touches and the order to do it in (the unit's sandbox first,
   measured under systemd).
-- **D2. Fuzz target** for the `aido-wire` request parser, a trust-boundary
-  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`.
+- ~~**D2. Fuzz target** for the `aido-wire` request parser, a trust-boundary
+  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`.~~ **DONE
+  2026-10-22.** Two targets, `wire_request` and `wire_response`, picked up by
+  `just fuzz` and `just fuzz-smoke` through `cargo fuzz list`; see `CONCERNS.md`.
 - **D3. Doctor oracle.** Ask the programs themselves — `sudo -l -U <user>` when
   run as root, `doas -C <file> <cmd>` unprivileged — as the authoritative
   passwordless check, demoting the hand parser to a hint. Four review rounds

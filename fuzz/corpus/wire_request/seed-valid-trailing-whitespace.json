@@ -1,0 +1,2 @@
+{"schema_version":1,"program":"/usr/bin/systemctl","argv":["restart","nginx.service"],"claimed_classification":"unattested"} 
+	
