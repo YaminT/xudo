@@ -1213,6 +1213,18 @@ mod tests {
     }
 
     #[test]
+    fn names_a_caller_with_no_passwd_entry_by_uid_on_every_platform() {
+        // The real host decides whether the running user has a name, so a test
+        // that only meets the real host reaches this arm on a machine where
+        // the user is nameless and not on one where they are not.
+        let mut report = hostile_report(false);
+        report.paths_to_root.subject.name = None;
+        let text = human(&report);
+        assert!(text.contains("other paths to root, as uid 1000:"), "{text}");
+        assert!(!text.contains("yamin (uid"), "{text}");
+    }
+
+    #[test]
     fn a_backend_with_no_banner_says_so_rather_than_inventing_one() {
         let report = gathered(
             &clean_host(),
