@@ -48,6 +48,7 @@ pub mod entropy;
 pub mod error;
 pub mod exec;
 pub mod hygiene;
+pub mod install;
 pub mod kernel;
 pub mod live;
 mod mounts;
@@ -78,6 +79,11 @@ pub use entropy::{Entropy, FakeEntropy, HostEntropy};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
+pub use install::{
+    Effect, HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,
+    Installer, PendingGateProbe, ProbeResult, RefusingInstaller, Verification, check_effect,
+    execute,
+};
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;
 pub use mounts::MountRefusal;

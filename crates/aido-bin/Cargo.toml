@@ -26,9 +26,23 @@ clap.workspace = true
 # to be sitting in the target directory: missing on a clean CI runner, and
 # silently stale on a developer's machine.
 [dev-dependencies]
+# The root-lane guard every `tests/root_*.rs` begins with.
+aido-tests = { path = "../aido-tests", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
+
+[features]
+# The tests that must run as uid 0: every `tests/root_*.rs`. Only
+# `ci/root-test.sh` (`just root-test`) runs them as root; the suites that enable
+# every feature build them and let them skip, loudly. Nothing shipped reads it.
+root-tests = []
+
+# Without the feature the target does not exist, so a lane that forgot it fails
+# ("requires the features") rather than running an empty binary and passing.
+[[test]]
+name = "root_install"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

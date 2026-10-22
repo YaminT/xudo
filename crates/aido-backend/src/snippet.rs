@@ -23,6 +23,13 @@ pub const DOAS_DROP_IN_PATH: &str = "/etc/doas.d/60-aido.conf";
 /// The shared doas config, appended to when there is no drop-in directory.
 pub const DOAS_CONF_PATH: &str = "/etc/doas.conf";
 
+/// What every file aido writes under its own name begins with.
+///
+/// Uninstall removes a file only if it begins with this, so a file an operator
+/// made at the same path is never mistaken for aido's. Both generated headers
+/// start with it, and a test holds them to that.
+pub const MANAGED_MARKER: &str = "# Managed by aido.";
+
 /// Opens aido's block in a shared file, so uninstall can remove exactly it.
 pub const DOAS_BEGIN: &str = "### aido:begin — do not edit between the markers";
 /// Closes aido's block.
@@ -623,5 +630,20 @@ mod tests {
             doas_snippet
         );
         assert!(format!("{doas_snippet:?}").contains("is_drop_in"));
+    }
+
+    #[test]
+    fn every_file_aido_writes_begins_with_the_marker_uninstall_looks_for() {
+        // Uninstall removes a file only if it begins with the marker, so a
+        // generated file that did not would be installed and never removed.
+        let sudoers = SudoersSnippet::human_only(&sudo()).unwrap();
+        assert!(sudoers.contents.starts_with(MANAGED_MARKER));
+        let drop_in = DoasSnippet::human_only(&doas(true)).unwrap();
+        assert!(drop_in.contents.starts_with(MANAGED_MARKER));
+        // The shared-file block is found by its sentinels, not by the marker,
+        // and carries the marker on its first line after them.
+        let block = DoasSnippet::human_only(&doas(false)).unwrap();
+        assert!(block.contents.starts_with(DOAS_BEGIN));
+        assert!(block.contents.contains(&format!("\n{MANAGED_MARKER}")));
     }
 }

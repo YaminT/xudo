@@ -77,7 +77,17 @@ root-tests = []
 name = "root_lane"
 required-features = ["root-tests"]
 
+[[test]]
+name = "root_install"
+required-features = ["root-tests"]
+
+[[test]]
+name = "root_sudo_names"
+required-features = ["root-tests"]
+
 [dev-dependencies]
+# The root-lane guard every `tests/root_*.rs` begins with.
+aido-tests = { path = "../aido-tests", version = "0.0.1" }
 # The system log's path must be the one the configuration crate names, and the
 # journal's alert priority must meet the gate's high-severity mark; both are
 # checked against the other crate rather than restated.

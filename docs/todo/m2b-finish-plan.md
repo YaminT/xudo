@@ -65,7 +65,12 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    root it can check, never printing clean for what it could not read. *(B2)*
 6. Install writes a validated snippet atomically and a **functional** probe
    proves the gate executed as root; the dotted-filename regression is tested.
-   *(B4, row 3)*
+   *(B4, row 3)* **Status 2026-10-22:** the executor, the snippet, and the
+   regression are done and tested as real root; the gate-as-uid-0 proof exists in
+   the root lane (`aido-gate-bin/tests/root_probe.rs`, a hand-written request
+   through real `sudo`), but **`aido install`'s own probe stays `NOT VERIFIED`
+   until C1** (it cannot mint a request), and the doctor reporting a dotted name
+   as not in effect is B2's.
 7. The broker and the gate each write their own audit record through the
    step-6 contract; a sink that cannot be written prevents mint and execution;
    `aido audit` verifies the produced trail and fails after truncation. *(D1,
@@ -101,7 +106,7 @@ exit. Packaging stays in phase 3.
   consuming a spool entry that is already gone (`ENOENT`) is a refusal; one
   monotonic clock seam shared with the broker; the exec path takes
   `Authorized<_>` from the step-6 contract. Merge.
-- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). Finish the executor;
+- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). **DONE 2026-10-22** apart from the two items named in exit 6; the root lane is blocking. Finish the executor;
   make the post-install probe real against the merged gate (a safe no-op
   request that must execute as uid 0); dotted-filename regression; merge. Its
   real-file tests that need uid 0 join the root lane (`tests/root_*.rs`, run

@@ -33,5 +33,5 @@ pub mod doctor;
 pub mod render;
 pub mod rules;
 
-pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with};
+pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with, run_with_installer};
 pub use rules::{LoadError, LoadedRules};

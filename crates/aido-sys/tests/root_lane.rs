@@ -24,11 +24,18 @@
 //!   A `[[test]]` entry with `required-features = ["root-tests"]` makes a build
 //!   without the feature refuse to run the target instead of running it empty,
 //!   as this file's entry does.
-//! * Begin each test with `if !root_or_skip("<its name>") { return; }`. Suites
-//!   that enable every feature (`just test`, `just linux-test`, coverage) build
-//!   this file and run it as an ordinary user, where it must neither fail nor
-//!   pretend to have run. The lane reads the output and fails on any `SKIPPED:`
-//!   line, so the only place a skip is accepted is the place nobody relies on.
+//! * Begin each test with `if !begin_root_test("<its name>") { return; }`, which
+//!   calls `aido_tests::root_lane::root_guard` first and does nothing before it.
+//!   Suites that enable every feature (`just test`, `just linux-test`,
+//!   coverage) build this file and run it as an ordinary user, where it must
+//!   neither fail nor pretend to have run: the guard skips, and the lane reads
+//!   the output and fails on any `SKIPPED:` line, so the only place a skip is
+//!   accepted is the place nobody relies on. As uid 0 *outside* the lane's
+//!   container (`sudo just test` on a real machine) the guard panics instead,
+//!   because these tests write the real `/etc`; the lane proves itself with the
+//!   sentinel file `ci/root-test.sh` makes. `crates/aido-tests/tests/
+//!   lane_guard_scan.rs` fails the build on a root test that does not begin
+//!   this way.
 //! * Assert what only root can show. A refusal that depends on a mode proves
 //!   nothing here, because root is not refused by one.
 //! * Scratch space under the target directory, never `/tmp`, and leave the
@@ -42,7 +49,9 @@
     clippy::indexing_slicing
 )]
 
-use std::fs::{self, File, OpenOptions, Permissions};
+use aido_tests::root_lane::{self, root_guard};
+
+use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::path::PathBuf;
 
@@ -65,20 +74,14 @@ fn scratch(name: &str) -> PathBuf {
 /// `geteuid` and `unsafe` is forbidden, and the owner of a file a process
 /// creates is the identity every operation in these tests acts as. The probe is
 /// the test's own, because the tests run in parallel outside the lane.
-fn root_or_skip(test: &str) -> bool {
-    let probe = scratch(&format!("{test}-identity")).join("probe");
-    File::create(&probe).unwrap();
-    if fs::metadata(&probe).unwrap().uid() == 0 {
-        return true;
-    }
-    eprintln!("SKIPPED: {test} needs uid 0; ci/root-test.sh runs it for real");
-    false
+fn begin_root_test(test: &str) -> bool {
+    root_guard(test)
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn the_lane_is_root_through_and_through() {
-    if !root_or_skip("the_lane_is_root_through_and_through") {
+    if !begin_root_test("the_lane_is_root_through_and_through") {
         return;
     }
     // Effective alone is not enough: a set-user-ID wrapper leaves the real id
@@ -101,7 +104,7 @@ fn the_lane_is_root_through_and_through() {
 
 #[test]
 fn a_mode_that_refuses_everyone_does_not_refuse_root() {
-    if !root_or_skip("a_mode_that_refuses_everyone_does_not_refuse_root") {
+    if !begin_root_test("a_mode_that_refuses_everyone_does_not_refuse_root") {
         return;
     }
     // The reason ci/linux-test.sh never runs as root, held as a fact of this
@@ -124,7 +127,7 @@ fn a_mode_that_refuses_everyone_does_not_refuse_root() {
 
 #[test]
 fn root_gives_a_file_away_and_still_sets_its_mode() {
-    if !root_or_skip("root_gives_a_file_away_and_still_sets_its_mode") {
+    if !begin_root_test("root_gives_a_file_away_and_still_sets_its_mode") {
         return;
     }
     // Two capabilities an install depends on and a stripped container may lack:
@@ -148,4 +151,34 @@ fn root_gives_a_file_away_and_still_sets_its_mode() {
         (back.uid(), back.gid(), back.mode() & 0o7777),
         (0, 0, 0o440)
     );
+}
+
+#[test]
+fn the_lane_sentinel_is_the_one_the_guard_demands() {
+    if !begin_root_test("the_lane_sentinel_is_the_one_the_guard_demands") {
+        return;
+    }
+    // The lane's own half of the guard: `ci/root-test.sh` made the file, and the
+    // guard accepts it. A script that stopped writing it would fail every root
+    // test with a refusal; one that wrote the wrong bytes would fail here.
+    let verdict = root_lane::lane(
+        root_lane::effective_uid(),
+        std::path::Path::new(root_lane::SENTINEL),
+    );
+    assert_eq!(verdict, root_lane::Lane::Run);
+}
+
+#[test]
+fn a_root_test_outside_the_lane_panics_before_touching_anything() {
+    if !begin_root_test("a_root_test_outside_the_lane_panics_before_touching_anything") {
+        return;
+    }
+    // Real uid 0, and a sentinel that is not there: the situation of `sudo just
+    // test` on a real machine. The guard must stop the test, and must not have
+    // made so much as the sentinel's path.
+    let absent = scratch("no-sentinel").join("aido-root-test-lane");
+    let caught =
+        std::panic::catch_unwind(|| root_lane::root_guard_at("some_root_test", 0, &absent));
+    assert!(caught.is_err(), "a root test went on outside the lane");
+    assert!(!absent.exists());
 }

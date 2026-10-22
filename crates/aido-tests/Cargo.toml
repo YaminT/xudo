@@ -15,11 +15,21 @@ publish = false
 # for the half that needs a gate binary — the same ruleset *executed* through
 # each backend. Until then it holds only the tests that belong to no one crate:
 # `tests/crate_inventory.rs` reads the workspace's own manifest and docs with
-# the standard library alone, so this package still has no dependencies.
+# the standard library alone, so this package
+# has next to none: only `rustix`, for the guard.
 #
 # The end-to-end tests of the `aido` binary are not here. They live in
 # `aido-bin/tests`, because only the package that owns a binary gets
 # `CARGO_BIN_EXE_<name>` and a guaranteed-fresh build of it.
+
+# The root-lane guard (`src/root_lane.rs`) asks for the effective uid, which the
+# standard library cannot, and `unsafe` is forbidden. A feature of a crate
+# already in the tree, not a new one.
+[dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "process",
+] }
 
 [lints]
 workspace = true

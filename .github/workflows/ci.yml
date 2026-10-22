@@ -131,21 +131,18 @@ jobs:
 
   # The tests that must run as uid 0, run as real root in a throwaway container,
   # on a copy of the checkout, and nothing else (ci/root-test.sh says why not the
-  # whole suite). Until the install executor's own root tests land (M2b step 5)
-  # the lane runs only its own checks that a run which says it is root behaves
-  # like one, so it is NON-BLOCKING: `continue-on-error` below is what makes a
-  # red lane leave the run green.
-  #
-  # THE SWITCH, in the commit that merges the install executor's root tests:
-  #   1. delete `continue-on-error: true` below;
-  #   2. add `root-test` to the `ci` recipe in the justfile;
-  #   3. if branch protection lists required checks, add this job's name.
-  # docs/CONCERNS.md, 2026-10-21, has the reasoning.
+  # whole suite). BLOCKING: the install executor's root tests (M2b step 5) are in
+  # it, so a red lane is a red run. It began non-blocking, while it ran only its
+  # own checks that a run which says it is root behaves like one, and the switch
+  # was made in the commit that merged the install executor: `continue-on-error`
+  # deleted, `root-test` added to the `ci` recipe in the justfile.
+  # Branch protection lives outside this repository: if it lists required
+  # checks, this job's name ("root tests (container)") has to be among them, or a
+  # red lane still merges. docs/CONCERNS.md, 2026-10-22, has the reasoning.
   root-tests:
     name: root tests (container)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -177,3 +174,24 @@ jobs:
           tool: just
       - name: Drive the static binary through sudo, sudo-rs, OpenDoas, and no escalator
         run: just differential
+
+  # `aido install` and `--uninstall` run for real, as root, in containers the
+  # job starts and discards: the file lands with the right owner and mode, the
+  # backend's own parser accepts it first, an operator's file is never replaced
+  # or removed, a rejected candidate leaves the old state alone. The functional
+  # probe is not covered here because `aido install` cannot yet ask the broker
+  # for a request (M2b plan item C1); the harness asserts the install says it is
+  # unverified rather than claiming otherwise. The root lane (`root-tests`) covers
+  # the sudo path the probe will use, with a request written by hand.
+  install-root:
+    name: install as root
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Install and uninstall through sudo, sudo-rs, and OpenDoas
+        run: just install-root

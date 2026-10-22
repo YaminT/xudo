@@ -10,13 +10,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aido_backend::paths_to_root::HostView;
-use aido_backend::{InstallPlan, PlanStep, Probe, detect};
+use aido_backend::{BackendKind, InstallPlan, PlanStep, Probe, detect, uninstall_plan};
 use aido_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use aido_policy::{
     Arg, Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict,
     engine::Settings,
 };
-use aido_sys::{HostProbe, LiveHost, PrivilegedOps, host_ops};
+use aido_sys::{
+    HostInstaller, HostProbe, InstallReport, Installer, LiveHost, PrivilegedOps, RefusingInstaller,
+    Verification, host_ops,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agentdoc::{self, DocFormat};
@@ -131,19 +134,27 @@ pub enum Command {
         schema: bool,
     },
 
-    /// Show the steps that would integrate aido with the local sudo backend.
+    /// Integrate aido with the local sudo or doas backend, or remove it again.
     ///
-    /// Prints the plan and exits. This build has no installer, so `--dry-run` is
-    /// the only accepted mode and must be given explicitly — a subcommand named
-    /// `install` that silently did nothing would be worse than no subcommand.
+    /// Needs root. Every step is validated by the backend's own parser before
+    /// anything is moved into place, and only files aido wrote are ever replaced
+    /// or removed. `--dry-run` prints the plan and changes nothing.
+    ///
+    /// An install is reported as verified only when the functional probe
+    /// confirmed that the rule is in effect. This build has no probe yet, so an
+    /// install completes as *unverified* and exits non-zero to say so.
     Install {
-        /// Required. Print the plan without performing any step.
+        /// Print the plan without performing any step.
         #[arg(long)]
         dry_run: bool,
 
         /// Print the file contents each step would write, not just its summary.
         #[arg(long)]
         show_contents: bool,
+
+        /// Remove what an install wrote, and nothing else.
+        #[arg(long)]
+        uninstall: bool,
     },
 
     /// Verify that the audit log has not been edited.
@@ -228,7 +239,7 @@ pub fn run(
         host: &LiveHost,
         path: invocation.path.as_deref(),
     };
-    run_with(cli, &platform, out, err)
+    run_with_installer(cli, &platform, &HostInstaller, out, err)
 }
 
 /// Runs a parsed command against an injected platform.
@@ -237,9 +248,24 @@ pub fn run(
 /// — a caller that cannot be observed, a platform that cannot attest — are
 /// reachable from a test. A branch that only executes on a broken machine is a
 /// branch that only gets exercised on a broken machine.
+///
+/// Cannot modify the machine: `install` without `--dry-run` is refused here, so
+/// a caller that injects a platform for a test is never one `sudo` away from
+/// writing under `/etc`.
 pub fn run_with(
     cli: &Cli,
     platform: &Platform<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    run_with_installer(cli, platform, &RefusingInstaller, out, err)
+}
+
+/// [`run_with`], with the installer injected as well.
+pub fn run_with_installer(
+    cli: &Cli,
+    platform: &Platform<'_>,
+    installer: &dyn Installer,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -279,7 +305,18 @@ pub fn run_with(
         Command::Install {
             dry_run,
             show_contents,
-        } => install(probe, *dry_run, *show_contents, out, err),
+            uninstall,
+        } => install(
+            probe,
+            installer,
+            InstallMode {
+                dry_run: *dry_run,
+                show_contents: *show_contents,
+                uninstall: *uninstall,
+            },
+            out,
+            err,
+        ),
         Command::Explain(args) => {
             with_rules!(|l: &LoadedRules| explain(cli, ops, l, args, out, err))
         }
@@ -302,41 +339,107 @@ pub fn run_with(
     }
 }
 
-/// Prints the install plan for the detected backend.
-///
-/// Performs no step. The plan is built by `aido-backend`, which is pure, so this
-/// is the same data an installer would execute — printing it is how the steps get
-/// reviewed before anything runs as root.
-fn install(
-    probe: &dyn Probe,
+/// What `install` was asked to do.
+#[derive(Clone, Copy, Debug)]
+struct InstallMode {
     dry_run: bool,
     show_contents: bool,
+    uninstall: bool,
+}
+
+/// Plans the install, or the removal, and performs it unless `--dry-run`.
+///
+/// The plans are built by `aido-backend`, which is pure, so a dry run prints
+/// exactly the data the executor then performs — printing it is how the steps
+/// get reviewed before anything runs as root.
+///
+/// A removal needs no backend: it takes away what aido wrote whichever backend
+/// is installed now, or none, so a machine whose `sudo` was uninstalled first
+/// can still be cleaned up. Both backends' removals run, each of them removing
+/// nothing it did not write.
+fn install(
+    probe: &dyn Probe,
+    installer: &dyn Installer,
+    mode: InstallMode,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if !dry_run {
-        let _ = writeln!(
-            err,
-            "aido: this build has no installer; pass --dry-run to see the plan"
-        );
-        return ExitCode::Unusable;
-    }
-
-    // One refusal path, not two. A backend that cannot be given a snippet is a
-    // backend aido cannot use, so the snippet failure is folded into the same
-    // answer rather than given its own arm — an arm that detection's usability
-    // guarantee means nothing could ever reach.
-    let plan = match detect(probe)
-        .map_err(|source| source.to_string())
-        .and_then(|backend| plan_for(&backend))
-    {
-        Ok(plan) => plan,
-        Err(reason) => {
-            let _ = writeln!(err, "aido: no usable backend: {reason}");
-            return ExitCode::Unusable;
+    let plans = if mode.uninstall {
+        vec![
+            uninstall_plan(BackendKind::Sudo),
+            uninstall_plan(BackendKind::Doas),
+        ]
+    } else {
+        // One refusal path, not two. A backend that cannot be given a snippet
+        // is a backend aido cannot use, so the snippet failure is folded into
+        // the same answer rather than given its own arm — an arm that
+        // detection's usability guarantee means nothing could ever reach.
+        match detect(probe)
+            .map_err(|source| source.to_string())
+            .and_then(|backend| plan_for(&backend))
+        {
+            Ok(plan) => vec![plan],
+            Err(reason) => {
+                let _ = writeln!(err, "aido: no usable backend: {reason}");
+                return ExitCode::Unusable;
+            }
         }
     };
 
+    if mode.dry_run {
+        for plan in &plans {
+            print_plan(plan, mode.show_contents, out);
+        }
+        let _ = writeln!(
+            out,
+            "\nNothing was written. This build grants the human path only: every rule it\n\
+             would install requires a password, and no passwordless rule exists in it."
+        );
+        return ExitCode::Delegated;
+    }
+
+    let mut unverified = None;
+    for plan in &plans {
+        match installer.run(plan) {
+            Ok(report) => {
+                print_report(&report, out);
+                if let Verification::Unverified { reason } = report.verification {
+                    unverified = Some(reason);
+                }
+            }
+            Err(failure) => {
+                let _ = writeln!(err, "aido: {} failed: {failure}", plan_verb(mode));
+                return ExitCode::Unusable;
+            }
+        }
+    }
+    match unverified {
+        // Files were written and nothing proved they take effect. Said in so
+        // many words, with a failing status, because a quiet success here is
+        // exactly the claim aido must not make.
+        Some(reason) => {
+            let _ = writeln!(
+                err,
+                "aido: installed, but NOT VERIFIED: {reason}. The integration has not been \
+                 shown to work; do not rely on it."
+            );
+            ExitCode::Unusable
+        }
+        None => ExitCode::Delegated,
+    }
+}
+
+/// The word for what is being done, for a failure message.
+fn plan_verb(mode: InstallMode) -> &'static str {
+    if mode.uninstall {
+        "uninstall"
+    } else {
+        "install"
+    }
+}
+
+/// Prints one plan, step by step.
+fn print_plan(plan: &InstallPlan, show_contents: bool, out: &mut dyn Write) {
     let _ = writeln!(out, "plan for     {}", plan.backend.label());
     let _ = writeln!(out, "steps        {}", plan.steps.len());
     for (index, step) in plan.steps.iter().enumerate() {
@@ -348,12 +451,20 @@ fn install(
             }
         }
     }
-    let _ = writeln!(
-        out,
-        "\nNothing was written. This build grants the human path only: every rule it\n\
-         would install requires a password, and no passwordless rule exists in it."
-    );
-    ExitCode::Delegated
+}
+
+/// Prints what a plan did, and whether that was shown to work.
+fn print_report(report: &InstallReport, out: &mut dyn Write) {
+    let _ = writeln!(out, "done         {}", report.backend.label());
+    for event in &report.events {
+        let _ = writeln!(out, "  - {event}");
+    }
+    if report.verification == Verification::Verified {
+        let _ = writeln!(out, "verified     the functional probe passed");
+    }
+    for notice in &report.notices {
+        let _ = writeln!(out, "\n{notice}");
+    }
 }
 
 /// The plan for one backend, with the failure rendered as text.
@@ -1959,14 +2070,226 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn install_without_dry_run_refuses_rather_than_appearing_to_work() {
-        // A subcommand named `install` that silently did nothing would be worse
-        // than no subcommand at all.
+    fn install_without_dry_run_cannot_modify_the_machine_from_an_injected_platform() {
+        // `run_with` is what every test drives. It must be impossible for one of
+        // them, run as root in a container, to write under /etc.
         let fx = fixture("cli-install-bare");
         let (code, out, err) = run_probe_full(&fx, &WorkingSudoProbe, &["install"]);
         assert_eq!(code, ExitCode::Unusable);
         assert_eq!(out, "");
-        assert!(err.contains("no installer"), "{err}");
+        assert!(err.contains("cannot modify the machine"), "{err}");
+        assert!(err.contains("install failed"), "{err}");
+    }
+
+    /// An installer that records the plans it was given and answers as told.
+    struct ScriptedInstaller {
+        plans: std::cell::RefCell<Vec<InstallPlan>>,
+        answers: std::cell::RefCell<Vec<Result<InstallReport, aido_sys::InstallError>>>,
+    }
+
+    impl ScriptedInstaller {
+        fn answering(answers: Vec<Result<InstallReport, aido_sys::InstallError>>) -> Self {
+            Self {
+                plans: std::cell::RefCell::new(Vec::new()),
+                answers: std::cell::RefCell::new(answers.into_iter().rev().collect()),
+            }
+        }
+    }
+
+    impl Installer for ScriptedInstaller {
+        fn run(&self, plan: &InstallPlan) -> Result<InstallReport, aido_sys::InstallError> {
+            self.plans.borrow_mut().push(plan.clone());
+            self.answers
+                .borrow_mut()
+                .pop()
+                .unwrap_or(Err(aido_sys::InstallError::NoInstaller))
+        }
+    }
+
+    fn report(backend: BackendKind, verification: Verification) -> InstallReport {
+        InstallReport {
+            backend,
+            events: vec!["installed /etc/sudoers.d/aido".to_owned()],
+            notices: vec!["every invocation will prompt".to_owned()],
+            verification,
+        }
+    }
+
+    fn run_installing(
+        fx: &Fixture,
+        probe: &dyn Probe,
+        installer: &dyn Installer,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let mut full = vec!["aido", "--rules", fx.dir.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ops = host_ops();
+        let platform = Platform {
+            ops: ops.as_ref(),
+            probe,
+            host: &LiveHost,
+            path: None,
+        };
+        let code = run_with_installer(&cli, &platform, installer, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn an_install_that_could_not_be_verified_says_so_and_exits_non_zero() {
+        // The honest outcome of this build: files written, nothing proving they
+        // take effect. A quiet success here is the claim aido must not make.
+        let fx = fixture("cli-install-unverified");
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Unverified {
+                reason: "the front-end cannot yet ask the broker for a request".to_owned(),
+            },
+        ))]);
+        let (code, out, err) = run_installing(&fx, &WorkingSudoProbe, &installer, &["install"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("NOT VERIFIED"), "{err}");
+        assert!(err.contains("cannot yet ask the broker"), "{err}");
+        assert!(out.contains("installed /etc/sudoers.d/aido"), "{out}");
+        assert!(out.contains("every invocation will prompt"), "{out}");
+        assert!(
+            !out.contains("verified     "),
+            "claimed verification: {out}"
+        );
+        // The plan it ran is the one a dry run prints: for the detected backend.
+        let plans = installer.plans.borrow();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].backend, BackendKind::Sudo);
+    }
+
+    #[test]
+    fn an_install_whose_probe_passed_is_reported_verified_and_exits_zero() {
+        let fx = fixture("cli-install-verified");
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Verified,
+        ))]);
+        let (code, out, err) = run_installing(&fx, &WorkingSudoProbe, &installer, &["install"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(
+            out.contains("verified     the functional probe passed"),
+            "{out}"
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn a_failed_install_prints_why_and_exits_unusable() {
+        let fx = fixture("cli-install-fails");
+        let installer =
+            ScriptedInstaller::answering(vec![Err(aido_sys::InstallError::NotRoot { uid: 1000 })]);
+        let (code, out, err) = run_installing(&fx, &WorkingSudoProbe, &installer, &["install"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("install failed"), "{err}");
+        assert!(err.contains("requires root"), "{err}");
+    }
+
+    #[test]
+    fn an_install_with_no_usable_backend_runs_nothing() {
+        let fx = fixture("cli-install-nobackend");
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, _, err) = run_installing(&fx, &NoBackendProbe, &installer, &["install"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("no usable backend"), "{err}");
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_never_reaches_the_installer() {
+        let fx = fixture("cli-install-dry");
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, _, _) = run_installing(
+            &fx,
+            &WorkingSudoProbe,
+            &installer,
+            &["install", "--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_uninstall_needs_no_backend_and_removes_for_both() {
+        // sudo may have been removed before aido was; the file it wrote must
+        // still go.
+        let fx = fixture("cli-uninstall");
+        let removed = |backend| InstallReport {
+            backend,
+            events: vec!["removed something".to_owned()],
+            notices: vec![],
+            verification: Verification::NotRequired,
+        };
+        let installer = ScriptedInstaller::answering(vec![
+            Ok(removed(BackendKind::Sudo)),
+            Ok(removed(BackendKind::Doas)),
+        ]);
+        let (code, out, err) = run_installing(
+            &fx,
+            &NoBackendProbe,
+            &installer,
+            &["install", "--uninstall"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        let plans = installer.plans.borrow();
+        assert_eq!(
+            plans.iter().map(|p| p.backend).collect::<Vec<_>>(),
+            [BackendKind::Sudo, BackendKind::Doas]
+        );
+        assert!(out.contains("removed something"), "{out}");
+        assert!(!err.contains("NOT VERIFIED"), "{err}");
+    }
+
+    #[test]
+    fn an_uninstall_that_fails_stops_and_says_it_was_an_uninstall() {
+        let fx = fixture("cli-uninstall-fails");
+        let installer = ScriptedInstaller::answering(vec![Err(aido_sys::InstallError::NotOurs {
+            path: "/etc/sudoers.d/aido".to_owned(),
+            reason: "it does not begin with aido's marker".to_owned(),
+        })]);
+        let (code, _, err) = run_installing(
+            &fx,
+            &NoBackendProbe,
+            &installer,
+            &["install", "--uninstall"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("uninstall failed"), "{err}");
+        assert!(err.contains("not a file aido wrote"), "{err}");
+        // The second plan was not attempted after the first refused.
+        assert_eq!(installer.plans.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_uninstall_dry_run_prints_both_removals_and_writes_nothing() {
+        let fx = fixture("cli-uninstall-dry");
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, out, _) = run_installing(
+            &fx,
+            &NoBackendProbe,
+            &installer,
+            &["install", "--uninstall", "--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("plan for     sudo"), "{out}");
+        assert!(out.contains("plan for     doas"), "{out}");
+        assert!(out.contains("remove /etc/sudoers.d/aido"), "{out}");
+        assert!(
+            out.contains("remove aido's block from /etc/doas.conf"),
+            "{out}"
+        );
+        assert!(installer.plans.borrow().is_empty());
     }
 
     #[test]
@@ -2041,7 +2364,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             PlanStep::AppendBlock {
                 path: "/p".to_owned(),
                 block: "body".to_owned(),
-                mode: 0o440,
             },
             PlanStep::Notice {
                 text: "body".to_owned(),

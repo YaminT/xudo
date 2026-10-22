@@ -123,7 +123,7 @@ The plan began with five crates and the deviations above account for the rest. T
 | `ido` | The buffered human-run command queue: queue, picker state machine, runner, and `AGENTS.md` splicer. Unprivileged |
 | `ido-bin` | The `ido` executable: collects the environment once and owns the raw terminal |
 | `term-sanitize` | Display-only sanitizer for agent-written text bound for a terminal, shared by `ido` and `aido`'s future confirmation prompt |
-| `aido-tests` | Tests that belong to the workspace as a whole, starting with the check on this table; reserved for the executing half of the differential matrix |
+| `aido-tests` | Tests that belong to the workspace as a whole, starting with the check on this table, and the guard every root test begins with; reserved for the executing half of the differential matrix |
 
 `aido-gate` and `aidod` are the privileged pair, with a dependency budget capped at sudo-rs's bar: rustix/libc plus one audited serialization crate. `#![forbid(unsafe_code)]` holds everywhere except `aido-sys-raw`'s `sys` module, which carries a published block budget.
 

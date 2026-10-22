@@ -21,8 +21,26 @@ aido-gate = { path = "../aido-gate", version = "0.0.1" }
 # could give it. It lives in this package because Cargo builds the binary for,
 # and sets `CARGO_BIN_EXE_aido-gate` in, only this package's integration tests.
 [dev-dependencies]
+# The root-lane guard every `tests/root_*.rs` begins with.
+aido-tests = { path = "../aido-tests", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
+# `tests/root_probe.rs` installs the real snippet and writes a spool entry by
+# hand, with the same code the product uses for both.
+aido-backend = { path = "../aido-backend", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
+
+[features]
+# The tests that must run as uid 0: every `tests/root_*.rs`. Only
+# `ci/root-test.sh` (`just root-test`) runs them as root; the suites that enable
+# every feature build them and let them skip, loudly. Nothing shipped reads it.
+root-tests = []
+
+# Without the feature the target does not exist, so a lane that forgot it fails
+# ("requires the features") rather than running an empty binary and passing.
+[[test]]
+name = "root_probe"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

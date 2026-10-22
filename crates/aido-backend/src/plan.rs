@@ -69,13 +69,15 @@ pub enum PlanStep {
         to: String,
     },
     /// Append a sentinel-delimited block to a shared file, under a lock.
+    ///
+    /// The file keeps the owner, group and mode it has: it is the operator's,
+    /// and an edit that changed who can read it would be a second, unannounced
+    /// change. There is no mode here to get wrong.
     AppendBlock {
         /// The shared file.
         path: String,
         /// The block, including its sentinels.
         block: String,
-        /// The mode the file must end up with.
-        mode: u32,
     },
     /// Remove a sentinel-delimited block from a shared file, and nothing else.
     RemoveBlock {
@@ -219,7 +221,6 @@ impl InstallPlan {
                     steps.push(PlanStep::AppendBlock {
                         path: snippet.path,
                         block: snippet.contents,
-                        mode: DoasSnippet::mode(),
                     });
                 }
             }
@@ -611,7 +612,6 @@ mod tests {
             PlanStep::AppendBlock {
                 path: "/p".to_owned(),
                 block: "b".to_owned(),
-                mode: 0o400,
             },
             PlanStep::RemoveBlock {
                 path: "/p".to_owned(),

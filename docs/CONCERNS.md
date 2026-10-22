@@ -4,6 +4,270 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-22 — M2b step 5: executing the install plan (done; the product's own probe waits for C1)
+
+**What exists.** `aido_sys::install`: `execute(plan, ops, probe)`, the executor
+for the plan `aido-backend` already builds, behind `InstallOps` (every effect)
+and `InstallProbe` (the post-install check). `HostInstallOps` is the real
+filesystem; a `FakeInstallOps` drives every path in the executor. `aido
+install` now performs the plan, and `aido install --uninstall` removes what it
+wrote. `run_with` (what every test drives) holds a `RefusingInstaller`, so no
+test can write under `/etc`, as root or otherwise; only `run` holds the real one.
+
+**The probe, split in two, and what is and is not claimed.** The finish plan's
+exit test (item 6) wants a functional probe that proves the gate executed as
+root. Two things were built, and they are not the same thing.
+
+- **Proven, in the root lane.** `aido-gate-bin/tests/root_probe.rs` installs the
+  real snippet through the product's executor into the container's real
+  `/etc/sudoers.d`, puts the real gate at `/usr/libexec/aido/aido-gate-auth`,
+  writes a spool entry the way the broker writes one (root-owned `0600` in a
+  root-owned `0700` directory) pinned to the test's own `(pid, starttime)`, and
+  runs `runuser -u aidotest -- sudo -S aido-gate-auth` with the password typed
+  by the harness on `sudo`'s own prompt. The gate printed `0`: `/usr/bin/id -u`
+  ran as uid 0, through the rule `aido install` writes, from an account that
+  authenticated with a password. The entry was consumed. Attack twins: a
+  consumed entry is not replayed (`gate_no_pending_request`), an entry pinned to
+  a reissued pid (right pid, wrong start time) is refused and not consumed, an
+  entry from another policy generation is refused, and a wrong password never
+  reaches the gate. No `aidod` and no front-end client is involved, because the
+  gate matches the entry to *any* ancestor by `(pid, starttime)`, so a test can
+  be its own requester. Nothing in `aido` reads the password (invariant 3): the
+  harness does, as the one typing at the prompt.
+- **Not done: `aido install`'s own probe.** It would have to mint that request,
+  and the front-end has no broker client until C1 (`aido exec`). So
+  `PendingGateProbe` still answers *unavailable*, a finished install is
+  `Verification::Unverified`, `aido install` says `NOT VERIFIED` and exits 19,
+  and both container harnesses assert the output never claims otherwise. The
+  reason text now says C1, where it used to say the gate was unbuilt. Wiring the
+  real probe is one `impl InstallProbe` once C1 lands, and it should reuse what
+  `root_probe.rs` does by hand.
+- **What `aido install` can say now, on a line of its own.** `aido_sys::check_effect`
+  asks the backend, not the filesystem: `sudo -l -U <first member of aido>` and
+  whether the gate is in the listing. It prints "the rule is read" (with "this
+  is not the functional probe"), a `WARNING ... NOT in effect`, or "not checked"
+  (an empty group, which is the default because membership is the privilege grant;
+  doas, which has no such question; a lookup that failed). It never says
+  "verified" and it never changes the exit status. A member name that could be read
+  as an option (`-U`, a space, a non-ASCII byte) is never passed on. The doctor's
+  half of the regression (reporting a dotted name as not in effect) is B2's and
+  can reuse the function; it is not built here.
+
+**The dotted-filename regression.** `sudo` skips a file in `/etc/sudoers.d` whose
+name contains a dot or ends in `~`, so `aido.conf` installs cleanly and grants
+nothing. The guard was enforced in the executor from the start; what was missing
+was proof that the premise is true of the real `sudo` and not just believed.
+`root_sudo_names.rs` asks it: `sudo_ignores_a_snippet_named_with_a_dot` (and the
+`~` twin) write the snippet by hand under the bad name and assert `sudo -l -U`
+does not list the gate; `the_installed_snippet_is_in_effect_for_the_group` is the
+twin that shows the same text under the right name *is* listed, so the negative is
+not vacuous. If a future `sudo` starts reading dotted names the first test fails
+and the guard's premise is gone. At unit level
+`no_name_sudo_ignores_is_ever_installed_to` is a property test: no name with a dot
+or a trailing `~` reaches a single effect.
+
+**The root lane is blocking from here.** The three-step switch in the `root-tests`
+job was done in this commit: `continue-on-error` deleted, `root-test` added to
+the `ci` recipe, the comments rewritten. **Branch protection is outside the
+repository.** If it lists required checks, `root tests (container)` has to be
+added by hand, or a red lane still merges. The lane now installs `sudo` and
+`passwd` from the image's apt sources and creates one account, `aidotest`, with
+a fixed password worth nothing, because real `sudo` needs someone to
+authenticate. Every crate's `root_*` targets run (the selection is by name across
+the workspace, and each crate declares the feature itself): `aido-sys`,
+`aido-bin` (the owner of the binary, so `CARGO_BIN_EXE_aido` is fresh) and
+`aido-gate-bin` (likewise for the gate).
+
+**Overlap between the two Docker lanes.** `just install-root` (ubuntu, Alpine) and
+`just root-test` both install with real `sudo` as real root and check the file's
+owner and mode. They are not merged: `install-root` runs the *static* binary and
+is the only place `sudo-rs` 0.2 and 26.04 and OpenDoas are installed; the root lane
+runs the *workspace's* tests and is the only place the gate is run through the
+installed rule. The sudo rows of `install-root` could go once the root lane has
+been green for a while; they are cheap, so they stay.
+
+**What the container needed, and what stands in for it.** A container has no
+`journald`, and the gate's audit trail is the file *and* the journal, so a host
+without one refuses every decision, by design. The test binds a datagram socket
+at `/run/systemd/journal/socket` and reads back what the gate sent: the other
+end of the real protocol, with the gate unmodified. The overlay root filesystem
+is accepted by the mount trust (root's mount; nothing is weakened), and the
+sudo `use_pty` monitor adds one process to the lineage, well inside the bound of
+nine. The gate printed `0\r\n` through the pty; the test trims.
+
+**Decisions.**
+
+- **The executor refuses on its own before it runs a step.** Not root: refused
+  first, before the plan is read. A path that is not one of the five aido
+  writes (or the candidate beside one): refused, so a hand-built plan is not a
+  root write primitive and `/etc/sudoers` is unreachable. A destination `sudo`
+  silently ignores (a dot, a trailing `~`): refused — the guard the request
+  said to keep, now enforced where the rename happens, with a test that names
+  the attack. Any mode beyond `0440`: refused. A validator that does not name
+  `{candidate}` exactly once, or is not an absolute path: refused, because it
+  would check something else. All of it is checked for the whole plan before
+  the first effect.
+- **Validate before install is structural, not a convention.** `Install` is
+  refused unless this run wrote that candidate and this run validated it; the
+  inode after validation must be the inode written, checked again at the rename.
+  A candidate that is no longer the inode written is *left in place*: removing
+  it would delete a file aido did not write.
+- **"A file aido wrote" has a definition.** A regular file, root's, one name,
+  beginning with `# Managed by aido.` (`MANAGED_MARKER`; a test holds both
+  generated headers to it), opened `O_NOFOLLOW` and checked on the descriptor.
+  A symlink, a hard link, a directory, or an operator's own `aido` is refused
+  by both install (will not replace) and uninstall (will not remove). The
+  candidate name is fixed by the plan and created `O_EXCL`: a stale one blocks
+  the install loudly instead of being overwritten, and uninstall removes it only
+  if it carries the marker.
+- **A missing `/etc/sudoers.d` is "nothing to remove", not an error**, so
+  `--uninstall` works on a doas-only machine and after the backend was removed
+  first. It needs no backend detection and runs both backends' removals. The
+  directory walk reports a missing directory as absent only when the path really
+  does not exist; a symlink, a writable ancestor, or a bad mount still refuses.
+- **doas.** The shared file is edited under `flock` (bounded wait, then refuse),
+  the lock re-checked against the name once held, a merged copy written beside
+  it `O_EXCL`, `doas -C` run on that copy, then renamed over. Removal
+  takes exactly the lines between the sentinels and every other byte as it was
+  (`blocks.rs`, with property tests: removal undoes insertion exactly; insertion
+  is idempotent; no operator byte is lost). Sentinels that do not pair are
+  refused, never guessed at. Matching is whole-line and byte-exact: a CRLF
+  marker is not aido's. The result is `root:root` and the plan's `0400`; the
+  operator's original mode is not preserved on install, because the plan says
+  the file must end up `0400`.
+- **A failed probe removes what the run installed**, in reverse; a refused
+  removal is reported as what was left behind. An integration that is installed
+  and not in effect looks installed.
+- **A backend that cannot validate a named file is refused**
+  (`ValidateBySubstitution` has no honest implementation: `sudo-rs`'s validator
+  checks only `/etc/sudoers`). Both real `sudo-rs` versions tested are either
+  refused at detection (0.2) or validate a named file (26.04), so this is
+  reachable only from a hand-built plan.
+
+**What the container run found.** `just install-root` runs the real binary as
+real root in throwaway containers for `sudo`, `sudo-rs` 0.2, `sudo-rs` 26.04
+and OpenDoas. It caught two harness faults, not product ones: the 26.04 image
+ships `/etc/sudoers` `0644`, which `visudo -c` refuses, and my first
+rejecting-`visudo` wrapper exec'd itself. It also confirmed three facts the code
+relies on: `sudo-rs` 0.2 is refused at detection, before any write, for both root
+and non-root; Alpine's doas has `/etc/doas.d` (so the block path is exercised by
+removing it); and `visudo -c` accepts the whole configuration after install and
+after uninstall.
+
+**Coverage, and a trap.** Every `?` on a call that cannot fail in a test is an
+uncovered region, and `matches!(x, Pat { .. })` in measured test code is one too
+(the false arm never runs). The host code chains the steps on a just-opened
+descriptor (`and_then`) rather than writing `?` after each, so the only branches
+that exist are ones a test takes; the executor's tests live in
+`install/tests.rs`, which `cargo llvm-cov` does not measure. No threshold was
+touched and no waiver added.
+
+**Review, round two (2026-10-22).** A second review of the first commit found
+five things. Each is fixed, with a test that fails when the fix is reverted.
+
+1. **The root tests could delete a real machine's files.** `just test` passes
+   `--all-features`, which turns `root-tests` on, and the only guard was "am I
+   uid 0". `sudo just test` on a real host would have deleted `/etc/doas.conf`
+   (locking out a doas admin), the audit log `/var/lib/aido/audit.jsonl`,
+   journald's socket, the installed gate, and added a rule file to
+   `/etc/aido/rules.d`. Now every root test begins with
+   `aido_tests::root_lane::root_guard`: not uid 0 is a skip, which the lane
+   fails on as before; uid 0 *without* the lane's sentinel file is a **panic**
+   before anything is touched. The sentinel, `/aido-root-test-lane`, is made by
+   `ci/root-test.sh` inside the container only: root-owned, `0400`, one fixed
+   line, a regular file and not a link, checked as such. A *file* because no
+   privileged code reads the environment to decide what it may do, and a
+   variable is one `export` away; a file directly under `/` is something only
+   root can have made, and root on a real host did not. A *panic* and not a skip
+   because a skip is a green build on the one machine where the guard mattered.
+   Held by `crates/aido-tests/tests/lane_guard_scan.rs` (every `#[test]` in
+   every `root_*.rs` begins with the guard, nobody defines a weaker one, and the
+   script writes exactly what the guard looks for) and by the guard's own tests
+   (`refuses_as_root_without_the_lane_sentinel` and one per way a sentinel can
+   be wrong), plus, as real uid 0,
+   `a_root_test_outside_the_lane_panics_before_touching_anything`. The guard
+   lives in `aido-tests` as a library because the workspace's `unsafe` scan
+   (rightly) refuses any `#[path]` or `include!` that brings in code it cannot
+   read. Cost: `aido-tests` now has one dependency, `rustix` (`process`, for the
+   effective uid), and three crates dev-depend on it.
+2. **A doas edit changed the operator's file.** The copy was made `root:root
+   0400`, so an operator's `root:wheel 0640` came back `root:root 0400`, and
+   `doas -C` run unprivileged (the doctor's D3) could no longer read it. The
+   copy now takes the original's owner, group and permission bits, and the plan
+   step no longer carries a mode at all (`AppendBlock` lost its `mode` field:
+   there is nothing to get wrong). The original is refused, unchanged, unless it
+   is a regular file, root's, with one name, writable by nobody else, and with no
+   set-user-ID, set-group-ID or sticky bit (`UnsafeFile`). Tests:
+   `a_doas_edit_keeps_the_operators_group_and_mode`, and as real root
+   `a_doas_install_and_uninstall_keep_the_operators_owner_group_and_mode`
+   (`root:4321 0640`). **ACLs and extended attributes are not carried over.** The
+   rename makes a new inode; POSIX ACLs and every xattr (`security.selinux`,
+   `user.*`, capabilities) on the old one are gone. Dropping an ACL can only
+   remove a grant; a lost SELinux label falls back to the directory's default
+   type (`etc_t`, which is what `doas.conf` usually has). aido does not copy
+   them, because copying a label or ACL it cannot validate is trusting it. An
+   operator who keeps an ACL or a custom label on `/etc/doas.conf` re-applies it
+   after `aido install`. The command does not say so yet; a notice line is cheap
+   and is a follow-up.
+3. **A crash wedged every later install.** A run killed between creating the
+   candidate and renaming it left `/etc/doas.conf.aido-new` (or the drop-in
+   candidate), and the exclusive create then failed forever with "File exists".
+   Now, on `EEXIST`, the existing file is *shown* to be a leftover and only then
+   removed, once, and the create retried once. It is aido's only if it is a
+   regular file (opened `O_NOFOLLOW`, so a link is refused), root's, with one
+   name, writable by nobody else, and its bytes are a **prefix of exactly what
+   this run is about to write**: that covers a crash at any point in the write,
+   including the empty mode-`0000` file left by a crash right after the create,
+   and does not cover anything an operator wrote or anything longer than ours.
+   Anything else is `StaleCandidate`: the path, why it is not aido's, "nothing
+   was removed", and what to do. The directory was walked as root's, so nothing
+   that could not already do worse can swap the name between the look and the
+   unlink, which is why the removal re-checks nothing further. A concurrent
+   second install on the sudoers side (no lock there) could delete the first's
+   in-progress candidate as a "leftover"; the first then fails closed on its
+   inode check. The uninstall of the shared file got the same rule, and
+   `remove_managed` clears a candidate that holds nothing, or only the start of
+   the marker (never an empty file at a destination's name: that is an
+   operator's). Tests: `a_crash_left_copy_of_ours_is_replaced_and_install_succeeds`
+   (empty, partial, whole), `a_stale_copy_aido_did_not_write_is_refused_and_kept`,
+   the symlink, two-link, group-writable and directory twins,
+   `uninstall_recovers_from_its_own_crash_left_copy`,
+   `a_stale_drop_in_candidate_of_ours_is_replaced`,
+   `a_removal_clears_a_candidate_a_crash_left_part_written`, and in the root lane
+   the install and uninstall cases against the real `/etc`.
+4. **`just ci` was not what CI runs.** The `install-root` job existed and the
+   recipe lacked it. Added, and `crates/aido-tests/tests/ci_lanes.rs` now fails
+   the build when a `just` recipe a workflow job runs is neither in `ci`
+   (directly or through `verify`) nor excused in its short list (the two fuzz
+   recipes, which need nightly). The `install-root` comment said the probe
+   "needs the gate"; it needs C1.
+5. **The rebase.** Main moved to the doctor commit; the CLI conflicted. Kept
+   main's `Platform`/`Invocation`; `run_with_installer` now takes the
+   `Platform` and an installer.
+
+**Open.**
+
+- The product's own probe (C1, above), and the doctor's reporting of a name sudo ignores (B2).
+- `fsync` of the directory after the rename is best effort: its failure cannot
+  un-install anything, and the file's data is synced before the rename.
+- `remove_managed` checks, then unlinks by name. The directory was walked as
+  root's and nobody else can write it, so the window is closed to everyone who
+  could not already do worse; an `unlinkat` on the checked descriptor does not
+  exist.
+- A crash between creating a candidate and renaming it leaves the candidate
+  behind; how that is now handled is under "Review, round two" above. What stays
+  open: an install that crashed and an *uninstall* run next finds a copy that
+  holds the install's text, which is not a prefix of the uninstall's, and
+  refuses with `StaleCandidate`, naming the file; remove it by hand, or run the
+  install again first.
+- The group is created with `groupadd --system` or `addgroup -S` and never
+  removed, never populated; a `purge` that removes it is the package's job.
+- `aido install` exits 19 on every successful-but-unverified install. The
+  `postinst` that calls it must treat that as the documented state until the
+  probe lands (C1).
+
+---
+
 ## 2026-10-21 — Agent pipelines moved to boof
 
 All agent pipelines for this repository now run through boof-runner: planner

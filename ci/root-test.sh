@@ -43,6 +43,8 @@
 #   suites that enable every feature (`just test`, `just linux-test`) can still
 #   build and run them as an ordinary user. Here that is a failure: the output is
 #   read, and any SKIPPED fails the run.
+# * A root test that is root but finds no sentinel (see below) panics, in every
+#   suite, rather than skipping: it would otherwise run on the host.
 # * A lane that runs no tests is not a lane. The passing tests are counted from
 #   cargo's own summaries, and none is a failure.
 #
@@ -88,6 +90,19 @@ set -euo pipefail
 mkdir -p /work
 (cd /src && tar --exclude=./target --exclude=./fuzz/target -cf - .) | tar -xmf - --no-same-owner -C /work
 
+# What the install tests need of the machine, which the image does not have:
+# the real `sudo` (the install writes for it, and the tests ask it what a user
+# may run), and one unprivileged account. `aidotest` exists only so that real
+# sudo has someone to authenticate: it has a fixed password that is worth
+# nothing, in a container that is thrown away with the run, and it is not in the
+# `aido` group until a test puts it there. Packages come from the image's own
+# apt sources; the cargo caches are volumes, these are not.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends sudo passwd >/dev/null
+useradd --create-home --shell /bin/bash aidotest
+echo 'aidotest:aidotest-fixed-password' | chpasswd
+
 # The image's own toolchain, which is the pinned one, asked from outside the
 # checkout: asked from inside it, rustup reads rust-toolchain.toml and downloads
 # the cross targets and tools the file lists, which no test here needs, on every
@@ -108,6 +123,19 @@ if [[ $(run id -u) != 0 ]]; then
     echo "FAIL: the root tests would run as uid $(run id -u), not root" >&2
     exit 1
 fi
+# The lane's sentinel: what every root test looks for before it will run as
+# root (crates/aido-tests/src/root_lane.rs). Root tests write the real /etc, replace the
+# installed gate and delete the audit log, so uid 0 alone is not permission to run
+# them: `sudo just test` on a real machine is uid 0 as well. A file, made here
+# and nowhere else, because nothing privileged reads the environment to decide
+# what it may do and a variable is one `export` away. It sits in the container's
+# own `/`, which the copy of the checkout and the tests never write, root-owned
+# and read-only. Its content must match SENTINEL_CONTENT in the guard, which
+# crates/aido-tests/tests/lane_guard_scan.rs holds it to.
+printf '%s\n' 'aido root-test lane: a throwaway container made by ci/root-test.sh' \
+    >/aido-root-test-lane
+chown 0:0 /aido-root-test-lane
+chmod 0400 /aido-root-test-lane
 echo "root-test: $(uname -sr) $(uname -m), as uid $(run id -u), on the container's own filesystem"
 cd /work
 

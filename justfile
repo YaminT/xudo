@@ -250,7 +250,7 @@ linux-test *args:
 # throwaway container, on a copy of the checkout, and nothing else. The rest of
 # the suite assumes an unprivileged user and is not run as root. Shares
 # `linux-test`'s lock and cache volumes. Needs Docker. Arguments go to
-# `cargo test`. In CI it does not yet block: see the `root-tests` job.
+# `cargo test`. Blocking in CI (the `root-tests` job) and part of `ci`.
 root-test *args:
     ci/root-test.sh {{args}}
 
@@ -283,6 +283,23 @@ differential:
     cargo build -p aido-bin --release --target {{musl_triple}}
     ci/differential/run.sh target/{{musl_triple}}/release/aido
 
+# --- install, for real, as root ----------------------------------------------
+
+# `aido install` and `aido install --uninstall` run as real root inside
+# containers this starts and discards, against real sudo, sudo-rs, and OpenDoas:
+# the file lands 0440/0400 root:root, validated by the backend's own parser;
+# an operator's file is never replaced or removed; a rejected candidate leaves
+# the old state alone; uninstall removes exactly what install wrote. Not in
+# `linux-test`, which is non-root on purpose. Needs Docker. It does not prove
+# the rule is in effect through `aido install` itself: that is the functional
+# probe, which needs a request only the front-end's broker client can mint
+# (plan item C1, `aido exec`), so a finished install reports NOT VERIFIED. The
+# uid-0 proof that the installed rule reaches the gate is in the root lane
+# (`aido-gate-bin/tests/root_probe.rs`).
+install-root:
+    cargo build -p aido-bin --release --target {{musl_triple}}
+    ci/install/run.sh target/{{musl_triple}}/release/aido
+
 # --- developer setup --------------------------------------------------------
 
 # Point git at the tracked hooks directory, so the gate runs before every
@@ -299,9 +316,13 @@ setup: install-hooks
 
 # --- convenience ------------------------------------------------------------
 
-# What CI runs on a pull request, including the slow lanes. `root-test` joins it
-# when its CI job stops being non-blocking (see the `root-tests` job).
-ci: verify check-linux miri units differential
+# What CI runs on a pull request, including the slow lanes. `root-test` and
+# `install-root` joined it when the install executor landed and the root lane
+# stopped being non-blocking (docs/CONCERNS.md, 2026-10-22). Every `just <lane>`
+# a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
+# fuzz recipes, which need nightly; `crates/aido-tests/tests/ci_lanes.rs` fails
+# the build when one is missing.
+ci: verify check-linux miri units differential root-test install-root
 
 clean:
     cargo clean

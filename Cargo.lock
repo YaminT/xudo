@@ -54,6 +54,7 @@ name = "aido-bin"
 version = "0.0.1"
 dependencies = [
  "aido",
+ "aido-tests",
  "assert_cmd",
  "clap",
  "predicates",
@@ -87,7 +88,10 @@ dependencies = [
 name = "aido-gate-bin"
 version = "0.0.1"
 dependencies = [
+ "aido-backend",
  "aido-gate",
+ "aido-sys",
+ "aido-tests",
  "assert_cmd",
  "predicates",
 ]
@@ -117,6 +121,7 @@ dependencies = [
  "aido-gate",
  "aido-policy",
  "aido-sys-raw",
+ "aido-tests",
  "bstr",
  "proptest",
  "rustix",
@@ -136,6 +141,9 @@ dependencies = [
 [[package]]
 name = "aido-tests"
 version = "0.0.1"
+dependencies = [
+ "rustix",
+]
 
 [[package]]
 name = "aido-wire"
