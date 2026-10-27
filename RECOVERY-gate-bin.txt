@@ -1,0 +1,40 @@
+M2b step 4 aido-gate-bin. Worktree wf_2a8abc38-d83-3, branched from main aebfd15.
+NOTE: shell tool refuses python heredocs containing "../" paths; use Edit. git needs /usr/bin/git (rtk wrapper refused).
+
+DONE so far (uncommitted):
+- aido-sys: clock.rs, hygiene.rs, procfs.rs (VerifiedProc), spool.rs (DirSpool), program.rs, provenance::lineage, error::lift, source::check_relative, trust::open_trusted_with pub(crate), Cargo (rustix features, sha2)
+- aido-gate: request (Ambiguous, ForgedNonce), decide (password_confirms, exec_argv, Stage, Refusal::Failed, exec_failure_record, GateCaller::unidentified), run.rs (GateHost, SystemHost, run)
+TODO: aido-gate-bin package (main.rs + tests/), Cargo members, justfile exclusion, docs (todo/README step 4 DONE, CONCERNS dated entry, CLAUDE.md crate table), clippy, coverage (just verify), check-linux, linux-test, rebase, squash, final gates.
+Decisions to record: exec in place; NNP early; consume before program open; entries skipped when unparseable; clock seam named aido_sys::Clock/HostClock/FakeClock (unify with broker at merge); settings default (freeze not read); uid unknown; password_confirms on -auth name via argv[0] (open item: /proc/self/exe); program opened via open_trusted (O_RDONLY after O_PATH probes), not O_PATH, because hashing needs reads.
+
+=== 2026-10-21 developer resume (B3 reconcile + finish) ===
+Worktree HEAD 8e6152a (gate built, awaiting review). origin/main = 1851c9a (broker B1 merged; audit deferred to D1, stderr record kept).
+PLAN: (1) branch gate-b3-pre-rebase-8e6152a as a safety ref; (2) git rebase origin/main, resolve add/add on aido-sys clock.rs + spool.rs
+ (take broker's, delete gate duplicates), lib.rs exports, Cargo features union, source.rs, docs; (3) contracts:
+ a) gate consume of an already-gone entry = refusal: add Spool::consume + SpoolError::Gone to the broker's spool seam (remove() keeps ENOENT=Ok, broker-only);
+ b) ONE clock: broker's aido_sys::{Clock,HostClock,FixedClock} (infallible u64); delete gate FakeClock/Stage::Clock;
+ c) Authorized<_>: gate already takes it; broker deferred audit to D1 -> keep gate pre-exec record, note D1.
+ (4) verify each step-4 definition item has an attack test (mutate to prove); (5) docs: README step 4 DONE, CLAUDE.md rows (flip in-review marker), justfile exclusion, CONCERNS dated entry;
+ (6) gates: just verify, just check-linux, just linux-test; ONE squashed commit, trailer per harness attribution.
+Rules: no git stash/reset --hard/clean; never write outside this worktree; use /usr/bin/git; rtk proxy for raw grep.
+[2026-10-21] REBASED onto origin/main 1851c9a (commit cf0bd18 = old gate commit rebased; conflicts resolved: CLAUDE.md/justfile/howiwork/todo README/CONCERNS/lib.rs/Cargo.toml).
+ Contracts done in code: Spool::consume + SpoolError::Gone + nlink check added to broker's aido-sys spool.rs (FakeSpool::consume/failing_consume); gate's DirSpool/clock.rs deleted (taken broker's);
+ run.rs: RequestSpool narrow trait + SpoolEntries adapter, read_clock refuses 0 (Stage::Clock kept), MAX_SPOOL_NAMES bound in find_entry; tests ported (115 gate lib tests green); design-plan crate table/count fixed; inventory test green.
+ TODO: fmt/clippy/coverage, verify step-4 items w/ mutation checks, CONCERNS rewrite (2026-10-21 entry, decisions+contracts+D1 note), README step 4 text, check-linux, linux-test, amend into ONE commit (trailer: Sonnet 5.5 per harness attribution), final gates.
+[2026-10-21 later] Squashed to ONE commit and rebased onto origin/main 20f4fc1 (howiwork.md conflict only). Gates seen pre-squash: macOS coverage 100/100/100; check-linux + clippy both triples clean;
+ linux-test green (6.12.76 aarch64 uid 1000; fixed one ETXTBSY flake in syscall.rs exec test); Linux coverage 100% on touched files except probe.rs/syscall.rs (known env-bound); 29 mutations all killed (27 mac + 2 Docker).
+ NOW: amend through the hook (just verify) with target/scratch/commit-msg.txt (trailer Sonnet 5.5 per harness attribution); then just check-linux + just linux-test on the final sha; then StructuredOutput.
+[2026-10-21 final] COMMIT 2d74d30248bc3df7d028701ddc4251660f8b41c7 (one commit on origin/main 20f4fc1). Gates on that sha: just verify (pre-commit hook) green; just check-linux clean; just linux-test green (1405 tests, 6.12.76 aarch64 uid 1000);
+ Linux coverage by hand: 100% on touched files except probe.rs (needs sudo/doas) and syscall.rs 802-803 (kernel>=6.16 closure), both pre-existing/env-bound. Not pushed. Output returned via StructuredOutput.
+
+=== 2026-10-21 developer pass 2: four observer findings on 2d74d30 ===
+Findings: (1) major: filled std stream left CLOEXEC (hygiene.rs HostStd::install; dup2(x,x) no-op); (2) minor: names() read whole spool before the MAX_SPOOL_NAMES check;
+ (3) minor: validate's caller pin taken from the entry itself (tautology); (4) minor: docs (Cargo description "Pure", GateExit "never the child's range", status.rs, CONCERNS decision 1).
+PLAN: reproduce each (scratch crate target/scratch/closed-probe for 1), fix with a test named for the attack, mutate each fix, amend into the ONE commit through the hook, then just check-linux + just linux-test on the final sha.
+Rules unchanged: no stash/reset --hard/clean; use /usr/bin/git; rtk proxy for raw output; trailer = Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com> (the harness attribution reminder; the task text says Fable 5.1 but the reminder replaces earlier attribution guidance - keep the existing commit's trailer).
+[pass 2] F1 REPRODUCED (scratch crate target/scratch/closed-probe: macOS + Linux 6.12.76 aarch64, N=0,1,2: FD_CLOEXEC=true, child sees stream CLOSED) and FIXED:
+  hygiene.rs HostStd/StdStream::install clears FD_CLOEXEC by name after dup2; new test crates/aido-sys/tests/std_streams.rs (one test, own process; sets CLOEXEC on the real stream, installs from itself/from a copy, asserts flag + sh child has 0,1,2).
+  Mutations H1-H4 (target/scratch/mut_hyg.sh) all KILLED. binary.rs comment fixed. TODO docs: CONCERNS 'Found while building it' + mutation-list sentence.
+  NEXT: F2 (Spool::names_up_to bounded listing; gate adapter asks MAX_SPOOL_NAMES+1; find_entry message without count), F3 (pin from matched ancestor), F4 docs.
+[pass 2] F2 DONE in code: Spool::names_up_to(limit) (SpoolDir via first_names(), lazily pulls; FakeSpool records SpoolCall::NamesUpTo), gate adapter SpoolEntries::names -> names_up_to(LISTED_NAMES = MAX_SPOOL_NAMES+1); find_entry reason no longer states a count.
+  Tests: a_listing_with_a_limit_reads_no_further_than_the_limit, ..._pulls_no_more_entries_than_the_limit_takes (counting iterator), the_fake_lists_up_to_a_limit..., the_gates_view_of_the_spool_lists_one_name_past_the_bound_and_reads_no_further. Mutations L1-L10 (target/scratch/mut_list*.sh) all KILLED. TODO docs: CONCERNS reconciliation 4 / open item 7 text.
