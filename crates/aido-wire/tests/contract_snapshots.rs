@@ -35,6 +35,7 @@ fn lists_every_refusal_code(code: RefusalCode) -> &'static str {
         RefusalCode::PolicyUnloadable => "policy_unloadable",
         RefusalCode::NonceCollision => "nonce_collision",
         RefusalCode::BrokerUnusable => "broker_unusable",
+        RefusalCode::AuditUnavailable => "broker_audit_unavailable",
     }
 }
 
@@ -56,6 +57,7 @@ fn renaming_a_refusal_code_breaks_the_wire_contract_and_this_test() {
         "policy_unloadable",
         "nonce_collision",
         "broker_unusable",
+        "broker_audit_unavailable",
     ];
     assert_eq!(RefusalCode::ALL.len(), pinned.len());
     for (code, name) in RefusalCode::ALL.iter().zip(pinned) {

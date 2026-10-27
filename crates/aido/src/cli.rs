@@ -425,8 +425,9 @@ fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> Exit
             let _ = writeln!(
                 out,
                 "note   an unbroken chain proves nothing was edited in place. It cannot \
-                 prove the log was never truncated and rebuilt, because the hashes are \
-                 all in the log."
+                 prove the log was never truncated and rebuilt, or that records were not \
+                 dropped whole from its end, because the hashes are all in the log. \
+                 The journal copy of each record is the witness for that."
             );
             ExitCode::Delegated
         }
@@ -1104,6 +1105,7 @@ mod tests {
         assert!(out.contains("chain intact"), "{out}");
         // The limit is printed with the good news, not buried in a man page.
         assert!(out.contains("truncated and rebuilt"), "{out}");
+        assert!(out.contains("dropped whole from its end"), "{out}");
         assert_eq!(err, "");
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "aido-tests"
-description = "Tests that belong to the workspace as a whole: the crate inventories name exactly the workspace members. Reserved for the executing half of the differential compliance matrix across sudo, sudo-rs, and OpenDoas."
+description = "Tests that belong to the workspace as a whole: the crate inventories name exactly the workspace members. The root lane's end-to-end tests of the audit trail. Reserved for the executing half of the differential compliance matrix across sudo, sudo-rs, and OpenDoas."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,27 @@ publish = false
 # The end-to-end tests of the `aido` binary are not here. They live in
 # `aido-bin/tests`, because only the package that owns a binary gets
 # `CARGO_BIN_EXE_<name>` and a guaranteed-fresh build of it.
+
+# The root lane's end-to-end tests of the audit trail (`tests/root_audit_trail.rs`)
+# drive the libraries the shipped binaries are made of, so they depend on them.
+# `tests/crate_inventory.rs` itself still uses the standard library alone.
+[dev-dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
+aido-gate = { path = "../aido-gate", version = "0.0.1" }
+aido-policy = { path = "../aido-policy", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1", features = ["fake"] }
+aido-wire = { path = "../aido-wire", version = "0.0.1" }
+aidod = { path = "../aidod", version = "0.0.1" }
+
+# The tests that must run as uid 0, run by `ci/root-test.sh` (`just root-test`).
+# Without the feature the target does not exist, so a run that forgot it fails
+# rather than running an empty binary.
+[features]
+root-tests = []
+
+[[test]]
+name = "root_audit_trail"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

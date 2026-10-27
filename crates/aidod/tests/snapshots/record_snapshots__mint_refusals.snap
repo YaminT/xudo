@@ -4,6 +4,8 @@ expression: text
 ---
 broker_unusable (Broker)
     a permitted decision names no action, so the gate would have nothing to look up
+broker_unusable (Broker)
+    the entry is for a different command or action than the one the audit trail authorized
 spool_unusable (Broker)
     a-name already exists in the spool
 spool_full (Client)

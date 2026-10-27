@@ -478,6 +478,40 @@ expression: text
   "seq": 1
 }
 
+## broker_audit_unavailable with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "broker_audit_unavailable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "2a89b4875174b7cdfdbbe4a74a78d1b274141a1cbe25b3c50d5ed3ec8c64c3ec",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
 ## before anything was known
 {
   "action": null,

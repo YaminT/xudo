@@ -1,6 +1,6 @@
 [package]
 name = "aidod-bin"
-description = "The `aidod` executable: hands descriptor 0 and standard error to the aidod library and exits with its status. Installed as /usr/libexec/aido/aidod."
+description = "The `aidod` executable: hands descriptor 0 and the system audit trail to the aidod library and exits with its status. Installed as /usr/libexec/aido/aidod."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,11 +17,23 @@ name = "aidod"
 path = "src/main.rs"
 
 [dependencies]
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
 aidod = { path = "../aidod", version = "0.0.1" }
 
 [dev-dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
 aido-wire = { path = "../aido-wire", version = "0.0.1" }
 serde_json.workspace = true
+
+# `tests/root_trail.rs` runs the binary as uid 0 against the real audit trail,
+# in the root lane (`just root-test`). Without the feature the target does not
+# exist, so a run that forgot it fails rather than running an empty binary.
+[features]
+root-tests = []
+
+[[test]]
+name = "root_trail"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

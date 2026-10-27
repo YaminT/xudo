@@ -1,0 +1,107 @@
+---
+source: crates/aidod/tests/record_snapshots.rs
+expression: text
+---
+## authorized, seq 1
+{
+  "action": "aido.svc.restart",
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "allowed",
+  "denial": null,
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=aidod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=0c462193521ac56bc31d18803e7064fe6bafe0fb934f3b5d82030a2f39398450",
+    "nonce=abababababababababababababababababababababababababababababababab",
+    "deadline=1900"
+  ],
+  "hash": "89956a0a3ee2562e2e6606bc576bd71723b87b79cead8bd63ff21159c2dd93fc",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": "20-services.toml:3",
+  "schema_version": 1,
+  "seq": 1
+}
+
+## withdrawn, seq 2
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "spool_full",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "withdraws_seq=1"
+  ],
+  "hash": "d78c61fa145270de2ba8fc281aa293c0a024b21f306cfeea274255cf412e8bfa",
+  "outcome": "not_executed",
+  "prev_hash": "89956a0a3ee2562e2e6606bc576bd71723b87b79cead8bd63ff21159c2dd93fc",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 2
+}
+
+## refused, seq 3
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "broker_audit_unavailable",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=aidod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "80058ad2e5a37bd0db7bb9e7b0dbc010504e00e08c102d552b78a8edfcde1e6d",
+  "outcome": "not_executed",
+  "prev_hash": "d78c61fa145270de2ba8fc281aa293c0a024b21f306cfeea274255cf412e8bfa",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 3
+}

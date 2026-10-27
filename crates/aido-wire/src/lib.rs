@@ -338,11 +338,17 @@ pub enum RefusalCode {
     NonceCollision,
     /// The broker could not complete the request for a reason of its own.
     BrokerUnusable,
+    /// The audit record could not be written, so nothing was minted.
+    ///
+    /// Named for the broker on the wire like `broker_unusable`, which an
+    /// operator tells it apart from: this one is a trail they can fix.
+    #[serde(rename = "broker_audit_unavailable")]
+    AuditUnavailable,
 }
 
 impl RefusalCode {
     /// Every code, in numeric order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::RequestTooLarge,
         Self::RequestTimedOut,
         Self::RequestUnreadable,
@@ -357,6 +363,7 @@ impl RefusalCode {
         Self::PolicyUnloadable,
         Self::NonceCollision,
         Self::BrokerUnusable,
+        Self::AuditUnavailable,
     ];
 
     /// The stable numeric code. Append-only.
@@ -376,6 +383,7 @@ impl RefusalCode {
             Self::PolicyUnloadable => 12,
             Self::NonceCollision => 13,
             Self::BrokerUnusable => 14,
+            Self::AuditUnavailable => 15,
         }
     }
 
@@ -396,6 +404,7 @@ impl RefusalCode {
             Self::PolicyUnloadable => "policy_unloadable",
             Self::NonceCollision => "nonce_collision",
             Self::BrokerUnusable => "broker_unusable",
+            Self::AuditUnavailable => "broker_audit_unavailable",
         }
     }
 
@@ -457,6 +466,11 @@ impl RefusalCode {
             Self::BrokerUnusable => {
                 "the broker could not complete the request and failed closed; an administrator \
                  should read the broker's audit record in the journal"
+            }
+            Self::AuditUnavailable => {
+                "the broker could not write the audit record, so it minted nothing and failed \
+                 closed; an administrator must check that /var/lib/aido is a root-owned 0700 \
+                 directory with room to write and that journald is running"
             }
         }
     }

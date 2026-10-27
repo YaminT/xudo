@@ -1,6 +1,7 @@
 # One broker per connection, as root without capabilities, in the tightest
 # sandbox that still lets it do its one job: identify the peer, read root's
-# ruleset, and write one entry under /run/aido/req.
+# ruleset, append one record to the audit trail (/var/lib/aido/audit.jsonl and
+# its copy in the journal), and write one entry under /run/aido/req.
 #
 # crates/aidod/tests/units.rs asserts every security-relevant line here, and
 # refuses any key it does not know: systemd ignores a misspelled directive with
@@ -19,7 +20,9 @@ ExecStart=/usr/libexec/aido/aidod
 # too; the broker writes nothing there, and nothing stray may reach the client.
 StandardInput=socket
 StandardOutput=journal
-# One audit record per connection, as a JSON line, into the journal.
+# Diagnostics only. The audit record goes through the trail
+# (aido_sys::AuditTrail), never to standard error: nothing is minted on the
+# strength of a line written here.
 StandardError=journal
 # Every read and write times out after five seconds; this ends whatever those
 # do not.
@@ -32,11 +35,13 @@ AmbientCapabilities=
 NoNewPrivileges=yes
 UMask=0077
 
-# The whole filesystem read-only except the spool.
+# The whole filesystem read-only except the spool and the audit trail.
 ProtectSystem=strict
-# "-": if tmpfiles has not created it, the broker still starts and answers
-# spool_unusable, rather than failing before it can say why.
-ReadWritePaths=-/run/aido/req
+# "-": if tmpfiles has not created one, the broker still starts and answers
+# spool_unusable or broker_audit_unavailable, rather than failing at namespace
+# setup (226/NAMESPACE) before it can say why. The journal's socket needs no
+# entry: connecting to a socket is not a write to the filesystem.
+ReadWritePaths=-/run/aido/req -/var/lib/aido
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

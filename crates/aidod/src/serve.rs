@@ -7,7 +7,8 @@
 //! load root's policy     the trusted ruleset and settings, or refuse
 //! classify               Unattested, always, in M2b
 //! decide                 the function behind `aido explain`
-//! mint                   permitted decisions only; recorded before it exists
+//! authorize              permitted decisions only; the record is on the trail
+//! mint                   only with the receipt for that record
 //! answer                 one response, then close
 //! ```
 //!
@@ -16,17 +17,28 @@
 //! was not established: the peer is known before its request is read, and the
 //! request is known before anything is said about the spool or the policy.
 //! Nothing after a failure runs.
-
-use std::io::Write;
+//!
+//! # The trail
+//!
+//! The record of a permitted decision is written with `aido_sys::authorize`,
+//! and [`publish`] takes the [`aido_sys::Authorized`] it returns: a spool entry
+//! the trail does not show cannot be minted, because the type to mint it does
+//! not exist. When the record cannot be written the client is told
+//! [`RefusalCode::AuditUnavailable`] and nothing is minted. A *refusal* is
+//! different: it stands whether or not its record lands, so a record that
+//! cannot be written changes nothing about a denial, only what an investigator
+//! will find.
 
 use aido_policy::{CallerFacts, Decision};
-use aido_sys::{Clock, Connection, Entropy, PeerCalls, Spool, SpoolError, Syscalls};
+use aido_sys::{
+    AuditSink, Clock, Connection, Entropy, PeerCalls, Spool, SpoolError, Syscalls, authorize,
+};
 use aido_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{Minting, REQUEST_TTL_SECS, draw_nonce, entry_for, publish};
+use crate::mint::{Minting, MintApproval, REQUEST_TTL_SECS, draw_nonce, entry_for, publish};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
-use crate::record::{decided, emit, refused};
+use crate::record::{decided, refused, withdrawn};
 use crate::refusal::Refusal;
 
 /// The exit status of a broker that could not do its job: `aido`'s own
@@ -34,6 +46,9 @@ use crate::refusal::Refusal;
 pub const UNUSABLE: u8 = 19;
 
 /// Everything the broker asks of its host, as seams.
+///
+/// The audit trail is not one of them: it is mutable, and it is passed to
+/// [`serve`] beside this, so the platform stays shared.
 pub struct Platform<'a> {
     /// The calls that need `unsafe` and that the ladder makes itself:
     /// `SO_PEERPIDFD` and `PIDFD_GET_INFO`.
@@ -49,14 +64,6 @@ pub struct Platform<'a> {
     pub entropy: &'a dyn Entropy,
     /// Root's ruleset and settings.
     pub policy: &'a dyn PolicySource,
-    /// Whether the audit trail is attested: `Ok` when standard error is a
-    /// connection to the journal, or the reason it is not.
-    ///
-    /// systemd points standard error at `/dev/null` when it cannot reach the
-    /// journal, and the runtime does the same for a closed descriptor, so a
-    /// write to either succeeds and goes nowhere. Nothing is minted unless
-    /// this is `Ok`; a refusal needs no trail and is answered either way.
-    pub trail: Result<(), String>,
 }
 
 /// How a connection ended.
@@ -98,30 +105,32 @@ struct Evaluated {
     policy: LoadedPolicy,
 }
 
-/// Serves one connection: identifies, reads, decides, mints, answers.
+/// Serves one connection: identifies, reads, decides, records, mints,
+/// answers.
 ///
 /// `spool` is the result of opening the spool, opened before the connection
-/// is served and refused only once the request is known.
+/// is served and refused only once the request is known. `trail` is where
+/// every record goes.
 pub fn serve<S: Spool>(
     conn: &dyn Connection,
     platform: &Platform<'_>,
     spool: Result<&S, &SpoolError>,
-    log: &mut dyn Write,
+    trail: &mut dyn AuditSink,
 ) -> Served {
     let identity = match identify(conn.socket(), platform.syscalls, platform.peers) {
         Ok(identity) => identity,
-        Err(error) => return refuse(conn, log, &Refusal::from(&error), None, None),
+        Err(error) => return refuse(conn, trail, &Refusal::from(&error), None, None),
     };
     let request = match receive(conn) {
         Ok(request) => request,
-        Err(refusal) => return refuse(conn, log, &refusal, Some(&identity), None),
+        Err(refusal) => return refuse(conn, trail, &refusal, Some(&identity), None),
     };
     let spool = match spool {
         Ok(spool) => spool,
         Err(error) => {
             return refuse(
                 conn,
-                log,
+                trail,
                 &Refusal::from(error),
                 Some(&identity),
                 Some(&request),
@@ -133,7 +142,7 @@ pub fn serve<S: Spool>(
         Err(error) => {
             return refuse(
                 conn,
-                log,
+                trail,
                 &Refusal::from(&error),
                 Some(&identity),
                 Some(&request),
@@ -144,19 +153,19 @@ pub fn serve<S: Spool>(
     let caller = classify(&identity);
     let decision = decide(&policy, &caller, &request);
     if !decision.verdict.is_permitted() {
-        // Nothing is enabled by this record, so a sink that cannot take it
+        // Nothing is enabled by this record, so a trail that cannot take it
         // does not change the answer.
-        let _ = emit(
-            &decided(
+        let _ = trail.append(&|previous| {
+            decided(
+                previous,
                 &decision,
                 &caller,
                 &identity,
                 &request,
                 &policy.rules.generation,
                 None,
-            ),
-            log,
-        );
+            )
+        });
         return answer(
             conn,
             &BrokerResponse::decided(decision, None),
@@ -167,7 +176,7 @@ pub fn serve<S: Spool>(
         conn,
         platform,
         spool,
-        log,
+        trail,
         Evaluated {
             decision,
             caller,
@@ -186,12 +195,13 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
     BrokerRequest::parse(&bytes).map_err(|error| Refusal::from(&error))
 }
 
-/// Mints the entry for a permitted decision and answers with it.
+/// Records the authorization of a permitted decision, mints the entry for it,
+/// and answers with it.
 fn mint<S: Spool>(
     conn: &dyn Connection,
     platform: &Platform<'_>,
     spool: &S,
-    log: &mut dyn Write,
+    trail: &mut dyn AuditSink,
     evaluated: Evaluated,
 ) -> Served {
     let Evaluated {
@@ -203,16 +213,6 @@ fn mint<S: Spool>(
     } = evaluated;
     let known = (Some(&identity), Some(&request));
 
-    if let Err(why) = &platform.trail {
-        let refusal = Refusal::broker(
-            RefusalCode::BrokerUnusable,
-            format!(
-                "standard error is not a connection to the journal ({why}), so nothing was minted"
-            ),
-        );
-        return refuse(conn, log, &refusal, known.0, known.1);
-    }
-
     let nonce = match draw_nonce(platform.entropy) {
         Ok(nonce) => nonce,
         Err(error) => {
@@ -220,7 +220,7 @@ fn mint<S: Spool>(
                 RefusalCode::BrokerUnusable,
                 format!("cannot draw a nonce: {error}"),
             );
-            return refuse(conn, log, &refusal, known.0, known.1);
+            return refuse(conn, trail, &refusal, known.0, known.1);
         }
     };
     let now = platform.clock.monotonic_secs();
@@ -234,35 +234,47 @@ fn mint<S: Spool>(
         nonce,
     ) {
         Ok(entry) => entry,
-        Err(error) => return refuse(conn, log, &Refusal::from(&error), known.0, known.1),
+        Err(error) => return refuse(conn, trail, &Refusal::from(&error), known.0, known.1),
     };
 
-    // Recorded before the entry exists: nothing is minted that the trail does
-    // not show.
-    let record = decided(
-        &decision,
-        &caller,
-        &identity,
-        &request,
-        &policy.rules.generation,
-        Some(&entry),
-    );
-    if emit(&record, log).is_err() {
-        let refusal = Refusal::broker(
-            RefusalCode::BrokerUnusable,
-            "the audit record could not be written, so nothing was minted",
-        );
-        return refuse(conn, log, &refusal, known.0, known.1);
-    }
+    // Recorded before the entry exists, and the receipt is what `publish`
+    // takes: nothing is minted that the trail does not show.
+    let build = |previous: Option<&aido_audit::record::Record>, _: &MintApproval| {
+        decided(
+            previous,
+            &decision,
+            &caller,
+            &identity,
+            &request,
+            &policy.rules.generation,
+            Some(&entry),
+        )
+    };
+    let authorized = match authorize(trail, MintApproval::of(&entry), &build) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            let refusal = Refusal::broker(
+                RefusalCode::AuditUnavailable,
+                format!("the audit record could not be written, so nothing was minted: {error}"),
+            );
+            return refuse(conn, trail, &refusal, known.0, known.1);
+        }
+    };
     let json = entry.to_json();
     let minting = Minting {
+        authorized: &authorized,
         entry: &entry,
         json: &json,
         uid: identity.uid,
         now,
     };
     if let Err(error) = publish(spool, platform.peers, &minting) {
-        return refuse(conn, log, &Refusal::from(&error), known.0, known.1);
+        // The authorization is on the trail and the file is append-only, so
+        // the refusal is a second record that names it.
+        let refusal = Refusal::from(&error);
+        let first = authorized.receipt().seq().get();
+        let _ = trail.append(&|previous| withdrawn(previous, first, &refusal, known.0, known.1));
+        return reply(conn, &refusal);
     }
 
     let minted = Minted {
@@ -281,12 +293,18 @@ fn mint<S: Spool>(
 /// Records a refusal and sends it.
 fn refuse(
     conn: &dyn Connection,
-    log: &mut dyn Write,
+    trail: &mut dyn AuditSink,
     refusal: &Refusal,
     identity: Option<&PeerIdentity>,
     request: Option<&BrokerRequest>,
 ) -> Served {
-    let _ = emit(&refused(refusal, identity, request), log);
+    // A refusal stands whether or not its record lands.
+    let _ = trail.append(&|previous| refused(previous, refusal, identity, request));
+    reply(conn, refusal)
+}
+
+/// Sends a refusal that is already on the trail, or that needs no record.
+fn reply(conn: &dyn Connection, refusal: &Refusal) -> Served {
     answer(
         conn,
         &BrokerResponse::refused(refusal.code),
@@ -323,7 +341,7 @@ mod tests {
     use aido_gate::request::{MonotonicSecs, PendingRequest};
     use aido_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
     use aido_sys::{
-        Creds, FakeConnection, FakeEntropy, FakePeer, FakeSpool, FakeSyscalls, FixedClock,
+        Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakePeer, FakeSpool, FakeSyscalls, FixedClock,
         PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, SpoolCall, SysError,
     };
     use aido_wire::{Answer, WIRE_SCHEMA_VERSION};
@@ -392,19 +410,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
-    /// A log that refuses every write: a journal that has gone away.
-    struct Refusing;
-
-    impl Write for Refusing {
-        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("the journal is gone"))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// Everything the broker asks of its host, faked: by default a peer that
     /// identifies honestly on the top rung, a fixed clock, one scripted
     /// nonce, and the test ruleset.
@@ -414,7 +419,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         clock: FixedClock,
         entropy: FakeEntropy,
         policy: FixedPolicy,
-        trail: Result<(), String>,
     }
 
     impl Host {
@@ -453,7 +457,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     answer: Ok(policy()),
                     loads: Cell::new(0),
                 },
-                trail: Ok(()),
             }
         }
 
@@ -464,7 +467,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 clock: &self.clock,
                 entropy: &self.entropy,
                 policy: &self.policy,
-                trail: self.trail.clone(),
             }
         }
     }
@@ -513,19 +515,23 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         conn: &FakeConnection,
         spool: Result<&FakeSpool, &SpoolError>,
     ) -> Outcome {
-        let mut log = Vec::new();
-        let served = serve(conn, &host.platform(), spool, &mut log);
+        serve_on(host, conn, spool, &mut FakeAuditSink::new())
+    }
+
+    /// As [`serve_with`], on a trail the test holds.
+    fn serve_on(
+        host: &Host,
+        conn: &FakeConnection,
+        spool: Result<&FakeSpool, &SpoolError>,
+        trail: &mut FakeAuditSink,
+    ) -> Outcome {
+        let served = serve(conn, &host.platform(), spool, trail);
         let response = BrokerResponse::parse(&conn.written()).unwrap();
         assert_eq!(response.schema_version, WIRE_SCHEMA_VERSION);
-        let records = String::from_utf8(log)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
         Outcome {
             served,
             answer: response.answer,
-            records,
+            records: trail.records().to_vec(),
         }
     }
 
@@ -936,37 +942,109 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn nothing_is_minted_when_standard_error_does_not_reach_the_journal() {
-        // systemd points a service at /dev/null when it cannot reach the
-        // journal; every audit write then succeeds and records nothing.
-        let mut host = Host::honest();
-        host.trail = Err("not a socket".to_owned());
+    fn a_mint_is_refused_when_the_trail_cannot_be_written() {
+        let host = Host::honest();
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let mut trail = FakeAuditSink::failing("the disk is full");
+        let outcome = serve_on(&host, &restart(), Ok(&spool), &mut trail);
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(outcome.served.exit_status(), UNUSABLE);
         assert_eq!(
             refusal_of(&outcome.answer),
-            Some(RefusalCode::BrokerUnusable)
+            Some(RefusalCode::AuditUnavailable)
         );
         assert_eq!(spool.calls(), [], "no entry, and no lock taken for one");
         assert!(spool.files().is_empty());
-        let detail = outcome.records.last().unwrap().evidence.join(" ");
-        assert!(detail.contains("not a socket"), "{detail}");
+        assert!(trail.records().is_empty());
     }
 
     #[test]
-    fn a_denial_is_answered_even_when_there_is_no_trail_to_write() {
-        let mut host = Host::honest();
-        host.trail = Err("not a socket".to_owned());
-        let outcome = serve_with(
+    fn a_denial_is_answered_even_when_the_trail_is_down() {
+        let host = Host::honest();
+        let mut trail = FakeAuditSink::failing("journald is down");
+        let outcome = serve_on(
             &host,
             &connection(Ok(BrokerRequest::new("/bin/sh", Vec::new(), "unattested")
                 .to_json()
                 .into_bytes())),
             Ok(&FakeSpool::new()),
+            &mut trail,
         );
         assert_eq!(outcome.served, Served::Decided);
+        assert!(trail.records().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_is_answered_even_when_the_trail_is_down() {
+        let host = Host::honest();
+        let mut trail = FakeAuditSink::failing("journald is down");
+        let outcome = serve_on(
+            &host,
+            &connection(Ok(b"not json".to_vec())),
+            Ok(&FakeSpool::new()),
+            &mut trail,
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::RequestMalformed)
+        );
+        assert!(trail.records().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_record_chains_after_the_trail_tail() {
+        let host = Host::honest();
+        let mut trail = FakeAuditSink::new();
+        let spool = FakeSpool::new();
+        let first = serve_on(&host, &restart(), Ok(&spool), &mut trail);
+        assert_eq!(first.served, Served::Minted);
+        let second = serve_on(
+            &host,
+            &connection(Ok(b"not json".to_vec())),
+            Ok(&spool),
+            &mut trail,
+        );
+        let seqs: Vec<u64> = second.records.iter().map(|r| r.seq.get()).collect();
+        assert_eq!(seqs, [1, 2]);
+        assert_eq!(second.records[1].prev_hash, second.records[0].hash);
+        assert!(
+            aido_audit::verify(&second.records).is_ok(),
+            "the broker's records verify as one chain"
+        );
+    }
+
+    #[test]
+    fn a_publish_failure_after_the_record_is_recorded_again() {
+        let host = Host::honest();
+        let broken = SpoolError::Io {
+            operation: "publish".to_owned(),
+            at: "/run/aido/req".to_owned(),
+            code: None,
+            reason: "no space left on device".to_owned(),
+        };
+        let mut trail = FakeAuditSink::new();
+        let outcome = serve_on(
+            &host,
+            &restart(),
+            Ok(&FakeSpool::new().failing_publish(broken)),
+            &mut trail,
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::SpoolUnusable)
+        );
+        assert_eq!(outcome.records.len(), 2);
+        assert_eq!(outcome.records[0].decision, AuditDecision::Allowed);
+        assert_eq!(outcome.records[1].decision, AuditDecision::Denied);
+        assert_eq!(
+            outcome.records[1].denial.as_deref(),
+            Some("spool_unusable")
+        );
+        assert!(
+            outcome.records[1]
+                .evidence
+                .contains(&"withdraws_seq=1".to_owned())
+        );
     }
 
     #[test]
@@ -1100,19 +1178,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn nothing_is_minted_whose_audit_record_cannot_be_written() {
-        let host = Host::honest();
-        let conn = restart();
-        let spool = FakeSpool::new();
-        let served = serve(&conn, &host.platform(), Ok(&spool), &mut Refusing);
-        assert_eq!(served, Served::Refused(Fault::Broker));
-        assert_eq!(spool.calls(), [], "no entry without its record");
-        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
-        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
-        assert!(Refusing.flush().is_ok());
-    }
-
-    #[test]
     fn a_client_that_leaves_before_its_answer_cannot_make_the_broker_fail() {
         // Minted or refused for its own fault, a client that went away is not
         // the broker failing: if it were, any group member could fill
@@ -1120,12 +1185,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         for conn in [restart(), connection(Err(ReadFailure::TimedOut))] {
             let host = Host::honest();
             let conn = conn.with_write_error(SysError::unsupported("peer gone"));
-            let mut log = Vec::new();
-            let served = serve(&conn, &host.platform(), Ok(&FakeSpool::new()), &mut log);
+            let mut trail = FakeAuditSink::new();
+            let served = serve(&conn, &host.platform(), Ok(&FakeSpool::new()), &mut trail);
             assert_eq!(served, Served::Undelivered);
             assert_eq!(served.exit_status(), 0);
             // It was still recorded.
-            assert!(!log.is_empty());
+            assert!(!trail.records().is_empty());
         }
     }
 
@@ -1136,8 +1201,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let untrusted = SpoolError::NotADirectory {
             at: "/run/aido/req".to_owned(),
         };
-        let mut log = Vec::new();
-        let served = serve::<FakeSpool>(&conn, &host.platform(), Err(&untrusted), &mut log);
+        let served = serve::<FakeSpool>(
+            &conn,
+            &host.platform(),
+            Err(&untrusted),
+            &mut FakeAuditSink::new(),
+        );
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(served.exit_status(), UNUSABLE);
     }
@@ -1161,15 +1230,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             request,
             policy: policy(),
         };
-        let mut log = Vec::new();
-        let served = mint(&conn, &host.platform(), &spool, &mut log, evaluated);
+        let mut trail = FakeAuditSink::new();
+        let served = mint(&conn, &host.platform(), &spool, &mut trail, evaluated);
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
         assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
         assert!(
-            String::from_utf8(log)
-                .unwrap()
+            trail.records()[0]
+                .evidence
+                .join(" ")
                 .contains(&MintError::NoAction.to_string())
         );
     }

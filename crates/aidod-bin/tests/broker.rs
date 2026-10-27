@@ -1,6 +1,14 @@
 //! The broker binary, run as a process, the way systemd runs it: one accepted
-//! connection on standard input, the audit record on standard error, and an
-//! exit status systemd reads.
+//! connection on standard input and an exit status systemd reads.
+//!
+//! The binary writes its audit record to the system trail
+//! (`/var/lib/aido/audit.jsonl`, copied to journald) and to nothing else, and
+//! offers no way to point it elsewhere: no argument, no feature, no
+//! environment variable. So these tests, which run as an ordinary user, can see
+//! what an unprivileged run does — every refusal is still answered, the exit
+//! status is still the right one, and standard error carries no record. That
+//! the trail is written, chained, and required is proven by
+//! `tests/root_trail.rs`, which runs this same binary as uid 0.
 //!
 //! Everything the broker decides is tested in the `aidod` library. These tests
 //! exist for what only a real process has: descriptor 0 as the connection, an
@@ -96,13 +104,15 @@ fn restart() -> Vec<u8> {
     .into_bytes()
 }
 
-/// The audit records the broker wrote, one per line.
-fn records(output: &Output) -> Vec<serde_json::Value> {
-    String::from_utf8(output.stderr.clone())
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+/// Asserts that standard error carries no audit record. A record there is
+/// diagnostics at best: nothing is minted on the strength of one, so a binary
+/// that wrote its trail to standard error again would be a regression.
+fn assert_no_record_on_stderr(output: &Output) {
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !text.lines().any(|line| line.contains("\"prev_hash\"")),
+        "an audit record on standard error: {text}"
+    );
 }
 
 #[test]
@@ -110,10 +120,7 @@ fn a_connection_on_descriptor_zero_is_answered_and_refused_without_a_root_owned_
     let (response, output) = exchange(&restart(), &[]);
     assert_eq!(refusal_of(&response.answer), Some(REFUSED_WITH));
     assert_eq!(output.status.code(), Some(UNUSABLE));
-    let records = records(&output);
-    assert_eq!(records.len(), 1, "one record per connection");
-    assert_eq!(records[0]["denial"], REFUSED_WITH.as_str());
-    assert_eq!(records[0]["decision"], "denied");
+    assert_no_record_on_stderr(&output);
 }
 
 #[test]
@@ -141,7 +148,7 @@ fn a_malformed_request_is_refused_and_the_broker_exits_by_whose_fault_it_was() {
     let (code, status) = MALFORMED_REFUSED_WITH;
     assert_eq!(refusal_of(&response.answer), Some(code));
     assert_eq!(output.status.code(), Some(status));
-    assert_eq!(records(&output).len(), 1);
+    assert_no_record_on_stderr(&output);
 }
 
 #[cfg(target_os = "linux")]
@@ -177,22 +184,14 @@ fn a_client_that_connects_and_exits_cannot_make_the_broker_exit_as_broken() {
         .wait_with_output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
-    let records = records(&output);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["denial"], "peer_unidentified");
-    assert!(
-        records[0]["evidence"]
-            .to_string()
-            .contains("\"fault=client\""),
-        "{}",
-        records[0]
-    );
+    assert_no_record_on_stderr(&output);
 }
 
 #[test]
-fn a_descriptor_zero_that_is_not_a_stream_socket_is_refused_with_a_record() {
+fn a_descriptor_zero_that_is_not_a_stream_socket_is_refused_and_fails_the_unit() {
     // A file, and a socket of the wrong type: nobody to answer, so nothing is
-    // written back, the record says why, and systemd sees a failure.
+    // written back, and systemd sees a failure. (The record that says why is
+    // the root lane's to read.)
     let (datagram, _other) = UnixDatagram::pair().unwrap();
     for (stdin, why) in [
         (Stdio::null(), "not a socket"),
@@ -200,13 +199,7 @@ fn a_descriptor_zero_that_is_not_a_stream_socket_is_refused_with_a_record() {
     ] {
         let output = broker(stdin, &[]).wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(UNUSABLE), "{why}");
-        let records = records(&output);
-        assert_eq!(records.len(), 1, "{why}");
-        assert_eq!(records[0]["denial"], "broker_unusable");
-        assert!(
-            records[0]["evidence"].to_string().contains(why),
-            "{why}: {}",
-            records[0]
-        );
+        assert!(output.stdout.is_empty(), "{why}");
+        assert_no_record_on_stderr(&output);
     }
 }

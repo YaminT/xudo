@@ -19,6 +19,8 @@ aido-wire = { path = "../aido-wire", version = "0.0.1" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The in-memory trail every `serve` test records through.
+aido-sys = { path = "../aido-sys", version = "0.0.1", features = ["fake"] }
 insta.workspace = true
 # Errno values, to script the answers a real kernel gives; and in the Linux
 # tests, `waitid(WNOWAIT)` to hold a peer as a zombie, and this process's ids.
