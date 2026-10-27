@@ -21,8 +21,19 @@ aido-gate = { path = "../aido-gate", version = "0.0.1" }
 # could give it. It lives in this package because Cargo builds the binary for,
 # and sets `CARGO_BIN_EXE_aido-gate` in, only this package's integration tests.
 [dev-dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
+
+# `tests/root_direct.rs` runs the binary as uid 0 against the real audit trail,
+# in the root lane (`just root-test`). Without the feature the target does not
+# exist, so a run that forgot it fails rather than running an empty binary.
+[features]
+root-tests = []
+
+[[test]]
+name = "root_direct"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

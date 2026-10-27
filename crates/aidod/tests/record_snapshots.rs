@@ -20,7 +20,7 @@ use aido_sys::{Attestation, SpoolError};
 use aido_wire::{BrokerRequest, RefusalCode};
 use aidod::identify::{EuidSource, PeerIdentity};
 use aidod::mint::MintError;
-use aidod::record::{decided, refused};
+use aidod::record::{decided, refused, withdrawn};
 use aidod::refusal::Refusal;
 
 fn identity() -> PeerIdentity {
@@ -95,6 +95,7 @@ fn the_records_of_a_decision_are_pinned() {
     let generation = aido_policy::load_rule_files(Vec::new()).unwrap().generation;
     let mut text = String::new();
     let minted = decided(
+        None,
         &permitted(Verdict::Allow),
         &caller(),
         &identity(),
@@ -103,6 +104,7 @@ fn the_records_of_a_decision_are_pinned() {
         Some(&entry()),
     );
     let awaiting = decided(
+        None,
         &permitted(Verdict::AllowWithConfirmation),
         &caller(),
         &identity(),
@@ -111,6 +113,7 @@ fn the_records_of_a_decision_are_pinned() {
         None,
     );
     let denied = decided(
+        None,
         &Decision::deny(DenialCode::ArgvRejected, vec!["x".to_owned()], Vec::new()),
         &caller(),
         &identity(),
@@ -129,6 +132,42 @@ fn the_records_of_a_decision_are_pinned() {
 }
 
 #[test]
+fn a_chain_of_the_brokers_records_is_pinned() {
+    let generation = aido_policy::load_rule_files(Vec::new()).unwrap().generation;
+    let authorized = decided(
+        None,
+        &permitted(Verdict::Allow),
+        &caller(),
+        &identity(),
+        &request(),
+        &generation,
+        Some(&entry()),
+    );
+    let withdrawal = withdrawn(
+        Some(&authorized),
+        authorized.seq.get(),
+        &Refusal::broker(RefusalCode::SpoolFull, "detail of the broker's fault"),
+        Some(&identity()),
+        Some(&request()),
+    );
+    let refusal = refused(
+        Some(&withdrawal),
+        &Refusal::broker(RefusalCode::AuditUnavailable, "detail of the broker's fault"),
+        Some(&identity()),
+        Some(&request()),
+    );
+    let mut text = String::new();
+    for (name, record) in [
+        ("authorized, seq 1", authorized),
+        ("withdrawn, seq 2", withdrawal),
+        ("refused, seq 3", refusal),
+    ] {
+        let _ = writeln!(text, "## {name}\n{}\n", rendered(&record));
+    }
+    insta::assert_snapshot!("record_chain", text);
+}
+
+#[test]
 fn the_record_of_every_refusal_code_is_pinned() {
     let mut text = String::new();
     for code in RefusalCode::ALL {
@@ -141,14 +180,14 @@ fn the_record_of_every_refusal_code_is_pinned() {
             text,
             "## {} with a request and a peer\n{}\n",
             code.as_str(),
-            rendered(&refused(&refusal, Some(&identity()), Some(&request())))
+            rendered(&refused(None, &refusal, Some(&identity()), Some(&request())))
         );
     }
     let nothing_known = Refusal::client(RefusalCode::RequestMalformed, "not JSON");
     let _ = writeln!(
         text,
         "## before anything was known\n{}",
-        rendered(&refused(&nothing_known, None, None))
+        rendered(&refused(None, &nothing_known, None, None))
     );
     insta::assert_snapshot!("refusal_records", text);
 }
@@ -158,6 +197,7 @@ fn every_mint_refusal_is_pinned_with_its_code_and_whose_fault_it_is() {
     let mut text = String::new();
     for failure in [
         MintError::NoAction,
+        MintError::Unauthorized,
         MintError::Spool(SpoolError::Exists {
             name: "a-name".to_owned(),
         }),

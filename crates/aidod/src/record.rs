@@ -1,10 +1,11 @@
 //! The audit record of every answer the broker gives.
 //!
-//! One `aido_audit::Record` per connection, as one JSON line on standard
-//! error, which the unit hands to the journal. The hash-chained trail
-//! (`aido_sys::audit`, M2b step 6) exists, but the broker does not write
-//! through it until plan item D1; until then each record is the first of a
-//! chain of one, and the journal is the trail.
+//! One `aido_audit::Record` per connection, written through the hash-chained
+//! trail (`aido_sys::audit`): every builder here takes the record it must
+//! follow, which the sink supplies while it holds the log, so the broker's
+//! records and the gate's are links of one chain. A mint that succeeded is
+//! followed by a second record only if the spool then refused the entry
+//! ([`withdrawn`]); the first stays, because the file is append-only.
 //!
 //! A record carries what the response does not: how the peer was identified
 //! and on which rung, its pinned identity, the generation decided under, the
@@ -13,14 +14,13 @@
 //! because "it claimed to be an agent and the claim changed nothing" is the
 //! sentence an investigator needs.
 
-use std::io::Write;
-
 use aido_audit::record::{Decision as AuditDecision, Outcome, Record};
 use aido_gate::request::PendingRequest;
 use aido_policy::{CallerFacts, Decision, Generation, Verdict, deny_list_version};
 use aido_wire::BrokerRequest;
 
 use crate::identify::PeerIdentity;
+use crate::mint::command_of as command_of_entry;
 use crate::refusal::Refusal;
 
 /// The classification label for a refusal made before anyone was classified.
@@ -31,6 +31,7 @@ const UNATTESTED: &str = "unattested";
 
 /// The record of a decision, and of the entry minted for it if there is one.
 pub fn decided(
+    previous: Option<&Record>,
     decision: &Decision,
     caller: &CallerFacts,
     identity: &PeerIdentity,
@@ -50,9 +51,14 @@ pub fn decided(
         evidence.push(format!("deadline={}", entry.deadline.0));
     }
 
-    let mut record = Record::first(
+    // What is minted is what is authorized: the entry's own command, so the
+    // record `aido_sys::authorize` checks against the approval is the one the
+    // gate will act on.
+    let command = minted.map_or_else(|| decision.resolved_command(), command_of_entry);
+    let mut record = Record::after(
+        previous,
         audit_decision(decision.verdict),
-        decision.resolved_command(),
+        command,
         caller.classification.label(),
     )
     .with_evidence(evidence)
@@ -69,6 +75,7 @@ pub fn decided(
 
 /// The record of a refusal.
 pub fn refused(
+    previous: Option<&Record>,
     refusal: &Refusal,
     identity: Option<&PeerIdentity>,
     request: Option<&BrokerRequest>,
@@ -87,7 +94,8 @@ pub fn refused(
             request.claimed_classification
         ));
     }
-    Record::first(
+    Record::after(
+        previous,
         AuditDecision::Denied,
         request.map(command_of).unwrap_or_default(),
         UNATTESTED,
@@ -97,14 +105,22 @@ pub fn refused(
     .with_outcome(Outcome::NotExecuted)
 }
 
-/// Writes one record as one line.
+/// The record of an entry that was authorized and then not minted: the spool
+/// refused it after the authorization was on the trail.
 ///
-/// # Errors
-///
-/// Whatever the writer refuses with. The broker mints nothing whose record
-/// could not be written.
-pub fn emit(record: &Record, log: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(log, "{}", record.to_jsonl())
+/// It names the authorization it withdraws, because the file is append-only
+/// and the first record cannot be edited.
+pub fn withdrawn(
+    previous: Option<&Record>,
+    authorization: u64,
+    refusal: &Refusal,
+    identity: Option<&PeerIdentity>,
+    request: Option<&BrokerRequest>,
+) -> Record {
+    let record = refused(previous, refusal, identity, request);
+    let mut evidence = record.evidence.clone();
+    evidence.push(format!("withdraws_seq={authorization}"));
+    record.with_evidence(evidence)
 }
 
 /// The evidence for how the peer was identified.
@@ -208,7 +224,7 @@ mod tests {
             caller_starttime: 998_877,
             action: "aido.svc.restart".to_owned(),
             program: "/usr/bin/systemctl".to_owned(),
-            argv: Vec::new(),
+            argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
             deadline: aido_gate::request::MonotonicSecs(1_900),
             confirmed: false,
@@ -216,6 +232,7 @@ mod tests {
             claimed_classification: "enrolled-agent-yolo".to_owned(),
         };
         let record = decided(
+            None,
             &permitted(Verdict::Allow),
             &caller(),
             &identity(Some(77)),
@@ -262,6 +279,7 @@ mod tests {
         // On the password path the confirmation is the password sudo asks
         // for; the record says one is still owed.
         let record = decided(
+            None,
             &permitted(Verdict::AllowWithConfirmation),
             &caller(),
             &identity(None),
@@ -278,6 +296,7 @@ mod tests {
     fn a_denial_records_its_code_and_no_rule() {
         let denial = Decision::deny(DenialCode::ArgvRejected, vec!["x".to_owned()], Vec::new());
         let record = decided(
+            None,
             &denial,
             &caller(),
             &identity(None),
@@ -296,7 +315,7 @@ mod tests {
             RefusalCode::SpoolUnusable,
             "/run/aido cannot be inspected: No such file or directory",
         );
-        let record = refused(&refusal, Some(&identity(None)), Some(&request()));
+        let record = refused(None, &refusal, Some(&identity(None)), Some(&request()));
         assert_eq!(record.decision, AuditDecision::Denied);
         assert_eq!(record.denial.as_deref(), Some("spool_unusable"));
         assert_eq!(
@@ -319,7 +338,7 @@ mod tests {
     #[test]
     fn a_refusal_before_anything_was_known_still_leaves_a_record() {
         let refusal = Refusal::client(RefusalCode::RequestMalformed, "not JSON");
-        let record = refused(&refusal, None, None);
+        let record = refused(None, &refusal, None, None);
         assert!(record.argv.is_empty());
         assert_eq!(record.classification, "unattested");
         assert_eq!(
@@ -329,14 +348,49 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_one_json_line() {
+    fn a_record_follows_the_one_before_it_so_the_brokers_records_chain() {
         let refusal = Refusal::client(RefusalCode::RequestMalformed, "line\nbreak");
-        let mut log = Vec::new();
-        emit(&refused(&refusal, None, None), &mut log).unwrap();
-        let text = String::from_utf8(log).unwrap();
-        assert_eq!(text.matches('\n').count(), 1, "{text}");
-        assert!(text.ends_with('\n'));
-        let parsed: aido_audit::record::Record = serde_json::from_str(text.trim_end()).unwrap();
-        assert!(parsed.is_sealed());
+        let first = refused(None, &refusal, None, None);
+        assert_eq!(first.to_jsonl().matches('\n').count(), 0);
+        let second = refused(Some(&first), &refusal, None, None);
+        assert_eq!(second.seq, first.seq.next());
+        assert_eq!(second.prev_hash, first.hash);
+        assert!(second.is_sealed());
+        let decision = decided(
+            Some(&second),
+            &permitted(Verdict::Allow),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert_eq!(decision.prev_hash, second.hash);
+    }
+
+    #[test]
+    fn a_withdrawal_names_the_authorization_it_withdraws() {
+        let refusal = Refusal::broker(RefusalCode::SpoolFull, "full");
+        let first = decided(
+            None,
+            &permitted(Verdict::Allow),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        let record = withdrawn(
+            Some(&first),
+            first.seq.get(),
+            &refusal,
+            Some(&identity(None)),
+            Some(&request()),
+        );
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.denial.as_deref(), Some("spool_full"));
+        assert!(record.evidence.contains(&"withdraws_seq=1".to_owned()));
+        assert_eq!(record.prev_hash, first.hash);
+        assert!(record.is_sealed());
     }
 }

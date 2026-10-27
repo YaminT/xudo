@@ -54,6 +54,8 @@ name = "aido-bin"
 version = "0.0.1"
 dependencies = [
  "aido",
+ "aido-audit",
+ "aido-sys",
  "assert_cmd",
  "clap",
  "predicates",
@@ -87,6 +89,7 @@ dependencies = [
 name = "aido-gate-bin"
 version = "0.0.1"
 dependencies = [
+ "aido-audit",
  "aido-gate",
  "assert_cmd",
  "predicates",
@@ -136,6 +139,14 @@ dependencies = [
 [[package]]
 name = "aido-tests"
 version = "0.0.1"
+dependencies = [
+ "aido-audit",
+ "aido-gate",
+ "aido-policy",
+ "aido-sys",
+ "aido-wire",
+ "aidod",
+]
 
 [[package]]
 name = "aido-wire"
@@ -169,6 +180,8 @@ dependencies = [
 name = "aidod-bin"
 version = "0.0.1"
 dependencies = [
+ "aido-audit",
+ "aido-sys",
  "aido-wire",
  "aidod",
  "serde_json",

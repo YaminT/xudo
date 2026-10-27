@@ -30,3 +30,5 @@ expression: table
     the broker drew a nonce that already names a request, so its random source is broken; an administrator must investigate before anything is retried
 14  broker_unusable
     the broker could not complete the request and failed closed; an administrator should read the broker's audit record in the journal
+15  broker_audit_unavailable
+    the broker could not write the audit record, so it minted nothing and failed closed; an administrator must check that /var/lib/aido is a root-owned 0700 directory with room to write and that journald is running

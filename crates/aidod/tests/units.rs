@@ -351,14 +351,15 @@ fn the_broker_is_root_without_a_single_capability() {
 }
 
 #[test]
-fn the_only_writable_path_is_the_spool() {
+fn the_only_writable_paths_are_the_spool_and_the_audit_trail() {
     let service = parse(SERVICE);
     assert_eq!(value(&service, "Service", "ProtectSystem"), "strict");
-    // "-" lets the broker start, and refuse with a reason, when the spool
-    // is missing; it widens nothing.
+    // "-" lets the broker start, and refuse with a reason, when the spool or
+    // the trail's directory is missing; it widens nothing. Without it systemd
+    // kills the unit at namespace setup and the client gets EOF, no refusal.
     assert_eq!(
         value(&service, "Service", "ReadWritePaths"),
-        format!("-{}", aido_gate::SPOOL_DIR)
+        format!("-{} -{}", aido_gate::SPOOL_DIR, aido_sys::AUDIT_DIR)
     );
     for key in [
         "ProtectHome",
@@ -451,7 +452,7 @@ fn the_service_takes_nothing_from_an_environment() {
 }
 
 #[test]
-fn tmpfiles_creates_a_reachable_run_dir_and_a_private_spool() {
+fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_trail() {
     let lines: Vec<Vec<&str>> = TMPFILES
         .lines()
         .map(str::trim)
@@ -463,6 +464,7 @@ fn tmpfiles_creates_a_reachable_run_dir_and_a_private_spool() {
         [
             ["d", "/run/aido", "0755", "root", "root", "-", "-"],
             ["d", aido_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
+            ["d", aido_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
         ]
     );
     assert_eq!(

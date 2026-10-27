@@ -40,10 +40,11 @@
 
 use std::fmt::Write as _;
 
+use aido_audit::Approval;
 use aido_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
 use aido_policy::Decision;
 use aido_sys::{
-    Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX, parse_stat,
+    Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX, parse_stat,
     parse_status_uids,
 };
 use aido_wire::BrokerRequest;
@@ -138,11 +139,61 @@ pub enum MintError {
         /// The nonce drawn.
         nonce: String,
     },
+    /// The entry is not the one the audit record authorized.
+    #[error(
+        "the entry is for a different command or action than the one the audit trail authorized"
+    )]
+    Unauthorized,
+}
+
+/// What the broker's audit record authorizes: one entry for this command under
+/// this action.
+///
+/// The only value [`publish`] accepts, and only inside the
+/// [`Authorized`] that `aido_sys::authorize` makes after the record is on the
+/// trail, so an entry nobody recorded cannot be minted. It is made from the
+/// entry itself ([`MintApproval::of`]), so what is authorized is what is
+/// minted; [`publish`] checks that again, because the receipt it is handed
+/// could have been made for another approval.
+#[derive(Debug)]
+pub struct MintApproval {
+    command: Vec<String>,
+    action: String,
+}
+
+impl MintApproval {
+    /// The approval to mint `entry`.
+    pub fn of(entry: &PendingRequest) -> Self {
+        Self {
+            command: command_of(entry),
+            action: entry.action.clone(),
+        }
+    }
+}
+
+impl Approval for MintApproval {
+    fn command(&self) -> Vec<String> {
+        self.command.clone()
+    }
+
+    fn action(&self) -> &str {
+        &self.action
+    }
+}
+
+/// The entry's command as one argv, program first: what the record carries and
+/// what the gate will run.
+pub fn command_of(entry: &PendingRequest) -> Vec<String> {
+    let mut command = vec![entry.program.clone()];
+    command.extend(entry.argv.iter().cloned());
+    command
 }
 
 /// An entry about to be published, and whose share of the spool it takes.
 #[derive(Clone, Copy, Debug)]
 pub struct Minting<'a> {
+    /// The record that authorizes minting this entry, on the trail.
+    pub authorized: &'a Authorized<MintApproval>,
     /// The entry.
     pub entry: &'a PendingRequest,
     /// The entry as it is written.
@@ -217,6 +268,8 @@ pub fn entry_for(
 ///
 /// # Errors
 ///
+/// [`MintError::Unauthorized`] if the entry is not what the receipt
+/// authorized, before the spool is touched;
 /// [`MintError::Spool`] if the spool refuses an operation,
 /// [`MintError::Full`] at its limits, [`MintError::UidFull`] at the asking
 /// uid's, and [`MintError::Collision`] if the nonce is taken. The lock is
@@ -226,6 +279,10 @@ pub fn publish<S: Spool + ?Sized>(
     callers: &dyn PeerCalls,
     minting: &Minting<'_>,
 ) -> Result<(), MintError> {
+    let approval = minting.authorized.approval();
+    if approval.command != command_of(minting.entry) || approval.action != minting.entry.action {
+        return Err(MintError::Unauthorized);
+    }
     spool.lock().map_err(MintError::Spool)?;
     let published = prune_and_publish(spool, callers, minting);
     spool.unlock();
@@ -356,8 +413,11 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
+    use aido_audit::record::{Decision as AuditDecision, Record};
     use aido_policy::{ActionId, DenialCode, Verdict};
-    use aido_sys::{Attestation, FakeEntropy, FakePeer, FakeSpool, PeerCall, SpoolCall};
+    use aido_sys::{
+        Attestation, FakeAuditSink, FakeEntropy, FakePeer, FakeSpool, PeerCall, SpoolCall,
+    };
 
     use super::*;
     use crate::identify::EuidSource;
@@ -435,22 +495,53 @@ mod tests {
         })
     }
 
-    /// Publishes `minting` for a caller running as uid 1000, at `NOW`.
-    fn publish_as_1000(
+    /// The authorization of `approved`, recorded on a fresh fake trail.
+    fn authorization_of(approved: &PendingRequest) -> Authorized<MintApproval> {
+        aido_sys::authorize(
+            &mut FakeAuditSink::new(),
+            MintApproval::of(approved),
+            &|previous, approval| {
+                Record::after(
+                    previous,
+                    AuditDecision::Allowed,
+                    approval.command(),
+                    "unattested",
+                )
+                .with_rule(approval.action(), "10-test.toml:1")
+            },
+        )
+        .unwrap()
+    }
+
+    /// Publishes `minting` for a caller running as uid 1000, at `NOW`, under
+    /// the authorization of `authorized`.
+    fn publish_authorized(
         spool: &FakeSpool,
         host: &FakePeer,
         minting: &PendingRequest,
+        authorized: &Authorized<MintApproval>,
     ) -> Result<(), MintError> {
         publish(
             spool,
             host,
             &Minting {
+                authorized,
                 entry: minting,
                 json: &minting.to_json(),
                 uid: 1000,
                 now: NOW,
             },
         )
+    }
+
+    /// Publishes `minting` for a caller running as uid 1000, at `NOW`, under
+    /// an authorization of that very entry.
+    fn publish_as_1000(
+        spool: &FakeSpool,
+        host: &FakePeer,
+        minting: &PendingRequest,
+    ) -> Result<(), MintError> {
+        publish_authorized(spool, host, minting, &authorization_of(minting))
     }
 
     fn permitted() -> Decision {
@@ -508,6 +599,61 @@ mod tests {
             entry_for(&decision, &identity(1, 1), &request, 7, 1, nonce('a')),
             Err(MintError::NoAction)
         );
+    }
+
+    #[test]
+    fn an_authorization_for_another_command_does_not_mint_this_entry() {
+        let mut other_command = entry('a', 4242, 5_000, NOW + 900);
+        other_command.argv = vec!["stop".to_owned(), "nginx.service".to_owned()];
+        let mut other_action = entry('a', 4242, 5_000, NOW + 900);
+        other_action.action = "aido.svc.stop".to_owned();
+        for authorized_for in [&other_command, &other_action] {
+            let spool = FakeSpool::new();
+            let minting = entry('a', 4242, 5_000, NOW + 900);
+            let authorized = authorization_of(authorized_for);
+            assert_eq!(
+                publish_authorized(&spool, &FakePeer::new(), &minting, &authorized),
+                Err(MintError::Unauthorized)
+            );
+            // Refused before the spool was touched: not even locked.
+            assert_eq!(spool.calls(), Vec::new());
+        }
+    }
+
+    #[test]
+    fn a_mint_recorded_as_a_refusal_has_no_authorization_to_publish_under() {
+        // `publish` takes an `Authorized`, and `authorize` makes none for a
+        // record that says the request was denied.
+        let approved = entry('a', 4242, 5_000, NOW + 900);
+        let error = aido_sys::authorize(
+            &mut FakeAuditSink::new(),
+            MintApproval::of(&approved),
+            &|previous, approval| {
+                Record::after(
+                    previous,
+                    AuditDecision::Denied,
+                    approval.command(),
+                    "unattested",
+                )
+                .with_rule(approval.action(), "10-test.toml:1")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            aido_sys::AuditError::RecordedAsRefusal { seq: 1 }
+        );
+    }
+
+    #[test]
+    fn an_approval_carries_the_entrys_command_and_action_and_nothing_else() {
+        let approval = MintApproval::of(&entry('a', 4242, 5_000, NOW + 900));
+        assert_eq!(
+            approval.command(),
+            ["/usr/bin/systemctl", "restart", "nginx.service"]
+        );
+        assert_eq!(approval.action(), "aido.svc.restart");
+        assert!(format!("{approval:?}").contains("aido.svc.restart"));
     }
 
     #[test]
@@ -627,21 +773,21 @@ mod tests {
 
     #[test]
     fn a_full_spool_refuses_rather_than_growing_by_bytes() {
-        // Twenty live entries is far under the count limit; their bytes and
-        // the new entry's together are over the byte limit.
+        // Thirty-five live entries is under the count limit; their bytes and
+        // the new entry's together are over the byte limit. The new entry is
+        // small, because its authorization record must fit a log line.
         let mut spool = FakeSpool::new();
         let mut host = FakePeer::new();
-        for index in 0..20u32 {
+        for index in 0..35u32 {
             let mut live = entry('b', 100 + index, 1, NOW + 100);
             live.nonce = format!("{:064x}", index + 1);
             live.argv = vec!["x".repeat(30_000)];
             spool = spool.with_file(live.nonce.clone(), live.to_json());
             host = running(host, &live, 2000 + index.div_euclid(8), 0);
         }
-        let mut minting = entry('a', 4242, 5_000, NOW + 900);
-        minting.argv = vec!["x".repeat(500_000)];
+        let minting = entry('a', 4242, 5_000, NOW + 900);
         let err = publish_as_1000(&spool, &host, &minting).unwrap_err();
-        assert!(err.to_string().contains("20 live entries"), "{err}");
+        assert!(err.to_string().contains("35 live entries"), "{err}");
         assert!(!spool.files().contains_key(nonce('a').as_bytes()));
     }
 

@@ -26,9 +26,21 @@ clap.workspace = true
 # to be sitting in the target directory: missing on a clean CI runner, and
 # silently stale on a developer's machine.
 [dev-dependencies]
+aido-audit = { path = "../aido-audit", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
+
+# `tests/root_audit.rs` runs the binary against a trail the real writer made, as
+# uid 0, in the root lane (`just root-test`). Without the feature the target does
+# not exist, so a run that forgot it fails rather than running an empty binary.
+[features]
+root-tests = []
+
+[[test]]
+name = "root_audit"
+required-features = ["root-tests"]
 
 [lints]
 workspace = true

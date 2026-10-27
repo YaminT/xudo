@@ -265,6 +265,16 @@ root-test *args:
 units:
     ci/units/run.sh {{unit_exposure_max}}
 
+# The broker's unit run for real: systemd as PID 1 in a privileged container,
+# the socket and service started, connections driven through the socket, and the
+# audit trail read back from the file and the journal. `just units` shows a unit
+# loads and scores well; this shows the sandbox lets the broker reach its trail
+# and that it refuses without it. ci/units/live.sh says what is measured and what
+# is not. Needs Docker and the network.
+units-live:
+    cargo build -p aidod-bin -p aido-bin --release --target {{musl_triple}}
+    ci/units/live.sh target/{{musl_triple}}/release
+
 # --- differential compliance ------------------------------------------------
 
 # The static Linux binary the matrix drives: musl, for whichever architecture
