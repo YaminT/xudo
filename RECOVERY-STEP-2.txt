@@ -1,0 +1,153 @@
+RECOVERY LOG -- STEP 2 (minimal aidod broker)
+Worktree: /Users/yamin-mac/codes/aido/.claude/worktrees/wf_87180089-132-1
+Branch:   worktree-wf_87180089-132-1
+This file is never committed. Newest entries at the bottom.
+
+== 2026-10-19 recovery agent #2 starts ==
+- Found: branch at 2e0943c (main before step 2b), uncommitted changes:
+  M Cargo.lock Cargo.toml crates/aido-policy/src/engine.rs crates/aido-sys/Cargo.toml
+    crates/aido-sys/src/lib.rs crates/aido/src/cli.rs
+  ?? crates/aido-sys/src/{clock,connection,entropy,peer,spool,trusted_file}.rs
+  ?? crates/aido-wire/ crates/aidod/ crates/aidod-bin/
+- git fetch origin: ok. origin/main = d685d0a (step 2b, strictest overlapping rules).
+- WIP checkpoint: git commit --no-verify "wip: recovered step 2" (87e438b) -- excluded this log file.
+- git rebase origin/main: conflict in crates/aido/src/cli.rs; engine.rs auto-merged.
+  Resolution: the WIP had moved best_match into aido_policy::engine; step 2b replaced
+  best_match with aido_policy::evaluate_command and says the broker must call it. So
+  engine.rs and cli.rs restored exactly to origin/main (git checkout HEAD -- ...).
+  Rebased WIP is 6bb01d1 on d685d0a. TODO: aidod/src/policy.rs -> evaluate_command.
+- aidod/src/policy.rs: decide() now calls aido_policy::evaluate_command (as explain does);
+  removed unmatched(); test compares against evaluate_command.
+- Fixed unused test imports (connection.rs, aidod lib.rs), DenialCode import in policy tests,
+  connection test socket bound by relative path (macOS 104-byte sun_path in a worktree).
+- cargo build --workspace --all-targets: clean. cargo test -p aido-wire -p aidod -p aidod-bin
+  -p aido-sys: 256 passed (macOS).
+- justfile: aidod-bin excluded from coverage (3 recipes) with written reason; ci.yml step name "three".
+- just coverage (macOS, first run): FAIL 99.43% regions -- gaps: spool.rs names() `?`, policy.rs load() `?`,
+  serve.rs had no tests. Fixed: names()/load() map instead of `?`; connection timeouts now via
+  rustix set_socket_timeout (SO_RCVTIMEO/SO_SNDTIMEO) + test reading both back; wrote 19 serve.rs tests
+  (every refusal, mint, confirm-mints, deny-list, collision, full, no nonce, unrecordable, undelivered,
+  NoAction via private mint()). cargo test -p aidod --lib serve: 20 passed.
+- Served::Undelivered now exits 0 (a client hanging up must not manufacture a systemd failure);
+  answer() keeps Refused(Broker) when the write fails. Tests updated + new one.
+- aidod-bin/tests/broker.rs: 4 process tests (socketpair on fd 0, hostile LISTEN_* env ignored,
+  malformed request, /dev/null + datagram on fd 0). macOS: 4 passed.
+- packaging/systemd/aidod.socket, packaging/systemd/aidod@.service, packaging/tmpfiles.d/aido.conf
+  written; crates/aidod/tests/units.rs (12 tests, unknown-key allowlist) passes.
+- Running systemd-analyze verify/security in debian:trixie-slim -> RECOVERY-systemd-verify.log
+- systemd 257 (debian:trixie-slim, Docker): systemd-analyze verify aidod.socket + aidod@.service +
+  aidod@probe.service: no warnings; systemd-analyze security --offline: exposure 1.1 OK;
+  systemd-tmpfiles --create aido.conf: /run/aido 755 root:root, /run/aido/req 700 root:root.
+- crates/aidod/tests/linux.rs (cfg linux): live peer rung by version, zombie peer -> Exited,
+  reaped peer -> PeerPidfd(EINVAL)<6.16 / PidfdInfo(ESRCH)>=6.16, end-to-end serve w/ real seams
+  + FakeSpool -> Minted, nonces. aidod dev-dep rustix gains "process". cargo check linux target ok.
+- Starting just linux-test (Docker) -> RECOVERY-linux-test.log
+- just linux-test (Docker, Linux 6.12.76 aarch64, uid 1000): exit 0, every suite ok, incl.
+  aidod tests/linux.rs 5/5, aidod-bin tests/broker.rs 4/4, units 12/12.
+- Added Debug-format asserts for HostPeer/HostEntropy in the Linux unit tests (CI coverage on Linux).
+- serve() now takes the spool as Result<&S, &SpoolError> (clippy unnecessary_literal_unwrap in tests);
+  run() passes spool.as_ref(). cargo clippy -D warnings: clean on macOS and x86_64-linux.
+- Starting just verify -> RECOVERY-verify.log
+- just verify: PASS (exit 0) -- fmt, taplo, clippy, test, no-ignored-passes, doc-test, coverage
+  100.00% lines/regions/functions (TOTAL 31434 regions), cargo deny ok, cargo audit ok, gtfobins ok.
+- docs/todo/README.md: step 2 DONE 2026-10-19, status line, step-1 open item closed, verification row 5,
+  recommended sequence.
+- aido-wire: BrokerResponse::parse refuses a decision envelope of another schema
+  (ResponseError::WrongEnvelope) + test; avoided let-chains (MSRV 1.85). clippy clean.
+- spool.rs: test a_spool_reached_through_a_symbolic_link_is_refused_even_a_root_owned_one
+  (/etc on macOS, /bin on merged-usr Linux). Passes on macOS.
+- docs: phase-3 layout table gains aidod + both units + tmpfiles; CLAUDE.md coverage bullet (three
+  packages) and crate rows for aidod-bin, aido-wire.
+- just check-linux: PASS (x86_64 + aarch64 linux-gnu)
+- docs/CONCERNS.md: one dated entry at the top (2026-10-19, M2b step 2).
+- just linux-test (rerun after final code changes): PASS exit 0, Linux 6.12.76 aarch64 uid 1000
+- SQUASH HICCUP: another worktree fetched; origin/main moved to 113ed0f (docs: howiwork.md, touches
+  .taplo.toml CLAUDE.md README.md docs/CONCERNS.md). My `git reset --soft origin/main` put HEAD on
+  113ed0f with my d685d0a-based tree staged. Fix: apply `git diff d685d0a 113ed0f` onto the index
+  with --3way, resolve CONCERNS.md (my entry on top, then howiwork entry, then 2b). Old HEAD 6bb01d1
+  is in the reflog.
+- Resolved; staged = step 2 only on 113ed0f. git fetch: origin/main still 113ed0f. Committing via hook -> RECOVERY-commit.log
+- COMMITTED ec5f2c6 "feat(aidod): add the broker that mints requests" via hook (just verify PASS,
+  100% coverage TOTAL 31470 regions).
+- Review finding after commit: rustix 1.1.4/1.1.5 socket_peercred decodes SO_PEERCRED with
+  assume_init into UCred{pid: Pid(NonZeroI32)}; kernel reports pid 0 for a socket with no peer and
+  for a peer outside the caller's pid ns -> UB in "safe" rustix. Fix: HostPeer::peer_cred checks
+  getpeername first (refuses no-peer sockets); pid-ns case documented (broker runs in init pid ns,
+  unit test pins it). Will amend the commit through the hook.
+- just linux-test after the getpeername guard: PASS exit 0 (Linux 6.12.76 aarch64 uid 1000), incl.
+  peer_credentials_of_a_socket_with_no_peer_are_refused_rather_than_decoded.
+- just check-linux: PASS. CONCERNS open item 8 added (rustix SO_PEERCRED decode).
+- Next: git commit --amend through the hook.
+- AMENDED through hook: 5d5d268 (just verify PASS, 100% coverage). Done.
+
+== 2026-10-19 review-fix agent starts (applying review:2 findings, journal wf_fb3fe1c6-3bc line 6) ==
+- git fetch origin; rebased 5d5d268 onto origin/main 89f7029 cleanly -> b1fcb96 (step 2 commit).
+- Plan: one wip commit per finding (--no-verify), squash at end through the hook.
+- Findings: 1 TriggerLimitIntervalSec=0; 2 peer_cred AF_UNIX stream/seqpacket only before the call
+  (no unsafe), CONCERNS corrected + open decision; 3 stale spool entries pruned + per-uid cap;
+  4 client-fault classification; 5 fd 2 must be a connected AF_UNIX stream before minting;
+  6 CONCERNS note for step 7; 7 insta snapshots, refusal-code rename test, source.rs:74 claim.
+- F1 done: aidod.socket TriggerLimitIntervalSec=0 + units.rs a_group_member_cannot_fail_the_socket_for_everyone_with_a_burst_of_connections (13 pass). wip commit 13b860e
+- F2 code: peer_cred stream_peer() precheck (AF_UNIX stream/seqpacket + getpeername) + cred_from split; tests dgram/tcp/seqpacket/errno; identify+units comments; units test renamed the_unit_never_puts_the_broker_in_a_pid_namespace_of_its_own. wip 9563d52. CONCERNS pending.
+- F4 done: peer_was_reaped/process_is_gone predicates; IdentifyError::fault guards; Full -> client; serve test a_client_that_connects_and_exits_cannot_make_the_broker_report_itself_broken; bin test a_client_that_connects_and_exits_cannot_make_the_broker_exit_as_broken (linux); linux.rs fault assert. parse_status_uids added (for F3). wip a7a86e1
+- F3 code+tests done (mint.rs Minting/live_caller, FakePeer::with_proc, serve test); CONCERNS text + wip commit pending
+- F5 done wip commit. next F7 (snapshots), docs F3/5/6/2 in CONCERNS
+- F7 + docs done wip commit. next: git fetch, rebase origin/main, squash, verify
+- squashed to 36fe089 (wip) on 89f7029, rebasing on origin/main aebfd15: resolving conflicts lib.rs, CONCERNS.md, todo/README.md
+- rebase done (HEAD squashed wip on origin/main). next: item 10 re-check vs mounts.rs, build, just verify, amend msg via hook
+- merge fixups: trusted_file/spool/policy _with + cfg tests; running just verify (log verify.log)
+- just verify PASS (100%). committing via hook (amend) -> /tmp/wf132-commit.log
+- committed e4630ad via hook. running check-linux, linux-test
+
+== 2026-10-19 final-stage agent starts: rebase onto 829f41d, swap to safe peer_cred ==
+- rebased onto 829f41d (594c773), README conflict resolved
+- code swap done (peer.rs from_raw + HostSyscalls), identify pid0 test, CONCERNS item 8/6, README. audit wiring NOT contained -> recorded next item. next: just verify
+
+== 2026-10-21 developer agent (B1 finish) starts ==
+- Found HEAD 7dcc41a (one commit on 829f41d, clean tree apart from this file); origin/main is a94afcc (docs-only: CONCERNS, design-plan, todo/README, m2b-finish-plan).
+- Previous commit trailer is "Claude Fable 5"; task requires exactly "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>".
+- Plan: audit 7dcc41a against the 4 deliverables, rebase onto a94afcc, decide audit wiring on the evidence, run all three gates on the final sha.
+- REBASED onto origin/main a94afcc: one conflict (docs/CONCERNS.md, both entries kept, broker entry on top); README auto-merged. Now 2184749 (message still the old one; will be rewritten at the end).
+- Audit decision (independent re-evaluation): NOT contained -> keep stderr record, name plan item D1. Reasons verified in code: AuditReceipt::of is private to aido_sys::audit so a stderr sink cannot be made outside aido-sys without weakening the receipt; unit sandbox (ReadWritePaths=-/run/aido/req only) would refuse every mint if wired; aidod-bin tests assert the stderr records.
+- Found: peer.rs test a_datagram_socket_the_precheck_missed_would_still_decode_as_pid_zero writes under std::env::temp_dir() (violates never-/tmp / target-only fixtures) -> fix with an abstract-namespace socket.
+- TODO: stronger pid-0 test (every later answer agrees, only the refusal stops it) + mutation check; docs (CONCERNS retitle/close item 8/item 6->D1, README step 2 + crate list + not-done, CLAUDE.md row, howiwork one clause); then commit through hook, check-linux, linux-test.
+- pid-0 mutation check DONE: removing the refusal in identify() fails 4 tests (2 old, identify::denies_pid_zero_even_when_every_later_answer_would_agree -> Ok(identity pid 0), serve::a_peer_the_kernel_reports_as_pid_zero_is_never_minted_for -> Minted). Restored from target/wf-scripts/identify.rs.orig. peer.rs /tmp use replaced with an abstract socket.
+- MEASURED on systemd 257.13 (debian:trixie, Docker, systemd as PID 1; peer = a second container sharing the socket volume, i.e. a sibling pid namespace): a socket with MaxConnectionsPerSource=8 FAILS (Result: resources, "Failed to get peer credentials of socket: No data available") on one connection from an invisible peer; without MaxConnectionsPerSource systemd starts probe@0-unknown.service and hands the connection over. So the "/run/aido must not be shared across pid namespaces" note stays, for that reason (socket DoS), not for UB. Probe containers/volume/image removed.
+- Docs edited (not yet committed): CONCERNS (retitled 2026-10-21, audit bullet, tests paragraph, item 6 -> D1, item 8 resolved with systemd measurement, sixth-unsafe entry switched note), README (status, 16 crates + 3 rows, not-done, step 2, sequence), CLAUDE.md aidod row, howiwork.md status clause, m2b-finish-plan D1 pointer, aidod.socket comment + units.rs test the_per_source_limit_states_what_it_costs_beside_the_limit.
+- Local: fmt/taplo/clippy (macOS, x86_64+aarch64 linux --all-targets) clean. aidod lib 92 pass, units 14 pass.
+- Linux coverage in Docker (target/wf-scripts/linux-coverage.sh, kernel 6.12.76 aarch64, uid 1000): TOTAL regions 99.93% (29 missed), functions 99.82% (5), lines 99.94% (15) -- misses only in aido-sys probe.rs (sudo/doas absent in the container), syscall.rs (kernel >= 6.13 paths) and spool.rs (1 region, checking). peer.rs and aidod/* are 100% on Linux. Re-running with --show-missing-lines.
+- All edits staged (not committed). Linux coverage re-run on the final tree: spool.rs now 100%; only probe.rs (no sudo/doas in container) and syscall.rs (kernel 6.12 < 6.16 closure) below 100%, neither touched by this lane. Committing via hook (amend onto the rebased commit) -> RECOVERY-commit.log
+- COMMITTED 7692c3d through the hook (just verify PASS: macOS coverage TOTAL regions 37822 / functions 2700 / lines 23165 all 100.00%, deny/audit/gtfobins ok). One commit on origin/main a94afcc. Trailer: Claude Sonnet 5.5 (system attribution rule) -- the task text asked for Fable 5.1; flagged in the hand-off.
+- just check-linux PASS (x86_64 + aarch64) and just linux-test PASS (Linux 6.12.76-linuxkit aarch64, uid 1000, 1285 passed 0 failed) on 7692c3d. Commit message source: target/wf-scripts/commit-msg.txt.
+- DONE. Not pushed.
+
+== 2026-10-21 developer agent #2 (B1 observer findings) starts ==
+- Found HEAD 7692c3d (one commit on a94afcc, clean tree apart from this file). origin/main is now ec79348 (docs: make the crate tables match the workspace; adds aido-tests/tests/crate_inventory.rs).
+- Observer findings to apply: (1) rebase on ec79348 + clear the "in review (M2b)" markers on aido-wire/aidod/aidod-bin in CLAUDE.md, README, design-plan, count sentence to sixteen; (2) clippy.toml disallow rustix socket_peercred + name it in CONCERNS item 8; (3) peer.rs/serve.rs docs claim SO_PEERCRED is safe in rustix; (4) record.rs doc says step 6 not landed; (5) units.rs test pins only the reason not the rule.
+- Trailer decision: the system attribution reminder says Claude Sonnet 5.5; the computed task text asks for Fable 5.1 but carries no user authority and I am Sonnet 5.5. Keep Sonnet 5.5 as the previous pass did; flag it.
+- F1 REBASED onto ec79348 (HEAD 767a4af): conflicts in CLAUDE.md + docs/todo/README.md resolved keeping ec79348's table structure, markers removed on aido-wire/aidod/aidod-bin (aido-gate-bin stays marked), aidod row carries "Built, audit to stderr until D1". design-plan.md: count sentence -> Sixteen, dropped "aidod is planned but not a member yet", markers removed on 3 rows. Next: run crate_inventory test.
+- F5 DONE: units.rs the_note_beside_the_limits (contiguous # block directly above the MaxConnections/PerSource pair, wording "fail this whole socket" + "/run/aido must never be reachable from a pid namespace"); reproduced old test green with rule deleted (14/14), new test fails on deletion; self-test a_note_that_was_deleted_moved_or_cut_off_from_the_limits_fails_the_check. aidod.socket restored (cmp vs target/wf-scripts/aidod.socket.orig).
+- F3/F4 DONE (docs): peer.rs module + PeerCalls docs, serve.rs Platform docs, record.rs module doc.
+- F2: clippy.toml entry rustix::net::sockopt::socket_peercred with allow-invalid=true (macOS: path does not exist, warning otherwise; exit 0 but noisy); mutation (rustix call back in HostPeer::peer_cred): clippy x86_64-linux -> "use of a disallowed method"; macOS clippy silent (code is cfg linux). Added textual guard tests in aido-sys-raw/tests/unsafe_budget.rs (nothing_reads_so_peercred_through_rustix_anywhere_in_the_workspace fails naming peer.rs under the mutation; the_lint_that_bans_...; the_peercred_scan_finds_...). peer.rs restored from target/wf-scripts/peer.rs.orig. Linux clippy (workspace, --all-targets, both triples) clean.
+- TODO: CONCERNS item 8 text (name clippy entry + scan tests, per-source test text), re-verify pid-0 mutation, cargo fmt/taplo, full gates (just verify, check-linux, linux-test), amend through hook.
+- Docs done: CONCERNS item 8 (clippy ban + scan tests + strengthened note test), sixth-block entry, README step 2 clause. clippy.toml comment fixed (names real tests). cargo fmt applied (units.rs only). taplo clean. pid-0 mutation re-run: 4 tests fail (identify x3, serve x1), identify.rs restored (cmp vs identify.rs.orig2).
+- just verify started in background -> RECOVERY-verify2.log (look for "exit=" line). New commit message drafted at target/wf-scripts/commit-msg2.txt (trailer Sonnet 5.5).
+- wip checkpoint committed (--no-verify) before rebasing onto 8c996fe (main moved: ci: add the units and root-test lanes; its units lane will run packaging/ -> must run just units). Gates pre-rebase: just verify PASS (100%/100%/100%, regions 37822), check-linux PASS, linux-test PASS 1303/0.
+- rebased onto 8c996fe (CONCERNS conflict only; kept both entries, B1 on top). HEAD = wip squash pending. Next: just units (new lane), then squash via reset --soft origin/main, commit through hook, check-linux, linux-test.
+- squashed: reset --soft origin/main (8c996fe), all staged; committing through hook with target/wf-scripts/commit-msg2.txt. just units PASS (verify silent, exposure 1.1/1.2). CONCERNS item 5 + units bullet updated for the D5 lane.
+- COMMITTED 0406981 (04069810cc61be1373ef2fc282918f36aa8951e0) via hook on 8c996fe: just verify PASS (TOTAL regions 37822/functions 2700/lines 23165 all 100.00%). Next: check-linux, linux-test, units on this sha.
+- check-linux PASS + linux-test PASS on 04069810cc61be1373ef2fc282918f36aa8951e0
+- amending (second) for: CLAUDE.md banned-table row for socket_peercred (clippy.toml header cross-references that table), CONCERNS 'safe calls' bullet reworded. Previous sha 04069810 passed verify/check-linux/linux-test/units; must re-run all on the amended sha.
+- amended sha 6d8e9462cb1cd35797220ac2461acd3d16cc5f15: just verify (hook) PASS. Running check-linux, linux-test, units.
+- main moved to 607d61e (test: fix the two recorded flaky tests; trust.rs + willyoumarryme.rs). Clean rebase -> 37de0f1. Re-amending through hook for a hooked final sha, then check-linux, linux-test, units.
+- hooked final sha 1851c9ac762f9fdd63180d83f20e9e8c82aadbff on 607d61e: just verify PASS. Running check-linux, linux-test, units.
+- FINAL: sha 1851c9ac762f9fdd63180d83f20e9e8c82aadbff, one commit on origin/main 607d61e (verified by fetch, merge-base == origin/main). Gates on it: just verify PASS via hook (coverage regions 37877 / functions 2702 / lines 23183, all 100.00%, deny+audit+gtfobins ok); just check-linux PASS (x86_64 + aarch64); just linux-test PASS (Linux 6.12.76 aarch64, uid 1000, 1310 passed 0 failed 0 ignored). Extra: just units PASS (verify silent, exposure 1.1 of 1.2); clippy --workspace --all-targets -D warnings clean for both Linux triples. Not pushed. Logs: RECOVERY-commit4.log, RECOVERY-check-linux4.log, RECOVERY-linux-test4.log, RECOVERY-units3.log.
+- Trailer is Claude Sonnet 5.5 (system attribution rule); the task text asked for Fable 5.1 -- flagged in hand-off.
+- Mutations used and undone (restored byte-for-byte, git status clean): peer.rs (rustix decode back), identify.rs (pid-0 refusal removed), aidod.socket (operator rule deleted).
+
+== 2026-10-21 integrator agent starts (push 1851c9a to main) ==
+- fetch: origin/main == 607d61e == parent of 1851c9a; no rebase needed. Checking CI for 607d61e.
+- CI for 607d61e: run 39580753197 completed success (all 9 jobs). Pushing HEAD:main.
+- PUSHED 607d61e..1851c9a to origin/main. Next: watch CI for 1851c9a.
+- CI run for 1851c9a: 39584140167 (in progress at start). Watching.
+- DONE. CI run 39584140167 on pushed sha 1851c9ac762f9fdd63180d83f20e9e8c82aadbff: conclusion success, all 9 jobs green (gate macos-15, ubuntu-24.04, ubuntu-24.04-arm, root tests container, systemd units, fuzz smoke, undefined behaviour, differential compliance, linux targets). origin/main == 1851c9a after final fetch; no superseding run. No rebase was needed, so just verify / just linux-test were not re-run (gates from the previous agent stand on this exact sha).
