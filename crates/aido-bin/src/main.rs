@@ -25,9 +25,11 @@ fn main() -> std::process::ExitCode {
         path: caller_path(),
     };
     let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
+    // The exec reader thread tees the child's stderr while this thread waits.
+    // Holding stderr's lock across that wait would block the tee.
+    let mut err = std::io::stderr();
     let status = aido::run(&cli, &invocation, &mut out, &mut err);
     // Falls back to "aido is unusable" rather than 0 if the status ever exceeds
     // a u8, so an unexpected value can never be read as success.
-    std::process::ExitCode::from(u8::try_from(status.as_i32()).unwrap_or(19))
+    std::process::ExitCode::from(u8::try_from(status).unwrap_or(19))
 }

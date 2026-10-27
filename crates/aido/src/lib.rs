@@ -1,11 +1,10 @@
 //! The unprivileged `aido` front-end.
 //!
-
-//!
 //! This crate parses a request, loads the root-owned ruleset, asks
-//! `aido-policy` for a decision, and renders it. It **decides nothing**, holds
-//! no secret, and at this milestone executes nothing at all: there is no
-//! privileged path yet, so every subcommand here is introspection.
+//! `aido-policy` for a decision, and renders it. It **decides nothing** and
+//! holds no secret. Every subcommand but one is introspection; `exec` asks the
+//! broker and then runs the backend's password prompt, and the broker and the
+//! gate decide again on their own.
 //!
 //! # Why the entry point lives in a different package
 //!
@@ -30,8 +29,9 @@
 pub mod agentdoc;
 pub mod cli;
 pub mod doctor;
+pub mod exec;
 pub mod render;
 pub mod rules;
 
-pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with};
+pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_in, run_with};
 pub use rules::{LoadError, LoadedRules};

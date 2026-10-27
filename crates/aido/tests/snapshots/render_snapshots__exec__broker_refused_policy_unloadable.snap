@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (policy_unloadable): the root-owned ruleset or settings could not be loaded and the broker is failing closed; an administrator must run `aido check` and `aido doctor`

@@ -359,3 +359,90 @@ fn every_denial_code_record_and_rendering_are_pinned() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `aido exec`: every string it adds is a reviewed surface.
+// ---------------------------------------------------------------------------
+
+use aido::exec::{self, ExecError};
+use aido_backend::DetectError;
+use aido_wire::{RefusalCode, ResponseError};
+
+/// The snapshot-name fragment for an error. Exhaustive, so a new variant stops
+/// this compiling until it has a place in [`exec_errors`] and so a snapshot.
+fn exec_error_slug(error: &ExecError) -> &'static str {
+    match error {
+        ExecError::NothingToRun => "nothing_to_run",
+        ExecError::NonUtf8Argument { .. } => "non_utf8_argument",
+        ExecError::InteriorNul { .. } => "interior_nul",
+        ExecError::ProgramNotAbsolute => "program_not_absolute",
+        ExecError::BrokerUnreachable => "broker_unreachable",
+        ExecError::BrokerAnswerUnreadable(_) => "broker_answer_unreadable",
+        ExecError::PermittedWithoutMint => "permitted_without_mint",
+        ExecError::MintedWithoutPermission => "minted_without_permission",
+        ExecError::GateNotTheCompiledOne => "gate_not_the_compiled_one",
+        ExecError::NoBackend(_) => "no_backend",
+        ExecError::BackendNotStarted => "backend_not_started",
+    }
+}
+
+fn exec_errors() -> Vec<ExecError> {
+    vec![
+        ExecError::NothingToRun,
+        ExecError::NonUtf8Argument { index: 2 },
+        ExecError::InteriorNul { index: 1 },
+        ExecError::ProgramNotAbsolute,
+        ExecError::BrokerUnreachable,
+        ExecError::BrokerAnswerUnreadable(ResponseError::TooLarge { limit: 262_144 }),
+        ExecError::PermittedWithoutMint,
+        ExecError::MintedWithoutPermission,
+        ExecError::GateNotTheCompiledOne,
+        ExecError::NoBackend(DetectError::NoBackend),
+        ExecError::BackendNotStarted,
+    ]
+}
+
+#[test]
+fn every_exec_refusal_is_pinned() {
+    let errors = exec_errors();
+    let slugs: std::collections::BTreeSet<_> = errors.iter().map(exec_error_slug).collect();
+    assert_eq!(slugs.len(), errors.len(), "two samples share a variant");
+    for error in &errors {
+        insta::assert_snapshot!(
+            format!("exec__{}", exec_error_slug(error)),
+            error.to_string()
+        );
+    }
+}
+
+#[test]
+fn every_broker_refusal_as_exec_prints_it_is_pinned() {
+    for code in RefusalCode::ALL {
+        insta::assert_snapshot!(
+            format!("exec__broker_refused_{}", code.as_str()),
+            exec::refusal_line(code, code.remediation())
+        );
+    }
+}
+
+#[test]
+fn the_ido_queue_line_for_every_denial_a_person_can_act_on_is_pinned() {
+    let command = ["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()];
+    let mut offered = 0;
+    for code in ALL_CODES {
+        if let Some(reason) = exec::queue_reason(code) {
+            offered += 1;
+            insta::assert_snapshot!(
+                format!("exec__queue_{}", code.as_str()),
+                exec::queue_line(reason, &command)
+            );
+        }
+    }
+    assert_eq!(offered, 2, "only a human-only or frozen denial is queued");
+}
+
+#[test]
+fn the_gate_note_and_the_signal_line_are_pinned() {
+    insta::assert_snapshot!("exec__gate_note", exec::gate_note("no_pending_request"));
+    insta::assert_snapshot!("exec__signal_line", exec::signal_line("sudo", 9));
+}

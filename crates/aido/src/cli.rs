@@ -21,6 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agentdoc::{self, DocFormat};
 use crate::doctor;
+use crate::exec::{self, Env, ProcessHop, SocketLink};
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
 
@@ -36,17 +37,18 @@ pub enum Format {
     Json,
 }
 
-/// Agent-aware privilege broker. This build performs no privileged operation.
+/// Agent-aware privilege broker. Only `exec` runs anything, and only through
+/// the broker and the backend's password prompt.
 #[derive(Debug, Parser)]
 #[command(
     name = "aido",
     version,
-    about = "Agent-aware privilege broker for Linux (beta: introspection only, executes nothing)",
+    about = "Agent-aware privilege broker for Linux (beta: `exec` runs a permitted command through the broker; the rest inspect)",
     long_about = "aido decides whether a privileged command is permitted by a root-owned \
-                  allowlist.\n\nThis build contains no privileged path: `explain`, `check`, \
-                  `why-not`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, and \
-                  `agentdoc` inspect the policy and execute nothing. \
-                  Passwordless agent execution arrives with the broker."
+                  allowlist.\n\n`explain`, `check`, `why-not`, `list`, `doctor`, `config`, \
+                  `install --dry-run`, `audit`, and `agentdoc` inspect the policy and execute \
+                  nothing. `exec` asks the broker and then runs the backend's own password \
+                  prompt. Passwordless agent execution arrives with M4."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -122,6 +124,18 @@ pub enum Command {
         /// exact command a human runs. Applies nothing.
         #[arg(long)]
         fix: bool,
+    },
+
+    /// Run a command as root, if the broker permits it.
+    ///
+    /// Asks the broker, then runs the backend's password prompt, so the human
+    /// at the terminal types their password. The command's exit status is
+    /// aido's own; `17`, `18` and `19` are aido's refusals.
+    Exec {
+        /// The command and its arguments, after `--`. The program is named by
+        /// its absolute path; nothing searches `PATH`.
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<OsString>,
     },
 
     /// Show the effective configuration and where each value came from.
@@ -214,13 +228,9 @@ pub struct Platform<'a> {
 /// Runs a parsed command, writing to `out` and `err`.
 ///
 /// Returns the process exit status. Every failure path returns a non-zero
-/// [`ExitCode`]; there is no path that reports success on an error.
-pub fn run(
-    cli: &Cli,
-    invocation: &Invocation,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
+/// status; there is no path that reports success on an error. For `exec` the
+/// status is the command's own.
+pub fn run(cli: &Cli, invocation: &Invocation, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let ops = host_ops();
     let platform = Platform {
         ops: ops.as_ref(),
@@ -231,13 +241,63 @@ pub fn run(
     run_with(cli, &platform, out, err)
 }
 
-/// Runs a parsed command against an injected platform.
+/// Runs a parsed command against an injected platform, talking to the real
+/// broker and running the real backend for `exec`.
+pub fn run_with(
+    cli: &Cli,
+    platform: &Platform<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let link = SocketLink::new(aido_wire::BROKER_SOCKET);
+    let hop = ProcessHop::new();
+    run_in(
+        cli,
+        platform,
+        &Env {
+            link: &link,
+            hop: &hop,
+        },
+        out,
+        err,
+    )
+}
+
+/// Runs a parsed command against an injected platform and an injected broker
+/// and backend.
 ///
 /// The platform is a parameter rather than a global so the fail-closed branches
 /// — a caller that cannot be observed, a platform that cannot attest — are
 /// reachable from a test. A branch that only executes on a broken machine is a
 /// branch that only gets exercised on a broken machine.
-pub fn run_with(
+pub fn run_in(
+    cli: &Cli,
+    platform: &Platform<'_>,
+    env: &Env<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    if let Command::Exec { argv } = &cli.command {
+        return match LoadedRules::from_dir(&cli.rules) {
+            Ok(loaded) => exec::run(env, cli, platform, &loaded, argv, out, err),
+            Err(load_err) => failing_closed(&load_err, err).as_i32(),
+        };
+    }
+    dispatch(cli, platform, out, err).as_i32()
+}
+
+/// Says the ruleset could not be loaded, and that aido is failing closed.
+fn failing_closed(load_err: &crate::rules::LoadError, err: &mut dyn Write) -> ExitCode {
+    let _ = writeln!(err, "aido: {load_err}");
+    let _ = writeln!(
+        err,
+        "aido: failing closed; run `aido doctor` for the platform report"
+    );
+    ExitCode::Unusable
+}
+
+/// Runs every command that is not `exec`.
+fn dispatch(
     cli: &Cli,
     platform: &Platform<'_>,
     out: &mut dyn Write,
@@ -254,14 +314,7 @@ pub fn run_with(
         ($body:expr) => {
             match &loaded {
                 Ok(loaded) => $body(loaded),
-                Err(load_err) => {
-                    let _ = writeln!(err, "aido: {load_err}");
-                    let _ = writeln!(
-                        err,
-                        "aido: failing closed; run `aido doctor` for the platform report"
-                    );
-                    return ExitCode::Unusable;
-                }
+                Err(load_err) => return failing_closed(load_err, err),
             }
         };
     }
@@ -275,6 +328,13 @@ pub fn run_with(
             *fix,
             out,
         ),
+        // Handled by `run_in`, which has the broker and the backend this
+        // function is not given. Refused rather than guessed at if it is ever
+        // dispatched here.
+        Command::Exec { .. } => {
+            let _ = writeln!(err, "aido: exec is not dispatched here; failing closed");
+            ExitCode::Unusable
+        }
         Command::Config { schema } => config(cli, *schema, out, err),
         Command::Install {
             dry_run,
@@ -545,7 +605,7 @@ fn why_not(
 /// The program is `argv[0]`. There is no `PATH` search and no resolution: the
 /// bytes are handed to the engine, which compares them to the rule's own
 /// absolute path byte-exactly.
-fn split_program(argv: &[String]) -> (&str, &[String]) {
+pub(crate) fn split_program(argv: &[String]) -> (&str, &[String]) {
     const NOTHING: &[String] = &[];
     argv.split_first()
         .map_or(("", NOTHING), |(first, rest)| (first.as_str(), rest))
@@ -655,7 +715,7 @@ fn list(
 /// defaults would be *safe* — they are the strict values — but it would also be
 /// silent, and a settings file that does not mean what it says is exactly the
 /// condition this project refuses to paper over.
-fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
+pub(crate) fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     let mut config = ConfigSettings::default();
 
     // A missing file is not an error: the defaults are the configuration until
@@ -721,7 +781,7 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
 }
 
 /// Classifies the current process, falling back to a password-requiring caller.
-fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
+pub(crate) fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
     match ops.classify(std::process::id()) {
         Ok(facts) => facts,
         Err(e) => {
@@ -742,7 +802,7 @@ fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
 }
 
 /// Renders a decision in the requested format and maps it to an exit status.
-fn emit(cli: &Cli, decision: &Decision, out: &mut dyn Write) -> ExitCode {
+pub(crate) fn emit(cli: &Cli, decision: &Decision, out: &mut dyn Write) -> ExitCode {
     match cli.output {
         Format::Human => {
             let _ = write!(out, "{}", render::human(decision));
@@ -789,7 +849,7 @@ mod tests {
             host: &LiveHost,
             path: None,
         };
-        run_with(cli, &platform, out, err)
+        dispatch(cli, &platform, out, err)
     }
 
     /// Root for throwaway fixture directories.
@@ -944,7 +1004,7 @@ mod tests {
             host,
             path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
         };
-        let code = run_with(&cli, &platform, &mut out, &mut Vec::new());
+        let code = dispatch(&cli, &platform, &mut out, &mut Vec::new());
         (code, String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -2465,7 +2525,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut err = Vec::new();
         assert_eq!(
             run(&cli, &Invocation::default(), &mut out, &mut err),
-            ExitCode::Unusable
+            ExitCode::Unusable.as_i32()
         );
         assert!(String::from_utf8_lossy(&err).contains("cannot read the rules directory"));
     }
@@ -2478,12 +2538,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn the_help_text_says_this_build_executes_nothing() {
-        // Someone must not install this expecting it to run a command.
+    fn the_help_text_says_which_command_runs_something_and_that_the_rest_do_not() {
+        // Someone must not install this expecting every subcommand to run one.
         let err = Cli::try_parse_from(["aido", "--help"]).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("execute nothing"), "{text}");
-        assert!(text.contains("no privileged path"), "{text}");
+        assert!(text.contains("`exec` asks the broker"), "{text}");
     }
 
     #[test]
@@ -2507,5 +2567,70 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn the_parsed_command_is_debuggable() {
         let cli = Cli::try_parse_from(["aido", "explain", "--", "x"]).unwrap();
         assert!(format!("{cli:?}").contains("Explain"));
+    }
+
+    #[test]
+    fn exec_is_not_dispatched_with_the_introspection_commands() {
+        // `run_in` owns it, because it alone has the broker and the backend.
+        // Reaching this arm anyway is refused, never guessed at.
+        let fx = fixture("cli-exec-dispatch");
+        let cli = Cli::try_parse_from([
+            "aido",
+            "--rules",
+            fx.dir.to_str().unwrap(),
+            "exec",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let mut err = Vec::new();
+        let ops = host_ops();
+        let platform = Platform {
+            ops: ops.as_ref(),
+            probe: &HostProbe,
+            host: &LiveHost,
+            path: None,
+        };
+        let code = dispatch(&cli, &platform, &mut Vec::new(), &mut err);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(String::from_utf8_lossy(&err).contains("not dispatched here"));
+    }
+
+    #[test]
+    fn exec_with_an_unreadable_ruleset_fails_closed_before_anything_is_asked() {
+        let cli = Cli::try_parse_from([
+            "aido",
+            "--rules",
+            "/nonexistent/aido",
+            "exec",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let mut err = Vec::new();
+        let code = run(&cli, &Invocation::default(), &mut Vec::new(), &mut err);
+        assert_eq!(code, 19);
+        assert!(String::from_utf8_lossy(&err).contains("failing closed"));
+    }
+
+    #[test]
+    fn exec_refuses_what_the_ruleset_refuses_without_contacting_anything() {
+        // Through the real entry points: nothing in this ruleset runs
+        // `/bin/true`, so the advisory match refuses it and the real broker
+        // socket is never opened.
+        let fx = fixture("cli-exec-advisory").write("10-rules.toml", "");
+        let cli = Cli::try_parse_from([
+            "aido",
+            "--rules",
+            fx.dir.to_str().unwrap(),
+            "exec",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(&cli, &Invocation::default(), &mut out, &mut err);
+        assert_eq!(code, ExitCode::Denied.as_i32());
+        assert!(String::from_utf8_lossy(&out).starts_with("DENY"));
     }
 }

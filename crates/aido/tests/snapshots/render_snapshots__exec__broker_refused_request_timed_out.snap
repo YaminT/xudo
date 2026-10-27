@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (request_timed_out): the request did not arrive complete before the broker's timeout; aido sends it in one write, so retry the aido command

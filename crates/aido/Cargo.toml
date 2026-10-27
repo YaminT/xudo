@@ -14,6 +14,9 @@ aido-backend = { path = "../aido-backend", version = "0.0.1" }
 aido-config = { path = "../aido-config", version = "0.0.1" }
 aido-policy = { path = "../aido-policy", version = "0.0.1" }
 aido-sys = { path = "../aido-sys", version = "0.0.1" }
+# The broker's messages, and nothing else of it: the front-end builds a request
+# and parses an answer without linking the root half.
+aido-wire = { path = "../aido-wire", version = "0.0.1" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

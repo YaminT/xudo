@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::gate_note(\"no_pending_request\")"
+---
+aido: the gate refused (no_pending_request); see the audit trail

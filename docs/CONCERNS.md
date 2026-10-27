@@ -4,6 +4,100 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-22 — M2b step 3 (C1): `aido exec`, the broker round trip and the password hop
+
+`aido exec -- <program> <operands>` in the front-end library (`aido::exec`),
+wired through `aido-bin`. The advisory match is `aido_policy::evaluate_command`,
+the call `explain` makes, so a request the engine refuses is refused locally
+with the same envelope and the broker is never contacted. Then one
+`BrokerRequest` over `/run/aido/broker.sock`, `BrokerResponse::parse`, and on a
+mint `<backend.exe> -- /usr/libexec/aido/aido-gate-auth`. The wire format is
+unchanged. The proof is `aido-bin/tests/root_exec.rs` in the root lane: a real
+broker, a real `sudo`, the real gate, a password typed through a pty, a command
+that ran as uid 0 and exited 7, and 7 came back.
+
+**Decisions.**
+
+1. **The status is the child's, always; the stderr line only adds a sentence.**
+   This is the disambiguation the gate entry (decision 1) asked C1 for. A child
+   exec'd in place can exit 17, 18 or 19, so status cannot tell it from a
+   refusal. `Exited(n)` is returned unchanged. When `n` is 17, 18 or 19 *and*
+   the last line the child wrote to stderr is exactly `aido-gate: refused
+   (<[a-z_]+>, severity <[a-z]+>)`, `aido` adds `aido: the gate refused (<code>);
+   see the audit trail`. **The forgery limit:** a command may print that line
+   and exit 18, and gets a note that is wrong. Nothing is authorized on it, and
+   nothing is withheld by it: it changes one sentence. The class of the line is
+   restricted so no escape sequence gets into the note. Tests:
+   `a_child_exiting_18_without_the_gate_line_is_reported_as_its_own`,
+   `a_gate_refusal_line_with_18_is_reported_as_the_gate`,
+   `a_gate_line_with_escape_bytes_is_not_recognised`.
+2. **A signal death is reported as one.** `aido: <backend> killed by signal <n>`
+   and exit `128 + n`, the convention `status.rs` documents.
+3. **Spawn and wait, never exec.** The gate finds the broker's entry by the
+   pid and start time of an ancestor, and that ancestor is `aido`. Replacing
+   `aido` with `sudo` would remove the process the broker pinned. The lineage the
+   root test exercises is gate, sudo's `use_pty` monitor, sudo, `aido`.
+4. **The root child's stderr is a pipe, not a terminal.** Reading the gate's last
+   line needs it. The cost: a command that prints colour on `isatty(2)`, or
+   prompts there, sees a pipe. The tee is byte for byte and in real time, on a
+   reader thread, and `sudo` still prompts on `/dev/tty`, so the password
+   prompt is unaffected.
+5. **A bounded drain after the wait.** After the child exits, stderr is read for
+   at most 250 ms and *not* until end of file: a background process the command
+   started can hold the pipe open forever, and `aido` must not hang on it. The
+   gate writes its line before it exits, so it is in the pipe by then.
+   `a_grandchild_holding_stderr_does_not_hang_exec`.
+6. **SIGINT at the password prompt kills `aido` along with `sudo`**, so the shell
+   reports 130. Accepted: forwarding signals needs a handler, a handler needs
+   `unsafe` or a new dependency in the front-end, and the outcome (nothing ran,
+   the request expires in fifteen minutes) is the safe one.
+7. **The backend runs from the path detection found it at**, not from its kind:
+   Ubuntu's `sudo-rs` is `/usr/bin/sudo-rs`. The gate path is the compiled
+   `GATE_AUTH`; the string the broker names is compared with it byte for byte
+   and never executed. The invocation is `--` then the gate and nothing else,
+   because the snippet allows the gate with no arguments, and because `--` ends
+   option parsing in `sudo`, `sudo-rs` and `doas`.
+8. **No fallback.** A broker that cannot be reached is exit 19 naming the socket.
+   There is no path where `aido` runs `sudo` for a command the broker did not
+   mint for.
+9. **`claimed_classification` is the constant `unattested`.** No input reaches
+   it. `the_claimed_classification_is_a_constant_no_input_reaches`.
+10. **The `ido queue` line** is printed for `human_path_only` and `frozen`, the
+    two denials whose remediation is "hand it to a person". The list is an
+    exhaustive `match` with no `_` arm (`exec::queue_reason`), so a new denial
+    code does not compile until someone decides. Words are quoted for display
+    with doctor's single-quote quoting, never parsed back, and the whole line is
+    made safe for a terminal.
+11. **The root lane has a sentinel.** `ci/root-test.sh` makes
+    `/etc/aido-root-lane-sentinel`; a root test as uid 0 without it *panics*
+    (`aido-sys/tests/support/root_lane.rs`, shared by `#[path]`), because a skip
+    would read as a pass to anyone running `cargo test` as root by habit. The
+    existing `aido-sys` root tests go through it too. The script also installs
+    `sudo`, `passwd` and `util-linux`, and builds the broker and the gate before
+    the tests, which find them beside `aido` and refuse one older than the
+    checkout.
+
+**Open.**
+
+1. **`aido doctor` still says `exec path    absent in this build`.** Left on
+   purpose: `ci/differential/row.sh` trips on that line, and C2 owns flipping it
+   together with the executing half of the matrix. Flipping it here would turn
+   the differential red with nothing written yet to make it green.
+2. **B4's install probe is still NOT VERIFIED.** B4 (install) is not on main.
+   When it lands, its functional post-install probe must call
+   `aido exec -- <probe program>` and expect uid 0 and the program's exit
+   status, instead of printing NOT VERIFIED and naming C1.
+3. **The test command is a compiled executable, not a script.** The gate
+   executes the descriptor it validated, and a script run that way cannot find
+   its interpreter through a close-on-exec descriptor. Worth a line in the
+   operator docs when a rule names a script: it will not run.
+4. **`aido exec` as a user who cannot run the backend's probes.** The hop runs
+   `detect` as the caller. The root test shows it working as an ordinary user;
+   a backend whose functional probes need privilege would report unusable and
+   `exec` would refuse, which is the safe direction.
+
+---
+
 ## 2026-10-21 — Agent pipelines moved to boof
 
 All agent pipelines for this repository now run through boof-runner: planner

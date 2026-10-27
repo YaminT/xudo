@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::signal_line(\"sudo\", 9)"
+---
+aido: sudo killed by signal 9

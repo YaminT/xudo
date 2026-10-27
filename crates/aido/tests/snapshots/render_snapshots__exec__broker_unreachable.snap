@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+the broker at /run/aido/broker.sock did not answer; an administrator must check that aidod.socket is active and that you are in the aido group. aido does not fall back to running sudo itself

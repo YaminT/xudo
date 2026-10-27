@@ -787,7 +787,7 @@ fn proposals_section(proposals: &[Proposal], prefixed: bool) -> String {
 /// One argument, quoted so a POSIX shell, bash, zsh, and fish all read it as
 /// the same single word. The proposals carry printable ASCII without a
 /// backslash, so single quotes, with `'` written `'\''`, are enough.
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .bytes()
@@ -801,7 +801,7 @@ fn shell_quote(word: &str) -> String {
 
 /// Machine-derived text, made safe for a terminal, flagged when anything was
 /// removed or altered.
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     flagged(term_sanitize::display_str(text, LIMITS))
 }
 

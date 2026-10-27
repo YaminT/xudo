@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (request_too_large): the request is longer than the broker reads; no rule permits a command this long, so shorten it rather than retrying
