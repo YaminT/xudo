@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+the broker's answer could not be read (the response is longer than 262144 bytes); failing closed

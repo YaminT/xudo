@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (nonce_collision): the broker drew a nonce that already names a request, so its random source is broken; an administrator must investigate before anything is retried

@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (interior_nul): an argument contains a NUL byte, which the kernel would cut short; remove it

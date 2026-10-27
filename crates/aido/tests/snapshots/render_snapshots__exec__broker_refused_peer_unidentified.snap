@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (peer_unidentified): the broker could not establish which process asked; retry, and if it persists run `aido doctor` to see whether this host can identify a caller

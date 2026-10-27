@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (spool_full): too many requests are pending; wait for them to be used or to expire, then retry the aido command

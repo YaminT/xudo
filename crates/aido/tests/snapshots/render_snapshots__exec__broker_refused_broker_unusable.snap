@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (broker_unusable): the broker could not complete the request and failed closed; an administrator should read the broker's audit record in the journal

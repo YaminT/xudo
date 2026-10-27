@@ -111,6 +111,23 @@ fi
 echo "root-test: $(uname -sr) $(uname -m), as uid $(run id -u), on the container's own filesystem"
 cd /work
 
+# Proof, to every root test, that it is in this throwaway container. A root
+# test changes the machine (accounts, /etc, /run), so as uid 0 without this file
+# it refuses to run (crates/aido-sys/tests/support/root_lane.rs). Only this
+# script makes it, and only here, after the checkout is copied.
+touch /etc/aido-root-lane-sentinel
+
+# What the end-to-end tests drive and the slim image lacks: the real `sudo`
+# (and its `visudo`), and the account tools. Needs the network, as the crate
+# downloads do.
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends sudo passwd util-linux >/dev/null
+
+# The siblings the tests start. Cargo builds a binary for, and names it to, only
+# the tests of the package that owns it, so the broker and the gate are built
+# here, fresh, next to `aido` in the one target directory.
+run cargo build -p aido-bin -p aidod-bin -p aido-gate-bin
+
 out=$(mktemp)
 run cargo test --workspace --features root-tests --test 'root_*' "$@" 2>&1 | tee "$out"
 

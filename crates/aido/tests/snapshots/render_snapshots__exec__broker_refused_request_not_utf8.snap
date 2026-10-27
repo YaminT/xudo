@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (request_not_utf8): the request is not UTF-8; aido refuses a non-UTF-8 argument before it sends anything, so this request did not come from aido

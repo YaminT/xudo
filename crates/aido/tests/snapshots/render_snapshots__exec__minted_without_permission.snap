@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+the broker minted a request for a command it did not permit; failing closed

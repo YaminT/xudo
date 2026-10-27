@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (request_wrong_schema): the request declares a schema this broker does not implement; install aido and aidod from the same release

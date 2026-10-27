@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::refusal_line(code, code.remediation())"
+---
+aido: the broker refused the request (spool_unusable): the broker cannot use its spool; an administrator must check that /run/aido/req is a root-owned 0700 directory (systemd-tmpfiles --create)

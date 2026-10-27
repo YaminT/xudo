@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+no privilege backend found: neither /usr/bin/sudo nor /usr/bin/doas exists. aido delegates every uid transition and performs none itself, so it cannot operate here

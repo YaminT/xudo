@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+name the program by its absolute path; aido never searches PATH

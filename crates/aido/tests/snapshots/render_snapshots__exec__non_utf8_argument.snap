@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+argument 2 is not valid UTF-8, and aido never converts one lossily; nothing was sent

@@ -568,6 +568,11 @@ struct Matched {
     /// entry's claim, and [`PendingRequest::validate`] is asked whether the
     /// claim is true of *this*. A pin made from the claim would be checked
     /// against itself, and a match that was wrong would sail through.
+    ///
+    /// `pinned_to` only matches an ancestor whose pid and starttime equal the
+    /// claim, so the two are equal by construction today: the check guards
+    /// a later change to the matcher, and is seen only by a test that builds
+    /// a `Matched` by hand.
     caller: CallerPin,
 }
 

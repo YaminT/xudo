@@ -24,7 +24,9 @@
 //!   A `[[test]]` entry with `required-features = ["root-tests"]` makes a build
 //!   without the feature refuse to run the target instead of running it empty,
 //!   as this file's entry does.
-//! * Begin each test with `if !root_or_skip("<its name>") { return; }`. Suites
+//! * Begin each test with `if !root_or_skip("<its name>") { return; }`, from
+//!   `support/root_lane.rs`, which refuses (panics) as uid 0 without the
+//!   sentinel file `ci/root-test.sh` makes in the container. Suites
 //!   that enable every feature (`just test`, `just linux-test`, coverage) build
 //!   this file and run it as an ordinary user, where it must neither fail nor
 //!   pretend to have run. The lane reads the output and fails on any `SKIPPED:`
@@ -42,7 +44,7 @@
     clippy::indexing_slicing
 )]
 
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, OpenOptions, Permissions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::path::PathBuf;
 
@@ -58,21 +60,20 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// `true` when the calling test should go on. Otherwise says so on standard
-/// error, which `ci/root-test.sh` turns into a failure, and the caller returns.
-///
-/// Root is judged by the files this process makes. The standard library has no
-/// `geteuid` and `unsafe` is forbidden, and the owner of a file a process
-/// creates is the identity every operation in these tests acts as. The probe is
-/// the test's own, because the tests run in parallel outside the lane.
-fn root_or_skip(test: &str) -> bool {
-    let probe = scratch(&format!("{test}-identity")).join("probe");
-    File::create(&probe).unwrap();
-    if fs::metadata(&probe).unwrap().uid() == 0 {
-        return true;
+#[path = "support/root_lane.rs"]
+mod lane;
+
+use lane::root_or_skip;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_lane_announces_itself_with_the_sentinel() {
+    if !root_or_skip("the_lane_announces_itself_with_the_sentinel") {
+        return;
     }
-    eprintln!("SKIPPED: {test} needs uid 0; ci/root-test.sh runs it for real");
-    false
+    // `root_or_skip` already refused a root run without it; this pins that the
+    // script, and not something else, is what made it.
+    assert!(PathBuf::from(lane::SENTINEL).is_file());
 }
 
 #[cfg(target_os = "linux")]

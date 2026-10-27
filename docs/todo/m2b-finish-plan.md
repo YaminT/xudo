@@ -55,9 +55,9 @@ this file adopts as the exit test. All of these true, with Linux evidence:
 2. A socket-activated root broker identifies its peer by the kernel, classifies,
    decides with the same engine `explain` uses, and mints bounded one-use
    requests. *(B1)*
-3. `aido exec` makes the broker round-trip, execs the backend's `PASSWD` hop,
+3. `aido exec` makes the broker round-trip, runs the backend's `PASSWD` hop,
    and passes the backend's exit status through; a human is prompted on a real
-   pty. *(C1, verification row 2)*
+   pty. *(C1, verification row 2; **done**, `aido-bin/tests/root_exec.rs`)*
 4. The auth-only gate re-decides from root-owned state, consumes the nonce
    before anything runs, execs the validated descriptor with the hardening list,
    and propagates status and signals faithfully. *(B3)*
@@ -110,7 +110,7 @@ exit. Packaging stays in phase 3.
 
 ### C. New builds *(after B; C1 before C2)*
 
-- **C1. Step 3, `aido exec`.** Front-end round-trip over `aido-wire`; exec of
+- **C1. Step 3, `aido exec`.** **DONE 2026-10-22.** Front-end round-trip over `aido-wire`; exec of
   the backend's `PASSWD` hop; backend exit status passed through byte for byte;
   a denial whose remediation is "a human must run this" prints the exact
   `ido queue` line; `rexpect` test of the password prompt on a real pty. This is

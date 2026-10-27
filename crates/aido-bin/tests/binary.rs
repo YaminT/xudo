@@ -239,3 +239,56 @@ fn an_unknown_subcommand_fails_rather_than_defaulting_to_something() {
         .assert()
         .failure();
 }
+
+#[test]
+fn exec_without_a_broker_is_refused_with_nineteen_and_does_not_fall_back() {
+    // A permitted command, so the advisory match lets it through to the broker,
+    // whose socket does not exist here. The refusal names the socket and the
+    // process runs nothing: there is no `sudo` fallback to observe, and the
+    // status is aido's "failed closed", not a child's.
+    aido(&rules_dir("bin-exec-nobroker"))
+        .args([
+            "exec",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
+        ])
+        .assert()
+        .code(19)
+        .stderr(contains("/run/aido/broker.sock").and(contains("does not fall back")));
+}
+
+#[test]
+fn exec_refuses_a_non_utf8_argument_without_echoing_a_lossy_copy() {
+    use std::os::unix::ffi::OsStrExt;
+    let output = aido(&rules_dir("bin-exec-non-utf8"))
+        .arg("exec")
+        .arg("--")
+        .arg("/usr/bin/systemctl")
+        .arg(std::ffi::OsStr::from_bytes(b"restart\xff"))
+        .assert()
+        .code(19)
+        .stderr(contains("argument 1 is not valid UTF-8"))
+        .get_output()
+        .clone();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains('\u{fffd}'),
+        "{:?}",
+        output.stderr
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn exec_prints_a_denial_byte_for_byte_as_explain_prints_it() {
+    let dir = rules_dir("bin-exec-denied");
+    let argv = ["--", "/usr/bin/systemctl", "restart", "nginx"];
+    let explained = aido(&dir).arg("explain").args(argv).assert().code(17);
+    let executed = aido(&dir).arg("exec").args(argv).assert().code(17);
+    assert_eq!(
+        explained.get_output().stdout,
+        executed.get_output().stdout,
+        "exec and explain disagree about the same command"
+    );
+}

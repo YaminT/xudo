@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: "exec::queue_line(reason, &command)"
+---
+ido queue -m 'aido refused this for an agent: a person must run it' -- /usr/bin/apt-get upgrade

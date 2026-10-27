@@ -1,0 +1,5 @@
+---
+source: crates/aido/tests/render_snapshots.rs
+expression: error.to_string()
+---
+argument 1 contains a NUL byte, which the kernel would cut short; nothing was sent

@@ -25,10 +25,31 @@ clap.workspace = true
 # it. From any other package `cargo_bin` falls back to whatever `aido` happens
 # to be sitting in the target directory: missing on a clean CI runner, and
 # silently stale on a developer's machine.
+[features]
+# The tests that must run as uid 0: `tests/root_exec.rs`. Only
+# `ci/root-test.sh` (`just root-test`) runs them as root; the suites that
+# enable every feature build them and let them skip, loudly, as anyone else.
+# Nothing shipped reads this feature; it selects tests and changes no behaviour.
+root-tests = []
+
+# Without the feature the target does not exist, so a run that forgot it fails
+# ("requires the features") rather than running an empty binary and passing.
+[[test]]
+name = "root_exec"
+required-features = ["root-tests"]
+
 [dev-dependencies]
+aido-backend = { path = "../aido-backend", version = "0.0.1" }
+aido-sys = { path = "../aido-sys", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
+
+# A real pseudo-terminal for the password prompt: `sudo` reads the password from
+# /dev/tty, so nothing short of a pty shows that a human at a terminal can type
+# one. Linux only, and only the root lane's test drives it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rexpect = "0.6"
 
 [lints]
 workspace = true
