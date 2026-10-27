@@ -1,0 +1,109 @@
+RECOVERY LOG — STEP 7 (refuse a ruleset on a filesystem mounted by a non-root user)
+Worktree: /Users/yamin-mac/codes/aido/.claude/worktrees/wf_87180089-132-5
+Branch:   worktree-wf_87180089-132-5
+This file is never committed.
+
+== 2026-10-19 recovery agent #1 ==
+
+[1] git status at start: HEAD 2e0943c, uncommitted:
+    M Cargo.lock, crates/aido-sys/{Cargo.toml,src/lib.rs,src/proc.rs,src/trust.rs},
+    crates/aido/src/{cli.rs,rules.rs}, docs/{CONCERNS.md,todo/README.md}
+    ?? crates/aido-sys/src/mounts.rs (824 lines), crates/aido-sys/tests/mountinfo.rs (137 lines)
+[2] git fetch origin -> ok. origin/main = d685d0a (fix(policy): enforce strictest overlapping rules)
+    HEAD (2e0943c) != origin/main -> need WIP commit + rebase.
+[3] Read the whole recovered diff + new files + earlier agent transcript tail (agent-ad4a826471e2fac9c).
+    Earlier agent had finished implementation, verify-1/2 logs present in target/probe/, its linux-test-1
+    run passed (exit=0) on a tree just before a last wording edit; it died while preparing the commit.
+[4] git add -u + new files; git commit --no-verify -m "wip: recovered step 7" -> 90b6d1d
+[5] git rebase origin/main -> conflict only in docs/CONCERNS.md (both added a top entry).
+    Resolved: step 7 entry on top, then step 2b, then step 1 (python script, markers removed).
+    trust.rs auto-merged; main (2b) had fixed the macOS sun_path socket test with a relative bind path,
+    so reverted our redundant canonicalize() in trust.rs tests' scratch_dir to main's version.
+    git rebase --continue -> 553a09c "wip: recovered step 7" on top of d685d0a.
+[6] cargo test -p aido-sys -p aido --all-features (macOS) -> all pass.
+[7] just verify (macOS, post-rebase, before any further edit) -> exit 0, "gate: all checks passed".
+    Coverage TOTAL regions 26570/0 missed, functions 1960/0, lines 16504/0 = 100% each.
+    Log: target/probe/verify-r1.log
+[8] Review-driven hardening (my changes on top of the recovered work):
+    a) UntrustedMount Display escapes fs_type/mount_point with [u8]::escape_ascii (a FUSE subtype is
+       daemon-chosen; kernel escapes only " \t\n\\"; ESC/BEL would reach root's terminal raw; decoded \012
+       could forge a doctor line). Test: mounts::tests::a_fuse_subtype_cannot_write_to_the_terminal_that_shows_its_refusal
+    b) read_toml_at judges the mounts of above+dir BEFORE listing the directory, files' mounts after opening,
+       before reading (2 inspections). Test: trust::tests::a_directory_on_a_refused_mount_is_not_listed_so_its_daemon_cannot_pick_the_refusal
+       FakeMounts Ids::Each now answers across inspections (Cell cursor `asked`).
+    c) walk(target, owner, target_is_dir): directory readers open the target O_DIRECTORY, so a file target is
+       refused by the open before any mount query (macOS tests expected "cannot be inspected").
+       Test added: a_descriptor_that_cannot_be_listed_is_refused_naming_it (keeps open_rule_files' `?` covered).
+    d) reverted the canonicalize() in trust tests' scratch_dir (main fixed the socket path differently).
+[9] cargo test -p aido-sys -p aido (macOS) -> all pass (161 aido-sys lib tests).
+[10] just coverage-clean && just coverage (macOS) -> exit 0; TOTAL 100% regions/functions/lines
+     (mounts.rs 443 regions, trust.rs 1304, proc.rs 833, aido/cli.rs 2206 — all 100%). Log target/probe/coverage-r2.log
+[11] target/probe/linux-cov.sh (one-off; CI's exact llvm-cov flags in Docker, uid 1000, Linux 6.12.76-linuxkit aarch64)
+     -> step-7 files all 100% on Linux (mounts.rs 652 regions, proc.rs 833, trust.rs 1315, aido/cli.rs 2223).
+     Workspace TOTAL 99.90%: gaps only in aido-sys/src/probe.rs (HostProbe sudo probes: no sudo in rust:slim image)
+     and aido-sys/src/syscall.rs (step-1 code; 1 fn) — untouched by step 7; main's GitHub CI is green.
+     Log target/probe/linux-cov-1.log
+[12] Mutant A (list dir before judging its mount) -> killed by
+     a_directory_on_a_refused_mount_is_not_listed_so_its_daemon_cannot_pick_the_refusal. File restored (cmp identical).
+[13] Mutant B (render fs_type/mount_point raw) -> killed by
+     a_fuse_subtype_cannot_write_to_the_terminal_that_shows_its_refusal. File restored (cmp identical).
+[14] Docs: CONCERNS step-7 entry updated (order, escaping, mutants, recovered-work note, 2 new open items,
+     measured paragraph), todo README status line + step 7 line, design-plan deviation bullet.
+[15] Started: just verify (macOS) -> target/probe/verify-r3.log ; just linux-test -> target/probe/linux-test-r1.log
+[16] just verify (macOS, final tree) -> exit 0, gate: all checks passed, TOTAL 100% regions/functions/lines
+     (26690 regions, 1964 functions, 16558 lines). Log target/probe/verify-r3.log
+[17] just check-linux -> exit 0, 0 warnings (x86_64 + aarch64). Log target/probe/check-linux-r1.log
+[18] cargo clippy --workspace --all-targets --all-features --target {x86_64,aarch64}-unknown-linux-gnu -- -D warnings
+     (CARGO_TARGET_DIR=target/clippy-linux) -> clean. Log target/probe/clippy-linux.log
+[19] just linux-test -> exit 0 (Linux 6.12.76-linuxkit aarch64, uid 1000), 0 FAILED; real-/proc tests ran:
+     mounts::tests::linux::*, trust::tests::{on_linux_the_real_mount_table..., procfs_is_refused...},
+     cli::tests::{the_trust_line_reports_a_root_owned_path_as_trusted, doctor_names_the_mount...}.
+     Log target/probe/linux-test-r1.log
+[20] Next: stage code+docs (not this file), git commit --amend through the hook with the final message.
+[21] Mutant C (skip the rule files' mount check) -> killed by
+     a_rule_file_on_a_refused_mount_is_refused_before_any_file_is_read. File restored (cmp identical).
+[22] git add mounts.rs trust.rs CONCERNS.md design-plan.md todo/README.md;
+     git commit --amend -F target/probe/commit-msg.txt (through the pre-commit hook = just verify)
+     -> log target/probe/commit-r1.log
+[23] Commit through the hook: pre-commit ran `just verify` -> gate: all checks passed (TOTAL 100%/100%/100%).
+     HEAD = 9dbc54c "fix(sys): refuse rules on a user-made mount" on worktree-wf_87180089-132-5, parent d685d0a
+     (= origin/main). Single commit; working tree clean except this file. STATUS: READY. Not pushed, not merged.
+
+== 2026-10-19 review-fix agent (applying review:7 findings) ==
+
+[R1] Read journal wf_6f9e4c60-a76 lines 5 (recover:7) and 8 (review:7). Start: HEAD 9dbc54c, clean except this file.
+[R2] git fetch origin -> origin/main 113ed0f (docs: howiwork.md). git rebase origin/main -> conflict only in
+     docs/CONCERNS.md (both added a top entry). Resolved with target/review-fix/resolve_concerns.py: step 7 entry
+     first (newest), then howiwork entry, then step 2b; all entries kept, separators restored.
+     git rebase --continue -> de33178 on 113ed0f.
+
+== 2026-10-19 review-fix agent #2 (retry; #1 stopped after R2) ==
+
+[R3] Start: HEAD de33178 on 113ed0f, clean except this file. Read journal lines 5+8 again.
+[R4] Verified finding 2: mutant (a) mounts.rs "(Some(0), None) => return None," and mutant (b)
+     trust.rs check over walked.above() both SURVIVE `cargo test -p aido-sys --lib` (161 pass). Restored (cmp).
+[R5] Plan: F1 MountPolicy {RootPath, Ruleset} param on mounts::check; F2 tests; F3 reorder (O_PATH probe,
+     judge mount per component, then fstat; reopen target by name + (st_dev,st_ino) identity check);
+     F4 user_namespace_from(Result<CString,Errno>) with ENOENT -> initial; F5 docs. Checkpoint after each.
+[R6] F1+F2 done: MountPolicy{RootPath,Ruleset}; tests a_spool_on_a_nosuid_mount_opens_while_rules_there_are_refused, a_root_mounted_fuse_still_carries_the_marks_of_a_user_mount, a_user_mount_over_the_target_file_itself_is_refused, the_marks_of_a_user_mount_are_refused_for_the_ruleset; procfs test now read_trusted_dir refused + open_trusted ok. Mutants A-F killed. Checkpoint commit: cda20bb
+[R7] F3 done: walk = per component probe (O_PATH on Linux, RDONLY|NONBLOCK off Linux) -> mounts::check one fd -> fstat+check;
+     target/rule files reopened by name, identity (st_dev,st_ino) vs held probe -> TrustError::Replaced. statat fallback removed.
+     FakeMounts.meanwhile hook (Box<dyn Fn(usize)>) for swap tests. Tests: the_owner_a_daemon_reports_is_never_asked_for_before_its_mount_is_refused,
+     on_linux_a_component_nobody_may_open_is_still_refused_for_its_mount, a_rule_file_replaced_after_it_passed_is_refused_rather_than_read,
+     a_target_swapped_after_it_passed_is_refused_rather_than_opened; walk tests moved to FakeMounts::ext4 (macOS fails at / otherwise).
+     macOS 166 pass; Linux 6.12 docker (snapshot target/review-fix/snap, F1-F3) all pass: target/review-fix/logs/linux-test-f3.log
+[R8] F4 code: host::user_namespace_from(Result<CString,Errno>) NOENT->INITIAL; test a_kernel_without_user_namespaces_is_not_refused_as_unreadable (linux-only).
+     mounts.rs doc nits (3.17, user_id relative to mount's userns) and NamespacedRoot doc/message done (F5 part).
+     Checkpoint: d5dbe7c. Linux run for F4 pending.
+[R9] Added tests a_rule_file_bound_nosuid_over_the_ruleset_is_refused, rules-dir-itself nosuid case, the_stat_of_a_link_or_a_socket_is_never_taken_for_a_file (macOS facts_of arms). Meanwhile hook now Fn(). aido-sys macOS coverage trust/mounts/proc 100%. Mutants M1,M2,M4-M10,A,E,F,O1-O5 all killed. Checkpoint c75002d.
+[R10] Linux 6.12 docker CI-coverage run on snapshot of c75002d: all tests pass; mounts.rs/proc.rs/trust.rs/aido cli.rs 100% regions/functions/lines; only gaps probe.rs (no sudo in image) + syscall.rs (no PIDFD_GET_INFO on 6.12), both untouched, as before. Log target/review-fix/logs/linux-cov-f4.log. Docs in progress: SECURITY.md, design-plan, todo README, CONCERNS.
+[R11] Real-kernel FUSE probe (privileged docker, Linux 6.12, fuse-overlayfs as uid 1000 on /opt/aido, probed as root; old=de33178 vs new): no allow_other old 'Permission denied' / new FuseUser; allow_other old 'owned by uid 1000' / new FuseUser; daemon SIGSTOP old timed out (10s) / new FuseUser promptly. Log target/review-fix/logs/fuseprobe.log. Volume aido-review7-target removed.
+[R12] Docs: SECURITY.md stale line rewritten + open item; design-plan deviation bullet; todo README step 7 line; CONCERNS step 7 entry updated (order, policy, userns, table reads, decisions, mutants, review-look-at, still open + writable-device item, stall closed, 'What review found' section). Checkpoint b8fb844. Next: just verify, check-linux, linux-test, then squash.
+[R13] just verify (macOS, tree b8fb844 + doc-comment edit) exit 0: TOTAL 100% regions 27079 / functions 1987 / lines 16794. Log target/review-fix/logs/verify-1.log
+[R14] just check-linux exit 0, 0 warnings (x86_64 + aarch64). Log target/review-fix/logs/check-linux.log
+[R15] just linux-test (ci/linux-test.sh on git-archive snapshot of b8fb844) exit 0: 957 tests ok, 0 failed, Linux 6.12.76 aarch64 uid 1000. Log target/review-fix/logs/linux-test-final.log
+[R16] Squashing: git reset --soft 113ed0f; git commit -F target/review-fix/commit-msg.txt (through the pre-commit hook = just verify). Pre-squash tip c3bf28d (wip chain cda20bb..c3bf28d on de33178). Log target/review-fix/logs/commit-final.log
+[R17] Squashed: 3afeae8 'fix(sys): refuse rules on a user-made mount' on 113ed0f, through the hook (just verify: gate passed, TOTAL 100%/100%/100%). Diff vs Linux-tested snapshot b8fb844: doc comment + CONCERNS only. Running just linux-test on the final tree.
+[R18] CONCERNS wording fix (no 'reproduced' overclaim; 'root-made mount of a writable device'); amending 3afeae8 through the hook (log target/review-fix/logs/commit-amend.log). just check-linux on 3afeae8: exit 0, 0 warnings. just linux-test on final tree running (log target/review-fix/logs/linux-test-3afeae8.log).
+[R19] Amended through the hook: gate passed, TOTAL 100%/100%/100% (27079 regions, 1987 functions, 16794 lines). HEAD b39acf3.
+[R20] just linux-test on the final tree (b39acf3, worktree copy) exit 0: 957 tests ok, 0 failed, Linux 6.12.76 aarch64 uid 1000. STATUS: READY. Final sha b39acf301c9192d8564ddfc5857afaeac2ee8b9e. Not pushed, not merged.
