@@ -1,0 +1,169 @@
+RECOVERY LOG -- STEP 4b (aido doctor --json, --fix, every-other-path-to-root report)
+Worktree: /Users/yamin-mac/codes/aido/.claude/worktrees/wf_87180089-132-3
+Branch:   worktree-wf_87180089-132-3
+This file is never committed. Append-only running log.
+
+== 2026-10-19 session 2 (recovery agent) ==
+- git status at start: base 13c9bc7; modified crates/aido-backend/src/{detect.rs,lib.rs};
+  untracked crates/aido-backend/src/paths_to_root.rs + paths_to_root/{config,accounts,memory,proposals,tests,walk}.rs (~4200 lines)
+- git fetch origin: ok; origin/main = d685d0a (step 2b) on top of 2e0943c (step 1)
+- WIP checkpoint: git add crates/aido-backend/... ; git commit --no-verify -m "wip: recovered step 4b" -> e379dfb (9 files, +4249/-5)
+- git rebase origin/main: clean, no conflicts -> 45a03e8 on top of d685d0a
+- Reviewed recovered code. Changes to aido-backend paths_to_root (pure report):
+  * walk.rs rewritten: kernel-style component lookup (links followed hop by hop, `..` physical);
+    every traversed dir and every link's dir examined (catches /usr/bin/x -> /etc/alternatives/x hops);
+    symlink entries of trusted dirs followed; devices/sockets/fifos judged by owner only (/dev/null masked units).
+  * HostView trait: removed canonical(), added read_link(); read() = regular files only, MAX_READ cap,
+    NOT_A_REGULAR_FILE / TOO_LARGE shared messages.
+  * passwordless: /etc/sudoers unreadable -> also read /etc/sudoers.d (note says so).
+  * user PATH: only entries ahead of the backend dir are findings; note counts the rest.
+  * root home: unverified files collapsed into one entry when all fail alike (0700 /root).
+  * proposals: root-trusted paths owned by subject now offered back to root; commands only from
+    printable-ASCII args (else by hand); MemoryHost builder writable() renamed acl_writable().
+  * config::number without unreachable from_utf8 branch.
+- tests.rs rewritten coverage-clean (Option helpers, no let-else panics / one-armed matches).
+- cargo test -p aido-backend: 122 passed. cargo llvm-cov --package aido-backend: 100/100/100 (macOS).
+- aido-sys: new crates/aido-sys/src/live.rs (LiveHost: HostView over std::fs + rustix; read = O_NONBLOCK|O_NOCTTY
+  open, fstat regular-only, capped). rustix feature "process" added. 11 tests pass.
+- aido front-end: new crates/aido/src/doctor.rs (Report/KernelReport/RulesetReport/CallerReport/BackendReport,
+  gather(), human(), run(); --json envelope schema_version 1; --fix prints proposals, applies nothing);
+  cli.rs: Platform{ops,probe,host,path} + Invocation{path}; run(cli,&invocation,..), run_with(cli,&platform,..);
+  Command::Doctor{json,fix}; old inline doctor/trust_line/report_backend/capability_label moved to doctor.rs.
+  term-sanitize added as aido dependency. 5 new insta snapshots in crates/aido/src/snapshots/aido__doctor__*.
+- aido-bin: main reads PATH once (#[allow(clippy::disallowed_methods)]) -> Invocation; 3 new process tests.
+- cargo test -p aido -p aido-bin -p aido-backend: all pass.
+- Fixed parallel-test races (unique fixture dirs), a lazily-evaluated assert message region in live.rs,
+  two clippy lints (single_match_else, assertions_on_constants).
+- just verify (macOS): PASS, exit 0. Coverage TOTAL 100.00% regions / functions / lines. cargo deny ok,
+  gtfobins ok, no-ignored-passes clean. Log: target/verify-4b.log
+- just check-linux: PASS (x86_64 + aarch64 linux-gnu). Log: target/check-linux-4b.log
+- just linux-test: PASS, 996 passed / 0 failed, Linux 6.12.76-linuxkit aarch64 as uid 1000. Log: target/linux-test-4b.log
+- Docs: SECURITY.md (what doctor reports / cannot see), docs/todo/README.md (4b DONE 2026-10-19, status, M1 note,
+  verification row 1), README.md doctor line, CLAUDE.md aido-bin row (PATH), docs/CONCERNS.md new top entry.
+- Extra: coverage gate inside Docker (target/cov-linux/run.sh, separate volumes): every file this step touches 100%;
+  workspace 99.91% only from aido-sys/src/probe.rs (image has no sudo) and syscall.rs (kernel 6.12 < 6.13 path),
+  both untouched by this step. Log: target/cov-linux/out.log
+- origin/main moved to 113ed0f (docs: howiwork.md; touches CLAUDE.md line 2, CONCERNS top, .taplo.toml).
+  Plan: git commit --amend (hook) -> git rebase origin/main (resolve CONCERNS) -> git commit --amend --no-edit (hook).
+- git commit --amend -F target/commit-msg-4b.txt (hook: just verify PASS) -> ebea24d
+- git fetch; git rebase origin/main (113ed0f): conflict in docs/CONCERNS.md only (both new top entries); kept both,
+  4b first. rebase --continue (no hook) -> dea96f7; git commit --amend --no-edit (hook: just verify PASS) -> c1bf393
+- final linux-test on c1bf393: PASS 996/0 (target/linux-test-final-4b.log); check-linux on c1bf393: PASS
+- Extra: just differential on c1bf393: PASS, 5 rows identical verdicts, every backend report as expected
+  (target/differential-4b.log). doctor's new section prints as root in the rows and matches no harness regex.
+- STATUS: READY. Final commit c1bf39378e125470aa0f5c099caddafc945ae82f on origin/main 113ed0f. Nothing pushed.
+
+== 2026-10-19 session 3 (review-fix agent) ==
+- Task: apply review of 4b (journal line 5, agent a0c8b2d1956dc0597); review text saved to target/review4b/review.md
+- Reviewer files survive: /tmp/aido-review-m2XhaO/.../review_tests.rs (E1-E13), /tmp/aido-review-scripts/
+- git fetch; git rebase origin/main (89f7029): clean -> 11edd05 (step commit, rebased)
+- Plan: one wip commit per finding (git commit --no-verify -m "wip: <finding>"), squash at end.
+- session 4: HEAD 11edd05, no wips yet; starting findings 2,1,...
+- wip commit: findings 2,3,6 (config lexing, includes, maybe-names) done; coverage not yet measured
+- wip: finding 1 done
+- wip: findings 4,7,11 done (Kind::CharDevice added, MemoryHost owned_link/char_device)
+- wip: findings 9,12,15 done
+- wip: findings 5,8,13 done (proposals); remaining: 10 (json ascii + prose safe()), 14 docs, aido/doctor snapshots, docs; then coverage
+- wip: finding 10 done; remaining: 14 docs + doc touch-ups, coverage run, rebase/squash/gates
+- wip: docs done (SECURITY, CONCERNS, todo, README); next: just coverage, then rebase+squash+gates
+- soft-reset to 11edd05 (all fixes staged); next: rebase onto origin/main, amend via hook
+- rebased onto origin/main aebfd15, conflicts resolved (SECURITY, CONCERNS both kept, todo status, cli.rs trust_line moved to doctor.rs trust_report/trust_line); next: snapshots, hook amend, gates
+- snapshots updated for merged trust text; doctor tests pin trust (macOS has no mount table). next: amend via hook (just verify), check-linux, linux-test
+- amended through hook: just verify PASS, sha 628c3ce, TOTAL 100/100/100; next check-linux, linux-test
+- linux-test found cfg(linux) test using old run_with signature in cli.rs (merge artifact); fixed -> run_on; must re-amend via hook and rerun all gates
+- final sha 4807ab7: just verify PASS (hook), TOTAL 100/100/100
+- check-linux PASS, linux-test PASS 1184/0 on 4807ab7. STATUS: READY. nothing pushed
+- session 5: observer findings (sudo '#' mid-word comment; doas lexer) on 4807ab7; starting
+- fixes+tests+docs written (config.rs Dialect enum); next: amend via hook, check-linux, linux-test, rebase/merge main
+- hook run 1 failed once on ido-bin argv_is_never_passed_through_a_shell (flaky, passes 3x alone); retrying amend
+
+== 2026-10-21 session 6 (B2, doctor round 5 developer; model sonnet) ==
+- Found HEAD 002230e (amended 2026-10-19 18:08) already carrying the round-5 decision: config.rs Dialect/Logical/Reading,
+  lines_ending_in_a_backslash(), tests, SECURITY.md, CONCERNS "Fifth round", todo README. No wip commit on top, tree clean.
+- git fetch; git rebase origin/main (a94afcc, adds docs/todo/m2b-finish-plan.md): clean, no conflicts.
+- Plan: audit every requirement of the request against the code/tests/docs (not assume), run real sudo/doas if a container
+  is available, fix gaps, then just verify / check-linux / linux-test on the final sha.
+- Audit result: HEAD already has the round-5 decision implemented + tests at both levels (include path ending in a backslash,
+  doas word split uid 1000, cases L/M/N/P/R, grid property test) + docs. Gaps found vs the request:
+    (1) no `:2\` + `7` (gid 27) case (the request names it; only :10\ + 00 exists); needs a caller in gid 27 (clean_for(caller(&[ME,27])))
+    (2) docs do not name plan item D3 (docs/todo/m2b-finish-plan.md) as the real fix; docs/todo/README.md 4b entry and SECURITY.md
+        paragraph are garbled by earlier edits and partly stale ("trailing backslash with blanks only after a blank ... modelled")
+    (3) commit trailer: task text says Fable 5.1, harness attribution reminder for this session says Sonnet 5.5 -> using Sonnet 5.5, flag it
+    (4) three gates not yet run on the rebased sha
+- Reference sources saved (untrusted data, scratch only): /tmp/b2-sudo-src/toke.l (sudo v1.9.16p2), /tmp/b2-doas-src/parse.y (OpenDoas v6.8.2)
+- Docker is up; debian:trixie-slim cached; building a sudo+opendoas image b2-sudo-doas for probes (scripts in /tmp/b2-scripts)
+- Real-program evidence gathered (image b2-sudo-doas = debian trixie sudo 1.9.16p2 + opendoas 6.8.2; scripts /tmp/b2-scripts/probe*.sh,
+  cases /tmp/b2-cases-{1,2,3}): doas `10\`+`00` and `:2\`+`7` PASSWORDLESS for yamin (uid 1000, gid 27); doas `nopas\s yamin`
+  PASSWORDLESS (OpenDoas drops the backslash of an escape; `nop\`+`ass` is a parse error: an escaped newline makes the word non-keyword);
+  sudo `@include`/`#include /p\` + rule: path keeps the backslash, next line is its own rule (PASSWORDLESS);
+  sudo `Defaults:alice lecture_file=/etc/x\ ` or `alice ALL=(ALL) ALL # note \` then `@include /etc/sudo-extra`
+  (also #include, @includedir, #includedir): the include IS honoured (PASSWORDLESS); where the backslash really joins it is not.
+- Code changes this session (config.rs, tests.rs), all passing (182 tests in aido-backend):
+  * spelled_with_or_without_escapes(): doas uncertain lines are searched for `nopass` as written and with backslashes removed
+  * Logical.later: includes starting a later physical line of an uncertain logical line are followed (hidden include, s8..s13)
+  * tests: gid 27 case (`:2\`+`7`) at both levels with clean_for(caller(&[ME,27])); doas escaped keyword; include on a later line;
+    property test widened (576 heads x 7 sudoers rule spellings x 5 doas spellings, joined and with an ordinary line between)
+  * mutation-checked: each new test fails when its fix is removed
+- NEXT: docs (SECURITY.md reflow + D3, CONCERNS fifth round + D3 + hidden include, docs/todo/README.md 4b entry), wip commit,
+  just verify via hook amend, check-linux, linux-test, final sha.
+- Differential vs the real programs (scratch, /tmp only: scripts /tmp/b2-scripts/{gen,gen3,gen4}.py, probe-corpus*.sh, compare.py; corpora
+  /tmp/b2-diff/run{2,3,4}; doctor probe = test appended to a scratch copy /tmp/b2-probe-ws, never in the worktree):
+  44000 generated files (sudoers vs sudo 1.9.16p2 and sudo-rs 0.2.5, doas.conf vs OpenDoas 6.8.2), the caller's grant arising only from the
+  odd construct. New code: 0 files where the program grants the caller and the doctor reads Clean or credits only others (sudo 12855+...,
+  see compare output). Same corpora vs round-4 code d1e702d: violations (doas `:2\`+`7`, `10\`+`00`, `@include /p\` false Clean...).
+  GOTCHA: running an old-code probe overwrites out/doctor.tsv of that run; always re-run the new probe before comparing.
+- Docs next: SECURITY.md, CONCERNS.md fifth round (+D3, +later-line include, +escaped keyword, +evidence), docs/todo/README.md 4b entry.
+- Docs done (SECURITY.md reflow + D3, CONCERNS fifth round rewrite with evidence/D3/later-line include/escaped keyword, docs/todo/README.md 4b entry,
+  config.rs module + Dialect docs). aido-backend coverage 100/100/100 after `just coverage-clean`.
+- Soft-reset onto a94afcc (origin/main), `git add -u` (30 files; RECOVERY file untracked, never added). Commit message in target/commit-msg-b2.txt
+  (trailer per the task text: Claude Fable 5.1; the harness default for this session would be Sonnet 5.5 -> flag in the report).
+- NEXT: `git commit -F target/commit-msg-b2.txt` (hook = just verify, log target/commit-b2.log), then `just check-linux`, `just linux-test`, final sha.
+- committed through the hook: 7220d80 (just verify PASS, TOTAL 100/100/100). next: check-linux, linux-test
+- polish: config.rs module docs name the later-line include test; amending 7220d80 through the hook (first linux-test attempt killed by me while queued, orphan container killed)
+- amended through hook: b588674 (just verify PASS, TOTAL 100/100/100). running check-linux + linux-test on it; DO NOT edit the tree while linux-test copies
+- final polish: dates in CONCERNS fifth round; amending through the hook again, then check-linux + linux-test (previous sha b588674 had all three green: verify 100/100/100, check-linux, linux-test 1219/0)
+- amended again through hook: 107755e (verify PASS 100/100/100); running check-linux + linux-test on it
+- STATUS: READY. Final commit 107755ea2fb7dc8d7819da23cca51ddc23418a3c, one commit on origin/main a94afcc, nothing pushed.
+  Gates on that sha: just verify via the hook (exit 0, coverage TOTAL 100.00% regions/functions/lines, deny+audit ok, gtfobins ok),
+  just check-linux (x86_64 + aarch64) exit 0, just linux-test 1219 passed / 0 failed (Linux 6.12.76-linuxkit aarch64, uid 1000).
+  Scratch outside the repo (safe to delete): /tmp/b2-* (scripts, corpora, probe workspaces), docker images b2-sudo-doas, b2-sudo-rs.
+
+== 2026-10-21 session 7 (B2 observer-fix developer; model sonnet) ==
+- Found HEAD 107755e (one commit on a94afcc), tree clean; origin/main now 8c996fe (moved). Task: apply 4 observer findings
+  (1 major: include path keeps the trailing backslash in sudo -> follow both candidates; 2 minor: rebase onto origin/main + CLAUDE.md row;
+  3 minor: reword Unverified/Found in docs+commit body, property test half; 4 minor: unmodelled gaps out of `unread`, own root-PATH reason).
+- Rebased 107755e onto origin/main 8c996fe -> daa3757 (CLAUDE.md conflict: kept origin/main's rewritten crate table, aido-bin row carries the PATH clause).
+  Auto-merged CONCERNS/todo README/aido-sys Cargo.toml looked sane. NEXT: read config.rs include handling, fix finding 1 (include path with backslash).
+- Verified observer finding 1 against real sudo 1.9.16p2 (docker b2-sudo-doas; /tmp/obs-r5-cases c01-c05 all PASSWORDLESS; my probe /tmp/b2-r6/scripts/probe-h.sh +
+  /tmp/b2-r6/cases h01-h14: `@include p\` opens `p\`, `p\ `(blank) opens `p `, tab, CRLF, `\\`->`p\`, includedir, later-line after `lecture_file=/x\ `
+  or `# note \` all open the backslash-kept name; sudo-rs refuses `@include p\` outright). Finding 1 is REAL.
+- Code (wip, uncommitted): config.rs Logical.whole + scan_sudoers `named` (cut candidates + whole-line candidates, deduped); paths_to_root.rs
+  ConfigOutcome.unmodelled + root_path new reason (finding 4). Unit tests added in config.rs (38 pass). NEXT: e2e tests (tests.rs), property loop widened,
+  root_path reason test, docs (config module docs, SECURITY, CONCERNS, todo README), commit message, gates.
+- e2e tests added (tests.rs): include path ending in a backslash (4 spellings x with/without rule after; later-line; blank-before-backslash; escaped blank),
+  root_path reason tests (3), property loop widened to every spelling after an ordinary line, assert_maybe_never_clean now asserts Status::Found.
+  aido-backend lib: 191 pass. NEXT: docs (config.rs module docs, SECURITY.md, CONCERNS fifth round + new review-findings bullet, todo README), then mutation checks,
+  coverage run, commit message, amend through the hook, check-linux, linux-test.
+- Docs written (config.rs module docs, SECURITY.md paragraph, CONCERNS fifth-round wording + "Review of the fifth round" section, todo README 4b entry).
+  aido-backend coverage 100/100/100; mutation-checked (6 mutants all killed: no-whole-candidates, first/later-line, no-dedupe, unread-includes-unmodelled,
+  no-unmodelled-root-path-entry; script /tmp/b2-r6/scripts/mutate.py, backups /tmp/b2-r6/backup). NEXT: differential re-check vs real sudo with the doctor,
+  commit message, wip commit, amend through hook (just verify), check-linux, linux-test.
+- Differential evidence (scratch only, /tmp/b2-r6: gen_inc.py, probe-inc.sh, probe-inc-rs.sh, ws/ = copy of the new tree + probe tests, ws-old/ = pre-fix code):
+  include corpus 2304 files: real sudo PASSWORDLESS 640, new doctor 0 violations / 0 weak; OLD code 320 weak (reproduces observer finding 1);
+  sudo-rs 160 granted, 0 violations. Earlier 44,000 corpora (run2/3/4 copies) re-run with the new code: 0 violations, 0 weak
+  (6038 + 2481 + 13155 = 21,674 granted, all found). Recorded in CONCERNS review section.
+- Session 7: all code/tests/docs done; message in target/commit-msg-b2-fix.txt (trailer kept as the task text says: Claude Fable 5.1; harness default
+  would be Sonnet 5.5 -> flag in the report). Amending daa3757 through the hook now: git add -u; git commit --amend -F target/commit-msg-b2-fix.txt
+  (log target/commit-b2-fix.log). THEN: git fetch + confirm origin/main still 8c996fe; just check-linux; just linux-test. DO NOT edit the tree while linux-test copies.
+- amended through hook: d31af42 (just verify PASS, coverage TOTAL 100/100/100, deny ok, gtfobins ok; log target/commit-b2-fix.log), one commit on origin/main 8c996fe.
+  NEXT: git fetch (confirm origin/main still 8c996fe), just check-linux, just linux-test on d31af42. DO NOT edit the tree.
+- origin/main moved to 607d61e (test: fix the two recorded flaky tests; trust.rs + willyoumarryme.rs only). Rebased d31af42 -> 7d5edbd cleanly.
+  Re-running the gate through the hook: git commit --amend --no-edit (log target/commit-b2-fix2.log). Then check-linux + linux-test on the final sha.
+- second hook run PASS: final sha f968d4a872a9b18680ec271d3d4f968cbf3e7775 on origin/main 607d61e (verify via hook: coverage TOTAL 100/100/100, deny/gtfobins ok;
+  log target/commit-b2-fix2.log). NEXT: just check-linux, just linux-test on f968d4a. DO NOT edit the tree.
+- check-linux PASS on f968d4a (x86_64 + aarch64, exit 0; target/check-linux-b2-final4.log). linux-test running (target/linux-test-b2-final4.log). DO NOT edit the tree.
+- linux-test PASS on f968d4a: 1249 passed / 0 failed, Linux 6.12.76-linuxkit aarch64 as uid 1000 (target/linux-test-b2-final4.log).
+- STATUS: READY. Final commit f968d4a872a9b18680ec271d3d4f968cbf3e7775, ONE commit on origin/main 607d61e (fetched after the gates: still its tip), nothing pushed.
+  Gates on that sha: just verify via the hook (exit 0; TOTAL 100.00% regions/functions/lines; deny, gtfobins ok; target/commit-b2-fix2.log),
+  just check-linux (x86_64 + aarch64, exit 0), just linux-test (1249/0). Trailer kept as the task text says (Claude Fable 5.1); harness default is Sonnet 5.5 -> flagged.
+  Scratch outside the repo (safe to delete): /tmp/b2-r6 (corpus, scripts, scratch workspaces ws/ ws-old/, backups), docker images b2-sudo-doas, b2-sudo-rs.
