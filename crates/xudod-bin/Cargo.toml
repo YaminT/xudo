@@ -1,0 +1,27 @@
+[package]
+name = "xudod-bin"
+description = "The `xudod` executable: hands descriptor 0 and standard error to the xudod library and exits with its status. Installed as /usr/libexec/xudo/xudod."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package for the same reason as `xudo-bin` and `ido-bin`: the library
+# is compiled, and therefore measured, exactly once. Excluded from coverage in
+# the justfile; `tests/broker.rs` runs the real binary as a process, with a
+# real socket on its standard input.
+[[bin]]
+name = "xudod"
+path = "src/main.rs"
+
+[dependencies]
+xudod = { path = "../xudod", version = "0.0.1" }
+
+[dev-dependencies]
+xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

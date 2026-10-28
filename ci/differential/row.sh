@@ -3,7 +3,7 @@
 #
 #   sh /harness/row.sh <row> <setup command>
 #
-# Expects the static aido binary at /usr/local/bin/aido, the shipped rules at
+# Expects the static xudo binary at /usr/local/bin/xudo, the shipped rules at
 # /rules, this directory at /harness, and a writable /out. POSIX sh only: the
 # Alpine rows have busybox, the Ubuntu rows have dash.
 #
@@ -15,7 +15,7 @@ set -f # an invocation token is never a glob
 
 row=$1
 setup=$2
-aido=/usr/local/bin/aido
+xudo=/usr/local/bin/xudo
 rules=/rules
 harness=/harness
 out=/out/$row
@@ -28,10 +28,10 @@ if ! sh -c "$setup" >"$out/setup.log" 2>&1; then
     exit 1
 fi
 
-# aido must not consult its environment, but the harness still hands it a
+# xudo must not consult its environment, but the harness still hands it a
 # known one so that a difference between rows cannot come from here.
-run_aido() {
-    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$aido" --rules "$rules" "$@"
+run_xudo() {
+    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$xudo" --rules "$rules" "$@"
 }
 
 report=$out/report.txt
@@ -40,7 +40,7 @@ report=$out/report.txt
 # 1. Which backend was found and what it was probed to support. The version is
 #    normalized away: the distribution's package moves, the capability matrix
 #    must not.
-run_aido doctor >"$out/doctor.txt" 2>&1 || true
+run_xudo doctor >"$out/doctor.txt" 2>&1 || true
 sed -nE \
     -e 's/^(backend      (sudo|sudo-rs|doas)) \(.*\)$/\1 (<version>)/p' \
     -e 's/^(backend      UNUSABLE: [a-z-]+) .* (is missing a required control .*)$/\1 <version> \2/p' \
@@ -55,24 +55,24 @@ sed -nE \
 # through each backend, identical outcomes — is due, and this fails until it
 # has been written.
 if ! grep -qx 'exec path    absent in this build' "$out/doctor.txt"; then
-    echo "row $row: aido doctor no longer reports the exec path as absent." >&2
+    echo "row $row: xudo doctor no longer reports the exec path as absent." >&2
     echo "          The matrix must now execute through each backend and compare outcomes; see run.sh." >&2
     exit 1
 fi
 
 # 2. The install plan: refused with exit 19 where nothing usable exists,
-#    printed in full where something does — and then the one file aido would
+#    printed in full where something does — and then the one file xudo would
 #    write is handed to that backend's own parser.
 set +e
-run_aido install --dry-run --show-contents >"$out/install.txt" 2>&1
+run_xudo install --dry-run --show-contents >"$out/install.txt" 2>&1
 rc=$?
 set -e
 echo "install      exit $rc" >>"$report"
 if [ "$rc" -eq 0 ]; then
     kind=$(sed -nE 's/^plan for     (.*)$/\1/p' "$out/install.txt")
     echo "plan for     $kind" >>"$report"
-    # The contents of the step that writes aido's rule, exactly as it would land.
-    awk '/^   [0-9]+\. (write candidate|append aido.s block)/ { grab = 1; next }
+    # The contents of the step that writes xudo's rule, exactly as it would land.
+    awk '/^   [0-9]+\. (write candidate|append xudo.s block)/ { grab = 1; next }
          /^   [0-9]+\. / { grab = 0 }
          grab && sub(/^      \| ?/, "")' "$out/install.txt" >"$out/snippet.txt"
     # The validator the plan itself names, pointed at stdin instead of the
@@ -93,15 +93,15 @@ if [ "$rc" -eq 0 ]; then
     fi
 else
     sed -nE \
-        -e 's/^aido: no usable backend: no privilege backend found.*$/refused      no privilege backend found/p' \
-        -e 's/^aido: no usable backend: ([a-z-]+) .* is missing a required control.*$/refused      \1 <version> is missing a required control/p' \
+        -e 's/^xudo: no usable backend: no privilege backend found.*$/refused      no privilege backend found/p' \
+        -e 's/^xudo: no usable backend: ([a-z-]+) .* is missing a required control.*$/refused      \1 <version> is missing a required control/p' \
         "$out/install.txt" >>"$report"
 fi
 
 # 3. The ruleset itself is accepted. Its generation hash is not pinned here;
 #    the verdicts below are what a rule change must answer for.
 set +e
-run_aido check >"$out/check.txt" 2>&1
+run_xudo check >"$out/check.txt" 2>&1
 rc=$?
 set -e
 echo "check        exit $rc" >>"$report"
@@ -118,7 +118,7 @@ while IFS= read -r line; do
     set -- $line
     echo "# $line" >>"$verdicts"
     set +e
-    run_aido --output json explain -- "$@" >"$out/explain.json" 2>"$out/explain.err"
+    run_xudo --output json explain -- "$@" >"$out/explain.json" 2>"$out/explain.err"
     rc=$?
     set -e
     grep -E '^  "(verdict|denial|action)":' "$out/explain.json" >>"$verdicts" || true

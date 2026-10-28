@@ -1,4 +1,4 @@
-# aido development gate.
+# xudo development gate.
 #
 # `just verify` is the pre-commit gate and is byte-for-byte what CI runs. If it
 # passes locally and fails in CI, that is a bug in this file, not in CI.
@@ -87,38 +87,38 @@ no-ignored-passes:
 #               we own, which a test cannot arrange. Every decision built on a
 #               probe result sits behind the `Runner` trait and is fully covered
 #               against a fake, so what is excluded is process plumbing only.
-#   aido-bin    is the five-line entry point. Its own `tests/binary.rs` asserts
+#   xudo-bin    is the five-line entry point. Its own `tests/binary.rs` asserts
 #               its exit statuses through a real process — 0, 17, and 19 — which
 #               is the only place that behaviour exists. It is a correctness gate
 #               (`just test` runs it), not a coverage source. Excluding one tiny
 #               package is honest; a line-level waiver inside a shared file is
 #               not.
-#   aido-gate-bin is the same shape for the root executor: `main` collects argv,
-#               hands `aido_gate::run` the real host, writes the one line it
+#   xudo-gate-bin is the same shape for the root executor: `main` collects argv,
+#               hands `xudo_gate::run` the real host, writes the one line it
 #               returns, and exits with its status. Its `tests/binary.rs` runs
 #               the real binary under each name a hardlink could give it, with
 #               closed and leaked descriptors and a hostile argv, and asserts
 #               the status and the line. The whole sequence, every refusal in
-#               it, and every fake it runs against are in the `aido-gate` and
-#               `aido-sys` libraries, at 100% like everything else.
+#               it, and every fake it runs against are in the `xudo-gate` and
+#               `xudo-sys` libraries, at 100% like everything else.
 #   ido-bin     is the same shape for `ido`, plus the raw terminal: reading the
 #               environment once, termios raw mode, and the alternate screen.
 #               None of that can run without a real terminal, so its
 #               `tests/willyoumarryme.rs` drives it through real processes and a
 #               real pseudo-terminal instead. The picker's logic is not here; it
 #               is in the `ido` library, at 100% like everything else.
-#   aidod-bin   is the same shape for the root broker: it borrows descriptor 0
+#   xudod-bin   is the same shape for the root broker: it borrows descriptor 0
 #               from standard input, where systemd puts the accepted connection,
-#               hands it and standard error to `aidod::run`, and exits with what
+#               hands it and standard error to `xudod::run`, and exits with what
 #               that returns. Its `tests/broker.rs` runs the real binary with a
 #               real socket, a file, and nothing at all on descriptor 0. Every
-#               decision is in the `aidod` library, at 100%.
+#               decision is in the `xudod` library, at 100%.
 #
 # Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features \
-        --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' \
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features \
+        --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
         --fail-under-regions {{cov_regions}} \
         --fail-under-functions {{cov_functions}}
@@ -130,11 +130,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features --ignore-filename-regex 'crates/aido-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude aido-bin --exclude aido-gate-bin --exclude ido-bin --exclude aidod-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 
@@ -144,7 +144,7 @@ coverage-lcov: coverage-clean
 # isolation blocks it. Disabling isolation to get it running would weaken the
 # check rather than widen it.
 miri:
-    cargo +nightly miri test -p aido-policy --lib
+    cargo +nightly miri test -p xudo-policy --lib
 
 # --- fuzzing ----------------------------------------------------------------
 
@@ -241,7 +241,7 @@ gtfobins:
 # user, on a copy of the checkout rather than the bind mount. Run it before
 # committing anything that touches a syscall: `cargo check --target` proves
 # only that Linux code compiles. Arguments go to `cargo test`, e.g.
-# `just linux-test -p aido-sys`.
+# `just linux-test -p xudo-sys`.
 linux-test *args:
     ci/linux-test.sh {{args}}
 
@@ -276,29 +276,29 @@ musl_triple := if arch() == "aarch64" { "aarch64-unknown-linux-musl" } else { "x
 # the real sudo, sudo-rs (the version Ubuntu 24.04 ships and the one 26.04
 # does), OpenDoas, and a container with no escalator at all. Every backend's
 # detection and probed capabilities are pinned, its own parser is asked to
-# accept the snippet aido would write, and every verdict must be identical in
+# accept the snippet xudo would write, and every verdict must be identical in
 # every row. Needs Docker. ci/differential/run.sh says what is compared and
 # what is deliberately not yet.
 differential:
-    cargo build -p aido-bin --release --target {{musl_triple}}
-    ci/differential/run.sh target/{{musl_triple}}/release/aido
+    cargo build -p xudo-bin --release --target {{musl_triple}}
+    ci/differential/run.sh target/{{musl_triple}}/release/xudo
 
 # --- install, for real, as root ----------------------------------------------
 
-# `aido install` and `aido install --uninstall` run as real root inside
+# `xudo install` and `xudo install --uninstall` run as real root inside
 # containers this starts and discards, against real sudo, sudo-rs, and OpenDoas:
 # the file lands 0440/0400 root:root, validated by the backend's own parser;
 # an operator's file is never replaced or removed; a rejected candidate leaves
 # the old state alone; uninstall removes exactly what install wrote. Not in
 # `linux-test`, which is non-root on purpose. Needs Docker. It does not prove
-# the rule is in effect through `aido install` itself: that is the functional
+# the rule is in effect through `xudo install` itself: that is the functional
 # probe, which needs a request only the front-end's broker client can mint
-# (plan item C1, `aido exec`), so a finished install reports NOT VERIFIED. The
+# (plan item C1, `xudo exec`), so a finished install reports NOT VERIFIED. The
 # uid-0 proof that the installed rule reaches the gate is in the root lane
-# (`aido-gate-bin/tests/root_probe.rs`).
+# (`xudo-gate-bin/tests/root_probe.rs`).
 install-root:
-    cargo build -p aido-bin --release --target {{musl_triple}}
-    ci/install/run.sh target/{{musl_triple}}/release/aido
+    cargo build -p xudo-bin --release --target {{musl_triple}}
+    ci/install/run.sh target/{{musl_triple}}/release/xudo
 
 # --- developer setup --------------------------------------------------------
 
@@ -320,7 +320,7 @@ setup: install-hooks
 # `install-root` joined it when the install executor landed and the root lane
 # stopped being non-blocking (docs/CONCERNS.md, 2026-10-22). Every `just <lane>`
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
-# fuzz recipes, which need nightly; `crates/aido-tests/tests/ci_lanes.rs` fails
+# fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
 ci: verify check-linux miri units differential root-test install-root
 

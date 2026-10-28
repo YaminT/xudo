@@ -19,7 +19,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use aido_audit::{Decision, Outcome, Record};
+use xudo_audit::{Decision, Outcome, Record};
 
 use crate::entry::Entry;
 use crate::error::IdoError;

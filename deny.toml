@@ -1,4 +1,4 @@
-# Supply-chain policy. aido is a privilege broker: a compromised dependency in
+# Supply-chain policy. xudo is a privilege broker: a compromised dependency in
 # the privileged crates is a root compromise, so the dependency budget is
 # deliberately tiny (sudo-rs's bar) and enforced here rather than by habit.
 

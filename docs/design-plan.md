@@ -1,31 +1,31 @@
-# aido — Agent-Aware Privilege Broker for Linux
+# xudo — Agent-Aware Privilege Broker for Linux
 
 **Plan only. No code in this phase.**
 
 > **Status and deviations, 2026-10-14.** This document is the architecture. `todo/README.md` is the sequence and the current state; `CONCERNS.md` is why. Where the code has diverged from the text below, the code is right and the text is kept as written:
 >
-> - Seventeen crates, not five. The additions are the policy/sys split's consequences (`aido-backend`, `aido-config`, `aido-audit`, `term-sanitize`), the crate that confines `unsafe` (`aido-sys-raw`), the entry-point packages (`aido-bin`, `ido-bin`), `ido` with its own phase, the broker with its entry point `aidod-bin` and its wire protocol `aido-wire` (M2b step 2, built 2026-10-21), and the gate's entry point `aido-gate-bin` (M2b step 4, built 2026-10-21). § Crate layout is the inventory.
-> - `unsafe` exists only in the crate `aido-sys-raw`, in its `sys` module: five syscalls in six blocks, budget enforced by a test; every other crate, `aido-sys` included, forbids it. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only (2026-10-19). `SO_PEERCRED` is the fifth, added 2026-10-19: rustix decodes it with a `NonZeroI32` pid, which is undefined behaviour when the kernel reports pid 0.
+> - Seventeen crates, not five. The additions are the policy/sys split's consequences (`xudo-backend`, `xudo-config`, `xudo-audit`, `term-sanitize`), the crate that confines `unsafe` (`xudo-sys-raw`), the entry-point packages (`xudo-bin`, `ido-bin`), `ido` with its own phase, the broker with its entry point `xudod-bin` and its wire protocol `xudo-wire` (M2b step 2, built 2026-10-21), and the gate's entry point `xudo-gate-bin` (M2b step 4, built 2026-10-21). § Crate layout is the inventory.
+> - `unsafe` exists only in the crate `xudo-sys-raw`, in its `sys` module: five syscalls in six blocks, budget enforced by a test; every other crate, `xudo-sys` included, forbids it. `close_range` is used with `CLOSE_RANGE_CLOEXEC` only (2026-10-19). `SO_PEERCRED` is the fifth, added 2026-10-19: rustix decodes it with a `NonZeroI32` pid, which is undefined behaviour when the kernel reports pid 0.
 > - A pidfd pins *which* process connected, not its pid number and not its credentials at connect time. Connect-time identity comes from `SO_PEERCRED` on every rung; `PIDFD_GET_INFO` reports current credentials; every read of `/proc/<pid>` is followed by a liveness check through the pidfd. The 5.3 `pidfd_open` rung withholds the agent path: its pin cannot be bound to the connection, so the passwordless path needs Linux 6.5 (2026-10-19).
-> - `ido`, the buffered human-run queue, was added beside `aido` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
-> - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `aidod` too.
+> - `ido`, the buffered human-run queue, was added beside `xudo` (phase 4, done). It gates on consequence, not uid, and needs none of the machinery below.
+> - The broker's request-minting half belongs to M2, not M3: the gate acts only on a root-minted request, so the password path needs `xudod` too.
 > - On the password path the password is the confirmation; `confirm = "always"` reaches the out-of-band channel only on the passwordless path.
 > - Where the password lives (2026-10-19, `howiwork.md`): an approved, attested agent request needs no human password and takes the `NOPASSWD` hardlink; the password sits on the human path (`ido` entries and direct human runs), through the `PASSWD` hardlink. The `sudo`/`doas` hop is kept as the uid transition only, since nothing here is setuid; the "always prompts" wording under M2 describes the beta, which ships only the `PASSWD` side.
 > - Canonicalization does not split `--key=value`; fuzzing killed that in M1.
-> - Temporary permissions (2026-10-21, `howiwork.md`): `aido grant <permission|set> [duration]`, default 30 minutes, names a permission or set root already defined (sets become a `[[set]]` construct in the rule files), is minted by a human on the password path, lifts only the per-call confirmation for the named harness, and never the deny-list, a human-only action, the critical tier, or rate limits. Supersedes the `--profile` form of `aido grant`; the CLI sketch is updated in place, and the M5 body and feature 12 below keep the old spelling as written. `trust.d` is no longer the only thing that narrows the confirmation requirement: a grant is its time-boxed sibling. M5.
-> - Overlapping actions resolve to the strictest, not last-match-wins: every action that accepts a command contributes its requirement — any human-only one refuses an agent, the strongest confirmation applies — and `aido check` reports every pair that can overlap. Negation was rejected because it would let a later rule widen an earlier one by reordering; reordering can never widen authorization or remove a confirmation (2026-10-19).
-> - The mount check reads `/proc/thread-self/mountinfo`, not `/proc/self/mountinfo`, and finds each opened descriptor's mount by the `mnt_id` in its fdinfo, never by `st_dev` or a path prefix. Each component is opened `O_PATH` and its mount judged before its owner and mode are read. Every reader refuses a user's FUSE mount, an `idmapped` mount, and everything outside the initial user namespace; the ruleset readers also refuse `nosuid` and `noexec`, on every component and rule file, not only on `/etc/aido`. Other root-owned paths are not refused for those two, because root's own `/run` carries `nosuid`. A "user-writable mount" in the sense of a backing device a user can write is not checked yet (2026-10-19).
-> - `/run/aido` is `0755`, not `0700`: a `0700` directory would put `broker.sock` out of every user's reach. The socket is `0660 root:aido`; `req/` and `sessions/` are the `0700` directories (2026-10-16).
-> - The policy generation is a framed SHA-256 over the rule files, computed by one function (`aido_policy::load_rule_files`) for the front-end, the broker, and the gate. Not yet the install-time counter described below (2026-10-16).
-> - Attestation on kernels before 6.5 is a ladder (`aido-sys::kernel`), not a single fallback.
+> - Temporary permissions (2026-10-21, `howiwork.md`): `xudo grant <permission|set> [duration]`, default 30 minutes, names a permission or set root already defined (sets become a `[[set]]` construct in the rule files), is minted by a human on the password path, lifts only the per-call confirmation for the named harness, and never the deny-list, a human-only action, the critical tier, or rate limits. Supersedes the `--profile` form of `xudo grant`; the CLI sketch is updated in place, and the M5 body and feature 12 below keep the old spelling as written. `trust.d` is no longer the only thing that narrows the confirmation requirement: a grant is its time-boxed sibling. M5.
+> - Overlapping actions resolve to the strictest, not last-match-wins: every action that accepts a command contributes its requirement — any human-only one refuses an agent, the strongest confirmation applies — and `xudo check` reports every pair that can overlap. Negation was rejected because it would let a later rule widen an earlier one by reordering; reordering can never widen authorization or remove a confirmation (2026-10-19).
+> - The mount check reads `/proc/thread-self/mountinfo`, not `/proc/self/mountinfo`, and finds each opened descriptor's mount by the `mnt_id` in its fdinfo, never by `st_dev` or a path prefix. Each component is opened `O_PATH` and its mount judged before its owner and mode are read. Every reader refuses a user's FUSE mount, an `idmapped` mount, and everything outside the initial user namespace; the ruleset readers also refuse `nosuid` and `noexec`, on every component and rule file, not only on `/etc/xudo`. Other root-owned paths are not refused for those two, because root's own `/run` carries `nosuid`. A "user-writable mount" in the sense of a backing device a user can write is not checked yet (2026-10-19).
+> - `/run/xudo` is `0755`, not `0700`: a `0700` directory would put `broker.sock` out of every user's reach. The socket is `0660 root:xudo`; `req/` and `sessions/` are the `0700` directories (2026-10-16).
+> - The policy generation is a framed SHA-256 over the rule files, computed by one function (`xudo_policy::load_rule_files`) for the front-end, the broker, and the gate. Not yet the install-time counter described below (2026-10-16).
+> - Attestation on kernels before 6.5 is a ladder (`xudo-sys::kernel`), not a single fallback.
 > - Linux verification is Docker, locally and in CI, not Lima; a VM is for the kernel-version matrix and M4's systemd scopes.
-> - The audit chain is `/var/lib/aido/audit.jsonl`, not `/var/log/aido`: Ubuntu's `/var/log` is `root:syslog 0775` and fails the ancestor walk. The file is the chain's authority and journald a required mirror, reached through its native protocol over rustix rather than the `systemd-journal-logger` crate, and written under the file's lock so an append lands on both or neither; only journal entries with `_UID=0` count; there is no syslog fallback yet (2026-10-19).
+> - The audit chain is `/var/lib/xudo/audit.jsonl`, not `/var/log/xudo`: Ubuntu's `/var/log` is `root:syslog 0775` and fails the ancestor walk. The file is the chain's authority and journald a required mirror, reached through its native protocol over rustix rather than the `systemd-journal-logger` crate, and written under the file's lock so an append lands on both or neither; only journal entries with `_UID=0` count; there is no syslog fallback yet (2026-10-19).
 
 ## Context
 
 AI coding agents (Claude Code, Codex CLI, Gemini CLI, Aider) constantly hit commands that need root: package installs, service restarts, `/etc/hosts` edits, sysctl tweaks. Today there are two options and both are bad. Either a human babysits every `sudo` password prompt — which destroys unattended agent work — or the user grants blanket `NOPASSWD: ALL`, which is a standing root backdoor available to *any* process running as that user.
 
-`aido` is the middle path: a sudo-like front door backed by a **root-owned allowlist of named actions**. Enrolled agent sessions execute allowlisted actions without a password. A human invoking `aido` directly is always prompted. A catastrophic-command deny-list is compiled into the binary and cannot be edited by config. Every decision is audited.
+`xudo` is the middle path: a sudo-like front door backed by a **root-owned allowlist of named actions**. Enrolled agent sessions execute allowlisted actions without a password. A human invoking `xudo` directly is always prompted. A catastrophic-command deny-list is compiled into the binary and cannot be edited by config. Every decision is audited.
 
 Target: Linux. Dev host is macOS, so the policy engine must build and unit-test natively on darwin while all privileged paths are Linux-only and fail closed elsewhere.
 
@@ -34,10 +34,10 @@ Target: Linux. Dev host is macOS, so the policy engine must build and unit-test 
 | # | Requirement | Where it is satisfied |
 |---|---|---|
 | 1 | sudo-like CLI, delegates to `sudo` or `doas` | Backend adapter, M2 |
-| 2 | Root-owned rule set allowlisting actions | `/etc/aido/rules.d/`, `aido-policy` crate, M1 |
-| 3 | Known agents run allowlisted actions with no password | `aido-gate-nopass` + `NOPASSWD` rule, M4 |
-| 4 | Human invoking `aido` is prompted | `aido-gate-auth` + `PASSWD` rule, M2 |
-| 5 | Predefined agent list, user-extensible, root required to extend | `/etc/aido/agents.d/`, `aido agent add` via password path, M4 |
+| 2 | Root-owned rule set allowlisting actions | `/etc/xudo/rules.d/`, `xudo-policy` crate, M1 |
+| 3 | Known agents run allowlisted actions with no password | `xudo-gate-nopass` + `NOPASSWD` rule, M4 |
+| 4 | Human invoking `xudo` is prompted | `xudo-gate-auth` + `PASSWD` rule, M2 |
+| 5 | Predefined agent list, user-extensible, root required to extend | `/etc/xudo/agents.d/`, `xudo agent add` via password path, M4 |
 | 6 | Confirm even in yolo mode; user-disableable | `confirm_agent_actions = true` default + `trust.d` narrowing, M3/M5 |
 | 7 | Best tooling | Rust workspace, see Stack |
 | 8 | No development yet | This document |
@@ -48,7 +48,7 @@ Target: Linux. Dev host is macOS, so the policy engine must build and unit-test 
 
 Everything below follows from three facts. Getting these wrong produces a tool that *looks* secure and is a passwordless-root installer.
 
-**(A) Agent detection is not a security boundary — and `aido` must say so in its own SECURITY.md.**
+**(A) Agent detection is not a security boundary — and `xudo` must say so in its own SECURITY.md.**
 The requirement "agents get no prompt, humans do" inverts the normal trust model: the *absence* of proof-of-humanity becomes the thing that grants a privilege. Every cheap signal (`CLAUDECODE=1`, `argv[0]`, `comm`, `/proc/<pid>/exe`, ancestry names) is caller-controlled and trivially forged by a same-uid process. Even with unforgeable enrollment, a human can simply *ask a real enrolled agent* to run the command — "consent laundering" — which is indistinguishable at the syscall layer.
 
 Therefore: a successful impersonation buys exactly one thing — skipping the password on an action **that is already allowlisted** — and buys no new capability. The real boundary is the root-owned allowlist, the non-overridable deny-list, and out-of-band confirmation. **Size the allowlist assuming every entry will be run passwordless by a process you cannot authenticate.**
@@ -57,7 +57,7 @@ Therefore: a successful impersonation buys exactly one thing — skipping the pa
 Misclassification can only withhold capability, never grant it. An unattested caller falls to the human flow with a password — never a silent downgrade to passwordless.
 
 **(C) Confirmation lives outside the agent's process tree and off its stdin.**
-The agent is `aido`'s *parent*. It owns `aido`'s stdin, stdout, and any pty it allocated. A confirmation read from stdin — or even from `/dev/tty` — is a confirmation the agent answers with `--yes`. Measured fact driving this: inside Claude Code's bash tool the child shell has **no controlling terminal** (`tty` → "not a tty", `open("/dev/tty")` → ENXIO) while the parent `claude` keeps its pty. So `aido` adopts polkit's authority/agent split: the root broker prompts on a channel the requester does not own. No live channel → **DENY**, never skip.
+The agent is `xudo`'s *parent*. It owns `xudo`'s stdin, stdout, and any pty it allocated. A confirmation read from stdin — or even from `/dev/tty` — is a confirmation the agent answers with `--yes`. Measured fact driving this: inside Claude Code's bash tool the child shell has **no controlling terminal** (`tty` → "not a tty", `open("/dev/tty")` → ENXIO) while the parent `claude` keeps its pty. So `xudo` adopts polkit's authority/agent split: the root broker prompts on a channel the requester does not own. No live channel → **DENY**, never skip.
 
 ---
 
@@ -67,15 +67,15 @@ Four binaries, **no setuid bit anywhere**, one uid transition performed by sudo/
 
 ```
   agent or human
-        │  aido pkg install ripgrep
+        │  xudo pkg install ripgrep
         ▼
-  /usr/bin/aido ────────── unix socket ────────►  aidod (root)
+  /usr/bin/xudo ────────── unix socket ────────►  xudod (root)
   (unprivileged,                                  ├ SO_PEERPIDFD → PIDFD_GET_INFO
    decides nothing)                               ├ classify: enrolled-agent | human | unattested
         │                                         ├ evaluate policy + deny-list + rate limits
         │  exec via backend                       ├ own the confirmation state machine
         ▼                                         └ mint one-use request record
-  sudo / doas  ──►  aido-gate-{nopass,auth} (root)
+  sudo / doas  ──►  xudo-gate-{nopass,auth} (root)
                     zero argv, zero env input
                     ├ calls back to broker, walks its own lineage
                     ├ consumes the nonce (one use)
@@ -85,14 +85,14 @@ Four binaries, **no setuid bit anywhere**, one uid transition performed by sudo/
 
 | Binary | Priv | Responsibility |
 |---|---|---|
-| `/usr/bin/aido` | user | Normalize verb + argv into a named action and typed argv vector (byte-exact `OsStr`, never `to_string_lossy`). Talk to the broker. Render the decision. Holds no secret, makes no decision. `clap` compiled **without** the `env` feature so no flag is ever settable from the environment. |
-| `/usr/libexec/aido/aidod` | root | The authority. Socket-activated on `/run/aido/broker.sock`. Identifies peers, classifies, evaluates, rate-limits, owns confirmation, mints one-use request records, writes the audit chain. |
-| `/usr/libexec/aido/aido-gate-{nopass,auth}` | root | Two hardlinks to one inode, branching on `argv[0]`. Exec'd only by sudo/doas. **A second, independent policy engine**, written on the assumption any local user can invoke it directly. |
-| `/usr/libexec/aido/aido-session` | root | Enrollment launcher — the *only* way an agent identity comes into existence. Reached through the password path. |
+| `/usr/bin/xudo` | user | Normalize verb + argv into a named action and typed argv vector (byte-exact `OsStr`, never `to_string_lossy`). Talk to the broker. Render the decision. Holds no secret, makes no decision. `clap` compiled **without** the `env` feature so no flag is ever settable from the environment. |
+| `/usr/libexec/xudo/xudod` | root | The authority. Socket-activated on `/run/xudo/broker.sock`. Identifies peers, classifies, evaluates, rate-limits, owns confirmation, mints one-use request records, writes the audit chain. |
+| `/usr/libexec/xudo/xudo-gate-{nopass,auth}` | root | Two hardlinks to one inode, branching on `argv[0]`. Exec'd only by sudo/doas. **A second, independent policy engine**, written on the assumption any local user can invoke it directly. |
+| `/usr/libexec/xudo/xudo-session` | root | Enrollment launcher — the *only* way an agent identity comes into existence. Reached through the password path. |
 
 ### Caller classification — the one thing that carries authorization weight
 
-A caller is an **agent** if and only if its cgroup id equals a live, root-created transient scope under `aido.slice/`. The user provably cannot write a pid into that cgroup: the kernel requires write access to both the destination and the common-ancestor `cgroup.procs`, and `aido.slice` sits outside systemd's delegated user subtree, so the attempt fails `EACCES`.
+A caller is an **agent** if and only if its cgroup id equals a live, root-created transient scope under `xudo.slice/`. The user provably cannot write a pid into that cgroup: the kernel requires write access to both the destination and the common-ancestor `cgroup.procs`, and `xudo.slice` sits outside systemd's delegated user subtree, so the attempt fails `EACCES`.
 
 - Peer identity: `SO_PEERPIDFD` → `ioctl(PIDFD_GET_INFO, PIDFD_INFO_CREDS|PIDFD_INFO_CGROUPID)`. Race-free by construction.
 - Kernels < 6.5: `SO_PEERCRED` + `(pid, starttime)` pinning, documented as the weaker fallback.
@@ -103,92 +103,92 @@ The scope-bound HMAC session token is bookkeeping — non-repudiation, expiry, r
 
 ### Crate layout (trust boundary drawn on day one)
 
-The plan began with five crates and the deviations above account for the rest. This table is the inventory: one row per member of `Cargo.toml`'s `[workspace]`, plus the crates still in review, whose rows open with `**in review (M2b).**` and lose it when the crate merges. `crates/aido-tests/tests/crate_inventory.rs` fails the build when the table and the manifest disagree.
+The plan began with five crates and the deviations above account for the rest. This table is the inventory: one row per member of `Cargo.toml`'s `[workspace]`, plus the crates still in review, whose rows open with `**in review (M2b).**` and lose it when the crate merges. `crates/xudo-tests/tests/crate_inventory.rs` fails the build when the table and the manifest disagree.
 
 | Crate | Role |
 |---|---|
-| `aido-policy` | The pure policy engine: `(ruleset, caller facts, request) → Decision`, with the deny-list compiled in. Zero syscalls; builds and tests natively on macOS |
-| `aido-backend` | What `aido` asks `sudo`, `sudo-rs`, or `doas` to do: the capability matrix, runtime detection, snippet generation, and the install plan. Pure, with the Linux half behind `aido-sys` |
-| `aido-config` | Layered configuration for `aido` and `ido`: one precedence order, nothing security-relevant from the environment, a project layer that may only narrow. Pure: it reads no file, flag, or environment |
-| `aido-audit` | Tamper-evident audit records: builds them, chains them, verifies a chain. Pure, with the file and the journald mirror in `aido-sys` |
-| `aido-sys` | Platform abstraction: every syscall and `/proc` read behind a trait with an in-memory fake, and `MacOsStub`, which answers `Unsupported` to every privileged question so a macOS dev cannot accidentally validate a Linux-only assumption |
-| `aido-sys-raw` | The five system calls that cannot be made safely, and the kernel-written records for two of them: the one crate that does not forbid `unsafe_code`, within a published block budget |
-| `aido` | The unprivileged front-end library: parses a request, loads the root-owned ruleset, asks `aido-policy` for a decision, and renders it. Decides nothing, holds no secret |
-| `aido-bin` | The `aido` executable: argument parsing and an exit code, nothing else |
-| `aido-wire` | The wire protocol between `aido` and `aidod`: the messages and the parser for them |
-| `aidod` | The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `aido explain` uses, and mints bounded one-use requests. Built; its audit record goes to standard error until plan item D1 routes it through the step-6 trail |
-| `aidod-bin` | The `aidod` executable, socket-activated on `/run/aido/broker.sock` |
-| `aido-gate` | The gate's library: a second, independent policy engine that re-decides from root-owned state and trusts nothing it was handed; the decision modules are pure, and `run` is the whole sequence written against `aido-sys` traits |
-| `aido-gate-bin` | The gate executable, installed as `aido-gate` with `aido-gate-auth` as a hardlink |
+| `xudo-policy` | The pure policy engine: `(ruleset, caller facts, request) → Decision`, with the deny-list compiled in. Zero syscalls; builds and tests natively on macOS |
+| `xudo-backend` | What `xudo` asks `sudo`, `sudo-rs`, or `doas` to do: the capability matrix, runtime detection, snippet generation, and the install plan. Pure, with the Linux half behind `xudo-sys` |
+| `xudo-config` | Layered configuration for `xudo` and `ido`: one precedence order, nothing security-relevant from the environment, a project layer that may only narrow. Pure: it reads no file, flag, or environment |
+| `xudo-audit` | Tamper-evident audit records: builds them, chains them, verifies a chain. Pure, with the file and the journald mirror in `xudo-sys` |
+| `xudo-sys` | Platform abstraction: every syscall and `/proc` read behind a trait with an in-memory fake, and `MacOsStub`, which answers `Unsupported` to every privileged question so a macOS dev cannot accidentally validate a Linux-only assumption |
+| `xudo-sys-raw` | The five system calls that cannot be made safely, and the kernel-written records for two of them: the one crate that does not forbid `unsafe_code`, within a published block budget |
+| `xudo` | The unprivileged front-end library: parses a request, loads the root-owned ruleset, asks `xudo-policy` for a decision, and renders it. Decides nothing, holds no secret |
+| `xudo-bin` | The `xudo` executable: argument parsing and an exit code, nothing else |
+| `xudo-wire` | The wire protocol between `xudo` and `xudod`: the messages and the parser for them |
+| `xudod` | The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `xudo explain` uses, and mints bounded one-use requests. Built; its audit record goes to standard error until plan item D1 routes it through the step-6 trail |
+| `xudod-bin` | The `xudod` executable, socket-activated on `/run/xudo/broker.sock` |
+| `xudo-gate` | The gate's library: a second, independent policy engine that re-decides from root-owned state and trusts nothing it was handed; the decision modules are pure, and `run` is the whole sequence written against `xudo-sys` traits |
+| `xudo-gate-bin` | The gate executable, installed as `xudo-gate` with `xudo-gate-auth` as a hardlink |
 | `ido` | The buffered human-run command queue: queue, picker state machine, runner, and `AGENTS.md` splicer. Unprivileged |
 | `ido-bin` | The `ido` executable: collects the environment once and owns the raw terminal |
-| `term-sanitize` | Display-only sanitizer for agent-written text bound for a terminal, shared by `ido` and `aido`'s future confirmation prompt |
-| `aido-tests` | Tests that belong to the workspace as a whole, starting with the check on this table, and the guard every root test begins with; reserved for the executing half of the differential matrix |
+| `term-sanitize` | Display-only sanitizer for agent-written text bound for a terminal, shared by `ido` and `xudo`'s future confirmation prompt |
+| `xudo-tests` | Tests that belong to the workspace as a whole, starting with the check on this table, and the guard every root test begins with; reserved for the executing half of the differential matrix |
 
-`aido-gate` and `aidod` are the privileged pair, with a dependency budget capped at sudo-rs's bar: rustix/libc plus one audited serialization crate. `#![forbid(unsafe_code)]` holds everywhere except `aido-sys-raw`'s `sys` module, which carries a published block budget.
+`xudo-gate` and `xudod` are the privileged pair, with a dependency budget capped at sudo-rs's bar: rustix/libc plus one audited serialization crate. `#![forbid(unsafe_code)]` holds everywhere except `xudo-sys-raw`'s `sys` module, which carries a published block budget.
 
 ---
 
 ## Config layout
 
-All of `/etc/aido` is `root:root` and **refuses to load** if any path *component* is group/world-writable, is a symlink, or lives on a filesystem mounted by a non-root user (checked against `/proc/self/mountinfo`). Verification is on the **opened fd** via `fstat`, never on the path string.
+All of `/etc/xudo` is `root:root` and **refuses to load** if any path *component* is group/world-writable, is a symlink, or lives on a filesystem mounted by a non-root user (checked against `/proc/self/mountinfo`). Verification is on the **opened fd** via `fstat`, never on the path string.
 
 ```
-/etc/aido/config.toml            0644  confirm_agent_actions = true (default), confirmation_timeout,
+/etc/xudo/config.toml            0644  confirm_agent_actions = true (default), confirmation_timeout,
                                        use_pty, audit_sink, rate limits, novelty signals.
                                        There is NO global confirmation off-switch key.
-/etc/aido/rules.d/*.toml         0644  Named actions + typed argv matchers. Lexical basename order.
+/etc/xudo/rules.d/*.toml         0644  Named actions + typed argv matchers. Lexical basename order.
                                        A missing include is a HARD ERROR, never a silent skip.
-/etc/aido/deny.d/00-catastrophic.toml  Shipped copy FOR OPERATOR READING ONLY. The authoritative
-                                       deny-list is compiled into aido-policy and cannot be edited,
+/etc/xudo/deny.d/00-catastrophic.toml  Shipped copy FOR OPERATOR READING ONLY. The authoritative
+                                       deny-list is compiled into xudo-policy and cannot be edited,
                                        shadowed, or disabled by any file.
-/etc/aido/agents.d/*.toml        0644  Enrollment registry: id, launch command, target pinned by
+/etc/xudo/agents.d/*.toml        0644  Enrollment registry: id, launch command, target pinned by
                                        (st_dev, st_ino), provenance (who/when/why).
-/etc/aido/trust.d/*.toml         0644  The ONLY thing that can narrow the confirmation requirement.
+/etc/xudo/trust.d/*.toml         0644  The ONLY thing that can narrow the confirmation requirement.
                                        Triple (agent × project root × action class) + mandatory
                                        reason + expiry.
-/etc/aido/projects.d/*.toml      0644  Project root → profile, grant ceiling, repo_policy_sha256.
-/etc/aido/backend.toml           0644  Detected backend + probed capability matrix.
-/etc/aido/attest.key             0600  HMAC-SHA256 key, regenerated per boot_id.
-/etc/aido/policy.generation      0644  Monotonic counter + hash of the committed generation.
+/etc/xudo/projects.d/*.toml      0644  Project root → profile, grant ceiling, repo_policy_sha256.
+/etc/xudo/backend.toml           0644  Detected backend + probed capability matrix.
+/etc/xudo/attest.key             0600  HMAC-SHA256 key, regenerated per boot_id.
+/etc/xudo/policy.generation      0644  Monotonic counter + hash of the committed generation.
 
-<project>/.aido/policy.toml            NARROWING ONLY. The loader structurally rejects any construct
+<project>/.xudo/policy.toml            NARROWING ONLY. The loader structurally rejects any construct
                                        that adds a rule, widens a matcher, removes a confirm
                                        requirement, raises a rate limit, or extends a TTL. Ignored
                                        unless projects.d records its sha256. There is deliberately
                                        NO user-home layer that can widen policy.
 
-/etc/sudoers.d/aido              0440  NO DOT, NO trailing ~ — sudo silently ignores such files.
-/etc/doas.d/60-aido.conf         0400  Or a sentinel-delimited block in /etc/doas.conf under flock.
+/etc/sudoers.d/xudo              0440  NO DOT, NO trailing ~ — sudo silently ignores such files.
+/etc/doas.d/60-xudo.conf         0400  Or a sentinel-delimited block in /etc/doas.conf under flock.
 
-/run/aido/                       0755  broker.sock (0660 root:aido, socket-activated)
-/run/aido/req/                   0700  <nonce> pending requests (0600, O_EXCL, renamed into place)
-/run/aido/sessions/              0700  <id> enrolled sessions (M4)
-/var/lib/aido/                   0700  grants, rate buckets, novelty baselines, nonce ledger,
+/run/xudo/                       0755  broker.sock (0660 root:xudo, socket-activated)
+/run/xudo/req/                   0700  <nonce> pending requests (0600, O_EXCL, renamed into place)
+/run/xudo/sessions/              0700  <id> enrolled sessions (M4)
+/var/lib/xudo/                   0700  grants, rate buckets, novelty baselines, nonce ledger,
                                        policy generations + rollback copies
-/var/lib/aido/audit.jsonl        0600  hash-chained log, the chain's authority; journald mirrors it
+/var/lib/xudo/audit.jsonl        0600  hash-chained log, the chain's authority; journald mirrors it
 ```
 
-Rate buckets and grant counters **must** live on disk, not in-process: each `aido` invocation is a fresh short-lived process. Grant TTLs are monotonic-clock-anchored so a clock change cannot extend a window.
+Rate buckets and grant counters **must** live on disk, not in-process: each `xudo` invocation is a fresh short-lived process. Grant TTLs are monotonic-clock-anchored so a clock change cannot extend a window.
 
 ---
 
 ## Backend integration
 
-Detection is **runtime, never build-time**, recorded in `backend.toml` and in every audit record. Probe `/usr/bin/sudo` and `/usr/bin/doas` by absolute path. Detect sudo vs **sudo-rs** (default sudo in Ubuntu 26.04 LTS — it *ignores* unsupported directives with a warning, so a rule aido wrote may silently not do what it says). For doas, detect whether the build has `--with-timestamp` (OpenDoas disables `persist` by default on Linux). **aido never depends on backend credential caching.**
+Detection is **runtime, never build-time**, recorded in `backend.toml` and in every audit record. Probe `/usr/bin/sudo` and `/usr/bin/doas` by absolute path. Detect sudo vs **sudo-rs** (default sudo in Ubuntu 26.04 LTS — it *ignores* unsupported directives with a warning, so a rule xudo wrote may silently not do what it says). For doas, detect whether the build has `--with-timestamp` (OpenDoas disables `persist` by default on Linux). **xudo never depends on backend credential caching.**
 
-Refuse to operate — exit 19, fail closed, no silent downgrade — when neither backend exists, when the ruleset is not root-owned, when `/etc/aido` sits on a `nosuid`/`noexec`/user-writable mount, or when "root" is a namespaced root that does not mean what the operator thinks.
+Refuse to operate — exit 19, fail closed, no silent downgrade — when neither backend exists, when the ruleset is not root-owned, when `/etc/xudo` sits on a `nosuid`/`noexec`/user-writable mount, or when "root" is a namespaced root that does not mean what the operator thinks.
 
 **Post-install verification is functional, not file-existence:** run the gate with a no-op probe and assert it actually executed as uid 0.
 
 ```sudoers
-# /etc/sudoers.d/aido — 0440 root:root
-Cmnd_Alias AIDO_NOPASS = /usr/libexec/aido/aido-gate-nopass ""
-Cmnd_Alias AIDO_AUTH   = /usr/libexec/aido/aido-gate-auth   ""
-Defaults!AIDO_NOPASS env_reset, !setenv, secure_path="/usr/sbin:/usr/bin:/sbin:/bin", timestamp_timeout=0, use_pty, !visiblepw
-Defaults!AIDO_AUTH   env_reset, !setenv, secure_path="/usr/sbin:/usr/bin:/sbin:/bin", timestamp_timeout=0, use_pty, !visiblepw
-%aido ALL=(root) NOPASSWD: AIDO_NOPASS
-%aido ALL=(root) PASSWD:   AIDO_AUTH
+# /etc/sudoers.d/xudo — 0440 root:root
+Cmnd_Alias XUDO_NOPASS = /usr/libexec/xudo/xudo-gate-nopass ""
+Cmnd_Alias XUDO_AUTH   = /usr/libexec/xudo/xudo-gate-auth   ""
+Defaults!XUDO_NOPASS env_reset, !setenv, secure_path="/usr/sbin:/usr/bin:/sbin:/bin", timestamp_timeout=0, use_pty, !visiblepw
+Defaults!XUDO_AUTH   env_reset, !setenv, secure_path="/usr/sbin:/usr/bin:/sbin:/bin", timestamp_timeout=0, use_pty, !visiblepw
+%xudo ALL=(root) NOPASSWD: XUDO_NOPASS
+%xudo ALL=(root) PASSWD:   XUDO_AUTH
 ```
 
 Line by line:
@@ -196,31 +196,31 @@ Line by line:
 - `timestamp_timeout=0` is **essential**: without it the agent path can ride a credential the human cached with an earlier unrelated `sudo` — the exact residual-timeout side channel used in a published Codex CLI sandbox escape.
 - `use_pty` is the remedy for the TIOCSTI/TIOCLINUX tty-hijack class (CVE-2005-4890 `su`, CVE-2016-2779 `runuser`, still-open OpenDoas #106). Blocking individual ioctls is a losing game — TIOCLINUX has no equivalent of Linux 6.2's `dev.tty.legacy_tiocsti` knob.
 - Two hardlinks, two rules: `NOPASSWD` only ever attaches to the agent-path name.
-- Validate with `visudo -cf` on aido's own temp copy before atomic rename. **sudo-rs's `visudo` validates only `/etc/sudoers`, not `sudoers.d`** — aido must run the check explicitly on its own file.
+- Validate with `visudo -cf` on xudo's own temp copy before atomic rename. **sudo-rs's `visudo` validates only `/etc/sudoers`, not `sudoers.d`** — xudo must run the check explicitly on its own file.
 
 ### Why zero arguments and not a request id on argv
 
-sudo closes all fds ≥ 3 before exec (`closefrom`), so an fd-passed request channel does not survive the backend hop. And sudoers cannot constrain argument *arity* — only "no arguments" or a trailing wildcard. Rather than accept a wildcard or a bearer token in argv (visible in `/proc`, and caller-controlled), the gate takes **nothing**: it calls back to the broker, the broker identifies the *gate* via `SO_PEERPIDFD`, walks `gate → sudo/doas → aido` with pidfds pinned by `(pid, starttime)`, matches the pending record it minted for that exact `aido` process, and atomically consumes the nonce. Nothing to spoof, no lookup to race.
+sudo closes all fds ≥ 3 before exec (`closefrom`), so an fd-passed request channel does not survive the backend hop. And sudoers cannot constrain argument *arity* — only "no arguments" or a trailing wildcard. Rather than accept a wildcard or a bearer token in argv (visible in `/proc`, and caller-controlled), the gate takes **nothing**: it calls back to the broker, the broker identifies the *gate* via `SO_PEERPIDFD`, walks `gate → sudo/doas → xudo` with pidfds pinned by `(pid, starttime)`, matches the pending record it minted for that exact `xudo` process, and atomically consumes the nonce. Nothing to spoof, no lookup to race.
 
-**The gate is directly invocable by any member of the `aido` group, and that is designed for, not wished away.** A hostile direct invocation gets: empty argv (the rule enforces it), an environment reset by sudo *and* rebuilt from scratch by the gate, no pending request record → no nonce to consume → nothing to execute. It exits non-zero having done nothing privileged, and emits a high-severity audit record. The gate is safe to invoke by anyone **because the gate is the policy engine** and derives every input from kernel-attested facts and root-owned state, never from what it was handed.
+**The gate is directly invocable by any member of the `xudo` group, and that is designed for, not wished away.** A hostile direct invocation gets: empty argv (the rule enforces it), an environment reset by sudo *and* rebuilt from scratch by the gate, no pending request record → no nonce to consume → nothing to execute. It exits non-zero having done nothing privileged, and emits a high-severity audit record. The gate is safe to invoke by anyone **because the gate is the policy engine** and derives every input from kernel-attested facts and root-owned state, never from what it was handed.
 
 ---
 
 ## Flows
 
-**Human (password required).** `aido svc restart nginx` → broker classifies HUMAN (cgroup does not match a live scope) → evaluate allowlist → deny-list → rate limits → freeze state → mint one-use request → front-end execs `sudo /usr/libexec/aido/aido-gate-auth` → sudo runs its own PAM conversation on the fresh pty it allocated. **aido never sees, handles, or caches the password** — the entire credential-handling bug class stays out of scope. Gate re-decides independently, then execs.
+**Human (password required).** `xudo svc restart nginx` → broker classifies HUMAN (cgroup does not match a live scope) → evaluate allowlist → deny-list → rate limits → freeze state → mint one-use request → front-end execs `sudo /usr/libexec/xudo/xudo-gate-auth` → sudo runs its own PAM conversation on the fresh pty it allocated. **xudo never sees, handles, or caches the password** — the entire credential-handling bug class stays out of scope. Gate re-decides independently, then execs.
 
-**Agent (enrolled, passwordless, still confirmed).** Same, except the cgroup id matches a live root-created scope → ENROLLED AGENT. Pre-flight runs the dry-run (`apt-get -s install`) and, for removals, intersects the resolved set against the protected-package set and count cap. `confirm_agent_actions = true` by default, so it goes to the confirmation flow — **not** to a password prompt. Then `sudo /usr/libexec/aido/aido-gate-nopass`.
+**Agent (enrolled, passwordless, still confirmed).** Same, except the cgroup id matches a live root-created scope → ENROLLED AGENT. Pre-flight runs the dry-run (`apt-get -s install`) and, for removals, intersects the resolved set against the protected-package set and count cap. `confirm_agent_actions = true` by default, so it goes to the confirmation flow — **not** to a password prompt. Then `sudo /usr/libexec/xudo/xudo-gate-nopass`.
 
-**Yolo confirmation (the default-on safety setting).** aido learns yolo state **only** from the agent's self-declaration over the authenticated channel, never inferred from ancestor argv (an attacker who wants the prompt skipped simply omits `--dangerously-skip-permissions`, and an in-session toggle never appears in argv at all). The declaration affects logging and wording, never authorization. The broker creates a pending request with an absolute monotonic deadline and returns a request id **immediately** — the front-end blocks on the broker socket, not on a terminal read, so the agent gets a resumable structured "pending approval" state rather than a wedged tool call. Prompt is rendered on, in strict priority order: (1) an `aido watch` session — the trusted-by-construction default; (2) the session TTY captured at enrollment, after re-verifying ownership; (3) `aido approve <req-id>` from any other authorized terminal.
+**Yolo confirmation (the default-on safety setting).** xudo learns yolo state **only** from the agent's self-declaration over the authenticated channel, never inferred from ancestor argv (an attacker who wants the prompt skipped simply omits `--dangerously-skip-permissions`, and an in-session toggle never appears in argv at all). The declaration affects logging and wording, never authorization. The broker creates a pending request with an absolute monotonic deadline and returns a request id **immediately** — the front-end blocks on the broker socket, not on a terminal read, so the agent gets a resumable structured "pending approval" state rather than a wedged tool call. Prompt is rendered on, in strict priority order: (1) an `xudo watch` session — the trusted-by-construction default; (2) the session TTY captured at enrollment, after re-verifying ownership; (3) `xudo approve <req-id>` from any other authorized terminal.
 
 The prompt shows post-canonicalization resolved argv, matched rule id + `file:line`, digest result, caller classification *and its evidence*, declared reversibility and write scope, and the cached dry-run preview. Every agent-supplied string is stripped of ANSI/C0/C1, bidi overrides (U+202A–202E, U+2066–2069), and confusable/homoglyph path characters — the approval prompt is itself an attack surface. Responses require a **typed token** (the action name, not `y`) and are rejected if they arrive faster than a human reaction floor. Requests are de-duplicated by fingerprint with exponential backoff so a looping agent cannot induce prompt fatigue. Timeout → **DENY**.
 
-**Agent registration.** `aido agent add claude-code --exec ...` is root-only through the password path. Registration mints an identity, which is exactly why root is the right requirement. It writes `/etc/aido/agents.d/<name>.toml` with `(st_dev, st_ino)` pinning and provenance, and **prints every time** that the registry is an availability control, not a security control. Content-hash pinning of agent binaries is deliberately *not* a boundary: real installs live in user-writable, self-updating `$HOME` paths (measured: `CLAUDE_CODE_EXECPATH` under `~/.local/share/claude/versions/`), so a hash registry over an attacker-writable file is decoration.
+**Agent registration.** `xudo agent add claude-code --exec ...` is root-only through the password path. Registration mints an identity, which is exactly why root is the right requirement. It writes `/etc/xudo/agents.d/<name>.toml` with `(st_dev, st_ino)` pinning and provenance, and **prints every time** that the registry is an availability control, not a security control. Content-hash pinning of agent binaries is deliberately *not* a boundary: real installs live in user-writable, self-updating `$HOME` paths (measured: `CLAUDE_CODE_EXECPATH` under `~/.local/share/claude/versions/`), so a hash registry over an attacker-writable file is decoration.
 
-**Enrollment** — the part that actually creates capability — happens per session: `aido session start --agent claude-code --project /srv/app -- --dangerously-skip-permissions`. Through the password path, so the human authenticates once. `aido-session` then creates the root-owned transient scope under `aido.slice`, captures and validates the human's controlling TTY as the confirmation channel, mints the scope-bound HMAC token, passes one end of a socketpair as an inherited fd (possession of the fd *is* the proof of lineage), and execs the registry-pinned harness with a scrubbed environment — refusing to launch if the exec-time environment carries `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONSTARTUP`.
+**Enrollment** — the part that actually creates capability — happens per session: `xudo session start --agent claude-code --project /srv/app -- --dangerously-skip-permissions`. Through the password path, so the human authenticates once. `xudo-session` then creates the root-owned transient scope under `xudo.slice`, captures and validates the human's controlling TTY as the confirmation channel, mints the scope-bound HMAC token, passes one end of a socketpair as an inherited fd (possession of the fd *is* the proof of lineage), and execs the registry-pinned harness with a scrubbed environment — refusing to launch if the exec-time environment carries `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONSTARTUP`.
 
-**Policy install (two-phase, semantically diffed).** Parse with `deny_unknown_fields` on every struct — an unrecognized key in a root-owned rule file is a **hard fail**. Run `aido check`. Then compute a **semantic capability diff**, not a text diff: for each rule, the set of `(binary, argv-shape, path-prefix, confirm-requirement, write-scope, network-flag)` tuples, reported in plain language — *"now permits writes anywhere under /etc, previously only /etc/nginx"* — including reachability changes caused by ordering. A textual diff hides a capability change made by loosening a regex by one character. Confirm on a trusted channel, commit atomically (staging → fsync file → fsync dir → rename → fsync dir), bump the monotonic generation, hash it into the audit chain. The bump invalidates outstanding grants, cached decisions, repo-policy trust hashes, and generated agent docs.
+**Policy install (two-phase, semantically diffed).** Parse with `deny_unknown_fields` on every struct — an unrecognized key in a root-owned rule file is a **hard fail**. Run `xudo check`. Then compute a **semantic capability diff**, not a text diff: for each rule, the set of `(binary, argv-shape, path-prefix, confirm-requirement, write-scope, network-flag)` tuples, reported in plain language — *"now permits writes anywhere under /etc, previously only /etc/nginx"* — including reachability changes caused by ordering. A textual diff hides a capability change made by loosening a regex by one character. Confirm on a trusted channel, commit atomically (staging → fsync file → fsync dir → rename → fsync dir), bump the monotonic generation, hash it into the audit chain. The bump invalidates outstanding grants, cached decisions, repo-policy trust hashes, and generated agent docs.
 
 ---
 
@@ -246,7 +246,7 @@ The ruleset allowlists root-authored action IDs that expand **internally** to a 
 | **T2 pkg-install** | high | on | `apt-get -y --no-install-recommends install -- <deb-name>{1,20}`, `apt-get update`, `dnf -y install`, `pacman -S --needed --noconfirm`, `apk add --no-cache`. snap/flatpak **off** |
 | **T3 pkg-remove/upgrade** | high | on, capped | `apt-get -y remove -- <deb-name>{1,10}`, `apt-get -y upgrade`. `full-upgrade` **off**. Removals cascade — resolved set is intersected against a protected-package set and a count cap |
 | **T4 sys-tunable** | high | narrow | `sysctl -w` on an **enum of keys with per-key value ranges** (`vm.max_map_count`, `fs.inotify.max_user_watches`, `net.core.somaxconn`), `timedatectl set-ntp\|set-timezone`, in-process `/etc/hosts` and `/etc/sysctl.d` writers |
-| **T5 net-filter-write** | high | via verbs | `aido net fw-allow <port>/<proto>` renders a fixed per-backend template *after* snapshotting the ruleset to a root-owned 0600 backup. Rollback restores from aido's own snapshot, never via `iptables-restore` |
+| **T5 net-filter-write** | high | via verbs | `xudo net fw-allow <port>/<proto>` renders a fixed per-backend template *after* snapshotting the ruleset to a root-owned 0600 backup. Rollback restores from xudo's own snapshot, never via `iptables-restore` |
 | **T6 fs-mount** | critical | **off** | Only `mount <target>` where target is an exact member of the fstab `user`/`noauto` set. `mount` with caller-influenced options is unconditionally equivalent to full root |
 | **T7 container-daemon** | critical | **off** | No safe subset exists — `docker run -v /:/host` rewrites root's password hash. Default action *prints rootless podman/Docker guidance*. Never `usermod -aG docker` |
 | **T8 lang-global-install** | critical | **off** | npm/pip install-time code execution is documented normal behavior. Default action *routes to userspace*: pipx, `uv tool install`, `npm prefix ~/.local`, venv |
@@ -258,7 +258,7 @@ Highest-leverage entries in the default set are the ones that **execute nothing*
 
 ### Compiled-in deny-list (by capability class)
 
-Shells · interpreters (`python*`, `perl`, `ruby`, `node`, `awk`, `lua`, `php`, `expect`) · exec proxies (`env`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `taskset`, `chrt`) · namespace/priv tools (`unshare`, `nsenter`, `chroot`, `systemd-run`, `systemd-nspawn`, `machinectl shell`, `setpriv`) · `find` with `-exec*`/`-delete`/`-fprintf` · `xargs`/`parallel` (argv from attacker-controlled stdin) · editors and `sed -i` · **pagers** (`less`/`more`/`man`/`bat` honor `LESSOPEN` and `!cmd`) · debuggers (`gdb`, `strace`, `perf`, `bpftrace`) · **`git` as root in any form** (`-c core.pager=`, `-c core.sshCommand=`, `alias.*=!`, repo-local `.git/hooks/*`) · `ssh`/`scp`/`socat`/`nc` (ProxyCommand, LocalCommand) · `tar --to-command`/`--checkpoint-action=exec`/`-I` · all generic write primitives · `dd` to any device · `mkfs*`/`wipefs`/`fdisk`/`parted` · `rm -rf` on system paths · recursive `chmod`/`chown`/`setfacl` on system paths, any setuid/setgid/`o+w` mode outside a workspace · `setcap` and any file-capability grant · all user/group/password tools · **anything that writes the thing that decides** (`/etc/sudoers*`, `/etc/doas.conf`, `/etc/polkit-1/**`, `/etc/pam.d/*`, `/etc/nsswitch.conf`, **`/etc/aido/**`**, aido's own binaries and audit log) · `/etc/ld.so.preload` and `ldconfig` with a caller path · `/etc/environment`, `/etc/profile*`, `/etc/default/*` · kernel modules and `kexec` · dangerous sysctl keys (`kernel.core_pattern`, `kernel.modprobe`, `kernel.sysrq`, `kernel.unprivileged_*`) and **all file-driven sysctl forms** (`-p`, `--load`, `--system`) · shutdown/reboot/kexec · `systemctl enable|disable|mask|link|revert|edit|set-property|set-environment` and unit-file writes · `iptables-restore`/`nft -f`/`nft flush ruleset` · `mount --bind`/`--move`/`-o suid,dev,exec`/`mount -a` · `docker run|build|exec|cp|commit|load`, `podman --privileged` · any network-fetch-piped-to-interpreter · cron/at/`run-parts`/`logrotate -f` with a caller config · audit and SELinux/AppArmor disabling · **any write to package-manager config, keyrings, or sources** · any package op naming a local file, path, URL, or VCS ref (`dpkg -i`, `rpm -i`, `apt install ./x.deb`) · any package-manager flag that redirects config or hooks (`apt -o DPkg::Pre-Invoke::='...'` **is** a `/bin/sh`-as-root injection through a rule that only meant to install a package).
+Shells · interpreters (`python*`, `perl`, `ruby`, `node`, `awk`, `lua`, `php`, `expect`) · exec proxies (`env`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `taskset`, `chrt`) · namespace/priv tools (`unshare`, `nsenter`, `chroot`, `systemd-run`, `systemd-nspawn`, `machinectl shell`, `setpriv`) · `find` with `-exec*`/`-delete`/`-fprintf` · `xargs`/`parallel` (argv from attacker-controlled stdin) · editors and `sed -i` · **pagers** (`less`/`more`/`man`/`bat` honor `LESSOPEN` and `!cmd`) · debuggers (`gdb`, `strace`, `perf`, `bpftrace`) · **`git` as root in any form** (`-c core.pager=`, `-c core.sshCommand=`, `alias.*=!`, repo-local `.git/hooks/*`) · `ssh`/`scp`/`socat`/`nc` (ProxyCommand, LocalCommand) · `tar --to-command`/`--checkpoint-action=exec`/`-I` · all generic write primitives · `dd` to any device · `mkfs*`/`wipefs`/`fdisk`/`parted` · `rm -rf` on system paths · recursive `chmod`/`chown`/`setfacl` on system paths, any setuid/setgid/`o+w` mode outside a workspace · `setcap` and any file-capability grant · all user/group/password tools · **anything that writes the thing that decides** (`/etc/sudoers*`, `/etc/doas.conf`, `/etc/polkit-1/**`, `/etc/pam.d/*`, `/etc/nsswitch.conf`, **`/etc/xudo/**`**, xudo's own binaries and audit log) · `/etc/ld.so.preload` and `ldconfig` with a caller path · `/etc/environment`, `/etc/profile*`, `/etc/default/*` · kernel modules and `kexec` · dangerous sysctl keys (`kernel.core_pattern`, `kernel.modprobe`, `kernel.sysrq`, `kernel.unprivileged_*`) and **all file-driven sysctl forms** (`-p`, `--load`, `--system`) · shutdown/reboot/kexec · `systemctl enable|disable|mask|link|revert|edit|set-property|set-environment` and unit-file writes · `iptables-restore`/`nft -f`/`nft flush ruleset` · `mount --bind`/`--move`/`-o suid,dev,exec`/`mount -a` · `docker run|build|exec|cp|commit|load`, `podman --privileged` · any network-fetch-piped-to-interpreter · cron/at/`run-parts`/`logrotate -f` with a caller config · audit and SELinux/AppArmor disabling · **any write to package-manager config, keyrings, or sources** · any package op naming a local file, path, URL, or VCS ref (`dpkg -i`, `rpm -i`, `apt install ./x.deb`) · any package-manager flag that redirects config or hooks (`apt -o DPkg::Pre-Invoke::='...'` **is** a `/bin/sh`-as-root injection through a rule that only meant to install a package).
 
 **Enforce with a CI gate** that greps every allowlisted binary against a vendored GTFOBins list and fails the build.
 
@@ -267,49 +267,49 @@ Shells · interpreters (`python*`, `perl`, `ruby`, `node`, `awk`, `lua`, `php`, 
 ## CLI surface
 
 ```
-aido [-n|--non-interactive] [--output human|json] [--explain] [-k] [--unattended] <subcommand>
-aido -- <argv>...                    # shorthand for `aido exec --`
+xudo [-n|--non-interactive] [--output human|json] [--explain] [-k] [--unattended] <subcommand>
+xudo -- <argv>...                    # shorthand for `xudo exec --`
 
 EXECUTION
-  aido exec -- <argv>...             # escape hatch; same matching, no looser
-  aido pkg     install|remove|update|upgrade|dry-run|search|info
-  aido svc     start|stop|restart|reload|status|logs|reload-units
-  aido net     listeners|who-holds|fw-list|fw-allow|fw-revoke|fw-rollback
-  aido hosts   add|remove|list
-  aido sysctl  get|set [--persist]
-  aido time    set-ntp|set-tz
-  aido dir     claim <path>
-  aido mount|umount <fstab-target>
-  aido global-install|container      # execute NOTHING by default; print the unprivileged equivalent
+  xudo exec -- <argv>...             # escape hatch; same matching, no looser
+  xudo pkg     install|remove|update|upgrade|dry-run|search|info
+  xudo svc     start|stop|restart|reload|status|logs|reload-units
+  xudo net     listeners|who-holds|fw-list|fw-allow|fw-revoke|fw-rollback
+  xudo hosts   add|remove|list
+  xudo sysctl  get|set [--persist]
+  xudo time    set-ntp|set-tz
+  xudo dir     claim <path>
+  xudo mount|umount <fstab-target>
+  xudo global-install|container      # execute NOTHING by default; print the unprivileged equivalent
 
 INTROSPECTION
-  aido explain [--json] -- <argv>    # full trace: every rule considered, per-position matcher
+  xudo explain [--json] -- <argv>    # full trace: every rule considered, per-position matcher
                                      # outcome, matched rule file:line, resolved binary + digest,
                                      # the exact environment, the classification AND its evidence
-  aido explain --why-not <rule-id> -- <argv>
-  aido list | aido -l [--as <agent>] # effective policy. Listing ANOTHER agent's effective
+  xudo explain --why-not <rule-id> -- <argv>
+  xudo list | xudo -l [--as <agent>] # effective policy. Listing ANOTHER agent's effective
                                      # permissions is itself a privileged action (polkit precedent)
-  aido check [--fuzz]                # linter + executable [[test]] blocks; distinct exit codes for
+  xudo check [--fuzz]                # linter + executable [[test]] blocks; distinct exit codes for
                                      # lint-warning / lint-error / test-failure so CI gates each
-  aido doctor [--json] [--fix]       # backend/kernel/env report + EVERY OTHER PATH TO ROOT that
-                                     # makes aido decorative (pre-existing NOPASSWD, wheel/docker
+  xudo doctor [--json] [--fix]       # backend/kernel/env report + EVERY OTHER PATH TO ROOT that
+                                     # makes xudo decorative (pre-existing NOPASSWD, wheel/docker
                                      # membership, writable unit dirs, writable PATH, writable rc)
 
 CONFIRMATION
-  aido watch                         # hold a terminal as the trusted confirmation channel (default)
-  aido pending | aido approve <id> | aido deny <id>
-  aido freeze [--session <id>] [--for <dur>] --reason <text>   # instantly deny every agent path;
+  xudo watch                         # hold a terminal as the trusted confirmation channel (default)
+  xudo pending | xudo approve <id> | xudo deny <id>
+  xudo freeze [--session <id>] [--for <dur>] --reason <text>   # instantly deny every agent path;
                                                                # human path stays available
-  aido thaw                          # human path only
+  xudo thaw                          # human path only
 
 SESSIONS / GRANTS / AGENTS / POLICY  (all root-authored, all through the password path)
-  aido session start --agent <a> --project <p> -- <harness-args>
-  aido grant <permission|set> [<dur>] [--agent <id>] [--project <p>] [--max <n>] | aido grants | aido revoke <id>
-  aido agent add|list|remove
-  aido policy install <path> | aido policy rollback | aido project trust
-  aido audit tail|query|verify
-  aido agentdoc --format claude|agents|codex
-  aido mcp                           # stdio MCP server: aido_run/explain/list_rules/request_grant
+  xudo session start --agent <a> --project <p> -- <harness-args>
+  xudo grant <permission|set> [<dur>] [--agent <id>] [--project <p>] [--max <n>] | xudo grants | xudo revoke <id>
+  xudo agent add|list|remove
+  xudo policy install <path> | xudo policy rollback | xudo project trust
+  xudo audit tail|query|verify
+  xudo agentdoc --format claude|agents|codex
+  xudo mcp                           # stdio MCP server: xudo_run/explain/list_rules/request_grant
 ```
 
 Contradictory safety flags (`--unattended` with `--confirm`, `-n` with `--explain-interactive`) are a **hard parse-time error**, never a silent precedence choice.
@@ -320,7 +320,7 @@ Contradictory safety flags (`--unattended` with `--confirm`, `-n` with `--explai
 
 **Rust**, 2024 edition, MSRV 1.85, stable toolchain.
 
-Why: the trust boundary in aido is almost entirely **parsing and matching** — TOML rules, argv canonicalization, deny-list evaluation, `/proc` text. That is precisely the code shape that produced sudo's CVE record (CVE-2021-3156 Baron Samedit heap overflow in argv unescaping; CVE-2023-22809 sudoedit; CVE-2025-32462/32463). Rust removes that bug class at the boundary and makes the rule engine a pure, fuzzable, proptest-able function. Precedent has moved: **sudo-rs** (Trifecta Tech / ISRG Prossimo, two external audits) is the default sudo in Ubuntu 26.04 LTS and packaged in Debian 13+, Fedora, Arch, Alpine, NixOS — distro security teams now accept Rust in exactly this niche. And `rustix` gives `openat2`, `execveat`, `close_range`, `pidfd_open`, `SO_PEERPIDFD` with `OwnedFd`/`AsFd` types that make **fd lifetime a compile-time property**; Rust's runtime spawns no threads before `main`.
+Why: the trust boundary in xudo is almost entirely **parsing and matching** — TOML rules, argv canonicalization, deny-list evaluation, `/proc` text. That is precisely the code shape that produced sudo's CVE record (CVE-2021-3156 Baron Samedit heap overflow in argv unescaping; CVE-2023-22809 sudoedit; CVE-2025-32462/32463). Rust removes that bug class at the boundary and makes the rule engine a pure, fuzzable, proptest-able function. Precedent has moved: **sudo-rs** (Trifecta Tech / ISRG Prossimo, two external audits) is the default sudo in Ubuntu 26.04 LTS and packaged in Debian 13+, Fedora, Arch, Alpine, NixOS — distro security teams now accept Rust in exactly this niche. And `rustix` gives `openat2`, `execveat`, `close_range`, `pidfd_open`, `SO_PEERPIDFD` with `OwnedFd`/`AsFd` types that make **fd lifetime a compile-time property**; Rust's runtime spawns no threads before `main`.
 
 Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactly where you need it), the runtime is multi-threaded before `main` while Linux `setuid`/`setresuid` are per-thread, and `SysProcAttr` is a fixed struct with no `pre_exec` hook, so `close_range`/`PR_SET_NO_NEW_PRIVS` are awkward. **C** — writing a new rule-language parser, argv matcher, and deny-list evaluator in C is volunteering for sudo's exact bug class.
 
@@ -335,7 +335,7 @@ Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactl
 | Patterns | `regex` (linear-time hybrid NFA/DFA — no ReDoS from an admin-added pattern) |
 | Byte-exact argv | `bstr` + `std::ffi::OsStr` — one `to_string_lossy()` in the matcher is a policy bypass |
 | Errors | `thiserror` everywhere; `anyhow` **banned** from the gate and any decision path (its context strings leak paths) |
-| Audit sinks | The hash-chained file is the authority (opened through the root-owned descriptor walk, never by a path string); journald is a required mirror, reached through its native protocol over `rustix` — no `systemd-journal-logger`, and no `syslog` fallback yet. A journald entry counts only with `_UID=0` (`aido_audit::journal::query`) |
+| Audit sinks | The hash-chained file is the authority (opened through the root-owned descriptor walk, never by a path string); journald is a required mirror, reached through its native protocol over `rustix` — no `systemd-journal-logger`, and no `syslog` fallback yet. A journald entry counts only with `_UID=0` (`xudo_audit::journal::query`) |
 | Secrets | `zeroize` + `secrecy` |
 | Digest pinning | `sha2`, verified on the already-open `O_PATH` fd immediately before exec |
 | Capabilities | `caps` |
@@ -347,7 +347,7 @@ Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactl
 
 ### Testing
 
-- **Native on macOS:** `aido-policy` unit tests, `proptest` invariants, `insta` snapshots, `cargo-fuzz` targets. Fast inner loop, no VM.
+- **Native on macOS:** `xudo-policy` unit tests, `proptest` invariants, `insta` snapshots, `cargo-fuzz` targets. Fast inner loop, no VM.
 - **Proptest invariants** (not examples): deny always wins · canonicalization is idempotent · appending an argument never flips deny→allow · rule load order never changes a deny · no generated argv escapes the declared matcher set.
 - **Fuzz three parsers separately:** TOML rule deserializer, argv canonicalizer/matcher, deny-list evaluator.
 - **Differential compliance harness** (the centerpiece): the same ruleset and invocation driven against `sudo`, `sudo-rs`, and `OpenDoas` asserting **identical** allow/deny outcomes, across Ubuntu 24.04 / Ubuntu 26.04 (sudo-rs default) / Debian 13 / Fedora+SELinux-enforcing / Alpine-musl-OpenDoas / Arch, × {x86_64, aarch64} natively, × kernels 5.15 / 6.1 / 6.6+, × cgroup v1 and v2, × `ptrace_scope` 0 and 1. Plus a no-escalator row asserting clean fail-closed.
@@ -361,19 +361,19 @@ Rejected: **Go** — PAM needs cgo (destroying the static/cross advantage exactl
 
 Each is independently shippable.
 
-**M1 — Policy core, matcher, `explain`.** *No privilege, no Linux required.* The workspace, five crates as planned (§ Crate layout has what it grew into), with the trust boundary drawn on day one. `aido-policy` as a pure function. Typed matchers, no globs. Compiled-in deny-list. `aido-sys` trait layer with `MacOsStub`. Ships as a standalone auditor: `aido explain`, `aido check --fuzz`, `aido rule list|test`, the versioned JSON envelope with a stable append-only exit-code and denial-code taxonomy, `aido agentdoc`. Test discipline established here and enforced forever. **Deliberately absent: any ability to execute anything.**
+**M1 — Policy core, matcher, `explain`.** *No privilege, no Linux required.* The workspace, five crates as planned (§ Crate layout has what it grew into), with the trust boundary drawn on day one. `xudo-policy` as a pure function. Typed matchers, no globs. Compiled-in deny-list. `xudo-sys` trait layer with `MacOsStub`. Ships as a standalone auditor: `xudo explain`, `xudo check --fuzz`, `xudo rule list|test`, the versioned JSON envelope with a stable append-only exit-code and denial-code taxonomy, `xudo agentdoc`. Test discipline established here and enforced forever. **Deliberately absent: any ability to execute anything.**
 
-**M2 — Human path end to end.** *A hardened, always-prompting sudo front-end.* Complete without any agent concept. Backend adapter with runtime capability probing across sudo/sudo-rs/OpenDoas; snippet generation with `visudo -cf`/`doas -C` validation, inode verification, atomic rename, and a **functional** post-install probe. `aido-gate` as the second independent policy engine with the full hardening set (`close_range` first, `/dev/null` substitution, `statfs` `/proc` check, ancestor ownership walk from a pinned dirfd, `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`, `O_PATH` + `fstat` + digest pin + `execveat(fd, "", AT_EMPTY_PATH)`, env from a fixed allowlist, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation). Audit subsystem with hash chain + journald. `aido doctor`. Distro packages. **Every invocation prompts** — exactly what a cautious operator wants to deploy first, and it already delivers the allowlist, the deny-list, and the audit trail.
+**M2 — Human path end to end.** *A hardened, always-prompting sudo front-end.* Complete without any agent concept. Backend adapter with runtime capability probing across sudo/sudo-rs/OpenDoas; snippet generation with `visudo -cf`/`doas -C` validation, inode verification, atomic rename, and a **functional** post-install probe. `xudo-gate` as the second independent policy engine with the full hardening set (`close_range` first, `/dev/null` substitution, `statfs` `/proc` check, ancestor ownership walk from a pinned dirfd, `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`, `O_PATH` + `fstat` + digest pin + `execveat(fd, "", AT_EMPTY_PATH)`, env from a fixed allowlist, `PR_SET_NO_NEW_PRIVS`, faithful exit-status and signal propagation). Audit subsystem with hash chain + journald. `xudo doctor`. Distro packages. **Every invocation prompts** — exactly what a cautious operator wants to deploy first, and it already delivers the allowlist, the deny-list, and the audit trail.
 
-**M3 — Broker and out-of-band confirmation.** *Still no passwordless path.* `aidod` socket-activated, `SO_PEERPIDFD` + `PIDFD_GET_INFO` peer identification with the documented fallback, namespace-divergence guard, gate-lineage walking. One-use nonce records with monotonic deadlines. The confirmation channel layer: `aido watch`, ownership-verified session TTY, `aido approve|deny|pending`, liveness pings, **DENY when no channel is live**. Full prompt-integrity work (ANSI/bidi/homoglyph stripping, typed tokens, reaction-time floor, de-dup with backoff, resumable pending envelope). `aido freeze`/`thaw`. Confirmation is purely **additive** here — every path still requires a password — so it ships as a safety upgrade with no new attack surface, and it proves the hardest architectural claim (that confirmation can live outside the agent's process tree) before anything depends on it.
+**M3 — Broker and out-of-band confirmation.** *Still no passwordless path.* `xudod` socket-activated, `SO_PEERPIDFD` + `PIDFD_GET_INFO` peer identification with the documented fallback, namespace-divergence guard, gate-lineage walking. One-use nonce records with monotonic deadlines. The confirmation channel layer: `xudo watch`, ownership-verified session TTY, `xudo approve|deny|pending`, liveness pings, **DENY when no channel is live**. Full prompt-integrity work (ANSI/bidi/homoglyph stripping, typed tokens, reaction-time floor, de-dup with backoff, resumable pending envelope). `xudo freeze`/`thaw`. Confirmation is purely **additive** here — every path still requires a password — so it ships as a safety upgrade with no new attack surface, and it proves the hardest architectural claim (that confirmation can live outside the agent's process tree) before anything depends on it.
 
-**M4 — Agent enrollment and the passwordless path.** *The milestone the product exists for — deliberately last among the load-bearing ones.* `aido-session` through the password path: root-owned transient scope under `aido.slice`, TTY capture and validation, scope-bound HMAC token with a replay ledger and per-agent revocation, socketpair fd as proof of lineage, registry-pinned harness exec with a scrubbed environment. `aido agent add|list|remove` with `(st_dev, st_ino)` pinning, provenance, expiry, and the mandatory printed disclaimer. Broker classification by cgroup identity, activation of the `aido-gate-nopass` hardlink, `confirm_agent_actions` defaulting to true. Agent-declared yolo state over the authenticated channel. **Non-delegable one-use grants** so a sub-agent, Task subagent, or MCP hop is a fresh decision. `SECURITY.md` published with the plain statement that agent detection is a UX mechanism, not a security boundary. **All eight requirements now met.**
+**M4 — Agent enrollment and the passwordless path.** *The milestone the product exists for — deliberately last among the load-bearing ones.* `xudo-session` through the password path: root-owned transient scope under `xudo.slice`, TTY capture and validation, scope-bound HMAC token with a replay ledger and per-agent revocation, socketpair fd as proof of lineage, registry-pinned harness exec with a scrubbed environment. `xudo agent add|list|remove` with `(st_dev, st_ino)` pinning, provenance, expiry, and the mandatory printed disclaimer. Broker classification by cgroup identity, activation of the `xudo-gate-nopass` hardlink, `confirm_agent_actions` defaulting to true. Agent-declared yolo state over the authenticated channel. **Non-delegable one-use grants** so a sub-agent, Task subagent, or MCP hop is a fresh decision. `SECURITY.md` published with the plain statement that agent detection is a UX mechanism, not a security boundary. **All eight requirements now met.**
 
-**M5 — Narrowing the confirmation, bounded grants, volume controls.** The "users can turn it off" requirement, implemented as a **narrowing rather than a switch**: `trust.d` records over (agent × project × action class) with mandatory reason and expiry, gating `confirm = "never"` and the per-invocation non-persistable `--unattended`; a persistent banner and a distinct high-severity audit record on every use. `aido grant <dur> --profile --project --max` with monotonic TTLs, use counters persisted *before* exec, and the invariant that an agent-path invocation can never mint or extend a grant. Persistent token buckets with three escalating thresholds (annotate → force confirmation even under a grant → deny + notify + optional auto-freeze), plus a separate **rule-novelty** bucket because breadth is a better anomaly signal than depth. **This is the milestone that prevents the realistic failure mode — someone disabling the safety default to unstick a workflow.**
+**M5 — Narrowing the confirmation, bounded grants, volume controls.** The "users can turn it off" requirement, implemented as a **narrowing rather than a switch**: `trust.d` records over (agent × project × action class) with mandatory reason and expiry, gating `confirm = "never"` and the per-invocation non-persistable `--unattended`; a persistent banner and a distinct high-severity audit record on every use. `xudo grant <dur> --profile --project --max` with monotonic TTLs, use counters persisted *before* exec, and the invariant that an agent-path invocation can never mint or extend a grant. Persistent token buckets with three escalating thresholds (annotate → force confirmation even under a grant → deny + notify + optional auto-freeze), plus a separate **rule-novelty** bucket because breadth is a better anomaly signal than depth. **This is the milestone that prevents the realistic failure mode — someone disabling the safety default to unstick a workflow.**
 
-**M6 — Ergonomics, named-action profiles, harness integration.** *All explicitly non-load-bearing.* The curated verb surface with per-backend argv rendering, mandatory dry-run pre-flight for installs, protected-package intersection for removals, in-process schema-aware writers for `/etc/hosts` and `/etc/sysctl.d`, firewall verbs with snapshots and rollback by aido's own rule ids. Dry-run previews rendered into the confirmation prompt (`apt-get -s`, `nft -c`, `systemd-analyze verify`), output-capped and cached against the request fingerprint. `aido init` wizard composing from profiles. `aido agentdoc` hook packs, `aido shell-init` EPERM hints verified against policy before printing, `aido mcp`, `aido audit tail|query` with session replay. Documented throughout: **the hook is a convenience; the guarantee is that the action is impossible without aido.**
+**M6 — Ergonomics, named-action profiles, harness integration.** *All explicitly non-load-bearing.* The curated verb surface with per-backend argv rendering, mandatory dry-run pre-flight for installs, protected-package intersection for removals, in-process schema-aware writers for `/etc/hosts` and `/etc/sysctl.d`, firewall verbs with snapshots and rollback by xudo's own rule ids. Dry-run previews rendered into the confirmation prompt (`apt-get -s`, `nft -c`, `systemd-analyze verify`), output-capped and cached against the request fingerprint. `xudo init` wizard composing from profiles. `xudo agentdoc` hook packs, `xudo shell-init` EPERM hints verified against policy before printing, `xudo mcp`, `xudo audit tail|query` with session replay. Documented throughout: **the hook is a convenience; the guarantee is that the action is impossible without xudo.**
 
-**M7 — Confinement, supply chain, external audit.** Hardening to 1.0. The full differential compliance matrix. Per-rule least privilege: capability bounding sets instead of full uid 0 where one or two caps suffice, Landlock rulesets derived from declared write scope (explicit audit record on kernel-version degradation, policy option to deny-on-degrade), seccomp filters. Two-phase installs with semantic capability diffs and `aido policy rollback`. Signed rule bundles (minisign/cosign, no insecure-skip path), `min_aido_version`, unknown-matcher-kind as a hard parse error rather than match-anything. Provably telemetry-free default build (networking behind a non-default cargo feature, seccomp denying `AF_INET` socket creation, a CI job under `strace` asserting no non-`AF_UNIX` socket), reproducible builds, SBOM, `aido verify-self`. **Then an external security audit on the sudo-rs precedent** — without which distro security teams will not package a privilege broker.
+**M7 — Confinement, supply chain, external audit.** Hardening to 1.0. The full differential compliance matrix. Per-rule least privilege: capability bounding sets instead of full uid 0 where one or two caps suffice, Landlock rulesets derived from declared write scope (explicit audit record on kernel-version degradation, policy option to deny-on-degrade), seccomp filters. Two-phase installs with semantic capability diffs and `xudo policy rollback`. Signed rule bundles (minisign/cosign, no insecure-skip path), `min_xudo_version`, unknown-matcher-kind as a hard parse error rather than match-anything. Provably telemetry-free default build (networking behind a non-default cargo feature, seccomp denying `AF_INET` socket creation, a CI job under `strace` asserting no non-`AF_UNIX` socket), reproducible builds, SBOM, `xudo verify-self`. **Then an external security audit on the sudo-rs precedent** — without which distro security teams will not package a privilege broker.
 
 ---
 
@@ -383,15 +383,15 @@ Each is independently shippable.
 → Root all authorization in kernel-attested facts only (`SO_PEERPIDFD` + root-created cgroup scope). Demote every env var, `comm`, `cmdline`, and ancestry name to an audited hint with zero weight. Make misclassification able only to *withhold* capability. State in SECURITY.md that detection is a UX mechanism, and **size the allowlist so that a full impersonation is survivable.**
 
 **2. The NOPASSWD gate is directly invocable.** Any design that says "only the front-end calls the helper" has already lost.
-→ Zero-argv rule, no env input, gate re-decides independently from root-owned state, one-use nonce bound to a specific `aido` pid via broker-walked lineage. Direct invocation does nothing and logs at high severity. `timestamp_timeout=0` so the agent path can never ride a cached human credential.
+→ Zero-argv rule, no env input, gate re-decides independently from root-owned state, one-use nonce bound to a specific `xudo` pid via broker-walked lineage. Direct invocation does nothing and logs at high severity. `timestamp_timeout=0` so the agent path can never ride a cached human credential.
 
-**3. The confirmation is self-approvable by the agent.** The agent owns aido's stdin, stdout, and pty.
-→ Confirmation leaves the agent's process tree entirely: `aido watch`, the ownership-verified session TTY, or `aido approve` from another terminal. Never a channel the requester supplied. Typed-token responses, human reaction-time floor, ANSI/bidi/homoglyph stripping, bounded deadlines that **fail closed**, de-dup with backoff to prevent prompt fatigue. The off switch is a narrowing (`trust.d` + per-rule `confirm = "never"` + per-invocation `--unattended`), never a global boolean — because **the most likely real failure is that a noisy prompt gets turned off.**
+**3. The confirmation is self-approvable by the agent.** The agent owns xudo's stdin, stdout, and pty.
+→ Confirmation leaves the agent's process tree entirely: `xudo watch`, the ownership-verified session TTY, or `xudo approve` from another terminal. Never a channel the requester supplied. Typed-token responses, human reaction-time floor, ANSI/bidi/homoglyph stripping, bounded deadlines that **fail closed**, de-dup with backoff to prevent prompt fatigue. The off switch is a narrowing (`trust.d` + per-rule `confirm = "never"` + per-invocation `--unattended`), never a global boolean — because **the most likely real failure is that a noisy prompt gets turned off.**
 
 **4. One overbroad allowlist entry voids the whole design.** One allowlisted shell, interpreter, pager, editor, exec proxy, container runtime, or `apt -o DPkg::Pre-Invoke::=` is unrestricted root regardless of how the arguments are written.
 → Named actions expanding to fixed argv · no intra-argument globs anywhere · flags deny-by-default per binary · deny-list compiled in and enumerated by capability class · **feature omission as the primary security property**, written down as a refusal list · CI gate against a vendored GTFOBins list.
 
-**5. Self-widening writes and TOCTOU/symlink races.** CVE-2021-3156's exploitation raced sudo's `ts_mkdirs()` with a symlink; sudo-rs's own audit found a path traversal (GHSA-2r3c-m6v7-9354). And because aido is deliberately **not** setuid, `ld.so` never sees `AT_SECURE` and does **no** `LD_*` scrubbing for it — that is entirely aido's problem.
+**5. Self-widening writes and TOCTOU/symlink races.** CVE-2021-3156's exploitation raced sudo's `ts_mkdirs()` with a symlink; sudo-rs's own audit found a path traversal (GHSA-2r3c-m6v7-9354). And because xudo is deliberately **not** setuid, `ld.so` never sees `AT_SECURE` and does **no** `LD_*` scrubbing for it — that is entirely xudo's problem.
 → Enforce paths by **resolution, never by string prefix**: `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` from a pinned dirfd, reject `..`, reject any symlink or non-root-owned component, reject `st_nlink>1` on write targets, verify ownership/mode **after** opening via `fstat`, and walk **every ancestor** (one writable ancestor defeats all per-file checks). **Exec the fd you validated, not the path you validated.** Audit to a log opened through the same descriptor walk, never by a path string, and to journald's socket. Build the child environment from an **allowlist**, never a denylist, and regression-test each hazard's removal with a real payload.
 
 ---
@@ -403,57 +403,57 @@ Beyond the eight stated requirements. Ranked by value-to-effort; explanations fo
 | # | Suggestion | Effort | TL;DR |
 |---|---|---|---|
 | 1 | JSON decision envelope + denial taxonomy | S | Versioned JSON verdict with a stable error code and a concrete next step, so the agent reacts correctly instead of guessing from exit 1. |
-| 2 | `aido explain` decision trace | S | Prints which rule matched at which `file:line`, the resolved binary, normalized argv, and the environment — without executing. |
+| 2 | `xudo explain` decision trace | S | Prints which rule matched at which `file:line`, the resolved binary, normalized argv, and the environment — without executing. |
 | 3 | Fail-closed confirmation + request de-dup | S | Confirmations time out into a **deny**, never a hang; an identical request inside a short window reuses the prior verdict instead of re-prompting. |
 | 4 | Per-rule env allowlist | S | Child environment built from scratch; loader and interpreter injection variables hard-refused. |
 | 5 | Rate limiting with escalating friction | S | Token buckets per (session, rule, project) escalate allow → forced confirmation → deny + notify. A runaway agent is throttled before it is catastrophic. |
-| 6 | `aido freeze` / `thaw` kill switch | S | One root-owned flag instantly denies every agent path; human path stays available for recovery. |
-| 7 | `aido agentdoc` generator | S | Emits a policy-derived CLAUDE.md / AGENTS.md block stamped with the policy hash so CI detects drift. |
-| 8 | Shell EPERM hint | S | A command that just failed on permissions prints one line — `try: aido <same command>` — verified against policy before suggesting. |
+| 6 | `xudo freeze` / `thaw` kill switch | S | One root-owned flag instantly denies every agent path; human path stays available for recovery. |
+| 7 | `xudo agentdoc` generator | S | Emits a policy-derived CLAUDE.md / AGENTS.md block stamped with the policy hash so CI detects drift. |
+| 8 | Shell EPERM hint | S | A command that just failed on permissions prints one line — `try: xudo <same command>` — verified against policy before suggesting. |
 | 9 | Typed argv matchers | M | Per-position matchers instead of globbing a flattened command string. **This one is load-bearing, not optional.** |
-| 10 | `aido check` linter + policy unit tests | M | Type-checks the ruleset, flags dangerous constructs, runs `[[test]]` blocks in CI and pre-commit. |
+| 10 | `xudo check` linter + policy unit tests | M | Type-checks the ruleset, flags dangerous constructs, runs `[[test]]` blocks in CI and pre-commit. |
 | 11 | Hash-chained audit log | M | Each JSONL record carries its predecessor's hash, mirrored to journald, so gaps and edits are detectable. |
-| 12 | Time-boxed revocable grants | M | `aido grant 15m --profile docker-dev --max 20` mints a root-held grant that expires hard and cannot be renewed by the agent. |
+| 12 | Time-boxed revocable grants | M | `xudo grant 15m --profile docker-dev --max 20` mints a root-held grant that expires hard and cannot be renewed by the agent. |
 | 13 | Attested caller identity | L | Root broker identifies the caller race-free from the socket peer and enrolled cgroup lineage. **Also load-bearing.** |
 | 14 | Two-phase policy install + semantic diff | M | Stages the change, renders a **capability-level** diff, confirms, commits atomically, bumps a generation counter. |
-| 15 | MCP server | M | `aido_run` / `aido_explain` / `aido_list_rules` / `aido_request_grant` with elicitation-based confirmation. |
-| 16 | `aido log` forensic TUI | M | Filter the audit chain by agent, session, project, rule, decision, time; session replay; export. |
+| 15 | MCP server | M | `xudo_run` / `xudo_explain` / `xudo_list_rules` / `xudo_request_grant` with elicitation-based confirmation. |
+| 16 | `xudo log` forensic TUI | M | Filter the audit chain by agent, session, project, rule, decision, time; session replay; export. |
 | 17 | Dry-run preview in the prompt | M | Rules declare a no-side-effect preview whose output is shown at confirmation time, so approval is informed rather than reflexive. |
 | 18 | Binary identity pinning | M | A rule pins its target by resolved path + content hash or owning package; a replaced or shadowed binary fails closed. |
-| 19 | Per-project narrowing-only scoping | M | A checked-in `.aido/policy.toml` can only further restrict, and only if root recorded its hash. |
+| 19 | Per-project narrowing-only scoping | M | A checked-in `.xudo/policy.toml` can only further restrict, and only if root recorded its hash. |
 | 20 | Anomaly / novelty escalation | M | Escalate on statistical surprise: a rule never used this session, unusual breadth, off-hours burst. |
 | 21 | Signed rule bundles + curated profiles | M | Shareable versioned profiles (`docker-dev`, `web-dev`, `k8s-dev`, `embedded`) verified offline before install. |
 | 22 | Telemetry-free build, verifiable at runtime | S | No network code in the default build, enforced by seccomp and a CI test asserting zero outbound syscalls. |
-| 23 | `aido doctor` | S | Reports the backend, unavailable features, kernel probes, live confirmation channels — **and every other path to root.** |
-| 24 | `aido init` wizard | M | Detects backend, distro, and installed agents; proposes a starter policy; previews the diff; installs atomically. |
+| 23 | `xudo doctor` | S | Reports the backend, unavailable features, kernel probes, live confirmation channels — **and every other path to root.** |
+| 24 | `xudo init` wizard | M | Detects backend, distro, and installed agents; proposes a starter policy; previews the diff; installs atomically. |
 | 25 | Landlock + capability-bounded children | L | Even allowed commands run with only the caps and filesystem access the rule declares, not full uid 0. |
 | 26 | I/O session recording with redaction | M | Rules can capture the child's stdout/stderr or a full pty transcript, size-capped and redacted. |
 | 27 | Off-box audit shipping | M | Optionally stream records to a remote collector so a compromised host cannot erase its own history. |
-| 28 | `aido undo` | L | Rules declare an inverse and/or a pre-snapshot hook, so recent actions can be reversed under the same policy checks. |
-| 29 | `aido shell --record` | M | A sanctioned escape hatch: a time-limited, fully recorded root shell, so humans stop reaching for raw `sudo`. |
+| 28 | `xudo undo` | L | Rules declare an inverse and/or a pre-snapshot hook, so recent actions can be reversed under the same policy checks. |
+| 29 | `xudo shell --record` | M | A sanctioned escape hatch: a time-limited, fully recorded root shell, so humans stop reaching for raw `sudo`. |
 | 30 | Two-person approval for a critical class | M | Rules tagged critical need approvals from two distinct humans on independent channels. |
 
 ---
 
 ## Suggestions — explained
 
-**1–2. Machine-readable envelope and `explain`.** The primary consumer of aido is a language model, and `exit 1` with a prose message is the worst possible interface for one: the model guesses, retries with a mangled command, or gives up and asks the human to run raw `sudo` — defeating the tool. A versioned envelope (`schema_version`, `decision`, `rule_id`, `rule_source`, `resolved_exe`, `resolved_exe_sha256`, `argv_normalized`, `session_id`, `grant_id`, `audit_id`, `remediation`) with a **stable, append-only** denial code taxonomy lets the agent branch correctly: "this needs a grant" → request one; "this is permanently denied" → stop asking; "this needs confirmation" → surface it to the human and wait. `explain` is the same engine with execution removed, which is also how a human answers *"how do I know my ruleset does what I think it does?"* — the question every allowlist system eventually fails to answer.
+**1–2. Machine-readable envelope and `explain`.** The primary consumer of xudo is a language model, and `exit 1` with a prose message is the worst possible interface for one: the model guesses, retries with a mangled command, or gives up and asks the human to run raw `sudo` — defeating the tool. A versioned envelope (`schema_version`, `decision`, `rule_id`, `rule_source`, `resolved_exe`, `resolved_exe_sha256`, `argv_normalized`, `session_id`, `grant_id`, `audit_id`, `remediation`) with a **stable, append-only** denial code taxonomy lets the agent branch correctly: "this needs a grant" → request one; "this is permanently denied" → stop asking; "this needs confirmation" → surface it to the human and wait. `explain` is the same engine with execution removed, which is also how a human answers *"how do I know my ruleset does what I think it does?"* — the question every allowlist system eventually fails to answer.
 
 **3. Fail-closed confirmation and de-dup.** Two failure modes, both fatal in practice. A confirmation that blocks forever wedges the agent's tool call and gets the feature disabled by an annoyed operator; a confirmation that times out into *allow* is not a confirmation. So: absolute monotonic deadlines, timeout → deny, and a resumable structured "pending" state so the agent's session survives an arbitrary approval delay. De-dup matters because a looping agent that re-requests the same action 40 times induces **prompt fatigue** — after the fifth identical prompt a human stops reading, which is a worse security state than no prompt at all.
 
-**4. Per-rule env allowlist.** Because aido is not setuid, `ld.so` does not scrub `LD_*` for it. `LD_PRELOAD`, `LD_AUDIT`, `GLIBC_TUNABLES`, `GCONV_PATH`, `BASH_ENV`, `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT`, `LESSOPEN`, `GIT_*`, `http_proxy` (a caller-supplied proxy on `apt-get update` is an invisible machine-in-the-middle), `SUDO_ASKPASS` — none of these appear in argv, so argv matching cannot see them. Allowlist, never denylist, and assert absence in the child's `/proc/self/environ` with a real payload in tests.
+**4. Per-rule env allowlist.** Because xudo is not setuid, `ld.so` does not scrub `LD_*` for it. `LD_PRELOAD`, `LD_AUDIT`, `GLIBC_TUNABLES`, `GCONV_PATH`, `BASH_ENV`, `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT`, `LESSOPEN`, `GIT_*`, `http_proxy` (a caller-supplied proxy on `apt-get update` is an invisible machine-in-the-middle), `SUDO_ASKPASS` — none of these appear in argv, so argv matching cannot see them. Allowlist, never denylist, and assert absence in the child's `/proc/self/environ` with a real payload in tests.
 
 **5. Rate limiting with escalating friction.** The distinctive agent failure mode is not one malicious command; it is a loop. Fifty `apt-get install` calls in ninety seconds is not a decision, it is a bug, and the right response is friction rather than a binary allow/deny. Three thresholds — annotate the audit record, then force confirmation *even under an active grant*, then deny + notify + optionally auto-freeze. Track a **separate novelty bucket**, because an agent suddenly touching twelve rules it has never used is a better anomaly signal than depth on one.
 
-**6. Kill switch.** When something is going wrong, the operator needs one command that stops it *now*, and they need it to not lock them out of fixing the problem. `aido freeze` denies every agent-path invocation and leaves the human path working. Pair it with the dead-man default (no live confirmation channel → deny) so the system fails safe without anyone typing anything.
+**6. Kill switch.** When something is going wrong, the operator needs one command that stops it *now*, and they need it to not lock them out of fixing the problem. `xudo freeze` denies every agent-path invocation and leaves the human path working. Pair it with the dead-man default (no live confirmation channel → deny) so the system fails safe without anyone typing anything.
 
-**7. `agentdoc`.** Agents behave far better when told what they may do than when made to discover it by failing. Generate the CLAUDE.md/AGENTS.md block *from the policy*, stamped with the policy generation hash, and let `aido check --agentdoc-fresh` fail CI when the doc has drifted. This closes the loop where documentation says one thing and the ruleset does another.
+**7. `agentdoc`.** Agents behave far better when told what they may do than when made to discover it by failing. Generate the CLAUDE.md/AGENTS.md block *from the policy*, stamped with the policy generation hash, and let `xudo check --agentdoc-fresh` fail CI when the doc has drifted. This closes the loop where documentation says one thing and the ruleset does another.
 
-**8. EPERM hint.** Pure adoption. Someone types `systemctl restart nginx`, gets a permission error, and — because the shell hook checked the policy first and only suggests when the answer is yes — sees `try: aido svc restart nginx`. Without something like this, users learn the tool by hitting walls, and a tool learned by hitting walls gets replaced by `sudo -i`.
+**8. EPERM hint.** Pure adoption. Someone types `systemctl restart nginx`, gets a permission error, and — because the shell hook checked the policy first and only suggests when the answer is yes — sees `try: xudo svc restart nginx`. Without something like this, users learn the tool by hitting walls, and a tool learned by hitting walls gets replaced by `sudo -i`.
 
 **9 & 13. Typed matchers and attested identity are not really suggestions.** They are listed here because they arrived as feature findings, but the design cannot ship without them — a glob-based matcher is an argument-injection engine, and env-var-based identity is trivially forged. Treat them as requirements.
 
-**10. `aido check`.** A security policy nobody can test is a security policy nobody trusts. Executable `[[test]]` blocks inside the ruleset — `argv X must be allowed by rule Y`, `argv Z must be denied` — turn policy edits into a CI-gated change like any other code. Distinct exit codes for lint-warning vs lint-error vs test-failure so a pipeline can gate each independently. Include the shadowing lint: rules unreachable because an earlier deny matched, and rules that *shadow a later deny*, which is the ordering bug everyone makes with last-match-wins semantics.
+**10. `xudo check`.** A security policy nobody can test is a security policy nobody trusts. Executable `[[test]]` blocks inside the ruleset — `argv X must be allowed by rule Y`, `argv Z must be denied` — turn policy edits into a CI-gated change like any other code. Distinct exit codes for lint-warning vs lint-error vs test-failure so a pipeline can gate each independently. Include the shadowing lint: rules unreachable because an earlier deny matched, and rules that *shadow a later deny*, which is the ordering bug everyone makes with last-match-wins semantics.
 
 **11. Hash-chained audit.** Two sinks, one authority: a hash-chained JSONL file where each record carries `seq`/`prev_hash`/`hash` so a deletion or an edit is detectable rather than invisible, and journald, a required mirror for structured querying, written under the file's lock so an append lands on both or on neither. Only journal entries with `_UID=0` count — any local user can send one carrying every other field. `fdatasync` before returning the exec result — an audit record written after the action completes is an audit record that a crash loses. Both the broker *and* the gate emit independently, so a direct gate invocation that bypasses the front-end still leaves a trace.
 
@@ -461,29 +461,29 @@ Beyond the eight stated requirements. Ranked by value-to-effort; explanations fo
 
 **14. Semantic policy diff.** A text diff of a rule file hides the thing that matters. Loosening a regex by one character can convert "writes under /etc/nginx" into "writes anywhere under /etc", and the diff shows one changed byte. Diff the **capability set** — `(binary, argv-shape, path-prefix, confirm-requirement, write-scope, network-flag)` — and render it in plain language, including reachability changes caused purely by reordering.
 
-**15. MCP server.** The agent-native interface: `aido_run`, `aido_explain`, `aido_list_rules`, `aido_request_grant` as first-class tools rather than shell strings the model has to construct. MCP elicitation can route confirmation through the agent's own client UI, which is a *nicer* channel — but note it is the agent's client, so it never replaces the out-of-band channel for high-tier actions; it forwards to the broker, which still decides.
+**15. MCP server.** The agent-native interface: `xudo_run`, `xudo_explain`, `xudo_list_rules`, `xudo_request_grant` as first-class tools rather than shell strings the model has to construct. MCP elicitation can route confirmation through the agent's own client UI, which is a *nicer* channel — but note it is the agent's client, so it never replaces the out-of-band channel for high-tier actions; it forwards to the broker, which still decides.
 
-**16–17. Forensic review and dry-run previews.** Both are about the human's decision quality. `aido log` answers "what did the agent actually do last Tuesday" in one place. Dry-run previews answer the harder question at the moment it matters: an `apt-get remove` prompt that says "this will remove 47 packages including build-essential" produces a different decision than one that says `apt-get -y remove foo`. Run the preview under the same argv validation and scrubbed environment, cap the output, cache it against the request fingerprint.
+**16–17. Forensic review and dry-run previews.** Both are about the human's decision quality. `xudo log` answers "what did the agent actually do last Tuesday" in one place. Dry-run previews answer the harder question at the moment it matters: an `apt-get remove` prompt that says "this will remove 47 packages including build-essential" produces a different decision than one that says `apt-get -y remove foo`. Run the preview under the same argv validation and scrubbed environment, cap the output, cache it against the request fingerprint.
 
 **18. Binary pinning.** A rule for `/usr/bin/systemctl` should not be satisfiable by a replaced `/usr/bin/systemctl`. Pin by resolved absolute path plus content hash *or* owning package, verify on the already-open `O_PATH` fd immediately before `execveat` — which closes the swap window a path-based check cannot.
 
-**19. Per-project narrowing.** Different repos need different capability. Bind a project root to a profile in root-owned config, and let a checked-in `.aido/policy.toml` **only further restrict** — never add a rule, widen a matcher, drop a confirm requirement, raise a limit, or extend a TTL — and only when root has recorded its sha256. Copies Claude Code's managed-settings property verbatim, for the same reason.
+**19. Per-project narrowing.** Different repos need different capability. Bind a project root to a profile in root-owned config, and let a checked-in `.xudo/policy.toml` **only further restrict** — never add a rule, widen a matcher, drop a confirm requirement, raise a limit, or extend a TTL — and only when root has recorded its sha256. Copies Claude Code's managed-settings property verbatim, for the same reason.
 
 **20. Novelty escalation.** Fixed rate limits catch volume; they miss the single surprising action. Escalate on interpretable, individually-toggleable signals — first use of a rule (on by default), first use in this project, rule-breadth spike, off-hours, novel path prefix — and **always state the reason in both the prompt and the record**. An unexplained "this looked unusual" prompt trains people to click through.
 
-**21. Signed profiles.** Nobody should hand-write a `docker-dev` ruleset. Curated, versioned, signature-bundled profiles verified offline (minisign, or cosign with a stapled inclusion proof) with `min_aido_version`, and **unknown matcher kinds as a hard parse error rather than match-anything** — the fail-open default that has bitten every policy format that allowed it.
+**21. Signed profiles.** Nobody should hand-write a `docker-dev` ruleset. Curated, versioned, signature-bundled profiles verified offline (minisign, or cosign with a stapled inclusion proof) with `min_xudo_version`, and **unknown matcher kinds as a hard parse error rather than match-anything** — the fail-open default that has bitten every policy format that allowed it.
 
-**22–23. Telemetry-free and `doctor`.** A privilege broker that phones home will not be installed. Make it *provable*: no network code in the default build, networking behind a non-default cargo feature, a seccomp filter denying `AF_INET`/`AF_INET6` socket creation, and a CI job running the suite under `strace` asserting no non-`AF_UNIX` socket. `doctor`'s most valuable output is the part that undermines aido itself: **every other path to root** — pre-existing `NOPASSWD` entries, `wheel`/`sudo`/`docker`/`lxd` membership, writable unit directories, writable `PATH` entries, writable shell rc files. Any one of them makes aido decorative, and the operator deserves to know before they trust it.
+**22–23. Telemetry-free and `doctor`.** A privilege broker that phones home will not be installed. Make it *provable*: no network code in the default build, networking behind a non-default cargo feature, a seccomp filter denying `AF_INET`/`AF_INET6` socket creation, and a CI job running the suite under `strace` asserting no non-`AF_UNIX` socket. `doctor`'s most valuable output is the part that undermines xudo itself: **every other path to root** — pre-existing `NOPASSWD` entries, `wheel`/`sudo`/`docker`/`lxd` membership, writable unit directories, writable `PATH` entries, writable shell rc files. Any one of them makes xudo decorative, and the operator deserves to know before they trust it.
 
-**24. `aido init`.** First-run experience determines whether the starter policy is minimal or `ALL`. Detect the backend, distro, and installed agents, propose a small policy composed **from profiles rather than bespoke matchers**, preview the capability diff, run the linter, install atomically.
+**24. `xudo init`.** First-run experience determines whether the starter policy is minimal or `ALL`. Detect the backend, distro, and installed agents, propose a small policy composed **from profiles rather than bespoke matchers**, preview the capability diff, run the linter, install atomically.
 
 **25. Landlock and capability bounding.** The deepest hardening available: even for an allowed command, run the child with only the capabilities and filesystem access the rule declares instead of full uid 0. `systemctl restart nginx` does not need write access to `/home`. Two operational requirements: an explicit audit record when kernel support degrades the confinement, and a policy option to **deny on degrade** rather than silently running unconfined.
 
 **26–27. Recording and off-box audit.** Optional, for teams. A size-capped redacted transcript makes "what did that command print" answerable after the fact. Streaming records off-box means a compromised host cannot erase its own history — the standard reason audit lives elsewhere.
 
-**28. `aido undo`.** The feature users will ask for immediately and that is hardest to do honestly. Only rules that *declare* an inverse or a pre-snapshot hook can be undone, the undo runs through the same policy checks, and the ones that genuinely cannot be reversed must say so rather than pretending. Firewall changes and `/etc/hosts` edits are the natural first candidates because aido already snapshots them.
+**28. `xudo undo`.** The feature users will ask for immediately and that is hardest to do honestly. Only rules that *declare* an inverse or a pre-snapshot hook can be undone, the undo runs through the same policy checks, and the ones that genuinely cannot be reversed must say so rather than pretending. Firewall changes and `/etc/hosts` edits are the natural first candidates because xudo already snapshots them.
 
-**29. `aido shell --record`.** The pressure-release valve. Policy will never cover everything, and when it does not, the human's alternative is `sudo -i` — which is unaudited, unbounded, and outside aido entirely. A time-limited, fully recorded root shell keeps that case inside the system. Deliberately human-path only.
+**29. `xudo shell --record`.** The pressure-release valve. Policy will never cover everything, and when it does not, the human's alternative is `sudo -i` — which is unaudited, unbounded, and outside xudo entirely. A time-limited, fully recorded root shell keeps that case inside the system. Deliberately human-path only.
 
 **30. Two-person approval.** For the small class of rules where one person's judgment is not enough. Two distinct human principals on independent channels. Only worth building once an org actually asks.
 
@@ -491,24 +491,24 @@ Beyond the eight stated requirements. Ranked by value-to-effort; explanations fo
 
 ## Verification
 
-**M1, natively on macOS:** `cargo test -p aido-policy` · `cargo test --workspace` · `cargo fuzz run rules_toml`, `argv_canon`, `denylist_eval` (60s each in CI, longer nightly) · `cargo clippy -- -D warnings` with the `disallowed_methods` list · `cargo insta test` · `cargo miri test -p aido-policy` · `cargo deny check` + `cargo audit --deny warnings`. Sanity: `aido explain -- apt-get install ripgrep` prints a matched rule with `file:line`; `aido explain -- /bin/sh -c id` prints a deny naming the compiled-in capability class; `aido check --fuzz` exits 0 on the shipped ruleset.
+**M1, natively on macOS:** `cargo test -p xudo-policy` · `cargo test --workspace` · `cargo fuzz run rules_toml`, `argv_canon`, `denylist_eval` (60s each in CI, longer nightly) · `cargo clippy -- -D warnings` with the `disallowed_methods` list · `cargo insta test` · `cargo miri test -p xudo-policy` · `cargo deny check` + `cargo audit --deny warnings`. Sanity: `xudo explain -- apt-get install ripgrep` prints a matched rule with `file:line`; `xudo explain -- /bin/sh -c id` prints a deny naming the compiled-in capability class; `xudo check --fuzz` exits 0 on the shipped ruleset.
 
 **M2 onward, on Linux (Lima VM locally, containers in CI):**
-1. `aido doctor --json` reports the backend, its implementation (sudo vs sudo-rs vs doas), the probed capability matrix, and every other path to root.
+1. `xudo doctor --json` reports the backend, its implementation (sudo vs sudo-rs vs doas), the probed capability matrix, and every other path to root.
 2. **Human path prompts.** Under `rexpect`: a plain invocation from a real pty must produce a password prompt. Test asserts the prompt string, not just the exit code.
-3. **Snippet is functionally in effect** — not that the file exists. Run the gate with a no-op probe and assert it executed as uid 0. Regression test: install the snippet as `aido.conf` and assert `doctor` reports it as **not in effect** (sudo silently ignores dotted filenames).
-4. **Hostile direct gate invocation.** `sudo /usr/libexec/aido/aido-gate-nopass` with no pending request must exit non-zero, perform nothing privileged, and emit a high-severity audit record.
+3. **Snippet is functionally in effect** — not that the file exists. Run the gate with a no-op probe and assert it executed as uid 0. Regression test: install the snippet as `xudo.conf` and assert `doctor` reports it as **not in effect** (sudo silently ignores dotted filenames).
+4. **Hostile direct gate invocation.** `sudo /usr/libexec/xudo/xudo-gate-nopass` with no pending request must exit non-zero, perform nothing privileged, and emit a high-severity audit record.
 5. **Nonce is one-use.** Replay a consumed request record; second attempt must fail.
-6. **Enrolled agent path is passwordless but confirmed.** Start a session, run an allowlisted action from inside the scope, assert no password prompt *and* a pending confirmation appearing on the `aido watch` channel — never on the agent's stdin.
+6. **Enrolled agent path is passwordless but confirmed.** Start a session, run an allowlisted action from inside the scope, assert no password prompt *and* a pending confirmation appearing on the `xudo watch` channel — never on the agent's stdin.
 7. **Yolo does not bypass confirmation.** Same, with `--dangerously-skip-permissions` declared. Then assert that *omitting* the declaration also confirms (the declaration must not be the gate).
 8. **Confirmation is not self-approvable.** From inside the agent's process tree, attempt to answer the prompt on stdin, on `/dev/tty`, and by writing to the parent's `/dev/pts/N`. All three must fail to approve.
 9. **Timeout denies.** No answer within the deadline → deny, with the agent receiving a structured pending-then-denied envelope rather than a hang.
-10. **Cgroup spoofing fails.** From the user's own shell, attempt to write a pid into `aido.slice/agent-N.scope/cgroup.procs` — must fail `EACCES`. Then attempt classification with `CLAUDECODE=1` set and assert the request is classified **human** and prompted.
+10. **Cgroup spoofing fails.** From the user's own shell, attempt to write a pid into `xudo.slice/agent-N.scope/cgroup.procs` — must fail `EACCES`. Then attempt classification with `CLAUDECODE=1` set and assert the request is classified **human** and prompted.
 11. **Env scrubbing.** Invoke with `LD_PRELOAD`, `BASH_ENV`, `NODE_OPTIONS`, `http_proxy`, `LESSOPEN` set to real payloads; assert each is absent from the child's `/proc/self/environ` and that the payload did not execute.
 12. **Symlink and TOCTOU resistance.** Plant a symlink mid-path on the ruleset path, on the exec target, and on the audit log; each must be refused. Swap the target binary between validation and exec; the digest pin on the `O_PATH` fd must catch it.
-13. **Deny-list is non-overridable.** Author a rule file that allows `/bin/sh`; assert it is denied and that `aido check` refuses the ruleset at lint time.
+13. **Deny-list is non-overridable.** Author a rule file that allows `/bin/sh`; assert it is denied and that `xudo check` refuses the ruleset at lint time.
 14. **Differential compliance.** Same ruleset, same invocations, against sudo / sudo-rs / OpenDoas across the distro × arch × kernel matrix; assert **identical** allow/deny outcomes. Plus a no-escalator row asserting clean fail-closed with exit 19.
-15. **Audit chain verifies.** `aido audit verify` passes; then truncate a record and assert it fails.
-16. `aido freeze` → every agent-path invocation denied, human path still works, `aido thaw` restores.
+15. **Audit chain verifies.** `xudo audit verify` passes; then truncate a record and assert it fails.
+16. `xudo freeze` → every agent-path invocation denied, human path still works, `xudo thaw` restores.
 
 CI gates: the GTFOBins grep over every allowlisted binary · `agentdoc` freshness · **fail the build if any `#[ignore]`d adversarial test passes** · the `strace` no-network assertion.

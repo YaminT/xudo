@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The differential compliance matrix: one static `aido` binary and the shipped
+# The differential compliance matrix: one static `xudo` binary and the shipped
 # ruleset, driven inside real distributions against the real sudo, sudo-rs, and
 # OpenDoas parsers, plus a container with no escalator at all.
 #
-#   ci/differential/run.sh <static linux aido binary>      (or: just differential)
+#   ci/differential/run.sh <static linux xudo binary>      (or: just differential)
 #
 # Each row below names an image and how to install its backend. Inside the
 # container, row.sh records two things:
@@ -11,7 +11,7 @@
 #   report.txt    what is backend-specific and must match expected/<row>.txt
 #                 exactly: which backend was found, every capability it was
 #                 probed to have, whether the install plan is offered or refused,
-#                 and whether the snippet aido would write is accepted by that
+#                 and whether the snippet xudo would write is accepted by that
 #                 backend's own parser. Versions are normalized out, so a
 #                 package update may not break this but a capability change
 #                 must.
@@ -19,7 +19,7 @@
 #                 expected/verdicts.txt: the engine's answer for every argv in
 #                 invocations.txt. No backend may change a verdict.
 #
-# What this does not do yet: execute anything. `aido doctor` reports the exec
+# What this does not do yet: execute anything. `xudo doctor` reports the exec
 # path as absent, and row.sh fails the moment that stops being true, because at
 # that point the comparison that matters — the same ruleset *executed* through
 # each backend, with identical outcomes — is due and has to be written here.
@@ -42,7 +42,7 @@ rows=(
 )
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <static linux aido binary>" >&2
+    echo "usage: $0 <static linux xudo binary>" >&2
     exit 2
 fi
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -68,7 +68,7 @@ for spec in "${rows[@]}"; do
     IFS='|' read -r row image setup <<<"$spec"
     echo "== $row  ($image)"
     if ! docker run --rm \
-        -v "$bin:/usr/local/bin/aido:ro" \
+        -v "$bin:/usr/local/bin/xudo:ro" \
         -v "$root/rules:/rules:ro" \
         -v "$here:/harness:ro" \
         -v "$out:/out" \
