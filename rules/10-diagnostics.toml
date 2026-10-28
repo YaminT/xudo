@@ -11,7 +11,7 @@
 # pager is what keeps these actions in this tier instead of that list.
 
 [[action]]
-id = "aido.svc.logs"
+id = "xudo.svc.logs"
 tier = "diag-read"
 exe = "/usr/bin/journalctl"
 args = [
@@ -23,7 +23,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.dmesg"
+id = "xudo.dmesg"
 tier = "diag-read"
 exe = "/usr/bin/journalctl"
 args = [
@@ -36,7 +36,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.svc.status"
+id = "xudo.svc.status"
 tier = "diag-read"
 exe = "/usr/bin/systemctl"
 args = [
@@ -47,7 +47,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.svc.show"
+id = "xudo.svc.show"
 tier = "diag-read"
 exe = "/usr/bin/systemctl"
 args = [
@@ -72,7 +72,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.net.listeners"
+id = "xudo.net.listeners"
 tier = "diag-read"
 # Fixed argv, no caller input reaches it at all — the safest shape a rule has.
 exe = "/usr/bin/ss"

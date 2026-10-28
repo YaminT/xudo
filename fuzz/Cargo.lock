@@ -12,27 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aido-fuzz"
-version = "0.0.0"
-dependencies = [
- "aido-policy",
- "arbitrary",
- "libfuzzer-sys",
-]
-
-[[package]]
-name = "aido-policy"
-version = "0.0.1"
-dependencies = [
- "bstr",
- "regex",
- "serde",
- "sha2",
- "thiserror",
- "toml",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -388,3 +367,24 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
+name = "xudo-fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "libfuzzer-sys",
+ "xudo-policy",
+]
+
+[[package]]
+name = "xudo-policy"
+version = "0.0.1"
+dependencies = [
+ "bstr",
+ "regex",
+ "serde",
+ "sha2",
+ "thiserror",
+ "toml",
+]

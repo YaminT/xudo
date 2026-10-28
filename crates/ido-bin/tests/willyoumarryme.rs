@@ -112,10 +112,10 @@ impl TempHome {
         serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout).unwrap()
     }
 
-    fn read_log(&self) -> Vec<aido_audit::Record> {
+    fn read_log(&self) -> Vec<xudo_audit::Record> {
         let text =
             std::fs::read_to_string(self.root.join("state").join("ido").join("log.jsonl")).unwrap();
-        aido_audit::Chain::from_jsonl(&text)
+        xudo_audit::Chain::from_jsonl(&text)
             .unwrap()
             .records()
             .to_vec()
@@ -168,7 +168,7 @@ fn an_agent_queues_and_the_human_runs_it() {
     assert!(home.read_queue().is_empty());
     let log = home.read_log();
     assert_eq!(log.len(), 1);
-    assert_eq!(log[0].outcome, aido_audit::Outcome::Exited { code: 0 });
+    assert_eq!(log[0].outcome, xudo_audit::Outcome::Exited { code: 0 });
     assert_eq!(log[0].argv, ["willyoumarryme"]);
 }
 

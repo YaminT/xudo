@@ -1,0 +1,32 @@
+[package]
+name = "xudod"
+description = "The root broker's logic: identifies its peer from the kernel, evaluates the request against root's ruleset with the function xudo explain uses, and mints the spool entry the gate acts on. Every syscall behind xudo-sys's seams."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
+xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
+xudo-config = { path = "../xudo-config", version = "0.0.1" }
+xudo-gate = { path = "../xudo-gate", version = "0.0.1" }
+xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
+xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+# Errno values, to script the answers a real kernel gives; and in the Linux
+# tests, `waitid(WNOWAIT)` to hold a peer as a zombie, and this process's ids.
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "process",
+] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

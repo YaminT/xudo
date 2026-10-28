@@ -138,7 +138,7 @@ repo_re='^[^/]+/[^/]+$'
 # ---- c. the lock ---------------------------------------------------------
 # Not the machine lock of ci/lib/machine-lock.sh: `just linux-test` takes that
 # one itself, and holding it here would deadlock the gate.
-lock="${TMPDIR:-/tmp}/aido-boof-integrate.lock"
+lock="${TMPDIR:-/tmp}/xudo-boof-integrate.lock"
 have_lock=0
 scratch=""
 

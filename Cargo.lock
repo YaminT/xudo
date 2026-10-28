@@ -12,177 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aido"
-version = "0.0.1"
-dependencies = [
- "aido-audit",
- "aido-backend",
- "aido-config",
- "aido-policy",
- "aido-sys",
- "clap",
- "insta",
- "serde",
- "serde_json",
- "term-sanitize",
- "thiserror",
-]
-
-[[package]]
-name = "aido-audit"
-version = "0.0.1"
-dependencies = [
- "insta",
- "serde",
- "serde_json",
- "sha2",
- "term-sanitize",
- "thiserror",
-]
-
-[[package]]
-name = "aido-backend"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "aido-bin"
-version = "0.0.1"
-dependencies = [
- "aido",
- "aido-tests",
- "assert_cmd",
- "clap",
- "predicates",
- "serde_json",
-]
-
-[[package]]
-name = "aido-config"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "aido-gate"
-version = "0.0.1"
-dependencies = [
- "aido-audit",
- "aido-config",
- "aido-policy",
- "aido-sys",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "aido-gate-bin"
-version = "0.0.1"
-dependencies = [
- "aido-backend",
- "aido-gate",
- "aido-sys",
- "aido-tests",
- "assert_cmd",
- "predicates",
-]
-
-[[package]]
-name = "aido-policy"
-version = "0.0.1"
-dependencies = [
- "bstr",
- "insta",
- "proptest",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "aido-sys"
-version = "0.0.1"
-dependencies = [
- "aido-audit",
- "aido-backend",
- "aido-config",
- "aido-gate",
- "aido-policy",
- "aido-sys-raw",
- "aido-tests",
- "bstr",
- "proptest",
- "rustix",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "aido-sys-raw"
-version = "0.0.1"
-dependencies = [
- "libc",
- "rustix",
- "toml",
-]
-
-[[package]]
-name = "aido-tests"
-version = "0.0.1"
-dependencies = [
- "rustix",
-]
-
-[[package]]
-name = "aido-wire"
-version = "0.0.1"
-dependencies = [
- "aido-policy",
- "insta",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "aidod"
-version = "0.0.1"
-dependencies = [
- "aido-audit",
- "aido-backend",
- "aido-config",
- "aido-gate",
- "aido-policy",
- "aido-sys",
- "aido-wire",
- "insta",
- "rustix",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "aidod-bin"
-version = "0.0.1"
-dependencies = [
- "aido-wire",
- "aidod",
- "serde_json",
-]
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -421,23 +250,23 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "ido"
 version = "0.0.1"
 dependencies = [
- "aido-audit",
- "aido-config",
  "clap",
  "serde",
  "serde_json",
  "term-sanitize",
  "thiserror",
+ "xudo-audit",
+ "xudo-config",
 ]
 
 [[package]]
 name = "ido-bin"
 version = "0.0.1"
 dependencies = [
- "aido-audit",
  "ido",
  "rustix",
  "serde_json",
+ "xudo-audit",
 ]
 
 [[package]]
@@ -935,6 +764,177 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
+
+[[package]]
+name = "xudo"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "insta",
+ "serde",
+ "serde_json",
+ "term-sanitize",
+ "thiserror",
+ "xudo-audit",
+ "xudo-backend",
+ "xudo-config",
+ "xudo-policy",
+ "xudo-sys",
+]
+
+[[package]]
+name = "xudo-audit"
+version = "0.0.1"
+dependencies = [
+ "insta",
+ "serde",
+ "serde_json",
+ "sha2",
+ "term-sanitize",
+ "thiserror",
+]
+
+[[package]]
+name = "xudo-backend"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "xudo-bin"
+version = "0.0.1"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "serde_json",
+ "xudo",
+ "xudo-tests",
+]
+
+[[package]]
+name = "xudo-config"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "xudo-gate"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xudo-audit",
+ "xudo-config",
+ "xudo-policy",
+ "xudo-sys",
+]
+
+[[package]]
+name = "xudo-gate-bin"
+version = "0.0.1"
+dependencies = [
+ "assert_cmd",
+ "predicates",
+ "xudo-backend",
+ "xudo-gate",
+ "xudo-sys",
+ "xudo-tests",
+]
+
+[[package]]
+name = "xudo-policy"
+version = "0.0.1"
+dependencies = [
+ "bstr",
+ "insta",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "xudo-sys"
+version = "0.0.1"
+dependencies = [
+ "bstr",
+ "proptest",
+ "rustix",
+ "sha2",
+ "thiserror",
+ "xudo-audit",
+ "xudo-backend",
+ "xudo-config",
+ "xudo-gate",
+ "xudo-policy",
+ "xudo-sys-raw",
+ "xudo-tests",
+]
+
+[[package]]
+name = "xudo-sys-raw"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "rustix",
+ "toml",
+]
+
+[[package]]
+name = "xudo-tests"
+version = "0.0.1"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
+name = "xudo-wire"
+version = "0.0.1"
+dependencies = [
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xudo-policy",
+]
+
+[[package]]
+name = "xudod"
+version = "0.0.1"
+dependencies = [
+ "insta",
+ "rustix",
+ "serde_json",
+ "thiserror",
+ "xudo-audit",
+ "xudo-backend",
+ "xudo-config",
+ "xudo-gate",
+ "xudo-policy",
+ "xudo-sys",
+ "xudo-wire",
+]
+
+[[package]]
+name = "xudod-bin"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "xudo-wire",
+ "xudod",
+]
 
 [[package]]
 name = "zerocopy"
