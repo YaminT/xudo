@@ -451,6 +451,11 @@ mod tests {
     fn a_tampered_queue_is_refused_before_anything_runs() {
         let (_, store) = store("tampered");
         std::fs::write(store.queue_path(), "junk\n").unwrap();
+        std::fs::set_permissions(
+            store.queue_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         let err = run_ids(&store, &[1], &CTX, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("cannot be parsed"), "{err}");
         assert!(store.read_log().unwrap().is_empty(), "nothing ran");
