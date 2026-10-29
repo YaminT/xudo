@@ -1276,8 +1276,24 @@ mod tests {
             .join("test-tmp")
             .join(format!("tw-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        mkdir(&dir);
         dir
+    }
+
+    /// A directory the test means to be trusted, whatever the umask says.
+    fn mkdir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A file the test means to be a 0644 rule file, whatever the umask says.
+    fn put(path: &Path, bytes: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     fn open_dir(dir: &Path) -> OwnedFd {
@@ -1646,8 +1662,8 @@ mod tests {
         // unread, though it too is the test user's and mode 0644.
         let dir = scratch_dir("replaced");
         let (checked, stranger) = (dir.join("10-a.toml"), dir.join("stranger"));
-        std::fs::write(&checked, "checked").unwrap();
-        std::fs::write(&stranger, "never checked").unwrap();
+        put(&checked, "checked");
+        put(&stranger, "never checked");
         let (from, to) = (stranger.clone(), checked.clone());
         // The rule files' mounts are the only ones judged here, so the swap
         // happens while they are, after the probes opened the files.
@@ -1681,8 +1697,8 @@ mod tests {
         // refused.
         let dir = scratch_dir("swapped-target");
         let (target, other) = (dir.join("rules.d"), dir.join("other"));
-        std::fs::create_dir(&target).unwrap();
-        std::fs::create_dir(&other).unwrap();
+        mkdir(&target);
+        mkdir(&other);
         let (from, to) = (other.clone(), target.clone());
         let swap = FakeMounts {
             meanwhile: Some(Box::new(move || {
@@ -1823,9 +1839,9 @@ mod tests {
     #[test]
     fn rule_files_are_read_in_order_through_their_own_descriptors() {
         let dir = scratch_dir("ordered");
-        std::fs::write(dir.join("20-b.toml"), "b").unwrap();
-        std::fs::write(dir.join("10-a.toml"), "a").unwrap();
-        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        put(&dir.join("20-b.toml"), "b");
+        put(&dir.join("10-a.toml"), "a");
+        put(&dir.join("notes.txt"), "ignored");
         let me = my_uid(&dir);
         let ext4 = FakeMounts::ext4();
         let files = read_at(&dir, me, &ext4).unwrap();
@@ -1850,8 +1866,8 @@ mod tests {
     #[test]
     fn the_trusted_ruleset_carries_the_generation_every_reader_computes() {
         let dir = scratch_dir("trusted-rules");
-        std::fs::write(dir.join("10-a.toml"), "# a").unwrap();
-        std::fs::write(dir.join(".toml"), "not selected by any reader").unwrap();
+        put(&dir.join("10-a.toml"), "# a");
+        put(&dir.join(".toml"), "not selected by any reader");
         let files = read_at(&dir, my_uid(&dir), &FakeMounts::ext4()).unwrap();
         let loaded = into_ruleset(files).unwrap();
         let expected = load_rule_files(vec![RuleFile {
@@ -1865,7 +1881,7 @@ mod tests {
     #[test]
     fn a_trusted_but_malformed_ruleset_is_refused_naming_the_file() {
         let dir = scratch_dir("trusted-malformed");
-        std::fs::write(dir.join("10-a.toml"), "[[action]\nid =").unwrap();
+        put(&dir.join("10-a.toml"), "[[action]\nid =");
         let files = read_at(&dir, my_uid(&dir), &FakeMounts::ext4()).unwrap();
         let err = into_ruleset(files).unwrap_err();
         assert!(err.to_string().contains("10-a.toml"), "{err}");
@@ -1908,10 +1924,10 @@ mod tests {
             let target = dir.join("10-x.toml");
             match shape {
                 "link" => {
-                    std::fs::write(dir.join("real"), "x").unwrap();
+                    put(&dir.join("real"), "x");
                     std::os::unix::fs::symlink(dir.join("real"), &target).unwrap();
                 }
-                "dir" => std::fs::create_dir(&target).unwrap(),
+                "dir" => mkdir(&target),
                 // Bound through `bind_socket`: under a deep checkout — a git
                 // worktree — the path to `dir` is longer than an address.
                 _ => drop(bind_socket(&dir, "10-x.toml")),
