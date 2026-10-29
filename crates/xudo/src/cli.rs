@@ -18,13 +18,14 @@ use xudo_policy::{
     engine::Settings,
 };
 use xudo_sys::{
-    HostInstaller, HostProbe, InstallReport, Installer, LiveHost, PrivilegedOps, RefusingInstaller,
-    Verification, host_ops,
+    HostInstaller, HostProbe, HostRunner, InstallReport, Installer, LiveHost, PrivilegedOps,
+    RefusingInstaller, Verification, host_ops,
 };
 
 use crate::agentdoc::{self, DocFormat};
 use crate::doctor;
 use crate::exec;
+use crate::probe::BrokerProbe;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
 
@@ -148,9 +149,11 @@ pub enum Command {
     /// anything is moved into place, and only files xudo wrote are ever replaced
     /// or removed. `--dry-run` prints the plan and changes nothing.
     ///
-    /// An install is reported as verified only when the functional probe
-    /// confirmed that the rule is in effect. This build has no probe yet, so an
-    /// install completes as *unverified* and exits non-zero to say so.
+    /// An install is reported as verified only when the functional probe passed:
+    /// the broker minted a request for `id -u`, the gate ran through the backend
+    /// and printed `0`, and the backend lists the gate for a member of the group.
+    /// Anything less (no broker running yet, say) installs, then says NOT
+    /// VERIFIED and exits non-zero.
     Install {
         /// Print the plan without performing any step.
         #[arg(long)]
@@ -247,7 +250,8 @@ pub fn run(
         host: &LiveHost,
         path: invocation.path.as_deref(),
     };
-    run_with_installer(cli, &platform, &HostInstaller, out, err)
+    let probe = BrokerProbe::live(&HostRunner);
+    run_with_installer(cli, &platform, &HostInstaller::new(&probe), out, err)
 }
 
 /// Runs a parsed command against an injected platform.

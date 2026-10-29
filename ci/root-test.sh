@@ -139,6 +139,10 @@ chmod 0400 /xudo-root-test-lane
 echo "root-test: $(uname -sr) $(uname -m), as uid $(run id -u), on the container's own filesystem"
 cd /work
 
+# root_probe.rs drives the real `xudo` binary, which is another package's: build
+# it fresh here so it is never a stale one from the cache volume.
+run cargo build -p xudo-bin
+
 out=$(mktemp)
 run cargo test --workspace --features root-tests --test 'root_*' "$@" 2>&1 | tee "$out"
 

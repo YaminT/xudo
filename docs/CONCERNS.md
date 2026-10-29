@@ -4,6 +4,27 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-29 — `xudo install` is verified by the gate printing 0
+
+`PendingGateProbe` is gone. `xudo_sys::HostInstaller` takes an `InstallProbe`,
+and `xudo` supplies `BrokerProbe` (`crates/xudo/src/probe.rs`): it asks the
+broker for `/usr/bin/id -u` (the shipped action `xudo.probe.id`,
+`rules/05-probe.toml`), then runs the plan's `<backend> -n <gate>` as a child of
+`xudo install`, so the entry pinned to that process is in the gate's lineage.
+**Verified** means the gate exited 0 and printed exactly `0`, **and** the
+backend's own `sudo -l -U <member of xudo>` did not say the gate is missing (an
+empty group, or doas, cannot be asked and does not block it). Broker
+unreachable, refusing or denying, or no entry minted: *unavailable*, so
+`NOT VERIFIED`, exit 19, nothing rolled back. The gate ran and was wrong:
+*failed*, and the install is taken off again.
+
+What it does **not** prove. The probe runs as root, which `sudo` never prompts,
+so the gate ran on root's own sudoers rule, not the `%xudo` snippet: the snippet
+is covered by the `sudo -l -U` half, and by `root_probe.rs`, where a member of
+the group runs `xudo exec` on a real pty, types the password and gets `0`. A
+wrong password runs nothing and leaves the minted entry for its expiry. doas
+is verified the same way only if it runs the gate as root; it has no `-l -U`.
+
 ## 2026-10-29 — D1: the broker writes the chained trail, and mints only on a record
 
 **What changed.** `Platform` holds `audit: &mut dyn AuditSink`; `xudod::run`

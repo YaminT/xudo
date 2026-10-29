@@ -115,7 +115,7 @@ pub fn plan(
 }
 
 /// One request, one response, both bounded.
-fn ask(
+pub(crate) fn ask(
     socket: &Path,
     timeout: Duration,
     request: &BrokerRequest,

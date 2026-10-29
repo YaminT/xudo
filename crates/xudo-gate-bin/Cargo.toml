@@ -33,6 +33,12 @@ xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
 xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
 xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
 xudod = { path = "../xudod", version = "0.0.1" }
+# The pseudo-terminal `xudo exec` is driven on, the way `ido-bin`'s tests do it.
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "pty",
+  "fs",
+] }
 
 [features]
 # The tests that must run as uid 0: every `tests/root_*.rs`. Only

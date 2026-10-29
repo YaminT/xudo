@@ -846,6 +846,7 @@ version = "0.0.1"
 dependencies = [
  "assert_cmd",
  "predicates",
+ "rustix",
  "xudo-audit",
  "xudo-backend",
  "xudo-gate",

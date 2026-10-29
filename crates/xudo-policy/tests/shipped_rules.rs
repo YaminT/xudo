@@ -18,6 +18,10 @@ use xudo_policy::{
 /// Each shipped file, paired with the name it has on disk.
 const SHIPPED: &[(&str, &str)] = &[
     (
+        "05-probe.toml",
+        include_str!("../../../rules/05-probe.toml"),
+    ),
+    (
         "10-diagnostics.toml",
         include_str!("../../../rules/10-diagnostics.toml"),
     ),
@@ -322,6 +326,26 @@ fn package_removal_always_confirms_even_for_a_human() {
     );
 }
 
+#[test]
+fn the_install_probe_permits_id_dash_u_and_nothing_wider() {
+    assert_eq!(verdict("xudo.probe.id", &["-u"]), Verdict::Allow);
+    for args in [
+        &[][..],
+        &["-un"],
+        &["-G"],
+        &["-u", "root"],
+        &["-u", "-u"],
+        &["root"],
+        &["-u", "--", "root"],
+    ] {
+        assert_eq!(
+            verdict("xudo.probe.id", args),
+            Verdict::Deny,
+            "{args:?} was permitted"
+        );
+    }
+}
+
 /// A command each shipped action accepts. Every shipped action must have one:
 /// an action with no example here fails the tests that walk the ruleset.
 fn example(id: &str) -> Vec<&'static str> {
@@ -338,6 +362,7 @@ fn example(id: &str) -> Vec<&'static str> {
         "xudo.svc.reset-failed" => vec!["--no-pager", "reset-failed", "nginx.service"],
         "xudo.svc.reload-units" => vec!["--no-pager", "daemon-reload"],
         "xudo.dmesg" => vec!["--no-pager", "-k"],
+        "xudo.probe.id" => vec!["-u"],
         "xudo.net.listeners" => vec!["-tulpnH"],
         "xudo.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
         "xudo.pkg.update" => vec!["update"],
