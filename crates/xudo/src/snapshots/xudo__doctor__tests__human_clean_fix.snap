@@ -15,9 +15,10 @@ backend caps 6 of 7 supported
              absent: rejects argument wildcards
 exec path    absent in this build
 
-other paths to root, as yamin (uid 1000): none found
+other paths to root, as yamin (uid 1000): none found, and 1 check(s) could not be completed
   any one of these is a way to root that does not go through xudo
-  passwordless rules    clean, 2 examined
+  passwordless rules    UNVERIFIED, 2 examined
+    cannot verify /usr/bin/sudo: run `sudo xudo doctor` to ask sudo itself
   group memberships     clean, 9 examined
   unit directories      clean, 18 examined
   root's PATH           clean, 8 examined
@@ -26,6 +27,7 @@ other paths to root, as yamin (uid 1000): none found
     note: the entries from /usr/bin on (2) were not examined: nothing there is found before /usr/bin/sudo
   root's shell startup  clean, 24 examined
   xudo group            exists (gid 998); you are in it
+  unverified is not clean: run `sudo xudo doctor` to read what this account cannot, and keep this run for the checks that only mean something as you
 
 proposed fixes: xudo applies none of them. Each is for a human to run, in a shell they started;
 a command that needs root starts with the backend, which asks for their password.

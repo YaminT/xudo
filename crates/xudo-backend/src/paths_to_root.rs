@@ -58,6 +58,7 @@
 mod accounts;
 mod config;
 mod memory;
+mod oracle;
 mod proposals;
 mod walk;
 
@@ -70,6 +71,7 @@ use serde::{Serialize, Serializer};
 
 pub use config::Grant;
 pub use memory::MemoryHost;
+pub use oracle::{Answer, ROOT_NEEDED, read_listing};
 pub use proposals::{Proposal, propose};
 
 use accounts::{Account, GroupEntry};
@@ -302,6 +304,12 @@ pub trait HostView {
     /// with `W_OK`, which sees what the mode bits do not — an ACL, a
     /// capability, a read-only mount.
     fn writable(&self, path: &Path) -> bool;
+
+    /// What the sudo-family program at `exe` says `user` may run without a
+    /// password. Unavailable unless a host can ask.
+    fn ask_sudo(&self, _exe: &str, _user: &str) -> Answer {
+        Answer::Unavailable("this host cannot ask sudo".to_owned())
+    }
 }
 
 /// The answer to one question about a path.
@@ -375,6 +383,8 @@ pub struct Input<'a> {
     /// The backend's executable, so a writable `PATH` entry ahead of it can
     /// be called what it is.
     pub backend_exe: Option<&'a Path>,
+    /// The sudo or sudo-rs executable to ask; `None` for doas or no backend.
+    pub sudo_exe: Option<&'a str>,
 }
 
 /// The whole report.
@@ -498,6 +508,13 @@ pub enum Finding {
         grant: Grant,
         /// Whether it names the subject.
         applies_to_you: Applies,
+    },
+    /// sudo itself lists something for `user` that needs no password.
+    BackendListing {
+        /// Who was asked about.
+        user: String,
+        /// The lines of its listing that say so.
+        listing: String,
     },
     /// Membership of a group that is root, or a way to it.
     GroupMembership {
@@ -660,7 +677,7 @@ struct RootGroup {
 /// fixing one path to root needs to know about the rest in the same pass.
 pub fn assess(host: &dyn HostView, input: &Input<'_>) -> Report {
     let ctx = Ctx::new(host);
-    let config = passwordless_rules(&ctx);
+    let config = passwordless_rules(&ctx, input);
     let checks = vec![
         config.check,
         group_memberships(&ctx),
@@ -926,7 +943,7 @@ struct ConfigOutcome {
 }
 
 /// Reads every sudoers and doas file a backend would, following includes.
-fn passwordless_rules(ctx: &Ctx<'_>) -> ConfigOutcome {
+fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     let mut sink = Sink::default();
     let mut secure_paths = Vec::new();
     let mut sudoers = Lookup::Missing;
@@ -1013,6 +1030,8 @@ fn passwordless_rules(ctx: &Ctx<'_>) -> ConfigOutcome {
         .map(|gap| gap.at.clone())
         .collect();
     let unmodelled = unmodelled.into_iter().map(|gap| gap.at).collect();
+    // The reader's gaps wait here: sudo's own answer may settle them.
+    let reader_gaps = std::mem::take(&mut sink.unverified);
     for file in doas_files(ctx, &mut sink) {
         let read = ctx.host.read(&file);
         if let Some(bytes) = sink.take(&file, read) {
@@ -1024,12 +1043,95 @@ fn passwordless_rules(ctx: &Ctx<'_>) -> ConfigOutcome {
         }
     }
 
+    if let Some(exe) = input.sudo_exe {
+        ask_sudo(ctx, exe, reader_gaps, &mut sink, &mut note);
+    } else {
+        sink.unverified.splice(0..0, reader_gaps);
+    }
+
     ConfigOutcome {
         check: sink.into_check(CheckId::PasswordlessRules, note),
         secure_paths,
         sudoers,
         unread,
         unmodelled,
+    }
+}
+
+/// The most users sudo is asked about: one process each.
+const MAX_ASKED: usize = 16;
+
+/// Puts the question to sudo and combines it with the reader.
+///
+/// sudo's answer wins. A passwordless listing is a finding whatever the
+/// reader saw; if every user asked comes back clean, the reader's gaps are
+/// dropped. A user that could not be asked leaves the check unverified, so a
+/// clean reader alone is never clean.
+fn ask_sudo(
+    ctx: &Ctx<'_>,
+    exe: &str,
+    reader_gaps: Vec<Unverified>,
+    sink: &mut Sink,
+    note: &mut Option<String>,
+) {
+    // As root the subject is root, who has nothing to ask: the members of
+    // xudo's group are the accounts an agent runs as.
+    let mut users: Vec<String> = if ctx.subject.is_root {
+        ctx.groups
+            .iter()
+            .filter(|group| group.name == XUDO_GROUP.as_bytes())
+            .flat_map(|group| group.members.iter())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect()
+    } else {
+        ctx.subject.name.clone().into_iter().collect()
+    };
+    let exe_path = Path::new(exe);
+    let mut gaps = Vec::new();
+    if users.len() > MAX_ASKED {
+        users.truncate(MAX_ASKED);
+        gaps.push(format!(
+            "only the first {MAX_ASKED} members of {XUDO_GROUP} were asked"
+        ));
+    }
+    if users.is_empty() {
+        gaps.push(if ctx.subject.is_root {
+            format!("no one is in {XUDO_GROUP} yet, so there is no one to ask sudo about")
+        } else {
+            ROOT_NEEDED.to_owned()
+        });
+    }
+    let mut answered = Vec::new();
+    for user in &users {
+        match ctx.host.ask_sudo(exe, user) {
+            Answer::Passwordless(listing) => {
+                answered.push(user.as_str());
+                sink.findings.push(Finding::BackendListing {
+                    user: user.clone(),
+                    listing,
+                });
+            }
+            Answer::Nothing => answered.push(user.as_str()),
+            Answer::Unavailable(reason) if !gaps.contains(&reason) => gaps.push(reason),
+            Answer::Unavailable(_) => {}
+        }
+    }
+    if !answered.is_empty() {
+        let asked = format!("sudo itself was asked about {}", answered.join(", "));
+        *note = Some(
+            note.take()
+                .map_or(asked.clone(), |old| format!("{old}; {asked}")),
+        );
+    }
+    // A finding stays one; only a clean answer replaces the reader's gaps.
+    if !gaps.is_empty() {
+        sink.unverified.splice(0..0, reader_gaps);
+        if sink.findings.is_empty() {
+            sink.unverified.extend(
+                gaps.iter()
+                    .map(|gap| Unverified::new(exe_path, exe_path, gap)),
+            );
+        }
     }
 }
 

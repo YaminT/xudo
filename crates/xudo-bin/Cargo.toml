@@ -44,5 +44,9 @@ root-tests = []
 name = "root_install"
 required-features = ["root-tests"]
 
+[[test]]
+name = "root_doctor"
+required-features = ["root-tests"]
+
 [lints]
 workspace = true

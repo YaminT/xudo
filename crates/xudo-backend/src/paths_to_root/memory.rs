@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use super::{Caller, HostView, Kind, Lookup, Meta, NOT_A_REGULAR_FILE};
+use super::{Answer, Caller, HostView, Kind, Lookup, Meta, NOT_A_REGULAR_FILE};
 
 /// How many links a lookup follows before giving up, as the kernel does.
 const MAX_LINKS: usize = 40;
@@ -51,6 +51,7 @@ pub struct MemoryHost {
     caller: Caller,
     nodes: BTreeMap<PathBuf, Node>,
     writable: BTreeSet<PathBuf>,
+    sudo: BTreeMap<String, Answer>,
 }
 
 impl MemoryHost {
@@ -60,7 +61,15 @@ impl MemoryHost {
             caller,
             nodes: BTreeMap::new(),
             writable: BTreeSet::new(),
+            sudo: BTreeMap::new(),
         }
+    }
+
+    /// What sudo says when asked about `user`; unasked users are unavailable.
+    #[must_use]
+    pub fn sudo_says(mut self, user: &str, answer: Answer) -> Self {
+        self.sudo.insert(user.to_owned(), answer);
+        self
     }
 
     /// Adds a directory.
@@ -336,5 +345,16 @@ impl HostView for MemoryHost {
     fn writable(&self, path: &Path) -> bool {
         self.resolve(path, true)
             .is_ok_and(|(resolved, _)| self.writable.contains(&resolved))
+    }
+
+    fn ask_sudo(&self, _exe: &str, user: &str) -> Answer {
+        // As the live host: only root can ask.
+        if self.caller.uid != 0 {
+            return Answer::Unavailable(super::ROOT_NEEDED.to_owned());
+        }
+        self.sudo
+            .get(user)
+            .cloned()
+            .unwrap_or_else(|| Answer::Unavailable("nothing was scripted".to_owned()))
     }
 }

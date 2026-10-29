@@ -102,14 +102,20 @@ expression: "render::json_of(&report)"
         }
       ]
     },
-    "status": "clean",
+    "status": "unverified",
     "checks": [
       {
         "check": "passwordless_rules",
-        "status": "clean",
+        "status": "unverified",
         "examined": 2,
         "findings": [],
-        "unverified": [],
+        "unverified": [
+          {
+            "path": "/usr/bin/sudo",
+            "at": "/usr/bin/sudo",
+            "reason": "run `sudo xudo doctor` to ask sudo itself"
+          }
+        ],
         "note": null
       },
       {

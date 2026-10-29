@@ -69,6 +69,7 @@ fn input(path: &str) -> Input<'_> {
     Input {
         user_path: Some(OsStr::new(path)),
         backend_exe: Some(Path::new("/usr/bin/sudo")),
+        sudo_exe: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn writable_at(finding: &Finding) -> Option<(String, String, Via)> {
             Some((path.display().to_string(), at.display().to_string(), *via))
         }
         Finding::PasswordlessRule { .. }
+        | Finding::BackendListing { .. }
         | Finding::GroupMembership { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -101,6 +103,7 @@ fn writers_of(finding: &Finding) -> Option<&[Writer]> {
     match finding {
         Finding::Writable { writers, .. } => Some(writers),
         Finding::PasswordlessRule { .. }
+        | Finding::BackendListing { .. }
         | Finding::GroupMembership { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -117,6 +120,7 @@ fn rule_of(finding: &Finding) -> Option<(String, usize, Grant, Applies)> {
             ..
         } => Some((file.display().to_string(), *line, *grant, *applies_to_you)),
         Finding::GroupMembership { .. }
+        | Finding::BackendListing { .. }
         | Finding::Writable { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -133,6 +137,7 @@ fn group_of(finding: &Finding) -> Option<(String, bool, bool, bool)> {
             ..
         } => Some((group.clone(), *passwordless, *listed, *active)),
         Finding::PasswordlessRule { .. }
+        | Finding::BackendListing { .. }
         | Finding::Writable { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -1258,6 +1263,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
         &Input {
             user_path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
             backend_exe: None,
+            sudo_exe: None,
         },
     );
     let path = check(&unknown, CheckId::UserPath);
@@ -1290,6 +1296,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
         &Input {
             user_path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
             backend_exe: Some(Path::new("/opt/gone/sudo")),
+            sudo_exe: None,
         },
     );
     assert_eq!(check(&gone, CheckId::UserPath).examined, 2);
@@ -3681,4 +3688,180 @@ fn a_finding_of_another_kind_in_the_user_path_check_is_ignored_not_misread() {
     });
     let proposals = propose(&host, &report, Some("/usr/bin/sudo"));
     assert!(proposals.iter().all(|p| !p.id.starts_with("fix-path")));
+}
+
+// The oracle: what sudo itself says outranks the hand reader.
+
+fn asked(host: &dyn HostView) -> Report {
+    assess(
+        host,
+        &Input {
+            sudo_exe: Some("/usr/bin/sudo"),
+            ..input("/usr/bin")
+        },
+    )
+}
+
+/// A root caller, with alice in xudo's group.
+fn root_with_alice() -> MemoryHost {
+    let group = b"root:x:0:\nxudo:x:998:alice,bob\n";
+    clean_for(root_caller()).file("/etc/group", 0, 0, 0o644, group)
+}
+
+const LISTING: &str = "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL";
+
+#[test]
+fn the_oracle_overrides_a_parser_that_missed_a_nopasswd_rule() {
+    // The reader saw nothing (sudo.conf can point sudo at another file, which
+    // is not examined); sudo lists the rule.
+    let host = root_with_alice()
+        .sudo_says(
+            "alice",
+            Answer::Passwordless("(ALL) NOPASSWD: ALL".to_owned()),
+        )
+        .sudo_says("bob", Answer::Nothing);
+    let report = asked(&host);
+    let rules = check(&report, CheckId::PasswordlessRules);
+    assert_eq!(rules.status, Status::Found);
+    assert_eq!(
+        rules.findings,
+        [Finding::BackendListing {
+            user: "alice".to_owned(),
+            listing: "(ALL) NOPASSWD: ALL".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn an_oracle_that_says_nothing_clears_the_readers_gaps() {
+    let host = root_with_alice()
+        .unreadable_file("/etc/sudoers", 0, 0, 0o440)
+        .sudo_says("alice", Answer::Nothing)
+        .sudo_says("bob", Answer::Nothing);
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Clean, "{rules:?}");
+    assert_eq!(
+        rules
+            .note
+            .as_deref()
+            .map(|note| note.ends_with("alice, bob")),
+        Some(true)
+    );
+    // Unasked, the same host stays unverified.
+    assert_eq!(run(&host, "/usr/bin").checks[0].status, Status::Unverified);
+}
+
+#[test]
+fn an_unreadable_oracle_answer_is_unverified_not_clean() {
+    let host = root_with_alice()
+        .sudo_says("alice", Answer::Nothing)
+        .sudo_says("bob", Answer::Unavailable("garbled".to_owned()));
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert_eq!(rules.unverified[0].reason, "garbled");
+}
+
+#[test]
+fn without_root_a_clean_parse_is_unverified() {
+    let rules = &asked(&clean()).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert_eq!(rules.unverified[0].reason, ROOT_NEEDED);
+}
+
+#[test]
+fn without_root_a_positive_finding_stays_a_finding() {
+    let host = clean().file("/etc/sudoers", 0, 0, 0o440, b"yamin ALL=NOPASSWD: ALL\n");
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Found);
+    assert!(rules.unverified.is_empty(), "{rules:?}");
+}
+
+#[test]
+fn an_empty_xudo_group_leaves_no_one_to_ask() {
+    let host = clean_for(root_caller());
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert!(rules.unverified[0].reason.contains("no one is in xudo"));
+}
+
+#[test]
+fn only_a_bounded_number_of_users_are_asked() {
+    let names: Vec<String> = (0..MAX_ASKED + 3).map(|n| format!("u{n}")).collect();
+    let group = format!("root:x:0:\nxudo:x:998:{}\n", names.join(","));
+    let mut host = clean_for(root_caller()).file("/etc/group", 0, 0, 0o644, group.as_bytes());
+    for name in &names {
+        host = host.sudo_says(name, Answer::Nothing);
+    }
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert!(rules.unverified[0].reason.contains("first 16"), "{rules:?}");
+}
+
+#[test]
+fn a_note_already_there_is_kept_beside_the_oracles() {
+    let host = root_with_alice()
+        .unreadable_file("/etc/sudoers", 0, 0, 0o440)
+        .sudo_says("alice", Answer::Nothing);
+    let note = asked(&host).checks[0].note.clone().unwrap();
+    assert!(note.contains("could not be read") && note.contains("asked about alice"));
+}
+
+#[test]
+fn the_listing_is_read_for_the_tags_sudo_prints() {
+    assert_eq!(
+        read_listing(LISTING),
+        Answer::Passwordless("(ALL) NOPASSWD: ALL".to_owned())
+    );
+    let defaults = "Matching Defaults entries for a on h:\n    !authenticate, env_reset\n\
+                    User a may run the following commands on h:\n    (ALL) ALL";
+    assert_eq!(
+        read_listing(defaults),
+        Answer::Passwordless("!authenticate, env_reset".to_owned())
+    );
+    let passworded = "User a may run the following commands on h:\n    (ALL : ALL) ALL";
+    assert_eq!(read_listing(passworded), Answer::Nothing);
+    assert_eq!(
+        read_listing("User a is not allowed to run sudo on h."),
+        Answer::Nothing
+    );
+    // Neither a listing nor a refusal: a failure, a prompt, a translation.
+    for reply in ["", "sudo: a password is required", "NOPASSWD: ALL"] {
+        assert!(
+            matches!(read_listing(reply), Answer::Unavailable(_)),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn the_default_host_cannot_ask() {
+    let host = Scripted::new(clean());
+    assert!(matches!(
+        host.ask_sudo("/usr/bin/sudo", "a"),
+        Answer::Unavailable(_)
+    ));
+    let unscripted = root_with_alice();
+    assert!(matches!(
+        unscripted.ask_sudo("/usr/bin/sudo", "alice"),
+        Answer::Unavailable(_)
+    ));
+}
+
+#[test]
+fn without_root_and_without_a_name_there_is_no_one_to_ask() {
+    let host = clean_for(Caller {
+        uid: 4242,
+        gid: 4242,
+        groups: Lookup::Found(vec![4242]),
+    });
+    let rules = &asked(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert_eq!(rules.unverified[0].reason, ROOT_NEEDED);
+}
+
+#[test]
+fn one_reason_is_given_once_however_many_users_share_it() {
+    let host = root_with_alice().sudo_says("alice", Answer::Unavailable("same".to_owned()));
+    let host = host.sudo_says("bob", Answer::Unavailable("same".to_owned()));
+    assert_eq!(asked(&host).checks[0].unverified.len(), 1);
 }
