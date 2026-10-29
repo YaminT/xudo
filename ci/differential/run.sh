@@ -5,8 +5,10 @@
 #
 #   ci/differential/run.sh <static linux xudo binary>      (or: just differential)
 #
+# xudod and xudo-gate are taken from the same directory as the xudo binary.
+#
 # Each row below names an image and how to install its backend. Inside the
-# container, row.sh records two things:
+# container, row.sh records three things:
 #
 #   report.txt    what is backend-specific and must match expected/<row>.txt
 #                 exactly: which backend was found, every capability it was
@@ -19,10 +21,10 @@
 #                 expected/verdicts.txt: the engine's answer for every argv in
 #                 invocations.txt. No backend may change a verdict.
 #
-# What this does not do yet: execute anything. `xudo doctor` reports the exec
-# path as absent, and row.sh fails the moment that stops being true, because at
-# that point the comparison that matters — the same ruleset *executed* through
-# each backend, with identical outcomes — is due and has to be written here.
+#   exec.txt      with a backend: the real broker and gate installed, `xudo exec`
+#                 run as an unprivileged user through the backend on a pty with
+#                 the password typed. Must be identical in every row and match
+#                 expected/exec.txt. See exec.sh.
 #
 # Images are moving tags on purpose. Detection is runtime, and the point is to
 # notice when a distribution's package changes what its backend can do.
@@ -69,6 +71,7 @@ for spec in "${rows[@]}"; do
     echo "== $row  ($image)"
     if ! docker run --rm \
         -v "$bin:/usr/local/bin/xudo:ro" \
+        -v "$(dirname "$bin"):/bins:ro" \
         -v "$root/rules:/rules:ro" \
         -v "$here:/harness:ro" \
         -v "$out:/out" \
@@ -81,6 +84,20 @@ for spec in "${rows[@]}"; do
         echo "FAIL: row $row: the backend report differs from expected/$row.txt" >&2
         fail=1
     fi
+    if [[ -e $out/$row/exec.txt ]]; then
+        want=$here/expected/exec.txt
+        # A difference found and recorded, not accepted: it is listed in
+        # docs/CONCERNS.md, and fixing it makes this row fail until the
+        # exception file is deleted.
+        if [[ -e $here/expected/exec-$row.txt ]]; then
+            want=$here/expected/exec-$row.txt
+            echo "NOTE: row $row is a known difference (expected/exec-$row.txt)"
+        fi
+        if ! diff -u "$want" "$out/$row/exec.txt"; then
+            echo "FAIL: row $row: what ran through the backend differs from $(basename "$want")" >&2
+            fail=1
+        fi
+    fi
     if ! diff -u "$here/expected/verdicts.txt" "$out/$row/verdicts.txt"; then
         echo "FAIL: row $row: a verdict depends on the backend, or policy changed without its snapshot" >&2
         fail=1
@@ -90,4 +107,4 @@ done
 if (( fail )); then
     exit 1
 fi
-echo "differential: ${#rows[@]} rows, identical verdicts, every backend report as expected"
+echo "differential: ${#rows[@]} rows, identical verdicts, every backend report and execution as expected"

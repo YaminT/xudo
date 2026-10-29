@@ -10,7 +10,7 @@ rules trust  UNTRUSTED: /etc/xudo is owned by uid 1000, not root
 classified   unavailable: cannot read self/stat: test stub refuses
 password     required (failing closed)
 backend      UNUSABLE: sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes xudo's settings to xudo's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); xudo refuses to install rather than install something weaker than it advertises
-exec path    absent in this build
+exec path    xudo exec runs /usr/bin/sudo on the gate
 
 other paths to root, as yamin (uid 1000): 18 found, and 5 check(s) could not be completed
   any one of these is a way to root that does not go through xudo

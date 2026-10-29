@@ -133,7 +133,7 @@ fn doctor_succeeds_and_states_that_nothing_is_executed() {
         .assert()
         .success()
         .stdout(
-            contains("exec path    absent in this build")
+            contains("exec path    ")
                 .and(contains("0 trusted"))
                 .and(contains("not a")),
         );
@@ -168,7 +168,12 @@ fn doctor_json_reports_on_the_path_the_process_was_started_with() {
     assert!(output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema_version"], 1);
-    assert_eq!(envelope["exec_path"], "absent");
+    assert!(
+        envelope["exec_path"]
+            .as_str()
+            .unwrap()
+            .contains("xudo exec")
+    );
     let check = user_path_check(&envelope);
     assert_eq!(check["status"], "found", "{check}");
     assert_eq!(

@@ -2,3 +2,4 @@ backend      UNUSABLE: sudo-rs <version> is missing a required control (REQUIRED
 install      exit 19
 refused      sudo-rs <version> is missing a required control
 check        exit 0
+install real  refused: no usable backend

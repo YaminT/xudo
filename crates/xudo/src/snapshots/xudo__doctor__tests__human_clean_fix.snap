@@ -13,7 +13,7 @@ hints        1 recorded, 0 trusted
 backend      sudo (Sudo version 1.9.17p2)
 backend caps 6 of 7 supported
              absent: rejects argument wildcards
-exec path    absent in this build
+exec path    xudo exec runs /usr/bin/sudo on the gate
 
 other paths to root, as yamin (uid 1000): none found, and 1 check(s) could not be completed
   any one of these is a way to root that does not go through xudo

@@ -6,7 +6,7 @@ expression: "render::json_of(&hostile_report(true))"
   "schema_version": 1,
   "xudo_version": "0.0.1",
   "platform": "test",
-  "exec_path": "absent",
+  "exec_path": "xudo exec runs /usr/bin/sudo on the gate",
   "kernel": {
     "version": "5.10",
     "attestation": "SO_PEERCRED + pidfd_open",

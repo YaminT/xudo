@@ -3,8 +3,8 @@
 #
 #   sh /harness/row.sh <row> <setup command>
 #
-# Expects the static xudo binary at /usr/local/bin/xudo, the shipped rules at
-# /rules, this directory at /harness, and a writable /out. POSIX sh only: the
+# Expects the static xudo binary at /usr/local/bin/xudo, its siblings in /bins, the
+# shipped rules at /rules, this directory at /harness, and a writable /out. POSIX sh only: the
 # Alpine rows have busybox, the Ubuntu rows have dash.
 #
 # Writes /out/<row>/report.txt (the backend-specific facts, normalized) and
@@ -48,17 +48,6 @@ sed -nE \
     -e '/^backend caps /p' \
     -e '/^ +absent: /p' \
     "$out/doctor.txt" >>"$report"
-
-# The tripwire. This matrix compares what the *unprivileged* binary does with
-# each backend, and that is honest only while nothing can execute. The day
-# doctor stops saying so, the real differential — the same ruleset executed
-# through each backend, identical outcomes — is due, and this fails until it
-# has been written.
-if ! grep -qx 'exec path    absent in this build' "$out/doctor.txt"; then
-    echo "row $row: xudo doctor no longer reports the exec path as absent." >&2
-    echo "          The matrix must now execute through each backend and compare outcomes; see run.sh." >&2
-    exit 1
-fi
 
 # 2. The install plan: refused with exit 19 where nothing usable exists,
 #    printed in full where something does — and then the one file xudo would
@@ -125,3 +114,8 @@ while IFS= read -r line; do
     echo "exit $rc" >>"$verdicts"
     echo >>"$verdicts"
 done <"$harness/invocations.txt"
+
+# 5. The same ruleset executed through the backend (exec.sh): exec.txt, which
+#    must be identical in every row with a backend. With none, `xudo exec` has
+#    nothing to run through and says so with exit 19.
+sh "$harness/exec.sh" "$row"
