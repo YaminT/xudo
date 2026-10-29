@@ -4,6 +4,12 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-29 — doctor asks sudo itself (D3)
+
+The hand reader for sudoers lost four review rounds to lexer mismatches, so it is now a hint and sudo's own answer is the verdict where it can be had. As root, with a sudo or sudo-rs backend, `xudo doctor` runs `sudo -n -l -U <user>` once per member of the `xudo` group (at most 16; more is unverified) and reads the tags sudo prints: `NOPASSWD:` or `!authenticate` is a finding (`backend_listing`), a listing without them or a refusal is nothing, any other reply is unverified. If every user answers nothing, the reader's gaps are dropped; a user who could not be asked, an empty group, or a non-root run leaves the check unverified ("run `sudo xudo doctor` to ask sudo itself"), unless the reader already found something. The reader's findings stay as hints. It cannot ask doas: `doas -C` answers for one command, and the report has no command to ask about, so doas stays on the reader alone. As root the subject is root, so the group members stand in for the accounts an agent runs as. Tests: `the_oracle_overrides_a_parser_that_missed_a_nopasswd_rule`, `an_unreadable_oracle_answer_is_unverified_not_clean`, `without_root_a_clean_parse_is_unverified`; against real sudo, `xudo-bin/tests/root_doctor.rs` (a rule in a file `/etc/sudo.conf` redirects sudo to, which the reader never opens).
+
+---
+
 ## 2026-10-29 — `xudo install` is verified by the gate printing 0
 
 `PendingGateProbe` is gone. `xudo_sys::HostInstaller` takes an `InstallProbe`,

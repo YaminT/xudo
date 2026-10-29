@@ -19,8 +19,11 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{Access, FileType, Mode, OFlags};
 use rustix::process::Gid;
 use xudo_backend::paths_to_root::{
-    Caller, HostView, Kind, Lookup, MAX_READ, Meta, NOT_A_REGULAR_FILE, TOO_LARGE,
+    Answer, Caller, HostView, Kind, Lookup, MAX_READ, Meta, NOT_A_REGULAR_FILE, ROOT_NEEDED,
+    TOO_LARGE, read_listing,
 };
+
+use crate::exec::{HostRunner, Runner};
 
 /// Answers the report's questions about this machine, as this process.
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +63,27 @@ impl HostView for LiveHost {
         // set-user-ID are the caller's: exactly whose write access the report
         // is about.
         rustix::fs::access(path, Access::WRITE_OK).is_ok()
+    }
+
+    fn ask_sudo(&self, exe: &str, user: &str) -> Answer {
+        ask_sudo(&HostRunner, rustix::process::geteuid().as_raw(), exe, user)
+    }
+}
+
+/// `sudo -n -l -U user`, only as root: anyone else is refused by sudo, and
+/// that refusal says nothing about the rules.
+fn ask_sudo(runner: &dyn Runner, euid: u32, exe: &str, user: &str) -> Answer {
+    if euid != 0 {
+        return Answer::Unavailable(ROOT_NEEDED.to_owned());
+    }
+    // A name that could be read as an option is not passed on.
+    let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+    if user.is_empty() || user.starts_with('-') || !user.bytes().all(plain) {
+        return Answer::Unavailable("the name is not one it will pass to sudo".to_owned());
+    }
+    match runner.run(exe, &["-n", "-l", "-U", user], None) {
+        Ok(out) => read_listing(&format!("{}{}", out.stdout, out.stderr)),
+        Err(error) => Answer::Unavailable(format!("sudo could not be run: {error}")),
     }
 }
 
@@ -387,6 +411,7 @@ mod tests {
             &Input {
                 user_path: Some(&path),
                 backend_exe: Some(Path::new("/usr/bin/sudo")),
+                sudo_exe: None,
             },
         );
         let order: Vec<CheckId> = report.checks.iter().map(|c| c.check).collect();
@@ -407,5 +432,75 @@ mod tests {
         assert_eq!(above_the_whole, 0, "{report:?}");
         assert_eq!(report.subject.uid, LiveHost.caller().uid);
         assert!(format!("{LiveHost:?}").contains("LiveHost"));
+    }
+
+    struct Says(Result<crate::exec::Output, crate::error::SysError>);
+
+    impl Runner for Says {
+        fn run(
+            &self,
+            _exe: &str,
+            args: &[&str],
+            _stdin: Option<&[u8]>,
+        ) -> Result<crate::exec::Output, crate::error::SysError> {
+            assert_eq!(args[..3], ["-n", "-l", "-U"]);
+            self.0.clone()
+        }
+    }
+
+    fn replied(stdout: &str) -> Says {
+        Says(Ok(crate::exec::Output {
+            success: true,
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }))
+    }
+
+    #[test]
+    fn without_root_sudo_is_not_asked() {
+        // Not root: sudo's refusal would be misread as "nothing listed".
+        let answer = ask_sudo(
+            &replied("is not allowed to run sudo"),
+            1000,
+            "/usr/bin/sudo",
+            "a",
+        );
+        assert_eq!(answer, Answer::Unavailable(ROOT_NEEDED.to_owned()));
+        // The real host, unprivileged or not, answers without panicking.
+        let _ = LiveHost.ask_sudo("/nonexistent/sudo", "a");
+    }
+
+    #[test]
+    fn a_name_that_reads_as_an_option_is_never_passed_to_sudo() {
+        for name in ["", "-U", "a b", "a;b", "a\nb"] {
+            let answer = ask_sudo(&replied(""), 0, "/usr/bin/sudo", name);
+            assert_eq!(
+                answer,
+                Answer::Unavailable("the name is not one it will pass to sudo".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn as_root_the_reply_is_read_from_both_streams() {
+        let said = ask_sudo(
+            &replied("User a may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n"),
+            0,
+            "/usr/bin/sudo",
+            "a",
+        );
+        assert_eq!(said, Answer::Passwordless("(ALL) NOPASSWD: ALL".to_owned()));
+        let failed = ask_sudo(
+            &Says(Err(crate::error::SysError::unsupported("no such file"))),
+            0,
+            "/usr/bin/sudo",
+            "a",
+        );
+        let why = crate::error::SysError::unsupported("no such file");
+        assert_eq!(
+            failed,
+            Answer::Unavailable(format!("sudo could not be run: {why}"))
+        );
     }
 }

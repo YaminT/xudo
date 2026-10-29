@@ -278,6 +278,10 @@ pub(crate) fn gather(
         &Input {
             user_path: platform.path,
             backend_exe,
+            sudo_exe: backend
+                .as_ref()
+                .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
+                .map(|found| found.exe.as_str()),
         },
     );
     // Root commands go through the backend, where the human types their
@@ -650,6 +654,11 @@ fn finding_line(finding: &Finding) -> String {
             },
             safe(text)
         ),
+        Finding::BackendListing { user, listing } => format!(
+            "sudo itself lists a rule for {} that needs no password: {}",
+            safe(user),
+            safe(&listing.replace('\n', " | "))
+        ),
         Finding::GroupMembership {
             group,
             gid,
@@ -834,7 +843,7 @@ mod tests {
     use std::path::PathBuf;
 
     use xudo_backend::Probe;
-    use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
+    use xudo_backend::paths_to_root::{Answer, Caller, Lookup, MemoryHost};
     use xudo_policy::{Classification, Hint, HintSource};
     use xudo_sys::PrivilegedOps;
 
@@ -1177,6 +1186,42 @@ mod tests {
         insta::assert_snapshot!("human_root_no_backend", human(&report));
         assert_eq!(report.backend.status, BackendStatus::None);
         assert!(report.paths_to_root.subject.is_root);
+    }
+
+    #[test]
+    fn root_is_shown_what_sudo_itself_says_about_the_xudo_group() {
+        let host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, PASSWD)
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:alice\n")
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/bin", 0, 0, 0o755)
+        .dir("/root", 0, 0, 0o700)
+        .sudo_says(
+            "alice",
+            Answer::Passwordless("(ALL) NOPASSWD: ALL".to_owned()),
+        );
+        let report = gathered(
+            &host,
+            "/usr/bin",
+            &TestOps {
+                release: "6.13.0",
+                observable: true,
+            },
+            &TestProbe {
+                present: &["/usr/bin/sudo"],
+                banner: Some("Sudo version 1.9.16"),
+                scoped: true,
+            },
+            Ok(&fixture_rules("4")),
+            false,
+        );
+        insta::assert_snapshot!("human_root_sudo_says", human(&report));
     }
 
     #[test]

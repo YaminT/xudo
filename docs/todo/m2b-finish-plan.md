@@ -147,7 +147,7 @@ exit. Packaging stays in phase 3.
 - **D2. Fuzz target** for the `xudo-wire` request parser, a trust-boundary
   parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`. *Done:*
   `fuzz/fuzz_targets/wire_request.rs` and `wire_response.rs`, both run by `just fuzz`.
-- **D3. Doctor oracle.** Ask the programs themselves — `sudo -l -U <user>` when
+- **D3. Doctor oracle.** **DONE 2026-10-29** for sudo and sudo-rs (as root, `sudo -l -U` per `xudo` group member; the reader is a hint, and a non-root run is unverified); doas stays on the reader, since `doas -C` needs a command to ask about. Ask the programs themselves — `sudo -l -U <user>` when
   run as root, `doas -C <file> <cmd>` unprivileged — as the authoritative
   passwordless check, demoting the hand parser to a hint. Four review rounds
   each found a new lexer mismatch; the parser cannot win that race.
