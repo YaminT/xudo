@@ -137,7 +137,8 @@ exit. Packaging stays in phase 3.
   lists what it touches and the order to do it in (the unit's sandbox first,
   measured under systemd).
 - **D2. Fuzz target** for the `xudo-wire` request parser, a trust-boundary
-  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`.
+  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`. *Done:*
+  `fuzz/fuzz_targets/wire_request.rs` and `wire_response.rs`, both run by `just fuzz`.
 - **D3. Doctor oracle.** Ask the programs themselves — `sudo -l -U <user>` when
   run as root, `doas -C <file> <cmd>` unprivileged — as the authoritative
   passwordless check, demoting the hand parser to a hint. Four review rounds
