@@ -14,6 +14,7 @@ xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
 xudo-config = { path = "../xudo-config", version = "0.0.1" }
 xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
 xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,6 +25,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

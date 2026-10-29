@@ -239,3 +239,16 @@ fn an_unknown_subcommand_fails_rather_than_defaulting_to_something() {
         .assert()
         .failure();
 }
+
+#[test]
+fn exec_with_no_broker_exits_nineteen() {
+    // On a machine with a broker this would ask it, so only assert without one.
+    if Path::new("/run/xudo/broker.sock").exists() {
+        return;
+    }
+    xudo(&rules_dir("bin-exec"))
+        .args(["exec", "--", "/usr/bin/true"])
+        .assert()
+        .code(19)
+        .stderr(contains("xudo doctor"));
+}
