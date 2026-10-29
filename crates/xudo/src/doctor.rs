@@ -66,10 +66,6 @@ use crate::rules::{LoadError, LoadedRules};
 /// The version of the `doctor --json` envelope.
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
-/// What `doctor` says about the exec path, until there is one. The
-/// differential matrix (`ci/differential/row.sh`) trips on this line changing.
-const EXEC_PATH: &str = "absent";
-
 /// How much of one machine-derived string a terminal is shown.
 const LIMITS: Limits = Limits {
     max_cols: 512,
@@ -85,8 +81,8 @@ pub struct Report {
     pub xudo_version: &'static str,
     /// Which platform implementation answered.
     pub platform: &'static str,
-    /// Whether this build can execute anything: `absent`.
-    pub exec_path: &'static str,
+    /// What `xudo exec` would run: the backend, or why there is none.
+    pub exec_path: String,
     /// What the kernel offers the broker.
     pub kernel: KernelReport,
     /// The ruleset, and whether it is root's.
@@ -295,7 +291,10 @@ pub(crate) fn gather(
         schema_version: DOCTOR_SCHEMA_VERSION,
         xudo_version: env!("CARGO_PKG_VERSION"),
         platform: platform.ops.platform(),
-        exec_path: EXEC_PATH,
+        exec_path: backend.as_ref().map_or_else(
+            || "no backend; `xudo exec` exits 19".to_owned(),
+            |found| format!("xudo exec runs {} on the gate", found.exe),
+        ),
         kernel: KernelReport::of(platform.ops.kernel()),
         ruleset: ruleset(rules, loaded),
         caller: caller(platform.ops.classify(std::process::id())),
@@ -436,7 +435,7 @@ pub(crate) fn human(report: &Report) -> String {
         line("password", "required (failing closed)");
     }
     backend_lines(&report.backend, &mut line);
-    line("exec path", &format!("{} in this build", report.exec_path));
+    line("exec path", &report.exec_path);
     let _ = write!(out, "{}", paths_section(&report.paths_to_root));
     if let Some(proposals) = &report.proposals {
         let prefixed = report.backend.exe.is_some() && !report.paths_to_root.subject.is_root;

@@ -272,15 +272,15 @@ units:
 # .cargo/config.toml) so the same build works from a Mac and from the runner.
 musl_triple := if arch() == "aarch64" { "aarch64-unknown-linux-musl" } else { "x86_64-unknown-linux-musl" }
 
-# One binary and the shipped ruleset, driven inside real distributions against
-# the real sudo, sudo-rs (the version Ubuntu 24.04 ships and the one 26.04
-# does), OpenDoas, and a container with no escalator at all. Every backend's
-# detection and probed capabilities are pinned, its own parser is asked to
-# accept the snippet xudo would write, and every verdict must be identical in
-# every row. Needs Docker. ci/differential/run.sh says what is compared and
-# what is deliberately not yet.
+# The shipped ruleset, driven inside real distributions against the real sudo,
+# sudo-rs (the version Ubuntu 24.04 ships and the one 26.04 does), OpenDoas,
+# and a container with no escalator at all. Every backend's detection and
+# probed capabilities are pinned, its own parser is asked to accept the snippet
+# xudo would write, every verdict must be identical in every row, and with the
+# real broker and gate installed, `xudo exec` must do the same thing through
+# each backend. Needs Docker. ci/differential/run.sh says what is compared.
 differential:
-    cargo build -p xudo-bin --release --target {{musl_triple}}
+    cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin --release --target {{musl_triple}}
     ci/differential/run.sh target/{{musl_triple}}/release/xudo
 
 # --- install, for real, as root ----------------------------------------------

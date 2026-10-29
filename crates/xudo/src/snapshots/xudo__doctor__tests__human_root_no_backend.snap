@@ -12,7 +12,7 @@ password     required
 hints        1 recorded, 0 trusted
 backend      NONE — xudo cannot operate on this machine
              xudo delegates every uid transition and performs none itself
-exec path    absent in this build
+exec path    no backend; `xudo exec` exits 19
 
 other paths to root, as root (uid 0): 1 found
   any one of these is a way to root that does not go through xudo

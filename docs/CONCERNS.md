@@ -4,6 +4,20 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-29 — C2: the differential executes, and OpenDoas differs
+
+`ci/differential/exec.sh` installs the real broker (socat as `Accept=yes`, `nofork` so the broker sees the real peer), gate, rules and `xudo install` in each row, then runs `xudo exec` as an unprivileged user through the backend on a pty with the password typed. Cases (`expected/exec.txt`): `id -u` prints 0; a harness-only `expr 1 +` passes exit 2 through; an argv no rule matches and `/bin/sh -c id` both exit 17; a wrong password fails and prints no `0`. `none` exits 19. sudo 24.04 and sudo-rs 26.04 agree; sudo-rs 0.2 refuses to install, as before. Not asserted: that a command printed by the child reached no secret environment (row 11), or two gates racing one entry (row 5).
+
+Findings, none fixed here:
+
+- **OpenDoas: `xudo exec` is refused by the gate** (`gate_no_pending_request`, exit 19). doas execs the gate without forking, so the process the broker pinned is the gate itself, and the gate looks only at ancestors. `expected/exec-doas.txt` records it; the row fails when it is fixed, until that file is deleted.
+- **OpenDoas: `xudo install` as root is rolled back.** The probe runs `doas` as root, which still asks for a password (`permit persist :xudo`). In the harness the broker starts after the install, which reports NOT VERIFIED.
+- **The gate refuses `/usr/bin/id`, the install probe's program, on Ubuntu 26.04 and Alpine.** There it is a symlink to a multicall binary (uutils, busybox). The symlink refusal is by design; the shipped probe action therefore cannot verify on those distributions. The harness swaps in GNU `gnuid` (26.04) or `apk add coreutils` (Alpine).
+
+`doctor` no longer says the exec path is absent: it says which backend `xudo exec` would run, or that there is none.
+
+---
+
 ## 2026-10-29 — doctor asks sudo itself (D3)
 
 The hand reader for sudoers lost four review rounds to lexer mismatches, so it is now a hint and sudo's own answer is the verdict where it can be had. As root, with a sudo or sudo-rs backend, `xudo doctor` runs `sudo -n -l -U <user>` once per member of the `xudo` group (at most 16; more is unverified) and reads the tags sudo prints: `NOPASSWD:` or `!authenticate` is a finding (`backend_listing`), a listing without them or a refusal is nothing, any other reply is unverified. If every user answers nothing, the reader's gaps are dropped; a user who could not be asked, an empty group, or a non-root run leaves the check unverified ("run `sudo xudo doctor` to ask sudo itself"), unless the reader already found something. The reader's findings stay as hints. It cannot ask doas: `doas -C` answers for one command, and the report has no command to ask about, so doas stays on the reader alone. As root the subject is root, so the group members stand in for the accounts an agent runs as. Tests: `the_oracle_overrides_a_parser_that_missed_a_nopasswd_rule`, `an_unreadable_oracle_answer_is_unverified_not_clean`, `without_root_a_clean_parse_is_unverified`; against real sudo, `xudo-bin/tests/root_doctor.rs` (a rule in a file `/etc/sudo.conf` redirects sudo to, which the reader never opens).

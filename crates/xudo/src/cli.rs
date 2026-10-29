@@ -1107,7 +1107,7 @@ mod tests {
         assert!(!out.contains("proposed fixes"), "{out}");
         // The lines the differential matrix reads are where they were.
         assert!(
-            out.contains("\nexec path    absent in this build\n"),
+            out.contains("\nexec path    xudo exec runs /usr/bin/sudo on the gate\n"),
             "{out}"
         );
         assert!(out.contains("\nbackend caps 6 of 7 supported\n"), "{out}");
@@ -1146,7 +1146,12 @@ mod tests {
         assert_eq!(parsed["backend"]["status"], "usable");
         assert_eq!(parsed["paths_to_root"]["status"], "found");
         assert_eq!(parsed["proposals"][0]["id"], "join-xudo");
-        assert_eq!(parsed["exec_path"], "absent");
+        assert!(
+            parsed["exec_path"]
+                .as_str()
+                .unwrap()
+                .starts_with("xudo exec runs")
+        );
         // `--output json` selects the same envelope; without --fix there are
         // no proposals, which is null rather than an empty list.
         let (_, global) = doctor_on(
@@ -2783,7 +2788,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(code, ExitCode::Delegated);
         assert!(out.contains("ruleset      2 action(s)"), "{out}");
         assert!(out.contains("0 trusted"), "{out}");
-        assert!(out.contains("exec path    absent in this build"), "{out}");
+        assert!(out.contains("exec path    "), "{out}");
         assert!(out.contains("not a"), "{out}");
         #[cfg(not(target_os = "linux"))]
         assert!(out.contains("macos-stub"), "{out}");

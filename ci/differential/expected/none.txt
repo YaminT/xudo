@@ -2,3 +2,4 @@ backend      NONE — xudo cannot operate on this machine
 install      exit 19
 refused      no privilege backend found
 check        exit 0
+exec         exit 19

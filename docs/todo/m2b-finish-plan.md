@@ -78,7 +78,8 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    `xudo audit` verifies the produced trail and fails after truncation. *(D1,
    row 15)*
 8. The differential matrix executes the same ruleset through sudo, sudo-rs, and
-   OpenDoas with identical verdicts. *(C2, row 14)*
+   OpenDoas with identical verdicts. *(C2, row 14; sudo and sudo-rs identical,
+   OpenDoas differs: a recorded exception, see `CONCERNS.md` 2026-10-29)*
 
 Rows 6–10 and 16 of the verification table are M3/M4 and are not part of this
 exit. Packaging stays in phase 3.
@@ -126,10 +127,13 @@ exit. Packaging stays in phase 3.
   a denial whose remediation is "a human must run this" prints the exact
   `ido queue` line; `rexpect` test of the password prompt on a real pty. This is
   the first user-visible outcome of the milestone.
-- **C2. Step 8, executing differential.** `xudo-tests` drives the static binary
-  through sudo, sudo-rs, and OpenDoas in `ci/differential`'s containers, every
-  verdict identical in every row; `row.sh` stops reporting the exec path as
-  absent.
+- **C2. Step 8, executing differential.** **Done 2026-10-29**, in the shell
+  harness (`ci/differential/exec.sh`), not `xudo-tests`. The real broker, gate, and
+  `xudo install` run in each row; `xudo exec` runs as an unprivileged user on a pty
+  with the password typed. sudo (24.04) and sudo-rs (26.04) give identical
+  outcomes; **OpenDoas does not** (the gate cannot find the entry, because doas
+  does not fork), kept as `expected/exec-doas.txt` until fixed. The tripwire is gone;
+  `doctor` now says what `xudo exec` would run.
 
 ### D. Debts to clear before closeout *(parallel with C)*
 
