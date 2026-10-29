@@ -28,7 +28,20 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 use xudo_backend::{InstallPlan, PlanStep, detect, uninstall_plan};
-use xudo_sys::{HostInstallOps, HostProbe, InstallError, PendingGateProbe, Verification, execute};
+use xudo_sys::{
+    HostInstallOps, HostProbe, InstallError, InstallProbe, ProbeResult, Verification, execute,
+};
+
+/// A probe that does not run: these tests look at files, not at the gate.
+struct NoProbe;
+
+impl InstallProbe for NoProbe {
+    fn verify(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "not probed here".to_owned(),
+        }
+    }
+}
 
 const SNIPPET: &str = "/etc/sudoers.d/xudo";
 const CANDIDATE: &str = "/etc/sudoers.d/xudo.candidate";
@@ -62,7 +75,7 @@ fn plan() -> InstallPlan {
 }
 
 fn install(plan: &InstallPlan) -> Result<Verification, InstallError> {
-    execute(plan, &HostInstallOps::system(), &PendingGateProbe).map(|report| report.verification)
+    execute(plan, &HostInstallOps::system(), &NoProbe).map(|report| report.verification)
 }
 
 fn marked(body: &str) -> String {

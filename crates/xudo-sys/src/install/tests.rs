@@ -48,7 +48,13 @@ impl InstallProbe for Probe {
 }
 
 fn run(plan: &InstallPlan, ops: &FakeInstallOps) -> Result<InstallReport, InstallError> {
-    execute(plan, ops, &PendingGateProbe)
+    execute(
+        plan,
+        ops,
+        &Probe(ProbeResult::Unavailable {
+            reason: "no gate to run".to_owned(),
+        }),
+    )
 }
 
 #[test]
@@ -771,15 +777,6 @@ fn an_install_plan_without_a_probe_is_reported_unverified() {
 }
 
 #[test]
-fn the_pending_probe_never_verifies_and_says_why() {
-    let result = PendingGateProbe.verify(&[]);
-    assert!(
-        matches!(&result, ProbeResult::Unavailable { reason } if reason.contains("C1")),
-        "{result:?}"
-    );
-}
-
-#[test]
 fn the_refusing_installer_changes_nothing() {
     let err = RefusingInstaller.run(&sudo_plan()).unwrap_err();
     assert_eq!(err, InstallError::NoInstaller);
@@ -794,7 +791,9 @@ fn the_host_installer_refuses_a_caller_that_is_not_root() {
     if rustix::process::geteuid().as_raw() == 0 {
         return;
     }
-    let err = HostInstaller.run(&sudo_plan()).unwrap_err();
+    let err = HostInstaller::new(&Probe(ProbeResult::Verified))
+        .run(&sudo_plan())
+        .unwrap_err();
     assert!(matches!(err, InstallError::NotRoot { .. }), "{err}");
 }
 
@@ -874,6 +873,48 @@ fn a_finished_install_carries_the_backends_account_as_a_notice_of_its_own() {
         finished.verification,
         Verification::Unverified { .. }
     ));
+}
+
+/// Answers `getent` with one member and `sudo -l` with `listing`.
+struct Listing(&'static str);
+
+impl Runner for Listing {
+    fn run(&self, exe: &str, _args: &[&str], _stdin: Option<&[u8]>) -> Result<Output, SysError> {
+        let stdout = if exe.ends_with("getent") {
+            "xudo:x:900:alice\n"
+        } else {
+            self.0
+        };
+        Ok(Output {
+            success: true,
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[test]
+fn a_probe_pass_does_not_stand_when_the_backend_does_not_list_the_gate() {
+    let finished = finish(Ok(report(Verification::Verified)), &Listing("nothing")).unwrap();
+    assert!(
+        matches!(finished.verification, Verification::Unverified { .. }),
+        "{:?}",
+        finished.verification
+    );
+}
+
+#[test]
+fn a_probe_pass_stands_when_the_backend_lists_the_gate() {
+    let listed = Listing("(root) PASSWD: /usr/libexec/xudo/xudo-gate-auth");
+    let finished = finish(Ok(report(Verification::Verified)), &listed).unwrap();
+    assert_eq!(finished.verification, Verification::Verified);
+}
+
+#[test]
+fn a_probe_pass_stands_when_the_backend_cannot_be_asked() {
+    let finished = finish(Ok(report(Verification::Verified)), &NoRunner).unwrap();
+    assert_eq!(finished.verification, Verification::Verified);
 }
 
 #[test]

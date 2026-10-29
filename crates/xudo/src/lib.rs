@@ -31,6 +31,7 @@ pub mod agentdoc;
 pub mod cli;
 pub mod doctor;
 pub mod exec;
+pub mod probe;
 pub mod render;
 pub mod rules;
 

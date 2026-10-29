@@ -5,9 +5,10 @@
 //! and `OpenDoas`. This is the same command in the root lane: the process the
 //! packaging scripts run, against the container's real `/etc` and the real
 //! `sudo` the lane installs, asserting the two things an operator relies on. The
-//! file that lands is `root:root` and `0440`, and an install says out loud that
-//! it was not shown to work, with a failing status, until the functional probe
-//! exists (it needs the broker client, M2b plan item C1).
+//! file that lands is `root:root` and `0440`, and an install with no broker
+//! running says out loud that it was not shown to work, with a failing status.
+//! The install that is verified, with a broker and a gate, is
+//! `xudo-gate-bin/tests/root_probe.rs`.
 //!
 //! This package owns the binary, so Cargo builds it fresh for these tests and
 //! sets `CARGO_BIN_EXE_xudo`: a binary found any other way could be a stale one.
@@ -52,14 +53,17 @@ fn xudo(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
-fn install_as_root_writes_the_snippet_and_says_it_was_not_verified() {
-    if !begin_root_test("install_as_root_writes_the_snippet_and_says_it_was_not_verified") {
+fn install_as_root_without_a_broker_writes_the_snippet_and_says_it_was_not_verified() {
+    if !begin_root_test(
+        "install_as_root_without_a_broker_writes_the_snippet_and_says_it_was_not_verified",
+    ) {
         return;
     }
     let (code, out, err) = xudo(&["install"]);
 
     assert_eq!(code, 19, "an unverified install must fail:\n{out}\n{err}");
     assert!(err.contains("NOT VERIFIED"), "{err}");
+    assert!(err.contains("broker is unreachable"), "{err}");
     assert!(
         !out.contains("verified     "),
         "the install claimed a probe passed:\n{out}"

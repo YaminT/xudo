@@ -68,9 +68,11 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    *(B4, row 3)* **Status 2026-10-22:** the executor, the snippet, and the
    regression are done and tested as real root; the gate-as-uid-0 proof exists in
    the root lane (`xudo-gate-bin/tests/root_probe.rs`, a hand-written request
-   through real `sudo`), but **`xudo install`'s own probe stays `NOT VERIFIED`
-   until C1** (it cannot mint a request), and the doctor reporting a dotted name
-   as not in effect is B2's.
+   through real `sudo`). **Done 2026-10-29:** `xudo install`'s own probe asks the
+   broker for `id -u` (shipped rule `rules/05-probe.toml`), runs the gate as a
+   child, and verifies only on `0`; the root lane proves it with the real
+   broker and `xudo exec` on a pty. The doctor reporting a dotted name as not in
+   effect is B2's.
 7. The broker and the gate each write their own audit record through the
    step-6 contract; a sink that cannot be written prevents mint and execution;
    `xudo audit` verifies the produced trail and fails after truncation. *(D1,
@@ -115,10 +117,11 @@ exit. Packaging stays in phase 3.
 
 ### C. New builds *(after B; C1 before C2)*
 
-- **C1. Step 3, `xudo exec`.** *Built 2026-10-29, except the pty test:
+- **C1. Step 3, `xudo exec`.** **Done 2026-10-29**, pty test included
+  (`xudo-gate-bin/tests/root_probe.rs`, root lane, on a hand-driven pty rather than `rexpect`):
   `xudo exec -- <abs program> [args]` asks the broker, checks the gate path is
   `GATE_AUTH`, and `xudo-bin` execs `sudo`/`doas` on it in place; a human-only
-  denial prints the `ido queue` line. Left: the `rexpect` test below.* Front-end round-trip over `xudo-wire`; exec of
+  denial prints the `ido queue` line. Front-end round-trip over `xudo-wire`; exec of
   the backend's `PASSWD` hop; backend exit status passed through byte for byte;
   a denial whose remediation is "a human must run this" prints the exact
   `ido queue` line; `rexpect` test of the password prompt on a real pty. This is

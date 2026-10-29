@@ -81,8 +81,7 @@ pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
     Effect, HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,
-    Installer, PendingGateProbe, ProbeResult, RefusingInstaller, Verification, check_effect,
-    execute,
+    Installer, ProbeResult, RefusingInstaller, Verification, check_effect, execute,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;

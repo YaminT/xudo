@@ -24,9 +24,20 @@ use std::os::unix::fs::PermissionsExt;
 
 use xudo_backend::{BackendKind, InstallPlan, PlanStep, detect, snippet::GATE_AUTH};
 use xudo_sys::{
-    Effect, HostInstallOps, HostProbe, HostRunner, InstallError, PendingGateProbe, check_effect,
-    execute, run_capture,
+    Effect, HostInstallOps, HostProbe, HostRunner, InstallError, InstallProbe, ProbeResult,
+    check_effect, execute, run_capture,
 };
+
+/// A probe that does not run: these tests look at files, not at the gate.
+struct NoProbe;
+
+impl InstallProbe for NoProbe {
+    fn verify(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "not probed here".to_owned(),
+        }
+    }
+}
 
 const SUDOERS_D: &str = "/etc/sudoers.d";
 const USER: &str = "xudotest";
@@ -85,7 +96,7 @@ fn the_installed_snippet_is_in_effect_for_the_group() {
     if !begin_root_test("the_installed_snippet_is_in_effect_for_the_group") {
         return;
     }
-    execute(&plan(), &HostInstallOps::system(), &PendingGateProbe).unwrap();
+    execute(&plan(), &HostInstallOps::system(), &NoProbe).unwrap();
     let granted = what_sudo_grants();
     assert!(
         granted.contains(GATE_AUTH),
@@ -137,7 +148,7 @@ fn the_executor_refuses_the_names_sudo_ignores() {
                 destination.clone_from(&to);
             }
         }
-        let error = execute(&plan, &HostInstallOps::system(), &PendingGateProbe).unwrap_err();
+        let error = execute(&plan, &HostInstallOps::system(), &NoProbe).unwrap_err();
         // Refused as a path xudo does not manage, or as a name sudo ignores:
         // either way nothing was written under it.
         assert!(
@@ -157,7 +168,7 @@ fn the_effect_check_sees_the_installed_rule() {
     if !begin_root_test("the_effect_check_sees_the_installed_rule") {
         return;
     }
-    execute(&plan(), &HostInstallOps::system(), &PendingGateProbe).unwrap();
+    execute(&plan(), &HostInstallOps::system(), &NoProbe).unwrap();
     assert_eq!(
         check_effect(&HostRunner, BackendKind::Sudo),
         Effect::InEffect {

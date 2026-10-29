@@ -39,15 +39,14 @@
 //! # What "installed" does and does not mean
 //!
 //! The plan's last real step is a functional probe: run the gate through the
-//! backend and see it execute as uid 0. The gate exists, but minting the request
-//! it waits for needs a broker client in the front-end (M2b plan item C1), so
-//! [`InstallProbe`] is the seam and the only production implementation,
-//! [`PendingGateProbe`], answers [`ProbeResult::Unavailable`]: a completed
-//! install reports [`Verification::Unverified`] with the reason, never
-//! "verified". A file in `/etc/sudoers.d` proves nothing: `sudo-rs` ignores
-//! directives it does not support, and `sudo` ignores a badly named file
-//! entirely. What the host installer adds is [`check_effect`], the backend's own
-//! answer to "do you read this rule", as a notice of its own; it is not the probe.
+//! backend and see it print `0`. [`InstallProbe`] is the seam; `xudo` supplies
+//! the real one, because minting the request the gate waits for needs the
+//! broker client. A probe that cannot run leaves the install
+//! [`Verification::Unverified`] with the reason, never "verified". A file in
+//! `/etc/sudoers.d` proves nothing: `sudo-rs` ignores directives it does not
+//! support, and `sudo` ignores a badly named file entirely. So [`HostInstaller`]
+//! also asks the backend ([`check_effect`]) and will not call an install
+//! verified when the backend does not list the gate.
 
 mod blocks;
 mod effect;
@@ -273,8 +272,7 @@ pub enum InstallError {
 /// What a functional probe saw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeResult {
-    /// The gate ran through the backend as uid 0, and refused without a
-    /// password rather than reporting that no rule permits it.
+    /// The gate ran through the backend and printed `0`.
     Verified,
     /// It ran and the integration is not in effect.
     Failed {
@@ -292,31 +290,6 @@ pub enum ProbeResult {
 pub trait InstallProbe {
     /// Runs `argv` and judges the outcome against the plan's expectation.
     fn verify(&self, argv: &[String]) -> ProbeResult;
-}
-
-/// The probe this build ships: unable to check anything yet.
-///
-/// **An explicit open item, not a stub to forget.** The functional probe runs
-/// the gate through `sudo` or `doas`, with a request pinned to the caller, and
-/// asserts it ran as uid 0. The gate exists (`xudo-gate-bin`) and so does the
-/// broker, but the front-end has no client for the broker (M2b plan item C1,
-/// `xudo exec`), so `xudo install` cannot mint the request the gate waits for.
-/// Until it can, an install completes and is never called verified.
-///
-/// The gate-through-sudo path is proven where a request can be written by
-/// hand: `xudo-gate-bin/tests/root_probe.rs`, in the root lane. That proves
-/// the installed snippet reaches the gate; it is not this probe.
-#[derive(Clone, Copy, Debug)]
-pub struct PendingGateProbe;
-
-impl InstallProbe for PendingGateProbe {
-    fn verify(&self, _argv: &[String]) -> ProbeResult {
-        ProbeResult::Unavailable {
-            reason: "the front-end cannot yet ask the broker for a request (M2b plan item C1), so \
-                     the gate cannot be driven from here and nothing shows it runs as root"
-                .to_owned(),
-        }
-    }
 }
 
 /// Whether the integration was shown to work.
@@ -453,22 +426,32 @@ pub trait Installer {
     fn run(&self, plan: &InstallPlan) -> Result<InstallReport, InstallError>;
 }
 
-/// The installer for a real machine: real file operations, and the probe this
-/// build has.
-#[derive(Clone, Copy, Debug)]
-pub struct HostInstaller;
+/// The installer for a real machine: real file operations and the given probe.
+#[derive(Clone, Copy)]
+pub struct HostInstaller<'a> {
+    probe: &'a dyn InstallProbe,
+}
 
-impl Installer for HostInstaller {
+impl<'a> HostInstaller<'a> {
+    /// An installer that checks its work with `probe`.
+    #[must_use]
+    pub fn new(probe: &'a dyn InstallProbe) -> Self {
+        Self { probe }
+    }
+}
+
+impl Installer for HostInstaller<'_> {
     fn run(&self, plan: &InstallPlan) -> Result<InstallReport, InstallError> {
         finish(
-            execute(plan, &HostInstallOps::system(), &PendingGateProbe),
+            execute(plan, &HostInstallOps::system(), self.probe),
             &HostRunner,
         )
     }
 }
 
 /// Adds the backend's own account of the rule to a finished install, as a
-/// notice of its own. An install that wrote nothing has nothing to ask about,
+/// notice of its own. A probe pass does not stand if the backend says it does
+/// not list the gate. An install that wrote nothing has nothing to ask about,
 /// and a refusal is passed on as it is.
 fn finish(
     result: Result<InstallReport, InstallError>,
@@ -476,9 +459,17 @@ fn finish(
 ) -> Result<InstallReport, InstallError> {
     result.map(|mut report| {
         if report.verification != Verification::NotRequired {
-            report
-                .notices
-                .push(check_effect(runner, report.backend).describe());
+            let effect = check_effect(runner, report.backend);
+            report.notices.push(effect.describe());
+            if report.verification == Verification::Verified
+                && matches!(effect, Effect::NotInEffect { .. })
+            {
+                report.verification = Verification::Unverified {
+                    reason: "the gate ran as root, but the backend does not list it for a member \
+                             of the xudo group"
+                        .to_owned(),
+                };
+            }
         }
         report
     })

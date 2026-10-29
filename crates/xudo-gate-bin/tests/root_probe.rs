@@ -9,9 +9,8 @@
 //! `0700` directory), pinned to this test's own process, and the gate finds it
 //! because this process is an ancestor of the `sudo` that runs it.
 //!
-//! It is **not** the product's probe. `xudo install` cannot mint an entry until
-//! the front-end has a broker client (M2b plan item C1), so its own probe stays
-//! `NOT VERIFIED`. What this file proves is the path that probe will use.
+//! The first tests write the entry by hand; the last ones use the real broker,
+//! the real `xudo exec` on a pseudo-terminal, and the real `xudo install` probe.
 //!
 //! The password is typed by this harness, on `sudo`'s own prompt: nothing in
 //! `xudo` reads a confirmation from a stream the requester owns (invariant 3).
@@ -34,7 +33,9 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::disallowed_methods,
+    clippy::arithmetic_side_effects
 )]
 
 use xudo_tests::root_lane::root_guard;
@@ -54,10 +55,21 @@ use xudo_backend::{InstallPlan, detect};
 use xudo_gate::SPOOL_DIR;
 use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION};
 use xudo_sys::{
-    Clock, HostClock, HostInstallOps, HostProbe, PendingGateProbe, VerifiedProc, execute, lineage,
-    load_trusted_rules, run_capture,
+    Clock, HostClock, HostInstallOps, HostProbe, InstallProbe, ProbeResult, VerifiedProc, execute,
+    lineage, load_trusted_rules, run_capture,
 };
 use xudo_wire::{Answer, BrokerRequest, BrokerResponse};
+
+/// A probe that does not run: these tests look at files, not at the gate.
+struct NoProbe;
+
+impl InstallProbe for NoProbe {
+    fn verify(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "not probed here".to_owned(),
+        }
+    }
+}
 
 const GATE: &str = env!("CARGO_BIN_EXE_xudo-gate");
 const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
@@ -69,17 +81,8 @@ const USER: &str = "xudotest";
 const PASSWORD: &str = "xudotest-fixed-password";
 const ACTION: &str = "xudo.probe.id";
 
-/// The one action in the ruleset the gate loads here: print the caller's
-/// effective uid, which is the whole of the proof that it ran as root.
-const RULES: &str = r#"
-[[action]]
-id = "xudo.probe.id"
-tier = "diag-read"
-exe = "/usr/bin/id"
-args = [
-  { name = "effective-uid", matcher = { literal = "-u" } },
-]
-"#;
+/// The rule that ships, so the broker is tested against the file operators get.
+const RULES: &str = include_str!("../../../rules/05-probe.toml");
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -150,7 +153,7 @@ fn install_everything() -> StandInJournal {
     root_dir("/etc/xudo", 0o755);
     root_dir(RULES_DIR, 0o755);
     root_file(
-        &format!("{RULES_DIR}/10-probe.toml"),
+        &format!("{RULES_DIR}/05-probe.toml"),
         RULES.as_bytes(),
         0o644,
     );
@@ -164,7 +167,7 @@ fn install_everything() -> StandInJournal {
     // The rule, exactly as `xudo install` writes it.
     let backend = detect(&HostProbe).expect("the lane installs sudo before it runs");
     let plan = InstallPlan::human_only(&backend).unwrap();
-    execute(&plan, &HostInstallOps::system(), &PendingGateProbe).unwrap();
+    execute(&plan, &HostInstallOps::system(), &NoProbe).unwrap();
     let _ = run_capture("/usr/sbin/groupadd", &["--system", "xudo"], None);
     let added = run_capture("/usr/sbin/usermod", &["-aG", "xudo", USER], None).unwrap();
     assert!(
@@ -405,4 +408,212 @@ fn a_wrong_password_never_reaches_the_gate() {
     assert_ne!(output.stdout.trim(), "0");
     assert!(entry_exists(&nonce), "the gate ran without a password");
     remove_snippet();
+}
+
+// --- the product's own path: broker, `xudo exec`, `xudo install` ------------
+
+use rustix::fs::{OFlags, fcntl_setfl};
+use rustix::io::Errno;
+use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixListener;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const SOCKET: &str = "/run/xudo/broker.sock";
+const AUDIT_LOG: &str = "/var/lib/xudo/audit.jsonl";
+
+/// The `xudo` the lane just built, next to the gate: `ci/root-test.sh` builds
+/// it first, because Cargo only sets `CARGO_BIN_EXE_` for this package's binary.
+fn xudo_binary() -> std::path::PathBuf {
+    let path = Path::new(GATE).with_file_name("xudo");
+    assert!(
+        path.exists(),
+        "{} is missing: run via ci/root-test.sh",
+        path.display()
+    );
+    path
+}
+
+/// The real broker on its real socket (`root:xudo 0660`, as the unit makes it),
+/// one `xudod::run` per connection, the way the socket unit does.
+fn start_broker() {
+    root_dir("/run/xudo", 0o755);
+    let _ = fs::remove_file(SOCKET);
+    let listener = UnixListener::bind(SOCKET).unwrap();
+    let group = fs::read_to_string("/etc/group").unwrap();
+    let gid: u32 = group
+        .lines()
+        .find_map(|l| l.strip_prefix("xudo:x:")?.split(':').next()?.parse().ok())
+        .expect("no xudo group");
+    chown(SOCKET, Some(0), Some(gid)).unwrap();
+    fs::set_permissions(SOCKET, Permissions::from_mode(0o660)).unwrap();
+    thread::spawn(move || {
+        let mut trail = xudo_sys::AuditTrail::system("xudod");
+        while let Ok((stream, _)) = listener.accept() {
+            xudod::run(stream.as_fd(), &mut trail);
+        }
+    });
+}
+
+/// A child on a real pseudo-terminal that is its controlling one.
+struct Pty {
+    master: OwnedFd,
+    child: Child,
+    seen: String,
+}
+
+impl Pty {
+    /// `argv` as `USER`, in its own session with the pty as controlling terminal.
+    fn spawn(argv: &[&str]) -> Self {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let name = ptsname(&master, Vec::new()).unwrap();
+        let slave = File::options()
+            .read(true)
+            .write(true)
+            .open(name.to_str().unwrap())
+            .unwrap();
+        // `setsid -c` takes the terminal on stdin; no `unsafe` needed here.
+        let child = Command::new("/usr/bin/setsid")
+            .args(["-w", "-c", "/usr/sbin/runuser", "-u", USER, "--"])
+            .args(argv)
+            .env_clear()
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+        fcntl_setfl(&master, OFlags::NONBLOCK).unwrap();
+        Self {
+            master,
+            child,
+            seen: String::new(),
+        }
+    }
+
+    /// Reads until `needle` shows up; the text up to it is dropped.
+    fn expect(&mut self, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut buf = [0_u8; 4096];
+        while Instant::now() < deadline {
+            if let Some(at) = self.seen.find(needle) {
+                self.seen.drain(..at + needle.len());
+                return;
+            }
+            match rustix::io::read(&self.master, &mut buf) {
+                Ok(0) | Err(Errno::IO) => break,
+                Ok(n) => self.seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let _ = self.child.kill();
+        panic!("never saw {needle:?}; saw {:?}", self.seen);
+    }
+
+    fn type_line(&self, line: &str) {
+        rustix::io::write(&self.master, format!("{line}\r").as_bytes()).unwrap();
+    }
+
+    /// Everything the child still says, and how it ended.
+    fn finish(mut self) -> (std::process::ExitStatus, String) {
+        let status = self.child.wait().unwrap();
+        let mut buf = [0_u8; 4096];
+        while let Ok(n @ 1..) = rustix::io::read(&self.master, &mut buf) {
+            self.seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        (status, self.seen)
+    }
+}
+
+fn audit_records() -> usize {
+    let log = fs::read(AUDIT_LOG).unwrap();
+    xudo_audit::verify_log(&log).unwrap().records().len()
+}
+
+fn spool_entries() -> usize {
+    fs::read_dir(SPOOL_DIR).unwrap().count()
+}
+
+fn exec_probe() -> Pty {
+    let xudo = xudo_binary();
+    Pty::spawn(&[xudo.to_str().unwrap(), "exec", "--", "/usr/bin/id", "-u"])
+}
+
+#[test]
+fn xudo_exec_asks_for_a_password_and_then_runs_as_uid_0() {
+    if !begin_root_test("xudo_exec_asks_for_a_password_and_then_runs_as_uid_0") {
+        return;
+    }
+    let _journal = install_everything();
+    start_broker();
+
+    let mut pty = exec_probe();
+    pty.expect("assword");
+    pty.type_line(PASSWORD);
+    let (status, said) = pty.finish();
+
+    assert!(status.success(), "{said:?}");
+    assert!(said.lines().any(|l| l.trim() == "0"), "{said:?}");
+    // The broker's record and the gate's, one chain; the entry was consumed.
+    assert_eq!(audit_records(), 2);
+    assert_eq!(spool_entries(), 0);
+    remove_snippet();
+}
+
+#[test]
+fn xudo_exec_with_a_wrong_password_runs_nothing() {
+    if !begin_root_test("xudo_exec_with_a_wrong_password_runs_nothing") {
+        return;
+    }
+    let _journal = install_everything();
+    start_broker();
+
+    let mut pty = exec_probe();
+    // `sudo` asks three times before it gives up.
+    for _ in 0..3 {
+        pty.expect("assword");
+        pty.type_line("not-the-password");
+    }
+    let (status, said) = pty.finish();
+
+    assert!(!status.success(), "{said:?}");
+    assert!(!said.lines().any(|l| l.trim() == "0"), "{said:?}");
+    // The broker minted and recorded; the gate never ran, so it recorded
+    // nothing and left the entry for the expiry to remove.
+    assert_eq!(audit_records(), 1);
+    assert_eq!(spool_entries(), 1);
+    remove_snippet();
+}
+
+#[test]
+fn xudo_install_is_verified_by_the_gate_printing_zero_and_uninstalls_again() {
+    if !begin_root_test("xudo_install_is_verified_by_the_gate_printing_zero_and_uninstalls_again") {
+        return;
+    }
+    let _journal = install_everything();
+    remove_snippet();
+    start_broker();
+    let xudo = xudo_binary();
+
+    let installed = Command::new(&xudo).arg("install").output().unwrap();
+    let out = String::from_utf8_lossy(&installed.stdout);
+    let err = String::from_utf8_lossy(&installed.stderr);
+    assert!(installed.status.success(), "{out}\n{err}");
+    assert!(
+        out.contains("verified     the functional probe passed"),
+        "{out}"
+    );
+    assert!(!err.contains("NOT VERIFIED"), "{err}");
+    assert!(Path::new("/etc/sudoers.d/xudo").exists());
+    // The gate the probe ran left its record beside the broker's.
+    assert_eq!(audit_records(), 2);
+
+    let removed = Command::new(&xudo)
+        .args(["install", "--uninstall"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!Path::new("/etc/sudoers.d/xudo").exists());
 }
