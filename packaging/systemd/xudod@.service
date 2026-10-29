@@ -1,6 +1,6 @@
 # One broker per connection, as root without capabilities, in the tightest
 # sandbox that still lets it do its one job: identify the peer, read root's
-# ruleset, and write one entry under /run/xudo/req.
+# ruleset, write its audit record, and write one entry under /run/xudo/req.
 #
 # crates/xudod/tests/units.rs asserts every security-relevant line here, and
 # refuses any key it does not know: systemd ignores a misspelled directive with
@@ -19,7 +19,7 @@ ExecStart=/usr/libexec/xudo/xudod
 # too; the broker writes nothing there, and nothing stray may reach the client.
 StandardInput=socket
 StandardOutput=journal
-# One audit record per connection, as a JSON line, into the journal.
+# Stray output only. The audit records go through the chained trail.
 StandardError=journal
 # Every read and write times out after five seconds; this ends whatever those
 # do not.
@@ -32,11 +32,11 @@ AmbientCapabilities=
 NoNewPrivileges=yes
 UMask=0077
 
-# The whole filesystem read-only except the spool.
+# The whole filesystem read-only except the spool and the audit log.
 ProtectSystem=strict
-# "-": if tmpfiles has not created it, the broker still starts and answers
-# spool_unusable, rather than failing before it can say why.
-ReadWritePaths=-/run/xudo/req
+# The spool and the audit log. "-": if tmpfiles has not created one, the broker
+# still starts and refuses with a reason, rather than failing before it can say.
+ReadWritePaths=-/run/xudo/req -/var/lib/xudo
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

@@ -95,6 +95,7 @@ fn the_records_of_a_decision_are_pinned() {
     let generation = xudo_policy::load_rule_files(Vec::new()).unwrap().generation;
     let mut text = String::new();
     let minted = decided(
+        None,
         &permitted(Verdict::Allow),
         &caller(),
         &identity(),
@@ -103,6 +104,7 @@ fn the_records_of_a_decision_are_pinned() {
         Some(&entry()),
     );
     let awaiting = decided(
+        None,
         &permitted(Verdict::AllowWithConfirmation),
         &caller(),
         &identity(),
@@ -111,6 +113,7 @@ fn the_records_of_a_decision_are_pinned() {
         None,
     );
     let denied = decided(
+        None,
         &Decision::deny(DenialCode::ArgvRejected, vec!["x".to_owned()], Vec::new()),
         &caller(),
         &identity(),
@@ -141,14 +144,19 @@ fn the_record_of_every_refusal_code_is_pinned() {
             text,
             "## {} with a request and a peer\n{}\n",
             code.as_str(),
-            rendered(&refused(&refusal, Some(&identity()), Some(&request())))
+            rendered(&refused(
+                None,
+                &refusal,
+                Some(&identity()),
+                Some(&request())
+            ))
         );
     }
     let nothing_known = Refusal::client(RefusalCode::RequestMalformed, "not JSON");
     let _ = writeln!(
         text,
         "## before anything was known\n{}",
-        rendered(&refused(&nothing_known, None, None))
+        rendered(&refused(None, &nothing_known, None, None))
     );
     insta::assert_snapshot!("refusal_records", text);
 }

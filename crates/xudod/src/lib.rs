@@ -43,12 +43,13 @@ pub mod record;
 pub mod refusal;
 pub mod serve;
 
-use std::io::Write;
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::time::Duration;
 
-use xudo_sys::{HostClock, HostEntropy, HostPeer, HostSyscalls, SpoolDir, UnixConnection};
+use xudo_sys::{
+    AuditSink, HostClock, HostEntropy, HostPeer, HostSyscalls, SpoolDir, UnixConnection,
+};
 use xudo_wire::RefusalCode;
 
 pub use identify::{Fault, IdentifyError, PeerIdentity, identify};
@@ -67,48 +68,30 @@ pub const INSTALLED_PATH: &str = "/usr/libexec/xudo/xudod";
 /// does not.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Whether the audit trail is attested: `Ok` when `stderr` is a connected
-/// `AF_UNIX` stream socket, which is what systemd makes of a connection to
-/// the journal, and the reason when it is anything else.
-///
-/// What this does and does not show: a socket, not that the journal is on the
-/// other end of it. But when systemd cannot connect a service to the journal it
-/// logs "Failed to connect stderr to the journal socket, ignoring" and
-/// points standard error at `/dev/null`, and a closed descriptor is reopened on
-/// `/dev/null` by the Rust runtime; neither is a socket.
-///
-/// # Errors
-///
-/// The first property that does not hold, in words for the audit record.
-pub fn trail_of(stderr: BorrowedFd<'_>) -> Result<(), String> {
-    xudo_sys::connected_unix_stream(stderr).map_err(|error| error.to_string())
-}
-
 /// Serves the connection on `socket` — descriptor 0, from systemd — against
 /// this host, and returns the exit status.
 ///
 /// A descriptor that is not a connected `AF_UNIX` stream socket is refused
-/// with [`UNUSABLE`] and an audit record: there is nobody to answer.
-///
-/// `trail` is [`trail_of`] standard error: nothing is minted unless it is `Ok`.
-pub fn run(socket: BorrowedFd<'_>, trail: Result<(), String>, log: &mut dyn Write) -> u8 {
+/// with [`UNUSABLE`]: there is nobody to answer. Nothing is minted unless its
+/// record lands on `audit` first.
+pub fn run(socket: BorrowedFd<'_>, audit: &mut dyn AuditSink) -> u8 {
     match UnixConnection::adopt(socket, IO_TIMEOUT) {
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let policy = HostPolicy::system();
-            let platform = Platform {
+            let mut platform = Platform {
                 syscalls: &HostSyscalls,
                 peers: &HostPeer,
                 clock: &HostClock,
                 entropy: &HostEntropy,
                 policy: &policy,
-                trail,
+                audit,
             };
-            serve(&conn, &platform, spool.as_ref(), log).exit_status()
+            serve(&conn, &mut platform, spool.as_ref()).exit_status()
         }
         Err(error) => {
             let refusal = Refusal::broker(RefusalCode::BrokerUnusable, error.to_string());
-            let _ = record::emit(&record::refused(&refusal, None, None), log);
+            let _ = audit.append(&|previous| record::refused(previous, &refusal, None, None));
             UNUSABLE
         }
     }
@@ -118,11 +101,12 @@ pub fn run(socket: BorrowedFd<'_>, trail: Result<(), String>, log: &mut dyn Writ
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::net::Shutdown;
     use std::os::fd::AsFd as _;
     use std::os::unix::net::UnixStream;
 
+    use xudo_sys::FakeAuditSink;
     use xudo_wire::{Answer, BrokerRequest, BrokerResponse};
 
     use super::*;
@@ -145,11 +129,11 @@ mod tests {
     #[test]
     fn descriptor_zero_that_is_not_a_socket_is_refused_with_a_record() {
         let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut log = Vec::new();
-        assert_eq!(run(file.as_fd(), Ok(()), &mut log), UNUSABLE);
-        let text = String::from_utf8(log).unwrap();
-        assert!(text.contains("broker_unusable"), "{text}");
-        assert!(text.contains("not a socket"), "{text}");
+        let mut audit = FakeAuditSink::new();
+        assert_eq!(run(file.as_fd(), &mut audit), UNUSABLE);
+        let record = &audit.records()[0];
+        assert_eq!(record.denial.as_deref(), Some("broker_unusable"));
+        assert!(record.evidence.join(" ").contains("not a socket"));
     }
 
     #[test]
@@ -163,8 +147,8 @@ mod tests {
         client.write_all(request.to_json().as_bytes()).unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
-        let mut log = Vec::new();
-        assert_eq!(run(broker.as_fd(), Ok(()), &mut log), UNUSABLE);
+        let mut audit = FakeAuditSink::new();
+        assert_eq!(run(broker.as_fd(), &mut audit), UNUSABLE);
         drop(broker);
 
         let mut answer = Vec::new();
@@ -185,17 +169,10 @@ mod tests {
             ),
             None
         );
-        let text = String::from_utf8(log).unwrap();
-        assert!(text.contains(EXPECTED.as_str()), "{text}");
-    }
-
-    #[test]
-    fn standard_error_counts_as_a_trail_only_when_it_is_a_connected_stream() {
-        let (journal, _other) = UnixStream::pair().unwrap();
-        assert_eq!(trail_of(journal.as_fd()), Ok(()));
-        let null = std::fs::File::open("/dev/null").unwrap();
-        let why = trail_of(null.as_fd()).unwrap_err();
-        assert!(why.contains("not a socket"), "{why}");
+        assert_eq!(
+            audit.records()[0].denial.as_deref(),
+            Some(EXPECTED.as_str())
+        );
     }
 
     #[test]

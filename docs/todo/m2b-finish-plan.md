@@ -135,10 +135,12 @@ exit. Packaging stays in phase 3.
   a direct hostile invocation and a denial leave theirs; a failing sink stops
   mint and execution; `xudo audit --log` passes on the produced trail and fails
   after truncation. Decide and record how a post-execution outcome is obtained
-  with an exec-in-place gate. The broker's half was examined at B1 and left
-  whole, not half-wired: `CONCERNS.md`, the M2b step 2 entry, open item 6,
-  lists what it touches and the order to do it in (the unit's sandbox first,
-  measured under systemd).
+  with an exec-in-place gate. *Done 2026-10-29:* the broker writes the chained
+  trail and mints only on an `Authorized<_>`; the unit and `tmpfiles` reach
+  `/var/lib/xudo`; the root lane proves one chain with both records that
+  verifies and fails when cut. The outcome is not obtained: the gate execs in
+  place, so the record is the authorization (`CONCERNS.md`, 2026-10-29). The
+  unit under a real systemd sandbox is not yet measured.
 - **D2. Fuzz target** for the `xudo-wire` request parser, a trust-boundary
   parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`. *Done:*
   `fuzz/fuzz_targets/wire_request.rs` and `wire_response.rs`, both run by `just fuzz`.

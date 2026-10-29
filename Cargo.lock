@@ -846,10 +846,13 @@ version = "0.0.1"
 dependencies = [
  "assert_cmd",
  "predicates",
+ "xudo-audit",
  "xudo-backend",
  "xudo-gate",
  "xudo-sys",
  "xudo-tests",
+ "xudo-wire",
+ "xudod",
 ]
 
 [[package]]
@@ -933,7 +936,7 @@ dependencies = [
 name = "xudod-bin"
 version = "0.0.1"
 dependencies = [
- "serde_json",
+ "xudo-sys",
  "xudo-wire",
  "xudod",
 ]
