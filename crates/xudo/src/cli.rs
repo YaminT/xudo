@@ -24,6 +24,7 @@ use xudo_sys::{
 
 use crate::agentdoc::{self, DocFormat};
 use crate::doctor;
+use crate::exec;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
 
@@ -97,6 +98,13 @@ pub enum Command {
 
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+
+    /// Run a command as root, if the broker permits it. Asks for your password.
+    Exec {
+        /// The command and its arguments, after `--`. The program is an absolute path.
+        #[arg(trailing_var_arg = true, required = true, value_name = "ARGV")]
         argv: Vec<String>,
     },
 
@@ -323,6 +331,18 @@ pub fn run_with_installer(
         Command::WhyNot { action, argv } => {
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
+        // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
+        Command::Exec { argv } => exec::plan(
+            cli,
+            argv,
+            probe,
+            Path::new(xudo_wire::BROKER_SOCKET),
+            exec::TIMEOUT,
+            out,
+            err,
+        )
+        .err()
+        .unwrap_or(ExitCode::Unusable),
         Command::Check => with_rules!(|l: &LoadedRules| check(l, out, err)),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
@@ -853,7 +873,7 @@ fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
 }
 
 /// Renders a decision in the requested format and maps it to an exit status.
-fn emit(cli: &Cli, decision: &Decision, out: &mut dyn Write) -> ExitCode {
+pub(crate) fn emit(cli: &Cli, decision: &Decision, out: &mut dyn Write) -> ExitCode {
     match cli.output {
         Format::Human => {
             let _ = write!(out, "{}", render::human(decision));

@@ -115,7 +115,10 @@ exit. Packaging stays in phase 3.
 
 ### C. New builds *(after B; C1 before C2)*
 
-- **C1. Step 3, `xudo exec`.** Front-end round-trip over `xudo-wire`; exec of
+- **C1. Step 3, `xudo exec`.** *Built 2026-10-29, except the pty test:
+  `xudo exec -- <abs program> [args]` asks the broker, checks the gate path is
+  `GATE_AUTH`, and `xudo-bin` execs `sudo`/`doas` on it in place; a human-only
+  denial prints the `ido queue` line. Left: the `rexpect` test below.* Front-end round-trip over `xudo-wire`; exec of
   the backend's `PASSWD` hop; backend exit status passed through byte for byte;
   a denial whose remediation is "a human must run this" prints the exact
   `ido queue` line; `rexpect` test of the password prompt on a real pty. This is

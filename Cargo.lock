@@ -773,6 +773,7 @@ dependencies = [
  "insta",
  "serde",
  "serde_json",
+ "tempfile",
  "term-sanitize",
  "thiserror",
  "xudo-audit",
@@ -780,6 +781,7 @@ dependencies = [
  "xudo-config",
  "xudo-policy",
  "xudo-sys",
+ "xudo-wire",
 ]
 
 [[package]]
