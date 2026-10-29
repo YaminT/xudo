@@ -116,7 +116,7 @@ The plan began with five crates and the deviations above account for the rest. T
 | `xudo` | The unprivileged front-end library: parses a request, loads the root-owned ruleset, asks `xudo-policy` for a decision, and renders it. Decides nothing, holds no secret |
 | `xudo-bin` | The `xudo` executable: argument parsing and an exit code, nothing else |
 | `xudo-wire` | The wire protocol between `xudo` and `xudod`: the messages and the parser for them |
-| `xudod` | The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `xudo explain` uses, and mints bounded one-use requests. Built; its audit record goes to standard error until plan item D1 routes it through the step-6 trail |
+| `xudod` | The root broker: identifies its peer from kernel-attested facts, classifies it, decides with the engine `xudo explain` uses, and mints bounded one-use requests. Built; its audit records go through the step-6 trail, and nothing is minted without one |
 | `xudod-bin` | The `xudod` executable, socket-activated on `/run/xudo/broker.sock` |
 | `xudo-gate` | The gate's library: a second, independent policy engine that re-decides from root-owned state and trusts nothing it was handed; the decision modules are pure, and `run` is the whole sequence written against `xudo-sys` traits |
 | `xudo-gate-bin` | The gate executable, installed as `xudo-gate` with `xudo-gate-auth` as a hardlink |

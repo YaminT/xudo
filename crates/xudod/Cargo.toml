@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# The in-memory audit sink, for tests only.
+xudo-sys = { path = "../xudo-sys", version = "0.0.1", features = ["fake"] }
 # Errno values, to script the answers a real kernel gives; and in the Linux
 # tests, `waitid(WNOWAIT)` to hold a peer as a zombie, and this process's ids.
 rustix = { version = "1.1", default-features = false, features = [

@@ -31,8 +31,8 @@ use rustix::io::Errno;
 use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 use xudo_policy::{Decision, RuleFile, Verdict, load_rule_files};
 use xudo_sys::{
-    Attestation, FakeSpool, HostClock, HostEntropy, HostPeer, HostSyscalls, KernelSupport,
-    SysError, UnixConnection, parse_stat,
+    Attestation, FakeAuditSink, FakeSpool, HostClock, HostEntropy, HostPeer, HostSyscalls,
+    KernelSupport, SysError, UnixConnection, parse_stat,
 };
 use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Minted};
 use xudod::identify::EuidSource;
@@ -223,18 +223,18 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         &request.to_json(),
     );
     let conn = UnixConnection::adopt(stream.as_fd(), xudod::IO_TIMEOUT).unwrap();
-    let platform = Platform {
+    let mut audit = FakeAuditSink::new();
+    let mut platform = Platform {
         syscalls: &HostSyscalls,
         peers: &HostPeer,
         clock: &HostClock,
         entropy: &HostEntropy,
         policy: &OneRule,
-        trail: Ok(()),
+        audit: &mut audit,
     };
     let spool = FakeSpool::new();
-    let mut log = Vec::new();
     let before = xudo_sys::Clock::monotonic_secs(&HostClock);
-    let served = serve(&conn, &platform, Ok(&spool), &mut log);
+    let served = serve(&conn, &mut platform, Ok(&spool));
     assert_eq!(served, Served::Minted);
     drop(conn);
     drop(stream);
@@ -256,17 +256,17 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     .unwrap();
     assert_eq!(entry.caller_pid, child.id());
     assert_eq!(entry.deadline.0, minted.deadline);
-    let records = String::from_utf8(log).unwrap();
+    let evidence = audit.records()[0].evidence.join(" ");
     assert!(
-        records.contains(&format!("peer_pid={}", child.id())),
-        "{records}"
+        evidence.contains(&format!("peer_pid={}", child.id())),
+        "{evidence}"
     );
     assert!(
-        records.contains(&format!(
+        evidence.contains(&format!(
             "rung={}",
             running_kernel().attestation.mechanism()
         )),
-        "{records}"
+        "{evidence}"
     );
 }
 

@@ -40,11 +40,12 @@
 
 use std::fmt::Write as _;
 
+use xudo_audit::Approval;
 use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
 use xudo_policy::Decision;
 use xudo_sys::{
-    Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX, parse_stat,
-    parse_status_uids,
+    Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
+    parse_stat, parse_status_uids,
 };
 use xudo_wire::BrokerRequest;
 
@@ -140,17 +141,47 @@ pub enum MintError {
     },
 }
 
+/// The entry as an approval: the command and action its audit record must
+/// carry before the broker may mint it.
+#[derive(Clone, Debug)]
+pub struct Grant(pub PendingRequest);
+
+impl Grant {
+    /// The entry's command, program first.
+    pub fn command_of(entry: &PendingRequest) -> Vec<String> {
+        let mut command = vec![entry.program.clone()];
+        command.extend(entry.argv.iter().cloned());
+        command
+    }
+}
+
+impl Approval for Grant {
+    fn command(&self) -> Vec<String> {
+        Self::command_of(&self.0)
+    }
+
+    fn action(&self) -> &str {
+        &self.0.action
+    }
+}
+
 /// An entry about to be published, and whose share of the spool it takes.
 #[derive(Clone, Copy, Debug)]
 pub struct Minting<'a> {
-    /// The entry.
-    pub entry: &'a PendingRequest,
+    /// The entry, whose record is on the trail.
+    pub authorized: &'a Authorized<Grant>,
     /// The entry as it is written.
     pub json: &'a str,
     /// The effective uid its caller connected with.
     pub uid: u32,
     /// Now, in whole seconds of `CLOCK_MONOTONIC`.
     pub now: u64,
+}
+
+impl Minting<'_> {
+    fn entry(&self) -> &PendingRequest {
+        &self.authorized.approval().0
+    }
 }
 
 /// Draws a fresh nonce: 32 random bytes, as 64 lowercase hex characters.
@@ -261,10 +292,10 @@ fn prune_and_publish<S: Spool + ?Sized>(
             entries: this_uid,
         });
     }
-    match spool.publish(&minting.entry.nonce, minting.json.as_bytes()) {
+    match spool.publish(&minting.entry().nonce, minting.json.as_bytes()) {
         Ok(()) => Ok(()),
         Err(SpoolError::Exists { .. }) => Err(MintError::Collision {
-            nonce: minting.entry.nonce.clone(),
+            nonce: minting.entry().nonce.clone(),
         }),
         Err(error) => Err(MintError::Spool(error)),
     }
@@ -315,8 +346,8 @@ fn classify<S: Spool + ?Sized>(
     };
     let expired = existing.deadline <= MonotonicSecs(minting.now);
     let misnamed = existing.nonce != text;
-    let superseded = existing.caller_pid == minting.entry.caller_pid
-        && existing.caller_starttime == minting.entry.caller_starttime;
+    let superseded = existing.caller_pid == minting.entry().caller_pid
+        && existing.caller_starttime == minting.entry().caller_starttime;
     if expired || misnamed || superseded {
         return Existing::Stale;
     }
@@ -356,8 +387,12 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
+    use xudo_audit::record::{Decision as AuditDecision, Record};
     use xudo_policy::{ActionId, DenialCode, Verdict};
-    use xudo_sys::{Attestation, FakeEntropy, FakePeer, FakeSpool, PeerCall, SpoolCall};
+    use xudo_sys::{
+        Attestation, FakeAuditSink, FakeEntropy, FakePeer, FakeSpool, PeerCall, SpoolCall,
+        authorize,
+    };
 
     use super::*;
     use crate::identify::EuidSource;
@@ -435,17 +470,32 @@ mod tests {
         })
     }
 
+    /// The entry with its record on a (fake) trail. Its operands are dropped
+    /// so a test of the spool's byte limit is not stopped by a log line's.
+    fn authorized(entry: &PendingRequest) -> Authorized<Grant> {
+        let grant = Grant(PendingRequest {
+            argv: Vec::new(),
+            ..entry.clone()
+        });
+        authorize(&mut FakeAuditSink::new(), grant, &|previous, g| {
+            Record::after(previous, AuditDecision::Allowed, g.command(), "unattested")
+                .with_rule(g.action(), "t.toml:1")
+        })
+        .unwrap()
+    }
+
     /// Publishes `minting` for a caller running as uid 1000, at `NOW`.
     fn publish_as_1000(
         spool: &FakeSpool,
         host: &FakePeer,
         minting: &PendingRequest,
     ) -> Result<(), MintError> {
+        let authorized = authorized(minting);
         publish(
             spool,
             host,
             &Minting {
-                entry: minting,
+                authorized: &authorized,
                 json: &minting.to_json(),
                 uid: 1000,
                 now: NOW,

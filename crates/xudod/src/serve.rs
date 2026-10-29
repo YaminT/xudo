@@ -17,16 +17,18 @@
 //! request is known before anything is said about the spool or the policy.
 //! Nothing after a failure runs.
 
-use std::io::Write;
-
+use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
-use xudo_sys::{Clock, Connection, Entropy, PeerCalls, Spool, SpoolError, Syscalls};
+use xudo_sys::{
+    AuditError, AuditSink, Clock, Connection, Entropy, PeerCalls, Spool, SpoolError, Syscalls,
+    authorize,
+};
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{Minting, REQUEST_TTL_SECS, draw_nonce, entry_for, publish};
+use crate::mint::{Grant, Minting, REQUEST_TTL_SECS, draw_nonce, entry_for, publish};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
-use crate::record::{decided, emit, refused};
+use crate::record::{decided, refused};
 use crate::refusal::Refusal;
 
 /// The exit status of a broker that could not do its job: `xudo`'s own
@@ -49,14 +51,9 @@ pub struct Platform<'a> {
     pub entropy: &'a dyn Entropy,
     /// Root's ruleset and settings.
     pub policy: &'a dyn PolicySource,
-    /// Whether the audit trail is attested: `Ok` when standard error is a
-    /// connection to the journal, or the reason it is not.
-    ///
-    /// systemd points standard error at `/dev/null` when it cannot reach the
-    /// journal, and the runtime does the same for a closed descriptor, so a
-    /// write to either succeeds and goes nowhere. Nothing is minted unless
-    /// this is `Ok`; a refusal needs no trail and is answered either way.
-    pub trail: Result<(), String>,
+    /// The audit trail. A permitted request is minted only once its record is
+    /// on it; refusals are recorded best-effort.
+    pub audit: &'a mut dyn AuditSink,
 }
 
 /// How a connection ended.
@@ -104,24 +101,23 @@ struct Evaluated {
 /// is served and refused only once the request is known.
 pub fn serve<S: Spool>(
     conn: &dyn Connection,
-    platform: &Platform<'_>,
+    platform: &mut Platform<'_>,
     spool: Result<&S, &SpoolError>,
-    log: &mut dyn Write,
 ) -> Served {
     let identity = match identify(conn.socket(), platform.syscalls, platform.peers) {
         Ok(identity) => identity,
-        Err(error) => return refuse(conn, log, &Refusal::from(&error), None, None),
+        Err(error) => return refuse(conn, platform.audit, &Refusal::from(&error), None, None),
     };
     let request = match receive(conn) {
         Ok(request) => request,
-        Err(refusal) => return refuse(conn, log, &refusal, Some(&identity), None),
+        Err(refusal) => return refuse(conn, platform.audit, &refusal, Some(&identity), None),
     };
     let spool = match spool {
         Ok(spool) => spool,
         Err(error) => {
             return refuse(
                 conn,
-                log,
+                platform.audit,
                 &Refusal::from(error),
                 Some(&identity),
                 Some(&request),
@@ -133,7 +129,7 @@ pub fn serve<S: Spool>(
         Err(error) => {
             return refuse(
                 conn,
-                log,
+                platform.audit,
                 &Refusal::from(&error),
                 Some(&identity),
                 Some(&request),
@@ -146,17 +142,17 @@ pub fn serve<S: Spool>(
     if !decision.verdict.is_permitted() {
         // Nothing is enabled by this record, so a sink that cannot take it
         // does not change the answer.
-        let _ = emit(
-            &decided(
+        let _ = platform.audit.append(&|previous| {
+            decided(
+                previous,
                 &decision,
                 &caller,
                 &identity,
                 &request,
                 &policy.rules.generation,
                 None,
-            ),
-            log,
-        );
+            )
+        });
         return answer(
             conn,
             &BrokerResponse::decided(decision, None),
@@ -167,7 +163,6 @@ pub fn serve<S: Spool>(
         conn,
         platform,
         spool,
-        log,
         Evaluated {
             decision,
             caller,
@@ -189,9 +184,8 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
 /// Mints the entry for a permitted decision and answers with it.
 fn mint<S: Spool>(
     conn: &dyn Connection,
-    platform: &Platform<'_>,
+    platform: &mut Platform<'_>,
     spool: &S,
-    log: &mut dyn Write,
     evaluated: Evaluated,
 ) -> Served {
     let Evaluated {
@@ -203,16 +197,6 @@ fn mint<S: Spool>(
     } = evaluated;
     let known = (Some(&identity), Some(&request));
 
-    if let Err(why) = &platform.trail {
-        let refusal = Refusal::broker(
-            RefusalCode::BrokerUnusable,
-            format!(
-                "standard error is not a connection to the journal ({why}), so nothing was minted"
-            ),
-        );
-        return refuse(conn, log, &refusal, known.0, known.1);
-    }
-
     let nonce = match draw_nonce(platform.entropy) {
         Ok(nonce) => nonce,
         Err(error) => {
@@ -220,7 +204,7 @@ fn mint<S: Spool>(
                 RefusalCode::BrokerUnusable,
                 format!("cannot draw a nonce: {error}"),
             );
-            return refuse(conn, log, &refusal, known.0, known.1);
+            return refuse(conn, platform.audit, &refusal, known.0, known.1);
         }
     };
     let now = platform.clock.monotonic_secs();
@@ -234,39 +218,63 @@ fn mint<S: Spool>(
         nonce,
     ) {
         Ok(entry) => entry,
-        Err(error) => return refuse(conn, log, &Refusal::from(&error), known.0, known.1),
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::from(&error),
+                known.0,
+                known.1,
+            );
+        }
     };
 
-    // Recorded before the entry exists: nothing is minted that the trail does
-    // not show.
-    let record = decided(
-        &decision,
-        &caller,
-        &identity,
-        &request,
-        &policy.rules.generation,
-        Some(&entry),
-    );
-    if emit(&record, log).is_err() {
-        let refusal = Refusal::broker(
-            RefusalCode::BrokerUnusable,
-            "the audit record could not be written, so nothing was minted",
-        );
-        return refuse(conn, log, &refusal, known.0, known.1);
-    }
-    let json = entry.to_json();
+    // No record, no entry: `publish` takes the authorization.
+    let build = |previous: Option<&Record>, grant: &Grant| {
+        decided(
+            previous,
+            &decision,
+            &caller,
+            &identity,
+            &request,
+            &policy.rules.generation,
+            Some(&grant.0),
+        )
+    };
+    let authorized = match authorize(&mut *platform.audit, Grant(entry), &build) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            let why =
+                format!("the audit record could not be written, so nothing was minted: {error}");
+            // A request too big to record is the client's doing, not the broker's.
+            let refusal = if matches!(error, AuditError::TooLarge { .. }) {
+                Refusal::client(RefusalCode::RequestTooLarge, why)
+            } else {
+                Refusal::broker(RefusalCode::BrokerUnusable, why)
+            };
+            return refuse(conn, platform.audit, &refusal, known.0, known.1);
+        }
+    };
+    let nonce = authorized.approval().0.nonce.clone();
+    let json = authorized.approval().0.to_json();
     let minting = Minting {
-        entry: &entry,
+        authorized: &authorized,
         json: &json,
         uid: identity.uid,
         now,
     };
     if let Err(error) = publish(spool, platform.peers, &minting) {
-        return refuse(conn, log, &Refusal::from(&error), known.0, known.1);
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::from(&error),
+            known.0,
+            known.1,
+        );
     }
 
     let minted = Minted {
-        nonce: entry.nonce,
+        nonce,
         deadline,
         ttl_secs: REQUEST_TTL_SECS,
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
@@ -281,12 +289,12 @@ fn mint<S: Spool>(
 /// Records a refusal and sends it.
 fn refuse(
     conn: &dyn Connection,
-    log: &mut dyn Write,
+    audit: &mut dyn AuditSink,
     refusal: &Refusal,
     identity: Option<&PeerIdentity>,
     request: Option<&BrokerRequest>,
 ) -> Served {
-    let _ = emit(&refused(refusal, identity, request), log);
+    let _ = audit.append(&|previous| refused(previous, refusal, identity, request));
     answer(
         conn,
         &BrokerResponse::refused(refusal.code),
@@ -323,8 +331,8 @@ mod tests {
     use xudo_gate::request::{MonotonicSecs, PendingRequest};
     use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
     use xudo_sys::{
-        Creds, FakeConnection, FakeEntropy, FakePeer, FakeSpool, FakeSyscalls, FixedClock,
-        PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, SpoolCall, SysError,
+        Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakePeer, FakeSpool, FakeSyscalls,
+        FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, SpoolCall, SysError,
     };
     use xudo_wire::{Answer, WIRE_SCHEMA_VERSION};
 
@@ -392,19 +400,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
-    /// A log that refuses every write: a journal that has gone away.
-    struct Refusing;
-
-    impl Write for Refusing {
-        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("the journal is gone"))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// Everything the broker asks of its host, faked: by default a peer that
     /// identifies honestly on the top rung, a fixed clock, one scripted
     /// nonce, and the test ruleset.
@@ -414,7 +409,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         clock: FixedClock,
         entropy: FakeEntropy,
         policy: FixedPolicy,
-        trail: Result<(), String>,
+        audit: FakeAuditSink,
     }
 
     impl Host {
@@ -453,18 +448,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     answer: Ok(policy()),
                     loads: Cell::new(0),
                 },
-                trail: Ok(()),
+                audit: FakeAuditSink::new(),
             }
         }
 
-        fn platform(&self) -> Platform<'_> {
+        fn platform(&mut self) -> Platform<'_> {
             Platform {
                 syscalls: &self.syscalls,
                 peers: &self.peers,
                 clock: &self.clock,
                 entropy: &self.entropy,
                 policy: &self.policy,
-                trail: self.trail.clone(),
+                audit: &mut self.audit,
             }
         }
     }
@@ -509,19 +504,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     fn serve_with(
-        host: &Host,
+        host: &mut Host,
         conn: &FakeConnection,
         spool: Result<&FakeSpool, &SpoolError>,
     ) -> Outcome {
-        let mut log = Vec::new();
-        let served = serve(conn, &host.platform(), spool, &mut log);
+        let served = serve(conn, &mut host.platform(), spool);
         let response = BrokerResponse::parse(&conn.written()).unwrap();
         assert_eq!(response.schema_version, WIRE_SCHEMA_VERSION);
-        let records = String::from_utf8(log)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let records = host.audit.records().to_vec();
         Outcome {
             served,
             answer: response.answer,
@@ -550,9 +540,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn a_permitted_request_is_minted_for_the_peer_the_kernel_named() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Minted);
         assert_eq!(outcome.served.exit_status(), 0);
         assert_eq!(refusal_of(&outcome.answer), None);
@@ -602,9 +592,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         // Invariant 1 at the broker: the request claimed to be a yolo agent;
         // the broker classified it from kernel facts, as unattested, and
         // routed it to the password path regardless.
-        let host = Host::honest();
+        let mut host = Host::honest();
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         let entry = entry_in(&spool);
         assert_eq!(entry.claimed_classification, "enrolled-agent-yolo");
         let record = &outcome.records[0];
@@ -620,10 +610,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn a_rule_that_demands_confirmation_still_mints_and_the_password_confirms() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let spool = FakeSpool::new();
         let outcome = serve_with(
-            &host,
+            &mut host,
             &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
             Ok(&spool),
         );
@@ -656,9 +646,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             ),
             ("/bin/sh", &["-c"][..], DenialCode::DenyListed),
         ] {
-            let host = Host::honest();
+            let mut host = Host::honest();
             let spool = FakeSpool::new();
-            let outcome = serve_with(&host, &asking(program, argv), Ok(&spool));
+            let outcome = serve_with(&mut host, &asking(program, argv), Ok(&spool));
             assert_eq!(outcome.served, Served::Decided, "{program}");
             assert_eq!(outcome.served.exit_status(), 0);
             let (decision, minted) = decision_of(&outcome.answer).unwrap();
@@ -676,7 +666,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.peers = FakePeer::new();
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(outcome.served.exit_status(), UNUSABLE);
         assert_eq!(
@@ -716,7 +706,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             ))
             .with_exit(Ok(false));
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(
             refusal_of(&outcome.answer),
@@ -751,7 +741,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             }))
             .with_stat(Ok(stat_line(PID, START)))
             .with_exit(Ok(true));
-        let outcome = serve_with(&host, &restart(), Ok(&FakeSpool::new()));
+        let outcome = serve_with(&mut host, &restart(), Ok(&FakeSpool::new()));
         assert_eq!(outcome.served, Served::Refused(Fault::Client));
         assert_eq!(outcome.served.exit_status(), 0);
         assert_eq!(
@@ -778,8 +768,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 RefusalCode::RequestUnreadable,
             ),
         ] {
-            let host = Host::honest();
-            let outcome = serve_with(&host, &connection(Err(failure)), Ok(&FakeSpool::new()));
+            let mut host = Host::honest();
+            let outcome = serve_with(&mut host, &connection(Err(failure)), Ok(&FakeSpool::new()));
             assert_eq!(outcome.served, Served::Refused(Fault::Client));
             assert_eq!(refusal_of(&outcome.answer), Some(code));
             assert_eq!(host.policy.loads.get(), 0);
@@ -794,9 +784,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn a_request_one_byte_over_the_limit_is_refused_without_being_parsed() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let over = vec![b' '; MAX_REQUEST_BYTES + 1];
-        let outcome = serve_with(&host, &connection(Ok(over)), Ok(&FakeSpool::new()));
+        let outcome = serve_with(&mut host, &connection(Ok(over)), Ok(&FakeSpool::new()));
         assert_eq!(
             refusal_of(&outcome.answer),
             Some(RefusalCode::RequestTooLarge)
@@ -835,9 +825,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             ),
             (nul.to_json().into_bytes(), RefusalCode::InteriorNul),
         ] {
-            let host = Host::honest();
+            let mut host = Host::honest();
             let spool = FakeSpool::new();
-            let outcome = serve_with(&host, &connection(Ok(bytes)), Ok(&spool));
+            let outcome = serve_with(&mut host, &connection(Ok(bytes)), Ok(&spool));
             assert_eq!(outcome.served, Served::Refused(Fault::Client), "{code:?}");
             assert_eq!(refusal_of(&outcome.answer), Some(code));
             assert_eq!(host.policy.loads.get(), 0, "{code:?}");
@@ -847,12 +837,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn a_spool_that_failed_its_checks_refuses_every_request() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let untrusted = SpoolError::NotOwned {
             at: "/run/xudo/req".to_owned(),
             uid: 1000,
         };
-        let outcome = serve_with(&host, &restart(), Err(&untrusted));
+        let outcome = serve_with(&mut host, &restart(), Err(&untrusted));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(outcome.served.exit_status(), UNUSABLE);
         assert_eq!(
@@ -876,7 +866,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             file: "/etc/xudo/config.toml".to_owned(),
         });
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(
             refusal_of(&outcome.answer),
@@ -890,7 +880,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.entropy = FakeEntropy::new().with(Err(SysError::unsupported("getrandom")));
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(
             refusal_of(&outcome.answer),
@@ -936,31 +926,27 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn nothing_is_minted_when_standard_error_does_not_reach_the_journal() {
-        // systemd points a service at /dev/null when it cannot reach the
-        // journal; every audit write then succeeds and records nothing.
+    fn nothing_is_minted_when_the_audit_trail_refuses() {
         let mut host = Host::honest();
-        host.trail = Err("not a socket".to_owned());
+        host.audit = FakeAuditSink::failing("the journal is gone");
         let spool = FakeSpool::new();
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(outcome.served.exit_status(), UNUSABLE);
         assert_eq!(
             refusal_of(&outcome.answer),
             Some(RefusalCode::BrokerUnusable)
         );
-        assert_eq!(spool.calls(), [], "no entry, and no lock taken for one");
+        assert_eq!(spool.calls(), [], "no entry without its record");
         assert!(spool.files().is_empty());
-        let detail = outcome.records.last().unwrap().evidence.join(" ");
-        assert!(detail.contains("not a socket"), "{detail}");
     }
 
     #[test]
     fn a_denial_is_answered_even_when_there_is_no_trail_to_write() {
         let mut host = Host::honest();
-        host.trail = Err("not a socket".to_owned());
+        host.audit = FakeAuditSink::failing("the journal is gone");
         let outcome = serve_with(
-            &host,
+            &mut host,
             &connection(Ok(BrokerRequest::new("/bin/sh", Vec::new(), "unattested")
                 .to_json()
                 .into_bytes())),
@@ -975,7 +961,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         running(&mut host, &theirs, UID + 1);
         let spool = FakeSpool::new().with_file(NONCE, theirs.to_json());
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));
         assert_eq!(
             refusal_of(&outcome.answer),
@@ -1007,7 +993,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 UID + 1 + u32::try_from(index.div_euclid(8)).unwrap(),
             );
         }
-        let outcome = serve_with(&host, &restart(), Ok(&spool));
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(refusal_of(&outcome.answer), Some(RefusalCode::SpoolFull));
         // Other clients filled it; the broker refusing to grow it is the
         // broker working, so systemd is not told it failed.
@@ -1026,7 +1012,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             gone.caller_pid = 10_000 + u32::try_from(index).unwrap();
             spool = spool.with_file(gone.nonce.clone(), gone.to_json());
         }
-        let outcome = serve_with(&Host::honest(), &restart(), Ok(&spool));
+        let outcome = serve_with(&mut Host::honest(), &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Minted);
         assert_eq!(spool.files().len(), 1);
     }
@@ -1064,7 +1050,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     gid: GID,
                 }))
                 .with_open(Err(gone("pidfd_open", rustix::io::Errno::SRCH)));
-            let outcome = serve_with(&host, &restart(), Ok(&FakeSpool::new()));
+            let outcome = serve_with(&mut host, &restart(), Ok(&FakeSpool::new()));
             assert_eq!(
                 refusal_of(&outcome.answer),
                 Some(RefusalCode::PeerUnidentified)
@@ -1081,7 +1067,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn a_spool_that_fails_while_publishing_is_refused() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let broken = SpoolError::Io {
             operation: "publish".to_owned(),
             at: "/run/xudo/req".to_owned(),
@@ -1089,7 +1075,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             reason: "no space left on device".to_owned(),
         };
         let outcome = serve_with(
-            &host,
+            &mut host,
             &restart(),
             Ok(&FakeSpool::new().failing_publish(broken)),
         );
@@ -1100,44 +1086,29 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn nothing_is_minted_whose_audit_record_cannot_be_written() {
-        let host = Host::honest();
-        let conn = restart();
-        let spool = FakeSpool::new();
-        let served = serve(&conn, &host.platform(), Ok(&spool), &mut Refusing);
-        assert_eq!(served, Served::Refused(Fault::Broker));
-        assert_eq!(spool.calls(), [], "no entry without its record");
-        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
-        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
-        assert!(Refusing.flush().is_ok());
-    }
-
-    #[test]
     fn a_client_that_leaves_before_its_answer_cannot_make_the_broker_fail() {
         // Minted or refused for its own fault, a client that went away is not
         // the broker failing: if it were, any group member could fill
         // systemd's record of failed units by hanging up.
         for conn in [restart(), connection(Err(ReadFailure::TimedOut))] {
-            let host = Host::honest();
+            let mut host = Host::honest();
             let conn = conn.with_write_error(SysError::unsupported("peer gone"));
-            let mut log = Vec::new();
-            let served = serve(&conn, &host.platform(), Ok(&FakeSpool::new()), &mut log);
+            let served = serve(&conn, &mut host.platform(), Ok(&FakeSpool::new()));
             assert_eq!(served, Served::Undelivered);
             assert_eq!(served.exit_status(), 0);
             // It was still recorded.
-            assert!(!log.is_empty());
+            assert!(!host.audit.records().is_empty());
         }
     }
 
     #[test]
     fn a_broken_broker_still_fails_when_its_client_has_left() {
-        let host = Host::honest();
+        let mut host = Host::honest();
         let conn = restart().with_write_error(SysError::unsupported("peer gone"));
         let untrusted = SpoolError::NotADirectory {
             at: "/run/xudo/req".to_owned(),
         };
-        let mut log = Vec::new();
-        let served = serve::<FakeSpool>(&conn, &host.platform(), Err(&untrusted), &mut log);
+        let served = serve::<FakeSpool>(&conn, &mut host.platform(), Err(&untrusted));
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(served.exit_status(), UNUSABLE);
     }
@@ -1146,7 +1117,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn a_permitted_decision_that_names_no_action_is_refused_not_minted() {
         // The engine never produces one; if it ever did, the gate would have
         // no action to look up, so the broker refuses rather than guessing.
-        let host = Host::honest();
+        let mut host = Host::honest();
         let conn = restart();
         let spool = FakeSpool::new();
         let mut decision = Decision::deny(DenialCode::UnknownAction, Vec::new(), Vec::new());
@@ -1161,17 +1132,47 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             request,
             policy: policy(),
         };
-        let mut log = Vec::new();
-        let served = mint(&conn, &host.platform(), &spool, &mut log, evaluated);
+        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
         assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        let detail = host.audit.records().last().unwrap().evidence.join(" ");
         assert!(
-            String::from_utf8(log)
-                .unwrap()
-                .contains(&MintError::NoAction.to_string())
+            detail.contains(&MintError::NoAction.to_string()),
+            "{detail}"
         );
+    }
+
+    #[test]
+    fn a_request_too_big_to_record_is_the_clients_fault_and_mints_nothing() {
+        // Control characters grow sixfold in a JSON record, so a request under
+        // the wire's limit can still overflow a log line.
+        let mut host = Host::honest();
+        let conn = restart();
+        let spool = FakeSpool::new();
+        let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+        let caller = crate::policy::classify(&identity);
+        let loaded = policy();
+        let mut request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let decision = decide(&loaded, &caller, &request);
+        request.argv = vec!["restart".to_owned(), "\u{1}".repeat(12_000)];
+        let evaluated = Evaluated {
+            decision,
+            caller,
+            identity,
+            request,
+            policy: loaded,
+        };
+        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(spool.calls(), []);
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::RequestTooLarge));
     }
 
     #[test]

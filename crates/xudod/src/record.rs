@@ -1,19 +1,9 @@
 //! The audit record of every answer the broker gives.
 //!
-//! One `xudo_audit::Record` per connection, as one JSON line on standard
-//! error, which the unit hands to the journal. The hash-chained trail
-//! (`xudo_sys::audit`, M2b step 6) exists, but the broker does not write
-//! through it until plan item D1; until then each record is the first of a
-//! chain of one, and the journal is the trail.
-//!
-//! A record carries what the response does not: how the peer was identified
-//! and on which rung, its pinned identity, the generation decided under, the
-//! nonce minted, and, for a refusal, the full detail. The caller's own claim
-//! about what it is goes in too, beside the classification the broker made,
-//! because "it claimed to be an agent and the claim changed nothing" is the
-//! sentence an investigator needs.
-
-use std::io::Write;
+//! Each builder takes the chain's last record, so the sink can chain it. A
+//! record carries what the response does not: how the peer was identified, its
+//! pin, the generation decided under, the nonce minted, a refusal's detail, and
+//! the caller's own claim beside the classification the broker made.
 
 use xudo_audit::record::{Decision as AuditDecision, Outcome, Record};
 use xudo_gate::request::PendingRequest;
@@ -21,6 +11,7 @@ use xudo_policy::{CallerFacts, Decision, Generation, Verdict, deny_list_version}
 use xudo_wire::BrokerRequest;
 
 use crate::identify::PeerIdentity;
+use crate::mint::Grant;
 use crate::refusal::Refusal;
 
 /// The classification label for a refusal made before anyone was classified.
@@ -31,6 +22,7 @@ const UNATTESTED: &str = "unattested";
 
 /// The record of a decision, and of the entry minted for it if there is one.
 pub fn decided(
+    previous: Option<&Record>,
     decision: &Decision,
     caller: &CallerFacts,
     identity: &PeerIdentity,
@@ -50,9 +42,13 @@ pub fn decided(
         evidence.push(format!("deadline={}", entry.deadline.0));
     }
 
-    let mut record = Record::first(
+    // A minted entry is recorded as the gate will read it, which is what
+    // `authorize` checks the record against.
+    let command = minted.map_or_else(|| decision.resolved_command(), Grant::command_of);
+    let mut record = Record::after(
+        previous,
         audit_decision(decision.verdict),
-        decision.resolved_command(),
+        command,
         caller.classification.label(),
     )
     .with_evidence(evidence)
@@ -69,6 +65,7 @@ pub fn decided(
 
 /// The record of a refusal.
 pub fn refused(
+    previous: Option<&Record>,
     refusal: &Refusal,
     identity: Option<&PeerIdentity>,
     request: Option<&BrokerRequest>,
@@ -87,7 +84,8 @@ pub fn refused(
             request.claimed_classification
         ));
     }
-    Record::first(
+    Record::after(
+        previous,
         AuditDecision::Denied,
         request.map(command_of).unwrap_or_default(),
         UNATTESTED,
@@ -95,16 +93,6 @@ pub fn refused(
     .with_denial(refusal.code.as_str())
     .with_evidence(evidence)
     .with_outcome(Outcome::NotExecuted)
-}
-
-/// Writes one record as one line.
-///
-/// # Errors
-///
-/// Whatever the writer refuses with. The broker mints nothing whose record
-/// could not be written.
-pub fn emit(record: &Record, log: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(log, "{}", record.to_jsonl())
 }
 
 /// The evidence for how the peer was identified.
@@ -208,7 +196,7 @@ mod tests {
             caller_starttime: 998_877,
             action: "xudo.svc.restart".to_owned(),
             program: "/usr/bin/systemctl".to_owned(),
-            argv: Vec::new(),
+            argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
             deadline: xudo_gate::request::MonotonicSecs(1_900),
             confirmed: false,
@@ -216,6 +204,7 @@ mod tests {
             claimed_classification: "enrolled-agent-yolo".to_owned(),
         };
         let record = decided(
+            None,
             &permitted(Verdict::Allow),
             &caller(),
             &identity(Some(77)),
@@ -262,6 +251,7 @@ mod tests {
         // On the password path the confirmation is the password sudo asks
         // for; the record says one is still owed.
         let record = decided(
+            None,
             &permitted(Verdict::AllowWithConfirmation),
             &caller(),
             &identity(None),
@@ -278,6 +268,7 @@ mod tests {
     fn a_denial_records_its_code_and_no_rule() {
         let denial = Decision::deny(DenialCode::ArgvRejected, vec!["x".to_owned()], Vec::new());
         let record = decided(
+            None,
             &denial,
             &caller(),
             &identity(None),
@@ -296,7 +287,7 @@ mod tests {
             RefusalCode::SpoolUnusable,
             "/run/xudo cannot be inspected: No such file or directory",
         );
-        let record = refused(&refusal, Some(&identity(None)), Some(&request()));
+        let record = refused(None, &refusal, Some(&identity(None)), Some(&request()));
         assert_eq!(record.decision, AuditDecision::Denied);
         assert_eq!(record.denial.as_deref(), Some("spool_unusable"));
         assert_eq!(
@@ -319,24 +310,12 @@ mod tests {
     #[test]
     fn a_refusal_before_anything_was_known_still_leaves_a_record() {
         let refusal = Refusal::client(RefusalCode::RequestMalformed, "not JSON");
-        let record = refused(&refusal, None, None);
+        let record = refused(None, &refusal, None, None);
         assert!(record.argv.is_empty());
         assert_eq!(record.classification, "unattested");
         assert_eq!(
             record.evidence,
             ["broker=xudod", "fault=client", "detail=not JSON"]
         );
-    }
-
-    #[test]
-    fn a_record_is_one_json_line() {
-        let refusal = Refusal::client(RefusalCode::RequestMalformed, "line\nbreak");
-        let mut log = Vec::new();
-        emit(&refused(&refusal, None, None), &mut log).unwrap();
-        let text = String::from_utf8(log).unwrap();
-        assert_eq!(text.matches('\n').count(), 1, "{text}");
-        assert!(text.ends_with('\n'));
-        let parsed: xudo_audit::record::Record = serde_json::from_str(text.trim_end()).unwrap();
-        assert!(parsed.is_sealed());
     }
 }

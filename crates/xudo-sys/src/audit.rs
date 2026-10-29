@@ -23,9 +23,8 @@
 //!   half — each privileged action, the broker minting a spool entry and the
 //!   gate executing, is to take an `Authorized<_>`, which only `authorize`
 //!   makes, so that acting on an approval nobody recorded does not compile.
-//!   The gate's exec takes one (M2b step 4, `xudo_gate::run`); the broker's
-//!   mint is to (plan item D1, `docs/todo/m2b-finish-plan.md`: it writes its
-//!   records to the journal on standard error until then).
+//!   The gate's exec takes one (`xudo_gate::run`), and so does the broker's
+//!   mint (`xudod::mint`).
 //!
 //! A refusal needs no receipt: it stands whether or not its record lands.
 //! Write it with [`AuditSink::append`] anyway; a failure there changes nothing
@@ -33,9 +32,8 @@
 //!
 //! # How the broker and the gate call it
 //!
-//! The gate is wired (M2b step 4, `xudo_gate::run`); the broker is not yet
-//! (plan item D1). This is the shape both are expected to take, with the
-//! record builders `xudo-gate` already has:
+//! Both are wired (`xudo_gate::run`, `xudod::serve`). The gate's shape, with
+//! the record builders `xudo-gate` has:
 //!
 //! ```text
 //! let mut trail = AuditTrail::system("xudo-gate");          // "xudod" in the broker

@@ -17,11 +17,11 @@ name = "xudod"
 path = "src/main.rs"
 
 [dependencies]
+xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
 xudod = { path = "../xudod", version = "0.0.1" }
 
 [dev-dependencies]
 xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
-serde_json.workspace = true
 
 [lints]
 workspace = true

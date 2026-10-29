@@ -4,6 +4,54 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-29 — D1: the broker writes the chained trail, and mints only on a record
+
+**What changed.** `Platform` holds `audit: &mut dyn AuditSink`; `xudod::run`
+takes it, and `xudod-bin` passes `AuditTrail::system("xudod")`. Every record is
+built from the chain's last (`Record::after`). A permitted request goes through
+`authorize` with `Grant`, the spool entry as an `Approval` (program and operands,
+action), and `publish` takes the resulting `Authorized<Grant>`, so minting
+without a record does not compile. A sink that fails answers `broker_unusable`
+and mints nothing; a denial or refusal is recorded best-effort, as in the gate.
+`trail_of`, `Platform::trail`, and the stderr record are gone. No new refusal
+code, so the wire contract is untouched.
+
+**One thing found on the way.** A record is at most 64 KiB, and control
+characters grow sixfold in JSON, so a request under the wire's 16 KiB can still
+overflow a log line. That is the client's doing, so it is answered
+`request_too_large` (client fault, exit 0) rather than `broker_unusable`, which
+would let a group member fail units
+(`a_request_too_big_to_record_is_the_clients_fault_and_mints_nothing`).
+
+**The unit.** `ReadWritePaths=` gains `-/var/lib/xudo` and `tmpfiles.d` makes it
+`0700 root root`. Checked against the code, not under systemd: the log needs
+`openat`, `flock`, `fstat`, `write`, `fdatasync`, `fsync`, `ftruncate`; the
+journal send is `socket(AF_UNIX, SOCK_DGRAM)`, `setsockopt`, `sendto`. All are in
+`@system-service` and none in `@privileged @resources`; `AF_UNIX` is allowed,
+and connecting to the journal socket on the read-only `/run` writes no file.
+Still not measured: the broker running under its real sandbox, including the
+trust walk on the new bind mount (open item 10 stands).
+
+**The unprivileged process tests** cannot reach `/var/lib/xudo`, so the real
+trail refuses every write there. That is the "no record, no mint" case and no
+seam was added to the binary; the records themselves are asserted on the
+library with a fake sink, and the real chain in the root lane
+(`a_minted_request_leaves_the_brokers_and_the_gates_records_in_one_chain`).
+
+**Outcome of an executed command.** The gate execs in place, so nothing of it
+survives to see the exit status; the record of the authorization is the last
+thing it writes, and the status goes to the caller. A post-execution outcome
+record would need a supervising process, which the gate deliberately is not.
+Records say `NotExecuted` or the authorization, never "succeeded". If an
+outcome is wanted, `xudo exec` (the caller) is the one that sees the status
+and could append a record naming the authorization's `seq`; that is not built.
+
+**Truncation.** Cutting a log inside a record or from the front fails
+`verify_log`. Dropping whole trailing records does not, by design of a hash
+chain; the journald copy is what shows that.
+
+---
+
 ## 2026-10-22 — M2b step 5: executing the install plan (done; the product's own probe waits for C1)
 
 **What exists.** `xudo_sys::install`: `execute(plan, ops, probe)`, the executor
@@ -954,47 +1002,8 @@ codes, their remediation sentences, and the audit records
    `just verify` because it needs Docker and the network. Nothing starts the
    broker under its own sandbox: phase 3's container tests are where that
    belongs (see item 10).
-6. **The audit trail is not wired: plan item D1 is the explicit next step
-   (decided 2026-10-21, at B1, not to half-wire it).** Step 7 is wired. Step
-   6, `xudo_sys::audit::{AuditTrail, authorize}`, is not: the broker's half of
-   it is not a contained change, which is the finish plan's test for doing it
-   now, and its parts are one piece. The broker keeps its stderr record and
-   mints under the stopgap of open item 9.
-   * **No receipt without the real trail.** `AuditReceipt` and `Authorized`
-     can be made only inside `xudo_sys::audit`, so the mint cannot take "an
-     authorization whose record went to standard error" unless a weaker sink
-     is added to that module, and a receipt that sometimes means "the chain
-     holds the record" and sometimes "a line was written" would say less than
-     the type says now. The only honest source of one is
-     `AuditTrail::system("xudod")`.
-   * **The unit must reach the trail**, a sandbox change that cannot be
-     tested here: `/var/lib/xudo` writable (`ReadWritePaths=` and a
-     `tmpfiles.d` line making it `0700 root`; the only writable path today is
-     `-/run/xudo/req`), the journal socket reachable under
-     `ProtectSystem=strict` (connecting to a socket is not a write to the
-     filesystem, but nothing here has run it), the system-call filter checked
-     against the calls the log and the journal sender make, and the trust walk
-     of `open_trusted` run inside that sandbox, which open item 10 already
-     calls argued, not measured.
-   * `Platform` gains a sink seam (`&mut dyn AuditSink`) and `serve` threads it
-     through every refusal, so every `serve` test that reads the stderr
-     record changes with it.
-   * The record is built from the chain's last record (`Record::after`), not
-     `Record::first`, so `record.rs` and its snapshots change.
-   * The mint takes an `Authorized<MintApproval>` (`impl Approval`: command
-     and governing action), which changes `publish` and `Minting`.
-   * Open item 9's stderr attestation is replaced by the trail itself, and its
-     test with it; the `xudod-bin` process tests, which run unprivileged and
-     read the records from standard error, then need a trail they can reach
-     through a seam the binary does not have.
-   * Whether "the record could not be written" gets a refusal code of its own
-     (today `broker_unusable`, the reason in the record) changes the pinned
-     wire contract, so it is a reviewed snapshot change (step 6, open item 1).
-
-   The order for whoever does it (D1, which also covers the gate): the unit
-   and `tmpfiles` first, measured under systemd in Docker; then the seam; then
-   `authorize` around the mint. Until then no record of the broker is chained
-   or hash-linked, and `xudo audit --log` has nothing of the broker to verify.
+6. **RESOLVED 2026-10-29 (D1).** The broker writes through `AuditTrail` and
+   mints on an `Authorized<_>`; see the 2026-10-29 entry.
 7. Seen, not changed: the front-end reads `/etc/xudo/config.toml` by path and
    the broker through the trust walk. They parse it identically; only the
    broker's reading is trusted, which is as it should be.
@@ -1084,20 +1093,8 @@ codes, their remediation sentences, and the audit records
    private pid namespace for the broker would make every caller pid 0 and
    every request a refusal, and the broker reads callers' `/proc` entries by
    number, which works only from a namespace its callers are visible in.
-9. **The audit trail is attested by its descriptor, not by the journal.**
-   "Nothing is minted whose record cannot be written" held only for a
-   `write()` that fails. systemd points standard error at `/dev/null` when it
-   cannot connect a service to the journal ("Failed to connect stderr to the
-   journal socket, ignoring"), and Rust reopens a closed descriptor 2 on
-   `/dev/null`: every write then succeeds and records nothing. The broker now
-   requires standard error to be a connected `AF_UNIX` stream socket before it
-   mints (`Platform::trail`, `xudod::trail_of`;
-   `nothing_is_minted_when_standard_error_does_not_reach_the_journal`); a
-   denial is answered regardless
-   (`a_denial_is_answered_even_when_there_is_no_trail_to_write`). That is what
-   holds, no more: a socket, not proof that it reaches the journal or that
-   something else did not take the other end. The hash-chained sink of step 6
-   is the real answer.
+9. **RESOLVED 2026-10-29 (D1).** The stderr attestation is gone, replaced by
+   the real trail; see the 2026-10-29 entry.
 10. **Step 7's mount-trust check and the unit's sandbox.** Inside the broker's
    unit, `ReadWritePaths=-/run/xudo/req` makes the spool a separate bind mount
    (mountinfo shows `/xudo/req /run/xudo/req rw ... tmpfs`) on top of a

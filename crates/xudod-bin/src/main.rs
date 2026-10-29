@@ -1,20 +1,16 @@
 //! The `xudod` entry point.
 //!
-//! Deliberately the whole of it. systemd starts one of these per accepted
-//! connection with the connection as standard input (`StandardInput=socket`),
-//! so descriptor 0 is borrowed from `std::io::stdin()` — no `LISTEN_FDS` to
-//! read from an environment a privileged process must not trust, and no
-//! descriptor adopted by number. Everything else is the `xudod` library,
-//! covered by its own tests; `tests/broker.rs` runs this binary as a process.
+//! systemd starts one of these per accepted connection with the connection as
+//! standard input (`StandardInput=socket`), so descriptor 0 is borrowed from
+//! `std::io::stdin()`: no `LISTEN_FDS` to read from an environment a privileged
+//! process must not trust. Everything else is the `xudod` library;
+//! `tests/broker.rs` runs this binary as a process.
 
 #![forbid(unsafe_code)]
 
 use std::os::fd::AsFd as _;
 
 fn main() -> std::process::ExitCode {
-    let stdin = std::io::stdin();
-    let stderr = std::io::stderr();
-    let trail = xudod::trail_of(stderr.as_fd());
-    let mut log = stderr.lock();
-    std::process::ExitCode::from(xudod::run(stdin.as_fd(), trail, &mut log))
+    let mut trail = xudo_sys::AuditTrail::system("xudod");
+    std::process::ExitCode::from(xudod::run(std::io::stdin().as_fd(), &mut trail))
 }

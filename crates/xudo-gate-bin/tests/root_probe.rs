@@ -40,9 +40,11 @@
 use xudo_tests::root_lane::root_guard;
 
 use std::fs::{self, File, Permissions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::net::Shutdown;
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::{PermissionsExt, chown};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +57,7 @@ use xudo_sys::{
     Clock, HostClock, HostInstallOps, HostProbe, PendingGateProbe, VerifiedProc, execute, lineage,
     load_trusted_rules, run_capture,
 };
+use xudo_wire::{Answer, BrokerRequest, BrokerResponse};
 
 const GATE: &str = env!("CARGO_BIN_EXE_xudo-gate");
 const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
@@ -264,6 +267,60 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         journal.text().contains(ACTION),
         "the journal was sent nothing"
     );
+    remove_snippet();
+}
+
+#[test]
+fn a_minted_request_leaves_the_brokers_and_the_gates_records_in_one_chain() {
+    if !begin_root_test("a_minted_request_leaves_the_brokers_and_the_gates_records_in_one_chain") {
+        return;
+    }
+    let _journal = install_everything();
+
+    // The real broker, in this process, on a real socket: it pins this process.
+    let (server, mut client) = UnixStream::pair().unwrap();
+    let request = BrokerRequest::new("/usr/bin/id", vec!["-u".to_owned()], "human");
+    client.write_all(request.to_json().as_bytes()).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut trail = xudo_sys::AuditTrail::system("xudod");
+    assert_eq!(xudod::run(server.as_fd(), &mut trail), 0);
+    drop(server);
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).unwrap();
+    let Answer::Decided {
+        minted: Some(minted),
+        ..
+    } = BrokerResponse::parse(&answer).unwrap().answer
+    else {
+        panic!("not minted: {}", String::from_utf8_lossy(&answer));
+    };
+
+    let output = through_sudo();
+    assert!(output.success, "{output:?}");
+    assert_eq!(output.stdout.trim(), "0");
+    assert!(!entry_exists(&minted.nonce));
+
+    // One chain holds both records, in order, and it verifies.
+    let path = format!("{AUDIT_DIR}/audit.jsonl");
+    let log = fs::read(&path).unwrap();
+    let chain = xudo_audit::verify_log(&log).unwrap();
+    let evidence: Vec<String> = chain
+        .records()
+        .iter()
+        .map(|record| record.evidence.join(" "))
+        .collect();
+    assert_eq!(evidence.len(), 2, "{evidence:?}");
+    assert!(evidence[0].contains("broker=xudod"), "{evidence:?}");
+    assert!(
+        evidence[0].contains(&format!("nonce={}", minted.nonce)),
+        "{evidence:?}"
+    );
+    assert!(!evidence[1].contains("broker=xudod"), "{evidence:?}");
+
+    // Cutting the log is seen: through the last record, and from the front.
+    assert!(xudo_audit::verify_log(&log[..log.len() - 20]).is_err());
+    let first_line = log.iter().position(|b| *b == b'\n').unwrap() + 1;
+    assert!(xudo_audit::verify_log(&log[first_line..]).is_err());
     remove_snippet();
 }
 
