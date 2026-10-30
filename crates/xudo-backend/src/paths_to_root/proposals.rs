@@ -495,6 +495,7 @@ fn fix_user_path(report: &Report) -> Vec<Proposal> {
             }
             Finding::PasswordlessRule { .. }
             | Finding::BackendListing { .. }
+            | Finding::DoasNopass { .. }
             | Finding::GroupMembership { .. } => continue,
         };
         out.push(by_hand(

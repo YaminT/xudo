@@ -278,6 +278,10 @@ pub(crate) fn gather(
                 .as_ref()
                 .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
                 .map(|found| found.exe.as_str()),
+            doas_exe: backend
+                .as_ref()
+                .filter(|found| matches!(found.kind, BackendKind::Doas))
+                .map(|found| found.exe.as_str()),
         },
     );
     // Root commands go through the backend, where the human types their
@@ -657,6 +661,11 @@ fn finding_line(finding: &Finding) -> String {
             "sudo itself lists a rule for {} that needs no password: {}",
             safe(user),
             safe(&listing.replace('\n', " | "))
+        ),
+        Finding::DoasNopass { command, file } => format!(
+            "doas itself permits {} for you without a password, by {}",
+            safe(command),
+            safe_path(file)
         ),
         Finding::GroupMembership {
             group,
@@ -1221,6 +1230,47 @@ mod tests {
             false,
         );
         insta::assert_snapshot!("human_root_sudo_says", human(&report));
+    }
+
+    #[test]
+    fn a_doas_nopass_answer_is_shown_for_the_user_who_ran_the_doctor() {
+        let host = MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![1000]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, PASSWD)
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\n")
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/bin", 0, 0, 0o755)
+        .file("/etc/doas.conf", 0, 0, 0o644, b"")
+        .doas_says(
+            "/etc/doas.conf",
+            "/bin/sh",
+            Answer::Passwordless("permit nopass".to_owned()),
+        );
+        let report = gathered(
+            &host,
+            "/usr/bin",
+            &TestOps {
+                release: "6.13.0",
+                observable: true,
+            },
+            &TestProbe {
+                present: &["/usr/bin/doas"],
+                banner: None,
+                scoped: true,
+            },
+            Ok(&fixture_rules("4")),
+            false,
+        );
+        assert!(
+            human(&report).contains(
+                "doas itself permits /bin/sh for you without a password, by /etc/doas.conf"
+            )
+        );
     }
 
     #[test]

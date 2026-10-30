@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{Access, FileType, Mode, OFlags};
 use rustix::process::Gid;
 use xudo_backend::paths_to_root::{
-    Answer, Caller, HostView, Kind, Lookup, MAX_READ, Meta, NOT_A_REGULAR_FILE, ROOT_NEEDED,
-    TOO_LARGE, read_listing,
+    Answer, Caller, DOAS_ASKED, DOAS_USER_NEEDED, HostView, Kind, Lookup, MAX_READ, Meta,
+    NOT_A_REGULAR_FILE, ROOT_NEEDED, TOO_LARGE, read_doas, read_listing,
 };
 
 use crate::exec::{HostRunner, Runner};
@@ -67,6 +67,42 @@ impl HostView for LiveHost {
 
     fn ask_sudo(&self, exe: &str, user: &str) -> Answer {
         ask_sudo(&HostRunner, rustix::process::geteuid().as_raw(), exe, user)
+    }
+
+    fn ask_doas(&self, exe: &str, file: &Path, command: &str) -> Answer {
+        let ids = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::geteuid().as_raw(),
+        );
+        ask_doas(&HostRunner, ids, exe, file, command)
+    }
+}
+
+/// `doas -C file command`, as the user: it answers for the real uid, so as
+/// root it would answer for root. `file` is one doas reads: its config or a
+/// drop-in, which `-C` does not follow.
+fn ask_doas(
+    runner: &dyn Runner,
+    (uid, euid): (u32, u32),
+    exe: &str,
+    file: &Path,
+    command: &str,
+) -> Answer {
+    if uid == 0 || euid == 0 {
+        return Answer::Unavailable(DOAS_USER_NEEDED.to_owned());
+    }
+    // Only the fixed commands and doas's own files are put in the argv.
+    let ours = file == Path::new("/etc/doas.conf")
+        || (file.parent() == Some(Path::new("/etc/doas.d")) && file.file_name().is_some());
+    let Some(file) = file
+        .to_str()
+        .filter(|_| ours && DOAS_ASKED.contains(&command))
+    else {
+        return Answer::Unavailable("not a file and command it asks doas about".to_owned());
+    };
+    match runner.run(exe, &["-C", file, command], None) {
+        Ok(out) => read_doas(&out.stdout),
+        Err(error) => Answer::Unavailable(format!("doas could not be run: {error}")),
     }
 }
 
@@ -412,6 +448,7 @@ mod tests {
                 user_path: Some(&path),
                 backend_exe: Some(Path::new("/usr/bin/sudo")),
                 sudo_exe: None,
+                doas_exe: None,
             },
         );
         let order: Vec<CheckId> = report.checks.iter().map(|c| c.check).collect();
@@ -502,5 +539,86 @@ mod tests {
             failed,
             Answer::Unavailable(format!("sudo could not be run: {why}"))
         );
+    }
+
+    struct Argv(std::cell::RefCell<Vec<Vec<String>>>);
+
+    impl Runner for Argv {
+        fn run(
+            &self,
+            _exe: &str,
+            args: &[&str],
+            _stdin: Option<&[u8]>,
+        ) -> Result<crate::exec::Output, crate::error::SysError> {
+            self.0
+                .borrow_mut()
+                .push(args.iter().map(|a| (*a).to_owned()).collect());
+            Ok(crate::exec::Output {
+                success: false,
+                code: Some(1),
+                stdout: "permit nopass\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn doas_is_asked_only_the_fixed_commands_as_a_user() {
+        let runner = Argv(std::cell::RefCell::new(Vec::new()));
+        let (conf, drop_in) = (Path::new("/etc/doas.conf"), Path::new("/etc/doas.d/a.conf"));
+        for file in [conf, drop_in] {
+            for command in DOAS_ASKED {
+                let said = ask_doas(&runner, (1000, 1000), "/usr/bin/doas", file, command);
+                assert_eq!(said, Answer::Passwordless("permit nopass".to_owned()));
+            }
+        }
+        // Off the list, nothing reaches an argv; nor is root asked, by either id.
+        for (file, command) in [
+            (conf, "--help"),
+            (Path::new("/tmp/x"), "/bin/sh"),
+            (Path::new("/etc/doas.d/../x"), "/bin/sh"),
+            (Path::new("/etc/doas.d/.."), "/bin/sh"),
+        ] {
+            let said = ask_doas(&runner, (1000, 1000), "/usr/bin/doas", file, command);
+            let why = "not a file and command it asks doas about";
+            assert_eq!(said, Answer::Unavailable(why.to_owned()));
+        }
+        for ids in [(0, 0), (0, 1000), (1000, 0)] {
+            let said = ask_doas(&runner, ids, "/usr/bin/doas", conf, "/bin/sh");
+            assert_eq!(said, Answer::Unavailable(DOAS_USER_NEEDED.to_owned()));
+        }
+        let argv = runner.0.borrow();
+        assert_eq!(argv.len(), 2 * DOAS_ASKED.len());
+        for (args, command) in argv.iter().zip(DOAS_ASKED.iter().cycle()) {
+            assert_eq!(args[0], "-C");
+            assert_eq!(args[2], *command);
+        }
+        let said = LiveHost.ask_doas("/nonexistent/doas", conf, "/bin/sh");
+        assert!(format!("{said:?}").starts_with("Unavailable(\"doas could not"));
+    }
+
+    struct Broken;
+
+    impl Runner for Broken {
+        fn run(
+            &self,
+            _exe: &str,
+            _args: &[&str],
+            _stdin: Option<&[u8]>,
+        ) -> Result<crate::exec::Output, crate::error::SysError> {
+            Err(crate::error::SysError::unsupported("no such file"))
+        }
+    }
+
+    #[test]
+    fn a_doas_that_cannot_run_is_unavailable_not_clean() {
+        let failed = ask_doas(
+            &Broken,
+            (1000, 1000),
+            "/usr/bin/doas",
+            Path::new("/etc/doas.conf"),
+            "/bin/sh",
+        );
+        assert!(matches!(failed, Answer::Unavailable(m) if m.starts_with("doas could not")));
     }
 }
