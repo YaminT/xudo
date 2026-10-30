@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xudo: a sudo alternative for AI coding agents</title>
+<meta name="description" content="A root-owned allowlist of named commands that an enrolled coding agent can run without a password, while a human is always prompted. Rust, Linux.">
+<meta name="author" content="Yamin Tashakkori">
+<link rel="canonical" href="https://yamint.github.io/xudo/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="xudo: a sudo alternative for AI coding agents">
+<meta property="og:description" content="A root-owned allowlist of named commands that an enrolled coding agent can run without a password, while a human is always prompted. Rust, Linux.">
+<meta property="og:url" content="https://yamint.github.io/xudo/">
+<meta property="og:site_name" content="xudo">
+<meta name="theme-color" content="#1f5fae">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>:root{--ink:#1c2128;--paper:#ffffff;--mist:#f1f3f5;--line:#d9dde2;--muted:#5b6470;--accent:#1f5fae}*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 'IBM Plex Sans',system-ui,sans-serif}a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}code,pre,kbd{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}.wrap{max-width:1040px;margin:0 auto;padding:0 16px}header.site{display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:18px 0;border-bottom:1px solid var(--line);font-size:15px}header.site a{color:var(--ink);text-decoration:none}header.site a:hover{text-decoration:underline}header.site .by{color:var(--muted)}.hero{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:40px;align-items:start;padding:48px 0 40px}.hero>*{min-width:0}pre{max-width:100%}h1{margin:0 0 6px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:clamp(2rem,5vw,2.9rem);font-weight:500;line-height:1.1;letter-spacing:-0.02em}.tagline{margin:0 0 18px;font-size:1.25rem;font-weight:500;color:var(--accent)}.pitch{margin:0 0 22px;max-width:60ch}.notice{margin:0 0 22px;padding:10px 14px;border-left:3px solid var(--accent);background:var(--mist);font-size:15px;max-width:60ch}.install{margin:0 0 22px}.install pre{margin:0;padding:12px 14px;background:var(--ink);color:#f5f7fa;border-radius:4px;font-size:14px;overflow-x:auto;white-space:pre}.links{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:10px 18px;font-size:15px}.links a{font-weight:500}.frame{border:1px solid var(--line);border-left:6px solid var(--accent);border-radius:4px;background:var(--mist);min-width:0}.frame .tab{display:flex;justify-content:space-between;padding:8px 14px;font-size:13px;color:var(--muted);border-bottom:1px solid var(--line)}.frame pre{margin:0;padding:16px 14px;font-size:13px;line-height:1.5;overflow-x:auto;white-space:pre}h2{font-size:1.35rem;font-weight:600;letter-spacing:-0.01em;margin:40px 0 14px}.facts{margin:0;padding:0;list-style:none;max-width:72ch}.facts li{margin:0 0 12px;padding-left:18px;border-left:2px solid var(--line)}.facts b{font-weight:600}.docs{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px 28px;max-width:72ch}.docs li{font-size:15px}.docs small{display:block;color:var(--muted)}footer.site{margin-top:56px;padding:20px 0 32px;border-top:1px solid var(--line);font-size:14px;color:var(--muted)}footer.site a{color:var(--ink)}@media (max-width:900px){.hero{grid-template-columns:1fr;gap:28px;padding-top:32px}}@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}</style>
+</head>
+<body>
+<div class="wrap">
+<header class="site">
+<a href="https://yamint.github.io/xudo/">xudo</a>
+<span class="by">by <a href="https://nodets.com/">Yamin Tashakkori</a></span>
+</header>
+<main>
+<section class="hero">
+<div>
+<h1>xudo</h1>
+<p class="tagline">Passwordless for the agent, a prompt for the human</p>
+<p class="pitch">An agent that hits a command needing root either stops unattended work at a sudo prompt or gets NOPASSWD: ALL, a standing root backdoor for every process running as that user. xudo is the middle path: a root-owned allowlist of named actions. Enrolled agent sessions run allowlisted actions without a password; a human invoking xudo is always prompted; a deny-list of catastrophic commands is compiled into the binary and cannot be edited by configuration.</p>
+<p class="notice">Beta, not externally audited. This build cannot execute anything as root yet: explain, check, list, config, doctor and agentdoc inspect the policy and execute nothing.</p>
+<div class="install"><pre><code>git clone https://github.com/YaminT/xudo
+cd xudo &amp;&amp; just setup &amp;&amp; just verify</code></pre></div>
+<ul class="links"><li><a href="https://github.com/YaminT/xudo">Source and README on GitHub</a></li><li><a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">How it works (howiwork.md)</a></li><li><a href="https://github.com/YaminT/xudo/blob/main/SECURITY.md">Security model (SECURITY.md)</a></li></ul>
+</div>
+<div class="frame"><div class="tab"><span>rules/svc.toml</span><span>TOML</span></div><pre><code>[[action]]
+id = &quot;xudo.svc.lifecycle&quot;
+tier = &quot;svc-control&quot;
+exe = &quot;/usr/bin/systemctl&quot;
+args = [
+  { name = &quot;no-pager&quot;, matcher = { literal = &quot;--no-pager&quot; } },
+  { name = &quot;verb&quot;,
+    matcher = { one-of = [&quot;start&quot;, &quot;stop&quot;, &quot;restart&quot;, &quot;reload&quot;] } },
+  { name = &quot;unit&quot;, matcher = { name = &quot;unit-name&quot; } },
+]
+
+# $ xudo --rules ./rules explain -- \
+#     /usr/bin/systemctl --no-pager restart nginx.service
+# prints the rule that matched, at file:line, the canonical
+# argv and the verdict; as JSON when the caller is a model</code></pre></div>
+</section>
+<h2>What it does</h2>
+<ul class="facts"><li><b>Named actions, no globs anywhere.</b> A rule fixes the executable and constrains every argument by position. sudoers joins arguments into one string and runs fnmatch, which is how /opt/utils/*.py becomes a root shell.</li>
+<li><b>A deny-list in the binary.</b> Catastrophic commands are refused regardless of configuration. It is defence in depth, not the boundary: the set of programs that can become a root shell is not enumerable.</li>
+<li><b>Answers a model can read.</b> explain reports which rule matched, where, with what argv and why, in a stable JSON envelope. An exit code and a prose message are the worst interface for a language model.</li>
+<li><b>A gate that is identical to CI.</b> just verify: 100% line, region and function coverage with no waivers, zero clippy warnings, cargo deny, miri and three fuzz targets.</li></ul>
+<h2>Read more</h2>
+<ul class="docs"><li><a href="https://github.com/YaminT/xudo/blob/main/docs/re.md">What is left before a release</a><small>The passwordless agent path, the broker and out-of-band confirmation are not in this build.</small></li></ul>
+</main>
+<footer class="site">
+<p>By <a href="https://nodets.com/about/">Yamin Tashakkori</a>. Source on <a href="https://github.com/YaminT/xudo">GitHub</a>. </p>
+</footer>
+</div>
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"SoftwareSourceCode","name":"xudo","description":"A root-owned allowlist of named commands that an enrolled coding agent can run without a password, while a human is always prompted. Rust, Linux.","url":"https://yamint.github.io/xudo/","codeRepository":"https://github.com/YaminT/xudo","programmingLanguage":"Rust","license":"https://spdx.org/licenses/Apache-2.0.html","author":{"@id":"https://nodets.com/#person"},"sameAs":["https://github.com/YaminT/xudo","https://github.com/YaminT/xudo/blob/main/howiwork.md","https://github.com/YaminT/xudo/blob/main/SECURITY.md"]},{"@type":"Person","@id":"https://nodets.com/#person","name":"Yamin Tashakkori","url":"https://nodets.com/","sameAs":["https://github.com/YaminT","https://stackoverflow.com/users/3123267/yamin","https://www.linkedin.com/in/yamin-tashakkori","https://pub.dev/publishers/nodets.com/packages"]}]}</script>
+</body>
+</html>
