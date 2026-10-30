@@ -152,8 +152,8 @@ pub enum Command {
     /// An install is reported as verified only when the functional probe passed:
     /// the broker minted a request for `id -u`, the gate ran through the backend
     /// and printed `0`, and the backend lists the gate for a member of the group.
-    /// Anything less (no broker running yet, say) installs, then says NOT
-    /// VERIFIED and exits non-zero.
+    /// Anything less (no broker running yet, or a probe that ran and failed)
+    /// keeps the validated install, then says NOT VERIFIED and exits non-zero.
     Install {
         /// Print the plan without performing any step.
         #[arg(long)]
