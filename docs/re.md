@@ -4,7 +4,7 @@ Only things that stop work. Full inventory in `todo/` and `CONCERNS.md`.
 
 ## None
 
-Nothing stops M2b. Docker on this machine gives a real Linux kernel, with
+Nothing blocks the next work (M3). M2b is done in code. Docker on this machine gives a real Linux kernel, with
 `sudo`, `sudo-rs`, and `OpenDoas` installable in it, which is enough for every
 M2b and M3 item. Run the suite there as a non-root user on a copy of the
 checkout, never on the bind mount and never as root; `todo/README.md` § M2b

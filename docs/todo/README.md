@@ -8,7 +8,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 ## Where the project actually stands
 
-> **Status, 2026-10-22.** M1 complete. M2 split: **M2a done**, M2b in progress (steps 0, 1, 2, 2b, 4, 4b, 5, 6, and 7 done: the Linux harness, the `xudo-sys-raw` syscalls, a minimal `xudod` that mints (its audit records go through the step-6 chain, D1), strictest overlapping-rule enforcement, `doctor`'s report of the other paths to root with `--json` and `--fix`, the gate executable `xudo-gate-bin` (which consumes the entry, records its own authorization through the step-6 sink, and execs), the audit sinks, and the refusal of a ruleset on a mount a non-root user could have made; both privileged halves are built; the gate has run as root through the installed `sudo` rule in the root lane, on a hand-written request, and since 2026-10-29 `xudo exec` and the install probe ask the real broker, verified in the root lane). **Phase 5 part 1 done** (`xudo-config`). **Phase 4 done** (`ido`, `ido-bin`, `term-sanitize`). The differential matrix runs in CI and trips the day an exec path appears. Next is **M2b**: Docker now gives a real Linux kernel to run privileged tests in, so the old "blocked on a VM" no longer holds for most of it. Read `../CONCERNS.md` first — it carries the decisions and what is still open.
+> **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: M3, and the two open decisions there (beta `.deb` timing, homes for the unscheduled `howiwork.md` promises).
 
 **Done.** The crates in the table below, a working unprivileged executable, and a root broker that mints entries and executes nothing. A row that opens with **in review (M2b).** is a crate built in a lane's worktree and not yet a workspace member; merging it deletes the marker. `crates/xudo-tests/tests/crate_inventory.rs` fails the build when this table and `Cargo.toml` disagree.
 
@@ -36,7 +36,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 **The gate:** 373 tests, 100% coverage on lines, regions, and functions with **zero line-level waivers**, zero clippy warnings, `cargo deny` clean, miri clean, three fuzz targets clean, a GTFOBins waiver gate, and a pre-commit hook. Nightly and `cargo-fuzz` are installed, so the fuzz and miri lanes have actually run — and fuzzing found a real bug on its first execution (see `../CONCERNS.md`).
 
-**Not done.** The privileged execution path, end to end. The syscall primitives exist on main (`xudo-sys-raw`, six audited `unsafe` blocks; the trust walk with its mount check; the audit sinks, which the gate and the broker write through), and both privileged halves are built: the broker mints entries, its records chained with the gate's, and the gate consumes one and execs it. But nothing yet executes a command as root through `sudo`: `xudo exec` is unbuilt, the install executor is in review, and the gate has only been run against fakes and as an unprivileged process. `classify()` returns `Unattested` for every caller on every platform, so every request routes to the password path. The step-by-step plan to close M2b is `m2b-finish-plan.md`.
+**Not done.** The passwordless path (M4): `classify()` returns `Unattested` for every caller, so every request takes the password path. Out-of-band confirmation (M3). The broker has not run under its real systemd sandbox. Doas is not verified by the doctor or the install probe, and the probe cannot verify on multicall-coreutils distros. Details: `../CONCERNS.md`, 2026-10-30.
 
 ---
 
@@ -126,16 +126,16 @@ The verb surface (`xudo pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previ
 |---|---|---|
 | M1 | Everything listed | Done; `just verify` is the gate |
 | 1 | `doctor --json` with backend, implementation, capabilities, other paths to root | Done 2026-10-19 (M2b 4b), pinned by snapshots; unverified where an unprivileged run cannot read |
-| 2 | Human path prompts, on a real pty | Done 2026-10-29: `xudo exec` as the lane's account on a pty gets sudo's prompt, a password gives `0`, a wrong one runs nothing (`root_probe.rs`; hand-driven pty, not `rexpect`) |
-| 3 | Snippet functionally in effect; dotted-filename regression | Done 2026-10-29: `xudo install` verifies by the gate printing `0` (see CONCERNS, 2026-10-29); the regression was done 2026-10-22 |
-| 4 | Hostile direct gate invocation does nothing privileged | Done 2026-10-21: `xudo_gate::run` tested step by step, and the binary through real processes; the root-run half is M2b 8 |
-| 5 | Nonce is one-use | Done 2026-10-21: the broker mints at most one live entry per caller pin (M2b 2), and the gate consumes it before anything runs, a second consumer's `ENOENT` being a refusal (M2b 4); two real gates racing one entry needs the root-run half (M2b 8) |
+| 2 | Human path prompts, on a real pty | Done 2026-10-29 for sudo: `xudo exec` on a pty gets the prompt, a password gives `0`, a wrong one runs nothing (`root_probe.rs`; hand-driven pty); the differential repeats it for sudo-rs and OpenDoas |
+| 3 | Snippet functionally in effect; dotted-filename regression | Regression done 2026-10-22 (`sudo_ignores_a_snippet_named_with_a_dot`). Probe done 2026-10-29 for sudo; doas and multicall-coreutils distros report NOT VERIFIED |
+| 4 | Hostile direct gate invocation does nothing privileged | Done: `xudo_gate::run` tested step by step and `xudo-gate-bin/tests/binary.rs` through real processes; not repeated as uid 0 |
+| 5 | Nonce is one-use | Partly: one live entry per caller pin; consumed before anything runs, a replay refused as root (`a_consumed_entry_is_not_replayed`). Two real gates racing one entry is not tested |
 | 6–10 | Enrolled agent path, yolo, self-approval, timeout, cgroup spoofing | M3 and M4 |
-| 11 | Env scrubbing with real payloads in the child's `/proc/self/environ` | Allowlist built and tested in `xudo-gate::env`, and the exec vector's environment asserted in `run`; the child's own `/proc/self/environ` needs the root-run half (M2b 8) |
-| 12 | Symlink and TOCTOU resistance on ruleset, exec target, audit log | Ruleset done 2026-10-14; audit log done 2026-10-19 (sink built; the gate and, since D1, the broker write through it); exec target done 2026-10-21 (`open_trusted`, `fstat`, digest, `execveat` on the descriptor) |
+| 11 | Env scrubbing with real payloads in the child's `/proc/self/environ` | Partly: allowlist tested in `xudo-gate::env`, exec vector asserted in `run`; the child's own `/proc/self/environ` is not asserted |
+| 12 | Symlink and TOCTOU resistance on ruleset, exec target, audit log | Done: ruleset, audit log (gate and broker write through it), and exec target (`open_trusted`, digest, `execveat` on the descriptor) |
 | 13 | Deny-list non-overridable; `check` refuses a rule naming a shell | Done |
-| 14 | Differential compliance | Done 2026-10-29 for sudo and sudo-rs (`ci/differential/exec.sh`); OpenDoas differs, an open finding |
-| 15 | Audit chain verifies and detects truncation | Done (D1): the root lane verifies a broker-and-gate chain and sees it fail when cut; dropping whole trailing records is not detectable from the file alone |
+| 14 | Differential compliance | Done 2026-10-30: sudo, sudo-rs and OpenDoas give the same outcomes (`ci/differential/exec.sh`); doas needed `xudo` to stay its parent |
+| 15 | Audit chain verifies and detects truncation | Done (D1): the root lane verifies a broker-and-gate chain and sees it fail when cut; dropping whole trailing records is not detectable from the file |
 | 16 | `freeze` / `thaw` | Engine honours `frozen`; the commands are M3 |
 
 ### M7 — confinement, supply chain, external audit
@@ -155,13 +155,10 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        project layer, XDG paths, `xudo config [--schema]`.
 4. Phase 4             DONE 2026-10-14 — ido: queue, picker, runner, `ido add`,
                        the willyoumarryme acceptance test, man pages.
-5. M2b                 STARTED 2026-10-14 — the ruleset is read through verified
-                       descriptors; `just linux-test` runs the suite on Linux.
-                       Done since: xudo-sys-raw, overlapping rules, a minimal
-                       xudod (minting only), the audit sinks, xudo-gate-bin.
-                       Left, in order: `xudo exec`, executing the install plan,
-                       the audit trail wired through both binaries (D1), the
-                       executing half of the differential matrix.
+5. M2b                 DONE 2026-10-30 in code and tests: `xudo exec`, the
+                       install and its probe, the audit trail through both
+                       binaries, the executing differential. Gaps: the broker
+                       under its real systemd sandbox; doas verification.
 6. Phase 3             beta .deb + publish, human path only, no NOPASSWD shipped.
                        Ships xudod too: without the nopass hardlink it grants
                        nothing a password did not.

@@ -8,12 +8,12 @@ Root-owned rule set, compiled-in deny-list, full decision trace. Rust, Linux.
 > the system behaves is [howiwork.md](howiwork.md); where the two disagree,
 > that file is right and this one is the bug.
 
-> ## Beta. Not externally audited. No privileged path yet.
+> ## Beta. Not externally audited. Password path only.
 >
-> This build **cannot execute anything as root.** `xudo explain`, `check`,
-> `list`, `config`, `doctor`, and `agentdoc` inspect the policy and execute
-> nothing. The passwordless agent path, the broker, and out-of-band confirmation
-> are not in this release. See [docs/re.md](docs/re.md) for what is left.
+> `xudo exec` runs an allowlisted command as root after a password prompt,
+> through `sudo`, `sudo-rs` or `doas`. The passwordless agent path and
+> out-of-band confirmation are not built yet. Installing and running it needs
+> root and a running broker. See [docs/re.md](docs/re.md) for what is left.
 
 ## The problem
 
