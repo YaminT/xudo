@@ -4,6 +4,36 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-30 — M2b closeout (E1)
+
+M2b is done in code and tests on branch `xudo-exec`, with the gaps below.
+Exit test from `docs/todo/m2b-finish-plan.md`, swept against the branch:
+
+1. Trust walk and mount check: **done** (`xudo-sys` trust tests, root lane).
+2. Broker: **done in code**, not run under its real systemd sandbox (open item 10 of the B1 section stands). It tells peers apart by kernel facts; every caller is still `Unattested` until M4.
+3. `xudo exec`: **done** (`root_probe.rs`: password gives `0`, wrong password runs nothing; hand-driven pty, not `rexpect`).
+4. Gate: **done** (`xudo_gate::run` tests, `xudo-gate-bin/tests/binary.rs`, replay and stale-pin twins in the root lane). Not asserted: the child's own `/proc/self/environ`.
+5. Doctor: **partly**. Sudo and sudo-rs are asked as root; doas stays on the hand reader; a non-root run is unverified.
+6. Install and probe: **partly**. Verified by the gate printing `0` on sudo; NOT VERIFIED on doas and on multicall-coreutils distros (Ubuntu 26.04, Alpine), where the install is kept.
+7. Audit: **done** (`a_minted_request_leaves_the_brokers_and_the_gates_records_in_one_chain`). No outcome record; dropping whole trailing records is not detectable from the file.
+8. Differential: **done** (`ci/differential/exec.sh`): sudo, sudo-rs and OpenDoas give the same outcomes.
+
+Still open:
+
+- Broker under the real sandbox, bind-mounted spool included (above).
+- Two gates racing one entry (row 5) and the child's environment (row 11), both unasserted.
+- Doas has no oracle and no `-l -U`; the probe cannot verify it.
+- Multicall `id`: the shipped probe cannot verify there (2026-10-29, C2).
+- D4: the umask fixes landed; the `ido-bin` pty flake was not diagnosed.
+- The FigJam card was not re-stamped; it cannot be edited from here.
+
+Waiting on the user:
+
+- **E2**: when the beta `.deb` ships (human path only).
+- **E3**: homes for vision-mode providers, YAML/JSON permission-set import, pasban's schedule and log checks, and `airead` (proposed M5/M6/phase 5).
+
+---
+
 ## 2026-10-29 — C2: the differential executes, and OpenDoas differs
 
 `ci/differential/exec.sh` installs the real broker (socat as `Accept=yes`, `nofork` so the broker sees the real peer), gate, rules and `xudo install` in each row, then runs `xudo exec` as an unprivileged user through the backend on a pty with the password typed. Cases (`expected/exec.txt`): `id -u` prints 0; a harness-only `expr 1 +` passes exit 2 through; an argv no rule matches and `/bin/sh -c id` both exit 17; a wrong password fails and prints no `0`. `none` exits 19. sudo 24.04 and sudo-rs 26.04 agree; sudo-rs 0.2 refuses to install, as before. Not asserted: that a command printed by the child reached no secret environment (row 11), or two gates racing one entry (row 5).

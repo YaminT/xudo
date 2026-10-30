@@ -81,6 +81,10 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    OpenDoas with identical verdicts. *(C2, row 14; all three identical;
    doas needed `xudo` to stay its parent, see `CONCERNS.md` 2026-10-29)*
 
+**Result, 2026-10-30:** items 1, 2, 3, 4, 7 and 8 done; 5 and 6 partly (doas, and
+multicall distros for the probe). The broker has not run under its real systemd
+sandbox. Detail in `CONCERNS.md`, 2026-10-30.
+
 Rows 6–10 and 16 of the verification table are M3/M4 and are not part of this
 exit. Packaging stays in phase 3.
 
@@ -93,23 +97,23 @@ exit. Packaging stays in phase 3.
 
 ### B. Merge queue, strict order
 
-- **B1. Broker final** (`wf_87180089-132-1`, HEAD `7dcc41a`). Switch
+- **B1. Broker final** *(done)* (`wf_87180089-132-1`, HEAD `7dcc41a`). Switch
   `SO_PEERCRED` to `Syscalls::peer_cred` (pid 0 is its own refusal, tested);
   close CONCERNS open item 8; revisit the "`/run/xudo` not shared across pid
   namespaces" note and keep it only with a reason; wire the audit contract if
   contained, else record D1 as the explicit next item with the stderr record
   kept. One squashed commit; gates; merge.
-- **B2. Doctor round 5** (`wf_87180089-132-3`, HEAD `002230e`). Any line
+- **B2. Doctor round 5** *(done)* (`wf_87180089-132-3`, HEAD `002230e`). Any line
   continuation, both dialects, → `Unverified`/`Maybe`, never `Clean`/`No`;
   tests for every real-sudo/doas case found in rounds 2–4 plus a generated
   property test; observer re-runs the real programs; merge. The oracle (D3) is
   the real fix for this class, and is recorded as such.
-- **B3. Gate** (`wf_2a8abc38-d83-3`, HEAD `8e6152a`). Resume at the observer.
+- **B3. Gate** *(done)* (`wf_2a8abc38-d83-3`, HEAD `8e6152a`). Resume at the observer.
   Rebase onto the merged broker and reconcile three contracts before merging:
   consuming a spool entry that is already gone (`ENOENT`) is a refusal; one
   monotonic clock seam shared with the broker; the exec path takes
   `Authorized<_>` from the step-6 contract. Merge.
-- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). **DONE 2026-10-22** apart from the two items named in exit 6; the root lane is blocking. Finish the executor;
+- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). **Done 2026-10-22; probe done 2026-10-29.** The root lane is blocking. Finish the executor;
   make the post-install probe real against the merged gate (a safe no-op
   request that must execute as uid 0); dotted-filename regression; merge. Its
   real-file tests that need uid 0 join the root lane (`tests/root_*.rs`, run
@@ -155,23 +159,24 @@ exit. Packaging stays in phase 3.
   run as root, `doas -C <file> <cmd>` unprivileged — as the authoritative
   passwordless check, demoting the hand parser to a hint. Four review rounds
   each found a new lexer mismatch; the parser cannot win that race.
-- **D4. Flaky tests, owned.** `ido-bin` PTY `argv_is_never_passed_through_a_shell`
+- **D4. Flaky tests, owned.** *(Partly: two umask-dependent tests fixed; the pty flake is not diagnosed.)* `ido-bin` PTY `argv_is_never_passed_through_a_shell`
   (failed once under load); the `trust.rs` socket tests that hit `SUN_LEN` on a
   long checkout path. Fix, or pin with the reason written beside the test.
-- **D5. CI gaps.** The systemd unit assertions (`xudod/tests/units.rs`) and a
+- **D5. CI gaps.** *(Done: `just units` and the root lane.)* The systemd unit assertions (`xudod/tests/units.rs`) and a
   root-in-container lane for the install tests join `just verify`/CI.
-- **D6. Inventories.** The crate tables in `CLAUDE.md`, `design-plan.md`, and
+- **D6. Inventories.** *(Done: `crate_inventory.rs` holds them.)* The crate tables in `CLAUDE.md`, `design-plan.md`, and
   `README.md` (this directory) name the real workspace members, with `xudod`
   marked in review until B1 lands.
 
 ### E. Closeout and decisions *(user sign-off)*
 
-- **E1. M2b closeout.** Sweep the verification table against the exit test
+- **E1. M2b closeout.** **Done 2026-10-30** (`CONCERNS.md`); the FigJam card is
+  not re-stamped, it cannot be edited from the repo. Sweep the verification table against the exit test
   above; `howiwork.md` "Where the build stands" and the FigJam card re-stamped;
   a dated `CONCERNS.md` entry.
-- **E2. Phase 3 beta `.deb`** — human path only, no `NOPASSWD` shipped. *Decision:
+- **E2. Phase 3 beta `.deb`** *(open)* — human path only, no `NOPASSWD` shipped. *Decision:
   release timing.*
-- **E3. Schedule the `howiwork.md` promises with no milestone:** vision-mode
+- **E3. Schedule the `howiwork.md` promises with no milestone** *(open)*:** vision-mode
   providers, YAML/JSON permission-set import, pasban's schedule and log
   verification, `airead`. *Decision: proposed homes M5/M6/phase 5.*
 
