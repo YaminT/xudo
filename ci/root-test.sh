@@ -78,13 +78,13 @@ image="rust:${channel}-slim"
 take_machine_lock root-test
 
 # Arguments are passed to `cargo test` as separate words, never re-parsed. They
-# come after the fixed ones, so they can add to what runs (`-p aido-sys`, or a
+# come after the fixed ones, so they can add to what runs (`-p xudo-sys`, or a
 # test name after `--`) and cannot remove the selection that keeps the
 # unprivileged suite out of a root run.
 docker run --rm -i \
     -v "$root:/src:ro" \
-    -v aido-linux-cargo:/cache/cargo \
-    -v aido-linux-target:/cache/target \
+    -v xudo-linux-cargo:/cache/cargo \
+    -v xudo-linux-target:/cache/target \
     "$image" bash -s -- "$@" <<'INNER'
 set -euo pipefail
 mkdir -p /work
@@ -92,16 +92,16 @@ mkdir -p /work
 
 # What the install tests need of the machine, which the image does not have:
 # the real `sudo` (the install writes for it, and the tests ask it what a user
-# may run), and one unprivileged account. `aidotest` exists only so that real
+# may run), and one unprivileged account. `xudotest` exists only so that real
 # sudo has someone to authenticate: it has a fixed password that is worth
 # nothing, in a container that is thrown away with the run, and it is not in the
-# `aido` group until a test puts it there. Packages come from the image's own
+# `xudo` group until a test puts it there. Packages come from the image's own
 # apt sources; the cargo caches are volumes, these are not.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends sudo passwd >/dev/null
-useradd --create-home --shell /bin/bash aidotest
-echo 'aidotest:aidotest-fixed-password' | chpasswd
+useradd --create-home --shell /bin/bash xudotest
+echo 'xudotest:xudotest-fixed-password' | chpasswd
 
 # The image's own toolchain, which is the pinned one, asked from outside the
 # checkout: asked from inside it, rustup reads rust-toolchain.toml and downloads
@@ -110,7 +110,7 @@ echo 'aidotest:aidotest-fixed-password' | chpasswd
 toolchain=$(cd / && rustup show active-toolchain | cut -d' ' -f1)
 
 # RUST_TEST_THREADS and RUST_TEST_NOCAPTURE are libtest's own settings: the
-# environment of the tests, not a switch in any aido crate.
+# environment of the tests, not a switch in any xudo crate.
 run() {
     env -i PATH=/usr/local/cargo/bin:/usr/bin:/bin HOME=/work \
         CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target \
@@ -124,20 +124,24 @@ if [[ $(run id -u) != 0 ]]; then
     exit 1
 fi
 # The lane's sentinel: what every root test looks for before it will run as
-# root (crates/aido-tests/src/root_lane.rs). Root tests write the real /etc, replace the
+# root (crates/xudo-tests/src/root_lane.rs). Root tests write the real /etc, replace the
 # installed gate and delete the audit log, so uid 0 alone is not permission to run
 # them: `sudo just test` on a real machine is uid 0 as well. A file, made here
 # and nowhere else, because nothing privileged reads the environment to decide
 # what it may do and a variable is one `export` away. It sits in the container's
 # own `/`, which the copy of the checkout and the tests never write, root-owned
 # and read-only. Its content must match SENTINEL_CONTENT in the guard, which
-# crates/aido-tests/tests/lane_guard_scan.rs holds it to.
-printf '%s\n' 'aido root-test lane: a throwaway container made by ci/root-test.sh' \
-    >/aido-root-test-lane
-chown 0:0 /aido-root-test-lane
-chmod 0400 /aido-root-test-lane
+# crates/xudo-tests/tests/lane_guard_scan.rs holds it to.
+printf '%s\n' 'xudo root-test lane: a throwaway container made by ci/root-test.sh' \
+    >/xudo-root-test-lane
+chown 0:0 /xudo-root-test-lane
+chmod 0400 /xudo-root-test-lane
 echo "root-test: $(uname -sr) $(uname -m), as uid $(run id -u), on the container's own filesystem"
 cd /work
+
+# root_probe.rs drives the real `xudo` binary, which is another package's: build
+# it fresh here so it is never a stale one from the cache volume.
+run cargo build -p xudo-bin
 
 out=$(mktemp)
 run cargo test --workspace --features root-tests --test 'root_*' "$@" 2>&1 | tee "$out"

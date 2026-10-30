@@ -1,0 +1,25 @@
+== /usr/bin/id -u
+0
+exit 0
+== /usr/bin/expr 1 +
+expr: syntax error: missing argument after '+'
+exit 2
+== /usr/bin/id -G
+DENY
+  command   -G
+  reason    argv_rejected
+  trace
+    canonicalized: unchanged (-G)
+    skipped xudo.probe.id: argv does not match the rule's argument list: argument 0 ("-G") does not satisfy effective-uid (literal "-u")
+  next      the action exists but these arguments are not permitted; run `xudo explain -- <argv>` to see which position was rejected
+exit 17
+== /bin/sh -c id
+DENY
+  command   /bin/sh -c id
+  reason    unknown_action
+  trace
+    canonicalized: unchanged (-c id)
+  next      no rule defines this action; run `xudo list` to see what is permitted, or ask an administrator to add a rule
+exit 17
+== wrong password
+failed, ran nothing

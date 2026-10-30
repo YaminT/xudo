@@ -1,19 +1,19 @@
-# aido
+# xudo
 
 **A sudo alternative that lets AI coding agents run an allowlisted set of
 privileged commands without a password, while always prompting humans.**
 Root-owned rule set, compiled-in deny-list, full decision trace. Rust, Linux.
 
-> This README is a derived view. The source of truth for what aido is and how
+> This README is a derived view. The source of truth for what xudo is and how
 > the system behaves is [howiwork.md](howiwork.md); where the two disagree,
 > that file is right and this one is the bug.
 
-> ## Beta. Not externally audited. No privileged path yet.
+> ## Beta. Not externally audited. Password path only.
 >
-> This build **cannot execute anything as root.** `aido explain`, `check`,
-> `list`, `config`, `doctor`, and `agentdoc` inspect the policy and execute
-> nothing. The passwordless agent path, the broker, and out-of-band confirmation
-> are not in this release. See [docs/re.md](docs/re.md) for what is left.
+> `xudo exec` runs an allowlisted command as root after a password prompt,
+> through `sudo`, `sudo-rs` or `doas`. The passwordless agent path and
+> out-of-band confirmation are not built yet. Installing and running it needs
+> root and a running broker. See [docs/re.md](docs/re.md) for what is left.
 
 ## The problem
 
@@ -21,8 +21,8 @@ An agent hits a command needing root. Today you either answer every `sudo`
 prompt yourself — which ends unattended work — or you grant `NOPASSWD: ALL`,
 which is a standing root backdoor for **any** process running as that user.
 
-`aido` is the middle path: a root-owned allowlist of *named actions*. Enrolled
-agent sessions run allowlisted actions passwordless; a human invoking `aido` is
+`xudo` is the middle path: a root-owned allowlist of *named actions*. Enrolled
+agent sessions run allowlisted actions passwordless; a human invoking `xudo` is
 always prompted; a catastrophic-command deny-list is compiled into the binary and
 cannot be edited by configuration.
 
@@ -30,7 +30,7 @@ cannot be edited by configuration.
 
 Said here rather than left for a critic to find.
 
-`aido`'s premise makes the *absence* of proof-of-humanity the thing that grants a
+`xudo`'s premise makes the *absence* of proof-of-humanity the thing that grants a
 privilege, and every cheap signal that a caller is an agent is produced by the
 caller: `CLAUDECODE=1` is an environment variable anyone can export, `argv[0]` is
 chosen by whoever exec'd, `/proc/<pid>/exe` points into a user-writable `$HOME`.
@@ -51,12 +51,12 @@ programs that can be turned into a root shell is not enumerable.
 Nothing here touches privilege.
 
 ```
-aido --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
-aido --rules ./rules explain -- /bin/sh -c id   # no rule names a shell, and one that did would be refused
-aido --rules ./rules doctor                     # backend, probed capabilities, whether the rules are root's,
+xudo --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
+xudo --rules ./rules explain -- /bin/sh -c id   # no rule names a shell, and one that did would be refused
+xudo --rules ./rules doctor                     # backend, probed capabilities, whether the rules are root's,
                                                 # and the other paths to root it can check (--json, --fix);
                                                 # SECURITY.md lists the ones it cannot
-aido --rules ./rules config --schema            # machine-readable settings schema
+xudo --rules ./rules config --schema            # machine-readable settings schema
 ido queue -m "install ripgrep" -- apt-get install -y ripgrep   # buffer it for a human; `ido` to run it
 ```
 
@@ -72,7 +72,7 @@ arguments are constrained position by position. No globs, anywhere:
 
 ```toml
 [[action]]
-id = "aido.svc.lifecycle"
+id = "xudo.svc.lifecycle"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
 args = [

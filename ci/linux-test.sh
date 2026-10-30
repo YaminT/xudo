@@ -50,8 +50,8 @@ take_machine_lock linux-test
 # Arguments are passed to `cargo test` as separate words, never re-parsed.
 docker run --rm -i \
     -v "$root:/src:ro" \
-    -v aido-linux-cargo:/cache/cargo \
-    -v aido-linux-target:/cache/target \
+    -v xudo-linux-cargo:/cache/cargo \
+    -v xudo-linux-target:/cache/target \
     -e TEST_UID="$uid" \
     "$image" bash -s -- "$@" <<'INNER'
 set -euo pipefail

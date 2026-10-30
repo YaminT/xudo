@@ -1,20 +1,20 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/aido-audit",
-  "crates/aido-backend",
-  "crates/aido-config",
-  "crates/aido-gate",
-  "crates/aido-gate-bin",
-  "crates/aido-policy",
-  "crates/aido-sys",
-  "crates/aido-sys-raw",
-  "crates/aido-wire",
-  "crates/aidod",
-  "crates/aidod-bin",
-  "crates/aido",
-  "crates/aido-bin",
-  "crates/aido-tests",
+  "crates/xudo-audit",
+  "crates/xudo-backend",
+  "crates/xudo-config",
+  "crates/xudo-gate",
+  "crates/xudo-gate-bin",
+  "crates/xudo-policy",
+  "crates/xudo-sys",
+  "crates/xudo-sys-raw",
+  "crates/xudo-wire",
+  "crates/xudod",
+  "crates/xudod-bin",
+  "crates/xudo",
+  "crates/xudo-bin",
+  "crates/xudo-tests",
   "crates/ido",
   "crates/ido-bin",
   "crates/term-sanitize",
@@ -30,8 +30,8 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/yamin/aido"
-authors = ["aido contributors"]
+repository = "https://github.com/yamin/xudo"
+authors = ["xudo contributors"]
 
 [workspace.dependencies]
 bstr = { version = "1", default-features = false, features = ["alloc"] }
@@ -84,7 +84,7 @@ indexing_slicing = "deny"
 integer_division = "deny"
 arithmetic_side_effects = "deny"
 disallowed_methods = "deny"
-# Inert everywhere but aido-sys::raw, and set here so the copy in aido-sys's
+# Inert everywhere but xudo-sys::raw, and set here so the copy in xudo-sys's
 # manifest stays identical to this table.
 undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
