@@ -61,21 +61,21 @@ broker() {
 # and Alpine (busybox), which also want their own name in argv[0]. Real GNU
 # ones stand in so the rows can run; reported, not fixed.
 for tool in id expr; do
-    if [ -L /usr/bin/$tool ] && [ -x /usr/bin/gnu$tool ]; then
+    # Alpine has no gnu$tool; its coreutils package is one multicall binary.
+    real=/usr/bin/gnu$tool
+    [ -x $real ] || real=/bin/coreutils
+    if [ -L /usr/bin/$tool ] && [ -x $real ]; then
         rm /usr/bin/$tool
-        cp /usr/bin/gnu$tool /usr/bin/$tool
+        cp $real /usr/bin/$tool
     fi
 done
 
-# `xudo install` for real, with its own probe through the broker. Finding: as
-# root, doas still wants a password the probe cannot give, so the install is
-# rolled back. There the broker starts after the install, which is then NOT
-# VERIFIED; the rest of the row is unaffected.
-[ "$row" = doas ] || broker
+# `xudo install` for real, with its own probe through the broker. doas asks root
+# for a password, so its probe cannot run: installed, NOT VERIFIED.
+broker
 set +e
 /usr/local/bin/xudo install >"$out/install-real.log" 2>&1
 set -e
-[ "$row" = doas ] && broker
 sed -nE -e 's/^verified +(.*)$/install real  verified: \1/p' \
     -e 's/^.*(installed, but NOT VERIFIED).*$/install real  \1/p' \
     "$out/install-real.log" | sort -u >>"$out/report.txt"
@@ -98,7 +98,7 @@ case_() {
     expect /harness/exec.exp "$SU" "$pw" "/usr/local/bin/xudo exec -- $*" >"$out/case.raw" 2>&1
     rc=$?
     set -e
-    tr -d '\r' <"$out/case.raw" | sed 's|^/usr/bin/||' | grep -vi -e '^spawn ' -e password -e '^$' >"$out/case.out" || true
+    tr -d '\r' <"$out/case.raw" | sed -e 's|^/usr/bin/||' -e "s/[‘’]/'/g" | grep -vi -e '^spawn ' -e password -e '^$' >"$out/case.out" || true
     cat "$out/case.out" >>"$res"
     echo "exit $rc" >>"$res"
 }

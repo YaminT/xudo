@@ -22,6 +22,10 @@ pub struct ExecPlan {
     pub backend: &'static str,
     /// The gate, its only argument.
     pub gate: &'static str,
+    /// Run as a child and wait, instead of exec in place. doas does not fork,
+    /// so the pinned process would be the gate itself; the gate only looks at
+    /// its ancestors. sudo forks, so it stays an in-place exec.
+    pub spawn: bool,
 }
 
 /// [`plan`] against this machine's backend and the real broker socket.
@@ -109,6 +113,7 @@ pub fn plan(
             Ok(ExecPlan {
                 backend,
                 gate: GATE_AUTH,
+                spawn: backend == "/usr/bin/doas",
             })
         }
     }
@@ -275,7 +280,8 @@ mod tests {
             result,
             Ok(ExecPlan {
                 backend: "/usr/bin/sudo",
-                gate: GATE_AUTH
+                gate: GATE_AUTH,
+                spawn: false
             })
         );
         assert!(err.is_empty());
@@ -286,6 +292,13 @@ mod tests {
         let reply = decided(allow(), Some(minted(GATE_AUTH)));
         let (result, _, _) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
         assert_eq!(result.unwrap().backend, "/usr/bin/doas");
+    }
+
+    #[test]
+    fn doas_is_run_as_a_child_so_xudo_stays_an_ancestor() {
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let (result, _, _) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
+        assert!(result.unwrap().spawn);
     }
 
     #[test]

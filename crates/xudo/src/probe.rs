@@ -44,6 +44,15 @@ impl InstallProbe for BrokerProbe<'_> {
         let Some((backend, rest)) = plan.split_first() else {
             return unavailable("the plan names nothing to run".to_owned());
         };
+        // doas asks root for a password too. Not a failed install, and nothing
+        // is minted for a probe that cannot run.
+        if Path::new(backend).file_name().is_some_and(|n| n == "doas") {
+            return unavailable(
+                "doas asks root for a password; check with `xudo exec -- /usr/bin/id -u` \
+                 as a member of xudo"
+                    .to_owned(),
+            );
+        }
         let request = BrokerRequest::new(PROGRAM, vec![ARGUMENT.to_owned()], "unattested");
         let response = match ask(self.socket, self.timeout, &request) {
             Ok(response) => response,
@@ -275,6 +284,22 @@ mod tests {
             );
             assert!(gate.1.borrow().is_empty());
         }
+    }
+
+    #[test]
+    fn a_doas_install_is_never_rolled_back_by_a_probe_that_cannot_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = printed("0", true);
+        let probe = BrokerProbe {
+            // Nothing listens: asking the broker would say "unreachable".
+            socket: &dir.path().join("none.sock"),
+            timeout: TIMEOUT,
+            runner: &gate,
+        };
+        let plan = ["/usr/bin/doas", "-n", GATE_AUTH].map(String::from);
+        let text = unavailable(&probe.verify(&plan));
+        assert!(text.contains("asks root for a password"), "{text}");
+        assert!(gate.1.borrow().is_empty());
     }
 
     #[test]

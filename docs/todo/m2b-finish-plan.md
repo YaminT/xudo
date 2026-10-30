@@ -78,8 +78,8 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    `xudo audit` verifies the produced trail and fails after truncation. *(D1,
    row 15)*
 8. The differential matrix executes the same ruleset through sudo, sudo-rs, and
-   OpenDoas with identical verdicts. *(C2, row 14; sudo and sudo-rs identical,
-   OpenDoas differs: a recorded exception, see `CONCERNS.md` 2026-10-29)*
+   OpenDoas with identical verdicts. *(C2, row 14; all three identical;
+   doas needed `xudo` to stay its parent, see `CONCERNS.md` 2026-10-29)*
 
 Rows 6–10 and 16 of the verification table are M3/M4 and are not part of this
 exit. Packaging stays in phase 3.
@@ -130,9 +130,9 @@ exit. Packaging stays in phase 3.
 - **C2. Step 8, executing differential.** **Done 2026-10-29**, in the shell
   harness (`ci/differential/exec.sh`), not `xudo-tests`. The real broker, gate, and
   `xudo install` run in each row; `xudo exec` runs as an unprivileged user on a pty
-  with the password typed. sudo (24.04) and sudo-rs (26.04) give identical
-  outcomes; **OpenDoas does not** (the gate cannot find the entry, because doas
-  does not fork), kept as `expected/exec-doas.txt` until fixed. The tripwire is gone;
+  with the password typed. sudo (24.04), sudo-rs (26.04) and OpenDoas give identical
+  outcomes (doas does not fork, so `xudo` runs it as a child and stays an
+  ancestor of the gate). The tripwire is gone;
   `doctor` now says what `xudo exec` would run.
 
 ### D. Debts to clear before closeout *(parallel with C)*
