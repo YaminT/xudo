@@ -16,6 +16,9 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 >   checksum-verified download becomes the documented install. The reasoning for
 >   why there is no `curl | sh` installer still applies and still belongs in the
 >   README.
+> * **Signing: cosign (keyless).** Release artifacts (the `.deb` and its checksums) are signed with cosign keyless: the GitHub Actions OIDC identity, recorded in the Rekor transparency log. No long-lived key exists to guard.
+> * **Pasban log verification is part of this phase.** A root-owned systemd timer verifies the audit chain and reports loudly when it breaks.
+> * **Publishing waits for the owner's explicit go.** The beta is built and its release workflow is made ready, but no tag or GitHub Release is created without it.
 
 ## 1. The beta ships the human path only
 
@@ -138,7 +141,7 @@ State plainly in the README why there is no `curl | sh` installer. That paragrap
 - **Launchpad PPA** for Ubuntu reach; it is what Ubuntu users look for first.
 - `.rpm` via `cargo-generate-rpm`, `APKBUILD`, `PKGBUILD`, and a Nix module — cheap once the `.deb` maintainer scripts exist, and the Alpine/doas lane is already in the test matrix.
 - `cargo-auditable` in the release build so the shipped binary carries its dependency list; publish an SBOM (CycloneDX or SPDX) per release.
-- Reproducible builds, and sign release artifacts (`minisign` or `cosign`).
+- Reproducible builds, and sign release artifacts with cosign (keyless).
 
 ---
 

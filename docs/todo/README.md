@@ -8,7 +8,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 ## Where the project actually stands
 
-> **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: M3, and the two open decisions there (beta `.deb` timing, homes for the unscheduled `howiwork.md` promises).
+> **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: phase 3 (beta `.deb`, human path only), then M3. Both open decisions from 2026-10-30 are decided; see the milestone sections.
 
 **Done.** The crates in the table below, a working unprivileged executable, and a root broker that mints entries and executes nothing. A row that opens with **in review (M2b).** is a crate built in a lane's worktree and not yet a workspace member; merging it deletes the marker. `crates/xudo-tests/tests/crate_inventory.rs` fails the build when this table and `Cargo.toml` disagree.
 
@@ -105,6 +105,8 @@ The milestone the product exists for, deliberately last among the load-bearing o
 
 ### M5 — temporary permissions, narrowing, volume controls
 
+Scheduled 2026-10-30: pasban's grant expiry and the YAML/JSON permission-set import land here.
+
 **Temporary permissions** (added 2026-10-21; the behaviour is specified in `../../howiwork.md` § Temporary permissions). Needs M4: before the passwordless path exists, every request asks for a password anyway. In order:
 
 1. **Permission sets in the rule files.** A `[[set]]` construct naming a group of actions (prerequisite for set grants and for the predefined sets), plus two action/set keys: `grant-only` (defined and reviewed, dormant until granted) and `max-grant` (this permission's ceiling). `deny_unknown_fields`, tested in `shipped_rules.rs`, GTFOBins-gated like any rule.
@@ -117,6 +119,8 @@ The milestone the product exists for, deliberately last among the load-bearing o
 Then the rest of M5: `trust.d` records over (agent × project × action class) with mandatory reason and expiry, for standing narrowing over days or weeks; `--unattended` as a non-persistable per-invocation flag; a banner and a high-severity audit record on every use. Token buckets escalating annotate → force confirmation even under a grant → deny and notify, plus a separate rule-novelty bucket.
 
 ### M6 — ergonomics, profiles, harness integration
+
+Scheduled 2026-10-30: `airead` (the read-only twin) lands here.
 
 The verb surface (`xudo pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previews rendered into the confirmation prompt, `xudo init`, `xudo mcp`, EPERM shell hints, audit query with session replay, `check --fuzz`, `rule list|test`, and `ido` running a queued entry through `xudo exec` (phase 4 § 8, second half). The `AGENTS.md` block becomes v2 and gains one line: *never run `ido run` or `ido drop`*. An agent that runs them gains nothing it could not do by running the command itself — `ido` holds no privilege, and a queued `sudo` has no terminal to prompt on — but the block should say so rather than rely on it.
 
@@ -144,6 +148,12 @@ Differential compliance matrix across sudo / sudo-rs / OpenDoas × distro × arc
 
 ---
 
+### M8 — vision mode
+
+Vision mode adds AI assistance on top of blind mode, through a configured provider. A model may only reject, defer, or annotate a request; it can never approve one. Blind mode is always on, and no configuration lets the absence of AI widen what passes. Scheduled 2026-10-30: M8, after M7's external audit.
+
+---
+
 ## Recommended sequence
 
 Strict numerical order is the wrong order. Two changes are worth making deliberately.
@@ -159,7 +169,8 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        install and its probe, the audit trail through both
                        binaries, the executing differential. Gaps: the broker
                        under its real systemd sandbox; doas verification.
-6. Phase 3             beta .deb + publish, human path only, no NOPASSWD shipped.
+6. Phase 3             NEXT (decided 2026-10-30). beta .deb + publish, human path
+                       only, no NOPASSWD shipped.
                        Ships xudod too: without the nopass hardlink it grants
                        nothing a password did not.
 7. M3                  out-of-band confirmation on the broker from M2b.
@@ -167,6 +178,7 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
 9. M5, M6              narrowing, grants, verbs, harness integration.
 10. Phase 5 (part 2)   predefined profiles, config introspection.
 11. M7                 confinement, signing, external audit.
+12. M8                 vision mode, after the external audit.
 ```
 
 M2b moved down the list on purpose: writing syscall code that has never executed
@@ -182,6 +194,8 @@ harness is M2b's step 0 and not an afterthought. The reasoning is in
 **Why `ido` moves before the passwordless path.** `ido` needs no root, no cgroups, no broker, and no policy engine. It delivers the entire "the agent cannot run this, so a human runs it" story with none of M4's risk, and it makes the product useful to someone who would never enable a `NOPASSWD` rule. It is also the natural landing place for `xudo`'s `HumanPathOnly` and `NoConfirmationChannel` denials — see phase 4.
 
 **Why phase 3 ships before M3/M4.** The earliest defensible publication point is right after M2, when the tool is a hardened always-prompting sudo front-end. The beta `.deb` must **not** install the `NOPASSWD` hardlink or its sudoers rule at all; that arrives with M4 behind an explicit opt-in. Publishing a passwordless-root mechanism before an external audit, with no reviewed enrollment path, would be indefensible.
+
+Scheduled 2026-10-30: pasban's audit-log verification is part of this phase, because the log exists now. It is a root-owned systemd timer that verifies the audit chain and reports loudly.
 
 ---
 
@@ -200,3 +214,5 @@ harness is M2b's step 0 and not an afterthought. The reasoning is in
 7. **DECIDED 2026-10-14: the gate executable is `xudo-gate-bin`**, the same shape as `xudo-bin` and `ido-bin`, so the pure `xudo-gate` library stays measured at 100% and the binary is tested through real processes.
 8. **DECIDED 2026-10-14: Linux tests run in Docker, as a non-root user, on a copy of the checkout.** A VM is for the kernel-version matrix and for M4's systemd scopes only. The old "blocked on a VM" was true of the machine, not of the work.
 9. **DECIDED 2026-10-14, amended 2026-10-19: the `xudo-sys-raw` crate holds the five syscalls that need `unsafe`** — `execveat`, `close_range`, `SO_PEERPIDFD`, `SO_PEERCRED`, `PIDFD_GET_INFO` — because rustix 1.1 wraps the rest of what the gate and broker are known to need without `unsafe`, and decodes `SO_PEERCRED` unsoundly (budget 6, decided 2026-10-19; see `../CONCERNS.md`). Two foreseeable additions are not in it: `fork`, if the gate outlives the command it runs, and a per-descriptor `fcntl` fallback below 5.11. Each is a budget change decided with the gate.
+10. **DECIDED 2026-10-30: beta timing.** Phase 3 (beta `.deb`, human path only) is built next, before M3. Publishing waits for the owner's explicit go.
+11. **DECIDED 2026-10-30: homes for the unscheduled promises.** Phase 3 (pasban log verification), M5 (grant expiry, YAML/JSON import), M6 (`airead`), M8 (vision mode).

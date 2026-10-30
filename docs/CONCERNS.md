@@ -4,6 +4,24 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-10-30 — Decisions: release, roadmap homes, signing, outcomes
+
+Six decisions by the project owner, 2026-10-30.
+
+- **Beta timing (E2):** build phase 3 (beta `.deb`, human path only) next, before M3.
+- **Homes for the unscheduled promises (E3):**
+  - pasban audit-log verification: phase 3 (the log exists now).
+  - pasban grant expiry: M5, with temporary grants.
+  - YAML/JSON permission-set import: M5.
+  - `airead` (read-only twin): M6.
+  - vision mode: M8, after M7's external audit.
+- **Signing:** cosign keyless, GitHub Actions OIDC identity, Rekor log. No long-lived key to guard. This settles "minisign or cosign" in phase 3.
+- **Publishing:** the beta is built and its release workflow made ready. No tag or GitHub Release without the owner's explicit go.
+- **Command outcomes are not audited:** the gate execs in place. The authorization record is the security fact; the exit status goes to the caller. No fork in the gate, which keeps root code fork-free.
+- **doas in the doctor oracle:** ask `doas -C` (unprivileged) about a fixed set of telling commands and report any `permit nopass`. Being built by another agent now.
+
+---
+
 ## 2026-10-30 — M2b closeout (E1)
 
 M2b is done in code and tests on branch `xudo-exec`, with the gaps below.
@@ -27,10 +45,7 @@ Still open:
 - D4: the umask fixes landed; the `ido-bin` pty flake was not diagnosed.
 - The FigJam card was not re-stamped; it cannot be edited from here.
 
-Waiting on the user:
-
-- **E2**: when the beta `.deb` ships (human path only).
-- **E3**: homes for vision-mode providers, YAML/JSON permission-set import, pasban's schedule and log checks, and `airead` (proposed M5/M6/phase 5).
+Waiting on the user: decided 2026-10-30; see the entry above.
 
 ---
 
