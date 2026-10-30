@@ -102,73 +102,32 @@ fn a_probe_that_passes_is_what_makes_an_install_verified() {
 }
 
 #[test]
-fn a_failed_probe_takes_off_what_the_install_put_on() {
-    // An integration that is installed and not in effect looks installed.
-    let ops = FakeInstallOps::root();
-    let err = execute(
-        &sudo_plan(),
-        &ops,
-        &Probe(ProbeResult::Failed {
-            reason: "no rule permits it".to_owned(),
-        }),
-    )
-    .unwrap_err();
-    assert!(matches!(err, InstallError::ProbeFailed { .. }), "{err}");
-    assert!(
-        ops.calls()
-            .contains(&"remove_managed /etc/sudoers.d/xudo".to_owned())
-    );
-}
-
-#[test]
-fn a_failed_probe_that_cannot_clean_up_says_what_it_left() {
-    let ops = FakeInstallOps::root().failing("remove_managed");
-    let err = execute(
-        &sudo_plan(),
-        &ops,
-        &Probe(ProbeResult::Failed {
-            reason: "x".to_owned(),
-        }),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, InstallError::LeftBehind { path, cause, .. }
-            if path == "/etc/sudoers.d/xudo"
-                && matches!(**cause, InstallError::ProbeFailed { .. })),
-        "{err}"
-    );
-}
-
-#[test]
-fn a_failed_probe_removes_a_block_it_appended() {
-    let ops = FakeInstallOps::root();
-    let err = execute(
-        &doas_block_plan(),
-        &ops,
-        &Probe(ProbeResult::Failed {
-            reason: "x".to_owned(),
-        }),
-    )
-    .unwrap_err();
-    assert!(matches!(err, InstallError::ProbeFailed { .. }));
-    assert!(
-        ops.calls()
-            .contains(&"remove_block /etc/doas.conf".to_owned())
-    );
-}
-
-#[test]
-fn a_failed_probe_that_cannot_remove_a_block_says_what_it_left() {
-    let ops = FakeInstallOps::root().failing("remove_block");
-    let err = execute(
-        &doas_block_plan(),
-        &ops,
-        &Probe(ProbeResult::Failed {
-            reason: "x".to_owned(),
-        }),
-    )
-    .unwrap_err();
-    assert!(matches!(err, InstallError::LeftBehind { .. }), "{err}");
+fn a_probe_that_fails_keeps_the_validated_install_and_is_not_verified() {
+    // The gate may refuse for a reason that is not the snippet's (a multicall
+    // `id`). The snippet passed the backend's parser, so it stays.
+    for plan in [sudo_plan(), doas_block_plan()] {
+        let ops = FakeInstallOps::root();
+        let report = execute(
+            &plan,
+            &ops,
+            &Probe(ProbeResult::Failed {
+                reason: "no rule permits it".to_owned(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&report.verification, Verification::Unverified { reason }
+                if reason == "the probe ran and failed: no rule permits it"),
+            "{report:?}"
+        );
+        assert!(
+            !ops.calls()
+                .iter()
+                .any(|c| c.starts_with("remove_managed") || c.starts_with("remove_block")),
+            "a failed probe took the install off: {:?}",
+            ops.calls()
+        );
+    }
 }
 
 #[test]

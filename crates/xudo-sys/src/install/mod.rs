@@ -248,12 +248,6 @@ pub enum InstallError {
         /// The operating system's account.
         reason: String,
     },
-    /// The functional probe ran and the integration is not in effect.
-    #[error("the functional probe failed, so the integration was removed: {reason}")]
-    ProbeFailed {
-        /// What the probe observed.
-        reason: String,
-    },
     /// An install that failed and then could not clean up after itself.
     #[error("{cause}; and then {path} could not be removed: {reason}")]
     LeftBehind {
@@ -274,7 +268,7 @@ pub enum InstallError {
 pub enum ProbeResult {
     /// The gate ran through the backend and printed `0`.
     Verified,
-    /// It ran and the integration is not in effect.
+    /// It ran and did not print `0`. The install stays, reported unverified.
     Failed {
         /// What it saw.
         reason: String,
@@ -491,8 +485,8 @@ impl Installer for RefusingInstaller {
 ///
 /// Every refusal listed in the module documentation, and any failure of a step.
 /// The candidate this run created is removed; the previous state of every file
-/// is otherwise as it was, except that a failed functional probe removes what
-/// this run installed.
+/// is otherwise as it was. A functional probe that fails is not an error: the
+/// validated install stays and the report says [`Verification::Unverified`].
 pub fn execute(
     plan: &InstallPlan,
     ops: &dyn InstallOps,
@@ -621,19 +615,13 @@ struct Candidate {
     identity: FileIdentity,
 }
 
-/// What an install put on the machine, so a failed probe can take it off.
-enum Installed {
-    File(String),
-    Block(String),
-}
-
 /// One execution's state.
 #[derive(Default)]
 struct Run {
     candidate: Option<Candidate>,
     validated: bool,
     armed: Option<Vec<String>>,
-    installed: Vec<Installed>,
+    wrote: bool,
     events: Vec<String>,
     notices: Vec<String>,
     verification: Option<Verification>,
@@ -715,7 +703,7 @@ impl Run {
                 ops.install(from, to, candidate.identity)?;
                 self.candidate = None;
                 self.validated = false;
-                self.installed.push(Installed::File(to.clone()));
+                self.wrote = true;
                 self.events.push(format!("installed {to}"));
             }
             PlanStep::AppendBlock { path, block } => {
@@ -723,7 +711,7 @@ impl Run {
                     reason: "a block appended with no validator named before it",
                 })?;
                 ops.append_block(path, block, &validator)?;
-                self.installed.push(Installed::Block(path.clone()));
+                self.wrote = true;
                 self.events.push(format!("set xudo's block in {path}"));
             }
             PlanStep::RemoveBlock { path, .. } => {
@@ -744,9 +732,11 @@ impl Run {
                 self.verification = Some(match probe.verify(argv) {
                     ProbeResult::Verified => Verification::Verified,
                     ProbeResult::Unavailable { reason } => Verification::Unverified { reason },
-                    ProbeResult::Failed { reason } => {
-                        return Err(InstallError::ProbeFailed { reason });
-                    }
+                    // It ran and the answer was wrong. The snippet passed the
+                    // backend's own parser, so it stays; the operator is told.
+                    ProbeResult::Failed { reason } => Verification::Unverified {
+                        reason: format!("the probe ran and failed: {reason}"),
+                    },
                 });
             }
             PlanStep::Notice { text } => self.notices.push(text.clone()),
@@ -790,28 +780,11 @@ impl Run {
                 };
             }
         }
-        if matches!(error, InstallError::ProbeFailed { .. }) {
-            // An integration that is installed and not in effect looks
-            // installed. Take off exactly what this run put on.
-            for item in self.installed.drain(..).rev() {
-                let (path, outcome) = match &item {
-                    Installed::File(path) => (path, ops.remove_managed(path)),
-                    Installed::Block(path) => (path, ops.remove_block(path)),
-                };
-                if let Err(failed) = outcome {
-                    error = InstallError::LeftBehind {
-                        path: path.clone(),
-                        reason: failed.to_string(),
-                        cause: Box::new(error),
-                    };
-                }
-            }
-        }
         error
     }
 
     fn report(self, backend: BackendKind) -> InstallReport {
-        let wrote = !self.installed.is_empty();
+        let wrote = self.wrote;
         let verification = self.verification.unwrap_or(if wrote {
             Verification::Unverified {
                 reason: "the plan has no functional probe".to_owned(),

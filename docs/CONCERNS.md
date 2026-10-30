@@ -12,7 +12,7 @@ Findings, none fixed here:
 
 - **OpenDoas: `xudo exec` was refused by the gate** (`gate_no_pending_request`, exit 19). doas execs the gate without forking, so the pinned process was the gate itself, and the gate looks only at ancestors. **Fixed** in the front-end: for doas `xudo` runs the backend as a child and waits (`ExecPlan::spawn`), so it stays an ancestor; sudo keeps the in-place exec. The gate is unchanged, and the row now matches `expected/exec.txt`. Test: `doas_is_run_as_a_child_so_xudo_stays_an_ancestor`.
 - **OpenDoas: `xudo install` as root was rolled back.** The probe ran `doas -n` as root, which still asks for a password (`permit persist :xudo`). **Fixed**: the probe returns `Unavailable` for doas before asking the broker, so the install stays, reported NOT VERIFIED with the way to check by hand. Test: `a_doas_install_is_never_rolled_back_by_a_probe_that_cannot_ask`.
-- **The gate refuses `/usr/bin/id`, the install probe's program, on Ubuntu 26.04 and Alpine.** There it is a symlink to a multicall binary (uutils, busybox). The symlink refusal is by design; the shipped probe action therefore cannot verify on those distributions. The harness swaps in GNU `gnuid` (26.04) or `apk add coreutils` (Alpine).
+- **The gate refuses `/usr/bin/id`, the install probe's program, on Ubuntu 26.04 and Alpine.** There it is a symlink to a multicall binary (uutils, busybox). The symlink refusal is by design; the shipped probe action therefore cannot verify on those distributions. A probe that ran and did not print `0` therefore leaves the validated snippet in place and reports NOT VERIFIED (exit 19) with "the probe ran and failed: ..."; the user chose that on 2026-10-30, so only a backend rejection or a write failure rolls an install back. The harness swaps in GNU `gnuid` (26.04) or `apk add coreutils` (Alpine).
 
 `doctor` no longer says the exec path is absent: it says which backend `xudo exec` would run, or that there is none.
 
@@ -36,7 +36,7 @@ backend's own `sudo -l -U <member of xudo>` did not say the gate is missing (an
 empty group, or doas, cannot be asked and does not block it). Broker
 unreachable, refusing or denying, or no entry minted: *unavailable*, so
 `NOT VERIFIED`, exit 19, nothing rolled back. The gate ran and was wrong:
-*failed*, and the install is taken off again.
+*failed*, which is also `NOT VERIFIED` and also keeps the install (changed 2026-10-30).
 
 What it does **not** prove. The probe runs as root, which `sudo` never prompts,
 so the gate ran on root's own sudoers rule, not the `%xudo` snippet: the snippet
