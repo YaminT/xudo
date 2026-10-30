@@ -70,6 +70,7 @@ fn input(path: &str) -> Input<'_> {
         user_path: Some(OsStr::new(path)),
         backend_exe: Some(Path::new("/usr/bin/sudo")),
         sudo_exe: None,
+        doas_exe: None,
     }
 }
 
@@ -93,6 +94,7 @@ fn writable_at(finding: &Finding) -> Option<(String, String, Via)> {
         }
         Finding::PasswordlessRule { .. }
         | Finding::BackendListing { .. }
+        | Finding::DoasNopass { .. }
         | Finding::GroupMembership { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -104,6 +106,7 @@ fn writers_of(finding: &Finding) -> Option<&[Writer]> {
         Finding::Writable { writers, .. } => Some(writers),
         Finding::PasswordlessRule { .. }
         | Finding::BackendListing { .. }
+        | Finding::DoasNopass { .. }
         | Finding::GroupMembership { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -121,6 +124,7 @@ fn rule_of(finding: &Finding) -> Option<(String, usize, Grant, Applies)> {
         } => Some((file.display().to_string(), *line, *grant, *applies_to_you)),
         Finding::GroupMembership { .. }
         | Finding::BackendListing { .. }
+        | Finding::DoasNopass { .. }
         | Finding::Writable { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -138,6 +142,7 @@ fn group_of(finding: &Finding) -> Option<(String, bool, bool, bool)> {
         } => Some((group.clone(), *passwordless, *listed, *active)),
         Finding::PasswordlessRule { .. }
         | Finding::BackendListing { .. }
+        | Finding::DoasNopass { .. }
         | Finding::Writable { .. }
         | Finding::RelativePathEntry { .. } => None,
     }
@@ -1264,6 +1269,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
             user_path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
             backend_exe: None,
             sudo_exe: None,
+            doas_exe: None,
         },
     );
     let path = check(&unknown, CheckId::UserPath);
@@ -1297,6 +1303,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
             user_path: Some(OsStr::new("/home/yamin/bin:/usr/bin")),
             backend_exe: Some(Path::new("/opt/gone/sudo")),
             sudo_exe: None,
+            doas_exe: None,
         },
     );
     assert_eq!(check(&gone, CheckId::UserPath).examined, 2);
@@ -3864,4 +3871,166 @@ fn one_reason_is_given_once_however_many_users_share_it() {
     let host = root_with_alice().sudo_says("alice", Answer::Unavailable("same".to_owned()));
     let host = host.sudo_says("bob", Answer::Unavailable("same".to_owned()));
     assert_eq!(asked(&host).checks[0].unverified.len(), 1);
+}
+
+// doas asked about a fixed set of commands, once per config file.
+
+const CONF: &str = "/etc/doas.conf";
+const DROP_IN: &str = "/etc/doas.d/50-t.conf";
+
+fn asked_doas(host: &dyn HostView) -> Report {
+    assess(
+        host,
+        &Input {
+            doas_exe: Some("/usr/bin/doas"),
+            ..input("/usr/bin")
+        },
+    )
+}
+
+/// A host with a config and a drop-in, doas answering `answer` for every
+/// command on both.
+fn doas_host(host: MemoryHost, answer: &Answer) -> MemoryHost {
+    let mut host = host
+        .dir("/etc/doas.d", 0, 0, 0o755)
+        .file(CONF, 0, 0, 0o644, b"")
+        .file(DROP_IN, 0, 0, 0o644, b"");
+    for file in [CONF, DROP_IN] {
+        for command in DOAS_ASKED {
+            host = host.doas_says(file, command, answer.clone());
+        }
+    }
+    host
+}
+
+fn nopass() -> Answer {
+    Answer::Passwordless("permit nopass".to_owned())
+}
+
+#[test]
+fn doas_permit_nopass_for_a_shell_is_a_finding_the_parser_missed() {
+    // The drop-in's rule is one `doas -C` on the main file alone calls deny.
+    let host = doas_host(clean(), &Answer::Nothing).doas_says(DROP_IN, "/bin/sh", nopass());
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Found);
+    assert_eq!(
+        rules.findings,
+        [Finding::DoasNopass {
+            command: "/bin/sh".to_owned(),
+            file: PathBuf::from(DROP_IN),
+        }]
+    );
+}
+
+#[test]
+fn a_deny_in_one_file_does_not_hide_a_nopass_in_another() {
+    let host = doas_host(clean(), &Answer::Nothing).doas_says(CONF, "/usr/bin/env", nopass());
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Found);
+    assert_eq!(rules.findings.len(), 1);
+}
+
+#[test]
+fn an_unreadable_doas_config_is_unverified_not_clean() {
+    let host = doas_host(
+        clean(),
+        &Answer::Unavailable("doas -C gave no verdict".to_owned()),
+    );
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert_eq!(rules.unverified.len(), 1);
+}
+
+#[test]
+fn doas_denying_or_asking_a_password_is_clean() {
+    let host = doas_host(clean(), &Answer::Nothing);
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Clean, "{rules:?}");
+    assert!(rules.note.as_deref().unwrap().contains("doas itself"));
+}
+
+#[test]
+fn one_unanswered_command_leaves_doas_unverified() {
+    let host = doas_host(clean(), &Answer::Nothing).doas_says(
+        DROP_IN,
+        "/usr/bin/env",
+        Answer::Unavailable("garbled".to_owned()),
+    );
+    assert_eq!(asked_doas(&host).checks[0].status, Status::Unverified);
+}
+
+#[test]
+fn as_root_doas_is_not_asked_because_it_would_answer_for_root() {
+    // Scripted nopass answers are never consulted.
+    let host = doas_host(clean_for(root_caller()), &nopass());
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert_eq!(rules.unverified[0].reason, DOAS_USER_NEEDED);
+}
+
+#[test]
+fn only_a_bounded_number_of_doas_files_are_asked() {
+    let mut host = clean().dir("/etc/doas.d", 0, 0, 0o755);
+    for n in 0..MAX_ASKED + 2 {
+        let file = format!("/etc/doas.d/{n:02}.conf");
+        host = host.file(&file, 0, 0, 0o644, b"");
+        for command in DOAS_ASKED {
+            host = host.doas_says(&file, command, Answer::Nothing);
+        }
+    }
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Unverified);
+    assert!(rules.unverified[0].reason.contains("first 16"), "{rules:?}");
+}
+
+#[test]
+fn a_parser_finding_stays_when_doas_cannot_be_asked() {
+    let host = clean().file(CONF, 0, 0, 0o644, b"permit nopass yamin\n");
+    let rules = &asked_doas(&host).checks[0];
+    assert_eq!(rules.status, Status::Found);
+    assert!(rules.unverified.is_empty(), "{rules:?}");
+}
+
+#[test]
+fn doas_says_only_deny_permit_or_permit_nopass() {
+    assert_eq!(
+        read_doas("permit nopass\n"),
+        Answer::Passwordless("permit nopass".to_owned())
+    );
+    assert_eq!(read_doas("permit\n"), Answer::Nothing);
+    assert_eq!(read_doas("deny\n"), Answer::Nothing);
+    // Anything else is a failure, never a deny: an empty reply, an error, a
+    // translation, or a nopass tucked into other words.
+    for reply in [
+        "",
+        "doas: could not open config file",
+        "permit nopass x",
+        "Permit",
+    ] {
+        assert!(
+            matches!(read_doas(reply), Answer::Unavailable(_)),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn the_default_host_cannot_ask_doas() {
+    let host = Scripted::new(clean());
+    let file = Path::new(CONF);
+    assert!(matches!(
+        host.ask_doas("/usr/bin/doas", file, "/bin/sh"),
+        Answer::Unavailable(_)
+    ));
+    assert!(matches!(
+        clean().ask_doas("/usr/bin/doas", file, "/bin/sh"),
+        Answer::Unavailable(_)
+    ));
+}
+
+#[test]
+fn a_note_already_there_is_kept_beside_the_doas_one() {
+    let host = doas_host(clean(), &Answer::Nothing).unreadable_file("/etc/sudoers", 0, 0, 0o440);
+    let note = asked_doas(&host).checks[0].note.clone().unwrap();
+    assert!(note.contains("could not be read") && note.contains("doas itself"));
 }

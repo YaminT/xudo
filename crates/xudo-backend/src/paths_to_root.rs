@@ -71,7 +71,7 @@ use serde::{Serialize, Serializer};
 
 pub use config::Grant;
 pub use memory::MemoryHost;
-pub use oracle::{Answer, ROOT_NEEDED, read_listing};
+pub use oracle::{Answer, DOAS_ASKED, DOAS_USER_NEEDED, ROOT_NEEDED, read_doas, read_listing};
 pub use proposals::{Proposal, propose};
 
 use accounts::{Account, GroupEntry};
@@ -310,6 +310,13 @@ pub trait HostView {
     fn ask_sudo(&self, _exe: &str, _user: &str) -> Answer {
         Answer::Unavailable("this host cannot ask sudo".to_owned())
     }
+
+    /// What the doas at `exe` says about running `command` as the caller,
+    /// reading only the config `file` (`doas -C`): passwordless, or not.
+    /// Unavailable unless a host can ask.
+    fn ask_doas(&self, _exe: &str, _file: &Path, _command: &str) -> Answer {
+        Answer::Unavailable("this host cannot ask doas".to_owned())
+    }
 }
 
 /// The answer to one question about a path.
@@ -385,6 +392,8 @@ pub struct Input<'a> {
     pub backend_exe: Option<&'a Path>,
     /// The sudo or sudo-rs executable to ask; `None` for doas or no backend.
     pub sudo_exe: Option<&'a str>,
+    /// The doas executable to ask; `None` for sudo or no backend.
+    pub doas_exe: Option<&'a str>,
 }
 
 /// The whole report.
@@ -515,6 +524,14 @@ pub enum Finding {
         user: String,
         /// The lines of its listing that say so.
         listing: String,
+    },
+    /// doas itself (`doas -C`) permits `command` for you without a password.
+    DoasNopass {
+        /// The command it was asked about.
+        command: String,
+        /// The config file it was asked with.
+        #[serde(serialize_with = "display")]
+        file: PathBuf,
     },
     /// Membership of a group that is root, or a way to it.
     GroupMembership {
@@ -1032,13 +1049,14 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     let unmodelled = unmodelled.into_iter().map(|gap| gap.at).collect();
     // The reader's gaps wait here: sudo's own answer may settle them.
     let reader_gaps = std::mem::take(&mut sink.unverified);
-    for file in doas_files(ctx, &mut sink) {
-        let read = ctx.host.read(&file);
-        if let Some(bytes) = sink.take(&file, read) {
+    let doas_files = doas_files(ctx, &mut sink);
+    for file in &doas_files {
+        let read = ctx.host.read(file);
+        if let Some(bytes) = sink.take(file, read) {
             sink.unverified
-                .extend(unmodelled_gap(&file, &config::doas_unmodelled(&bytes)));
+                .extend(unmodelled_gap(file, &config::doas_unmodelled(&bytes)));
             for rule in config::scan_doas(&bytes) {
-                sink.findings.push(passwordless(ctx, &file, &rule));
+                sink.findings.push(passwordless(ctx, file, &rule));
             }
         }
     }
@@ -1048,6 +1066,8 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     } else {
         sink.unverified.splice(0..0, reader_gaps);
     }
+
+    ask_doas(ctx, input.doas_exe, &doas_files, &mut sink, &mut note);
 
     ConfigOutcome {
         check: sink.into_check(CheckId::PasswordlessRules, note),
@@ -1132,6 +1152,56 @@ fn ask_sudo(
                     .map(|gap| Unverified::new(exe_path, exe_path, gap)),
             );
         }
+    }
+}
+
+/// Asks doas about the fixed commands, once per config file the reader read:
+/// `doas -C` does not follow `/etc/doas.d`. A `permit nopass` is a finding; a
+/// failure leaves the check unverified; the reader's findings stand either way.
+fn ask_doas(
+    ctx: &Ctx<'_>,
+    exe: Option<&str>,
+    files: &[PathBuf],
+    sink: &mut Sink,
+    note: &mut Option<String>,
+) {
+    let Some(exe) = exe else { return };
+    // As root it would answer for root.
+    let mut gaps: Vec<String> = ctx
+        .subject
+        .is_root
+        .then(|| DOAS_USER_NEEDED.to_owned())
+        .into_iter()
+        .collect();
+    let asked = if gaps.is_empty() { files } else { &[] };
+    if asked.len() > MAX_ASKED {
+        gaps.push(format!("only the first {MAX_ASKED} doas files were asked"));
+    }
+    for file in asked.iter().take(MAX_ASKED) {
+        for command in DOAS_ASKED {
+            match ctx.host.ask_doas(exe, file, command) {
+                Answer::Passwordless(_) => sink.findings.push(Finding::DoasNopass {
+                    command: command.to_owned(),
+                    file: file.clone(),
+                }),
+                Answer::Unavailable(reason) if !gaps.contains(&reason) => gaps.push(reason),
+                Answer::Nothing | Answer::Unavailable(_) => {}
+            }
+        }
+    }
+    if !gaps.is_empty() && sink.findings.is_empty() {
+        let exe_path = Path::new(exe);
+        sink.unverified.extend(
+            gaps.iter()
+                .map(|gap| Unverified::new(exe_path, exe_path, gap)),
+        );
+    }
+    if gaps.is_empty() {
+        let asked = format!("doas itself was asked about {}", DOAS_ASKED.join(", "));
+        *note = Some(
+            note.take()
+                .map_or(asked.clone(), |old| format!("{old}; {asked}")),
+        );
     }
 }
 

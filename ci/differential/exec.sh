@@ -115,3 +115,18 @@ expect /harness/exec.exp "$SU" wrong "/usr/local/bin/xudo exec -- /usr/bin/id -u
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && ! tr -d '\r' <"$out/wrong.raw" | grep -qx 0; then echo "failed, ran nothing" >>"$res"; else echo "UNEXPECTED rc=$rc" >>"$res"; fi
+
+# doas asked about telling commands (doctor, as the user: doas -C answers for
+# the caller). `-C` does not follow /etc/doas.d, so the rule goes there, and a
+# deny in the main file must not hide it.
+if [ "$row" = doas ]; then
+    echo "deny xudotest cmd /usr/bin/env" >>/etc/doas.conf
+    echo "permit nopass xudotest as root cmd /usr/bin/env" >/etc/doas.d/50-t.conf
+    chmod 644 /etc/doas.conf /etc/doas.d/50-t.conf
+    chmod 755 /etc/doas.d
+    set +e
+    $SU xudotest -c "/usr/local/bin/xudo --rules /rules doctor" >"$out/doctor-doas.txt" 2>&1
+    set -e
+    grep -o 'doas itself permits [^ ]* for you without a password, by [^ ]*' "$out/doctor-doas.txt" |
+        sed 's/^/doctor      /' >>"$out/report.txt"
+fi

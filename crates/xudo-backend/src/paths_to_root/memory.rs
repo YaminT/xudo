@@ -52,6 +52,7 @@ pub struct MemoryHost {
     nodes: BTreeMap<PathBuf, Node>,
     writable: BTreeSet<PathBuf>,
     sudo: BTreeMap<String, Answer>,
+    doas: BTreeMap<(PathBuf, String), Answer>,
 }
 
 impl MemoryHost {
@@ -62,6 +63,7 @@ impl MemoryHost {
             nodes: BTreeMap::new(),
             writable: BTreeSet::new(),
             sudo: BTreeMap::new(),
+            doas: BTreeMap::new(),
         }
     }
 
@@ -69,6 +71,14 @@ impl MemoryHost {
     #[must_use]
     pub fn sudo_says(mut self, user: &str, answer: Answer) -> Self {
         self.sudo.insert(user.to_owned(), answer);
+        self
+    }
+
+    /// What `doas -C file` says about `command`; unasked ones are unavailable.
+    #[must_use]
+    pub fn doas_says(mut self, file: &str, command: &str, answer: Answer) -> Self {
+        self.doas
+            .insert((PathBuf::from(file), command.to_owned()), answer);
         self
     }
 
@@ -354,6 +364,13 @@ impl HostView for MemoryHost {
         }
         self.sudo
             .get(user)
+            .cloned()
+            .unwrap_or_else(|| Answer::Unavailable("nothing was scripted".to_owned()))
+    }
+
+    fn ask_doas(&self, _exe: &str, file: &Path, command: &str) -> Answer {
+        self.doas
+            .get(&(file.to_path_buf(), command.to_owned()))
             .cloned()
             .unwrap_or_else(|| Answer::Unavailable("nothing was scripted".to_owned()))
     }

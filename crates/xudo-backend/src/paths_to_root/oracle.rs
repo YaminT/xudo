@@ -42,3 +42,27 @@ pub fn read_listing(reply: &str) -> Answer {
         Answer::Unavailable("its reply was neither a listing nor a refusal".to_owned())
     }
 }
+
+/// Why root cannot ask doas: `doas -C` answers for whoever runs it.
+pub const DOAS_USER_NEEDED: &str = "run `xudo doctor` as the user, not root, to ask doas itself";
+
+/// The commands `doas -C` is asked about. A shell; a harmless probe a narrow
+/// rule often names; xudo's own gate; and `env`, which runs anything.
+pub const DOAS_ASKED: [&str; 4] = [
+    "/bin/sh",
+    "/usr/bin/id",
+    crate::snippet::GATE_AUTH,
+    "/usr/bin/env",
+];
+
+/// Reads what `doas -C` prints on stdout: `deny`, `permit`, or `permit
+/// nopass`, alone on a line. The exit status is not used: a deny exits 1.
+pub fn read_doas(stdout: &str) -> Answer {
+    match stdout.trim() {
+        "permit nopass" => Answer::Passwordless("permit nopass".to_owned()),
+        "permit" | "deny" => Answer::Nothing,
+        _ => Answer::Unavailable(
+            "doas -C gave no verdict (is its config readable to you?)".to_owned(),
+        ),
+    }
+}
