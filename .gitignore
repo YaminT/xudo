@@ -119,5 +119,5 @@ perf.data*
 /debian/.debhelper/
 /debian/files
 /debian/*.substvars
-/debian/aido/
+/debian/xudo/
 /dist

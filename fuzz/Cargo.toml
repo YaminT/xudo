@@ -3,7 +3,7 @@
 # Not a workspace member: cargo-fuzz needs nightly and its own profile, and the
 # main workspace must stay buildable on the pinned stable toolchain.
 [package]
-name = "aido-fuzz"
+name = "xudo-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -15,7 +15,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-aido-policy = { path = "../crates/aido-policy" }
+xudo-policy = { path = "../crates/xudo-policy" }
 arbitrary = { version = "1", features = ["derive"] }
 
 [[bin]]

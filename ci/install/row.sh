@@ -3,7 +3,7 @@
 #
 #   sh /harness/row.sh <row> <setup command>
 #
-# Expects the static aido binary at /usr/local/bin/aido, this directory at
+# Expects the static xudo binary at /usr/local/bin/xudo, this directory at
 # /harness, and a writable /out. POSIX sh only: the Alpine row has busybox, the
 # Ubuntu rows have dash. Every check that fails prints what it was checking and
 # exits non-zero; there is no "warn".
@@ -12,7 +12,7 @@ set -f
 
 row=$1
 setup=$2
-aido=/usr/local/bin/aido
+xudo=/usr/local/bin/xudo
 out=/out/$row
 mkdir -p "$out"
 export DEBIAN_FRONTEND=noninteractive
@@ -30,18 +30,18 @@ if ! sh -c "$setup" >"$out/setup.log" 2>&1; then
     fail "setup failed"
 fi
 
-# aido must not consult its environment, but the harness still hands it a known
+# xudo must not consult its environment, but the harness still hands it a known
 # one so that nothing here can come from it.
-run_aido() {
-    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$aido" "$@"
+run_xudo() {
+    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "$xudo" "$@"
 }
 
-# try <name> <args...>: runs aido as root, keeping stdout, stderr, and the status.
+# try <name> <args...>: runs xudo as root, keeping stdout, stderr, and the status.
 try() {
     name=$1
     shift
     set +e
-    run_aido "$@" >"$out/$name.out" 2>"$out/$name.err"
+    run_xudo "$@" >"$out/$name.out" 2>"$out/$name.err"
     rc=$?
     set -e
 }
@@ -67,7 +67,7 @@ expect_unverified() {
 # 1. Anyone but root is refused before anything is touched.
 as_nobody() {
     set +e
-    su -s /bin/sh nobody -c "env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $aido $*" \
+    su -s /bin/sh nobody -c "env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $xudo $*" \
         >"$out/nobody.out" 2>"$out/nobody.err"
     rc=$?
     set -e
@@ -77,7 +77,7 @@ refuses_non_root() {
     as_nobody install
     expect_rc 19 "non-root install"
     expect_err nobody "requires root"
-    if getent group aido >/dev/null; then fail "a non-root install created the group"; fi
+    if getent group xudo >/dev/null; then fail "a non-root install created the group"; fi
 }
 
 # A doas that rejects any command line matching the pattern, and is otherwise
@@ -96,16 +96,16 @@ restore_doas() { mv /usr/bin/doas.orig /usr/bin/doas; }
 
 case $row in
 sudo-rs-0.2)
-    # sudo-rs 0.2 cannot scope `Defaults!command`, which aido's rule depends on.
+    # sudo-rs 0.2 cannot scope `Defaults!command`, which xudo's rule depends on.
     # Installing anyway would write a rule that does not mean what it says, so
     # the install refuses, as root and as anyone, before it writes a byte. The
-    # uninstall does not need a usable backend: it removes what aido wrote.
+    # uninstall does not need a usable backend: it removes what xudo wrote.
     try install install
     expect_rc 19 "install on an unusable backend"
     expect_err install "no usable backend"
-    expect_absent /etc/sudoers.d/aido
-    expect_absent /etc/sudoers.d/aido.candidate
-    if getent group aido >/dev/null; then fail "a refused install created the group"; fi
+    expect_absent /etc/sudoers.d/xudo
+    expect_absent /etc/sudoers.d/xudo.candidate
+    if getent group xudo >/dev/null; then fail "a refused install created the group"; fi
     try uninstall install --uninstall
     expect_rc 0 "uninstall with nothing installed"
     ;;
@@ -113,8 +113,8 @@ sudo-rs-0.2)
 sudo | sudo-rs)
     # The image ships /etc/sudoers 0644, which both visudo and sudo-rs's refuse.
     chmod 440 /etc/sudoers
-    dest=/etc/sudoers.d/aido
-    cand=/etc/sudoers.d/aido.candidate
+    dest=/etc/sudoers.d/xudo
+    cand=/etc/sudoers.d/xudo.candidate
     refuses_non_root
     expect_absent "$dest"
     expect_absent "$cand"
@@ -125,7 +125,7 @@ sudo | sudo-rs)
     before=$(sum "$dest")
     try operator install
     expect_rc 19 "install over an operator's file"
-    expect_err operator "not a file aido wrote"
+    expect_err operator "not a file xudo wrote"
     [ "$(sum "$dest")" = "$before" ] || fail "an operator's file was changed"
     expect_absent "$cand"
     rm -f "$dest"
@@ -145,13 +145,13 @@ sudo | sudo-rs)
     expect_out install "installed $dest"
     expect_meta "$dest" "440 root:root"
     expect_absent "$cand"
-    [ "$(head -c 18 "$dest")" = "# Managed by aido." ] || fail "the file lacks aido's marker"
+    [ "$(head -c 18 "$dest")" = "# Managed by xudo." ] || fail "the file lacks xudo's marker"
     has "$dest" "PASSWD:" || fail "no PASSWD rule"
     if has "$dest" "NOPASSWD"; then fail "a passwordless rule was installed"; fi
     visudo -cf "$dest" >/dev/null || fail "the backend's validator rejects the installed file"
     visudo -c >/dev/null || fail "the whole sudoers configuration is no longer valid"
-    members=$(getent group aido | cut -d: -f4)
-    [ -z "$members" ] || fail "the aido group is not empty: $members"
+    members=$(getent group xudo | cut -d: -f4)
+    [ -z "$members" ] || fail "the xudo group is not empty: $members"
     inode=$(stat -c %i "$dest")
 
     # 5. A reinstall replaces the file atomically, still one file.
@@ -159,7 +159,7 @@ sudo | sudo-rs)
     expect_unverified reinstall
     [ "$(stat -c %i "$dest")" != "$inode" ] || fail "the reinstall did not replace the file"
     expect_meta "$dest" "440 root:root"
-    [ "$(ls /etc/sudoers.d | grep -c '^aido')" -eq 1 ] || fail "more than one aido file"
+    [ "$(ls /etc/sudoers.d | grep -c '^xudo')" -eq 1 ] || fail "more than one xudo file"
 
     # 6. A backend that rejects the candidate leaves the old state as it was.
     real=$(readlink -f /usr/sbin/visudo)
@@ -169,7 +169,7 @@ sudo | sudo-rs)
     [ "$real" != /usr/sbin/visudo ] || real=/usr/sbin/visudo.orig
     cat >/usr/sbin/visudo <<EOF
 #!/bin/sh
-case "\$*" in *aido.candidate*) echo "rejected by the test" >&2; exit 1 ;; esac
+case "\$*" in *xudo.candidate*) echo "rejected by the test" >&2; exit 1 ;; esac
 exec $real "\$@"
 EOF
     chmod 755 /usr/sbin/visudo
@@ -183,7 +183,7 @@ EOF
     [ "$(stat -c %i "$dest")" = "$inode" ] || fail "a rejected install replaced the old file"
     expect_absent "$cand"
 
-    # 7. Uninstall removes aido's file, and nothing else, and not the group.
+    # 7. Uninstall removes xudo's file, and nothing else, and not the group.
     printf '# operator\n' >/etc/sudoers.d/other
     chmod 440 /etc/sudoers.d/other
     before=$(sum /etc/sudoers.d/other)
@@ -191,31 +191,31 @@ EOF
     expect_rc 0 "uninstall"
     expect_absent "$dest"
     [ "$(sum /etc/sudoers.d/other)" = "$before" ] || fail "uninstall touched another file"
-    getent group aido >/dev/null || fail "uninstall removed the group"
+    getent group xudo >/dev/null || fail "uninstall removed the group"
     try again install --uninstall
     expect_rc 0 "a second uninstall"
     visudo -c >/dev/null || fail "the configuration is invalid after uninstall"
 
-    # 8. Uninstall never removes what is not provably aido's.
+    # 8. Uninstall never removes what is not provably xudo's.
     printf '# mine\n' >"$dest"
     chmod 440 "$dest"
     try theirs install --uninstall
     expect_rc 19 "uninstall of an operator's file"
-    expect_err theirs "not a file aido wrote"
+    expect_err theirs "not a file xudo wrote"
     [ -f "$dest" ] || fail "an operator's file was removed"
     rm -f "$dest"
-    printf 'precious\n' >/etc/hostname-aido-test
-    ln -s /etc/hostname-aido-test "$dest"
+    printf 'precious\n' >/etc/hostname-xudo-test
+    ln -s /etc/hostname-xudo-test "$dest"
     try link install --uninstall
     expect_rc 19 "uninstall of a symlink"
     [ -L "$dest" ] || fail "the symlink was removed or replaced"
-    [ "$(cat /etc/hostname-aido-test)" = precious ] || fail "the link's target was changed"
-    rm -f "$dest" /etc/hostname-aido-test /etc/sudoers.d/other
+    [ "$(cat /etc/hostname-xudo-test)" = precious ] || fail "the link's target was changed"
+    rm -f "$dest" /etc/hostname-xudo-test /etc/sudoers.d/other
     ;;
 
 doas)
-    dropin=/etc/doas.d/60-aido.conf
-    cand=/etc/doas.d/60-aido.conf.candidate
+    dropin=/etc/doas.d/60-xudo.conf
+    cand=/etc/doas.d/60-xudo.conf.candidate
     conf=/etc/doas.conf
     cp "$conf" "$out/doas.conf.orig"
     refuses_non_root
@@ -226,12 +226,12 @@ doas)
     expect_out install "installed $dropin"
     expect_meta "$dropin" "400 root:root"
     expect_absent "$cand"
-    [ "$(head -c 18 "$dropin")" = "# Managed by aido." ] || fail "the drop-in lacks aido's marker"
+    [ "$(head -c 18 "$dropin")" = "# Managed by xudo." ] || fail "the drop-in lacks xudo's marker"
     doas -C "$dropin" || fail "doas rejects the installed drop-in"
     doas -C "$conf" || fail "doas rejects its configuration after the install"
     cmp -s "$conf" "$out/doas.conf.orig" || fail "the drop-in install changed doas.conf"
-    members=$(getent group aido | cut -d: -f4)
-    [ -z "$members" ] || fail "the aido group is not empty: $members"
+    members=$(getent group xudo | cut -d: -f4)
+    [ -z "$members" ] || fail "the xudo group is not empty: $members"
 
     # 3. An operator's file at the drop-in's name is never replaced.
     mv "$dropin" "$out/dropin.saved"
@@ -239,7 +239,7 @@ doas)
     before=$(sum "$dropin")
     try operator install
     expect_rc 19 "install over an operator's drop-in"
-    expect_err operator "not a file aido wrote"
+    expect_err operator "not a file xudo wrote"
     [ "$(sum "$dropin")" = "$before" ] || fail "an operator's drop-in was changed"
     expect_absent "$cand"
     try theirs install --uninstall
@@ -263,7 +263,7 @@ doas)
     expect_rc 0 "uninstall"
     expect_absent "$dropin"
     cmp -s "$conf" "$out/doas.conf.orig" || fail "uninstall changed doas.conf"
-    getent group aido >/dev/null || fail "uninstall removed the group"
+    getent group xudo >/dev/null || fail "uninstall removed the group"
 
     # 6. Without a drop-in directory the rule is a sentinel-delimited block in
     #    the operator's own file.
@@ -276,28 +276,28 @@ doas)
     cp "$conf" "$out/doas.conf.operator"
     try block install
     expect_unverified block
-    expect_out block "set aido's block in $conf"
-    [ "$(grep -c '^### aido:begin' "$conf")" -eq 1 ] || fail "not exactly one begin sentinel"
-    [ "$(grep -c '^### aido:end$' "$conf")" -eq 1 ] || fail "not exactly one end sentinel"
+    expect_out block "set xudo's block in $conf"
+    [ "$(grep -c '^### xudo:begin' "$conf")" -eq 1 ] || fail "not exactly one begin sentinel"
+    [ "$(grep -c '^### xudo:end$' "$conf")" -eq 1 ] || fail "not exactly one end sentinel"
     has "$conf" "permit persist :wheel" || fail "an operator's line was lost"
     expect_meta "$conf" "640 root:wheel"
     doas -C "$conf" || fail "doas rejects its configuration with the block"
-    expect_absent "$conf.aido-new"
+    expect_absent "$conf.xudo-new"
 
     # 7. A reinstall replaces the block, it does not add a second.
     try reblock install
     expect_unverified reblock
-    [ "$(grep -c '^### aido:begin' "$conf")" -eq 1 ] || fail "a reinstall added a second block"
+    [ "$(grep -c '^### xudo:begin' "$conf")" -eq 1 ] || fail "a reinstall added a second block"
 
     # 8. A backend that rejects the merged copy leaves doas.conf as it was.
     before=$(sum "$conf")
-    reject_doas '*aido-new*'
+    reject_doas '*xudo-new*'
     try blockrejected install
     restore_doas
     expect_rc 19 "block install the backend rejects"
     expect_err blockrejected "rejected the candidate"
     [ "$(sum "$conf")" = "$before" ] || fail "a rejected block install changed doas.conf"
-    expect_absent "$conf.aido-new"
+    expect_absent "$conf.xudo-new"
 
     # 9. Uninstall removes exactly the block: the file is the operator's again.
     try blockagain install
@@ -308,7 +308,7 @@ doas)
     expect_meta "$conf" "640 root:wheel"
 
     # 10. Sentinels that do not pair are not guessed at.
-    printf '### aido:begin — do not edit between the markers\n' >>"$conf"
+    printf '### xudo:begin — do not edit between the markers\n' >>"$conf"
     cp "$conf" "$out/doas.conf.ambiguous"
     try ambiguous install --uninstall
     expect_rc 19 "uninstall with an unpaired sentinel"

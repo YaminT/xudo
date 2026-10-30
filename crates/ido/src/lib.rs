@@ -5,9 +5,9 @@
 //! terminal. Nothing executes without a keystroke from a person who went
 //! looking for the queue.
 //!
-//! # Why this is a better trust story than `aido`, not a weaker one
+//! # Why this is a better trust story than `xudo`, not a weaker one
 //!
-//! `aido` fights impersonation: the agent owns `aido`'s stdin, stdout, and
+//! `xudo` fights impersonation: the agent owns `xudo`'s stdin, stdout, and
 //! pty, so confirmation needs a root broker and an out-of-band channel. `ido`
 //! sidesteps all of it — the human is already the one running the program.
 //! **`ido` needs no root, no cgroups, no broker, and no policy engine.** It

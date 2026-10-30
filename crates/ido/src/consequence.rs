@@ -13,7 +13,7 @@
 use term_sanitize::flag_command_name;
 
 /// Programs that run their arguments with someone else's privilege.
-pub const ELEVATORS: [&str; 6] = ["sudo", "doas", "aido", "pkexec", "su", "run0"];
+pub const ELEVATORS: [&str; 6] = ["sudo", "doas", "xudo", "pkexec", "su", "run0"];
 
 /// Command-line clients that hold long-lived credentials to remote systems.
 pub const CLOUD_TOOLS: [&str; 12] = [

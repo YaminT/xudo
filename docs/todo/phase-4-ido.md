@@ -3,22 +3,22 @@
 > **DONE 2026-10-14.** Every deliverable below exists, with two deliberate
 > departures recorded in `../CONCERNS.md`: the picker is built on `rustix`
 > termios rather than `ratatui` + `crossterm`, and the `AGENTS.md` splicer is a
-> module of `ido` rather than its own crate. § 8, the integration with `aido`,
+> module of `ido` rather than its own crate. § 8, the integration with `xudo`,
 > is not built.
 
 An agent queues the commands it cannot or should not run. The human runs `ido`, sees the queue in a full-screen picker, chooses what to run, and runs it in their own terminal.
 
 ---
 
-## 1. Why this is a better trust story than `aido`, not a weaker one
+## 1. Why this is a better trust story than `xudo`, not a weaker one
 
-`aido` fights a hard problem: the agent is the parent process, so it owns `aido`'s stdin, stdout, and pty, and a confirmation read from any of them is a confirmation the agent can answer. That is why `aido` needs a root broker, an out-of-band channel, cgroup attestation, and a reaction-time floor.
+`xudo` fights a hard problem: the agent is the parent process, so it owns `xudo`'s stdin, stdout, and pty, and a confirmation read from any of them is a confirmation the agent can answer. That is why `xudo` needs a root broker, an out-of-band channel, cgroup attestation, and a reaction-time floor.
 
 `ido` sidesteps all of it. The human is already the one running the program, in their own shell, on their own terminal. There is no impersonation to detect because nothing executes without a keystroke from a person who went looking for the queue. **`ido` needs no root, no cgroups, no broker, and no policy engine**, which is why the sequencing note in `README.md` recommends building it before the passwordless path.
 
 The division of labour:
 
-| | `aido` | `ido` |
+| | `xudo` | `ido` |
 |---|---|---|
 | Who executes | The agent, under root-owned policy | The human, after selecting |
 | Gates on | **Privilege** — does this need uid 0 | **Consequence** — how bad is this if wrong |
@@ -79,7 +79,7 @@ One queue per user. No shared queue, ever — a shared queue is a way for one us
 
 ### Every field in it is untrusted input
 
-This is the security core of phase 4, and it is the same lesson as `aido`'s confirmation prompt.
+This is the security core of phase 4, and it is the same lesson as `xudo`'s confirmation prompt.
 
 The agent writes this file. The human reads it in a terminal and then executes what it says. So the command, the reason, the cwd, and the group name are all **attacker-controlled text destined for a terminal and then for execution.** Concretely required:
 
@@ -91,7 +91,7 @@ The agent writes this file. The human reads it in a terminal and then executes w
 
 ### Store argv, never a shell string
 
-`ido queue -- <argv>` takes a real argument vector and stores it as a vector. `ido` execs it directly with no shell involved, which makes the entire quoting-and-injection class unreachable — the same reason `aido` bans `shlex::split` and resolves executables absolutely.
+`ido queue -- <argv>` takes a real argument vector and stores it as a vector. `ido` execs it directly with no shell involved, which makes the entire quoting-and-injection class unreachable — the same reason `xudo` bans `shlex::split` and resolves executables absolutely.
 
 An agent that needs a pipeline must queue a **script file** it has written, so the human can read the script before running it. A one-line convenience that accepts a shell string is the obvious request and should be refused; if it is ever added, it must be a distinct entry kind, rendered with a visibly different marker, and the docs must say a shell will interpret it.
 
@@ -209,7 +209,7 @@ From the brief: the agent queues `willyoumarryme`; when the user runs `ido`, a s
 
 ### Shape
 
-Ship the celebration as `ido celebrate`, and install `willyoumarryme` as a **second name for the same inode** — the same hardlink-with-two-names trick `aido-gate` uses, so there is one binary and one code path. The literal string from the brief then works as a queued command, and there is no separate script to keep in sync.
+Ship the celebration as `ido celebrate`, and install `willyoumarryme` as a **second name for the same inode** — the same hardlink-with-two-names trick `xudo-gate` uses, so there is one binary and one code path. The literal string from the brief then works as a queued command, and there is no separate script to keep in sync.
 
 The celebration has **no people in it**: no names, no couple, no pronouns, no figures. Abstract only — confetti glyphs, rings, a bell, colour. It ends by printing exactly:
 
@@ -271,21 +271,21 @@ Adversarial tests in the same file, because the queue is untrusted input:
 
 ---
 
-## 8. Integration with `aido`
+## 8. Integration with `xudo`
 
 Two connections worth building, because they make each tool better rather than merely adjacent.
 
-**`aido` denials offer the queue.** When `aido` denies with `HumanPathOnly` or `NoConfirmationChannel`, the remediation string in the decision envelope already tells the agent to hand the action to a person. Make it concrete: `aido` can queue the request into `ido` and return the entry id, so the agent's next message is *"queued as #7, run `ido` to execute"* instead of a dead end. The denial taxonomy already has the codes; this is a renderer change plus one call.
+**`xudo` denials offer the queue.** When `xudo` denies with `HumanPathOnly` or `NoConfirmationChannel`, the remediation string in the decision envelope already tells the agent to hand the action to a person. Make it concrete: `xudo` can queue the request into `ido` and return the entry id, so the agent's next message is *"queued as #7, run `ido` to execute"* instead of a dead end. The denial taxonomy already has the codes; this is a renderer change plus one call.
 
-**`ido` can run through `aido`.** A queued entry that needs root can be executed as `aido exec -- <argv>` rather than `sudo <argv>`, so it still gets policy matching, the deny-list, and the audit record — with the human's password prompt, which they are present to answer. The human keeps the decision; the machine keeps the guardrails.
+**`ido` can run through `xudo`.** A queued entry that needs root can be executed as `xudo exec -- <argv>` rather than `sudo <argv>`, so it still gets policy matching, the deny-list, and the audit record — with the human's password prompt, which they are present to answer. The human keeps the decision; the machine keeps the guardrails.
 
-Shared crates: the audit sink (hash-chained JSONL plus journald) and the config layering from phase 5. The terminal-text sanitizer belongs in a shared crate too, since both the `aido` confirmation prompt and the `ido` picker need exactly the same thing.
+Shared crates: the audit sink (hash-chained JSONL plus journald) and the config layering from phase 5. The terminal-text sanitizer belongs in a shared crate too, since both the `xudo` confirmation prompt and the `ido` picker need exactly the same thing.
 
 ---
 
 ## 9. Packaging note
 
-`ido` is installable by someone who wants nothing to do with `aido` — it needs no root and grants no privilege. That argues for `ido` as its own package with `aido` as a `Suggests:`, and it is one of the open decisions in `README.md`. If they ship as one package, `ido` must still work fully with no sudoers snippet installed and no `aido` group membership.
+`ido` is installable by someone who wants nothing to do with `xudo` — it needs no root and grants no privilege. That argues for `ido` as its own package with `xudo` as a `Suggests:`, and it is one of the open decisions in `README.md`. If they ship as one package, `ido` must still work fully with no sudoers snippet installed and no `xudo` group membership.
 
 ---
 
@@ -293,7 +293,7 @@ Shared crates: the audit sink (hash-chained JSONL plus journald) and the config 
 
 - `crates/ido` — queue, picker, runner, log.
 - `crates/ido-doc` — the `AGENTS.md` splicer with sentinel handling and backups.
-- `crates/term-sanitize` — shared ANSI/bidi/homoglyph sanitizer, used by both `ido` and `aido`.
+- `crates/term-sanitize` — shared ANSI/bidi/homoglyph sanitizer, used by both `ido` and `xudo`.
 - `ido celebrate` plus the `willyoumarryme` second name.
 - The acceptance test, the `rexpect` interactive test, and the adversarial table above.
 - Man pages `ido(1)` and `ido-queue(5)`.

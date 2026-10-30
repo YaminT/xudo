@@ -21,7 +21,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aido_audit::{Chain, Record};
+use xudo_audit::{Chain, Record};
 
 use crate::entry::Entry;
 use crate::error::IdoError;
@@ -543,8 +543,8 @@ mod tests {
         assert!(store.read_log().is_err());
         assert!(
             store
-                .append_log(&aido_audit::Record::first(
-                    aido_audit::Decision::Allowed,
+                .append_log(&xudo_audit::Record::first(
+                    xudo_audit::Decision::Allowed,
                     vec!["x".into()],
                     "t"
                 ))
