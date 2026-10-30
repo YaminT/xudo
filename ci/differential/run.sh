@@ -85,16 +85,8 @@ for spec in "${rows[@]}"; do
         fail=1
     fi
     if [[ -e $out/$row/exec.txt ]]; then
-        want=$here/expected/exec.txt
-        # A difference found and recorded, not accepted: it is listed in
-        # docs/CONCERNS.md, and fixing it makes this row fail until the
-        # exception file is deleted.
-        if [[ -e $here/expected/exec-$row.txt ]]; then
-            want=$here/expected/exec-$row.txt
-            echo "NOTE: row $row is a known difference (expected/exec-$row.txt)"
-        fi
-        if ! diff -u "$want" "$out/$row/exec.txt"; then
-            echo "FAIL: row $row: what ran through the backend differs from $(basename "$want")" >&2
+        if ! diff -u "$here/expected/exec.txt" "$out/$row/exec.txt"; then
+            echo "FAIL: row $row: what ran through the backend differs from exec.txt" >&2
             fail=1
         fi
     fi

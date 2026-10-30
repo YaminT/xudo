@@ -10,8 +10,8 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 Findings, none fixed here:
 
-- **OpenDoas: `xudo exec` is refused by the gate** (`gate_no_pending_request`, exit 19). doas execs the gate without forking, so the process the broker pinned is the gate itself, and the gate looks only at ancestors. `expected/exec-doas.txt` records it; the row fails when it is fixed, until that file is deleted.
-- **OpenDoas: `xudo install` as root is rolled back.** The probe runs `doas` as root, which still asks for a password (`permit persist :xudo`). In the harness the broker starts after the install, which reports NOT VERIFIED.
+- **OpenDoas: `xudo exec` was refused by the gate** (`gate_no_pending_request`, exit 19). doas execs the gate without forking, so the pinned process was the gate itself, and the gate looks only at ancestors. **Fixed** in the front-end: for doas `xudo` runs the backend as a child and waits (`ExecPlan::spawn`), so it stays an ancestor; sudo keeps the in-place exec. The gate is unchanged, and the row now matches `expected/exec.txt`. Test: `doas_is_run_as_a_child_so_xudo_stays_an_ancestor`.
+- **OpenDoas: `xudo install` as root was rolled back.** The probe ran `doas -n` as root, which still asks for a password (`permit persist :xudo`). **Fixed**: the probe returns `Unavailable` for doas before asking the broker, so the install stays, reported NOT VERIFIED with the way to check by hand. Test: `a_doas_install_is_never_rolled_back_by_a_probe_that_cannot_ask`.
 - **The gate refuses `/usr/bin/id`, the install probe's program, on Ubuntu 26.04 and Alpine.** There it is a symlink to a multicall binary (uutils, busybox). The symlink refusal is by design; the shipped probe action therefore cannot verify on those distributions. The harness swaps in GNU `gnuid` (26.04) or `apk add coreutils` (Alpine).
 
 `doctor` no longer says the exec path is absent: it says which backend `xudo exec` would run, or that there is none.

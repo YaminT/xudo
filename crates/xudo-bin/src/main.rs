@@ -37,7 +37,25 @@ fn exec(
     // The path is a constant from the library, absolute, never searched for.
     #[allow(clippy::disallowed_methods)]
     let mut command = std::process::Command::new(plan.backend);
-    let error = command.arg(plan.gate).exec();
+    command.arg(plan.gate);
+    // doas does not fork: stay its parent, so the gate finds us as an ancestor.
+    // No signal handler; Ctrl-C reaches the whole foreground group anyway.
+    if plan.spawn {
+        return match command.status() {
+            Ok(status) => {
+                use std::os::unix::process::ExitStatusExt;
+                let code = status
+                    .code()
+                    .or(status.signal().and_then(|n| n.checked_add(128)));
+                exit_status(code.unwrap_or(19))
+            }
+            Err(error) => {
+                let _ = writeln!(err, "xudo: cannot run {}: {error}", plan.backend);
+                exit_status(19)
+            }
+        };
+    }
+    let error = command.exec();
     let _ = writeln!(err, "xudo: cannot run {}: {error}", plan.backend);
     exit_status(19)
 }
