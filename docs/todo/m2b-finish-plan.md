@@ -174,11 +174,11 @@ exit. Packaging stays in phase 3.
   not re-stamped, it cannot be edited from the repo. Sweep the verification table against the exit test
   above; `howiwork.md` "Where the build stands" and the FigJam card re-stamped;
   a dated `CONCERNS.md` entry.
-- **E2. Phase 3 beta `.deb`** *(open)* — human path only, no `NOPASSWD` shipped. *Decision:
-  release timing.*
-- **E3. Schedule the `howiwork.md` promises with no milestone** *(open)*:** vision-mode
-  providers, YAML/JSON permission-set import, pasban's schedule and log
-  verification, `airead`. *Decision: proposed homes M5/M6/phase 5.*
+- **E2. Phase 3 beta `.deb`** *(decided 2026-10-30)*: build phase 3 next, before M3
+  (beta `.deb`, human path only, no `NOPASSWD` shipped).
+- **E3. Homes for the unscheduled `howiwork.md` promises** *(decided 2026-10-30)*: pasban
+  log verification to phase 3; pasban grant expiry and YAML/JSON import to M5; `airead`
+  to M6; vision mode to M8, after M7's external audit.
 
 Temporary permissions (requested 2026-10-21) are specified in `howiwork.md`
 and scheduled as the first part of M5 in `README.md`; they are not M2b work.
