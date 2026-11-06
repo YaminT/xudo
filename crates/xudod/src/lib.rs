@@ -127,6 +127,10 @@ mod tests {
     const EXPECTED: RefusalCode = RefusalCode::SpoolUnusable;
     #[cfg(not(target_os = "linux"))]
     const EXPECTED: RefusalCode = RefusalCode::BrokerUnusable;
+    #[cfg(target_os = "linux")]
+    const AFTER_HYGIENE: RefusalCode = RefusalCode::SpoolUnusable;
+    #[cfg(not(target_os = "linux"))]
+    const AFTER_HYGIENE: RefusalCode = RefusalCode::PeerUnidentified;
 
     fn code_of(answer: &Answer) -> Option<RefusalCode> {
         match answer {
@@ -194,12 +198,12 @@ mod tests {
         let mut answer = Vec::new();
         client.read_to_end(&mut answer).unwrap();
         let response = BrokerResponse::parse(&answer).unwrap();
-        assert_eq!(code_of(&response.answer), Some(EXPECTED));
+        assert_eq!(code_of(&response.answer), Some(AFTER_HYGIENE));
         assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
         assert_eq!(audit.records().len(), 1);
         assert_eq!(
             audit.records()[0].denial.as_deref(),
-            Some(EXPECTED.as_str())
+            Some(AFTER_HYGIENE.as_str())
         );
     }
 
