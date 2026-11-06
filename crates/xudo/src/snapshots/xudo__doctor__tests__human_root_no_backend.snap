@@ -3,7 +3,7 @@ source: crates/xudo/src/doctor.rs
 expression: human(&report)
 ---
 platform     test
-kernel       6.13 via SO_PEERPIDFD + PIDFD_GET_INFO (agent path available)
+kernel       6.13 via SO_PEERPIDFD + PIDFD_GET_INFO (kernel supports attestation for the planned agent path; agent path not in this build)
 rules dir    /usr/bin
 ruleset      1 action(s), 1 file(s), generation e7f87e5d34d9
 rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors

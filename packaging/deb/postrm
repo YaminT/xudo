@@ -1,0 +1,24 @@
+#!/bin/sh
+# A rule left behind is a security defect: fail loudly rather than leave one.
+# /usr/bin/xudo is already gone, so the leftover has to be deleted by hand.
+set -eu
+case $1 in
+remove | purge)
+    if [ -e /etc/sudoers.d/xudo ] || [ -L /etc/sudoers.d/xudo ] ||
+        [ -e /etc/doas.d/60-xudo.conf ] || [ -L /etc/doas.d/60-xudo.conf ] ||
+        { [ -f /etc/doas.conf ] && grep -q '^### xudo:begin' /etc/doas.conf; }; then
+        printf '%s\n' 'xudo: a sudo or doas rule is still installed; delete /etc/sudoers.d/xudo, /etc/doas.d/60-xudo.conf, or the xudo block in /etc/doas.conf by hand' >&2
+        exit 1
+    fi
+    # Drop the removed units from systemd's view.
+    if [ "$1" = remove ]; then
+        if [ -d /run/systemd/system ]; then systemctl --system daemon-reload >/dev/null || true; fi
+    fi
+    ;;
+esac
+if [ "$1" = purge ]; then
+    deb-systemd-helper purge xudod.socket >/dev/null || true
+    deb-systemd-helper purge xudo-pasban.timer >/dev/null || true
+    rm -rf /etc/xudo /var/lib/xudo /run/xudo
+    ! getent group xudo >/dev/null || groupdel xudo
+fi

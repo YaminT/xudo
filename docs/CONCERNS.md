@@ -4,6 +4,69 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-06 — release workflow
+
+The release workflow starts on a pushed `v*` tag. `<tag>` is `v` plus the Cargo version unchanged (for example, `v0.1.0-beta.1`); `<ver>` is the Debian version used in the `.deb` filename (for example, `0.1.0~beta.1`). Native amd64 and arm64 jobs run `just deb-test` and upload the tested packages. A signing job uses cosign keyless through GitHub Actions OIDC, then a separate release job creates a draft prerelease. The owner reviews and publishes it by hand; no tag or release was created for this work.
+
+---
+
+## 2026-11-06 — pasban: the audit log is checked daily, and a broken one is loud
+
+Pasban, for this step, is the audit-log half of the watchman in `howiwork.md`. Grant expiry stays M5. The package ships `xudo-pasban.service` and `xudo-pasban.timer`. The timer is `OnCalendar=daily`, `Persistent=true`, `RandomizedDelaySec=1h`. The operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled; remove disables it; purge drops its state. No pre-pasban package was published, so there is no released upgrade that needs to enable the new timer.
+
+The service runs, as root, `/usr/bin/xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. The capability bounding set is empty. The log is `0600` and root's, so the owner read bit is enough; `CAP_DAC_OVERRIDE` is what a process that does not own the file would need. Nothing in the sandbox is writable. `NoNewPrivileges=yes` is set here. The broker's unit still omits it, because that directive makes systemd remount the ruleset `nosuid` (the entry below).
+
+Loud is two things, both checked by `just systemd-test`. The process exits non-zero, so `systemctl start` fails and the unit is `failed`. The failure line is prefixed `<2>`. The unit sets `SyslogLevelPrefix=yes` and `StandardError=journal`, and journald stores that line at priority 2. `journalctl -u xudo-pasban -p 2` shows it. `SyslogLevel=` was not used: it would mark the clean result critical as well. `LogLevelMax=` only drops lines.
+
+`--against-journal` runs `/usr/bin/journalctl` by absolute path, through the probe runner, with no `PATH` search. The query is `_UID=0` and xudo's `MESSAGE_ID`; journalctl reads all boots by default. It compares `XUDO_SEQ`, `XUDO_HASH` and `XUDO_PREV_HASH` with the verified file chain. An entry linked to the file's last hash shows a removed tail. An entry linked to a file record but carrying a different next hash shows a cut followed by replacement records. Once any file record matches, a higher sequence on another chain is ignored. The query fails closed on any stderr, including journalctl warnings; `LimitNOFILE=65536` gives it room to open journal files. A log file whose records the journal never saw fails pasban, including a log restored from backup or moved from another host while this host's journal holds other xudo entries.
+
+What this does not catch, on purpose:
+
+- Whoever can empty the file can clear it completely: an empty file has no hash to link to, so the journal cannot attribute even a non-genesis chain to it. A missing log fails until the next boot or write, when tmpfiles recreates it empty. Rolling back to an older genuine chain whose last record has no successor in the journal is still not caught. A journal that is empty or behind the file cannot show a cut because journald drops entries over its rate limit and an operator can vacuum it; genesis entries have an empty predecessor and are skipped as ambiguous.
+- Any `journalctl` stderr fails pasban, including a corrupt journal file after an unclean shutdown. The daily check keeps failing loudly until that file rotates out; this is accepted.
+- Root. uid 0 can rewrite the file and send a matching journal entry. The journal is a copy to compare against a third party, not a defence against root.
+
+---
+
+## 2026-11-06 — Phase 3 step 2: the broker under real systemd — fixed
+
+The systemd lane found that the shipped unit's `ProtectSystem=strict` together with `NoNewPrivileges=yes` caused systemd to remount `/` read-only and `nosuid` in the broker's mount namespace. `MountPolicy::Ruleset` correctly refuses a ruleset on a `nosuid` mount, so every request was refused `policy_unloadable` before the gate ran. The issue was measured in Debian 13, Ubuntu 24.04, and Ubuntu 26.04; removing only the unit directive made the lane pass in a container.
+
+The owner's decision, implemented 2026-11-06: remove `NoNewPrivileges=yes` from the unit and have the broker set `PR_SET_NO_NEW_PRIVS` through `xudo_sys::Hygiene` at startup. If the kernel refuses, the broker answers `broker_unusable`, records the refusal, and exits non-zero without serving or minting. The trust walk remains unchanged. The systemd lane checks `NoNewPrivs: 1` in `/proc/<MainPID>/status` while a socket-activated broker is waiting for its request, then exercises the install probe, password flow, gate audit, and clean unit exit on all three images. Ubuntu 26.04's image ships uutils `id` as a symlink, which the gate refuses; the disposable lane installs GNU coreutils and places its regular `id` binary at the ruleset's `/usr/bin/id` path.
+
+The 2026-10-19 finding still applies: the unit must not add `nosuid` or `noexec` on the path to the rules. This systemd remount was caused by the unit's NNP directive, not by a mount option written in the unit. The spool walk was not the cause; it remains protected by its existing `MountPolicy::RootPath` policy.
+
+---
+
+## 2026-11-05 — Phase 3 step 1: beta `.deb`
+
+- The package is unsigned and human-path only; it includes no NOPASSWD rule or passwordless gate name. No release or external publication was performed.
+- `xudo install` keeps exit 19 for NOT VERIFIED. `postinst` continues only when the exact explicit `installed, but NOT VERIFIED` diagnostic appears; all other nonzero outcomes fail configuration.
+- The container matrix has no running systemd, so it asserts the socket enablement links without starting the broker; running the broker under a real systemd host remains deferred.
+- `postinst` reloads systemd on every configure and `postrm` reloads it on remove when `/run/systemd/system` exists, and the package ships `DEBIAN/md5sums` which the matrix checks with `dpkg --verify` or `debsums -s`.
+- Signing, publication, doas-specific matrix coverage, and the broader release work remain later phase 3 steps.
+- Beta `Depends` is `sudo` only. A doas host installs the rule by hand with `xudo install` (`just install-root` tests that).
+
+---
+
+## 2026-10-30 — Decisions: release, roadmap homes, signing, outcomes
+
+Six decisions by the project owner, 2026-10-30.
+
+- **Beta timing (E2):** build phase 3 (beta `.deb`, human path only) next, before M3.
+- **Homes for the unscheduled promises (E3):**
+  - pasban audit-log verification: phase 3 (the log exists now).
+  - pasban grant expiry: M5, with temporary grants.
+  - YAML/JSON permission-set import: M5.
+  - `airead` (read-only twin): M6.
+  - vision mode: M8, after M7's external audit.
+- **Signing:** cosign keyless, GitHub Actions OIDC identity, Rekor log. No long-lived key to guard. This settles "minisign or cosign" in phase 3.
+- **Publishing:** the beta is built and its release workflow made ready. No tag or GitHub Release without the owner's explicit go.
+- **Command outcomes are not audited:** the gate execs in place. The authorization record is the security fact; the exit status goes to the caller. No fork in the gate, which keeps root code fork-free.
+- **doas in the doctor oracle:** ask `doas -C` (unprivileged) about a fixed set of telling commands and report any `permit nopass`. Being built by another agent now.
+
+---
+
 ## 2026-10-30 — M2b closeout (E1)
 
 M2b is done in code and tests on branch `xudo-exec`, with the gaps below.
@@ -27,10 +90,7 @@ Still open:
 - D4: the umask fixes landed; the `ido-bin` pty flake was not diagnosed.
 - The FigJam card was not re-stamped; it cannot be edited from here.
 
-Waiting on the user:
-
-- **E2**: when the beta `.deb` ships (human path only).
-- **E3**: homes for vision-mode providers, YAML/JSON permission-set import, pasban's schedule and log checks, and `airead` (proposed M5/M6/phase 5).
+Waiting on the user: decided 2026-10-30; see the entry above.
 
 ---
 
@@ -50,7 +110,7 @@ Findings, none fixed here:
 
 ## 2026-10-29 — doctor asks sudo itself (D3)
 
-The hand reader for sudoers lost four review rounds to lexer mismatches, so it is now a hint and sudo's own answer is the verdict where it can be had. As root, with a sudo or sudo-rs backend, `xudo doctor` runs `sudo -n -l -U <user>` once per member of the `xudo` group (at most 16; more is unverified) and reads the tags sudo prints: `NOPASSWD:` or `!authenticate` is a finding (`backend_listing`), a listing without them or a refusal is nothing, any other reply is unverified. If every user answers nothing, the reader's gaps are dropped; a user who could not be asked, an empty group, or a non-root run leaves the check unverified ("run `sudo xudo doctor` to ask sudo itself"), unless the reader already found something. The reader's findings stay as hints. It cannot ask doas: `doas -C` answers for one command, and the report has no command to ask about, so doas stays on the reader alone. As root the subject is root, so the group members stand in for the accounts an agent runs as. Tests: `the_oracle_overrides_a_parser_that_missed_a_nopasswd_rule`, `an_unreadable_oracle_answer_is_unverified_not_clean`, `without_root_a_clean_parse_is_unverified`; against real sudo, `xudo-bin/tests/root_doctor.rs` (a rule in a file `/etc/sudo.conf` redirects sudo to, which the reader never opens).
+The hand reader for sudoers lost four review rounds to lexer mismatches, so it is now a hint and sudo's own answer is the verdict where it can be had. As root, with a sudo or sudo-rs backend, `xudo doctor` runs `sudo -n -l -U <user>` once per member of the `xudo` group (at most 16; more is unverified) and reads the tags sudo prints: `NOPASSWD:` or `!authenticate` is a finding (`backend_listing`), a listing without them or a refusal is nothing, any other reply is unverified. If every user answers nothing, the reader's gaps are dropped; a user who could not be asked, an empty group, or a non-root run leaves the check unverified ("run `sudo xudo doctor` to ask sudo itself"), unless the reader already found something. The reader's findings stay as hints. doas: now asks `doas -C <file> <cmd>`, as the user (it answers for the caller; as root it is unverified), about `/bin/sh`, `/usr/bin/id`, the gate and `/usr/bin/env`, once per file the reader read (`doas -C` does not follow `/etc/doas.d`), and reports any `permit nopass` (`doas_nopass`). On stock Alpine `/etc/doas.conf` is 0640 and `/etc/doas.d` 0750, so an unprivileged `doas -C` fails and the check is unverified there, as intended. As root the subject is root, so the group members stand in for the accounts an agent runs as. Tests: `the_oracle_overrides_a_parser_that_missed_a_nopasswd_rule`, `an_unreadable_oracle_answer_is_unverified_not_clean`, `without_root_a_clean_parse_is_unverified`, and for doas `doas_permit_nopass_for_a_shell_is_a_finding_the_parser_missed`, `a_deny_in_one_file_does_not_hide_a_nopass_in_another`, `an_unreadable_doas_config_is_unverified_not_clean`; against real sudo, `xudo-bin/tests/root_doctor.rs` (a rule in a file `/etc/sudo.conf` redirects sudo to, which the reader never opens).
 
 ---
 

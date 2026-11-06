@@ -1,0 +1,13 @@
+# xudo
+
+> Linux privilege broker for narrowly scoped privileged commands; this beta uses the human password path.
+## Project
+- [README](https://github.com/YaminT/xudo/blob/main/README.md): Install status, examples, security limits, rules, and FAQ.
+- [howiwork.md](https://github.com/YaminT/xudo/blob/main/howiwork.md): Authoritative description of product behavior and request flow.
+- [SECURITY.md](https://github.com/YaminT/xudo/blob/main/SECURITY.md): Vulnerability reporting route and current security limits.
+- [Design plan](https://github.com/YaminT/xudo/blob/main/docs/design-plan.md): Architecture and threat model.
+## Rules
+- [Rule files](https://github.com/YaminT/xudo/tree/main/rules/): Shipped TOML action rules.
+## Manuals
+- [ido(1)](https://github.com/YaminT/xudo/blob/main/docs/man/ido.1): Human-run queued command interface.
+- [ido-queue(5)](https://github.com/YaminT/xudo/blob/main/docs/man/ido-queue.5): Queue data format.

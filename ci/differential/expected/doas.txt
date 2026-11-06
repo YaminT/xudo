@@ -7,3 +7,4 @@ plan for     doas
 snippet      accepted by /usr/bin/doas -C /dev/stdin
 check        exit 0
 install real  installed, but NOT VERIFIED
+doctor      doas itself permits /usr/bin/env for you without a password, by /etc/doas.d/50-t.conf
