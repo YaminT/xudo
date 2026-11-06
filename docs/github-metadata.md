@@ -38,4 +38,8 @@ Environments → github-pages → Deployment branches and replace the `gh-pages`
 rule with `main` only. That rule is also what blocks branch deploys
 server-side.
 
+Create a tag ruleset at Settings → Rules → Rulesets → New tag ruleset that
+restricts `v*` tags to the owner. Anyone with write access could otherwise
+push a release tag.
+
 Social preview image: not made.
