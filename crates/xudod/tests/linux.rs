@@ -224,7 +224,9 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     );
     let conn = UnixConnection::adopt(stream.as_fd(), xudod::IO_TIMEOUT).unwrap();
     let mut audit = FakeAuditSink::new();
+    let hygiene = xudo_sys::FakeHygiene::new(std::process::id());
     let mut platform = Platform {
+        hygiene: &hygiene,
         syscalls: &HostSyscalls,
         peers: &HostPeer,
         clock: &HostClock,

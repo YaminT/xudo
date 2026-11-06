@@ -290,7 +290,6 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "RuntimeMaxSec",
             "CapabilityBoundingSet",
             "AmbientCapabilities",
-            "NoNewPrivileges",
             "UMask",
             "ProtectSystem",
             "ReadWritePaths",
@@ -346,7 +345,8 @@ fn the_broker_is_root_without_a_single_capability() {
     assert!(values(&service, "Service", "PrivateUsers").is_empty());
     assert_eq!(value(&service, "Service", "CapabilityBoundingSet"), "");
     assert_eq!(value(&service, "Service", "AmbientCapabilities"), "");
-    assert_eq!(value(&service, "Service", "NoNewPrivileges"), "yes");
+    // systemd's NNP remount makes / nosuid and breaks the trust walk; xudod sets NNP itself.
+    assert!(values(&service, "Service", "NoNewPrivileges").is_empty());
     assert_eq!(value(&service, "Service", "UMask"), "0077");
 }
 

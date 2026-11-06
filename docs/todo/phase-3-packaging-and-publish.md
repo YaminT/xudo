@@ -24,6 +24,8 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 **Step 1 status (2026-11-05):** the unsigned beta package and three-distro container lane are implemented. Signing and publishing remain deferred until the owner explicitly approves.
 
+**Step 2 status (2026-11-06):** implemented. The unit omits `NoNewPrivileges=yes`; the broker sets it through `xudo_sys::Hygiene` before serving and fails closed with an audited `broker_unusable` refusal if it cannot. The ruleset trust walk is unchanged. `just systemd-test` checks `NoNewPrivs: 1` and the complete installed password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
+
 This is the load-bearing decision of the whole phase, so it comes first.
 
 A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. Before M4 there is no reviewed enrollment path, no broker, and no out-of-band confirmation, so a passwordless rule would be a standing root grant with no compensating control.
@@ -206,7 +208,7 @@ Every one of these appears in the README, the package description, and `xudo --v
 
 ## 7. Tests that gate the release
 
-**Status (2026-11-05):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). The README pipe-to-shell check remains in `xudo-tests`.
+**Status (2026-11-06):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`.
 
 Run in containers, per distro, on both architectures.
 

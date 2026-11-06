@@ -35,18 +35,18 @@ const UNUSABLE: i32 = 19;
 
 /// How a well-formed request is refused here. On Linux the kernel names the
 /// peer — the test process, which created the socket pair — and the broker
-/// then finds no root-owned spool. Anywhere else no peer can be named at all.
+/// then finds no root-owned spool. Elsewhere broker hygiene is unsupported.
 #[cfg(target_os = "linux")]
 const REFUSED_WITH: RefusalCode = RefusalCode::SpoolUnusable;
 #[cfg(not(target_os = "linux"))]
-const REFUSED_WITH: RefusalCode = RefusalCode::PeerUnidentified;
+const REFUSED_WITH: RefusalCode = RefusalCode::BrokerUnusable;
 
 /// How a malformed request is refused here: on Linux it is read, and refused
 /// as the client's fault; anywhere else the peer is refused before it is read.
 #[cfg(target_os = "linux")]
 const MALFORMED_REFUSED_WITH: (RefusalCode, i32) = (RefusalCode::RequestMalformed, 0);
 #[cfg(not(target_os = "linux"))]
-const MALFORMED_REFUSED_WITH: (RefusalCode, i32) = (RefusalCode::PeerUnidentified, UNUSABLE);
+const MALFORMED_REFUSED_WITH: (RefusalCode, i32) = (RefusalCode::BrokerUnusable, UNUSABLE);
 
 fn refusal_of(answer: &Answer) -> Option<RefusalCode> {
     match answer {

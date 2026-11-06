@@ -20,8 +20,8 @@
 use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
-    AuditError, AuditSink, Clock, Connection, Entropy, PeerCalls, Spool, SpoolError, Syscalls,
-    authorize,
+    AuditError, AuditSink, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool, SpoolError,
+    Syscalls, authorize,
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
@@ -37,6 +37,8 @@ pub const UNUSABLE: u8 = 19;
 
 /// Everything the broker asks of its host, as seams.
 pub struct Platform<'a> {
+    /// Establishes process hygiene before the peer or request is inspected.
+    pub hygiene: &'a dyn Hygiene,
     /// The calls that need `unsafe` and that the ladder makes itself:
     /// `SO_PEERPIDFD` and `PIDFD_GET_INFO`.
     pub syscalls: &'a dyn Syscalls,
@@ -104,6 +106,9 @@ pub fn serve<S: Spool>(
     platform: &mut Platform<'_>,
     spool: Result<&S, &SpoolError>,
 ) -> Served {
+    if let Err(error) = platform.hygiene.forbid_new_privileges() {
+        return refuse_hygiene_failure(conn, platform.audit, &error);
+    }
     let identity = match identify(conn.socket(), platform.syscalls, platform.peers) {
         Ok(identity) => identity,
         Err(error) => return refuse(conn, platform.audit, &Refusal::from(&error), None, None),
@@ -314,6 +319,21 @@ fn answer(conn: &dyn Connection, response: &BrokerResponse, served: Served) -> S
     }
 }
 
+/// Answers and records a startup hygiene failure before any other broker work.
+pub(crate) fn refuse_hygiene_failure(
+    conn: &dyn Connection,
+    audit: &mut dyn AuditSink,
+    error: &xudo_sys::SysError,
+) -> Served {
+    refuse(
+        conn,
+        audit,
+        &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+        None,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -331,8 +351,9 @@ mod tests {
     use xudo_gate::request::{MonotonicSecs, PendingRequest};
     use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
     use xudo_sys::{
-        Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakePeer, FakeSpool, FakeSyscalls,
-        FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, SpoolCall, SysError,
+        Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakeHygiene, FakePeer, FakeSpool,
+        FakeSyscalls, FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure,
+        SpoolCall, SysError,
     };
     use xudo_wire::{Answer, WIRE_SCHEMA_VERSION};
 
@@ -404,6 +425,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     /// identifies honestly on the top rung, a fixed clock, one scripted
     /// nonce, and the test ruleset.
     struct Host {
+        hygiene: FakeHygiene,
         syscalls: FakeSyscalls,
         peers: FakePeer,
         clock: FixedClock,
@@ -431,6 +453,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     fsgid: GID,
                 });
             Self {
+                hygiene: FakeHygiene::new(PID),
                 syscalls: FakeSyscalls::new()
                     .with_peer(Ok(a_descriptor()))
                     .with_info(Ok(record)),
@@ -454,6 +477,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
         fn platform(&mut self) -> Platform<'_> {
             Platform {
+                hygiene: &self.hygiene,
                 syscalls: &self.syscalls,
                 peers: &self.peers,
                 clock: &self.clock,
@@ -524,6 +548,42 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Refused { code, .. } => Some(*code),
             Answer::Decided { .. } => None,
         }
+    }
+
+    #[test]
+    fn a_broker_without_no_new_privs_refuses_before_reading_or_minting() {
+        let mut host = Host::honest();
+        host.hygiene = FakeHygiene::new(PID)
+            .with_privileges_error(SysError::unsupported("PR_SET_NO_NEW_PRIVS"));
+        let conn = restart();
+        let spool = FakeSpool::new();
+
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(outcome.served.exit_status(), UNUSABLE);
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::BrokerUnusable)
+        );
+        assert_eq!(
+            host.hygiene.calls(),
+            [xudo_sys::HygieneCall::ForbidNewPrivileges]
+        );
+        assert!(host.syscalls.calls().is_empty());
+        assert_eq!(host.policy.loads.get(), 0);
+        assert!(spool.calls().is_empty());
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(
+            outcome.records[0].denial.as_deref(),
+            Some("broker_unusable")
+        );
+        assert!(
+            outcome.records[0]
+                .evidence
+                .join(" ")
+                .contains("PR_SET_NO_NEW_PRIVS")
+        );
     }
 
     fn decision_of(answer: &Answer) -> Option<(&Decision, Option<&Minted>)> {

@@ -4,6 +4,16 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-06 — Phase 3 step 2: the broker under real systemd — fixed
+
+The systemd lane found that the shipped unit's `ProtectSystem=strict` together with `NoNewPrivileges=yes` caused systemd to remount `/` read-only and `nosuid` in the broker's mount namespace. `MountPolicy::Ruleset` correctly refuses a ruleset on a `nosuid` mount, so every request was refused `policy_unloadable` before the gate ran. The issue was measured in Debian 13, Ubuntu 24.04, and Ubuntu 26.04; removing only the unit directive made the lane pass in a container.
+
+The owner's decision, implemented 2026-11-06: remove `NoNewPrivileges=yes` from the unit and have the broker set `PR_SET_NO_NEW_PRIVS` through `xudo_sys::Hygiene` at startup. If the kernel refuses, the broker answers `broker_unusable`, records the refusal, and exits non-zero without serving or minting. The trust walk remains unchanged. The systemd lane checks `NoNewPrivs: 1` in `/proc/<MainPID>/status` while a socket-activated broker is waiting for its request, then exercises the install probe, password flow, gate audit, and clean unit exit on all three images. Ubuntu 26.04's image ships uutils `id` as a symlink, which the gate refuses; the disposable lane installs GNU coreutils and places its regular `id` binary at the ruleset's `/usr/bin/id` path.
+
+The 2026-10-19 finding still applies: the unit must not add `nosuid` or `noexec` on the path to the rules. This systemd remount was caused by the unit's NNP directive, not by a mount option written in the unit. The spool walk was not the cause; it remains protected by its existing `MountPolicy::RootPath` policy.
+
+---
+
 ## 2026-11-05 — Phase 3 step 1: beta `.deb`
 
 - The package is unsigned and human-path only; it includes no NOPASSWD rule or passwordless gate name. No release or external publication was performed.
