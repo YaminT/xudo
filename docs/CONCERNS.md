@@ -4,6 +4,17 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-05 — Phase 3 step 1: beta `.deb`
+
+- The package is unsigned and human-path only; it includes no NOPASSWD rule or passwordless gate name. No release or external publication was performed.
+- `xudo install` keeps exit 19 for NOT VERIFIED. `postinst` continues only when the exact explicit `installed, but NOT VERIFIED` diagnostic appears; all other nonzero outcomes fail configuration.
+- The container matrix has no running systemd, so it asserts the socket enablement links without starting the broker; running the broker under a real systemd host remains deferred.
+- `postinst` reloads systemd on every configure and `postrm` reloads it on remove when `/run/systemd/system` exists, and the package ships `DEBIAN/md5sums` which the matrix checks with `dpkg --verify` or `debsums -s`.
+- Signing, publication, doas-specific matrix coverage, and the broader release work remain later phase 3 steps.
+- Beta `Depends` is `sudo` only. A doas host installs the rule by hand with `xudo install` (`just install-root` tests that).
+
+---
+
 ## 2026-10-30 — Decisions: release, roadmap homes, signing, outcomes
 
 Six decisions by the project owner, 2026-10-30.

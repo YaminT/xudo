@@ -22,13 +22,15 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 ## 1. The beta ships the human path only
 
+**Step 1 status (2026-11-05):** the unsigned beta package and three-distro container lane are implemented. Signing and publishing remain deferred until the owner explicitly approves.
+
 This is the load-bearing decision of the whole phase, so it comes first.
 
 A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. Before M4 there is no reviewed enrollment path, no broker, and no out-of-band confirmation, so a passwordless rule would be a standing root grant with no compensating control.
 
 Therefore the beta package:
 
-- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate` with `xudo-gate-auth` as its hardlink, and `/usr/libexec/xudo/xudod` with its socket unit — the broker mints requests and grants nothing a password did not;
+- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate-auth`, and `/usr/libexec/xudo/xudod` with its socket unit;
 - installs the `PASSWD:` sudoers rule only;
 - does **not** install `xudo-gate-nopass`, its hardlink, or its `NOPASSWD:` rule — those files are not in the package at all, rather than present-but-unreferenced;
 - does **not** add any user to the `xudo` group (see § 3);
@@ -40,7 +42,9 @@ The passwordless path arrives in a later release, behind an explicit `xudo enabl
 
 ## 2. Package layout
 
-Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need hand-writing: `cargo-deb`'s generated postinst is not adequate for a privilege broker.
+**Status (2026-11-05):** staged from the static musl binaries, existing units, tmpfiles config, shipped rules, and existing man pages. Rules are conffiles; only the password-authenticated gate name is installed.
+
+Build a single `.deb` directly with `dpkg-deb`; the small explicit staging script keeps the privileged file list reviewable.
 
 ```
 /usr/bin/xudo                             0755 root:root   no setuid bit, ever
@@ -68,7 +72,7 @@ Control fields:
 | `Section` | `admin` | |
 | `Priority` | `optional` | |
 | `Architecture` | `amd64`, `arm64` | Native runners for both; no QEMU in the release path |
-| `Depends` | `sudo \| opendoas`, `${shlibs:Depends}`, `${misc:Depends}` | An alternation, because the doas lane is real |
+| `Depends` | `sudo`, `init-system-helpers (>= 1.54~)` | Beta depends on `sudo` only. A doas host runs `xudo install` by hand (`just install-root`). |
 | `Recommends` | `systemd` | journald mirrors every audit record and the mirror is required: a host or container without journald refuses every privileged request until an `audit_sink` setting exists to leave it out (`../CONCERNS.md`, 2026-10-19). No `/dev/log` fallback yet |
 | `Conflicts` | — | Deliberately none; `xudo` does not replace `sudo` |
 
@@ -83,6 +87,8 @@ Shipped rules under `/etc/xudo/rules.d/` are Debian conffiles, so dpkg prompts o
 ---
 
 ## 3. Maintainer scripts
+
+**Status (2026-11-05):** postinst delegates rule installation to `xudo install` and accepts only a stderr line whose prefix is `xudo: installed, but NOT VERIFIED:`. The socket is enabled on a first install only. An upgrade runs `xudo install` only when `/etc/sudoers.d/xudo` is already there. Remove uninstalls through xudo before disabling the socket; purge removes state and the package group.
 
 The dangerous part. Each step exists because of a specific failure mode.
 
@@ -199,6 +205,8 @@ Every one of these appears in the README, the package description, and `xudo --v
 ---
 
 ## 7. Tests that gate the release
+
+**Status (2026-11-05):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). The README pipe-to-shell check remains in `xudo-tests`.
 
 Run in containers, per distro, on both architectures.
 

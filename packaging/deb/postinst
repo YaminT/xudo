@@ -1,0 +1,67 @@
+#!/bin/sh
+# Creates the group and the runtime dirs. The socket is enabled only on a
+# first install, and an upgrade writes the rule only when one is already there.
+set -eu
+
+# abort-*: dpkg is putting the old files back. Leave the rule and the socket
+# alone; restoring a rule the operator removed is the bug this script avoids.
+case $1 in
+configure) ;;
+abort-upgrade | abort-remove | abort-deconfigure) exit 0 ;;
+*) exit 0 ;;
+esac
+
+getent group xudo >/dev/null || groupadd --system xudo
+
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/xudo.conf
+else
+    # Same modes as packaging/tmpfiles.d/xudo.conf. Recommends may be off.
+    install -d -m 0755 -o root -g root /run/xudo
+    install -d -m 0700 -o root -g root /run/xudo/req
+    install -d -m 0700 -o root -g root /var/lib/xudo
+fi
+
+# Upgraded units are ignored until systemd rereads them.
+if [ -d /run/systemd/system ]; then systemctl --system daemon-reload >/dev/null || true; fi
+
+# $2 is empty only on a first install. A reinstall after remove also sets it,
+# so that path will not put the rule back either. That is the safe direction.
+if [ -z "${2:-}" ]; then
+    deb-systemd-helper enable xudod.socket >/dev/null
+    deb-systemd-invoke start xudod.socket >/dev/null || true
+    write_rule=1
+elif [ -e /etc/sudoers.d/xudo ] || [ -L /etc/sudoers.d/xudo ]; then
+    write_rule=1
+elif [ -e /etc/doas.d/60-xudo.conf ] || [ -L /etc/doas.d/60-xudo.conf ] ||
+    { [ -f /etc/doas.conf ] && grep -q '^### xudo:begin' /etc/doas.conf; }; then
+    write_rule=0
+else
+    write_rule=0
+    printf '%s\n' 'no xudo rule installed; run `sudo xudo install` to add it, and `systemctl enable --now xudod.socket`' >&2
+fi
+
+if [ "$write_rule" -eq 1 ]; then
+    rc=0
+    exec 3>&1
+    err=$(/usr/bin/xudo install 2>&1 >&3 3>&-) || rc=$?
+    exec 3>&-
+    [ -z "$err" ] || printf '%s\n' "$err" >&2
+    if [ "$rc" -ne 0 ]; then
+        # Full prefix, start of a line. Any other nonzero exit fails configure.
+        if printf '%s\n' "$err" | grep -q '^xudo: installed, but NOT VERIFIED:'; then
+            printf '%s\n' 'xudo: continuing; the rule is written but unproven' >&2
+        else
+            printf '%s\n' "xudo: install failed (exit $rc); the package is not configured" >&2
+            exit "$rc"
+        fi
+    fi
+fi
+
+cat <<'MSG'
+
+xudo (beta): every invocation asks for your password. There is no agent
+path in this release, and nobody was added to the xudo group.
+Agent detection is not a security boundary. Read SECURITY.md first:
+/usr/share/doc/xudo/SECURITY.md
+MSG

@@ -8,6 +8,8 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 ## Where the project actually stands
 
+> **Status, 2026-11-05.** Phase 3 step 1 is implemented in `packaging/deb/`: the unsigned human-path `.deb`, maintainer scripts, and Ubuntu 24.04/26.04 plus Debian 13 install matrix are wired into CI. Signing, publication, and the remaining phase 3 deliverables await later steps and the owner's explicit release approval.
+
 > **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: phase 3 (beta `.deb`, human path only), then M3. Both open decisions from 2026-10-30 are decided; see the milestone sections.
 
 **Done.** The crates in the table below, a working unprivileged executable, and a root broker that mints entries and executes nothing. A row that opens with **in review (M2b).** is a crate built in a lane's worktree and not yet a workspace member; merging it deletes the marker. `crates/xudo-tests/tests/crate_inventory.rs` fails the build when this table and `Cargo.toml` disagree.
