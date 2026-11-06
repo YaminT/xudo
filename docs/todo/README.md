@@ -8,6 +8,8 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 ## Where the project actually stands
 
+> **Status, 2026-11-06.** Phase 3 step 2 is implemented: the systemd unit omits `NoNewPrivileges=yes`, and the broker sets it through the hygiene seam before serving. Failure is audited, refused, and exits non-zero. `just systemd-test` checks `NoNewPrivs: 1` and the full password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
+
 > **Status, 2026-11-05.** Phase 3 step 1 is implemented in `packaging/deb/`: the unsigned human-path `.deb`, maintainer scripts, and Ubuntu 24.04/26.04 plus Debian 13 install matrix are wired into CI. Signing, publication, and the remaining phase 3 deliverables await later steps and the owner's explicit release approval.
 
 > **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: phase 3 (beta `.deb`, human path only), then M3. Both open decisions from 2026-10-30 are decided; see the milestone sections.
@@ -38,7 +40,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 **The gate:** 373 tests, 100% coverage on lines, regions, and functions with **zero line-level waivers**, zero clippy warnings, `cargo deny` clean, miri clean, three fuzz targets clean, a GTFOBins waiver gate, and a pre-commit hook. Nightly and `cargo-fuzz` are installed, so the fuzz and miri lanes have actually run — and fuzzing found a real bug on its first execution (see `../CONCERNS.md`).
 
-**Not done.** The passwordless path (M4): `classify()` returns `Unattested` for every caller, so every request takes the password path. Out-of-band confirmation (M3). The broker has not run under its real systemd sandbox. Doas is not verified by the doctor or the install probe, and the probe cannot verify on multicall-coreutils distros. Details: `../CONCERNS.md`, 2026-10-30.
+**Not done.** The passwordless path (M4): `classify()` returns `Unattested` for every caller, so every request takes the password path. Out-of-band confirmation (M3). Doas is not verified by the doctor or the install probe, and the probe cannot verify on multicall-coreutils distros. Details: `../CONCERNS.md`, 2026-10-30.
 
 ---
 
@@ -169,8 +171,7 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        the willyoumarryme acceptance test, man pages.
 5. M2b                 DONE 2026-10-30 in code and tests: `xudo exec`, the
                        install and its probe, the audit trail through both
-                       binaries, the executing differential. Gaps: the broker
-                       under its real systemd sandbox; doas verification.
+                       binaries, the executing differential. Gaps: doas verification.
 6. Phase 3             NEXT (decided 2026-10-30). beta .deb + publish, human path
                        only, no NOPASSWD shipped.
                        Ships xudod too: without the nopass hardlink it grants
