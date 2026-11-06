@@ -18,7 +18,11 @@
 <p>xudo is a Linux privilege broker for operators who want AI coding agents to request narrowly defined privileged commands. It checks commands against root-owned rules and uses the host's privilege backend. This beta runs every request through the human password path.</p>
 <p><strong>Beta. Not externally audited.</strong> The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release. See <a href="security.html">security status and limits</a>.</p>
 <h2>Install</h2>
-<p>A signed Debian package on GitHub Releases, a checksum, and cosign keyless signing are planned. The package has not been released. xudo has no <code>curl | sh</code> installer because a privileged shell script is difficult to inspect before execution.</p>
+<p>No release has been published yet. When one is available, download the <code>.deb</code>, <code>SHA256SUMS</code>, and its <code>.cosign.bundle</code> from the GitHub Release. Replace <code>&lt;ver&gt;</code> with the Debian version, <code>&lt;arch&gt;</code> with <code>amd64</code> or <code>arm64</code>, and <code>&lt;tag&gt;</code> with the Git tag; for example, <code>&lt;ver&gt;</code> <code>0.1.0~beta.1</code> corresponds to <code>&lt;tag&gt;</code> <code>v0.1.0-beta.1</code>.</p>
+<pre><code>sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob --bundle xudo_&lt;ver&gt;_&lt;arch&gt;.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/&lt;tag&gt; --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_&lt;ver&gt;_&lt;arch&gt;.deb
+sudo apt install ./xudo_&lt;ver&gt;_&lt;arch&gt;.deb</code></pre>
+<p>xudo has no <code>curl | sh</code> installer because a privileged shell script is difficult to inspect before execution.</p>
 <h2>Example</h2><p>From a checkout, <code>--rules ./rules</code> applies to <code>explain</code>. <code>exec</code> ignores <code>--rules</code>; the broker loads root's <code>/etc/xudo/rules.d</code>.</p>
 <pre><code>xudo --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
 xudo doctor

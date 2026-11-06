@@ -4,6 +4,12 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-06 — release workflow
+
+The release workflow starts on a pushed `v*` tag. `<tag>` is `v` plus the Cargo version unchanged (for example, `v0.1.0-beta.1`); `<ver>` is the Debian version used in the `.deb` filename (for example, `0.1.0~beta.1`). Native amd64 and arm64 jobs run `just deb-test` and upload the tested packages. A signing job uses cosign keyless through GitHub Actions OIDC, then a separate release job creates a draft prerelease. The owner reviews and publishes it by hand; no tag or release was created for this work.
+
+---
+
 ## 2026-11-06 — pasban: the audit log is checked daily, and a broken one is loud
 
 Pasban, for this step, is the audit-log half of the watchman in `howiwork.md`. Grant expiry stays M5. The package ships `xudo-pasban.service` and `xudo-pasban.timer`. The timer is `OnCalendar=daily`, `Persistent=true`, `RandomizedDelaySec=1h`. The operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled; remove disables it; purge drops its state. No pre-pasban package was published, so there is no released upgrade that needs to enable the new timer.

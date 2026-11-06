@@ -6,7 +6,15 @@ xudo is a Linux privilege broker. It checks commands against root-owned rules an
 
 ## Install
 
-A signed `.deb` on GitHub Releases, a checksum, and cosign keyless signing are planned. No release artifacts are available yet. xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
+No release has been published yet. When one is available, download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the GitHub Release, then verify both the checksum and the exact GitHub Actions identity before installing. Replace `<ver>` with the Debian version, `<arch>` with `amd64` or `arm64`, and `<tag>` with the Git tag; for example, `<ver>` `0.1.0~beta.1` corresponds to `<tag>` `v0.1.0-beta.1`:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_<ver>_<arch>.deb
+sudo apt install ./xudo_<ver>_<arch>.deb
+```
+
+xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 
 ## Example
 

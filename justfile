@@ -306,7 +306,7 @@ install-root:
 # for the architecture Docker on this host runs. No cargo-deb: the layout and
 # the maintainer scripts are in packaging/deb/.
 deb:
-    cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --target {{musl_triple}}
+    cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
     packaging/deb/build.sh {{musl_triple}}
 
 # Install, upgrade, remove, and purge the .deb in Ubuntu 24.04, Ubuntu 26.04
