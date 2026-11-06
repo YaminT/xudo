@@ -1,0 +1,8 @@
+# Static musl binaries on purpose: no shared libraries to swap under a root helper.
+xudo: statically-linked-binary [*]
+# xudo(1) is a later phase 3 deliverable.
+xudo: no-manual-page [usr/bin/xudo]
+# The alternate ido name shares ido(1), but lintian checks the path literally.
+xudo: no-manual-page [usr/bin/willyoumarryme]
+# The packaged binary, called by absolute path. Root's PATH is not searched.
+xudo: command-with-path-in-maintainer-script /usr/bin/xudo*

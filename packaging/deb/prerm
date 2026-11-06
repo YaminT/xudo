@@ -1,0 +1,13 @@
+#!/bin/sh
+# Remove the rule while the binary still exists. An upgrade keeps it.
+set -eu
+case $1 in
+remove | deconfigure)
+    if [ -x /usr/bin/xudo ]; then
+        /usr/bin/xudo install --uninstall
+    fi
+    # Stop only matters when systemd is up. Disable removes the links either way.
+    deb-systemd-invoke stop xudod.socket >/dev/null || true
+    deb-systemd-helper disable xudod.socket >/dev/null || true
+    ;;
+esac

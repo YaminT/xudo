@@ -300,6 +300,20 @@ install-root:
     cargo build -p xudo-bin --release --target {{musl_triple}}
     ci/install/run.sh target/{{musl_triple}}/release/xudo
 
+# --- the beta .deb -----------------------------------------------------------
+
+# Builds target/deb/xudo_<version>_<arch>.deb from the static musl binaries,
+# for the architecture Docker on this host runs. No cargo-deb: the layout and
+# the maintainer scripts are in packaging/deb/.
+deb:
+    cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --target {{musl_triple}}
+    packaging/deb/build.sh {{musl_triple}}
+
+# Install, upgrade, remove, and purge the .deb in Ubuntu 24.04, Ubuntu 26.04
+# and Debian 13 containers, and lint it. Needs Docker. ci/deb/run.sh has the rows.
+deb-test: deb
+    ci/deb/run.sh {{musl_triple}}
+
 # --- developer setup --------------------------------------------------------
 
 # Point git at the tracked hooks directory, so the gate runs before every
@@ -322,7 +336,7 @@ setup: install-hooks
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
 # fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
-ci: verify check-linux miri units differential root-test install-root
+ci: verify check-linux miri units differential root-test install-root deb-test
 
 clean:
     cargo clean

@@ -1,0 +1,13 @@
+Package: xudo
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: xudo contributors <noreply@xudo.invalid>
+Section: admin
+Priority: optional
+Depends: sudo, init-system-helpers (>= 1.54~)
+Recommends: systemd
+Homepage: https://github.com/YaminT/xudo
+Description: allowlisted privileged commands for AI coding agents (beta)
+ xudo runs an allowlisted set of privileged actions through sudo or doas,
+ with a root-owned rule set and a compiled-in deny-list. This beta ships
+ the password path only: every invocation prompts. Not externally audited.

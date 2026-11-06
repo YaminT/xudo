@@ -1,0 +1,63 @@
+#!/bin/sh
+# Builds xudo_<version>_<arch>.deb from the static musl binaries.
+#
+#   packaging/deb/build.sh <musl triple> [outdir]      (or: just deb)
+#
+# VERSION overrides the workspace version (the upgrade test builds a second one).
+# Run `cargo build --release --target <triple>` for the four binaries first.
+set -eu
+umask 022
+triple=$1
+root=$(cd "$(dirname "$0")/../.." && pwd)
+out=${2:-$root/target/deb}
+case $triple in
+x86_64-*) arch=amd64 ;;
+aarch64-*) arch=arm64 ;;
+*) echo "unsupported triple $triple" >&2; exit 1 ;;
+esac
+version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
+# A hyphen starts a Debian revision, so 0.1.0-beta.1 would sort above 0.1.0.
+# Tilde stays in the upstream version and sorts before the final release.
+version=$(printf '%s\n' "$version" | tr '-' '~')
+bin=$root/target/$triple/release
+epoch=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)}
+export SOURCE_DATE_EPOCH=$epoch
+
+stage=$out/stage
+rm -rf "$stage"
+mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
+    "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
+    "$stage/etc/xudo/rules.d" \
+    "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
+
+install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
+ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
+install -m 0755 "$bin/xudod" "$stage/usr/libexec/xudo/"
+# Only the -auth name: the passwordless gate is not in this package at all.
+install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-auth"
+install -m 0644 "$root"/packaging/systemd/* "$stage/usr/lib/systemd/system/"
+install -m 0644 "$root/packaging/tmpfiles.d/xudo.conf" "$stage/usr/lib/tmpfiles.d/"
+install -m 0644 "$root"/rules/*.toml "$stage/etc/xudo/rules.d/"
+mkdir -p "$stage/usr/share/lintian/overrides"
+install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
+install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \
+    "$stage/usr/share/doc/xudo/"
+printf 'xudo (%s) unstable; urgency=low\n\n  * Beta release.\n\n -- xudo contributors <noreply@xudo.invalid>  %s\n' \
+    "$version" "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')" |
+    gzip -9n >"$stage/usr/share/doc/xudo/changelog.gz"
+for m in "$root"/docs/man/*.1; do gzip -9n <"$m" >"$stage/usr/share/man/man1/$(basename "$m").gz"; done
+for m in "$root"/docs/man/*.5; do gzip -9n <"$m" >"$stage/usr/share/man/man5/$(basename "$m").gz"; done
+
+sed -e "s/@VERSION@/$version/" -e "s/@ARCH@/$arch/" "$root/packaging/deb/control" >"$stage/DEBIAN/control"
+install -m 0755 "$root/packaging/deb/postinst" "$root/packaging/deb/prerm" \
+    "$root/packaging/deb/postrm" "$stage/DEBIAN/"
+(cd "$stage" && find etc -type f | sed 's|^|/|' | sort) >"$stage/DEBIAN/conffiles"
+(cd "$stage" && find . -type f ! -path './DEBIAN/*' -printf '%P\0' | sort -z | xargs -0 md5sum >DEBIAN/md5sums)
+
+# Normalise mtimes so two builds of one commit match.
+find "$stage" -exec touch -h -d "@$epoch" {} +
+# Drop older builds so a caller cannot pick a stale .deb by listing the directory.
+rm -f "$out"/xudo_*.deb
+deb=$out/xudo_${version}_${arch}.deb
+dpkg-deb --build --root-owner-group -Zxz "$stage" "$deb" >/dev/null
+echo "$deb"
