@@ -4,6 +4,24 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-06 — pasban: the audit log is checked daily, and a broken one is loud
+
+Pasban, for this step, is the audit-log half of the watchman in `howiwork.md`. Grant expiry stays M5. The package ships `xudo-pasban.service` and `xudo-pasban.timer`. The timer is `OnCalendar=daily`, `Persistent=true`, `RandomizedDelaySec=1h`. The operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled; remove disables it; purge drops its state. No pre-pasban package was published, so there is no released upgrade that needs to enable the new timer.
+
+The service runs, as root, `/usr/bin/xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. The capability bounding set is empty. The log is `0600` and root's, so the owner read bit is enough; `CAP_DAC_OVERRIDE` is what a process that does not own the file would need. Nothing in the sandbox is writable. `NoNewPrivileges=yes` is set here. The broker's unit still omits it, because that directive makes systemd remount the ruleset `nosuid` (the entry below).
+
+Loud is two things, both checked by `just systemd-test`. The process exits non-zero, so `systemctl start` fails and the unit is `failed`. The failure line is prefixed `<2>`. The unit sets `SyslogLevelPrefix=yes` and `StandardError=journal`, and journald stores that line at priority 2. `journalctl -u xudo-pasban -p 2` shows it. `SyslogLevel=` was not used: it would mark the clean result critical as well. `LogLevelMax=` only drops lines.
+
+`--against-journal` runs `/usr/bin/journalctl` by absolute path, through the probe runner, with no `PATH` search. The query is `_UID=0` and xudo's `MESSAGE_ID`; journalctl reads all boots by default. It compares `XUDO_SEQ`, `XUDO_HASH` and `XUDO_PREV_HASH` with the verified file chain. An entry linked to the file's last hash shows a removed tail. An entry linked to a file record but carrying a different next hash shows a cut followed by replacement records. Once any file record matches, a higher sequence on another chain is ignored. The query fails closed on any stderr, including journalctl warnings; `LimitNOFILE=65536` gives it room to open journal files. A log file whose records the journal never saw fails pasban, including a log restored from backup or moved from another host while this host's journal holds other xudo entries.
+
+What this does not catch, on purpose:
+
+- Whoever can empty the file can clear it completely: an empty file has no hash to link to, so the journal cannot attribute even a non-genesis chain to it. A missing log fails until the next boot or write, when tmpfiles recreates it empty. Rolling back to an older genuine chain whose last record has no successor in the journal is still not caught. A journal that is empty or behind the file cannot show a cut because journald drops entries over its rate limit and an operator can vacuum it; genesis entries have an empty predecessor and are skipped as ambiguous.
+- Any `journalctl` stderr fails pasban, including a corrupt journal file after an unclean shutdown. The daily check keeps failing loudly until that file rotates out; this is accepted.
+- Root. uid 0 can rewrite the file and send a matching journal entry. The journal is a copy to compare against a third party, not a defence against root.
+
+---
+
 ## 2026-11-06 — Phase 3 step 2: the broker under real systemd — fixed
 
 The systemd lane found that the shipped unit's `ProtectSystem=strict` together with `NoNewPrivileges=yes` caused systemd to remount `/` read-only and `nosuid` in the broker's mount namespace. `MountPolicy::Ruleset` correctly refuses a ruleset on a `nosuid` mount, so every request was refused `policy_unloadable` before the gate ran. The issue was measured in Debian 13, Ubuntu 24.04, and Ubuntu 26.04; removing only the unit directive made the lane pass in a container.

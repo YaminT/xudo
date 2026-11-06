@@ -1,6 +1,7 @@
 #!/bin/sh
-# Creates the group and the runtime dirs. The socket is enabled only on a
-# first install, and an upgrade writes the rule only when one is already there.
+# Creates the group and the runtime dirs. The socket and pasban's timer are
+# enabled only on a first install, and an upgrade writes the rule only when
+# one is already there.
 set -eu
 
 # abort-*: dpkg is putting the old files back. Leave the rule and the socket
@@ -30,6 +31,8 @@ if [ -d /run/systemd/system ]; then systemctl --system daemon-reload >/dev/null 
 if [ -z "${2:-}" ]; then
     deb-systemd-helper enable xudod.socket >/dev/null
     deb-systemd-invoke start xudod.socket >/dev/null || true
+    deb-systemd-helper enable xudo-pasban.timer >/dev/null
+    deb-systemd-invoke start xudo-pasban.timer >/dev/null || true
     write_rule=1
 elif [ -e /etc/sudoers.d/xudo ] || [ -L /etc/sudoers.d/xudo ]; then
     write_rule=1

@@ -18,6 +18,7 @@ remove | purge)
 esac
 if [ "$1" = purge ]; then
     deb-systemd-helper purge xudod.socket >/dev/null || true
+    deb-systemd-helper purge xudo-pasban.timer >/dev/null || true
     rm -rf /etc/xudo /var/lib/xudo /run/xudo
     ! getent group xudo >/dev/null || groupdel xudo
 fi

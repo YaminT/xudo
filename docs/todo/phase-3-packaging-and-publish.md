@@ -26,13 +26,15 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 **Step 2 status (2026-11-06):** implemented. The unit omits `NoNewPrivileges=yes`; the broker sets it through `xudo_sys::Hygiene` before serving and fails closed with an audited `broker_unusable` refusal if it cannot. The ruleset trust walk is unchanged. `just systemd-test` checks `NoNewPrivs: 1` and the complete installed password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
 
+**Step 3 status (2026-11-06):** implemented. `xudo-pasban.service` and `xudo-pasban.timer` ship in the package. The timer is daily, persistent, with a one-hour randomized delay; the operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled. The service runs, as root with no capabilities, `xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. A failure exits non-zero and is a `<2>` line, stored at journal priority 2. `--against-journal` catches a tail removed on a record boundary by the journal's highest root-written sequence. Grant expiry stays M5. See `../CONCERNS.md`, 2026-11-06.
+
 This is the load-bearing decision of the whole phase, so it comes first.
 
 A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. Before M4 there is no reviewed enrollment path, no broker, and no out-of-band confirmation, so a passwordless rule would be a standing root grant with no compensating control.
 
 Therefore the beta package:
 
-- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate-auth`, and `/usr/libexec/xudo/xudod` with its socket unit;
+- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate-auth`, and `/usr/libexec/xudo/xudod` with its socket unit and pasban's timer;
 - installs the `PASSWD:` sudoers rule only;
 - does **not** install `xudo-gate-nopass`, its hardlink, or its `NOPASSWD:` rule — those files are not in the package at all, rather than present-but-unreferenced;
 - does **not** add any user to the `xudo` group (see § 3);
@@ -54,6 +56,8 @@ Build a single `.deb` directly with `dpkg-deb`; the small explicit staging scrip
 /usr/libexec/xudo/xudod                   0755 root:root   the broker; started per connection, never by hand
 /usr/lib/systemd/system/xudod.socket      0644 root:root   packaging/systemd/xudod.socket: /run/xudo/broker.sock, 0660 root:xudo
 /usr/lib/systemd/system/xudod@.service    0644 root:root   packaging/systemd/xudod@.service: one sandboxed instance per connection
+/usr/lib/systemd/system/xudo-pasban.service 0644 root:root packaging/systemd/xudo-pasban.service: audit-log check, root, read-only
+/usr/lib/systemd/system/xudo-pasban.timer   0644 root:root   packaging/systemd/xudo-pasban.timer: daily, persistent, randomized delay
 /usr/share/doc/xudo/                                       README, SECURITY, changelog, copyright
 /usr/share/man/man1/xudo.1.gz
 /usr/share/man/man5/xudo-rules.5.gz                        the rule-file format
@@ -64,7 +68,7 @@ Build a single `.deb` directly with `dpkg-deb`; the small explicit staging scrip
 /usr/lib/tmpfiles.d/xudo.conf             0644 root:root   packaging/tmpfiles.d/xudo.conf: /run/xudo 0755, /run/xudo/req 0700
 ```
 
-The three files under `packaging/` are tested as code by `crates/xudod/tests/units.rs`, which refuses any directive it does not know — systemd ignores a misspelled one with a warning — and asserts every security-relevant line against the constants the code uses. The postinst creates the `xudo` group before it enables `xudod.socket`, because `SocketGroup=xudo` fails without it.
+The unit files and the tmpfiles line under `packaging/` are tested as code by `crates/xudod/tests/units.rs`, which refuses any directive it does not know — systemd ignores a misspelled one with a warning — and asserts every security-relevant line against the constants the code uses. The postinst creates the `xudo` group before it enables `xudod.socket`, because `SocketGroup=xudo` fails without it. Pasban's timer is enabled the same way, on a first install only.
 
 Control fields:
 
