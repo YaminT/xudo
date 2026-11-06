@@ -125,7 +125,15 @@ impl KernelReport {
             agent_path_available: support.agent_path_available(),
             withheld_because: support.attestation.withheld_because(),
             resolution: support.resolution.mechanism(),
-            summary: support.summary(),
+            summary: if support.agent_path_available() {
+                format!(
+                    "{} via {} (kernel supports attestation for the planned agent path; agent path not in this build)",
+                    support.version,
+                    support.attestation.mechanism()
+                )
+            } else {
+                support.summary()
+            },
         }
     }
 }

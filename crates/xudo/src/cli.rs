@@ -1,9 +1,7 @@
 //! The command surface.
 //!
-//! At this milestone every subcommand is introspection: nothing here executes a
-//! privileged command, because no privileged path exists yet. That is worth
-//! saying in the `--help` text too, so nobody installs this expecting it to run
-//! something.
+//! The password-authenticated privileged path is built. Passwordless agent
+//! execution is not available in this beta.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -41,17 +39,15 @@ pub enum Format {
     Json,
 }
 
-/// Agent-aware privilege broker. This build performs no privileged operation.
+/// Linux privilege broker. This beta uses the human password path.
 #[derive(Debug, Parser)]
 #[command(
     name = "xudo",
-    version,
-    about = "Agent-aware privilege broker for Linux (beta: introspection only, executes nothing)",
-    long_about = "xudo decides whether a privileged command is permitted by a root-owned \
-                  allowlist.\n\nThis build contains no privileged path: `explain`, `check`, \
-                  `why-not`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, and \
-                  `agentdoc` inspect the policy and execute nothing. \
-                  Passwordless agent execution arrives with the broker."
+    version = concat!(env!("CARGO_PKG_VERSION"), " (beta, not externally audited)"),
+    about = "Linux privilege broker; this beta uses the human password path",
+    long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
+                  password-authenticated path through the host backend. The passwordless \
+                  agent path is not available in this beta (M4)."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -1274,7 +1270,7 @@ mod tests {
         let fx = fixture("cli-doctor-kernel");
         let (_, out, _) = run_ops(&fx, &BlindOps, &["doctor"]);
         assert!(
-            out.contains("kernel       6.8 via SO_PEERPIDFD (agent path available)"),
+            out.contains("kernel       6.8 via SO_PEERPIDFD (kernel supports attestation for the planned agent path; agent path not in this build)"),
             "{out}"
         );
     }
@@ -3510,12 +3506,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn the_help_text_says_this_build_executes_nothing() {
-        // Someone must not install this expecting it to run a command.
+    fn the_help_text_describes_the_beta_password_path() {
         let err = Cli::try_parse_from(["xudo", "--help"]).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("execute nothing"), "{text}");
-        assert!(text.contains("no privileged path"), "{text}");
+        assert!(text.contains("password-authenticated path"), "{text}");
+        assert!(
+            text.contains("passwordless agent path is not available"),
+            "{text}"
+        );
     }
 
     #[test]
