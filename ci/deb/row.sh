@@ -9,6 +9,7 @@ meta() { [ "$(stat -c '%a %U:%G' "$1")" = "$2" ] || fail "$1 is $(stat -c '%a %U
 gone() { [ ! -e "$1" ] && [ ! -L "$1" ] || fail "$1 exists, and must not"; }
 rule=/etc/sudoers.d/xudo
 socket=/etc/systemd/system/sockets.target.wants/xudod.socket
+timer=/etc/systemd/system/timers.target.wants/xudo-pasban.timer
 norec=${APT_NO_RECOMMENDS:-}
 apt() { apt-get "$@" -y -qq >/tmp/apt.log 2>&1 || { cat /tmp/apt.log >&2; fail "apt-get $*"; }; }
 deb_install() {
@@ -32,9 +33,20 @@ meta $rule "440 root:root"
 getent group xudo >/dev/null || fail "no xudo group"
 [ -z "$(getent group xudo | cut -d: -f4)" ] || fail "xudo group is not empty"
 meta /var/lib/xudo "700 root:root"
+grep -Eq '^f[[:space:]]+/var/lib/xudo/audit.jsonl[[:space:]]+0600[[:space:]]+root[[:space:]]+root([[:space:]]|$)' /usr/lib/tmpfiles.d/xudo.conf || fail "tmpfiles audit-log rule missing"
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/xudo.conf
+else
+    install -m 0600 -o root -g root /dev/null /var/lib/xudo/audit.jsonl
+fi
+meta /var/lib/xudo/audit.jsonl "600 root:root"
+[ ! -s /var/lib/xudo/audit.jsonl ] || fail "new audit log is not empty"
 meta /run/xudo "755 root:root"
 meta /run/xudo/req "700 root:root"
 [ -L "$socket" ] || fail "socket was not enabled"
+[ -f /usr/lib/systemd/system/xudo-pasban.service ] || fail "pasban service not in the package"
+[ -f /usr/lib/systemd/system/xudo-pasban.timer ] || fail "pasban timer not in the package"
+[ -L "$timer" ] || fail "timer was not enabled"
 gone /usr/libexec/xudo/xudo-gate-nopass
 gone /usr/libexec/xudo/xudo-gate
 [ -x /usr/libexec/xudo/xudo-gate-auth ] || fail "auth gate missing"
@@ -61,6 +73,7 @@ grep -q '^# mine' /etc/xudo/rules.d/05-probe.toml || fail "upgrade lost the oper
 members=$(getent group xudo | cut -d: -f4)
 printf '%s\n' ",$members," | grep -q ',xudomember,' || fail "upgrade dropped the group member"
 [ -L "$socket" ] || fail "upgrade dropped the socket enablement"
+[ -L "$timer" ] || fail "upgrade dropped the timer enablement"
 if grep -q 'no xudo rule installed' /tmp/apt.log; then
     fail "upgrade with a rule said there was none"
 fi
@@ -73,6 +86,7 @@ gone /usr/bin/xudo
 getent group xudo >/dev/null || fail "remove deleted the group"
 dpkg -s xudo | grep -q '^Status: deinstall ok config-files' || fail "remove did not leave config-files"
 [ ! -e "$socket" ] && [ ! -L "$socket" ] || fail "remove left the socket enabled"
+[ ! -e "$timer" ] && [ ! -L "$timer" ] || fail "remove left the timer enabled"
 apt purge xudo
 gone $rule
 gone /etc/xudo
@@ -85,7 +99,11 @@ deb_install ./old.deb
 meta $rule "440 root:root"
 xudo install --uninstall
 gone $rule
+# An operator who disabled the timer keeps it disabled across an upgrade.
+# Enablement is a first install only, same as the socket.
+rm -f "$timer"
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
 gone $rule
+[ ! -e "$timer" ] && [ ! -L "$timer" ] || fail "upgrade re-enabled a timer the operator disabled"
 grep -q 'no xudo rule installed' /tmp/apt.log || fail "upgrade did not report the missing rule"
 echo "row ok"

@@ -7,7 +7,8 @@ remove | deconfigure)
         /usr/bin/xudo install --uninstall
     fi
     # Stop only matters when systemd is up. Disable removes the links either way.
-    deb-systemd-invoke stop xudod.socket >/dev/null || true
+    deb-systemd-invoke stop xudod.socket xudo-pasban.timer xudo-pasban.service >/dev/null || true
     deb-systemd-helper disable xudod.socket >/dev/null || true
+    deb-systemd-helper disable xudo-pasban.timer >/dev/null || true
     ;;
 esac
