@@ -6,9 +6,10 @@
 precondition for 1.0. Until then, do not deploy this where a compromise would
 matter.
 
-**This build has no privileged path.** Nothing it contains can execute a command
-as root. `classify()` returns `Unattested` for every caller on every platform, so
-every request routes to the password path.
+The broker and password-authenticated gate are built. Every caller is currently
+classified as `Unattested`, so every request uses the password path. The
+package does not install a `NOPASSWD` rule. The passwordless agent path,
+out-of-band confirmation, and Landlock confinement are not in this release.
 
 ## Reporting
 
@@ -26,8 +27,8 @@ one you know you lack.
 
 - **Agent detection is not a security boundary.** A same-uid process can forge
   every cheap signal, and a human can ask a genuinely-enrolled agent to run a
-  command. Impersonation buys only a skipped password on an already-allowlisted
-  action.
+  command. Once the passwordless path exists, impersonation would skip the password on
+  an already-allowlisted action; today it buys nothing.
 - **The deny-list is defence in depth.** The set of programs that can be turned
   into a root shell is not enumerable. It catches a mistake in a rule; it is not
   the boundary.
@@ -42,13 +43,12 @@ one you know you lack.
   report can and cannot see.
 - **`xudo explain` does not verify the rules it reads.** It reads them by path,
   so that it works on a checkout; a tampered ruleset makes it print a wrong
-  answer to the human who asked. Survivable only because nothing can execute.
-  The privileged loader, `xudo_sys::load_trusted_rules`, refuses a ruleset with
+  answer to the human who asked. `exec` does not use the front-end's rule path. The broker and gate load through the privileged loader `xudo_sys::load_trusted_rules`, which refuses a ruleset with
   any component that is not root's, is writable by group or world, is a
   symbolic link, or is on a mount a non-root user could have made — checked on
   the descriptors the rules are read through — and `xudo doctor` reports
-  through it. The broker and the gate are not written yet; loading through it,
-  and nothing else, is a stated precondition of the privileged path.
+  through it. The broker and gate use this trusted loader for privileged
+  requests; `explain` itself remains an unprivileged inspection command.
 - **Not every user-writable filesystem is refused yet.** A mount that root made
   from a block device or loop file a user can write passes, and so does an
   overlay whose upper layer a user can write: what is checked is who made the
@@ -87,8 +87,8 @@ It reports:
   neither reaches a file any of them names. So a line that is not settled and
   holds the word `include` is also reported as an include (`"grant":
   "include"`, "may name you"), whatever else is found, and the check is never
-  clean. It is a containment: only asking sudo itself (plan item D3) turns it
-  into an answer. Within a line the scan is left to right with escape semantics,
+  clean. It is a containment. Plan item D3 is done: as root, doctor asks
+  `sudo -n -l -U`. Within a line the scan is left to right with escape semantics,
   and **only three escapes are modelled**: a backslash before a backslash,
   before a `#`, and before a blank. Any other backslash escape (`\q`, `\xHH`,
   `\"`), and a double quote on a line that also has a backslash or a later `#`,
@@ -104,8 +104,8 @@ It reports:
   and has a line xudo does not model, which may set it (the `secure_path` it did
   find is examined either way). A file with a continuation line therefore says
   "may name you" and "unverified" where a faithful parser would say yes or no;
-  the fix for that is to ask the program itself (`doas -C`, `sudo -l -U`), which
-  is planned (`docs/todo/m2b-finish-plan.md`, item D3).
+  the fix is to ask the program itself: as root, doctor runs `sudo -n -l -U`;
+  unprivileged, it runs `doas -C` for each configuration file.
 - **Group membership** that is root by another name: `sudo`, `wheel`, `admin`,
   `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `input` — both the groups
   `/etc/group` lists you in and the ones this session holds.
@@ -142,6 +142,10 @@ design means the ones listed above; this is the list of the ones it is not. `xud
 prints each proposed change, what it means, and the exact command for a human
 to run; it applies nothing, because a confirmation read from your own terminal
 is one an agent driving that terminal could type.
+
+## Other known limits
+
+The install probe reports `installed, but NOT VERIFIED` on doas and on multicall-coreutils systems, including stock Ubuntu 26.04 with uutils `/usr/bin/id` and Alpine. The systemd and differential lanes on Ubuntu 26.04 pass because those lanes install GNU `id`. The audit trail records authorization, not command outcomes. Pasban runs daily as root to verify the chain and compare file records with journald copies by hash. It detects a removed tail, a cut followed by continued writes, and a forged chain journald never saw. It cannot prevent privileged tampering or prove a command completed.
 
 ## No telemetry
 
