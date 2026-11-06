@@ -14,7 +14,7 @@ expression: "render::json_of(&report)"
     "agent_path_available": true,
     "withheld_because": null,
     "resolution": "openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)",
-    "summary": "6.8 via SO_PEERPIDFD (agent path available)"
+    "summary": "6.8 via SO_PEERPIDFD (kernel supports attestation for the planned agent path; agent path not in this build)"
   },
   "ruleset": {
     "dir": "/usr/bin",

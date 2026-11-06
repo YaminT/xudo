@@ -128,8 +128,8 @@ impl<S: ProcSource> PrivilegedOps for LinuxOps<S> {
         let mut facts = CallerFacts::new(
             Classification::Unattested {
                 reason: format!(
-                    "no broker: SO_PEERPIDFD and cgroup attestation are not available \
-                     until M3, so no caller can be attested (ancestry: {})",
+                    "caller is unattested; every caller remains unattested until M4 \
+                     (ancestry: {})",
                     chain.describe()
                 ),
             },
@@ -316,7 +316,7 @@ mod tests {
         // so there is no arm for a variant no implementation can return.
         let rendered = format!("{:?}", facts.classification);
         assert!(rendered.starts_with("Unattested"), "{rendered}");
-        assert!(rendered.contains("SO_PEERPIDFD"), "{rendered}");
+        assert!(rendered.contains("unattested until M4"), "{rendered}");
         assert!(rendered.contains("bash(412)"), "{rendered}");
     }
 

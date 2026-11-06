@@ -48,6 +48,7 @@ pub fn render(rules: &RuleSet, generation: &str, format: DocFormat) -> String {
     }
 
     out.push_str("Do not use sudo. Use xudo. It runs an approved list only.\n\n");
+    out.push_str("In this beta every `xudo exec` asks a human for a password; queue it with `ido queue` instead when no human is at the terminal.\n\n");
     out.push_str("You may run these:\n\n");
 
     for action in rules.actions() {
