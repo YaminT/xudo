@@ -26,7 +26,7 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 **Step 2 status (2026-11-06):** implemented. The unit omits `NoNewPrivileges=yes`; the broker sets it through `xudo_sys::Hygiene` before serving and fails closed with an audited `broker_unusable` refusal if it cannot. The ruleset trust walk is unchanged. `just systemd-test` checks `NoNewPrivs: 1` and the complete installed password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
 
-**Step 3 status (2026-11-06):** implemented. `xudo-pasban.service` and `xudo-pasban.timer` ship in the package. The timer is daily, persistent, with a one-hour randomized delay; the operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled. The service runs, as root with no capabilities, `xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. A failure exits non-zero and is a `<2>` line, stored at journal priority 2. `--against-journal` catches a tail removed on a record boundary by the journal's highest root-written sequence. Grant expiry stays M5. See `../CONCERNS.md`, 2026-11-06.
+**Step 3 status (2026-11-06):** implemented. `xudo-pasban.service` and `xudo-pasban.timer` ship in the package. The timer is daily, persistent, with a one-hour randomized delay; the operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled. The service runs, as root with no capabilities, `xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. A failure exits non-zero and is a `<2>` line, stored at journal priority 2. Pasban links journal entries to the audit file by hash. It detects a removed tail, a cut followed by continued writes, and a forged chain the journal never saw; see `../CONCERNS.md` for limits. Grant expiry stays M5. See `../CONCERNS.md`, 2026-11-06.
 
 This is the load-bearing decision of the whole phase, so it comes first.
 
@@ -159,6 +159,13 @@ State plainly in the README why there is no `curl | sh` installer. That paragrap
 
 ## 5. GitHub presence: SEO and AI-crawler discoverability
 
+**Step 5 status (2026-11-06):** public docs and metadata drafts are written. No
+GitHub settings were changed. Pages is live from the `gh-pages` branch with old
+content. A main-only Pages workflow is now added for the owner to switch to. No
+release was published. Beta claims describe the built broker and password-only
+path; the passwordless path, out-of-band confirmation, and Landlock are not in
+this release.
+
 Two audiences, and they retrieve differently. A search engine wants crawlable structure and inbound relevance; a language model retrieves passages and answers questions, so it rewards prose that states the subject explicitly and headings shaped like questions.
 
 ### Repository metadata
@@ -166,7 +173,7 @@ Two audiences, and they retrieve differently. A search engine wants crawlable st
 - **About description**, under 350 characters, front-loading the concrete nouns rather than the pitch. Something like: *"A sudo alternative that lets AI coding agents run an allowlisted set of privileged commands without a password, while always prompting humans. Root-owned rule set, compiled-in deny-list, full audit trail. Rust, Linux."*
 - **Topics**: `sudo`, `sudo-alternative`, `privilege-escalation`, `linux-security`, `ai-agents`, `claude-code`, `openai-codex`, `agentic-ai`, `rust`, `cli`, `devsecops`, `least-privilege`, `doas`, `polkit`, `allowlist`.
 - **Social preview image** — it is what appears in every link unfurl, including Slack and Discord.
-- `SECURITY.md` with a disclosure address, `CITATION.cff`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, a real `CHANGELOG.md`.
+- `SECURITY.md` with a disclosure address, `CITATION.cff`, `CONTRIBUTING.md`, a real `CHANGELOG.md`. The owner dropped `CODE_OF_CONDUCT.md` for now.
 - `LICENSE` — Apache-2.0 OR MIT, matching the workspace manifest.
 
 ### README structure
@@ -212,7 +219,7 @@ Every one of these appears in the README, the package description, and `xudo --v
 
 ## 7. Tests that gate the release
 
-**Status (2026-11-06):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`.
+**Status (2026-11-06):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`. The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems, including stock Ubuntu 26.04 and Alpine; the 26.04 systemd and differential lanes pass because they install GNU `id`.
 
 Run in containers, per distro, on both architectures.
 

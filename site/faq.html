@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>FAQ — xudo</title><meta name="description" content="Frequently asked questions about xudo."><link rel="canonical" href="https://yamint.github.io/xudo/faq.html"><link rel="stylesheet" href="style.css"></head>
+<body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
+<h1>FAQ</h1>
+<h2>What is the difference between xudo and sudo?</h2><p>sudo performs the host privilege transition. xudo checks a named-action policy first and sends permitted requests through a broker and gate. This beta always prompts for a password.</p>
+<h2>Can an AI agent run any command with xudo?</h2><p>No. The command must match a root-owned rule and pass the deny-list; the host also prompts for a password.</p>
+<h2>Is this safe? What are the limits?</h2><p>It is beta software and has not been externally audited. Agent detection is not a security boundary; the allowlist is. See <a href="security.html">security limits</a>.</p>
+<h2>Does this work with Claude Code, Codex CLI, Gemini CLI, or Aider?</h2><p>The policy does not depend on a specific agent, but this beta does not enroll or authenticate agents or provide passwordless execution.</p>
+<h2>What happens if an agent lies about being an agent?</h2><p>Agent names and environment variables do not authorize requests. Every caller currently uses the password path.</p>
+<h2>How is this different from NOPASSWD: ALL?</h2><p>The package installs only a password-authenticated rule. Actions constrain the executable and arguments, and the gate checks policy again.</p>
+<h2>Does it work with doas? With sudo-rs?</h2><p>The package depends on sudo, so package installs use sudo for both <code>xudo install</code> and <code>xudo exec</code>. doas works only with a hand install on a host without sudo; its install probe always reports NOT VERIFIED. Detection and execution prefer sudo. sudo-rs 0.2 is refused at detection; newer sudo-rs, including Ubuntu 26.04's version, works.</p>
+<h2>Does it phone home?</h2><p>The default build contains no network code and sends no telemetry. The planned strace CI check does not exist yet.</p>
+</main><footer><a href="./">xudo documentation</a></footer></body></html>

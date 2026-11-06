@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rule format — xudo</title><meta name="description" content="TOML action rules for xudo."><link rel="canonical" href="https://yamint.github.io/xudo/rules.html"><link rel="stylesheet" href="style.css"></head>
+<body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
+<h1>Rule format</h1><p>Native rules are TOML files. Each action fixes one executable and constrains each argument by position. There are no globs.</p>
+<pre><code>[[action]]
+id = "xudo.svc.lifecycle"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = ["start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "try-reload-or-restart"] } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]</code></pre>
+<p>This example is from <code>rules/20-services.toml</code>. See the repository's <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rule files</a> and <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">behavior source</a>.</p>
+</main><footer><a href="./">xudo documentation</a></footer></body></html>

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xudo — Linux privilege broker</title>
+  <meta name="description" content="Linux privilege broker for narrowly scoped privileged commands. This beta uses the human password path.">
+  <link rel="canonical" href="https://yamint.github.io/xudo/">
+  <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"xudo","applicationCategory":"SecurityApplication","operatingSystem":"Linux","url":"https://yamint.github.io/xudo/","description":"Linux privilege broker for narrowly scoped privileged commands. Beta uses the human password path."},{"@type":"SoftwareSourceCode","name":"xudo","codeRepository":"https://github.com/YaminT/xudo","programmingLanguage":"Rust","runtimePlatform":"Linux","license":"https://www.apache.org/licenses/LICENSE-2.0"}]}
+  </script>
+</head>
+<body>
+<header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header>
+<main>
+<h1>xudo</h1>
+<p>xudo is a Linux privilege broker for operators who want AI coding agents to request narrowly defined privileged commands. It checks commands against root-owned rules and uses the host's privilege backend. This beta runs every request through the human password path.</p>
+<p><strong>Beta. Not externally audited.</strong> The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release. See <a href="security.html">security status and limits</a>.</p>
+<h2>Install</h2>
+<p>A signed Debian package on GitHub Releases, a checksum, and cosign keyless signing are planned. The package has not been released. xudo has no <code>curl | sh</code> installer because a privileged shell script is difficult to inspect before execution.</p>
+<h2>Example</h2><p>From a checkout, <code>--rules ./rules</code> applies to <code>explain</code>. <code>exec</code> ignores <code>--rules</code>; the broker loads root's <code>/etc/xudo/rules.d</code>.</p>
+<pre><code>xudo --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
+xudo doctor
+ido queue -m "restart nginx after review" -- /usr/bin/systemctl restart nginx.service</code></pre>
+<p><code>explain</code> reports a decision without execution. After installing the package, add your user to the <code>xudo</code> group with <code>sudo usermod -aG xudo YOUR_USER</code>, then log out and back in. This is a deliberate privilege grant: group members can invoke the privileged gate. Then run <code>xudo exec -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service</code>; it uses the host password prompt and gate.</p>
+<p>Read <a href="how-it-works.html">how requests flow</a>, the <a href="rules.html">rule format</a>, and the <a href="faq.html">FAQ</a>. The repository's <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">howiwork.md</a> is the source of truth for behavior.</p>
+</main>
+<footer><a href="https://github.com/YaminT/xudo">Source repository</a> · <a href="security.html">Security</a></footer>
+</body>
+</html>
