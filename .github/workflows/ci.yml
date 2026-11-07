@@ -195,3 +195,44 @@ jobs:
           tool: just
       - name: Install and uninstall through sudo, sudo-rs, and OpenDoas
         run: just install-root
+
+  # Beta .deb: build it and install, upgrade, remove, and purge it in Debian and Ubuntu.
+  deb:
+    name: Debian package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Build and test the Debian package in three distributions
+        run: just deb-test
+
+  # The installed .deb with the broker under systemd as PID 1, in throwaway
+  # containers. ci/systemd/run.sh boots systemd; the unit files are not loosened
+  # to make the lane pass. Same runners as the package job: the .deb is built
+  # for the runner's architecture.
+  systemd:
+    name: systemd broker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Installed package under systemd as PID 1
+        run: just systemd-test

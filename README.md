@@ -1,74 +1,56 @@
 # xudo
 
-**A sudo alternative that lets AI coding agents run an allowlisted set of
-privileged commands without a password, while always prompting humans.**
-Root-owned rule set, compiled-in deny-list, full decision trace. Rust, Linux.
+xudo is a Linux privilege broker. It checks commands against root-owned rules and uses the host's `sudo`, `sudo-rs`, or `doas` for privileged execution. This beta uses the human password path for every request.
 
-> This README is a derived view. The source of truth for what xudo is and how
-> the system behaves is [howiwork.md](howiwork.md); where the two disagree,
-> that file is right and this one is the bug.
+> This README is a derived view of [howiwork.md](howiwork.md), the source of truth for product behavior.
 
-> ## Beta. Not externally audited. Password path only.
->
-> `xudo exec` runs an allowlisted command as root after a password prompt,
-> through `sudo`, `sudo-rs` or `doas`. The passwordless agent path and
-> out-of-band confirmation are not built yet. Installing and running it needs
-> root and a running broker. See [docs/re.md](docs/re.md) for what is left.
+## Install
 
-## The problem
+No release has been published yet. When one is available, download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the GitHub Release, then verify both the checksum and the exact GitHub Actions identity before installing. Replace `<ver>` with the Debian version, `<arch>` with `amd64` or `arm64`, and `<tag>` with the Git tag; for example, `<ver>` `0.1.0~beta.1` corresponds to `<tag>` `v0.1.0-beta.1`:
 
-An agent hits a command needing root. Today you either answer every `sudo`
-prompt yourself — which ends unattended work — or you grant `NOPASSWD: ALL`,
-which is a standing root backdoor for **any** process running as that user.
-
-`xudo` is the middle path: a root-owned allowlist of *named actions*. Enrolled
-agent sessions run allowlisted actions passwordless; a human invoking `xudo` is
-always prompted; a catastrophic-command deny-list is compiled into the binary and
-cannot be edited by configuration.
-
-## Agent detection is not a security boundary
-
-Said here rather than left for a critic to find.
-
-`xudo`'s premise makes the *absence* of proof-of-humanity the thing that grants a
-privilege, and every cheap signal that a caller is an agent is produced by the
-caller: `CLAUDECODE=1` is an environment variable anyone can export, `argv[0]` is
-chosen by whoever exec'd, `/proc/<pid>/exe` points into a user-writable `$HOME`.
-Even with unforgeable enrollment, a human can ask a genuinely-enrolled agent to
-run the command — indistinguishable at the syscall layer.
-
-So a successful impersonation buys exactly one thing: **skipping the password on
-an action that is already allowlisted.** It buys no new capability. The real
-boundary is the allowlist, the deny-list, and out-of-band confirmation. Size the
-allowlist on the assumption that every entry will eventually be run passwordless
-by a process you cannot authenticate.
-
-The compiled-in deny-list is **defence in depth, not the boundary** — the set of
-programs that can be turned into a root shell is not enumerable.
-
-## Try it
-
-Nothing here touches privilege.
-
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_<ver>_<arch>.deb
+sudo apt install ./xudo_<ver>_<arch>.deb
 ```
+
+xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
+
+## Example
+
+From a checkout, inspect the example rules with `--rules ./rules`:
+
+```sh
 xudo --rules ./rules explain -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
-xudo --rules ./rules explain -- /bin/sh -c id   # no rule names a shell, and one that did would be refused
-xudo --rules ./rules doctor                     # backend, probed capabilities, whether the rules are root's,
-                                                # and the other paths to root it can check (--json, --fix);
-                                                # SECURITY.md lists the ones it cannot
-xudo --rules ./rules config --schema            # machine-readable settings schema
-ido queue -m "install ripgrep" -- apt-get install -y ripgrep   # buffer it for a human; `ido` to run it
+xudo doctor
+ido queue -m "restart nginx after review" -- /usr/bin/systemctl restart nginx.service
 ```
 
-`explain` prints which rule matched at which `file:line`, the canonical argv, the
-deny-list verdict, and a stable machine-readable envelope under
-`--output json` — because the primary consumer is a language model, and `exit 1`
-with a prose message is the worst possible interface for one.
+`explain` shows the policy decision and executes nothing. `exec` ignores `--rules`. The installed broker loads root's `/etc/xudo/rules.d`. After installing the package, add your user to the `xudo` group (`sudo usermod -aG xudo YOUR_USER`, then log out and back in). This is a deliberate privilege grant: the group can invoke the installed password-authenticated gate.
 
-## How rules work
+Then run `xudo exec -- /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. `ido queue` stores exact arguments for a human to review and run with `ido`.
 
-A rule allowlists a **named action** whose executable is fixed and whose
-arguments are constrained position by position. No globs, anywhere:
+## Security status
+
+**Beta. Not externally audited.** The rule-file format and command-line interface may change, and an upgrade may require rule edits. Do not deploy this where a compromise would matter.
+
+Agent detection is not a security boundary. The passwordless agent path is not in this release, so a successful impersonation cannot skip the password today. The allowlist is the boundary; the compiled-in deny-list is defense in depth because the set of programs that can become a root shell is not enumerable. `xudo doctor` reports some other paths to root, but cannot prove that a host has none.
+
+The broker and password-authenticated gate are built and packaged. The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release. The default build has no network code or telemetry. The planned `strace` CI check does not exist yet.
+
+The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems. Examples include stock Ubuntu 26.04 and Alpine, where `/usr/bin/id` is uutils or a multicall applet. The Ubuntu 26.04 systemd and differential lanes pass because they install GNU `id`.
+
+The audit trail records authorization, not execution outcomes. Pasban runs daily as root. It verifies the audit chain and compares journal copies with the file by hash. It detects removed tails, cut-and-continued files, and forged chains the journal never saw. It does not prevent privileged tampering or prove that a command completed.
+
+## How it works
+
+`xudo explain` loads the selected rules and reports what the policy would decide. For `xudo exec`, the front end sends the request to the root broker over a Unix socket. The broker identifies the connected peer from kernel-provided facts, checks the root-owned rules and deny-list, and records the authorization decision. If permitted, it creates a bounded one-use request. The host's `sudo`, `sudo-rs`, or `doas` performs the uid transition through the password-authenticated gate. The gate independently checks policy and the one-use request before executing the validated program. Errors fail closed.
+
+Every caller is currently classified as unattested. The beta therefore uses the password path for every invocation; no `NOPASSWD` rule is installed by the package.
+
+## Rule format
+
+Rules are TOML files. An action fixes the executable and constrains each argument by position. For example, `rules/20-services.toml` allows a limited set of service lifecycle verbs:
 
 ```toml
 [[action]]
@@ -77,42 +59,56 @@ tier = "svc-control"
 exe = "/usr/bin/systemctl"
 args = [
   { name = "no-pager", matcher = { literal = "--no-pager" } },
-  { name = "verb", matcher = { one-of = ["start", "stop", "restart", "reload"] } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = ["start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "try-reload-or-restart"] } },
   { name = "unit", matcher = { name = "unit-name" } },
 ]
 ```
 
-`sudoers` matches arguments by joining them into one string and running
-`fnmatch`, so `*` crosses whitespace *and* matches `/` — which makes
-`/usr/bin/python3 /opt/utils/*.py` a root shell. There is no wildcard here at
-any position.
+There are no argument globs. The native format and matcher behavior are documented in [docs/design-plan.md](docs/design-plan.md) and the shipped TOML rules under [rules/](rules/).
 
-## Building
+## FAQ
 
-Requires the pinned toolchain in `rust-toolchain.toml`.
+### What is the difference between `xudo` and `sudo`?
 
-```
-just setup     # git hooks + toolchain
-just verify    # the full gate; identical to CI
-```
+`sudo` is the host's privilege transition. `xudo` checks a named-action policy first, asks a root broker to authorize the request, and sends an approved request through a separate gate. In this beta, every invocation uses the human password path.
 
-The gate is 100% line, region, and function coverage with no line-level waivers,
-zero clippy warnings, `cargo deny`, miri, and three fuzz targets. Fuzzing found a
-real bug in argv canonicalization on its first run; the story is in
-[docs/CONCERNS.md](docs/CONCERNS.md).
+### Can an AI agent run any command with `xudo`?
 
-## Documentation
+No. A command must match an action in the root-owned rules and pass the compiled-in deny-list. This beta also requires the host's password prompt for each privileged request.
 
-| File | What it is |
-|---|---|
-| [howiwork.md](howiwork.md) | **The source of truth.** Product behaviour, components, modes, outcomes — everything else derives from it |
-| [docs/re.md](docs/re.md) | Current blockers |
-| [docs/CONCERNS.md](docs/CONCERNS.md) | Running decision log — read this before changing anything |
-| [docs/design-plan.md](docs/design-plan.md) | Full architecture and threat model |
-| [docs/todo/](docs/todo/) | Remaining phases |
-| [CLAUDE.md](CLAUDE.md) | Project rules; every one exists because of a specific CVE or escape |
-| [SECURITY.md](SECURITY.md) | Reporting, and what is not yet protected |
+### Is this safe? What are the limits?
 
-## Licence
+This is beta software and has not been externally audited. A broad rule can grant broad root access, the deny-list is not a complete boundary, and other host paths to root remain outside xudo's control. Agent detection is not a security boundary; the allowlist is. The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release.
+
+### Does this work with Claude Code, Codex CLI, Gemini CLI, or Aider?
+
+The policy engine does not depend on a particular agent. This beta does not enroll or authenticate agents, and it does not provide passwordless agent execution. Any caller that gets permission still follows the host password path.
+
+### What happens if an agent lies about being an agent?
+
+Agent names and environment variables do not authorize a request. Kernel-attested identity is required for the future passwordless path, which is not in this beta. Today every caller is unattested and uses the password path.
+
+### How is this different from `NOPASSWD: ALL`?
+
+The package installs only the password-authenticated gate rule. It does not install a `NOPASSWD` rule. Rules name executables and constrain arguments; the gate checks the request again before execution.
+
+### Does it work with `doas`? With `sudo-rs`?
+
+The package depends on `sudo`, so package installs use sudo for both `xudo install` and `xudo exec`. doas works only with a hand install on a host without sudo; its install probe always reports NOT VERIFIED. Detection and execution prefer sudo. sudo-rs 0.2 is refused at detection; newer sudo-rs, including Ubuntu 26.04's version, works.
+
+### Does it phone home?
+
+The default build has no network code or telemetry. The planned `strace` CI check does not exist yet.
+
+## More documentation
+
+- [howiwork.md](howiwork.md): source of truth for behavior
+- [SECURITY.md](SECURITY.md): reporting route and security limits
+- [docs/design-plan.md](docs/design-plan.md): architecture and threat model
+- [docs/man/](docs/man/): available manual pages
+- [CLAUDE.md](CLAUDE.md): contributor and engineering rules
+
+## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -1,9 +1,7 @@
 //! The command surface.
 //!
-//! At this milestone every subcommand is introspection: nothing here executes a
-//! privileged command, because no privileged path exists yet. That is worth
-//! saying in the `--help` text too, so nobody installs this expecting it to run
-//! something.
+//! The password-authenticated privileged path is built. Passwordless agent
+//! execution is not available in this beta.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -19,7 +17,7 @@ use xudo_policy::{
 };
 use xudo_sys::{
     HostInstaller, HostProbe, HostRunner, InstallReport, Installer, LiveHost, PrivilegedOps,
-    RefusingInstaller, Verification, host_ops,
+    RefusingInstaller, Runner, Verification, host_ops,
 };
 
 use crate::agentdoc::{self, DocFormat};
@@ -41,17 +39,15 @@ pub enum Format {
     Json,
 }
 
-/// Agent-aware privilege broker. This build performs no privileged operation.
+/// Linux privilege broker. This beta uses the human password path.
 #[derive(Debug, Parser)]
 #[command(
     name = "xudo",
-    version,
-    about = "Agent-aware privilege broker for Linux (beta: introspection only, executes nothing)",
-    long_about = "xudo decides whether a privileged command is permitted by a root-owned \
-                  allowlist.\n\nThis build contains no privileged path: `explain`, `check`, \
-                  `why-not`, `list`, `doctor`, `config`, `install --dry-run`, `audit`, and \
-                  `agentdoc` inspect the policy and execute nothing. \
-                  Passwordless agent execution arrives with the broker."
+    version = concat!(env!("CARGO_PKG_VERSION"), " (beta, not externally audited)"),
+    about = "Linux privilege broker; this beta uses the human password path",
+    long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
+                  password-authenticated path through the host backend. The passwordless \
+                  agent path is not available in this beta (M4)."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -175,6 +171,11 @@ pub enum Command {
         /// consulted.
         #[arg(long, value_name = "PATH")]
         log: Option<PathBuf>,
+
+        /// Compare file records with the journal's root-written xudo entries.
+        /// This can expose records removed from the end or replaced after a cut.
+        #[arg(long)]
+        against_journal: bool,
     },
 
     /// Print the block that tells an agent what it may do.
@@ -351,7 +352,16 @@ pub fn run_with_installer(
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
-        Command::Audit { log } => audit(log.clone().or_else(default_log_file), out, err),
+        Command::Audit {
+            log,
+            against_journal,
+        } => audit(
+            log.clone().or_else(default_log_file),
+            *against_journal,
+            &HostRunner,
+            out,
+            err,
+        ),
         Command::Agentdoc { format } => with_rules!(|l: &LoadedRules| {
             let _ = write!(
                 out,
@@ -529,11 +539,24 @@ fn step_contents(step: &PlanStep) -> &str {
 /// checks the end of the log as a privileged writer does
 /// (`xudo_audit::verify_log`), so every damaged ending that writer refuses is
 /// reported here too.
-fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+///
+/// With `against_journal`, checks file records against root-written journal
+/// entries. The chain that remains after a tail cut still verifies.
+///
+/// Every failure is one `<2>` line. Under the pasban unit's
+/// `SyslogLevelPrefix=yes` that is journal priority 2. A person running the
+/// command sees the prefix.
+fn audit(
+    log: Option<PathBuf>,
+    against_journal: bool,
+    runner: &dyn Runner,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let Some(path) = log else {
-        let _ = writeln!(
+        crit(
             err,
-            "xudo: no log path: HOME is unset and --log was not given"
+            "xudo: no log path: HOME is unset and --log was not given",
         );
         return ExitCode::Unusable;
     };
@@ -541,7 +564,10 @@ fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let contents = match std::fs::read(&path) {
         Ok(contents) => contents,
         Err(source) => {
-            let _ = writeln!(err, "xudo: cannot read {}: {source}", path.display());
+            crit(
+                err,
+                format!("xudo: cannot read {}: {source}", path.display()),
+            );
             // An unreadable log is not a verified log. A missing file is the
             // same answer as a corrupt one here on purpose: "nothing to check"
             // and "I could not check" must not print the same reassurance.
@@ -549,27 +575,280 @@ fn audit(log: Option<PathBuf>, out: &mut dyn Write, err: &mut dyn Write) -> Exit
         }
     };
 
-    match xudo_audit::verify_log(&contents) {
-        Ok(chain) => {
-            let _ = writeln!(
-                out,
-                "audit  {} record(s) in {}: chain intact",
-                chain.len(),
-                path.display()
-            );
-            let _ = writeln!(
-                out,
-                "note   an unbroken chain proves nothing was edited in place. It cannot \
-                 prove the log was never truncated and rebuilt, because the hashes are \
-                 all in the log."
-            );
-            ExitCode::Delegated
-        }
+    let chain = match xudo_audit::verify_log(&contents) {
+        Ok(chain) => chain,
         Err(source) => {
-            let _ = writeln!(err, "xudo: {} is not intact: {source}", path.display());
-            ExitCode::Denied
+            crit(
+                err,
+                format!("xudo: {} is not intact: {source}", path.display()),
+            );
+            return ExitCode::Denied;
+        }
+    };
+
+    // `None` means the journal was not consulted.
+    let checked = if against_journal {
+        match journal_tail(runner) {
+            Ok(journal_entries) => {
+                match compare_journal_chain(chain.records(), &journal_entries) {
+                    JournalFinding::RemovedTail { seq, file_last } => {
+                        crit(
+                            err,
+                            format!(
+                                "xudo: {} is not intact: journal seq {seq} links to the file's last record ({file_last}); a record was removed from the end",
+                                path.display(),
+                            ),
+                        );
+                        return ExitCode::Denied;
+                    }
+                    JournalFinding::Replaced { seq } => {
+                        crit(
+                            err,
+                            format!(
+                                "xudo: {} is not intact: journal seq {seq} continues a file record with a different hash; records were replaced after a cut",
+                                path.display(),
+                            ),
+                        );
+                        return ExitCode::Denied;
+                    }
+                    JournalFinding::Unlinked => {
+                        crit(
+                            err,
+                            format!(
+                                "xudo: {} is not intact: no journal entry matches any file record",
+                                path.display(),
+                            ),
+                        );
+                        return ExitCode::Denied;
+                    }
+                    JournalFinding::NoLink => {}
+                }
+                Some((chain.records(), journal_entries))
+            }
+            Err(reason) => {
+                crit(
+                    err,
+                    format!(
+                        "xudo: cannot check {} against the journal: {reason}",
+                        path.display()
+                    ),
+                );
+                return ExitCode::Unusable;
+            }
+        }
+    } else {
+        None
+    };
+
+    let _ = writeln!(
+        out,
+        "audit  {} record(s) in {}: chain intact",
+        chain.len(),
+        path.display()
+    );
+    if let Some((file_records, journal_entries)) = checked {
+        let _ = writeln!(out, "{}", journal_note(file_records, &journal_entries));
+    }
+    let _ = writeln!(
+        out,
+        "note   an unbroken chain proves nothing was edited in place. It cannot \
+         prove the log was never truncated and rebuilt, because the hashes are \
+         all in the log."
+    );
+    ExitCode::Delegated
+}
+
+/// One failure line, at syslog crit once the pasban unit's journal stream reads it.
+///
+/// `SyslogLevel=` would raise every line, including a clean result, and
+/// `LogLevelMax=` only discards lines. A `<2>` prefix with `SyslogLevelPrefix=yes`
+/// is what journald stores as priority 2.
+fn crit(err: &mut dyn Write, message: impl std::fmt::Display) {
+    let _ = writeln!(err, "<2>{message}");
+}
+
+/// What the journal comparison found, when it did not find a removed tail.
+fn journal_note(file_records: &[xudo_audit::Record], entries: &[JournalEntry]) -> String {
+    if entries.is_empty() {
+        return "note   the journal has no root-written xudo audit entry, so a tail removed \
+                from the file would not show"
+            .to_owned();
+    }
+    if let Some(tail) = file_records.last() {
+        let by_hash = file_index(file_records);
+        if entries
+            .iter()
+            .any(|entry| entry.seq == tail.seq.get() && entry.hash == tail.hash)
+        {
+            return format!(
+                "note   journal seq {} matches the file's last record",
+                tail.seq.get()
+            );
+        }
+        let journal_max = entries.iter().map(|entry| entry.seq).max();
+        let links_to_file = entries.iter().any(|entry| {
+            by_hash
+                .get(entry.hash.as_str())
+                .is_some_and(|&(seq, _)| seq == entry.seq)
+        });
+        if let (Some(journal), true) = (journal_max, links_to_file)
+            && journal < tail.seq.get()
+        {
+            return format!(
+                "note   journal seq {journal} is behind the file's last record ({}), so the journal \
+                 cannot show whether a tail was removed",
+                tail.seq.get()
+            );
         }
     }
+    "note   the journal has no link to this file's last record, so it cannot show whether a tail \
+     was removed"
+        .to_owned()
+}
+
+/// `/usr/bin/journalctl`, never a `PATH` search.
+const JOURNALCTL: &str = "/usr/bin/journalctl";
+
+/// The arguments of the trusted journal query, program name not included.
+fn journal_args() -> Vec<String> {
+    let mut args = xudo_audit::journal::trusted_matches(&[]);
+    args.extend(
+        [
+            "--output=json",
+            "--output-fields=XUDO_SEQ,XUDO_HASH,XUDO_PREV_HASH",
+            "--no-pager",
+        ]
+        .map(str::to_owned),
+    );
+    args
+}
+
+/// One root-written xudo record returned by the trusted query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JournalEntry {
+    seq: u64,
+    hash: String,
+    prev_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalFinding {
+    NoLink,
+    Unlinked,
+    RemovedTail { seq: u64, file_last: u64 },
+    Replaced { seq: u64 },
+}
+
+fn compare_journal_chain(file: &[xudo_audit::Record], journal: &[JournalEntry]) -> JournalFinding {
+    let Some(last) = file.last() else {
+        return JournalFinding::NoLink;
+    };
+    let by_hash = file_index(file);
+    let any_record_matches = journal.iter().any(|entry| {
+        by_hash
+            .get(entry.hash.as_str())
+            .is_some_and(|&(seq, _)| seq == entry.seq)
+    });
+    if !journal.is_empty() && !any_record_matches {
+        return JournalFinding::Unlinked;
+    }
+    for entry in journal {
+        // Genesis has no predecessor and cannot identify which chain it belongs to.
+        if entry.prev_hash.is_empty() {
+            continue;
+        }
+        if let Some(&(_, index)) = by_hash.get(entry.prev_hash.as_str()) {
+            match index
+                .checked_add(1)
+                .and_then(|next_index| file.get(next_index))
+            {
+                Some(next) if entry.hash != next.hash => {
+                    return JournalFinding::Replaced { seq: entry.seq };
+                }
+                None => {
+                    return JournalFinding::RemovedTail {
+                        seq: entry.seq,
+                        file_last: last.seq.get(),
+                    };
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    JournalFinding::NoLink
+}
+
+/// Hash each record once so journal comparisons stay linear.
+fn file_index(records: &[xudo_audit::Record]) -> std::collections::BTreeMap<&str, (u64, usize)> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.hash.as_str(), (record.seq.get(), index)))
+        .collect()
+}
+
+/// Root-written chain links returned by journalctl. Missing or malformed hash
+/// fields fail closed because the comparison could not establish its claim.
+fn journal_tail(runner: &dyn Runner) -> Result<Vec<JournalEntry>, String> {
+    let args = journal_args();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = runner
+        .run(JOURNALCTL, &refs, None)
+        .map_err(|source| source.to_string())?;
+    if !output.stderr.trim().is_empty() {
+        return Err(format!(
+            "journalctl wrote to standard error: {}",
+            output.stderr.trim()
+        ));
+    }
+    if !output.success {
+        let status = match output.code {
+            Some(code) => code.to_string(),
+            None => "on a signal".to_owned(),
+        };
+        return Err(format!("journalctl exited {status}"));
+    }
+    parse_journal_entries(&output.stdout)
+}
+
+/// The chain fields in `journalctl --output=json` text.
+///
+/// Every nonempty line must be one complete JSON object with chain fields.
+/// Anything else is a query this check cannot trust.
+fn parse_journal_entries(text: &str) -> Result<Vec<JournalEntry>, String> {
+    let mut entries = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let line_no = index.saturating_add(1);
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|source| {
+            format!("line {line_no} of the journal query is not json: {source}")
+        })?;
+        let serde_json::Value::Object(fields) = value else {
+            return Err(format!(
+                "line {line_no} of the journal query is not a journal entry"
+            ));
+        };
+        let field = |name: &str| -> Result<&str, String> {
+            fields
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("line {line_no} of the journal query has no text {name}"))
+        };
+        let seq_text = field("XUDO_SEQ")?;
+        let seq = seq_text.parse::<u64>().map_err(|_| {
+            format!(
+                "line {line_no} of the journal query has an XUDO_SEQ that is not a sequence number"
+            )
+        })?;
+        entries.push(JournalEntry {
+            seq,
+            hash: field("XUDO_HASH")?.to_owned(),
+            prev_hash: field("XUDO_PREV_HASH")?.to_owned(),
+        });
+    }
+    Ok(entries)
 }
 
 /// The per-user log, resolved the way `xudo-config` resolves it.
@@ -991,7 +1270,7 @@ mod tests {
         let fx = fixture("cli-doctor-kernel");
         let (_, out, _) = run_ops(&fx, &BlindOps, &["doctor"]);
         assert!(
-            out.contains("kernel       6.8 via SO_PEERPIDFD (agent path available)"),
+            out.contains("kernel       6.8 via SO_PEERPIDFD (kernel supports attestation for the planned agent path; agent path not in this build)"),
             "{out}"
         );
     }
@@ -1270,6 +1549,7 @@ mod tests {
         let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Denied);
         assert_eq!(out, "");
+        assert!(err.starts_with("<2>"), "{err}");
         assert!(err.contains("is not intact"), "{err}");
         assert!(err.contains("record 2 was edited"), "{err}");
     }
@@ -1282,6 +1562,7 @@ mod tests {
 
         let (code, _, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Denied);
+        assert!(err.starts_with("<2>"), "{err}");
         assert!(err.contains("line 1 is not an audit record"), "{err}");
     }
 
@@ -1307,6 +1588,7 @@ mod tests {
         let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Denied);
         assert_eq!(out, "");
+        assert!(err.starts_with("<2>"), "{err}");
         assert!(err.contains("is not intact"), "{err}");
         assert!(
             err.contains("every record verifies, but a privileged writer refuses"),
@@ -1333,6 +1615,7 @@ mod tests {
 
         let (code, _, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Denied);
+        assert!(err.starts_with("<2>"), "{err}");
         assert!(err.contains("line 2 is not an audit record"), "{err}");
     }
 
@@ -1346,6 +1629,7 @@ mod tests {
         let (code, out, err) = fx.run(&["audit", "--log", log.to_str().unwrap()]);
         assert_eq!(code, ExitCode::Unusable);
         assert_eq!(out, "");
+        assert!(err.starts_with("<2>"), "{err}");
         assert!(err.contains("cannot read"), "{err}");
     }
 
@@ -1388,11 +1672,404 @@ mod tests {
     fn audit_with_no_resolvable_path_refuses_rather_than_guessing_one() {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = audit(None, &mut out, &mut err);
+        let code = audit(None, false, &RefuseJournal, &mut out, &mut err);
         assert_eq!(code, ExitCode::Unusable);
         assert!(out.is_empty());
         let message = String::from_utf8_lossy(&err).into_owned();
+        assert!(message.starts_with("<2>"), "{message}");
         assert!(message.contains("HOME is unset"), "{message}");
+    }
+
+    /// A runner the chain check must not call. A panic here means `audit`
+    /// consulted the journal without being asked.
+    struct RefuseJournal;
+
+    impl xudo_sys::Runner for RefuseJournal {
+        fn run(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: Option<&[u8]>,
+        ) -> Result<xudo_sys::Output, xudo_sys::SysError> {
+            panic!("the chain check must not run a program");
+        }
+    }
+
+    /// One scripted answer from `journalctl`, and the argv it was given.
+    struct ScriptedJournal {
+        output: Result<xudo_sys::Output, xudo_sys::SysError>,
+        exe: std::cell::RefCell<String>,
+        args: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ScriptedJournal {
+        fn new(output: Result<xudo_sys::Output, xudo_sys::SysError>) -> Self {
+            Self {
+                output,
+                exe: std::cell::RefCell::new(String::new()),
+                args: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn ok(stdout: &str) -> Self {
+            Self::new(Ok(xudo_sys::Output {
+                success: true,
+                code: Some(0),
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            }))
+        }
+    }
+
+    impl xudo_sys::Runner for ScriptedJournal {
+        fn run(
+            &self,
+            exe: &str,
+            args: &[&str],
+            stdin: Option<&[u8]>,
+        ) -> Result<xudo_sys::Output, xudo_sys::SysError> {
+            assert!(stdin.is_none(), "the journal query takes no stdin");
+            *self.exe.borrow_mut() = exe.to_owned();
+            *self.args.borrow_mut() = args.iter().map(|arg| (*arg).to_owned()).collect();
+            self.output.clone()
+        }
+    }
+
+    fn audit_file(
+        log: &Path,
+        against_journal: bool,
+        runner: &dyn xudo_sys::Runner,
+    ) -> (ExitCode, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = audit(
+            Some(log.to_path_buf()),
+            against_journal,
+            runner,
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn write_chain(dir: &Path, records: usize) -> PathBuf {
+        let mut chain = xudo_audit::Chain::new();
+        for index in 0..records {
+            chain.append(
+                xudo_audit::Decision::Allowed,
+                vec![format!("/usr/bin/true{index}")],
+                "human",
+            );
+        }
+        let log = dir.join("log.jsonl");
+        std::fs::write(&log, chain.to_jsonl()).unwrap();
+        log
+    }
+
+    fn journal_object(record: &xudo_audit::Record) -> String {
+        serde_json::json!({
+            "XUDO_SEQ": record.seq.get().to_string(),
+            "XUDO_HASH": record.hash,
+            "XUDO_PREV_HASH": record.prev_hash,
+        })
+        .to_string()
+    }
+
+    fn linked_object(seq: u64, hash: &str, prev_hash: &str) -> String {
+        serde_json::json!({
+            "XUDO_SEQ": seq.to_string(),
+            "XUDO_HASH": hash,
+            "XUDO_PREV_HASH": prev_hash,
+        })
+        .to_string()
+    }
+
+    fn records_at(log: &Path) -> Vec<xudo_audit::Record> {
+        xudo_audit::verify_log(&std::fs::read(log).unwrap())
+            .unwrap()
+            .records()
+            .to_vec()
+    }
+
+    #[test]
+    fn the_journal_refusal_panics_if_the_chain_check_runs_a_program() {
+        // The body has to run once, or the guard that audit must not trip is
+        // itself an uncovered line. audit's own test is the one that proves
+        // the check does not call it.
+        let caught = std::panic::catch_unwind(|| {
+            let _ = xudo_sys::Runner::run(&RefuseJournal, "/usr/bin/journalctl", &[], None);
+        });
+        assert!(caught.is_err(), "the refusal has to panic");
+    }
+
+    #[test]
+    fn without_against_journal_a_higher_sequence_is_not_consulted() {
+        let fx = Fixture::new("audit-file-only");
+        let log = write_chain(&fx.dir, 1);
+        let (code, out, err) = audit_file(&log, false, &RefuseJournal);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("chain intact"), "{out}");
+        assert!(
+            !out.lines()
+                .any(|line| line.starts_with("note") && line.contains("journal")),
+            "{out}"
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn a_tail_cut_back_to_a_record_boundary_is_caught_against_the_journal() {
+        // One valid record. The chain verifies. The journal still holds seq 2,
+        // which is the record that was taken off the end.
+        let fx = Fixture::new("audit-tail-cut");
+        let log = write_chain(&fx.dir, 1);
+        let file_record = records_at(&log)[0].clone();
+        let next = linked_object(2, "different-chain-hash", &file_record.hash);
+        let journal = ScriptedJournal::ok(&format!("{}\n{}\n", journal_object(&file_record), next));
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(err.starts_with("<2>"), "{err}");
+        assert!(err.contains("is not intact"), "{err}");
+        assert!(
+            err.contains("journal seq 2 links to the file's last record (1)"),
+            "{err}"
+        );
+        assert!(err.contains("removed from the end"), "{err}");
+        assert_eq!(journal.exe.borrow().as_str(), "/usr/bin/journalctl");
+        let args = journal.args.borrow();
+        assert_eq!(args[0], xudo_audit::journal::TRUSTED_SENDER);
+        assert_eq!(
+            args[1],
+            format!("MESSAGE_ID={}", xudo_audit::journal::MESSAGE_ID)
+        );
+        for flag in [
+            "--output=json",
+            "--output-fields=XUDO_SEQ,XUDO_HASH,XUDO_PREV_HASH",
+            "--no-pager",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == flag),
+                "{flag} missing: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forged_chain_the_journal_never_saw_is_caught() {
+        let fx = Fixture::new("audit-other-chain");
+        let log = write_chain(&fx.dir, 1);
+        let unrelated = linked_object(40, "old-chain-hash", "old-chain-prev");
+        let journal = ScriptedJournal::ok(&unrelated);
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(err.starts_with("<2>"), "{err}");
+        assert!(
+            err.contains("no journal entry matches any file record"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_new_chain_is_accepted_when_its_first_record_is_in_the_journal() {
+        let fx = Fixture::new("audit-new-chain");
+        let log = write_chain(&fx.dir, 1);
+        let current = records_at(&log).remove(0);
+        let old = linked_object(8, "old-chain-hash", "older-chain-hash");
+        let journal = ScriptedJournal::ok(&format!("{old}\n{}", journal_object(&current)));
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("chain intact"), "{out}");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn thousands_of_file_and_journal_records_are_compared() {
+        let fx = Fixture::new("audit-linear-chain");
+        let log = write_chain(&fx.dir, 3_000);
+        let records = records_at(&log);
+        let entries = records
+            .iter()
+            .map(journal_object)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let journal = ScriptedJournal::ok(&entries);
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("3000 record(s)"), "{out}");
+        assert!(
+            out.contains("journal seq 3000 matches the file's last record"),
+            "{out}"
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn a_tail_cut_and_then_continued_is_caught() {
+        let fx = Fixture::new("audit-tail-continued");
+        let log = write_chain(&fx.dir, 2);
+        let records = records_at(&log);
+        let replacement = linked_object(2, "replacement-hash", &records[0].hash);
+        let journal = ScriptedJournal::ok(&format!(
+            "{}\n{}\n",
+            journal_object(&records[0]),
+            replacement
+        ));
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(err.contains("records were replaced after a cut"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_log_has_no_hash_link_to_attribute_a_journal_chain() {
+        let fx = Fixture::new("audit-emptied");
+        let log = fx.dir.join("log.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let journal = ScriptedJournal::ok(&linked_object(3, "old-chain-hash", "older-chain-hash"));
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("chain intact"), "{out}");
+        assert!(
+            out.contains("cannot show whether a tail was removed"),
+            "{out}"
+        );
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn a_journal_that_matches_or_trails_the_file_does_not_accuse_it() {
+        let fx = Fixture::new("audit-journal-match");
+        let log = write_chain(&fx.dir, 2);
+        let records = records_at(&log);
+        let matched = ScriptedJournal::ok(&format!(
+            "{}\n{}\n",
+            journal_object(&records[0]),
+            journal_object(&records[1])
+        ));
+        let (code, out, err) = audit_file(&log, true, &matched);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("2 record(s)"), "{out}");
+        assert!(out.contains("chain intact"), "{out}");
+        assert!(
+            out.contains("journal seq 2 matches the file's last record"),
+            "{out}"
+        );
+        assert_eq!(err, "");
+
+        // Behind: vacuum, or a dropped entry. Not a tail cut.
+        let behind = ScriptedJournal::ok(&journal_object(&records[0]));
+        let (code, out, err) = audit_file(&log, true, &behind);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(
+            out.contains("journal seq 1 is behind the file's last record (2)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("cannot show whether a tail was removed"),
+            "{out}"
+        );
+        let newer_unlinked = ScriptedJournal::ok(&format!(
+            "{}\n{}",
+            journal_object(&records[0]),
+            linked_object(3, "other-chain-hash", "other-chain-prev")
+        ));
+        let (code, out, err) = audit_file(&log, true, &newer_unlinked);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("no link to this file's last record"), "{out}");
+
+        let different_hash =
+            ScriptedJournal::ok(&linked_object(2, "different-hash", "unrelated-prev"));
+        let (code, out, err) = audit_file(&log, true, &different_hash);
+        assert_eq!(code, ExitCode::Denied);
+        assert_eq!(out, "");
+        assert!(
+            err.contains("no journal entry matches any file record"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_journal_with_no_root_written_entry_does_not_pretend_the_tail_was_checked() {
+        let fx = Fixture::new("audit-journal-empty");
+        let log = write_chain(&fx.dir, 1);
+        let journal = ScriptedJournal::ok("\n");
+        let (code, out, err) = audit_file(&log, true, &journal);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("chain intact"), "{out}");
+        assert!(out.contains("no root-written xudo audit entry"), "{out}");
+        assert!(out.contains("would not show"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_not_an_intact_log() {
+        let fx = Fixture::new("audit-journal-dead");
+        let log = write_chain(&fx.dir, 1);
+        let cases = [
+            ScriptedJournal::new(Err(xudo_sys::SysError::unsupported(
+                "cannot run journalctl",
+            ))),
+            ScriptedJournal::new(Ok(xudo_sys::Output {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            })),
+            ScriptedJournal::new(Ok(xudo_sys::Output {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "permission denied\n".to_owned(),
+            })),
+            ScriptedJournal::new(Ok(xudo_sys::Output {
+                success: false,
+                code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })),
+            ScriptedJournal::new(Ok(xudo_sys::Output {
+                success: true,
+                code: Some(0),
+                stdout: String::new(),
+                stderr: "journal file skipped\n".to_owned(),
+            })),
+            ScriptedJournal::ok("not json\n"),
+            ScriptedJournal::ok("[1]\n"),
+            ScriptedJournal::ok("{\"XUDO_SEQ\":4}\n"),
+            ScriptedJournal::ok("{\"XUDO_SEQ\":\"1\"}\n"),
+            ScriptedJournal::ok("{\"XUDO_SEQ\":\"nope\"}\n"),
+            ScriptedJournal::ok("{\"XUDO_SEQ\":\"1\",\"XUDO_HASH\":\"h\"}\n"),
+        ];
+        for journal in cases {
+            let (code, out, err) = audit_file(&log, true, &journal);
+            assert_eq!(code, ExitCode::Unusable, "{err}");
+            assert_eq!(out, "");
+            assert!(err.starts_with("<2>"), "{err}");
+            assert!(err.contains("cannot check"), "{err}");
+            assert!(!err.contains("chain intact"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_journal_parser_requires_complete_chain_fields() {
+        let entry = linked_object(9, "hash", "prev");
+        let parsed = parse_journal_entries(&format!("\n{entry}\n")).unwrap();
+        assert_eq!(parsed[0].seq, 9);
+        assert_eq!(parse_journal_entries("").unwrap(), Vec::new());
+        let bad = parse_journal_entries("nope\n").unwrap_err();
+        assert!(bad.contains("line 1"), "{bad}");
+        let not_entry = parse_journal_entries("[]\n").unwrap_err();
+        assert!(not_entry.contains("not a journal entry"), "{not_entry}");
+        let not_text = parse_journal_entries("{\"XUDO_SEQ\":1}\n").unwrap_err();
+        assert!(not_text.contains("no text XUDO_SEQ"), "{not_text}");
+        let not_seq = parse_journal_entries(&linked_object(0, "h", "p").replace("\"0\"", "\"x\""))
+            .unwrap_err();
+        assert!(not_seq.contains("not a sequence number"), "{not_seq}");
     }
 
     const RULES: &str = r#"
@@ -2829,12 +3506,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn the_help_text_says_this_build_executes_nothing() {
-        // Someone must not install this expecting it to run a command.
+    fn the_help_text_describes_the_beta_password_path() {
         let err = Cli::try_parse_from(["xudo", "--help"]).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("execute nothing"), "{text}");
-        assert!(text.contains("no privileged path"), "{text}");
+        assert!(text.contains("password-authenticated path"), "{text}");
+        assert!(
+            text.contains("passwordless agent path is not available"),
+            "{text}"
+        );
     }
 
     #[test]

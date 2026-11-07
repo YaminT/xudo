@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Installs the built .deb in real Debian and Ubuntu containers and walks it
+# through install, upgrade, remove and purge. What each row asserts is in row.sh.
+#
+#   ci/deb/run.sh <musl triple>          (or: just deb-test, which builds first)
+#
+# Plain Docker has no running systemd. postinst still enables the socket
+# through deb-systemd-helper; deb-systemd-invoke does not start it here.
+set -euo pipefail
+
+rows=(ubuntu:24.04 ubuntu:26.04 debian:13)
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 <musl triple>" >&2
+    exit 2
+fi
+triple=$1
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
+command -v docker >/dev/null || { echo "FAIL: docker is required" >&2; exit 1; }
+
+# The path build.sh prints: xudo_<debian version>_<arch>.deb. Cargo's
+# 0.1.0-beta.1 is Debian 0.1.0~beta.1, same mapping as build.sh.
+case $triple in
+x86_64-*) arch=amd64 ;;
+aarch64-*) arch=arm64 ;;
+*) echo "unsupported triple $triple" >&2; exit 1 ;;
+esac
+raw=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)
+[ -n "$raw" ] || { echo "FAIL: no version in Cargo.toml" >&2; exit 1; }
+deb_ver=$(printf '%s\n' "$raw" | tr '-' '~')
+numeric=$(printf '%s\n' "$raw" | sed 's/[-+].*//')
+case $numeric in
+*.*.*) ;;
+*) echo "FAIL: cannot parse version $raw" >&2; exit 1 ;;
+esac
+patch=${numeric##*.}
+case $patch in
+'' | *[!0-9]*) echo "FAIL: bad patch in $raw" >&2; exit 1 ;;
+esac
+dir="$root/target/deb"
+deb="$dir/xudo_${deb_ver}_${arch}.deb"
+[ -f "$deb" ] || { echo "FAIL: built package not at $deb" >&2; exit 1; }
+
+# Two packages from the same binaries: the upgrade is the next patch.
+rm -rf "$root/target/deb-upgrade"
+up=$(VERSION="${numeric%.*}.$((patch + 1))" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-upgrade")
+[ -f "$up" ] || { echo "FAIL: upgrade package not at $up" >&2; exit 1; }
+mkdir -p "$root/target/deb-mount"
+rm -f "$root"/target/deb-mount/*
+cp "$deb" "$root/target/deb-mount/old.deb"
+cp "$up" "$root/target/deb-mount/new.deb"
+
+fail=0
+for image in "${rows[@]}"; do
+    echo "== $image"
+    # Debian without Recommends has no systemd-tmpfiles. The others install normally.
+    norec=()
+    if [[ $image == debian:13 ]]; then
+        norec=(-e APT_NO_RECOMMENDS=--no-install-recommends)
+        echo "   --no-install-recommends"
+    fi
+    docker run --rm "${norec[@]}" -v "$root/target/deb-mount:/debs:ro" -v "$here:/harness:ro" \
+        "$image" sh /harness/row.sh || { echo "FAIL: row $image" >&2; fail=1; }
+done
+
+# lintian runs in Debian, on the built package.
+echo "== lintian"
+docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$root/target/deb-mount:/debs:ro" -v "$here:/harness:ro" debian:13 sh -c '
+    apt-get update -qq && apt-get install -y -qq lintian >/dev/null &&
+    lintian --fail-on warning,error /debs/old.deb' ||
+    { echo "FAIL: lintian" >&2; fail=1; }
+
+((fail == 0)) || exit 1
+echo "deb-test: ${#rows[@]} rows + lintian clean"

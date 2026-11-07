@@ -62,11 +62,14 @@ pub fn plan(
         return Err(ExitCode::Unusable);
     };
     // Cheap pick on purpose: `detect` runs slow probes, and this runs every time.
-    let Some(backend) = ["/usr/bin/sudo", "/usr/bin/doas"]
+    let Some(backend) = ["/usr/bin/sudo", "/usr/bin/sudo-rs", "/usr/bin/doas"]
         .into_iter()
         .find(|path| probe.exists(path))
     else {
-        let _ = writeln!(err, "xudo: no sudo or doas installed; run `xudo doctor`");
+        let _ = writeln!(
+            err,
+            "xudo: no sudo, sudo-rs, or doas installed; run `xudo doctor`"
+        );
         return Err(ExitCode::Unusable);
     };
 
@@ -288,6 +291,13 @@ mod tests {
     }
 
     #[test]
+    fn a_host_with_only_sudo_rs_uses_it() {
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let (result, _, _) = against(reply, &Has(&["/usr/bin/sudo-rs"]), &argv());
+        assert_eq!(result.unwrap().backend, "/usr/bin/sudo-rs");
+    }
+
+    #[test]
     fn doas_is_used_when_sudo_is_absent() {
         let reply = decided(allow(), Some(minted(GATE_AUTH)));
         let (result, _, _) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
@@ -437,7 +447,11 @@ mod tests {
             &mut err,
         );
         assert_eq!(result, Err(ExitCode::Unusable));
-        assert!(String::from_utf8(err).unwrap().contains("no sudo or doas"));
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("no sudo, sudo-rs, or doas")
+        );
     }
 
     #[test]

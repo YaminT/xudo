@@ -1,0 +1,22 @@
+# Daily check that the audit log still verifies. Persistent= runs a check the
+# machine missed while it was off. RandomizedDelaySec keeps every host from
+# firing at midnight.
+#
+# Change the period with a drop-in, not by editing this file. Clear the
+# packaged calendar first, then set the new one:
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=weekly
+#   systemctl edit xudo-pasban.timer
+
+[Unit]
+Description=Daily xudo audit-log verification (pasban)
+Documentation=https://github.com/YaminT/xudo/blob/main/howiwork.md
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

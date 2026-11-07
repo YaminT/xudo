@@ -48,7 +48,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use xudo_sys::{
-    AuditSink, HostClock, HostEntropy, HostPeer, HostSyscalls, SpoolDir, UnixConnection,
+    AuditSink, HostClock, HostEntropy, HostHygiene, HostPeer, HostSyscalls, Hygiene, SpoolDir,
+    UnixConnection,
 };
 use xudo_wire::RefusalCode;
 
@@ -75,11 +76,20 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// with [`UNUSABLE`]: there is nobody to answer. Nothing is minted unless its
 /// record lands on `audit` first.
 pub fn run(socket: BorrowedFd<'_>, audit: &mut dyn AuditSink) -> u8 {
+    run_with_hygiene(socket, audit, &HostHygiene)
+}
+
+fn run_with_hygiene(
+    socket: BorrowedFd<'_>,
+    audit: &mut dyn AuditSink,
+    hygiene: &dyn Hygiene,
+) -> u8 {
     match UnixConnection::adopt(socket, IO_TIMEOUT) {
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let policy = HostPolicy::system();
             let mut platform = Platform {
+                hygiene,
                 syscalls: &HostSyscalls,
                 peers: &HostPeer,
                 clock: &HostClock,
@@ -106,18 +116,21 @@ mod tests {
     use std::os::fd::AsFd as _;
     use std::os::unix::net::UnixStream;
 
-    use xudo_sys::FakeAuditSink;
+    use xudo_sys::{FakeAuditSink, FakeHygiene, HygieneCall, SysError};
     use xudo_wire::{Answer, BrokerRequest, BrokerResponse};
 
     use super::*;
 
     /// What a socketpair client is refused with on this host, as a test user:
-    /// on Linux the peer is identified and the spool is not root's; anywhere
-    /// else, no peer can be identified at all.
+    /// Linux reaches the untrusted spool; other platforms cannot set broker hygiene.
     #[cfg(target_os = "linux")]
     const EXPECTED: RefusalCode = RefusalCode::SpoolUnusable;
     #[cfg(not(target_os = "linux"))]
-    const EXPECTED: RefusalCode = RefusalCode::PeerUnidentified;
+    const EXPECTED: RefusalCode = RefusalCode::BrokerUnusable;
+    #[cfg(target_os = "linux")]
+    const AFTER_HYGIENE: RefusalCode = RefusalCode::SpoolUnusable;
+    #[cfg(not(target_os = "linux"))]
+    const AFTER_HYGIENE: RefusalCode = RefusalCode::PeerUnidentified;
 
     fn code_of(answer: &Answer) -> Option<RefusalCode> {
         match answer {
@@ -134,6 +147,64 @@ mod tests {
         let record = &audit.records()[0];
         assert_eq!(record.denial.as_deref(), Some("broker_unusable"));
         assert!(record.evidence.join(" ").contains("not a socket"));
+    }
+
+    #[test]
+    fn a_broker_that_cannot_set_no_new_privs_serves_nothing() {
+        let (broker, mut client) = UnixStream::pair().unwrap();
+
+        let hygiene =
+            FakeHygiene::new(1).with_privileges_error(SysError::unsupported("PR_SET_NO_NEW_PRIVS"));
+        let mut audit = FakeAuditSink::new();
+        assert_eq!(
+            run_with_hygiene(broker.as_fd(), &mut audit, &hygiene),
+            UNUSABLE
+        );
+        drop(broker);
+
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).unwrap();
+        let response = BrokerResponse::parse(&answer).unwrap();
+        assert_eq!(code_of(&response.answer), Some(RefusalCode::BrokerUnusable));
+        assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
+        assert_eq!(audit.records().len(), 1);
+        assert_eq!(
+            audit.records()[0].denial.as_deref(),
+            Some("broker_unusable")
+        );
+        assert!(
+            audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("PR_SET_NO_NEW_PRIVS")
+        );
+    }
+
+    #[test]
+    fn a_broker_that_sets_no_new_privs_reaches_request_serving() {
+        let (broker, mut client) = UnixStream::pair().unwrap();
+        let request = BrokerRequest::new("/usr/bin/id", vec!["-u".to_owned()], "unattested");
+        client.write_all(request.to_json().as_bytes()).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let hygiene = FakeHygiene::new(1);
+        let mut audit = FakeAuditSink::new();
+        assert_eq!(
+            run_with_hygiene(broker.as_fd(), &mut audit, &hygiene),
+            UNUSABLE
+        );
+        drop(broker);
+
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).unwrap();
+        let response = BrokerResponse::parse(&answer).unwrap();
+        assert_eq!(code_of(&response.answer), Some(AFTER_HYGIENE));
+        assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
+        assert_eq!(audit.records().len(), 1);
+        assert_eq!(
+            audit.records()[0].denial.as_deref(),
+            Some(AFTER_HYGIENE.as_str())
+        );
     }
 
     #[test]

@@ -29,7 +29,6 @@ RuntimeMaxSec=30
 # /proc/<pid>/stat and status are world-readable, and pidfds need none.
 CapabilityBoundingSet=
 AmbientCapabilities=
-NoNewPrivileges=yes
 UMask=0077
 
 # The whole filesystem read-only except the spool and the audit log.

@@ -61,9 +61,11 @@
 //!   are the sender's claims.
 //! * `XUDO_*` index fields for queries, and `XUDO_RECORD`: the record's JSON line
 //!   exactly as the file holds it, so the entries [`query`] finds can be
-//!   checked against the file record by record — as long as journald kept each
-//!   one, since it drops what exceeds its rate limit without telling the
-//!   sender. No tool makes that comparison yet.
+//!   checked against file records — as long as journald kept each one, since
+//!   it drops what exceeds its rate limit without telling the sender. The
+//!   pasban check links entries by sequence and hash to find removed tails or
+//!   replaced records. An empty or behind journal cannot show a cut: vacuum
+//!   and the rate limit drop entries without touching the file.
 //!
 //! An index value longer than [`INDEX_FIELD_MAX`] is left out — the record
 //! carries it whole. That is what keeps an entry inside one datagram: the
@@ -89,15 +91,30 @@ pub const MESSAGE_ID: &str = "a06b36c755dd4b85815d6af790559b5e";
 /// the module docs for why nothing narrower can be relied on.
 pub const TRUSTED_SENDER: &str = "_UID=0";
 
+/// The match arguments a trusted query starts with, without the program name.
+///
+/// [`query`] joins these for a person to read. A program that runs the query
+/// passes them to `journalctl` by absolute path, so the word `journalctl` in
+/// [`query`] is never looked up on `PATH`.
+pub fn trusted_matches(extra: &[&str]) -> Vec<String> {
+    let mut matches = vec![
+        TRUSTED_SENDER.to_owned(),
+        format!("MESSAGE_ID={MESSAGE_ID}"),
+    ];
+    matches.extend(extra.iter().copied().map(str::to_owned));
+    matches
+}
+
 /// The `journalctl` command that finds xudo's audit entries, narrowed by
 /// `extra` matches such as `XUDO_DECISION=denied` or `PRIORITY=1`.
 ///
 /// Every query, alert rule, and comparison with the file starts here, so none
-/// of them counts an entry an unprivileged user sent.
+/// of them counts an entry an unprivileged user sent. This is the command a
+/// person reads. Run it through [`trusted_matches`] and an absolute path.
 pub fn query(extra: &[&str]) -> String {
-    let message_id = format!("MESSAGE_ID={MESSAGE_ID}");
-    let mut words = vec!["journalctl", TRUSTED_SENDER, message_id.as_str()];
-    words.extend_from_slice(extra);
+    let mut words = Vec::with_capacity(extra.len().saturating_add(1));
+    words.push("journalctl".to_owned());
+    words.extend(trusted_matches(extra));
     words.join(" ")
 }
 
@@ -319,6 +336,16 @@ mod tests {
         assert_eq!(
             query(&[]),
             "journalctl _UID=0 MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e"
+        );
+        // The argv a program runs is the same matches, and not the word
+        // `journalctl`, which would be a PATH search.
+        assert_eq!(
+            trusted_matches(&["XUDO_DECISION=denied"]),
+            vec![
+                "_UID=0".to_owned(),
+                format!("MESSAGE_ID={MESSAGE_ID}"),
+                "XUDO_DECISION=denied".to_owned(),
+            ]
         );
         // A client cannot send the field the query trusts: journald drops a
         // client field whose name starts with `_`, and the encoder sends none.

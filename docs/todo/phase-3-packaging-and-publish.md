@@ -16,8 +16,19 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 >   checksum-verified download becomes the documented install. The reasoning for
 >   why there is no `curl | sh` installer still applies and still belongs in the
 >   README.
+> * **Signing: cosign (keyless).** Release artifacts (the `.deb` and its checksums) are signed with cosign keyless: the GitHub Actions OIDC identity, recorded in the Rekor transparency log. No long-lived key exists to guard.
+> * **Pasban log verification is part of this phase.** A root-owned systemd timer verifies the audit chain and reports loudly when it breaks.
+> * **Publishing waits for the owner's explicit go.** The beta is built and its release workflow is made ready, but no tag or GitHub Release is created without it.
 
 ## 1. The beta ships the human path only
+
+**Step 1 status (2026-11-05):** the unsigned beta package and three-distro container lane are implemented. Signing and publishing remain deferred until the owner explicitly approves.
+
+**Step 2 status (2026-11-06):** implemented. The unit omits `NoNewPrivileges=yes`; the broker sets it through `xudo_sys::Hygiene` before serving and fails closed with an audited `broker_unusable` refusal if it cannot. The ruleset trust walk is unchanged. `just systemd-test` checks `NoNewPrivs: 1` and the complete installed password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
+
+**Step 3 status (2026-11-06):** implemented. `xudo-pasban.service` and `xudo-pasban.timer` ship in the package. The timer is daily, persistent, with a one-hour randomized delay; the operator changes the period with `systemctl edit xudo-pasban.timer`. First install enables and starts the timer; an upgrade does not re-enable one the operator disabled. The service runs, as root with no capabilities, `xudo audit --log /var/lib/xudo/audit.jsonl --against-journal`. A failure exits non-zero and is a `<2>` line, stored at journal priority 2. Pasban links journal entries to the audit file by hash. It detects a removed tail, a cut followed by continued writes, and a forged chain the journal never saw; see `../CONCERNS.md` for limits. Grant expiry stays M5. See `../CONCERNS.md`, 2026-11-06.
+
+**Step 4 status (2026-11-06):** release workflow implemented. It runs on a pushed `v*` tag and checks that `<tag>` is `v` plus the root Cargo version unchanged (for example, `v0.1.0-beta.1`); `<ver>` is the Debian version used in `.deb` filenames (for example, `0.1.0~beta.1`). It tests the packages natively on amd64 and arm64, signs the tested packages and checksums with cosign keyless, and creates only a draft prerelease. No tag or release has been created or published.
 
 This is the load-bearing decision of the whole phase, so it comes first.
 
@@ -25,7 +36,7 @@ A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then t
 
 Therefore the beta package:
 
-- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate` with `xudo-gate-auth` as its hardlink, and `/usr/libexec/xudo/xudod` with its socket unit — the broker mints requests and grants nothing a password did not;
+- installs `/usr/bin/xudo`, `/usr/bin/ido` (with `willyoumarryme` as a second name for the same inode), `/usr/libexec/xudo/xudo-gate-auth`, and `/usr/libexec/xudo/xudod` with its socket unit and pasban's timer;
 - installs the `PASSWD:` sudoers rule only;
 - does **not** install `xudo-gate-nopass`, its hardlink, or its `NOPASSWD:` rule — those files are not in the package at all, rather than present-but-unreferenced;
 - does **not** add any user to the `xudo` group (see § 3);
@@ -37,7 +48,9 @@ The passwordless path arrives in a later release, behind an explicit `xudo enabl
 
 ## 2. Package layout
 
-Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need hand-writing: `cargo-deb`'s generated postinst is not adequate for a privilege broker.
+**Status (2026-11-05):** staged from the static musl binaries, existing units, tmpfiles config, shipped rules, and existing man pages. Rules are conffiles; only the password-authenticated gate name is installed.
+
+Build a single `.deb` directly with `dpkg-deb`; the small explicit staging script keeps the privileged file list reviewable.
 
 ```
 /usr/bin/xudo                             0755 root:root   no setuid bit, ever
@@ -45,6 +58,8 @@ Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need h
 /usr/libexec/xudo/xudod                   0755 root:root   the broker; started per connection, never by hand
 /usr/lib/systemd/system/xudod.socket      0644 root:root   packaging/systemd/xudod.socket: /run/xudo/broker.sock, 0660 root:xudo
 /usr/lib/systemd/system/xudod@.service    0644 root:root   packaging/systemd/xudod@.service: one sandboxed instance per connection
+/usr/lib/systemd/system/xudo-pasban.service 0644 root:root packaging/systemd/xudo-pasban.service: audit-log check, root, read-only
+/usr/lib/systemd/system/xudo-pasban.timer   0644 root:root   packaging/systemd/xudo-pasban.timer: daily, persistent, randomized delay
 /usr/share/doc/xudo/                                       README, SECURITY, changelog, copyright
 /usr/share/man/man1/xudo.1.gz
 /usr/share/man/man5/xudo-rules.5.gz                        the rule-file format
@@ -55,7 +70,7 @@ Build with `cargo-deb` for the ordinary paths, but the maintainer scripts need h
 /usr/lib/tmpfiles.d/xudo.conf             0644 root:root   packaging/tmpfiles.d/xudo.conf: /run/xudo 0755, /run/xudo/req 0700
 ```
 
-The three files under `packaging/` are tested as code by `crates/xudod/tests/units.rs`, which refuses any directive it does not know — systemd ignores a misspelled one with a warning — and asserts every security-relevant line against the constants the code uses. The postinst creates the `xudo` group before it enables `xudod.socket`, because `SocketGroup=xudo` fails without it.
+The unit files and the tmpfiles line under `packaging/` are tested as code by `crates/xudod/tests/units.rs`, which refuses any directive it does not know — systemd ignores a misspelled one with a warning — and asserts every security-relevant line against the constants the code uses. The postinst creates the `xudo` group before it enables `xudod.socket`, because `SocketGroup=xudo` fails without it. Pasban's timer is enabled the same way, on a first install only.
 
 Control fields:
 
@@ -65,7 +80,7 @@ Control fields:
 | `Section` | `admin` | |
 | `Priority` | `optional` | |
 | `Architecture` | `amd64`, `arm64` | Native runners for both; no QEMU in the release path |
-| `Depends` | `sudo \| opendoas`, `${shlibs:Depends}`, `${misc:Depends}` | An alternation, because the doas lane is real |
+| `Depends` | `sudo`, `init-system-helpers (>= 1.54~)` | Beta depends on `sudo` only. A doas host runs `xudo install` by hand (`just install-root`). |
 | `Recommends` | `systemd` | journald mirrors every audit record and the mirror is required: a host or container without journald refuses every privileged request until an `audit_sink` setting exists to leave it out (`../CONCERNS.md`, 2026-10-19). No `/dev/log` fallback yet |
 | `Conflicts` | — | Deliberately none; `xudo` does not replace `sudo` |
 
@@ -80,6 +95,8 @@ Shipped rules under `/etc/xudo/rules.d/` are Debian conffiles, so dpkg prompts o
 ---
 
 ## 3. Maintainer scripts
+
+**Status (2026-11-05):** postinst delegates rule installation to `xudo install` and accepts only a stderr line whose prefix is `xudo: installed, but NOT VERIFIED:`. The socket is enabled on a first install only. An upgrade runs `xudo install` only when `/etc/sudoers.d/xudo` is already there. Remove uninstalls through xudo before disabling the socket; purge removes state and the package group.
 
 The dangerous part. Each step exists because of a specific failure mode.
 
@@ -138,11 +155,18 @@ State plainly in the README why there is no `curl | sh` installer. That paragrap
 - **Launchpad PPA** for Ubuntu reach; it is what Ubuntu users look for first.
 - `.rpm` via `cargo-generate-rpm`, `APKBUILD`, `PKGBUILD`, and a Nix module — cheap once the `.deb` maintainer scripts exist, and the Alpine/doas lane is already in the test matrix.
 - `cargo-auditable` in the release build so the shipped binary carries its dependency list; publish an SBOM (CycloneDX or SPDX) per release.
-- Reproducible builds, and sign release artifacts (`minisign` or `cosign`).
+- Reproducible builds, and sign release artifacts with cosign (keyless).
 
 ---
 
 ## 5. GitHub presence: SEO and AI-crawler discoverability
+
+**Step 5 status (2026-11-06):** public docs and metadata drafts are written. No
+GitHub settings were changed. Pages is live from the `gh-pages` branch with old
+content. A main-only Pages workflow is now added for the owner to switch to. No
+release was published. Beta claims describe the built broker and password-only
+path; the passwordless path, out-of-band confirmation, and Landlock are not in
+this release.
 
 Two audiences, and they retrieve differently. A search engine wants crawlable structure and inbound relevance; a language model retrieves passages and answers questions, so it rewards prose that states the subject explicitly and headings shaped like questions.
 
@@ -151,7 +175,7 @@ Two audiences, and they retrieve differently. A search engine wants crawlable st
 - **About description**, under 350 characters, front-loading the concrete nouns rather than the pitch. Something like: *"A sudo alternative that lets AI coding agents run an allowlisted set of privileged commands without a password, while always prompting humans. Root-owned rule set, compiled-in deny-list, full audit trail. Rust, Linux."*
 - **Topics**: `sudo`, `sudo-alternative`, `privilege-escalation`, `linux-security`, `ai-agents`, `claude-code`, `openai-codex`, `agentic-ai`, `rust`, `cli`, `devsecops`, `least-privilege`, `doas`, `polkit`, `allowlist`.
 - **Social preview image** — it is what appears in every link unfurl, including Slack and Discord.
-- `SECURITY.md` with a disclosure address, `CITATION.cff`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, a real `CHANGELOG.md`.
+- `SECURITY.md` with a disclosure address, `CITATION.cff`, `CONTRIBUTING.md`, a real `CHANGELOG.md`. The owner dropped `CODE_OF_CONDUCT.md` for now.
 - `LICENSE` — Apache-2.0 OR MIT, matching the workspace manifest.
 
 ### README structure
@@ -196,6 +220,8 @@ Every one of these appears in the README, the package description, and `xudo --v
 ---
 
 ## 7. Tests that gate the release
+
+**Status (2026-11-06):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`. The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems, including stock Ubuntu 26.04 and Alpine; the 26.04 systemd and differential lanes pass because they install GNU `id`.
 
 Run in containers, per distro, on both architectures.
 

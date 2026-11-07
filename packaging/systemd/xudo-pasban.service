@@ -1,0 +1,63 @@
+# Verifies the hash-chained audit log. The period is the timer's; change it
+# with a drop-in, not by editing this file: systemctl edit xudo-pasban.timer
+#
+# A failure exits non-zero, so the unit is failed. The program writes that
+# failure as a <2> line. SyslogLevelPrefix=yes makes journald store it at
+# priority 2 (crit) and drop the prefix. SyslogLevel= would mark a clean run
+# critical too, and LogLevelMax= only drops lines.
+#
+# crates/xudod/tests/units.rs asserts every security-relevant line here, and
+# refuses any key it does not know.
+
+[Unit]
+Description=xudo audit-log verification (pasban)
+Documentation=https://github.com/YaminT/xudo/blob/main/howiwork.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/xudo audit --log /var/lib/xudo/audit.jsonl --against-journal
+StandardOutput=journal
+StandardError=journal
+SyslogLevelPrefix=yes
+# A hung journal read must fail the unit, not sit there.
+TimeoutStartSec=120
+ExecStopPost=:/bin/sh -c 'if [ "$SERVICE_RESULT" != success ]; then printf "<2>pasban: %s (exit status %s)\n" "$SERVICE_RESULT" "$EXIT_STATUS"; fi'
+
+# Root, and no capability. The log is mode 0600 and owned by root, so the
+# owner read bit is enough. CAP_DAC_OVERRIDE is what a process that does not
+# own the file would need.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The broker's unit omits this: systemd's no-new-privileges remounts the
+# ruleset nosuid. This unit never reads the ruleset.
+NoNewPrivileges=yes
+UMask=0077
+
+# Read-only everywhere. The check reads the log and the journal and writes nothing.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# No network. journalctl reads journal files; a Unix socket is the most it needs.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+TasksMax=8
+LimitNOFILE=65536
