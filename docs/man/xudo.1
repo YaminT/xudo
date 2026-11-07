@@ -1,0 +1,373 @@
+.TH XUDO 1 "2026-11-07" "xudo 0.0.1" "User Commands"
+.SH NAME
+xudo \- decide whether a privileged command runs as root
+.SH SYNOPSIS
+.B xudo
+.RI [ options ]
+.I command
+.RI [ args ]
+.br
+.B xudo explain
+.RB [ \-\-action
+.IR id ]
+.RB [ options ]
+.B \-\-
+.I program
+.RI [ arg ...]
+.br
+.B xudo why\-not
+.B \-\-action
+.I id
+.RB [ options ]
+.B \-\-
+.I program
+.RI [ arg ...]
+.br
+.B xudo exec
+.RB [ options ]
+.B \-\-
+.I program
+.RI [ arg ...]
+.br
+.B xudo check
+.RB [ options ]
+.br
+.B xudo list
+.RB [ \-\-tier
+.IR tier ]
+.RB [ options ]
+.br
+.B xudo doctor
+.RB [ \-\-json ]
+.RB [ \-\-fix ]
+.RB [ options ]
+.br
+.B xudo config
+.RB [ \-\-schema ]
+.RB [ options ]
+.br
+.B xudo install
+.RB [ \-\-dry\-run ]
+.RB [ \-\-show\-contents ]
+.RB [ \-\-uninstall ]
+.RB [ options ]
+.br
+.B xudo audit
+.RB [ \-\-log
+.IR path ]
+.RB [ \-\-against\-journal ]
+.RB [ options ]
+.br
+.B xudo agentdoc
+.RB [ \-\-format
+.IR harness ]
+.RB [ options ]
+.br
+.B xudo help
+.RI [ command ]
+.SH DESCRIPTION
+.B xudo
+checks a request against root-owned rules.
+.B xudo exec
+runs an allowed command as root through the host's
+.B sudo
+or
+.BR doas ,
+which asks for your password.
+This beta is that password path only.
+The passwordless agent path is not built: the package has no
+.B xudo\-gate\-nopass
+and installs no
+.B NOPASSWD
+rule.
+.PP
+This release is a beta and has not been externally audited.
+.SH OPTIONS
+These options apply to every command.
+They may come before or after the command name.
+.TP
+.BI \-\-rules\  DIR
+Directory of rule files.
+The default is
+.IR /etc/xudo/rules.d .
+.TP
+.BI \-\-config\-file\  FILE
+The settings file.
+The default is
+.IR /etc/xudo/config.toml .
+.TP
+.BI \-\-output\  FORMAT
+.B human
+(the default) prints prose and the decision trace.
+.B json
+prints the versioned decision envelope.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.B \-h
+is the short form.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+The version line says the build is a beta and not externally audited.
+.SH COMMANDS
+.TP
+.B explain
+Show what the policy would decide, and why.
+Executes nothing.
+The command is a real argument vector after
+.BR \-\- ;
+the program is the first argument.
+.B \-\-action
+asks about one action id.
+Every other action that accepts the same command still applies, and
+overlapping actions resolve to the strictest.
+.TP
+.B why\-not
+Show why one action would refuse this argv.
+.B \-\-action
+is required.
+Executes nothing.
+.TP
+.B exec
+Run the command as root, if the broker permits it.
+Asks for your password through the host backend.
+The program is an absolute path, after
+.BR \-\- .
+The command's own status is the process status.
+A policy refusal happens before the command runs.
+.TP
+.B check
+Lint the loaded ruleset.
+Exits
+.B 17
+when an action allowlists an executable the compiled-in deny-list refuses.
+Overlapping actions are reported and are not themselves a failure: a command
+more than one action accepts is refused to an agent if any of them is
+human-only, and confirmed as strictly as the strictest demands.
+A ruleset that will not load is
+.BR 19 ,
+before this lint runs.
+.TP
+.B list
+List each action's id, tier, executable, and the file and line it came from.
+.B \-\-tier
+shows actions whose tier contains that name.
+Hyphens in the name are ignored, so
+.B diag\-read
+matches.
+The tier names are
+.BR diag\-read ,
+.BR svc\-control ,
+.BR pkg\-install ,
+.BR pkg\-remove ,
+.BR sys\-tunable ,
+.BR net\-filter ,
+.BR critical .
+No match exits
+.BR 17 .
+.TP
+.B doctor
+Report the platform, the ruleset, how this caller would be classified, and
+every other path to root on this machine.
+It reads as you.
+What you cannot read is reported as unverified, never as absent; run it as
+root as well to read what this account cannot.
+.B \-\-json
+prints the versioned machine-readable envelope, the same as
+.BR \-\-output\ json .
+.B \-\-fix
+proposes a fix for each path to root, including the command a human would
+run, and applies nothing.
+.TP
+.B config
+Show the effective settings and where each value came from.
+.B \-\-schema
+prints the machine-readable schema instead.
+Only
+.B \-\-config\-file
+is read, as the system layer.
+A missing file is the defaults, not an error.
+A file that does not parse, or that contains an unrecognised key, exits
+.BR 19 .
+The keys are
+.B confirm_agent_actions
+(default true),
+.B confirmation_timeout_secs
+(default 60),
+.B frozen
+(default false),
+.B audit_sink
+(default
+.BR journald ),
+.B color
+(default true), and
+.BR use_pty ,
+which is compiled in as true and is refused if set.
+The command marks security-relevant settings and says they are never
+settable from the environment.
+This binary does not read the environment for them.
+.TP
+.B install
+Integrate xudo with the local
+.B sudo
+or
+.B doas
+backend, or remove that integration.
+Needs root.
+Every step is validated by the backend's own parser before anything is moved,
+and only files xudo wrote are replaced or removed.
+.B \-\-dry\-run
+prints the plan and changes nothing.
+.B \-\-show\-contents
+prints the file each step would write.
+.B \-\-uninstall
+removes what an install wrote, for both backends, and nothing else.
+The rules this build would install all require a password.
+An install is reported as verified only when the broker minted a request for
+.BR "id -u" ,
+the gate ran through the backend and printed
+.BR 0 ,
+and the backend lists the gate for a member of the group.
+Anything less keeps the validated files, says
+.BR "NOT VERIFIED" ,
+and exits
+.BR 19 .
+.TP
+.B audit
+Verify that a hash-chained log has not been edited in place.
+The default path is
+.IR $HOME/.local/state/ido/log.jsonl .
+.B XDG_STATE_HOME
+is not read; if it is set, pass
+.BR \-\-log .
+The broker's own log is
+.IR /var/lib/xudo/audit.jsonl .
+.B \-\-against\-journal
+compares file records with the journal's root-written xudo entries, which
+can show a tail removed or records replaced after a cut.
+An unbroken chain does not prove the log was never truncated and rebuilt.
+A damaged log exits
+.BR 17 .
+A log that cannot be read, or a journal check that cannot run, exits
+.BR 19 .
+.TP
+.B agentdoc
+Print the block that tells an agent what the loaded rules permit.
+.B \-\-format
+is
+.B agents
+(the default,
+.BR AGENTS.md ),
+.B claude
+.RB ( CLAUDE.md ),
+or
+.B codex
+(Codex CLI).
+.TP
+.B help
+Print the same text as
+.BR \-\-help ,
+or the help of the named command.
+.SH EXIT STATUS
+.TP
+.B 0
+The request succeeded.
+.B exec
+returns the command's own status instead, so a command that exits 0 is the
+only successful run; any other status from the command, or from the password
+prompt, is that status.
+.TP
+.B 17
+Denied by policy, or an audit log that is not intact.
+.TP
+.B 18
+Confirmation is required, or there is no live confirmation channel.
+Both mean nobody has approved the action.
+.TP
+.B 19
+.B xudo
+could not operate and failed closed: the ruleset or the settings file would
+not load, no usable backend, an install that is not verified, an audit log
+that could not be read, or a status that does not fit in a byte.
+.PP
+.BR 17 ,
+.BR 18 ,
+and
+.B 19
+sit above the
+.BR 0 / 1 / 2
+band a program uses for its own failures and below
+.BR 128 ,
+where a shell reports a killed child as
+.IR 128+signal .
+A refusal is therefore distinct from a command that ran and failed, and from
+a command that was killed.
+.SH FILES
+.TP
+.I /etc/xudo/rules.d/
+Rule files, loaded in name order.
+See
+.BR xudo\-rules (5).
+.TP
+.I /etc/xudo/config.toml
+Settings.
+Not a rule file.
+.TP
+.I /run/xudo/broker.sock
+The broker socket.
+systemd listens; one
+.B xudod
+serves each connection.
+Mode
+.BR 0660 ,
+group
+.BR xudo .
+.TP
+.I /var/lib/xudo/audit.jsonl
+The hash-chained audit log the broker and the gate append to.
+.TP
+.I /etc/sudoers.d/xudo
+Written by
+.BR "xudo install" ,
+mode
+.BR 0440 .
+Not shipped in the package.
+The name has no dot and no trailing tilde, which
+.B sudo
+would ignore.
+.TP
+.I /usr/lib/systemd/system/xudod.socket
+.TQ
+.I /usr/lib/systemd/system/xudod@.service
+.TQ
+.I /usr/lib/systemd/system/xudo-pasban.service
+.TQ
+.I /usr/lib/systemd/system/xudo-pasban.timer
+The broker socket, one broker instance per connection, and the daily audit
+check.
+Pasban runs
+.B xudo audit \-\-log /var/lib/xudo/audit.jsonl \-\-against\-journal
+as root.
+.SH SECURITY
+Agent detection is not a security boundary.
+.BR CLAUDECODE ,
+.BR argv[0] ,
+.BR comm ,
+the command line,
+.BR /proc/ pid /exe ,
+and process ancestry are unauthenticated hints.
+They are recorded.
+Authorization does not branch on them.
+An unattested caller takes the human path and is asked for a password.
+.PP
+Confirmation is not read from the requester's standard input, standard
+output, or terminal.
+No live confirmation channel means deny.
+.PP
+This beta has not been externally audited.
+.SH SEE ALSO
+.BR xudo\-rules (5),
+.BR ido (1),
+.BR sudo (8),
+.BR doas (1)

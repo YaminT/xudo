@@ -1,0 +1,253 @@
+.TH XUDO-RULES 5 "2026-11-07" "xudo 0.0.1" "File Formats"
+.SH NAME
+xudo-rules \- rule files for xudo
+.SH DESCRIPTION
+A rule file allowlists named actions.
+It does not allowlist a command string.
+Each action names one absolute executable and one typed argument list.
+The caller's tokens fill only positions the action declared.
+.PP
+The file is TOML.
+Unknown keys are a hard error, on the file and on every table in it
+.RB ( deny_unknown_fields ).
+A key that is silently ignored would be a constraint the operator believes
+is in force.
+A file that fails to parse fails the whole directory.
+.SH LOCATION
+The default directory is
+.IR /etc/xudo/rules.d/ .
+Only names that end in
+.B .toml
+and have something before that suffix are rule files.
+A file named
+.B .toml
+is not one.
+Names and contents must be UTF-8.
+.PP
+Files are loaded in byte order of their names, whatever order the directory
+returns them.
+Duplicate action ids fail the load.
+.PP
+The broker and the gate load the directory through a trust walk.
+Every component from the filesystem root must be owned by uid 0, must not be
+group- or world-writable, and must not sit on a mount a non-root user could
+have made.
+The front-end reads the same directory by path, so
+.B xudo explain
+works on a checkout.
+It does not execute.
+.PP
+Provenance is assigned by the loader.
+Each action's source is the file name and the line of its
+.B id
+declaration.
+A rule cannot set
+.BR source :
+that key is rejected.
+.SH FILE
+The only top-level key is
+.BR action ,
+written as one
+.B [[action]]
+table per action.
+.TP
+.B id
+Stable identifier, for example
+.BR xudo.svc.reset\-failed .
+.TP
+.B tier
+One of
+.BR diag\-read ,
+.BR svc\-control ,
+.BR pkg\-install ,
+.BR pkg\-remove ,
+.BR sys\-tunable ,
+.BR net\-filter ,
+.BR critical .
+.B critical
+always demands confirmation.
+.TP
+.B exe
+Absolute path of the program.
+A relative path, an empty component,
+.BR . ,
+or
+.B ..
+is rejected.
+.B PATH
+is never searched.
+.TP
+.B args
+The argument list, position by position.
+Omitted or empty means zero arguments and nothing else.
+Each element is a table with
+.BR name ,
+.BR matcher ,
+and optionally
+.BR repeat .
+.B name
+is cited in traces.
+Two positions in one action may not share a name.
+.TP
+.B confirm
+When a human must approve.
+.B default
+(the default) follows
+.BR confirm_agent_actions ,
+which starts true, so an enrolled agent is confirmed.
+.B always
+confirms for every caller.
+.B never
+asks for no confirmation from this action.
+It is not a grant against a stricter overlapping action, and a
+.B critical
+action cannot set it.
+Overlapping actions resolve to the strictest requirement.
+File order does not decide whether confirmation is demanded.
+.TP
+.B agent\-allowed
+Whether an enrolled agent may run this action.
+The default is true.
+.B false
+makes it human-only.
+.TP
+.B env\-allow
+Environment variable names to pass through, by exact name.
+The default is none.
+The child's environment is built from scratch, so a name on no list does not
+exist for the child.
+.SH MATCHERS
+Matcher keys are kebab-case.
+A position accepts one of them.
+.TP
+.B literal
+Exactly these bytes.
+.TP
+.B one\-of
+Exactly one of these byte strings.
+.TP
+.B int\-range
+A base-10 integer in the inclusive range
+.BR lo .. hi .
+No leading
+.BR + ,
+no surrounding space, no underscores, and no leading zero on a multi-digit
+number.
+.TP
+.B path\-under
+An absolute path lexically equal to
+.B prefix
+or beneath it.
+A relative path, a
+.B ..
+component, or an embedded NUL is refused, and
+.B /etc/nginx\-evil
+is not under
+.BR /etc/nginx .
+This is a syntactic pre-filter.
+It does not see symlinks, bind mounts, or hardlinks.
+Containment at execution is a separate check.
+.TP
+.B name
+An identifier class:
+.BR deb\-name ,
+.BR rpm\-name ,
+.BR arch\-name ,
+.BR apk\-name ,
+.BR unit\-name ,
+.BR hostname ,
+.BR sysctl\-key .
+Every class rejects an empty value and a value longer than 255 bytes.
+A leading
+.BR \- ,
+or any occurrence of
+.BR / ,
+.BR = ,
+.BR : ,
+or
+.B ..
+anywhere in the value is rejected.
+.B unit\-name
+must end in
+.BR .service ,
+.BR .socket ,
+.BR .timer ,
+.BR .target ,
+.BR .path ,
+or
+.BR .mount .
+A suffix-less name would match more units than it appears to, because
+.B systemctl restart foo
+resolves
+.B foo
+to
+.BR foo.service .
+.TP
+.B pattern
+A regular expression.
+Anchors are added by the parser; a pattern that already starts with
+.B ^
+or ends with
+.B $
+is rejected.
+The compiled pattern is size-bounded.
+.SH REPEAT
+.B repeat
+is how many arguments one position consumes.
+.B one
+(the default) is exactly one.
+.B optional
+is zero or one.
+.B between
+takes
+.B min
+and
+.BR max ,
+inclusive, and
+.B max
+is clamped to 64.
+.SH ARGUMENTS AS DELIVERED
+A rule matches the argv byte for byte as the kernel delivers it.
+Canonicalization drops a trailing
+.B \-\-
+that separates nothing, and does nothing else.
+It does not split
+.BR \-\-key=value .
+A value can itself look like a flag, and splitting had no fixed point.
+.PP
+A rule that accepts both spellings lists both.
+.B \-\-lines=20
+is one argument;
+.B \-\-lines
+and
+.B 20
+are two.
+The engine will not turn one spelling into the other.
+Prefer the joined spelling where one token is enough, because that is what
+people type.
+.SH DENY\-LIST
+After an action matches, a deny-list compiled into the binary is evaluated
+on the canonical argv.
+No rule file can disable, reorder, shadow, or override it.
+It is enumerated by capability class (a shell, an interpreter, an arbitrary
+read or write, a unit-definition change, and the rest of that list), not by
+binary name.
+A copy, a hardlink, or a multicall applet does not escape a class.
+.SH EXAMPLE
+From the shipped
+.IR 20\-services.toml .
+The verb is an enumeration, and the unit must carry a suffix.
+.PP
+.EX
+[[action]]
+id = "xudo.svc.reset\-failed"
+tier = "svc\-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no\-pager", matcher = { literal = "\-\-no\-pager" } },
+  { name = "verb", matcher = { literal = "reset\-failed" } },
+  { name = "unit", matcher = { name = "unit\-name" } },
+]
+.EE
+.SH SEE ALSO
+.BR xudo (1)

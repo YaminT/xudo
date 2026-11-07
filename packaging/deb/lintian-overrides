@@ -6,9 +6,5 @@ xudo: shared-library-lacks-prerequisites [usr/bin/willyoumarryme]
 xudo: shared-library-lacks-prerequisites [usr/bin/xudo]
 xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudo-gate-auth]
 xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudod]
-# xudo(1) is a later phase 3 deliverable.
-xudo: no-manual-page [usr/bin/xudo]
-# The alternate ido name shares ido(1), but lintian checks the path literally.
-xudo: no-manual-page [usr/bin/willyoumarryme]
 # The packaged binary, called by absolute path. Root's PATH is not searched.
 xudo: command-with-path-in-maintainer-script /usr/bin/xudo*
