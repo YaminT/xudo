@@ -7,6 +7,9 @@ kernel       5.10 via SO_PEERCRED + pidfd_open (agent path WITHHELD: the pid SO_
 rules dir    /etc/xudo/rules.d
 ruleset      NOT LOADED (run `xudo check` for the parse error)
 rules trust  UNTRUSTED: /etc/xudo is owned by uid 1000, not root
+rule package unknown: rules did not load
+sudoers xudo unknown: canonical rule could not be read
+sudoers xudo unknown: test fixture has no sudoers directory
 classified   unavailable: cannot read self/stat: test stub refuses
 password     required (failing closed)
 backend      UNUSABLE: sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes xudo's settings to xudo's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); xudo refuses to install rather than install something weaker than it advertises

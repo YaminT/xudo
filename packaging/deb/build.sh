@@ -32,6 +32,7 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
 
 install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
 ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
+printf '.so man1/ido.1\n' | gzip -9n >"$stage/usr/share/man/man1/willyoumarryme.1.gz"
 install -m 0755 "$bin/xudod" "$stage/usr/libexec/xudo/"
 # Only the -auth name: the passwordless gate is not in this package at all.
 install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-auth"

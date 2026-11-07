@@ -1,0 +1,492 @@
+---
+source: crates/xudo/src/doctor.rs
+expression: "render::json_of(&report)"
+---
+{
+  "schema_version": 1,
+  "xudo_version": "0.0.1",
+  "platform": "test",
+  "exec_path": "xudo exec runs /usr/bin/sudo on the gate",
+  "kernel": {
+    "version": "5.10",
+    "attestation": "SO_PEERCRED + pidfd_open",
+    "attestation_since": "5.3",
+    "agent_path_available": false,
+    "withheld_because": "the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the pin is not bound to the connection",
+    "resolution": "openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)",
+    "summary": "5.10 via SO_PEERCRED + pidfd_open (agent path WITHHELD: the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the pin is not bound to the connection)"
+  },
+  "ruleset": {
+    "dir": "/etc/xudo/rules.d",
+    "loaded": null,
+    "load_error": "cannot read the rules directory /etc/xudo/rules.d: No such file or directory (os error 2)",
+    "trust": {
+      "trusted": false,
+      "files_checked": null,
+      "reason": "/etc/xudo is owned by uid 1000, not root"
+    },
+    "package_drift": {
+      "files": [
+        {
+          "path": "/etc/xudo/rules.d/00-shipped.toml",
+          "status": "matches_shipped"
+        },
+        {
+          "path": "/etc/xudo/rules.d/05-edited.toml",
+          "status": "changed_locally"
+        },
+        {
+          "path": "/etc/xudo/rules.d/06-obsolete.toml",
+          "status": "no_longer_shipped"
+        },
+        {
+          "path": "/etc/xudo/rules.d/99-operator.toml",
+          "status": "not_from_package"
+        },
+        {
+          "path": "/etc/xudo/rules.d/90-unknown.toml",
+          "status": "unknown"
+        }
+      ],
+      "unavailable": "dpkg-query unavailable"
+    }
+  },
+  "sudoers_snippet": {
+    "installed_rule": false,
+    "not_in_effect": [
+      "/etc/sudoers.d/xudo.conf"
+    ],
+    "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
+    "unavailable": "one candidate was not trusted"
+  },
+  "caller": {
+    "classification": null,
+    "password_required": true,
+    "hints_recorded": 0,
+    "hints_trusted": 0,
+    "unavailable": "cannot read self/stat: test stub refuses"
+  },
+  "backend": {
+    "status": "unusable",
+    "implementation": "sudo-rs",
+    "exe": "/usr/bin/sudo",
+    "version": "sudo-rs 0.2.2",
+    "capabilities": [
+      {
+        "capability": "drop-in-directory",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "validate-named-file",
+        "supported": true,
+        "required": false
+      },
+      {
+        "capability": "per-command-defaults",
+        "supported": false,
+        "required": true
+      },
+      {
+        "capability": "disable-credential-cache",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "allocate-pty",
+        "supported": true,
+        "required": true
+      },
+      {
+        "capability": "rejects-argument-wildcards",
+        "supported": false,
+        "required": false
+      },
+      {
+        "capability": "persistent-credential-cache",
+        "supported": true,
+        "required": false
+      }
+    ],
+    "missing_required": [
+      "per-command-defaults"
+    ],
+    "refusal": "sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes xudo's settings to xudo's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); xudo refuses to install rather than install something weaker than it advertises"
+  },
+  "paths_to_root": {
+    "subject": {
+      "uid": 1000,
+      "name": "yamin",
+      "is_root": false,
+      "groups": [
+        {
+          "gid": 4,
+          "name": "adm",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 996,
+          "name": "libvirt",
+          "active": true,
+          "listed": false
+        },
+        {
+          "gid": 997,
+          "name": "lxd",
+          "active": false,
+          "listed": true
+        },
+        {
+          "gid": 999,
+          "name": "docker",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 1000,
+          "name": "yamin",
+          "active": true,
+          "listed": true
+        },
+        {
+          "gid": 4242,
+          "name": null,
+          "active": true,
+          "listed": false
+        }
+      ]
+    },
+    "status": "found",
+    "checks": [
+      {
+        "check": "passwordless_rules",
+        "status": "found",
+        "examined": 5,
+        "findings": [
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers",
+            "line": 3,
+            "text": "%adm ALL=(ALL) NOPASSWD: /usr/bin/apt",
+            "grant": "nopasswd",
+            "applies_to_you": "yes"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers",
+            "line": 4,
+            "text": "@include \"/etc/sudoers.l ocal\"",
+            "grant": "include",
+            "applies_to_you": "maybe"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers.d/90 cloud",
+            "line": 1,
+            "text": "alice ALL=(ALL) NOPASSWD:ALL",
+            "grant": "nopasswd",
+            "applies_to_you": "no"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/sudoers.d/91-defaults",
+            "line": 1,
+            "text": "Defaults:ADMINS !authenticate",
+            "grant": "no_authenticate",
+            "applies_to_you": "maybe"
+          },
+          {
+            "kind": "passwordless_rule",
+            "file": "/etc/doas.conf",
+            "line": 1,
+            "text": "permit nopass :wheel",
+            "grant": "nopass",
+            "applies_to_you": "maybe"
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers",
+            "reason": "line(s) 4 end in a backslash, or use an escape or quote, that xudo does not model, so which lines they join, and so whom a rule near it names, could not be verified"
+          },
+          {
+            "path": "/etc/sudoers.d/99-secret",
+            "at": "/etc/sudoers.d/99-secret",
+            "reason": "Permission denied (os error 13)"
+          },
+          {
+            "path": "/etc/sudoers.l ocal",
+            "at": "/etc/sudoers.l ocal",
+            "reason": "an include names it, and it does not exist"
+          },
+          {
+            "path": "/etc/sudoers.l\\",
+            "at": "/etc/sudoers.l\\",
+            "reason": "an include names it, and it does not exist"
+          }
+        ],
+        "note": null
+      },
+      {
+        "check": "group_memberships",
+        "status": "found",
+        "examined": 9,
+        "findings": [
+          {
+            "kind": "group_membership",
+            "group": "docker",
+            "gid": 999,
+            "passwordless": true,
+            "grants": "the Docker daemon runs as root and starts any container you ask for, including one with / mounted (`docker run -v /:/host`): root, with no password",
+            "listed": true,
+            "active": true
+          },
+          {
+            "kind": "group_membership",
+            "group": "lxd",
+            "gid": 997,
+            "passwordless": true,
+            "grants": "the LXD daemon starts a privileged container with the host's / attached on request: root, with no password",
+            "listed": true,
+            "active": false
+          },
+          {
+            "kind": "group_membership",
+            "group": "libvirt",
+            "gid": 996,
+            "passwordless": true,
+            "grants": "the system libvirt daemon starts a VM with the host's disks attached on request: root, with no password",
+            "listed": false,
+            "active": true
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/group",
+            "at": "/etc/group",
+            "reason": "this process holds gid 4242, which has no name there, so whether it is one of the groups below cannot be told (a directory service is not consulted)"
+          }
+        ],
+        "note": null
+      },
+      {
+        "check": "unit_directories",
+        "status": "found",
+        "examined": 19,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/etc/systemd/system",
+            "at": "/etc/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 4,
+                "name": "adm",
+                "you": true
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/run/systemd/system",
+            "at": "/run/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1001,
+                "name": "alice",
+                "you": false
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/local/lib/systemd/system",
+            "at": "/usr/local/lib/systemd/system",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "you"
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/lib/systemd/system/b.service",
+            "at": "/usr/lib/systemd/system/b.service",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 4242,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "group",
+                "gid": 4243,
+                "name": null,
+                "you": false
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/usr/lib/systemd/system-generators",
+            "at": "/usr/lib/systemd",
+            "via": "missing",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [],
+        "note": null
+      },
+      {
+        "check": "root_path",
+        "status": "found",
+        "examined": 13,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/opt/rootbin",
+            "at": "/opt/rootbin",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1000,
+                "name": "yamin",
+                "you": true
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers.d/99-secret",
+            "reason": "root's secure_path may be set in a sudoers file that could not be read (3 such, the first at /etc/sudoers.d/99-secret); the stock directories were examined instead"
+          },
+          {
+            "path": "/etc/sudoers",
+            "at": "/etc/sudoers",
+            "reason": "root's secure_path may be set on a line xudo does not model, in a sudoers file it read (1 such, the first at /etc/sudoers); the directories it did find in secure_path, and the stock ones, were examined"
+          }
+        ],
+        "note": "the directories /etc/sudoers names in secure_path, and the stock ones"
+      },
+      {
+        "check": "user_path",
+        "status": "found",
+        "examined": 2,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/home/yamin/bin",
+            "at": "/home/yamin",
+            "via": "ancestor",
+            "writers": [
+              {
+                "kind": "owner",
+                "uid": 1000,
+                "name": "yamin",
+                "you": true
+              }
+            ],
+            "shadows": "/usr/bin/sudo"
+          },
+          {
+            "kind": "relative_path_entry",
+            "entry": ""
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/srv/sealed/a/b",
+            "at": "/srv/sealed/a",
+            "reason": "Permission denied (os error 13)"
+          }
+        ],
+        "note": "the entries from /usr/bin on (1) were not examined: nothing there is found before /usr/bin/sudo"
+      },
+      {
+        "check": "root_shell_startup",
+        "status": "found",
+        "examined": 25,
+        "findings": [
+          {
+            "kind": "writable",
+            "path": "/etc/environment",
+            "at": "/etc/environment",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          },
+          {
+            "kind": "writable",
+            "path": "/etc/profile.d/x\u001b[2Jy.sh",
+            "at": "/etc/profile.d/x\u001b[2Jy.sh",
+            "via": "itself",
+            "writers": [
+              {
+                "kind": "group",
+                "gid": 0,
+                "name": null,
+                "you": false
+              },
+              {
+                "kind": "everyone"
+              }
+            ],
+            "shadows": null
+          }
+        ],
+        "unverified": [
+          {
+            "path": "/root",
+            "at": "/root",
+            "reason": "Permission denied (os error 13): none of the files root's shells read there (.profile, .bash_profile, .bash_login, .bashrc, .zshenv, .zprofile, .zshrc, .zlogin, .config/fish/config.fish) could be examined"
+          }
+        ],
+        "note": null
+      }
+    ],
+    "xudo_group": {
+      "exists": true,
+      "gid": 998,
+      "member": false
+    }
+  },
+  "proposals": null
+}

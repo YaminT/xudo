@@ -47,7 +47,7 @@
 use std::fmt::Write as _;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use term_sanitize::Limits;
@@ -57,7 +57,7 @@ use xudo_backend::paths_to_root::{
 };
 use xudo_backend::{Backend, BackendKind, Capability, DetectError, identify, judge};
 use xudo_policy::{CallerFacts, ExitCode};
-use xudo_sys::{KernelSupport, SysError};
+use xudo_sys::{HostRunner, KernelSupport, Runner, SysError, TrustError, TrustedFile};
 
 use crate::cli::Platform;
 use crate::render;
@@ -87,6 +87,8 @@ pub struct Report {
     pub kernel: KernelReport,
     /// The ruleset, and whether it is root's.
     pub ruleset: RulesetReport,
+    /// Whether xudo's sudoers rule is installed under a name sudo reads.
+    pub sudoers_snippet: SnippetReport,
     /// How this caller is classified.
     pub caller: CallerReport,
     /// The privilege backend.
@@ -149,6 +151,55 @@ pub struct RulesetReport {
     pub load_error: Option<String>,
     /// Whether it is root's, checked the way the gate must load it.
     pub trust: TrustReport,
+    /// Whether each loaded rule matches dpkg's shipped conffile checksum.
+    pub package_drift: RuleDriftReport,
+}
+
+/// How a loaded rule relates to dpkg's original conffile record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDriftStatus {
+    /// Current bytes have the checksum dpkg recorded for the package.
+    MatchesShipped,
+    /// dpkg retained a conffile that a later package version stopped shipping.
+    NoLongerShipped,
+    /// A package conffile whose current bytes differ.
+    ChangedLocally,
+    /// No dpkg conffile record names this file.
+    NotFromPackage,
+    /// The package record or a trusted current read was unavailable.
+    Unknown,
+}
+
+/// Package provenance for the files this ruleset loaded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuleDriftReport {
+    /// One row for every loaded rule file.
+    pub files: Vec<RuleDriftRow>,
+    /// Why package comparison could not be completed, if applicable.
+    pub unavailable: Option<String>,
+}
+
+/// One loaded rule file's package provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuleDriftRow {
+    /// The rule's path.
+    pub path: String,
+    /// The comparison result.
+    pub status: RuleDriftStatus,
+}
+
+/// sudo's treatment of xudo's own snippet and marked copies it ignores.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SnippetReport {
+    /// Whether the canonical extensionless `/etc/sudoers.d/xudo` is managed.
+    pub installed_rule: Option<bool>,
+    /// Marked snippets under names sudo skips.
+    pub not_in_effect: Vec<String>,
+    /// Why sudo ignores those names.
+    pub ignored_reason: &'static str,
+    /// Why the directory or a trusted file could not be checked.
+    pub unavailable: Option<String>,
 }
 
 /// A loaded ruleset, in brief.
@@ -309,6 +360,7 @@ pub(crate) fn gather(
         ),
         kernel: KernelReport::of(platform.ops.kernel()),
         ruleset: ruleset(rules, loaded),
+        sudoers_snippet: sudoers_snippets(),
         caller: caller(platform.ops.classify(std::process::id())),
         backend: BackendReport::of(backend),
         paths_to_root: paths,
@@ -343,7 +395,9 @@ pub(crate) fn run(
 /// enforcement point is the executor: a check the front-end could "pass"
 /// would be a check an attacker races against.
 fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetReport {
-    let trust = trust_report(&xudo_sys::read_trusted_dir(rules));
+    let trusted = xudo_sys::read_trusted_dir(rules);
+    let trust = trust_report(&trusted);
+    let package_drift = rule_drift(rules, loaded, &trusted);
     RulesetReport {
         dir: rules.display().to_string(),
         loaded: loaded.ok().map(|loaded| LoadedSummary {
@@ -353,7 +407,305 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         }),
         load_error: loaded.err().map(ToString::to_string),
         trust,
+        package_drift,
     }
+}
+
+fn rule_drift(
+    rules: &Path,
+    loaded: Result<&LoadedRules, &LoadError>,
+    trusted: &Result<Vec<TrustedFile>, TrustError>,
+) -> RuleDriftReport {
+    let Ok(loaded) = loaded else {
+        return RuleDriftReport {
+            files: Vec::new(),
+            unavailable: Some("rules did not load".to_owned()),
+        };
+    };
+    let trusted = match trusted {
+        Ok(files) => files,
+        Err(error) => return unavailable_drift(loaded.files(), error.to_string()),
+    };
+    rule_drift_from_trusted(rules, loaded.files(), trusted, &HostRunner)
+}
+
+fn unavailable_drift(paths: &[PathBuf], reason: String) -> RuleDriftReport {
+    RuleDriftReport {
+        files: paths
+            .iter()
+            .map(|path| RuleDriftRow {
+                path: path.display().to_string(),
+                status: RuleDriftStatus::Unknown,
+            })
+            .collect(),
+        unavailable: Some(reason),
+    }
+}
+
+fn rule_drift_from_trusted(
+    rules: &Path,
+    paths: &[PathBuf],
+    trusted: &[TrustedFile],
+    runner: &dyn Runner,
+) -> RuleDriftReport {
+    let query = match runner.run(
+        "/usr/bin/dpkg-query",
+        &["-W", "-f=${Conffiles}\\n", "xudo"],
+        None,
+    ) {
+        Ok(output) if output.success => output.stdout,
+        Ok(_) => {
+            return unavailable_drift(paths, "dpkg-query could not read xudo conffiles".to_owned());
+        }
+        Err(error) => return unavailable_drift(paths, error.to_string()),
+    };
+    let records = parse_conffiles(&query);
+    let mut files = Vec::with_capacity(paths.len());
+    let mut unavailable = None;
+    for path in paths {
+        let Some(name) = path.file_name() else {
+            files.push(RuleDriftRow {
+                path: path.display().to_string(),
+                status: RuleDriftStatus::Unknown,
+            });
+            unavailable.get_or_insert_with(|| "loaded rule has no file name".to_owned());
+            continue;
+        };
+        let full_path = rules.join(name);
+        let Some(current) = trusted.iter().find(|file| file.name.as_os_str() == name) else {
+            files.push(RuleDriftRow {
+                path: full_path.display().to_string(),
+                status: RuleDriftStatus::Unknown,
+            });
+            unavailable.get_or_insert_with(|| {
+                "trusted rule read did not include every loaded file".to_owned()
+            });
+            continue;
+        };
+        let Some(record) = records.get(full_path.as_os_str().as_bytes()) else {
+            files.push(RuleDriftRow {
+                path: full_path.display().to_string(),
+                status: RuleDriftStatus::NotFromPackage,
+            });
+            continue;
+        };
+        if record.status == ConffileStatus::Obsolete {
+            files.push(RuleDriftRow {
+                path: full_path.display().to_string(),
+                status: RuleDriftStatus::NoLongerShipped,
+            });
+            continue;
+        }
+        if record.status == ConffileStatus::New {
+            files.push(RuleDriftRow {
+                path: full_path.display().to_string(),
+                status: RuleDriftStatus::Unknown,
+            });
+            unavailable
+                .get_or_insert_with(|| "dpkg reports a new conffile without a baseline".to_owned());
+            continue;
+        }
+        let digest = match runner.run("/usr/bin/md5sum", &[], Some(&current.bytes)) {
+            Ok(output) if output.success => output
+                .stdout
+                .split_ascii_whitespace()
+                .next()
+                .map(str::to_owned),
+            _ => None,
+        };
+        let status = match digest {
+            Some(digest) if digest.eq_ignore_ascii_case(&record.digest) => {
+                RuleDriftStatus::MatchesShipped
+            }
+            Some(_) => RuleDriftStatus::ChangedLocally,
+            None => {
+                unavailable
+                    .get_or_insert_with(|| "md5sum could not hash a trusted rule file".to_owned());
+                RuleDriftStatus::Unknown
+            }
+        };
+        files.push(RuleDriftRow {
+            path: full_path.display().to_string(),
+            status,
+        });
+    }
+    RuleDriftReport { files, unavailable }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConffileStatus {
+    Shipped,
+    Obsolete,
+    New,
+}
+
+struct ConffileRecord {
+    digest: String,
+    status: ConffileStatus,
+}
+
+/// One `${Conffiles}` line, as dpkg prints it: a leading space, the path, then
+/// either 32 lowercase hex digits or the word `newconffile` in place of them,
+/// then only `obsolete` and `remove-on-upgrade`. `newconffile` is not a flag
+/// after a hash. The path is the original prefix, so a doubled space or a tab
+/// in it stays; a flag word that is part of the path stays too.
+fn parse_conffiles(output: &str) -> std::collections::BTreeMap<Vec<u8>, ConffileRecord> {
+    output.lines().filter_map(parse_conffile_line).collect()
+}
+
+fn parse_conffile_line(line: &str) -> Option<(Vec<u8>, ConffileRecord)> {
+    let mut rest = line.trim_ascii_end();
+    let mut obsolete = false;
+    let (prefix, token) = loop {
+        let (prefix, token) = rest.rsplit_once(|byte: char| byte.is_ascii_whitespace())?;
+        if token == "obsolete" || token == "remove-on-upgrade" {
+            obsolete = true;
+            rest = prefix.trim_ascii_end();
+            continue;
+        }
+        break (prefix, token);
+    };
+    let (digest, status) = if is_lowercase_md5(token) {
+        let status = if obsolete {
+            ConffileStatus::Obsolete
+        } else {
+            ConffileStatus::Shipped
+        };
+        (token.to_owned(), status)
+    } else if token == "newconffile" {
+        (String::new(), ConffileStatus::New)
+    } else {
+        return None;
+    };
+    let path = prefix.strip_prefix(' ')?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((path.as_bytes().to_vec(), ConffileRecord { digest, status }))
+}
+
+fn is_lowercase_md5(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn sudoers_snippets() -> SnippetReport {
+    sudoers_snippets_at(Path::new("/etc/sudoers.d"), &read_sudoers_candidate)
+}
+
+type SudoersReader = dyn Fn(&Path) -> Result<Option<Vec<u8>>, String>;
+
+fn read_sudoers_candidate(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    xudo_sys::read_trusted_file(path, 1 << 20).map_err(|error| error.to_string())
+}
+
+fn sudoers_snippets_at(dir: &Path, read_file: &SudoersReader) -> SnippetReport {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
+            .map(|entry| map_sudoers_entry(entry, read_file))
+            .collect()),
+        Err(error) => Err(error.to_string()),
+    };
+    summarize_sudoers_scan(entries, &dir.join("xudo"))
+}
+
+fn map_sudoers_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    read_file: &SudoersReader,
+) -> SudoersEntry {
+    match entry {
+        Ok(entry) => SudoersEntry::File {
+            path: entry.path(),
+            bytes: read_file(&entry.path()),
+        },
+        Err(error) => SudoersEntry::Error(error.to_string()),
+    }
+}
+
+enum SudoersEntry {
+    File {
+        path: PathBuf,
+        bytes: Result<Option<Vec<u8>>, String>,
+    },
+    Error(String),
+}
+
+fn summarize_sudoers_scan(
+    entries: Result<Vec<SudoersEntry>, String>,
+    installed: &Path,
+) -> SnippetReport {
+    const MARKER: &[u8] = xudo_backend::snippet::MANAGED_MARKER.as_bytes();
+    const IGNORED_REASON: &str = "sudo skips filenames containing a dot or ending in ~";
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(reason) => {
+            return SnippetReport {
+                installed_rule: None,
+                not_in_effect: Vec::new(),
+                ignored_reason: IGNORED_REASON,
+                unavailable: Some(reason),
+            };
+        }
+    };
+    let mut marked_entries = Vec::new();
+    let mut unavailable = None;
+    let mut canonical_checked = true;
+    for entry in entries {
+        let (path, bytes) = match entry {
+            SudoersEntry::File { path, bytes } => (path, bytes),
+            SudoersEntry::Error(reason) => {
+                unavailable.get_or_insert(reason);
+                canonical_checked = false;
+                continue;
+            }
+        };
+        let bytes = match bytes {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                if path == installed {
+                    canonical_checked = false;
+                }
+                continue;
+            }
+            Err(reason) => {
+                unavailable.get_or_insert(reason);
+                if path == installed {
+                    canonical_checked = false;
+                }
+                continue;
+            }
+        };
+        marked_entries.push((path, bytes.starts_with(MARKER)));
+    }
+    let installed_rule = canonical_checked.then(|| {
+        marked_entries
+            .iter()
+            .find(|(path, _)| path == installed)
+            .is_some_and(|(_, marked)| *marked)
+    });
+    let mut not_in_effect: Vec<String> = marked_entries
+        .iter()
+        .filter(|(path, marked)| {
+            *marked
+                && path
+                    .file_name()
+                    .is_some_and(|name| snippet_name_is_ignored(name.as_bytes()))
+        })
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    not_in_effect.sort();
+    SnippetReport {
+        installed_rule,
+        not_in_effect,
+        ignored_reason: IGNORED_REASON,
+        unavailable,
+    }
+}
+
+fn snippet_name_is_ignored(filename: &[u8]) -> bool {
+    filename.contains(&b'.') || filename.ends_with(b"~")
 }
 
 /// The trust walk's outcome as a report.
@@ -422,6 +774,42 @@ pub(crate) fn human(report: &Report) -> String {
         ),
     );
     line("rules trust", &trust_line(&report.ruleset.trust));
+    for row in &report.ruleset.package_drift.files {
+        line(
+            "rule package",
+            &format!("{}: {}", safe(&row.path), drift_label(row.status)),
+        );
+    }
+    if let Some(reason) = &report.ruleset.package_drift.unavailable {
+        line("rule package", &format!("unknown: {}", safe(reason)));
+    }
+    if report.backend.implementation == Some(BackendKind::Doas) {
+        line("sudoers xudo", "does not apply to the doas backend");
+    } else {
+        match report.sudoers_snippet.installed_rule {
+            Some(true) => line("sudoers xudo", "managed rule at /etc/sudoers.d/xudo"),
+            Some(false) => line(
+                "sudoers xudo",
+                "no xudo rule installed at /etc/sudoers.d/xudo",
+            ),
+            None => line("sudoers xudo", "unknown: canonical rule could not be read"),
+        }
+    }
+    for path in &report.sudoers_snippet.not_in_effect {
+        line(
+            "sudoers xudo",
+            &format!(
+                "{} is not in effect: {}",
+                safe(path),
+                report.sudoers_snippet.ignored_reason
+            ),
+        );
+    }
+    if report.backend.implementation != Some(BackendKind::Doas) {
+        if let Some(reason) = &report.sudoers_snippet.unavailable {
+            line("sudoers xudo", &format!("unknown: {}", safe(reason)));
+        }
+    }
     if let Some(label) = report.caller.classification {
         line("classified", label);
         line(
@@ -462,6 +850,16 @@ pub(crate) fn human(report: &Report) -> String {
         "security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+fn drift_label(status: RuleDriftStatus) -> &'static str {
+    match status {
+        RuleDriftStatus::MatchesShipped => "matches shipped",
+        RuleDriftStatus::NoLongerShipped => "no longer shipped",
+        RuleDriftStatus::ChangedLocally => "changed locally",
+        RuleDriftStatus::NotFromPackage => "not from the package",
+        RuleDriftStatus::Unknown => "unknown",
+    }
 }
 
 /// The trust line, saying which situation it is rather than a bare FAIL: a
@@ -861,13 +1259,421 @@ mod tests {
     use xudo_backend::Probe;
     use xudo_backend::paths_to_root::{Answer, Caller, Lookup, MemoryHost};
     use xudo_policy::{Classification, Hint, HintSource};
-    use xudo_sys::PrivilegedOps;
+    use xudo_sys::{Output, PrivilegedOps, Runner};
 
     use super::*;
 
     const PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
         yamin:x:1000:1000::/home/yamin:/bin/sh\n\
         alice:x:1001:1001::/home/alice:/bin/sh\n";
+
+    #[derive(Clone, Copy)]
+    enum DriftRunnerMode {
+        Normal,
+        QueryError,
+        QueryFailure,
+        DigestError,
+        DigestFailure,
+        DigestEmpty,
+        Obsolete,
+        NewConffile,
+    }
+
+    struct DriftRunner(DriftRunnerMode);
+
+    impl Runner for DriftRunner {
+        fn run(
+            &self,
+            absolute_exe: &str,
+            _args: &[&str],
+            stdin: Option<&[u8]>,
+        ) -> Result<Output, SysError> {
+            if absolute_exe == "/usr/bin/dpkg-query" {
+                if matches!(self.0, DriftRunnerMode::QueryError) {
+                    return Err(SysError::unsupported("dpkg-query unavailable"));
+                }
+                return Ok(Output {
+                    success: !matches!(self.0, DriftRunnerMode::QueryFailure),
+                    code: Some(i32::from(matches!(self.0, DriftRunnerMode::QueryFailure))),
+                    stdout: format!(
+                        " /etc/xudo/rules.d/10-same.toml 00000000000000000000000000000000\n /etc/xudo/rules.d/20-changed.toml {}\n",
+                        match self.0 {
+                            DriftRunnerMode::Obsolete => {
+                                "11111111111111111111111111111111 obsolete"
+                            }
+                            DriftRunnerMode::NewConffile => "newconffile",
+                            _ => "11111111111111111111111111111111",
+                        }
+                    ),
+                    stderr: String::new(),
+                });
+            }
+            if matches!(self.0, DriftRunnerMode::DigestError) {
+                return Err(SysError::unsupported("md5sum unavailable"));
+            }
+            if matches!(self.0, DriftRunnerMode::DigestFailure) {
+                return Ok(Output {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            if matches!(self.0, DriftRunnerMode::DigestEmpty) {
+                return Ok(Output {
+                    success: true,
+                    code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            let digest = match stdin {
+                Some(b"same") => "00000000000000000000000000000000",
+                Some(b"changed") => "22222222222222222222222222222222",
+                _ => return Err(SysError::unsupported("unexpected digest input")),
+            };
+            Ok(Output {
+                success: true,
+                code: Some(0),
+                stdout: format!("{digest}  -\n"),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn summarize_sudoers(entries: Result<Vec<SudoersEntry>, String>) -> SnippetReport {
+        summarize_sudoers_scan(entries, Path::new("/etc/sudoers.d/xudo"))
+    }
+
+    fn read_candidate_fixture(path: &Path) -> Result<Option<Vec<u8>>, String> {
+        std::fs::read(path)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_locally_edited_shipped_rule_is_reported_as_changed_locally() {
+        let root = Path::new("/etc/xudo/rules.d");
+        let paths = [
+            root.join("10-same.toml"),
+            root.join("20-changed.toml"),
+            root.join("30-own.toml"),
+        ];
+        let trusted = [
+            TrustedFile {
+                name: "10-same.toml".into(),
+                bytes: b"same".to_vec(),
+            },
+            TrustedFile {
+                name: "20-changed.toml".into(),
+                bytes: b"changed".to_vec(),
+            },
+            TrustedFile {
+                name: "30-own.toml".into(),
+                bytes: b"mine".to_vec(),
+            },
+        ];
+        let report = rule_drift_from_trusted(
+            root,
+            &paths,
+            &trusted,
+            &DriftRunner(DriftRunnerMode::Normal),
+        );
+        assert_eq!(report.files[0].status, RuleDriftStatus::MatchesShipped);
+        assert_eq!(report.files[1].status, RuleDriftStatus::ChangedLocally);
+        assert_eq!(report.files[2].status, RuleDriftStatus::NotFromPackage);
+        assert_eq!(report.unavailable, None);
+        let obsolete = rule_drift_from_trusted(
+            root,
+            &paths,
+            &trusted,
+            &DriftRunner(DriftRunnerMode::Obsolete),
+        );
+        assert_eq!(obsolete.files[1].status, RuleDriftStatus::NoLongerShipped);
+    }
+
+    fn conffile_blob(lines: &[&str]) -> String {
+        let mut blob = String::new();
+        for line in lines {
+            blob.push_str(line);
+            blob.push('\n');
+        }
+        blob
+    }
+
+    #[test]
+    fn an_obsolete_conffile_is_not_reported_as_shipped() {
+        let md5 = "0123456789abcdef0123456789abcdef";
+        let parsed = parse_conffiles(&conffile_blob(&[
+            "",
+            "   ",
+            &format!(" not-absolute {md5}"),
+            &format!(" /etc/xudo/good.toml {md5} obsolete"),
+            &format!(" /etc/xudo/remove.toml {md5} remove-on-upgrade"),
+            &format!(" /etc/xudo/both.toml {md5} obsolete remove-on-upgrade"),
+            " /etc/xudo/short.toml abc",
+            " /etc/xudo/nonhex.toml z123456789abcdef0123456789abcdef",
+            " /etc/xudo/upper.toml 0123456789ABCDEF0123456789ABCDEF",
+            " /etc/xudo/no-digest.toml",
+            &format!("/etc/xudo/no-leading-space.toml {md5}"),
+            "obsolete",
+        ]));
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed
+                .get(b"/etc/xudo/good.toml".as_slice())
+                .map(|record| (record.status, record.digest.as_str())),
+            Some((ConffileStatus::Obsolete, md5))
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/xudo/remove.toml".as_slice())
+                .map(|r| r.status),
+            Some(ConffileStatus::Obsolete)
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/xudo/both.toml".as_slice())
+                .map(|record| (record.status, record.digest.as_str())),
+            Some((ConffileStatus::Obsolete, md5))
+        );
+    }
+
+    #[test]
+    fn a_new_conffile_record_without_a_hash_is_unknown() {
+        let parsed = parse_conffiles(&conffile_blob(&[
+            " /etc/new.toml newconffile",
+            " /etc/x/fresh.toml newconffile obsolete",
+        ]));
+        assert_eq!(
+            parsed.get(b"/etc/new.toml".as_slice()).map(|r| r.status),
+            Some(ConffileStatus::New)
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/fresh.toml".as_slice())
+                .map(|r| r.status),
+            Some(ConffileStatus::New)
+        );
+        let root = Path::new("/etc/xudo/rules.d");
+        let files = [root.join("20-changed.toml")];
+        let report = rule_drift_from_trusted(
+            root,
+            &files,
+            &[TrustedFile {
+                name: "20-changed.toml".into(),
+                bytes: b"new".to_vec(),
+            }],
+            &DriftRunner(DriftRunnerMode::NewConffile),
+        );
+        assert_eq!(report.files[0].status, RuleDriftStatus::Unknown);
+        assert_eq!(
+            report.unavailable.as_deref(),
+            Some("dpkg reports a new conffile without a baseline")
+        );
+    }
+
+    #[test]
+    fn a_path_ending_in_a_flag_word_keeps_its_last_word() {
+        let md5 = "0123456789abcdef0123456789abcdef";
+        let parsed = parse_conffiles(&conffile_blob(&[
+            &format!(" /etc/x/foo obsolete {md5}"),
+            &format!(" /etc/x/foo remove-on-upgrade {md5}"),
+            &format!(" /etc/x/bar obsolete {md5} obsolete"),
+        ]));
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/foo obsolete".as_slice())
+                .map(|record| (record.status, record.digest.as_str())),
+            Some((ConffileStatus::Shipped, md5))
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/foo remove-on-upgrade".as_slice())
+                .map(|record| record.status),
+            Some(ConffileStatus::Shipped)
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/bar obsolete".as_slice())
+                .map(|record| (record.status, record.digest.as_str())),
+            Some((ConffileStatus::Obsolete, md5))
+        );
+        assert!(!parsed.contains_key(b"/etc/x/foo".as_slice()));
+    }
+
+    #[test]
+    fn a_path_with_a_double_space_or_a_tab_is_not_collapsed() {
+        let md5 = "0123456789abcdef0123456789abcdef";
+        let parsed = parse_conffiles(&conffile_blob(&[
+            &format!(" /etc/x/foo  bar.toml {md5}"),
+            &format!(" /etc/x/foo\tbar.toml {md5}"),
+        ]));
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/foo  bar.toml".as_slice())
+                .map(|record| (record.status, record.digest.as_str())),
+            Some((ConffileStatus::Shipped, md5))
+        );
+        assert_eq!(
+            parsed
+                .get(b"/etc/x/foo\tbar.toml".as_slice())
+                .map(|record| record.status),
+            Some(ConffileStatus::Shipped)
+        );
+        assert!(!parsed.contains_key(b"/etc/x/foo bar.toml".as_slice()));
+    }
+
+    #[test]
+    fn a_missing_dpkg_record_is_unknown_instead_of_clean() {
+        let root = Path::new("/etc/xudo/rules.d");
+        let paths = [root.join("10-same.toml")];
+        let report = rule_drift_from_trusted(
+            root,
+            &paths,
+            &[TrustedFile {
+                name: "10-same.toml".into(),
+                bytes: b"same".to_vec(),
+            }],
+            &DriftRunner(DriftRunnerMode::QueryFailure),
+        );
+        assert_eq!(report.files[0].status, RuleDriftStatus::Unknown);
+        assert!(report.unavailable.is_some());
+    }
+
+    #[test]
+    fn a_failed_or_incomplete_drift_check_is_unknown() {
+        let root = Path::new("/etc/xudo/rules.d");
+        let path = [root.join("10-same.toml")];
+        let trusted = [TrustedFile {
+            name: "10-same.toml".into(),
+            bytes: b"same".to_vec(),
+        }];
+        for mode in [
+            DriftRunnerMode::QueryError,
+            DriftRunnerMode::DigestError,
+            DriftRunnerMode::DigestFailure,
+            DriftRunnerMode::DigestEmpty,
+        ] {
+            let report = rule_drift_from_trusted(root, &path, &trusted, &DriftRunner(mode));
+            assert_eq!(report.files[0].status, RuleDriftStatus::Unknown);
+            assert!(report.unavailable.is_some());
+        }
+        let missing_name = [PathBuf::from("/")];
+        let report = rule_drift_from_trusted(
+            root,
+            &missing_name,
+            &trusted,
+            &DriftRunner(DriftRunnerMode::Normal),
+        );
+        assert_eq!(report.files[0].status, RuleDriftStatus::Unknown);
+        let missing_trusted =
+            rule_drift_from_trusted(root, &path, &[], &DriftRunner(DriftRunnerMode::Normal));
+        assert_eq!(missing_trusted.files[0].status, RuleDriftStatus::Unknown);
+        let bad_digest = rule_drift_from_trusted(
+            root,
+            &path,
+            &[TrustedFile {
+                name: "10-same.toml".into(),
+                bytes: b"unexpected".to_vec(),
+            }],
+            &DriftRunner(DriftRunnerMode::Normal),
+        );
+        assert_eq!(bad_digest.files[0].status, RuleDriftStatus::Unknown);
+    }
+
+    #[test]
+    fn a_snippet_named_with_a_dot_is_reported_not_in_effect() {
+        let marked = |name: &str| SudoersEntry::File {
+            path: PathBuf::from("/etc/sudoers.d").join(name),
+            bytes: Ok(Some(b"# Managed by xudo.\n".to_vec())),
+        };
+        let report = summarize_sudoers(Ok(vec![
+            marked("xudo.conf"),
+            marked("xudo~"),
+            marked("xudo"),
+        ]));
+        assert_eq!(report.installed_rule, Some(true));
+        assert_eq!(
+            report.not_in_effect,
+            ["/etc/sudoers.d/xudo.conf", "/etc/sudoers.d/xudo~"]
+        );
+        let dotted_only = summarize_sudoers(Ok(vec![marked("xudo.conf")]));
+        assert_eq!(dotted_only.installed_rule, Some(false));
+        assert!(snippet_name_is_ignored(b"xudo.conf"));
+        assert!(snippet_name_is_ignored(b"xudo~"));
+        assert!(!snippet_name_is_ignored(b"xudo"));
+    }
+
+    #[test]
+    fn an_unreadable_sudoers_path_is_unknown() {
+        let report = summarize_sudoers(Err("directory unreadable".to_owned()));
+        assert_eq!(report.installed_rule, None);
+        assert_eq!(report.unavailable.as_deref(), Some("directory unreadable"));
+        let report = summarize_sudoers(Ok(vec![SudoersEntry::File {
+            path: PathBuf::from("/etc/sudoers.d/xudo"),
+            bytes: Err("not trusted".to_owned()),
+        }]));
+        assert_eq!(report.installed_rule, None);
+        assert_eq!(report.unavailable.as_deref(), Some("not trusted"));
+        let report = summarize_sudoers(Ok(vec![SudoersEntry::File {
+            path: PathBuf::from("/etc/sudoers.d/unrelated"),
+            bytes: Ok(None),
+        }]));
+        assert_eq!(report.installed_rule, Some(false));
+        assert!(report.unavailable.is_none());
+        let report = summarize_sudoers(Ok(vec![SudoersEntry::File {
+            path: PathBuf::from("/etc/sudoers.d/xudo"),
+            bytes: Ok(None),
+        }]));
+        assert_eq!(report.installed_rule, None);
+        let report = summarize_sudoers(Ok(vec![SudoersEntry::Error("entry vanished".to_owned())]));
+        assert_eq!(report.installed_rule, None);
+        assert_eq!(report.unavailable.as_deref(), Some("entry vanished"));
+    }
+
+    #[test]
+    fn sudoers_scan_reads_candidates_and_uses_only_the_canonical_name() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join("doctor-sudoers-scan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xudo.conf"), b"# Managed by xudo.\n").unwrap();
+        std::fs::write(dir.join("xudo"), b"# Managed by xudo.\n").unwrap();
+        std::fs::write(dir.join("other.conf"), b"operator content\n").unwrap();
+        let report = sudoers_snippets_at(&dir, &read_candidate_fixture);
+        assert_eq!(report.installed_rule, Some(true));
+        assert_eq!(
+            report.not_in_effect,
+            [dir.join("xudo.conf").display().to_string()]
+        );
+        assert!(report.unavailable.is_none());
+        let absent = sudoers_snippets_at(&dir.join("absent"), &read_candidate_fixture);
+        assert_eq!(absent.installed_rule, None);
+        let unreadable = sudoers_snippets_at(&dir, &|_| Err("untrusted".to_owned()));
+        assert_eq!(unreadable.installed_rule, None);
+        assert!(unreadable.unavailable.is_some());
+        assert!(matches!(
+            map_sudoers_entry(
+                Err(std::io::Error::other("entry vanished")),
+                &read_candidate_fixture,
+            ),
+            SudoersEntry::Error(reason) if reason.contains("entry vanished")
+        ));
+        assert!(read_candidate_fixture(&dir.join("missing")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sudoers_candidates_use_the_trusted_file_reader() {
+        let candidate = read_sudoers_candidate(Path::new("/usr/bin/true")).unwrap();
+        assert!(candidate.is_some());
+        assert!(read_sudoers_candidate(Path::new("/proc/self/environ")).is_err());
+    }
 
     /// A platform that answers the same on every host.
     struct TestOps {
@@ -963,6 +1769,30 @@ mod tests {
             trusted: true,
             files_checked: Some(0),
             reason: None,
+        };
+        report.ruleset.package_drift = match loaded {
+            Ok(loaded) => RuleDriftReport {
+                files: loaded
+                    .files()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| RuleDriftRow {
+                        path: format!("/usr/bin/rule-{index}.toml"),
+                        status: RuleDriftStatus::Unknown,
+                    })
+                    .collect(),
+                unavailable: Some("test fixture has no dpkg record".to_owned()),
+            },
+            Err(_) => RuleDriftReport {
+                files: Vec::new(),
+                unavailable: Some("rules did not load".to_owned()),
+            },
+        };
+        report.sudoers_snippet = SnippetReport {
+            installed_rule: None,
+            not_in_effect: Vec::new(),
+            ignored_reason: "sudo skips filenames containing a dot or ending in ~",
+            unavailable: Some("test fixture has no sudoers directory".to_owned()),
         };
         report
     }
@@ -1168,6 +1998,48 @@ mod tests {
     }
 
     #[test]
+    fn package_drift_and_ignored_snippets_are_pinned_in_both_renderers() {
+        let mut report = hostile_report(false);
+        report.ruleset.package_drift = RuleDriftReport {
+            files: vec![
+                RuleDriftRow {
+                    path: "/etc/xudo/rules.d/00-shipped.toml".to_owned(),
+                    status: RuleDriftStatus::MatchesShipped,
+                },
+                RuleDriftRow {
+                    path: "/etc/xudo/rules.d/05-edited.toml".to_owned(),
+                    status: RuleDriftStatus::ChangedLocally,
+                },
+                RuleDriftRow {
+                    path: "/etc/xudo/rules.d/06-obsolete.toml".to_owned(),
+                    status: RuleDriftStatus::NoLongerShipped,
+                },
+                RuleDriftRow {
+                    path: "/etc/xudo/rules.d/99-operator.toml".to_owned(),
+                    status: RuleDriftStatus::NotFromPackage,
+                },
+                RuleDriftRow {
+                    path: "/etc/xudo/rules.d/90-unknown.toml".to_owned(),
+                    status: RuleDriftStatus::Unknown,
+                },
+            ],
+            unavailable: Some("dpkg-query unavailable".to_owned()),
+        };
+        report.sudoers_snippet = SnippetReport {
+            installed_rule: Some(false),
+            not_in_effect: vec!["/etc/sudoers.d/xudo.conf".to_owned()],
+            ignored_reason: "sudo skips filenames containing a dot or ending in ~",
+            unavailable: Some("one candidate was not trusted".to_owned()),
+        };
+        insta::assert_snapshot!("human_package_drift", human(&report));
+        insta::assert_snapshot!("json_package_drift", render::json_of(&report));
+        report.sudoers_snippet.installed_rule = Some(true);
+        report.ruleset.package_drift.unavailable = None;
+        report.sudoers_snippet.unavailable = None;
+        insta::assert_snapshot!("human_installed_snippet", human(&report));
+    }
+
+    #[test]
     fn root_with_no_backend_is_told_to_run_commands_as_root() {
         let host = MemoryHost::new(Caller {
             uid: 0,
@@ -1274,11 +2146,14 @@ mod tests {
             Ok(&fixture_rules("4")),
             false,
         );
+        let text = human(&report);
         assert!(
-            human(&report).contains(
+            text.contains(
                 "doas itself permits /bin/sh for you without a password, by /etc/doas.conf"
             )
         );
+        assert!(text.contains("does not apply to the doas backend"));
+        assert!(!text.contains("sudoers xudo unknown:"));
     }
 
     #[test]
