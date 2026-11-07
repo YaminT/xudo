@@ -149,6 +149,4 @@ The install probe reports `installed, but NOT VERIFIED` on doas and on multicall
 
 ## No telemetry
 
-The default build contains no network code. Verifying that mechanically —
-a seccomp filter denying `AF_INET` socket creation and a CI job under `strace`
-asserting no non-`AF_UNIX` socket — is planned and not yet done.
+The shipped release-musl binaries are checked under `strace` across selected commands, failing on socket families outside `AF_UNIX`/`AF_LOCAL`. CI also checks their normal Cargo dependency tree for known networking crates.

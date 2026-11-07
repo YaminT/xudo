@@ -880,6 +880,10 @@ mod tests {
         }
 
         #[test]
+        #[allow(
+            clippy::disallowed_types,
+            reason = "This test deliberately opens TCP sockets to verify their peer credentials are rejected."
+        )]
         fn peer_credentials_of_a_tcp_connection_are_refused_rather_than_decoded() {
             // TCP records no peer process either; both ends answer pid 0.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

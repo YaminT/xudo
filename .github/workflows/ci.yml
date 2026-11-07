@@ -129,6 +129,19 @@ jobs:
       - name: systemd-analyze verify and security, offline, in Debian trixie
         run: just units
 
+  # Release binaries and the real xudo CLI must not create Internet sockets.
+  telemetry:
+    name: no telemetry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Trace release binaries and xudo commands
+        run: just telemetry
+
   # The tests that must run as uid 0, run as real root in a throwaway container,
   # on a copy of the checkout, and nothing else (ci/root-test.sh says why not the
   # whole suite). BLOCKING: the install executor's root tests (M2b step 5) are in

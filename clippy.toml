@@ -22,4 +22,7 @@ disallowed-methods = [
 disallowed-types = [
   { path = "std::collections::HashMap", reason = "Iteration order is nondeterministic, which makes audit records and snapshots unstable. Use BTreeMap." },
   { path = "std::collections::HashSet", reason = "See HashMap." },
+  { path = "std::net::TcpStream", reason = "xudo is local-only; no network code." },
+  { path = "std::net::TcpListener", reason = "xudo is local-only; no network code." },
+  { path = "std::net::UdpSocket", reason = "xudo is local-only; no network code." },
 ]
