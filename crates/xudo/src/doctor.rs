@@ -1401,6 +1401,23 @@ mod tests {
         assert_eq!(obsolete.files[1].status, RuleDriftStatus::NoLongerShipped);
     }
 
+    #[test]
+    fn rule_drift_accepts_test_supplied_trusted_files_on_every_platform() {
+        let loaded = fixture_rules("direct-trusted");
+        let path = loaded.files()[0].clone();
+        let trusted = Ok(vec![TrustedFile {
+            name: path.file_name().unwrap().to_os_string(),
+            bytes: std::fs::read(&path).unwrap(),
+        }]);
+
+        let report = rule_drift(path.parent().unwrap(), Ok(&loaded), &trusted);
+
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].path, path.display().to_string());
+        // The fixture is never a dpkg conffile, so it can never match a shipped rule.
+        assert_ne!(report.files[0].status, RuleDriftStatus::MatchesShipped);
+    }
+
     fn conffile_blob(lines: &[&str]) -> String {
         let mut blob = String::new();
         for line in lines {
