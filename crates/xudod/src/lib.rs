@@ -135,7 +135,10 @@ mod tests {
     fn code_of(answer: &Answer) -> Option<RefusalCode> {
         match answer {
             Answer::Refused { code, .. } => Some(*code),
-            Answer::Decided { .. } => None,
+            Answer::Decided { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
         }
     }
 

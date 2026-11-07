@@ -30,3 +30,9 @@ expression: table
     the broker drew a nonce that already names a request, so its random source is broken; an administrator must investigate before anything is retried
 14  broker_unusable
     the broker could not complete the request and failed closed; an administrator should read the broker's audit record in the journal
+15  channel_untrusted
+    the peer is not trusted for this broker channel
+16  request_unknown
+    the request is unknown or this question is not implemented yet
+17  answer_rejected
+    the broker rejected this confirmation answer

@@ -1,0 +1,16 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 1,
+  "verdict": "deny",
+  "denial": "confirmation_refused",
+  "remediation": "the human refused this request; do not retry it",
+  "action": null,
+  "rule_source": null,
+  "resolved_exe": null,
+  "resolved_argv": [],
+  "confirm": "not_required",
+  "trace": []
+}

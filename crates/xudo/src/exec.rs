@@ -91,6 +91,13 @@ pub fn plan(
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
             Err(ExitCode::Unusable)
         }
+        Answer::Pending { .. } | Answer::Watching { .. } | Answer::Done => {
+            let _ = writeln!(
+                err,
+                "xudo: broker returned an answer for an unsupported question"
+            );
+            Err(ExitCode::Unusable)
+        }
         Answer::Decided { decision, minted } => {
             if !decision.verdict.is_permitted() {
                 let status = emit(cli, &decision, out);
@@ -283,8 +290,7 @@ mod tests {
     fn minted(gate: &str) -> Minted {
         Minted {
             nonce: "0".repeat(64),
-            deadline: 1,
-            ttl_secs: 1,
+            expires_in_ms: 1,
             gate: gate.into(),
         }
     }
@@ -317,8 +323,10 @@ mod tests {
         let request = broker.join().unwrap();
         // What the broker received is exactly what the caller typed.
         let sent = BrokerRequest::parse(&request).unwrap();
-        assert_eq!(sent.program, argv[0]);
-        assert_eq!(sent.argv, argv[1..]);
+        assert_eq!(
+            sent.run_fields().map(|(program, args, _)| (program, args)),
+            Some((argv[0].as_str(), &argv[1..]))
+        );
         (
             result,
             String::from_utf8(out).unwrap(),
@@ -373,6 +381,28 @@ mod tests {
             "{err}"
         );
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_non_run_answer_from_the_broker_fails_closed() {
+        let id = "a".repeat(64);
+        for answer in [
+            Answer::Pending {
+                id: id.clone(),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+            },
+            Answer::Done,
+        ] {
+            let response = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer,
+            };
+            let (result, _, _) = against(response.to_json().into_bytes(), &SUDO, &argv());
+            assert_eq!(result, Err(ExitCode::Unusable));
+        }
     }
 
     #[test]
@@ -436,7 +466,10 @@ mod tests {
             "waited {elapsed:?} for the broker to hang up: {err}"
         );
         let sent = BrokerRequest::parse(&broker.join().unwrap()).unwrap();
-        assert_eq!(sent.program, argv()[0]);
+        assert_eq!(
+            sent.run_fields().map(|(program, _, _)| program),
+            Some(argv()[0].as_str())
+        );
     }
 
     #[test]

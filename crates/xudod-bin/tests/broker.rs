@@ -51,7 +51,10 @@ const MALFORMED_REFUSED_WITH: (RefusalCode, i32) = (RefusalCode::BrokerUnusable,
 fn refusal_of(answer: &Answer) -> Option<RefusalCode> {
     match answer {
         Answer::Refused { code, .. } => Some(*code),
-        Answer::Decided { .. } => None,
+        Answer::Decided { .. }
+        | Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::Done => None,
     }
 }
 

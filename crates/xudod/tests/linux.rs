@@ -245,7 +245,10 @@ args = [
 fn decided(answer: Answer) -> Option<(Decision, Option<Minted>)> {
     match answer {
         Answer::Decided { decision, minted } => Some((decision, minted)),
-        Answer::Refused { .. } => None,
+        Answer::Refused { .. }
+        | Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::Done => None,
     }
 }
 
@@ -296,7 +299,8 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     assert_eq!(decision.verdict, Verdict::Allow);
     let minted = minted.unwrap();
     assert!(xudo_gate::request::is_nonce(&minted.nonce));
-    assert!(minted.deadline >= before + xudod::mint::REQUEST_TTL_MILLIS);
+    assert!(minted.expires_in_ms > 0);
+    assert!(minted.expires_in_ms <= xudod::mint::REQUEST_TTL_MILLIS);
 
     let files = spool.files();
     let entry = xudo_gate::PendingRequest::parse(
@@ -304,7 +308,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     )
     .unwrap();
     assert_eq!(entry.caller_pid, child.id());
-    assert_eq!(entry.deadline.0, minted.deadline);
+    assert!(entry.deadline.0 >= before + xudod::mint::REQUEST_TTL_MILLIS);
     let evidence = audit.records()[0].evidence.join(" ");
     assert!(
         evidence.contains(&format!("peer_pid={}", child.id())),

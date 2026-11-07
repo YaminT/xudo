@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use xudo_wire::{BrokerResponse, MAX_RESPONSE_BYTES, WIRE_SCHEMA_VERSION};
+use xudo_wire::{Answer, BrokerResponse, MAX_RESPONSE_BYTES, WIRE_SCHEMA_VERSION};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -13,6 +13,10 @@ fuzz_target!(|data: &[u8]| {
     };
 
     assert_eq!(response.schema_version, WIRE_SCHEMA_VERSION);
+    match &response.answer {
+        Answer::Decided { .. } | Answer::Pending { .. } | Answer::Watching { .. }
+        | Answer::Done | Answer::Refused { .. } => {}
+    }
     assert!(data.len() <= MAX_RESPONSE_BYTES);
 
     let again = BrokerResponse::parse(response.to_json().as_bytes())

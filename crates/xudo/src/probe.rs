@@ -62,6 +62,11 @@ impl InstallProbe for BrokerProbe<'_> {
             Answer::Refused { code, .. } => {
                 return unavailable(format!("the broker refused the probe ({code:?})"));
             }
+            Answer::Pending { .. } | Answer::Watching { .. } | Answer::Done => {
+                return unavailable(
+                    "the broker returned an answer for an unsupported question".to_owned(),
+                );
+            }
             Answer::Decided { decision, minted } => {
                 if !decision.verdict.is_permitted() {
                     return unavailable(
@@ -148,8 +153,7 @@ mod tests {
     fn minted(gate: &str) -> Minted {
         Minted {
             nonce: "0".repeat(64),
-            deadline: 1,
-            ttl_secs: 1,
+            expires_in_ms: 1,
             gate: gate.into(),
         }
     }
@@ -201,8 +205,8 @@ mod tests {
         let (result, request) = against(decided(allow(), Some(minted(GATE_AUTH))), &gate);
         assert_eq!(result, ProbeResult::Verified);
         assert_eq!(
-            (request.program.as_str(), request.argv),
-            ("/usr/bin/id", vec!["-u".to_owned()])
+            request.run_fields().map(|(p, a, _)| (p, a.to_vec())),
+            Some(("/usr/bin/id", vec!["-u".to_owned()]))
         );
         assert_eq!(*gate.1.borrow(), [format!("/usr/bin/sudo -n {GATE_AUTH}")]);
     }
@@ -262,6 +266,30 @@ mod tests {
         let (result, _) = against(reply, &gate);
         assert!(unavailable(&result).contains("refused"), "{result:?}");
         assert!(gate.1.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_non_run_answer_from_the_broker_does_not_verify_install() {
+        let id = "a".repeat(64);
+        for answer in [
+            Answer::Pending {
+                id: id.clone(),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+            },
+            Answer::Done,
+        ] {
+            let gate = printed("0", true);
+            let response = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer,
+            };
+            let (result, _) = against(response.to_json().into_bytes(), &gate);
+            assert!(unavailable(&result).contains("unsupported question"));
+            assert!(gate.1.borrow().is_empty());
+        }
     }
 
     #[test]

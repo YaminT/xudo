@@ -18,3 +18,9 @@ expression: table
     this action is never available to an agent; hand it to a person
  8  exe_mismatch
     this action runs a different program than the one requested; run `xudo list` to find the action that names this program
+ 9  confirmation_refused
+    the human refused this request; do not retry it
+10  confirmation_expired
+    the request expired; ask a person to approve it again with `xudo watch` before running it
+11  confirmation_throttled
+    an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`
