@@ -118,6 +118,7 @@ no-ignored-passes:
 # writing down why here.
 coverage:
     cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features \
+        --show-missing-lines \
         --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
         --fail-under-regions {{cov_regions}} \

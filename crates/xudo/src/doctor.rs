@@ -598,7 +598,16 @@ fn sudoers_snippets() -> SnippetReport {
 type SudoersReader = dyn Fn(&Path) -> Result<Option<Vec<u8>>, String>;
 
 fn read_sudoers_candidate(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    xudo_sys::read_trusted_file(path, 1 << 20).map_err(|error| error.to_string())
+    read_sudoers_candidate_with(path, &|path| {
+        xudo_sys::read_trusted_file(path, 1 << 20).map_err(|error| error.to_string())
+    })
+}
+
+fn read_sudoers_candidate_with(
+    path: &Path,
+    read_file: &SudoersReader,
+) -> Result<Option<Vec<u8>>, String> {
+    read_file(path)
 }
 
 fn sudoers_snippets_at(dir: &Path, read_file: &SudoersReader) -> SnippetReport {
@@ -1673,6 +1682,22 @@ mod tests {
         let candidate = read_sudoers_candidate(Path::new("/usr/bin/true")).unwrap();
         assert!(candidate.is_some());
         assert!(read_sudoers_candidate(Path::new("/proc/self/environ")).is_err());
+    }
+
+    #[test]
+    fn sudoers_candidate_reader_returns_the_injected_file_result() {
+        let path = Path::new("/etc/sudoers.d/xudo");
+        let expected = b"# Managed by xudo.\n".to_vec();
+        let expected_path = path.to_owned();
+        let fixture = expected.clone();
+        let result = read_sudoers_candidate_with(path, &move |seen| {
+            assert_eq!(seen, expected_path);
+            Ok(Some(fixture.clone()))
+        });
+        assert_eq!(result.unwrap(), Some(expected));
+
+        let rejected = read_sudoers_candidate_with(path, &|_| Err("untrusted".to_owned()));
+        assert_eq!(rejected, Err("untrusted".to_owned()));
     }
 
     /// A platform that answers the same on every host.
