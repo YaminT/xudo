@@ -9,7 +9,7 @@ left. When the two disagree, fix this one, it is newer.
 
 | Merged | Not merged, in a worktree | Not started |
 |---|---|---|
-| 0 Linux harness · 1 `aido-sys-raw` · 2b strictest rules · 6 audit sinks (unwired) · 7 mount trust · `SO_PEERCRED` safe decode (sixth `unsafe` block) · `howiwork.md` and its derived views | 2 broker (review fixes applied, awaiting the decode switch) · 4b doctor (round 5: any line continuation → unverified) · 4 gate executor (built, awaiting its observer) · 5 install executor (mid-build) | 3 `aido exec` · 8 executing differential · audit integration (D1) |
+| 0 Linux harness · 1 `xudo-sys-raw` · 2b strictest rules · 6 audit sinks (unwired) · 7 mount trust · `SO_PEERCRED` safe decode (sixth `unsafe` block) · `howiwork.md` and its derived views | 2 broker (review fixes applied, awaiting the decode switch) · 4b doctor (round 5: any line continuation → unverified) · 4 gate executor (built, awaiting its observer) · 5 install executor (mid-build) | 3 `xudo exec` · 8 executing differential · audit integration (D1) |
 
 ## How work moves
 
@@ -21,7 +21,7 @@ next step, and a missing or non-`APPROVE` verdict stops the task: the gate fails
 closed. Review findings are reproduced before they are fixed, and every fix
 lands with a test named for the attack it closes.
 
-Each lane has a data root, `~/.boof/aido/<lane>`, holding the durable task
+Each lane has a data root, `~/.boof/xudo/<lane>`, holding the durable task
 records. Today boof creates the task worktrees under `.boof-runner-worktrees/`
 in the main checkout, which `.gitignore` ignores and `.taplo.toml` excludes;
 they will move outside the checkout once boof supports a configurable worktree
@@ -55,7 +55,7 @@ this file adopts as the exit test. All of these true, with Linux evidence:
 2. A socket-activated root broker identifies its peer by the kernel, classifies,
    decides with the same engine `explain` uses, and mints bounded one-use
    requests. *(B1)*
-3. `aido exec` makes the broker round-trip, execs the backend's `PASSWD` hop,
+3. `xudo exec` makes the broker round-trip, execs the backend's `PASSWD` hop,
    and passes the backend's exit status through; a human is prompted on a real
    pty. *(C1, verification row 2)*
 4. The auth-only gate re-decides from root-owned state, consumes the nonce
@@ -67,16 +67,23 @@ this file adopts as the exit test. All of these true, with Linux evidence:
    proves the gate executed as root; the dotted-filename regression is tested.
    *(B4, row 3)* **Status 2026-10-22:** the executor, the snippet, and the
    regression are done and tested as real root; the gate-as-uid-0 proof exists in
-   the root lane (`aido-gate-bin/tests/root_probe.rs`, a hand-written request
-   through real `sudo`), but **`aido install`'s own probe stays `NOT VERIFIED`
-   until C1** (it cannot mint a request), and the doctor reporting a dotted name
-   as not in effect is B2's.
+   the root lane (`xudo-gate-bin/tests/root_probe.rs`, a hand-written request
+   through real `sudo`). **Done 2026-10-29:** `xudo install`'s own probe asks the
+   broker for `id -u` (shipped rule `rules/05-probe.toml`), runs the gate as a
+   child, and verifies only on `0`; the root lane proves it with the real
+   broker and `xudo exec` on a pty. The doctor reporting a dotted name as not in
+   effect is B2's.
 7. The broker and the gate each write their own audit record through the
    step-6 contract; a sink that cannot be written prevents mint and execution;
-   `aido audit` verifies the produced trail and fails after truncation. *(D1,
+   `xudo audit` verifies the produced trail and fails after truncation. *(D1,
    row 15)*
 8. The differential matrix executes the same ruleset through sudo, sudo-rs, and
-   OpenDoas with identical verdicts. *(C2, row 14)*
+   OpenDoas with identical verdicts. *(C2, row 14; all three identical;
+   doas needed `xudo` to stay its parent, see `CONCERNS.md` 2026-10-29)*
+
+**Result, 2026-10-30:** items 1, 2, 3, 4, 7 and 8 done; 5 and 6 partly (doas, and
+multicall distros for the probe). The broker has not run under its real systemd
+sandbox. Detail in `CONCERNS.md`, 2026-10-30.
 
 Rows 6–10 and 16 of the verification table are M3/M4 and are not part of this
 exit. Packaging stays in phase 3.
@@ -90,23 +97,23 @@ exit. Packaging stays in phase 3.
 
 ### B. Merge queue, strict order
 
-- **B1. Broker final** (`wf_87180089-132-1`, HEAD `7dcc41a`). Switch
+- **B1. Broker final** *(done)* (`wf_87180089-132-1`, HEAD `7dcc41a`). Switch
   `SO_PEERCRED` to `Syscalls::peer_cred` (pid 0 is its own refusal, tested);
-  close CONCERNS open item 8; revisit the "`/run/aido` not shared across pid
+  close CONCERNS open item 8; revisit the "`/run/xudo` not shared across pid
   namespaces" note and keep it only with a reason; wire the audit contract if
   contained, else record D1 as the explicit next item with the stderr record
   kept. One squashed commit; gates; merge.
-- **B2. Doctor round 5** (`wf_87180089-132-3`, HEAD `002230e`). Any line
+- **B2. Doctor round 5** *(done)* (`wf_87180089-132-3`, HEAD `002230e`). Any line
   continuation, both dialects, → `Unverified`/`Maybe`, never `Clean`/`No`;
   tests for every real-sudo/doas case found in rounds 2–4 plus a generated
   property test; observer re-runs the real programs; merge. The oracle (D3) is
   the real fix for this class, and is recorded as such.
-- **B3. Gate** (`wf_2a8abc38-d83-3`, HEAD `8e6152a`). Resume at the observer.
+- **B3. Gate** *(done)* (`wf_2a8abc38-d83-3`, HEAD `8e6152a`). Resume at the observer.
   Rebase onto the merged broker and reconcile three contracts before merging:
   consuming a spool entry that is already gone (`ENOENT`) is a refusal; one
   monotonic clock seam shared with the broker; the exec path takes
   `Authorized<_>` from the step-6 contract. Merge.
-- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). **DONE 2026-10-22** apart from the two items named in exit 6; the root lane is blocking. Finish the executor;
+- **B4. Install** (`wf_2a8abc38-d83-4`, HEAD `9ce866e`). **Done 2026-10-22; probe done 2026-10-29.** The root lane is blocking. Finish the executor;
   make the post-install probe real against the merged gate (a safe no-op
   request that must execute as uid 0); dotted-filename regression; merge. Its
   real-file tests that need uid 0 join the root lane (`tests/root_*.rs`, run
@@ -115,50 +122,61 @@ exit. Packaging stays in phase 3.
 
 ### C. New builds *(after B; C1 before C2)*
 
-- **C1. Step 3, `aido exec`.** Front-end round-trip over `aido-wire`; exec of
+- **C1. Step 3, `xudo exec`.** **Done 2026-10-29**, pty test included
+  (`xudo-gate-bin/tests/root_probe.rs`, root lane, on a hand-driven pty rather than `rexpect`):
+  `xudo exec -- <abs program> [args]` asks the broker, checks the gate path is
+  `GATE_AUTH`, and `xudo-bin` execs `sudo`/`doas` on it in place; a human-only
+  denial prints the `ido queue` line. Front-end round-trip over `xudo-wire`; exec of
   the backend's `PASSWD` hop; backend exit status passed through byte for byte;
   a denial whose remediation is "a human must run this" prints the exact
   `ido queue` line; `rexpect` test of the password prompt on a real pty. This is
   the first user-visible outcome of the milestone.
-- **C2. Step 8, executing differential.** `aido-tests` drives the static binary
-  through sudo, sudo-rs, and OpenDoas in `ci/differential`'s containers, every
-  verdict identical in every row; `row.sh` stops reporting the exec path as
-  absent.
+- **C2. Step 8, executing differential.** **Done 2026-10-29**, in the shell
+  harness (`ci/differential/exec.sh`), not `xudo-tests`. The real broker, gate, and
+  `xudo install` run in each row; `xudo exec` runs as an unprivileged user on a pty
+  with the password typed. sudo (24.04), sudo-rs (26.04) and OpenDoas give identical
+  outcomes (doas does not fork, so `xudo` runs it as a child and stays an
+  ancestor of the gate). The tripwire is gone;
+  `doctor` now says what `xudo exec` would run.
 
 ### D. Debts to clear before closeout *(parallel with C)*
 
 - **D1. Audit integration, end to end.** Broker mint and gate exec take
   `Authorized<_>`; a successful root execution leaves both independent records;
   a direct hostile invocation and a denial leave theirs; a failing sink stops
-  mint and execution; `aido audit --log` passes on the produced trail and fails
+  mint and execution; `xudo audit --log` passes on the produced trail and fails
   after truncation. Decide and record how a post-execution outcome is obtained
-  with an exec-in-place gate. The broker's half was examined at B1 and left
-  whole, not half-wired: `CONCERNS.md`, the M2b step 2 entry, open item 6,
-  lists what it touches and the order to do it in (the unit's sandbox first,
-  measured under systemd).
-- **D2. Fuzz target** for the `aido-wire` request parser, a trust-boundary
-  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`.
-- **D3. Doctor oracle.** Ask the programs themselves — `sudo -l -U <user>` when
+  with an exec-in-place gate. *Done 2026-10-29:* the broker writes the chained
+  trail and mints only on an `Authorized<_>`; the unit and `tmpfiles` reach
+  `/var/lib/xudo`; the root lane proves one chain with both records that
+  verifies and fails when cut. The outcome is not obtained: the gate execs in
+  place, so the record is the authorization (`CONCERNS.md`, 2026-10-29). The
+  unit under a real systemd sandbox is not yet measured.
+- **D2. Fuzz target** for the `xudo-wire` request parser, a trust-boundary
+  parser `CLAUDE.md` requires fuzzing; wire it into `just fuzz`. *Done:*
+  `fuzz/fuzz_targets/wire_request.rs` and `wire_response.rs`, both run by `just fuzz`.
+- **D3. Doctor oracle.** **DONE 2026-10-29** for sudo and sudo-rs (as root, `sudo -l -U` per `xudo` group member; the reader is a hint, and a non-root run is unverified); doas stays on the reader, since `doas -C` needs a command to ask about. Ask the programs themselves — `sudo -l -U <user>` when
   run as root, `doas -C <file> <cmd>` unprivileged — as the authoritative
   passwordless check, demoting the hand parser to a hint. Four review rounds
   each found a new lexer mismatch; the parser cannot win that race.
-- **D4. Flaky tests, owned.** `ido-bin` PTY `argv_is_never_passed_through_a_shell`
+- **D4. Flaky tests, owned.** *(Partly: two umask-dependent tests fixed; the pty flake is not diagnosed.)* `ido-bin` PTY `argv_is_never_passed_through_a_shell`
   (failed once under load); the `trust.rs` socket tests that hit `SUN_LEN` on a
   long checkout path. Fix, or pin with the reason written beside the test.
-- **D5. CI gaps.** The systemd unit assertions (`aidod/tests/units.rs`) and a
+- **D5. CI gaps.** *(Done: `just units` and the root lane.)* The systemd unit assertions (`xudod/tests/units.rs`) and a
   root-in-container lane for the install tests join `just verify`/CI.
-- **D6. Inventories.** The crate tables in `CLAUDE.md`, `design-plan.md`, and
-  `README.md` (this directory) name the real workspace members, with `aidod`
+- **D6. Inventories.** *(Done: `crate_inventory.rs` holds them.)* The crate tables in `CLAUDE.md`, `design-plan.md`, and
+  `README.md` (this directory) name the real workspace members, with `xudod`
   marked in review until B1 lands.
 
 ### E. Closeout and decisions *(user sign-off)*
 
-- **E1. M2b closeout.** Sweep the verification table against the exit test
+- **E1. M2b closeout.** **Done 2026-10-30** (`CONCERNS.md`); the FigJam card is
+  not re-stamped, it cannot be edited from the repo. Sweep the verification table against the exit test
   above; `howiwork.md` "Where the build stands" and the FigJam card re-stamped;
   a dated `CONCERNS.md` entry.
-- **E2. Phase 3 beta `.deb`** — human path only, no `NOPASSWD` shipped. *Decision:
+- **E2. Phase 3 beta `.deb`** *(open)* — human path only, no `NOPASSWD` shipped. *Decision:
   release timing.*
-- **E3. Schedule the `howiwork.md` promises with no milestone:** vision-mode
+- **E3. Schedule the `howiwork.md` promises with no milestone** *(open)*:** vision-mode
   providers, YAML/JSON permission-set import, pasban's schedule and log
   verification, `airead`. *Decision: proposed homes M5/M6/phase 5.*
 

@@ -5,10 +5,10 @@
 # installed.
 
 [Unit]
-Description=aido units lane control socket
+Description=xudo units lane control socket
 
 [Socket]
-ListenStream=/run/aido-control.sock
+ListenStream=/run/xudo-control.sock
 SocketUser=root
 SocketGroup=root
 SocketMode=0660

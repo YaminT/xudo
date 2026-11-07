@@ -1,6 +1,6 @@
 //! Sanitizes untrusted text on its way to a terminal.
 //!
-//! Both `ido`'s picker and `aido`'s confirmation prompt render text an agent
+//! Both `ido`'s picker and `xudo`'s confirmation prompt render text an agent
 //! wrote — a queued command, a reason string, a working directory — to a human
 //! who will act on what they see. That text is therefore attacker-controlled
 //! input destined for a terminal, and a terminal is an interpreter: escape

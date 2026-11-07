@@ -89,7 +89,7 @@ jobs:
       - run: rustup toolchain install nightly --component miri
       - uses: Swatinem/rust-cache@v2
       # --lib only: see the justfile's miri recipe for why.
-      - run: cargo +nightly miri test -p aido-policy --lib
+      - run: cargo +nightly miri test -p xudo-policy --lib
 
   fuzz:
     name: fuzz smoke
@@ -155,11 +155,11 @@ jobs:
   # ruleset driven inside real distributions against real sudo, sudo-rs,
   # OpenDoas, and no escalator at all. ci/differential/run.sh pins what each
   # backend is probed to support, asks each backend's own parser to accept the
-  # snippet aido would write, and requires every verdict to be identical in
+  # snippet xudo would write, and requires every verdict to be identical in
   # every row.
   #
   # It compares only what the unprivileged binary does, and says so: row.sh
-  # fails the moment `aido doctor` stops reporting the exec path as absent,
+  # fails the moment `xudo doctor` stops reporting the exec path as absent,
   # because then the same ruleset must be *executed* through each backend and
   # compared, and "we will add it later" is how it never gets added.
   differential:
@@ -175,11 +175,11 @@ jobs:
       - name: Drive the static binary through sudo, sudo-rs, OpenDoas, and no escalator
         run: just differential
 
-  # `aido install` and `--uninstall` run for real, as root, in containers the
+  # `xudo install` and `--uninstall` run for real, as root, in containers the
   # job starts and discards: the file lands with the right owner and mode, the
   # backend's own parser accepts it first, an operator's file is never replaced
   # or removed, a rejected candidate leaves the old state alone. The functional
-  # probe is not covered here because `aido install` cannot yet ask the broker
+  # probe is not covered here because `xudo install` cannot yet ask the broker
   # for a request (M2b plan item C1); the harness asserts the install says it is
   # unverified rather than claiming otherwise. The root lane (`root-tests`) covers
   # the sudo path the probe will use, with a request written by hand.

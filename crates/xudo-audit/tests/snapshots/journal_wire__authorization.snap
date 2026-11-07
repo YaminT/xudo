@@ -1,0 +1,20 @@
+---
+source: crates/xudo-audit/tests/journal_wire.rs
+expression: "render(&datagram(&authorization(), \"xudod\").unwrap())"
+---
+MESSAGE=allowed: [\"/usr/bin/systemctl\",\"restart\",\"nginx.service\"] (caller human, action xudo.svc.restart, rule 20-services.toml:15, audit seq 2)\n
+PRIORITY=5\n
+SYSLOG_FACILITY=10\n
+SYSLOG_IDENTIFIER=xudod\n
+MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e\n
+XUDO_SCHEMA_VERSION=1\n
+XUDO_SEQ=2\n
+XUDO_HASH=334d83030048f09f039456bbcf860e5cfe17573ecf046f86c90928a68e5aa7de\n
+XUDO_PREV_HASH=1a44a17000387efdf3b4511e7e7414ddb83331aa656c5d609b394eb8bc849f2d\n
+XUDO_DECISION=allowed\n
+XUDO_OUTCOME=not_executed\n
+XUDO_CLASSIFICATION=human\n
+XUDO_ACTION=xudo.svc.restart\n
+XUDO_RULE_SOURCE=20-services.toml:15\n
+XUDO_PROGRAM=/usr/bin/systemctl\n
+XUDO_RECORD={\"schema_version\":1,\"seq\":2,\"prev_hash\":\"1a44a17000387efdf3b4511e7e7414ddb83331aa656c5d609b394eb8bc849f2d\",\"hash\":\"334d83030048f09f039456bbcf860e5cfe17573ecf046f86c90928a68e5aa7de\",\"decision\":\"allowed\",\"denial\":null,\"action\":\"xudo.svc.restart\",\"rule_source\":\"20-services.toml:15\",\"argv\":[\"/usr/bin/systemctl\",\"restart\",\"nginx.service\"],\"classification\":\"human\",\"evidence\":[\"gate_caller_pid=4242\"],\"deny_list_version\":1,\"outcome\":\"not_executed\"}\n

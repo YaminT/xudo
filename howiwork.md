@@ -1,6 +1,6 @@
 # howiwork.md — the source of truth
 
-This file is the authoritative statement of what aido is and how the system
+This file is the authoritative statement of what xudo is and how the system
 behaves. **Every other description derives from it**: the README, the FigJam
 overview, generated agent documentation, and marketing text of any kind. When
 any of them disagrees with this file, this file is right and the other document
@@ -22,14 +22,14 @@ is an error in the edit, not a new truth.
 
 ---
 
-## What aido is
+## What xudo is
 
-aido lives beside `sudo`. Its job is to let AI agents run the privileged
+xudo lives beside `sudo`. Its job is to let AI agents run the privileged
 commands a task genuinely needs — in the safest way achievable — while a human
 invoking the same commands is always prompted, and everything either of them
 does is recorded in a tamper-evident trail.
 
-The long-term shape is a system where aido is part of the installed path of a
+The long-term shape is a system where xudo is part of the installed path of a
 machine built for agent work (ultimately a Linux distribution that ships it
 preconfigured). The near-term shape is a signed `.deb` an operator installs
 beside the escalator they already have (`sudo`, `sudo-rs`, or `doas`).
@@ -38,7 +38,7 @@ beside the escalator they already have (`sudo`, `sudo-rs`, or `doas`).
 
 1. **Agent detection is not a security boundary.** Authorization comes only
    from kernel-attested facts (`SO_PEERPIDFD` + a root-created cgroup scope
-   under `aido.slice`). Environment variables, process names, `/proc` paths,
+   under `xudo.slice`). Environment variables, process names, `/proc` paths,
    and process ancestry are *unauthenticated hints*: recorded in the audit
    trail, never used to authorize.
 2. **The agent path is never broader than the human path in authentication.**
@@ -82,7 +82,7 @@ write under `/var/www`, run `certbot` as root. **Predefined permission sets
 (PRS)** are shipped, reviewed sets the operator selects or imports.
 
 The engine's native, tested format is TOML under root-owned
-`/etc/aido/rules.d/` (this is what ships today). YAML and JSON are accepted as
+`/etc/xudo/rules.d/` (this is what ships today). YAML and JSON are accepted as
 *import formats* for permission sets: converted to the native rules, shown to
 the operator as a capability-level diff, and installed only after review.
 Every shipped set is tested as code and checked against the GTFOBins gate —
@@ -96,11 +96,11 @@ permission set, without asking the human each time, for a bounded window that
 ends on its own.
 
 ```
-aido grant nginx-reload              # 30 minutes, the default
-aido grant web-admin 24h             # a whole permission set
-aido grant nginx-reload 2h --agent claude-code --project /srv/site --max 20
-aido grants                          # what is live, who granted it, when it ends
-aido revoke <grant-id>               # end one early
+xudo grant nginx-reload              # 30 minutes, the default
+xudo grant web-admin 24h             # a whole permission set
+xudo grant nginx-reload 2h --agent claude-code --project /srv/site --max 20
+xudo grants                          # what is live, who granted it, when it ends
+xudo revoke <grant-id>               # end one early
 ```
 
 What makes it safe:
@@ -143,10 +143,10 @@ What makes it safe:
   generation it was minted under; installing new rules bumps the generation
   and invalidates every outstanding grant.
 - **Visible and recorded.** Granting, every use under a grant, expiry, and
-  revocation each write an audit record, and while any grant is live, aido
+  revocation each write an audit record, and while any grant is live, xudo
   shows a banner naming it.
 
-Grants are stored root-owned under `/var/lib/aido/grants` and read only
+Grants are stored root-owned under `/var/lib/xudo/grants` and read only
 through the trust walk. Standing, reviewed narrowing over days or weeks stays
 in `trust.d`; a grant is its time-boxed sibling, the short window an operator
 opens from the command line. Grants only mean something once the passwordless path exists (M4):
@@ -157,10 +157,10 @@ M5, with permission sets becoming a construct in the rule files first.
 
 | Component | Privilege | Role |
 |---|---|---|
-| `aido` | user | The front-end agents and humans call. Explains, checks, asks the broker. Decides nothing. |
-| `aidod` | root | The authority. Identifies the peer, classifies, evaluates policy, mints one-use requests, owns confirmation. |
-| `aido-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
-| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: aido ships no setuid bit anywhere. Two rules point at two hardlinks of the gate: `aido-gate-nopass` (`NOPASSWD`, the approved agent path) and `aido-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. |
+| `xudo` | user | The front-end agents and humans call. Explains, checks, asks the broker. Decides nothing. |
+| `xudod` | root | The authority. Identifies the peer, classifies, evaluates policy, mints one-use requests, owns confirmation. |
+| `xudo-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
+| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: xudo ships no setuid bit anywhere. Two rules point at two hardlinks of the gate: `xudo-gate-nopass` (`NOPASSWD`, the approved agent path) and `xudo-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. |
 | `ido` | user | The buffered human-run queue (below). Where the human's password is entered. |
 | `airead` | user | The read-only surface (below). |
 | `pasban` | root (scheduled) | The watchman (below). |
@@ -171,7 +171,7 @@ Every request resolves to exactly one of:
 
 1. **Rejected** — the deny-list matched, no rule accepts the command, the
    context forbids it, or a required confirmation has no live channel. Every
-   error path lands here: aido fails closed.
+   error path lands here: xudo fails closed.
 2. **Approved** — an enrolled agent, attested by the kernel, asks for
    something a rule accepts, and every requirement is met, including whatever
    out-of-band confirmation the strictest matching rule demands. **An approved
@@ -180,12 +180,12 @@ Every request resolves to exactly one of:
    approved this way (invariant 2): it takes the human path below.
    *Not built yet:* the passwordless hop and enrollment are M4. The beta ships
    only the `PASSWD` hop, so today nothing runs without a password.
-3. **Run with ido** — aido cannot or should not run it now, so it is handed to
+3. **Run with ido** — xudo cannot or should not run it now, so it is handed to
    a human as reviewable work instead of being silently dropped. **This is
    where the human password lives**: the human runs the entry, and the
    privileged step goes through the `PASSWD` hop, which asks for it once.
 
-A human who runs `aido` directly is on the same human path: always prompted,
+A human who runs `xudo` directly is on the same human path: always prompted,
 because a human is exactly what the kernel cannot attest as an enrolled agent.
 
 When several rules accept the same command, the **strictest requirement wins**
@@ -199,8 +199,8 @@ reason, and an identifier; `ido {id}` runs one entry, `ido` opens the picker.
 The admin is told when unfinished tasks exist.
 
 Running an entry is a *human* act: it executes with the human's own authority,
-and anything privileged goes through aido's human path, where the `PASSWD` hop
-(`aido-gate-auth`) prompts for the password once. ido itself holds no privilege and never will —
+and anything privileged goes through xudo's human path, where the `PASSWD` hop
+(`xudo-gate-auth`) prompts for the password once. ido itself holds no privilege and never will —
 "running ido is equivalent to sudo" is achieved by routing through the same
 gate as everything else, not by making ido a second sudo. Every rendered field
 of an entry is sanitized for the terminal (agent text cannot forge the UI), and
@@ -208,7 +208,7 @@ every run lands in the audit chain.
 
 ### airead
 
-`airead` is aido's read-only twin: the same engine, the same attestation, the
+`airead` is xudo's read-only twin: the same engine, the same attestation, the
 same audit trail, but it can only ever grant actions whose capability class is
 *reads* — no file writes, no database writes, no cloud-CLI mutations, no
 network egress that changes state. The separation is structural, not
@@ -252,7 +252,7 @@ operator-configurable) that
   an **immediate threat** and reports it loudly.
 
 The security log is the hash-chained audit trail: root-owned, mode 0600,
-append-only in practice and tamper-evident by construction. aido (broker and
+append-only in practice and tamper-evident by construction. xudo (broker and
 gate) writes it and can read it; pasban reads and verifies it; nothing else has
 access. "Hard written" is implemented as a hash chain — every record seals the
 one before it — plus the journald copy, so a modification cannot be hidden
@@ -262,21 +262,21 @@ pasban's next run reports exactly where.
 ## How a request flows
 
 ```
-enrolled agent ── aido ──► aidod (root broker)
+enrolled agent ── xudo ──► xudod (root broker)
                              ├ who is asking? (kernel-attested)
                              ├ which rules accept it? strictest wins
                              ├ deny-list (compiled in, non-overridable)
                              ├ confirmation needed? channel live? (else deny)
                              └ outcome: Reject │ Approve │ ido-queue
 
-  Approve ─► mint one-use record ─► sudo/doas, NOPASSWD ─► aido-gate-nopass
+  Approve ─► mint one-use record ─► sudo/doas, NOPASSWD ─► xudo-gate-nopass
                                     (uid transition only,       │
                                      no password)               │
-  Run with ido ─► human reviews, runs entry ─► aido (human path)│
-                  ─► sudo/doas, PASSWD ─────► aido-gate-auth    │
+  Run with ido ─► human reviews, runs entry ─► xudo (human path)│
+                  ─► sudo/doas, PASSWD ─────► xudo-gate-auth    │
                   (the human types the password here)           │
                                                                 ▼
-                                        aido-gate (root, the same binary)
+                                        xudo-gate (root, the same binary)
                                           ├ re-decides from root-owned state
                                           ├ consumes the nonce (one use, ever)
                                           └ execs the validated file descriptor
@@ -284,7 +284,7 @@ enrolled agent ── aido ──► aidod (root broker)
 ```
 
 Why the hop exists at all when approval needs no password: it is the only
-place a uid transition happens, because aido has no setuid bit. It also gives
+place a uid transition happens, because xudo has no setuid bit. It also gives
 the gate a real pty (`use_pty`, the TIOCSTI defence), faithful exit status, and
 the operator's existing sudo/doas logging. Take it away and the choice is a
 setuid binary, which this project refuses, or having the root daemon execute
@@ -303,7 +303,7 @@ Recorded so the reconciliation is visible, not silent:
    defer to ido, or annotate — never approve (invariants 2 and 3). Blind mode
    is the engine, not a fallback.
 3. *"Running ido is equivalent of sudo without sudo"* → ido stays
-   unprivileged; privileged entries run through aido's human path with its
+   unprivileged; privileged entries run through xudo's human path with its
    password prompt. Same user experience, no second privilege boundary.
 4. *"Permission sets in YAML and JSON"* → native engine format stays TOML
    (tested, shipped); YAML/JSON are import formats converted and reviewed
@@ -311,16 +311,16 @@ Recorded so the reconciliation is visible, not silent:
 5. *"If something is approved, no human password is needed"* → true for an
    approved, attested agent request, which takes the `NOPASSWD` hop. The
    password moved next to ido: it belongs to the human path (the human running
-   an ido entry, or running `aido` directly), because an unattested caller,
+   an ido entry, or running `xudo` directly), because an unattested caller,
    including a human, is never silently downgraded to passwordless
    (invariant 2). The `sudo`/`doas` hop itself stays: it is the uid transition,
    not the password mechanism.
 6. *"airead as a separate app"* → same engine, structurally restricted to
    read-class capabilities, so the read/write separation cannot drift between
    two codebases.
-7. *"Temp permissions: `aido set-temp nginx-reload 30m`, `aido set-temp
+7. *"Temp permissions: `xudo set-temp nginx-reload 30m`, `xudo set-temp
    nginx-perm-set 24h`, default 30 minutes"* → adopted as temporary
-   permissions, spelled `aido grant <name> [duration]` to match the existing
+   permissions, spelled `xudo grant <name> [duration]` to match the existing
    `grants`/`revoke` verbs, default 30 minutes. A grant activates something
    root already defined, for a named harness, minted by a human on the
    password path; it lifts only the per-call confirmation, and never the
@@ -346,17 +346,13 @@ file before acting on it.
 
 ## Where the build stands
 
-M1 (policy core, explain) done. M2a (backend model) done. M2b in progress:
-the Linux harness, the audited unsafe syscall layer, strictest
-overlapping-rule resolution, the mount-trust check, and the audit sinks
-(hash-chained file plus journald mirror; the gate writes through them, the
-broker not yet) are on main, and so are the broker (`aidod`), which mints the
-entries the gate will act on and writes its records to the journal, not yet to
-that chain, and the gate (`aido-gate-bin`: it consumes an entry, records the
-authorization, and execs the command, on the `-auth` name only); the doctor
-report is in review. Neither privileged half has yet run as root through
-`sudo`: nothing asks the broker (`aido exec`) and nothing installs the rule
-that reaches the gate. Then: M3 out-of-band confirmation,
+M1 (policy core, explain) done. M2a (backend model) done. M2b done in code
+and tests (2026-10-30): the broker mints entries, the gate consumes one and
+runs it as root, `xudo exec` and `xudo install` ask the broker, both write one
+hash-chained audit trail, and the same ruleset behaves the same through sudo,
+sudo-rs and OpenDoas. Only the password path exists. Not yet: the broker under
+its real systemd sandbox, and doas verification in the doctor and the install
+probe. Then: M3 out-of-band confirmation,
 M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.

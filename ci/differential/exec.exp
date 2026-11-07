@@ -1,0 +1,11 @@
+# expect exec.exp <su> <password> <command>: run <command> as xudotest on a pty and
+# type the password at whatever asks for it. Exits with the command's status.
+set timeout 30
+spawn {*}[lindex $argv 0] -s /bin/sh -c [lindex $argv 2] xudotest
+expect {
+    -nocase "password" { send "[lindex $argv 1]\r"; exp_continue }
+    timeout { exit 124 }
+    eof
+}
+catch wait result
+exit [lindex $result 3]

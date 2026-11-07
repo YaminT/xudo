@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-if [ "$repo" != test/aido ]; then
+if [ "$repo" != test/xudo ]; then
     echo "fake gh: unexpected repository '$repo'" >&2
     exit 2
 fi
@@ -139,13 +139,13 @@ fixture() {
     mkdir "$dir/main/ci"
     cp "$here/boof-integrate.sh" "$dir/main/ci/boof-integrate.sh"
     printf 'line one\n' >"$dir/main/README"
-    printf 'verify:\n    cargo fmt --all --check\n    cargo clippy --all-targets -- -D warnings\n    cargo test --workspace\n    cargo deny check\n\nlinux-test:\n    docker run --rm aido-test\n' >"$dir/main/justfile"
+    printf 'verify:\n    cargo fmt --all --check\n    cargo clippy --all-targets -- -D warnings\n    cargo test --workspace\n    cargo deny check\n\nlinux-test:\n    docker run --rm xudo-test\n' >"$dir/main/justfile"
     printf '/target\n' >"$dir/main/.gitignore"
     git -C "$dir/main" add -A
     git -C "$dir/main" commit -q -m "chore: seed"
     git -C "$dir/main" push -q origin HEAD:main
-    git -C "$dir/main" remote set-url origin git@github.com:test/aido.git
-    git -C "$dir/main" config "url.$dir/origin.git.insteadOf" git@github.com:test/aido.git
+    git -C "$dir/main" remote set-url origin git@github.com:test/xudo.git
+    git -C "$dir/main" config "url.$dir/origin.git.insteadOf" git@github.com:test/xudo.git
     git -C "$dir/main" fetch -q origin
     git -C "$dir/main" branch -q --set-upstream-to=origin/main main
     add_worktree wt "boof-runner/$1" thing
@@ -392,7 +392,7 @@ case_concurrency() {
     expect "gate steps strictly alternate start/end, 4 of them" "$((alternates == 1 ? 0 : 1))"
     git -C "$dir/origin.git" cat-file -e "main:thing" 2>/dev/null || expect "origin main holds 'thing'" 1
     git -C "$dir/origin.git" cat-file -e "main:thing2" 2>/dev/null || expect "origin main holds 'thing2'" 1
-    expect_absent "$tmp/aido-boof-integrate.lock"
+    expect_absent "$tmp/xudo-boof-integrate.lock"
     local combined="$dir/out"
     cat "$dir/out1" "$dir/out2" >"$combined"
     finish concurrent "$combined"
@@ -407,7 +407,7 @@ case_happy_path() {
     expect_same "$(git -C "$dir/main" rev-parse HEAD)" "$(origin_head)" "the main checkout was fast-forwarded"
     expect_out "$dir/out" 'boof-integrate: landed [0-9a-f]{40} on main; base [0-9a-f]{40}; CI success; https://example.invalid/run/1'
     expect_same "$(grep -c '^start' "$dir/fake/just.log")" 2 "the gate ran verify and linux-test once each"
-    expect_absent "$tmp/aido-boof-integrate.lock"
+    expect_absent "$tmp/xudo-boof-integrate.lock"
     expect "no GATE FILES CHANGED block" "$(grep -q 'GATE FILES CHANGED' "$dir/out" && echo 1 || echo 0)"
     finish happy "$dir/out"
 }
@@ -500,7 +500,7 @@ case_push_refused_not_moved() {
     expect_same "$(grep -c '^start verify' "$dir/fake/just.log")" 1 "the gate ran once"
     expect "no retry message" "$(grep -q 'push rejected 3 times' "$dir/out" && echo 1 || echo 0)"
     expect_same "$(origin_head)" "$before" "origin main is unchanged"
-    expect_absent "$tmp/aido-boof-integrate.lock"
+    expect_absent "$tmp/xudo-boof-integrate.lock"
     finish refused "$dir/out"
 }
 
@@ -516,7 +516,7 @@ case_red_after_push() {
     expect_out "$dir/out" 'MAIN IS NOW RED'
     expect_out "$dir/out" 'https://example.invalid/run/boom'
     expect_same "$(origin_head)" "$(git -C "$dir/wt" rev-parse HEAD)" "origin main holds the task commit"
-    expect_absent "$tmp/aido-boof-integrate.lock"
+    expect_absent "$tmp/xudo-boof-integrate.lock"
     expect_same "$(git -C "$dir/main" rev-parse HEAD)" "$seed" "the main checkout is not fast-forwarded"
     finish red-after "$dir/out"
 }

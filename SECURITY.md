@@ -34,19 +34,19 @@ one you know you lack.
 - **One overbroad allowlist entry voids the design.** A single allowlisted shell,
   interpreter, pager, exec proxy, or `apt-get -o DPkg::Pre-Invoke::=` is
   unrestricted root regardless of how the arguments are written.
-- **`aido` cannot protect a host that already has other paths to root.**
+- **`xudo` cannot protect a host that already has other paths to root.**
   Pre-existing `NOPASSWD` entries, `wheel` / `sudo` / `docker` / `lxd`
   membership, writable unit directories, writable `PATH` entries, writable shell
-  rc files: any one of them makes `aido` decorative. `aido doctor` reports them
+  rc files: any one of them makes `xudo` decorative. `xudo doctor` reports them
   (`--json` for a program, `--fix` for what to change); see below for what that
   report can and cannot see.
-- **`aido explain` does not verify the rules it reads.** It reads them by path,
+- **`xudo explain` does not verify the rules it reads.** It reads them by path,
   so that it works on a checkout; a tampered ruleset makes it print a wrong
   answer to the human who asked. Survivable only because nothing can execute.
-  The privileged loader, `aido_sys::load_trusted_rules`, refuses a ruleset with
+  The privileged loader, `xudo_sys::load_trusted_rules`, refuses a ruleset with
   any component that is not root's, is writable by group or world, is a
   symbolic link, or is on a mount a non-root user could have made — checked on
-  the descriptors the rules are read through — and `aido doctor` reports
+  the descriptors the rules are read through — and `xudo doctor` reports
   through it. The broker and the gate are not written yet; loading through it,
   and nothing else, is a stated precondition of the privileged path.
 - **Not every user-writable filesystem is refused yet.** A mount that root made
@@ -55,7 +55,7 @@ one you know you lack.
   mount and the marks it carries, not what backs it (`docs/CONCERNS.md`,
   2026-10-19).
 
-## What `aido doctor` reports about other paths to root
+## What `xudo doctor` reports about other paths to root
 
 It runs as you, unprivileged, and reports what it can read. **What it cannot
 read is "unverified", never "clean"**: `/etc/sudoers` is `0440` and `/root` is
@@ -101,7 +101,7 @@ It reports:
   than "does not", and an include whose target is missing or unreadable is
   unverified. Root's `PATH` is unverified too, and says which of two causes:
   a sudoers file that could set `secure_path` could not be read, or one was read
-  and has a line aido does not model, which may set it (the `secure_path` it did
+  and has a line xudo does not model, which may set it (the `secure_path` it did
   find is examined either way). A file with a continuation line therefore says
   "may name you" and "unverified" where a faithful parser would say yes or no;
   the fix for that is to ask the program itself (`doas -C`, `sudo -l -U`), which
@@ -138,7 +138,7 @@ and `system.conf.d` directories, udev rules, *your own* shell's rc files (an
 alias or function named `sudo` there captures the password exactly as a
 writable `PATH` entry does), and an ACL that lets someone *else* write (visible
 only through the group bits it sets). "Every other path to root" in the
-design means the ones listed above; this is the list of the ones it is not. `aido doctor --fix`
+design means the ones listed above; this is the list of the ones it is not. `xudo doctor --fix`
 prints each proposed change, what it means, and the exact command for a human
 to run; it applies nothing, because a confirmation read from your own terminal
 is one an agent driving that terminal could type.

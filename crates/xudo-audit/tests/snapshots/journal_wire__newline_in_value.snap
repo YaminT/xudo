@@ -1,0 +1,20 @@
+---
+source: crates/xudo-audit/tests/journal_wire.rs
+expression: render(&payload)
+---
+MESSAGE=allowed: [\"/usr/bin/true\"] (caller human, action xudo.x, rule evil.toml:1\\nPRIORITY=7, exited 0, audit seq 1)\n
+PRIORITY=5\n
+SYSLOG_FACILITY=10\n
+SYSLOG_IDENTIFIER=xudod\n
+MESSAGE_ID=a06b36c755dd4b85815d6af790559b5e\n
+XUDO_SCHEMA_VERSION=1\n
+XUDO_SEQ=1\n
+XUDO_HASH=a9cdc41108da118e6d832c7ba32b2395795f2613801cd4404ed6ced26ab30f99\n
+XUDO_PREV_HASH=\n
+XUDO_DECISION=allowed\n
+XUDO_OUTCOME=exited\n
+XUDO_CLASSIFICATION=human\n
+XUDO_ACTION=xudo.x\n
+XUDO_RULE_SOURCE\n\x16\x00\x00\x00\x00\x00\x00\x00evil.toml:1\nPRIORITY=7\n
+XUDO_PROGRAM=/usr/bin/true\n
+XUDO_RECORD={\"schema_version\":1,\"seq\":1,\"prev_hash\":\"\",\"hash\":\"a9cdc41108da118e6d832c7ba32b2395795f2613801cd4404ed6ced26ab30f99\",\"decision\":\"allowed\",\"denial\":null,\"action\":\"xudo.x\",\"rule_source\":\"evil.toml:1\\nPRIORITY=7\",\"argv\":[\"/usr/bin/true\"],\"classification\":\"human\",\"evidence\":[],\"deny_list_version\":0,\"outcome\":{\"exited\":{\"code\":0}}}\n
