@@ -89,10 +89,11 @@ pub struct GateContext {
     ///
     /// True only for the `xudo-gate-auth` name, which `sudo` reaches only after
     /// a PAM conversation on a fresh pty that the requesting process tree cannot
-    /// answer without the secret. On that path the password **is** the
-    /// confirmation, so a rule that demands one is satisfied by it. Never true
-    /// for a request that was merely approved: that is the broker's
-    /// `confirmed`, which carries the channel that approved it.
+    /// answer without the secret. It satisfies the password half of a
+    /// confirmation requirement; when `confirm_human_path` is enabled, a
+    /// checked watch approval is required as well. Never true for a request
+    /// that was merely approved: that is the broker's `confirmed`, which adds
+    /// the watch fact but never replaces this password fact.
     pub password_confirms: bool,
 }
 
@@ -184,6 +185,8 @@ pub enum Stage {
     Audit,
     /// Build the exec vector and exec.
     Exec,
+    /// Load and parse the root-owned configuration.
+    Config,
 }
 
 impl Stage {
@@ -197,6 +200,7 @@ impl Stage {
             Self::Procfs => "verify /proc",
             Self::Lineage => "walk its lineage",
             Self::Rules => "load the root-owned ruleset",
+            Self::Config => "load the root-owned configuration",
             Self::Clock => "read the monotonic clock",
             Self::Spool => "use the spool",
             Self::Program => "open the program",
@@ -215,6 +219,7 @@ impl Stage {
             Self::Procfs => "gate_failed_procfs",
             Self::Lineage => "gate_failed_lineage",
             Self::Rules => "gate_failed_rules",
+            Self::Config => "gate_failed_config",
             Self::Clock => "gate_failed_clock",
             Self::Spool => "gate_failed_spool",
             Self::Program => "gate_failed_program",
@@ -407,7 +412,13 @@ pub fn decide(
         // here even though the front-end may already have shown a prompt: the
         // gate's evidence that a human approved is the broker's record, and
         // there isn't one.
-        Verdict::AllowWithConfirmation if !pending.confirmed && !context.password_confirms => {
+        Verdict::AllowWithConfirmation
+            if if context.settings.confirm_human_path {
+                !(pending.confirmed && context.password_confirms)
+            } else {
+                !(pending.confirmed || context.password_confirms)
+            } =>
+        {
             return Err(Refusal::ConfirmationMissing(Box::new(decision)));
         }
         Verdict::Allow | Verdict::AllowWithConfirmation => {}
@@ -1252,13 +1263,46 @@ args = [
     }
 
     #[test]
-    fn a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say() {
+    fn a_watch_approval_never_stands_in_for_the_password() {
         let rules = overlapping_rules();
         let pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
-        // Without a password and without the broker's approval: refused.
-        let refused = decide(&rules, &human(77), Some(&pending), context()).unwrap_err();
+        let watch_required = GateContext {
+            settings: engine::Settings {
+                confirm_human_path: true,
+                ..engine::Settings::default()
+            },
+            password_confirms: false,
+            ..context()
+        };
+        let refused = decide(&rules, &human(77), Some(&pending), watch_required).unwrap_err();
         assert_eq!(refused.code(), "gate_confirmation_missing");
-        // On the -auth name the password is the confirmation.
+        // A password is still insufficient when the setting requires a watch.
+        let typed = GateContext {
+            settings: watch_required.settings,
+            password_confirms: true,
+            ..watch_required
+        };
+        assert_eq!(
+            decide(&rules, &human(77), Some(&pending), typed)
+                .unwrap_err()
+                .code(),
+            "gate_confirmation_missing"
+        );
+        let mut watched = pending.clone();
+        watched.confirmed = true;
+        watched.confirmed_by = Some("checked-watch".to_owned());
+        assert_eq!(
+            decide(&rules, &human(77), Some(&watched), watch_required)
+                .unwrap_err()
+                .code(),
+            "gate_confirmation_missing"
+        );
+        let watched_and_typed = GateContext {
+            password_confirms: true,
+            ..watch_required
+        };
+        assert!(decide(&rules, &human(77), Some(&watched), watched_and_typed).is_ok());
+        // With the channel off, the existing password path remains valid.
         let typed = GateContext {
             password_confirms: true,
             ..context()
@@ -1313,6 +1357,7 @@ args = [
             Stage::Program,
             Stage::Audit,
             Stage::Exec,
+            Stage::Config,
         ];
         let mut codes: Vec<&str> = stages.iter().map(|stage| stage.code()).collect();
         codes.sort_unstable();

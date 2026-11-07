@@ -193,6 +193,8 @@ A file that does not parse, or that contains an unrecognised key, exits
 The keys are
 .B confirm_agent_actions
 (default true),
+.B confirm_human_path
+(default false),
 .B confirmation_timeout_secs
 (default 60),
 .B frozen
@@ -204,6 +206,8 @@ The keys are
 (default true), and
 .BR use_pty ,
 which is compiled in as true and is refused if set.
+When enabled, a rule that requires confirmation also requires an out-of-band
+watch approval; the password alone does not satisfy it.
 The command marks security-relevant settings and says they are never
 settable from the environment.
 This binary does not read the environment for them.

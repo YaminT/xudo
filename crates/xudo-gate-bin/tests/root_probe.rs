@@ -52,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use xudo_backend::{InstallPlan, detect};
-use xudo_gate::SPOOL_DIR;
 use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION};
+use xudo_gate::{CONFIG_FILE as GATE_CONFIG_FILE, SPOOL_DIR};
 use xudo_sys::{
     Clock, HostClock, HostInstallOps, HostProbe, InstallProbe, ProbeResult, VerifiedProc, execute,
     lineage, load_trusted_rules, run_capture,
@@ -74,6 +74,7 @@ impl InstallProbe for NoProbe {
 const GATE: &str = env!("CARGO_BIN_EXE_xudo-gate");
 const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 const RULES_DIR: &str = "/etc/xudo/rules.d";
+const CONFIG_FILE: &str = "/etc/xudo/config.toml";
 const AUDIT_DIR: &str = "/var/lib/xudo";
 const JOURNAL_DIR: &str = "/run/systemd/journal";
 const USER: &str = "xudotest";
@@ -89,6 +90,51 @@ fn begin_root_test(test: &str) -> bool {
         return false;
     }
     true
+}
+
+#[test]
+fn gate_reads_the_root_owned_config_from_etc() {
+    if !begin_root_test("gate_reads_the_root_owned_config_from_etc") {
+        return;
+    }
+    let _journal = install_everything();
+    let loaded = xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
+    assert!(loaded.settings.confirm_human_path);
+}
+
+#[test]
+fn gate_refuses_bad_configs_through_the_real_trust_walk() {
+    if !begin_root_test("gate_refuses_bad_configs_through_the_real_trust_walk") {
+        return;
+    }
+    let _journal = install_everything();
+    let paths = xudo_config::SystemPaths::default();
+    assert_eq!(Path::new(GATE_CONFIG_FILE), paths.config());
+
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o666);
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "world-writable config passed the gate trust walk"
+    );
+
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+    let target = "/etc/xudo/config-target.toml";
+    root_file(target, b"confirm_human_path = true\n", 0o644);
+    fs::remove_file(CONFIG_FILE).unwrap();
+    std::os::unix::fs::symlink(target, CONFIG_FILE).unwrap();
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "symlinked config passed the gate trust walk"
+    );
+
+    fs::remove_file(CONFIG_FILE).unwrap();
+    root_file(CONFIG_FILE, b"unknown_m3_setting = true\n", 0o644);
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "unknown config key passed the gate parser"
+    );
+    fs::remove_file(target).unwrap();
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
 }
 
 fn root_dir(path: &str, mode: u32) {
@@ -157,6 +203,7 @@ fn install_everything() -> StandInJournal {
         RULES.as_bytes(),
         0o644,
     );
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
     root_dir("/var/lib", 0o755);
     root_dir(AUDIT_DIR, 0o700);
     let _ = fs::remove_file(format!("{AUDIT_DIR}/audit.jsonl"));
@@ -271,6 +318,43 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         "the journal was sent nothing"
     );
     remove_snippet();
+}
+
+#[test]
+fn the_real_gate_requires_watch_approval_in_addition_to_the_password() {
+    if !begin_root_test("the_real_gate_requires_watch_approval_in_addition_to_the_password") {
+        return;
+    }
+    let _journal = install_everything();
+    let mut confirm_rule = RULES.to_owned();
+    confirm_rule.push_str("confirm = \"always\"\n");
+    root_file(
+        &format!("{RULES_DIR}/05-probe.toml"),
+        confirm_rule.as_bytes(),
+        0o644,
+    );
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+    let nonce = write_entry(own_pin(), 0);
+
+    let output = through_sudo();
+
+    assert!(
+        !output.success,
+        "gate ran a confirm-tier command without watch approval: {output:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected command output: {output:?}"
+    );
+    assert!(
+        output.stderr.contains("gate_confirmation_missing"),
+        "gate did not refuse after the password: {output:?}"
+    );
+    assert!(
+        entry_exists(&nonce),
+        "refused request should remain unconsumed"
+    );
+    clear_spool();
 }
 
 #[test]

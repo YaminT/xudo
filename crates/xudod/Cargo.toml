@@ -29,6 +29,7 @@ rustix = { version = "1.1", default-features = false, features = [
   "process",
 ] }
 serde_json.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

@@ -57,8 +57,11 @@
 
 pub mod decide;
 pub mod env;
+pub mod policy;
+pub use policy::{MAX_CONFIG_BYTES, PolicyError, SettingsError, settings_from};
 pub mod request;
 pub mod run;
+pub use run::CONFIG_FILE;
 pub mod status;
 
 pub use decide::{

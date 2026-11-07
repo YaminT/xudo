@@ -922,9 +922,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn a_policy_that_cannot_be_loaded_refuses_rather_than_deciding() {
         let mut host = Host::honest();
-        host.policy.answer = Err(PolicyError::ConfigNotUtf8 {
+        host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
             file: "/etc/xudo/config.toml".to_owned(),
-        });
+        }));
         let spool = FakeSpool::new();
         let outcome = serve_with(&mut host, &restart(), Ok(&spool));
         assert_eq!(outcome.served, Served::Refused(Fault::Broker));

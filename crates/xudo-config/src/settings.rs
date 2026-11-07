@@ -35,6 +35,8 @@ pub enum Setting {
     /// narrowing the confirmation requirement takes a root-authored `trust.d`
     /// record plus a per-invocation flag, both enforced by the broker.
     ConfirmAgentActions,
+    /// Require an out-of-band human watch approval on the human path.
+    ConfirmHumanPath,
     /// How long a pending confirmation waits before it is denied.
     ConfirmationTimeoutSecs,
     /// Whether the agent path is frozen.
@@ -54,8 +56,9 @@ pub enum Setting {
 
 impl Setting {
     /// Every setting, for exhaustive reporting and schema export.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ConfirmAgentActions,
+        Self::ConfirmHumanPath,
         Self::ConfirmationTimeoutSecs,
         Self::Frozen,
         Self::AuditSink,
@@ -67,6 +70,7 @@ impl Setting {
     pub fn key(self) -> &'static str {
         match self {
             Self::ConfirmAgentActions => "confirm_agent_actions",
+            Self::ConfirmHumanPath => "confirm_human_path",
             Self::ConfirmationTimeoutSecs => "confirmation_timeout_secs",
             Self::Frozen => "frozen",
             Self::AuditSink => "audit_sink",
@@ -100,7 +104,7 @@ impl Setting {
     pub fn narrows(self, current: &Value, candidate: &Value) -> bool {
         match (self, current, candidate) {
             (
-                Self::ConfirmAgentActions | Self::Frozen,
+                Self::ConfirmAgentActions | Self::ConfirmHumanPath | Self::Frozen,
                 Value::Bool(current),
                 Value::Bool(candidate),
             ) => *candidate || !*current,
@@ -208,6 +212,10 @@ impl Default for Settings {
         values.insert(
             Setting::ConfirmAgentActions,
             Tracked::default_value(Value::Bool(true)),
+        );
+        values.insert(
+            Setting::ConfirmHumanPath,
+            Tracked::default_value(Value::Bool(false)),
         );
         values.insert(
             Setting::ConfirmationTimeoutSecs,
@@ -378,6 +386,26 @@ mod tests {
         assert_eq!(confirm.value, Value::Bool(true));
         assert_eq!(confirm.origin.layer, Layer::BuiltInDefault);
         assert_eq!(confirm.origin.to_string(), "<default>");
+    }
+
+    #[test]
+    fn a_project_layer_cannot_turn_confirm_human_path_off() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.get(Setting::ConfirmHumanPath).value,
+            Value::Bool(false)
+        );
+        settings
+            .apply(Setting::ConfirmHumanPath, Value::Bool(true), project(1))
+            .unwrap();
+        let error = settings
+            .apply(Setting::ConfirmHumanPath, Value::Bool(false), project(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("may only narrow"), "{error}");
+        assert_eq!(
+            settings.get(Setting::ConfirmHumanPath).value,
+            Value::Bool(true)
+        );
     }
 
     #[test]

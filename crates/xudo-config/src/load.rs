@@ -52,6 +52,7 @@ pub enum LoadError {
 #[serde(deny_unknown_fields)]
 struct File {
     confirm_agent_actions: Option<bool>,
+    confirm_human_path: Option<bool>,
     confirmation_timeout_secs: Option<u64>,
     frozen: Option<bool>,
     audit_sink: Option<String>,
@@ -82,10 +83,14 @@ pub fn apply_file(
 
     // Ordered so a file's errors are reported in a stable order regardless of
     // how the keys were written.
-    let entries: [(Setting, Option<Value>); 6] = [
+    let entries: [(Setting, Option<Value>); 7] = [
         (
             Setting::ConfirmAgentActions,
             parsed.confirm_agent_actions.map(Value::Bool),
+        ),
+        (
+            Setting::ConfirmHumanPath,
+            parsed.confirm_human_path.map(Value::Bool),
         ),
         (
             Setting::ConfirmationTimeoutSecs,
@@ -338,6 +343,7 @@ mod tests {
         // the file struct, which would make it silently unconfigurable.
         let cases = [
             ("confirm_agent_actions = true", Setting::ConfirmAgentActions),
+            ("confirm_human_path = true", Setting::ConfirmHumanPath),
             (
                 "confirmation_timeout_secs = 45",
                 Setting::ConfirmationTimeoutSecs,

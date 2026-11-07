@@ -1,0 +1,17 @@
+---
+source: crates/xudo-gate/tests/stage_contract.rs
+expression: snapshot
+---
+Descriptors gate_failed_descriptors
+Streams gate_failed_streams
+Privileges gate_failed_privileges
+Invocation gate_failed_invocation
+Procfs gate_failed_procfs
+Lineage gate_failed_lineage
+Rules gate_failed_rules
+Clock gate_failed_clock
+Spool gate_failed_spool
+Program gate_failed_program
+Audit gate_failed_audit
+Exec gate_failed_exec
+Config gate_failed_config
