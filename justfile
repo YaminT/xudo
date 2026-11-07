@@ -321,6 +321,10 @@ deb-test: deb
 systemd-test: deb
     ci/systemd/run.sh {{musl_triple}}
 
+# Trace selected shipped release-musl binaries and check their normal dependency graph.
+telemetry:
+    ci/telemetry/run.sh {{musl_triple}}
+
 # --- developer setup --------------------------------------------------------
 
 # Point git at the tracked hooks directory, so the gate runs before every
@@ -343,7 +347,7 @@ setup: install-hooks
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
 # fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
-ci: verify check-linux miri units differential root-test install-root deb-test systemd-test
+ci: verify check-linux miri units differential root-test install-root deb-test systemd-test telemetry
 
 clean:
     cargo clean
