@@ -831,6 +831,7 @@ dependencies = [
 name = "xudo-gate"
 version = "0.0.1"
 dependencies = [
+ "insta",
  "serde",
  "serde_json",
  "thiserror",
@@ -849,6 +850,7 @@ dependencies = [
  "rustix",
  "xudo-audit",
  "xudo-backend",
+ "xudo-config",
  "xudo-gate",
  "xudo-sys",
  "xudo-tests",
@@ -921,6 +923,7 @@ name = "xudod"
 version = "0.0.1"
 dependencies = [
  "insta",
+ "proptest",
  "rustix",
  "serde_json",
  "thiserror",

@@ -4,6 +4,10 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-07 — M3 step 1
+
+The gate and broker now derive settings from `/etc/xudo/config.toml` through the shared `xudo-gate::policy::load` trusted-file walk; open item 8 below is closed. `confirm_human_path = true` requires both a watch approval and the password. Until M3 step 5, the broker still mints the entry and the gate refuses after the password when this setting is on; the key is off by default.
+
 ## 2026-11-07 — doctor reports rule drift and skipped sudoers snippets
 
 `xudo doctor` compares each loaded rule with dpkg's recorded `${Conffiles}` MD5. It runs `/usr/bin/dpkg-query` and `/usr/bin/md5sum` through the fixed-environment runner; current bytes come from the single `read_trusted_dir` result, which reads each rule through its verified descriptor. Records are parsed from the right so paths may contain spaces. dpkg's `obsolete` and `remove-on-upgrade` flags report `no longer shipped`, even when the retained file still has the old checksum; a `newconffile` has no usable baseline and reports `unknown`. A missing package record, failed command, or unavailable trusted read is also `unknown`; it is never presented as clean. The checksum is dpkg's upgrade baseline, not a trust decision.
@@ -864,13 +868,8 @@ records the order, because Rust's own runtime fills a closed descriptor before
    `MAX_SPOOL_NAMES` (4096, against the broker's 64) is a bound on what a
    spool someone else filled can make it read, and the listing stops one name
    past it (`Spool::names_up_to`, reconciliation 4).
-8. **The gate does not read `/etc/xudo/config.toml`.** Before M3's `freeze` or
-   M4's enrolment can make `frozen` or `confirm_agent_actions` bite, the gate
-   must read the same file through the same walk and derive the same settings
-   as the broker, and the two must be one function: `settings_from` is in
-   `xudod::policy` today, which `xudo-gate` cannot depend on (the dependency
-   runs the other way), so it belongs in `xudo-gate` (or lower) and the broker
-   should call it from there.
+8. **Closed — M3 step 1.** The gate loads the trusted config and shares
+   `xudo-gate::settings_from` with the broker; see the dated entry at the top.
 9. **The audit trail is the gate's alone until D1** (reconciliation 3), and the
    post-execution outcome of an exec-in-place gate is D1's to decide.
 10. **A time namespace** is argued, not measured (reconciliation 2).

@@ -240,12 +240,15 @@ to 5 are pure or faked, 6 to 9 touch real systems.
 
 ### 1. The gate reads the settings; the new key
 
+Done 2026-11-07: the gate and broker share settings parsing and the gate loads the trusted config.
+
 - **Goal.** Close gate open item 8 before anything makes `frozen` or a
   confirmation bite. Move `xudod::policy::settings_from` into `xudo-gate`; the
   broker calls it there. The gate reads `/etc/xudo/config.toml` through the
   trust walk. Add `confirm_human_path` (`xudo-config`, narrows by turning on;
-  one `engine::Settings` field). `password_confirms` is false for a decision
-  that needs a watch. *Touches* `xudo-config`, `xudo-policy`, `xudo-gate`,
+  one `engine::Settings` field). `password_confirms` records the password fact
+  unchanged; when this key is on, the gate requires both password and watch
+  approval. *Touches* `xudo-config`, `xudo-policy`, `xudo-gate`,
   `xudod::policy`.
 - **Exit.** Same bytes, same `Settings` in broker and gate; a broken or
   user-writable config refuses at the gate.

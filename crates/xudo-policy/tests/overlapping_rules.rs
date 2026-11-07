@@ -273,7 +273,7 @@ fn turning_the_agent_setting_off_does_not_combine_with_a_duplicate_to_skip_an_al
     ]);
     let off = Settings {
         confirm_agent_actions: false,
-        frozen: false,
+        ..Settings::default()
     };
     let d = evaluate_command(&rules, &agent(), &apt_get(), &remove(&["gcc"]), off);
     assert_eq!(d.confirm, always());

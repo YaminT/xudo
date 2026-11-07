@@ -1,75 +1,33 @@
 //! Root's policy, read the way a privileged reader must, and the one decision
 //! the broker and `xudo explain` both make.
 //!
-//! The ruleset is loaded only through [`xudo_sys::load_trusted_rules`]: every
-//! directory from `/` down and every rule file checked on the descriptor it is
-//! read through, then handed to the same `xudo_policy::load_rule_files` the
-//! front-end and the gate use. So the generation the broker mints with is the
-//! generation the gate will compute from the same bytes.
-//!
-//! The decision is [`xudo_policy::evaluate_command`] — the function behind
-//! `xudo explain` — so the broker never mints for a command `explain` refuses,
-//! nor refuses one it allows. The broker does not search the actions itself:
-//! the engine gathers every action that accepts the command and resolves them
-//! to the strictest, and a second search here would be a second chance to get
-//! that wrong.
+//! Settings and trusted policy loading come from `xudo-gate::policy`, so the
+//! broker and gate necessarily interpret the same trusted bytes identically.
+//! The decision is `xudo_policy::evaluate_command`, the function behind
+//! `xudo explain`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use xudo_config::{Layer, LoadError, Setting, Settings as ConfigSettings, SystemPaths, Value};
-use xudo_policy::engine::Settings;
-use xudo_policy::{
-    Arg, Argv, CallerFacts, Classification, Decision, LoadedRuleSet, evaluate_command,
-};
-use xudo_sys::{TrustError, TrustedRulesError, load_trusted_rules, read_trusted_file};
+use xudo_policy::{Arg, Argv, CallerFacts, Classification, Decision, evaluate_command};
 use xudo_wire::BrokerRequest;
 
 use crate::identify::PeerIdentity;
 
-/// The largest settings file the broker reads, in bytes.
-pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+pub use xudo_gate::policy::{LoadedPolicy, PolicyError};
+/// The largest settings file the broker will accept, in bytes.
+pub const MAX_CONFIG_BYTES: usize = xudo_gate::MAX_CONFIG_BYTES;
 
-/// The ruleset and settings in force.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadedPolicy {
-    /// The validated ruleset and its generation.
-    pub rules: LoadedRuleSet,
-    /// The settings the engine decides with.
-    pub settings: Settings,
-}
-
-/// Why root's policy could not be loaded. Every variant fails closed.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PolicyError {
-    /// The ruleset failed the trust walk or is not a ruleset.
-    #[error("the ruleset cannot be loaded: {0}")]
-    Rules(TrustedRulesError),
-    /// The settings file, or a directory above it, failed the trust walk.
-    #[error("the settings file cannot be read: {0}")]
-    ConfigUntrusted(TrustError),
-    /// The settings file is not UTF-8.
-    #[error("{file} is not UTF-8")]
-    ConfigNotUtf8 {
-        /// The file.
-        file: String,
-    },
-    /// The settings file is not valid configuration.
-    #[error(transparent)]
-    ConfigInvalid(LoadError),
-}
-
-/// Where root's policy comes from, as a seam.
+/// Where the broker's policy comes from.
 pub trait PolicySource {
     /// Loads the ruleset and settings in force now.
     ///
     /// # Errors
     ///
-    /// A [`PolicyError`] for anything that cannot be loaded; there is no
-    /// partial policy.
+    /// Returns the shared policy error if trusted loading or parsing fails.
     fn load(&self) -> Result<LoadedPolicy, PolicyError>;
 }
 
-/// Root's policy on this host: the ruleset directory and the settings file.
+/// Root's policy on this host: the ruleset directory and settings file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPolicy {
     rules_dir: PathBuf,
@@ -79,7 +37,7 @@ pub struct HostPolicy {
 impl HostPolicy {
     /// `/etc/xudo/rules.d` and `/etc/xudo/config.toml`.
     pub fn system() -> Self {
-        let paths = SystemPaths::default();
+        let paths = xudo_config::SystemPaths::default();
         Self::new(paths.rules_dir(), paths.config())
     }
 
@@ -94,64 +52,8 @@ impl HostPolicy {
 
 impl PolicySource for HostPolicy {
     fn load(&self) -> Result<LoadedPolicy, PolicyError> {
-        self.load_with(&load_trusted_rules, &read_trusted_file)
+        xudo_gate::policy::load(&self.rules_dir, &self.config_file)
     }
-}
-
-/// The trusted read of the ruleset directory.
-type RulesRead = dyn Fn(&Path) -> Result<LoadedRuleSet, TrustedRulesError>;
-
-/// The trusted read of the settings file, to at most the given bytes.
-type ConfigRead = dyn Fn(&Path, usize) -> Result<Option<Vec<u8>>, TrustError>;
-
-impl HostPolicy {
-    /// [`PolicySource::load`], with the two trusted reads as parameters, so the
-    /// composition is tested on a host whose mount table cannot be read.
-    ///
-    /// Trait objects, not generics: one body, so the host's own reads and the
-    /// test's are the same code and the same coverage.
-    fn load_with(
-        &self,
-        rules: &RulesRead,
-        config: &ConfigRead,
-    ) -> Result<LoadedPolicy, PolicyError> {
-        let rules = rules(&self.rules_dir).map_err(PolicyError::Rules)?;
-        let config =
-            config(&self.config_file, MAX_CONFIG_BYTES).map_err(PolicyError::ConfigUntrusted)?;
-        // Mapped rather than `?`: a root-owned settings file that is broken
-        // cannot be planted on a development host, and every way
-        // `settings_from` refuses is pinned by its own tests below.
-        settings_from(config.as_deref(), &self.config_file)
-            .map(|settings| LoadedPolicy { rules, settings })
-    }
-}
-
-/// The engine's settings from the settings file's contents, or the documented
-/// defaults when there is no file.
-///
-/// The same derivation `xudo explain` makes, from the same `xudo-config`
-/// loader, so a key the front-end honours the broker honours too. A file that
-/// is present and broken is a refusal, never a quiet fall back to defaults: a
-/// settings file that does not mean what it says is exactly what this project
-/// refuses to paper over.
-///
-/// # Errors
-///
-/// [`PolicyError::ConfigNotUtf8`] or [`PolicyError::ConfigInvalid`].
-pub fn settings_from(contents: Option<&[u8]>, file: &Path) -> Result<Settings, PolicyError> {
-    let mut config = ConfigSettings::default();
-    if let Some(bytes) = contents {
-        let name = file.display().to_string();
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return Err(PolicyError::ConfigNotUtf8 { file: name });
-        };
-        xudo_config::apply_file(&mut config, Layer::System, &name, text)
-            .map_err(PolicyError::ConfigInvalid)?;
-    }
-    Ok(Settings {
-        confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value == Value::Bool(true),
-        frozen: config.get(Setting::Frozen).value == Value::Bool(true),
-    })
 }
 
 /// How the broker classifies the peer: `Unattested`, always, in M2b.
@@ -180,8 +82,7 @@ pub fn classify(identity: &PeerIdentity) -> CallerFacts {
     )
 }
 
-/// The decision for a request, made exactly as `xudo explain` makes it: the
-/// command, with no action named, through [`evaluate_command`].
+/// The decision for a request, made exactly as `xudo explain` makes it.
 pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerRequest) -> Decision {
     evaluate_command(
         &policy.rules.rules,
@@ -196,11 +97,35 @@ pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerReque
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
-    use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
-    use xudo_sys::Attestation;
+    use proptest::prelude::*;
+    use std::path::Path;
+    use xudo_policy::{DenialCode, RuleFile, Verdict, engine::Settings, load_rule_files};
+    use xudo_sys::{Attestation, TrustError, TrustedRulesError};
 
     use super::*;
     use crate::identify::EuidSource;
+
+    proptest! {
+        #[test]
+        fn shared_loader_handles_absent_and_present_settings(
+            agent in proptest::option::of(any::<bool>()),
+            human in proptest::option::of(any::<bool>()),
+            frozen in proptest::option::of(any::<bool>()),
+        ) {
+            let mut rows = Vec::new();
+            if let Some(value) = agent { rows.push(format!("confirm_agent_actions = {value}")); }
+            if let Some(value) = human { rows.push(format!("confirm_human_path = {value}")); }
+            if let Some(value) = frozen { rows.push(format!("frozen = {value}")); }
+            let bytes = rows.join("\n");
+            let loaded = xudo_gate::settings_from(
+                (!rows.is_empty()).then_some(bytes.as_bytes()),
+                Path::new("/etc/xudo/config.toml"),
+            ).unwrap();
+            prop_assert_eq!(loaded.confirm_agent_actions, agent.unwrap_or(Settings::default().confirm_agent_actions));
+            prop_assert_eq!(loaded.confirm_human_path, human.unwrap_or(Settings::default().confirm_human_path));
+            prop_assert_eq!(loaded.frozen, frozen.unwrap_or(Settings::default().frozen));
+        }
+    }
 
     fn policy_of(toml: &str) -> LoadedPolicy {
         LoadedPolicy {
@@ -314,6 +239,7 @@ args = [
             policy.settings = Settings {
                 confirm_agent_actions,
                 frozen,
+                ..Settings::default()
             };
             assert_eq!(decide(&policy, &caller, &request), baseline);
         }
@@ -331,13 +257,13 @@ args = [
 
     #[test]
     fn a_missing_settings_file_means_the_documented_defaults() {
-        let settings = settings_from(None, Path::new("/etc/xudo/config.toml")).unwrap();
+        let settings = xudo_gate::settings_from(None, Path::new("/etc/xudo/config.toml")).unwrap();
         assert_eq!(settings, Settings::default());
     }
 
     #[test]
     fn a_settings_file_is_honoured_as_the_front_end_honours_it() {
-        let settings = settings_from(
+        let settings = xudo_gate::settings_from(
             Some(b"confirm_agent_actions = false\nfrozen = true\n"),
             Path::new("/etc/xudo/config.toml"),
         )
@@ -346,7 +272,8 @@ args = [
             settings,
             Settings {
                 confirm_agent_actions: false,
-                frozen: true
+                confirm_human_path: false,
+                frozen: true,
             }
         );
     }
@@ -354,79 +281,16 @@ args = [
     #[test]
     fn a_broken_settings_file_is_a_refusal_not_a_fallback() {
         let file = Path::new("/etc/xudo/config.toml");
-        let err = settings_from(Some(b"confirm_agent_actions = \xff"), file).unwrap_err();
+        let err =
+            xudo_gate::settings_from(Some(b"confirm_agent_actions = \xff"), file).unwrap_err();
         assert_eq!(
             err,
-            PolicyError::ConfigNotUtf8 {
+            xudo_gate::SettingsError::NotUtf8 {
                 file: "/etc/xudo/config.toml".to_owned()
             }
         );
-        let err = settings_from(Some(b"skip_confirmation = true"), file).unwrap_err();
+        let err = xudo_gate::settings_from(Some(b"skip_confirmation = true"), file).unwrap_err();
         assert!(err.to_string().contains("/etc/xudo/config.toml"), "{err}");
-    }
-
-    // Handed to a parameter that must return a `Result`.
-    #[allow(clippy::unnecessary_wraps)]
-    fn no_rules(_: &Path) -> Result<LoadedRuleSet, TrustedRulesError> {
-        Ok(xudo_policy::load_rule_files(Vec::new()).unwrap())
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn no_config(_: &Path, _: usize) -> Result<Option<Vec<u8>>, TrustError> {
-        Ok(None)
-    }
-
-    fn untrusted() -> TrustError {
-        TrustError::NotAbsolute { at: "x".to_owned() }
-    }
-
-    #[test]
-    fn the_host_policy_is_the_trusted_ruleset_and_the_trusted_settings() {
-        // On every platform: the composition, with the trusted reads handed in.
-        let host = HostPolicy::new("/etc/xudo/rules.d", "/etc/xudo/config.toml");
-        let loaded = host.load_with(&no_rules, &no_config).unwrap();
-        assert!(loaded.rules.rules.is_empty());
-        assert_eq!(loaded.settings, Settings::default());
-
-        let loaded = host
-            .load_with(&no_rules, &|file, limit| {
-                assert_eq!(file, Path::new("/etc/xudo/config.toml"));
-                assert_eq!(limit, MAX_CONFIG_BYTES);
-                Ok(Some(b"frozen = true\n".to_vec()))
-            })
-            .unwrap();
-        assert!(loaded.settings.frozen);
-    }
-
-    #[test]
-    fn the_host_policy_refuses_whatever_either_trusted_read_refuses() {
-        let host = HostPolicy::new("/etc/xudo/rules.d", "/etc/xudo/config.toml");
-        let err = host
-            .load_with(
-                &|dir| {
-                    assert_eq!(dir, Path::new("/etc/xudo/rules.d"));
-                    Err(TrustedRulesError::Trust(untrusted()))
-                },
-                &no_config,
-            )
-            .unwrap_err();
-        assert_eq!(
-            err,
-            PolicyError::Rules(TrustedRulesError::Trust(untrusted()))
-        );
-        let err = host
-            .load_with(&no_rules, &|_, _| Err(untrusted()))
-            .unwrap_err();
-        assert_eq!(err, PolicyError::ConfigUntrusted(untrusted()));
-        let err = host
-            .load_with(&no_rules, &|_, _| Ok(Some(b"\xff".to_vec())))
-            .unwrap_err();
-        assert_eq!(
-            err,
-            PolicyError::ConfigNotUtf8 {
-                file: "/etc/xudo/config.toml".to_owned()
-            }
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -489,9 +353,9 @@ args = [
                 at: "x".to_owned(),
             })),
             PolicyError::ConfigUntrusted(TrustError::NotAbsolute { at: "x".to_owned() }),
-            PolicyError::ConfigNotUtf8 {
+            PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
                 file: "x".to_owned(),
-            },
+            }),
         ] {
             assert!(err.to_string().len() > 10, "{err:?}");
         }

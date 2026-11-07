@@ -28,6 +28,7 @@ predicates.workspace = true
 # `tests/root_probe.rs` installs the real snippet and writes a spool entry by
 # hand, with the same code the product uses for both.
 xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
+xudo-config = { path = "../xudo-config", version = "0.0.1" }
 xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
 # The broker runs in-process in the chain test, and its answer is read back.
 xudo-audit = { path = "../xudo-audit", version = "0.0.1" }

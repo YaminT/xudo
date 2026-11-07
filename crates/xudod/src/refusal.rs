@@ -138,9 +138,9 @@ mod tests {
         });
         assert_eq!(spool.code, RefusalCode::SpoolUnusable);
         assert_eq!(spool.fault, Fault::Broker);
-        let policy = Refusal::from(&PolicyError::ConfigNotUtf8 {
+        let policy = Refusal::from(&PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
             file: "f".to_owned(),
-        });
+        }));
         assert_eq!(policy.code, RefusalCode::PolicyUnloadable);
         assert_eq!(policy.fault, Fault::Broker);
     }

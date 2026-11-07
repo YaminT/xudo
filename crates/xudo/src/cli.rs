@@ -1089,6 +1089,7 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     Some(Settings {
         confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value
             == ConfigValue::Bool(true),
+        confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
 }
