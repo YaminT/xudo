@@ -4,6 +4,14 @@ Running log. Newest section first. This is where commentary lives instead of a c
 
 ---
 
+## 2026-11-07 — doctor reports rule drift and skipped sudoers snippets
+
+`xudo doctor` compares each loaded rule with dpkg's recorded `${Conffiles}` MD5. It runs `/usr/bin/dpkg-query` and `/usr/bin/md5sum` through the fixed-environment runner; current bytes come from the single `read_trusted_dir` result, which reads each rule through its verified descriptor. Records are parsed from the right so paths may contain spaces. dpkg's `obsolete` and `remove-on-upgrade` flags report `no longer shipped`, even when the retained file still has the old checksum; a `newconffile` has no usable baseline and reports `unknown`. A missing package record, failed command, or unavailable trusted read is also `unknown`; it is never presented as clean. The checksum is dpkg's upgrade baseline, not a trust decision.
+
+The sudoers check recognizes xudo's rule only at the exact canonical `/etc/sudoers.d/xudo` path. It reads candidate files through `read_trusted_file`. An absent canonical file says no xudo rule is installed; an unreadable file remains unknown. On doas hosts the sudoers check is explicitly inapplicable. A marked xudo snippet under a name with a dot or trailing `~` is reported as not in effect, because sudo skips those names. `a_locally_edited_shipped_rule_is_reported_as_changed_locally`, `an_obsolete_conffile_is_not_reported_as_shipped`, `conffile_records_parse_from_the_right_and_newconffile_is_unknown`, `a_snippet_named_with_a_dot_is_reported_not_in_effect`, and the package row in `ci/deb/row.sh` pin the report; the Debian matrix checks the installed package and a real edit. The packaged `willyoumarryme` alias has a `.so man1/ido.1` stub so lintian resolves its shared manual page.
+
+---
+
 ## 2026-11-06 — release workflow
 
 The release workflow starts on a pushed `v*` tag. `<tag>` is `v` plus the Cargo version unchanged (for example, `v0.1.0-beta.1`); `<ver>` is the Debian version used in the `.deb` filename (for example, `0.1.0~beta.1`). Native amd64 and arm64 jobs run `just deb-test` and upload the tested packages. A signing job uses cosign keyless through GitHub Actions OIDC, then a separate release job creates a draft prerelease. The owner reviews and publishes it by hand; no tag or release was created for this work.

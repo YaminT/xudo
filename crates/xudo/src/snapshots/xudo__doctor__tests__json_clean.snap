@@ -28,7 +28,22 @@ expression: "render::json_of(&report)"
       "trusted": true,
       "files_checked": 0,
       "reason": null
+    },
+    "package_drift": {
+      "files": [
+        {
+          "path": "/usr/bin/rule-0.toml",
+          "status": "unknown"
+        }
+      ],
+      "unavailable": "test fixture has no dpkg record"
     }
+  },
+  "sudoers_snippet": {
+    "installed_rule": null,
+    "not_in_effect": [],
+    "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
+    "unavailable": "test fixture has no sudoers directory"
   },
   "caller": {
     "classification": "unattested",

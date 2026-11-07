@@ -30,6 +30,8 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 **Step 4 status (2026-11-06):** release workflow implemented. It runs on a pushed `v*` tag and checks that `<tag>` is `v` plus the root Cargo version unchanged (for example, `v0.1.0-beta.1`); `<ver>` is the Debian version used in `.deb` filenames (for example, `0.1.0~beta.1`). It tests the packages natively on amd64 and arm64, signs the tested packages and checksums with cosign keyless, and creates only a draft prerelease. No tag or release has been created or published.
 
+**Man pages (2026-11-07):** `docs/man/xudo.1` and `docs/man/xudo-rules.5` are written. `packaging/deb/build.sh` installs both gzipped (`-9n`) with the other pages. The lintian `no-manual-page` override for `/usr/bin/xudo` is gone. `crates/xudo-bin/tests/man_page.rs` fails when a subcommand from `xudo --help` is missing from `xudo(1)`.
+
 This is the load-bearing decision of the whole phase, so it comes first.
 
 A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. Before M4 there is no reviewed enrollment path, no broker, and no out-of-band confirmation, so a passwordless rule would be a standing root grant with no compensating control.
@@ -48,7 +50,7 @@ The passwordless path arrives in a later release, behind an explicit `xudo enabl
 
 ## 2. Package layout
 
-**Status (2026-11-05):** staged from the static musl binaries, existing units, tmpfiles config, shipped rules, and existing man pages. Rules are conffiles; only the password-authenticated gate name is installed.
+**Status (2026-11-07):** staged from the static musl binaries, existing units, tmpfiles config, shipped rules, and the man pages, including `xudo(1)` and `xudo-rules(5)`. Rules are conffiles; only the password-authenticated gate name is installed.
 
 Build a single `.deb` directly with `dpkg-deb`; the small explicit staging script keeps the privileged file list reviewable.
 
@@ -91,6 +93,8 @@ Create the group in postinst (`addgroup --system xudo`), and **add nobody to it*
 ### 2.2 Rule files as conffiles
 
 Shipped rules under `/etc/xudo/rules.d/` are Debian conffiles, so dpkg prompts on local modification rather than overwriting. Consequence to test: an operator who narrows a shipped rule keeps their version across upgrades, which means an upgrade can leave a *stale* rule in place. `xudo doctor` must report the version of each rule file it loaded against the version the package shipped, so drift is visible rather than silent.
+
+**Status (2026-11-07):** implemented. `xudo doctor` compares each loaded rule's trusted bytes with dpkg's original conffile MD5 and reports `matches shipped`, `changed locally`, `not from the package`, or `unknown`. The `.deb` matrix checks the shipped baseline and a local edit. See `../CONCERNS.md`, 2026-11-07.
 
 ---
 
@@ -215,13 +219,15 @@ Every one of these appears in the README, the package description, and `xudo --v
 - **The deny-list is defence in depth, not the boundary.** The set of programs that can be turned into a root shell is not enumerable.
 - **`xudo` cannot protect a host that already has other paths to root.** `xudo doctor` reports pre-existing `NOPASSWD` entries, `wheel`/`sudo`/`docker`/`lxd` membership, writable unit directories, writable `PATH` entries, and writable shell rc files — any one of which makes `xudo` decorative.
 - **What is not in this release**: the passwordless agent path, the broker, out-of-band confirmation, Landlock confinement.
-- **No telemetry**, and how to verify it: no network code in the default build, networking behind a non-default cargo feature, and a CI job running the suite under `strace` asserting no non-`AF_UNIX` socket.
+- **No telemetry**, and how to verify it: a CI check tracing selected invocations of the shipped release-musl binaries under `strace` (failing outside `AF_UNIX`/`AF_LOCAL`) and checking their normal Cargo dependency tree for known networking crates.
 
 ---
 
 ## 7. Tests that gate the release
 
-**Status (2026-11-06):** `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`. The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems, including stock Ubuntu 26.04 and Alpine; the 26.04 systemd and differential lanes pass because they install GNU `id`.
+**Status (2026-11-07):** `just telemetry` traces selected invocations of the shipped release-musl binaries (`xudo`, `ido`, and `xudo-gate-auth`) under `strace`, failing on socket families outside `AF_UNIX`/`AF_LOCAL`, and checks their normal Cargo dependency tree for known networking crates; it is wired into `just ci` and the Ubuntu 24.04 workflow. `just deb-test` covers install, upgrade, remove, purge from the config-files state, an upgrade that must not restore a removed rule, package contents, conffiles, and lintian in Ubuntu 24.04, Ubuntu 26.04, and Debian 13 (Debian with `--no-install-recommends`). `just systemd-test` runs the same package with systemd as PID 1 and checks broker NNP plus the password and gate path across all three distributions. The README pipe-to-shell check remains in `xudo-tests`. The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems, including stock Ubuntu 26.04 and Alpine; the 26.04 systemd and differential lanes pass because they install GNU `id`.
+
+**Doctor regressions (2026-11-07):** `just deb-test` runs `xudo doctor` as root after install, checks every shipped rule is `matches shipped`, changes one rule and checks `changed locally`, then copies xudo's marker to `xudo.conf` and checks the report says it is not in effect because sudo skips dotted names.
 
 Run in containers, per distro, on both architectures.
 

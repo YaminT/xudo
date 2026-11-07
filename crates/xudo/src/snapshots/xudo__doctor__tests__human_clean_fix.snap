@@ -7,6 +7,10 @@ kernel       6.8 via SO_PEERPIDFD (kernel supports attestation for the planned a
 rules dir    /usr/bin
 ruleset      1 action(s), 1 file(s), generation e7f87e5d34d9
 rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
+rule package /usr/bin/rule-0.toml: unknown
+rule package unknown: test fixture has no dpkg record
+sudoers xudo unknown: canonical rule could not be read
+sudoers xudo unknown: test fixture has no sudoers directory
 classified   unattested
 password     required
 hints        1 recorded, 0 trusted

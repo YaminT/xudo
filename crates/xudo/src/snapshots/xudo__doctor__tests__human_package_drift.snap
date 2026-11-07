@@ -1,0 +1,65 @@
+---
+source: crates/xudo/src/doctor.rs
+expression: human(&report)
+---
+platform     test
+kernel       5.10 via SO_PEERCRED + pidfd_open (agent path WITHHELD: the pid SO_PEERCRED reports may be reissued before pidfd_open pins it, so the pin is not bound to the connection)
+rules dir    /etc/xudo/rules.d
+ruleset      NOT LOADED (run `xudo check` for the parse error)
+rules trust  UNTRUSTED: /etc/xudo is owned by uid 1000, not root
+rule package /etc/xudo/rules.d/00-shipped.toml: matches shipped
+rule package /etc/xudo/rules.d/05-edited.toml: changed locally
+rule package /etc/xudo/rules.d/06-obsolete.toml: no longer shipped
+rule package /etc/xudo/rules.d/99-operator.toml: not from the package
+rule package /etc/xudo/rules.d/90-unknown.toml: unknown
+rule package unknown: dpkg-query unavailable
+sudoers xudo no xudo rule installed at /etc/sudoers.d/xudo
+sudoers xudo /etc/sudoers.d/xudo.conf is not in effect: sudo skips filenames containing a dot or ending in ~
+sudoers xudo unknown: one candidate was not trusted
+classified   unavailable: cannot read self/stat: test stub refuses
+password     required (failing closed)
+backend      UNUSABLE: sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes xudo's settings to xudo's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); xudo refuses to install rather than install something weaker than it advertises
+exec path    xudo exec runs /usr/bin/sudo on the gate
+
+other paths to root, as yamin (uid 1000): 18 found, and 5 check(s) could not be completed
+  any one of these is a way to root that does not go through xudo
+  passwordless rules    FOUND, 5 examined
+    /etc/sudoers:3 NOPASSWD (names you): %adm ALL=(ALL) NOPASSWD: /usr/bin/apt
+    /etc/sudoers:4 include (may name you): @include "/etc/sudoers.l ocal"
+    /etc/sudoers.d/90 cloud:1 NOPASSWD (names others): alice ALL=(ALL) NOPASSWD:ALL
+    /etc/sudoers.d/91-defaults:1 !authenticate (may name you): Defaults:ADMINS !authenticate
+    /etc/doas.conf:1 nopass (may name you): permit nopass :wheel
+    cannot verify /etc/sudoers: line(s) 4 end in a backslash, or use an escape or quote, that xudo does not model, so which lines they join, and so whom a rule near it names, could not be verified
+    cannot verify /etc/sudoers.d/99-secret: Permission denied (os error 13)
+    cannot verify /etc/sudoers.l ocal: an include names it, and it does not exist
+    cannot verify /etc/sudoers.l\: an include names it, and it does not exist
+  group memberships     FOUND, 9 examined
+    docker (gid 999), listed in /etc/group and held now: the Docker daemon runs as root and starts any container you ask for, including one with / mounted (`docker run -v /:/host`): root, with no password
+    lxd (gid 997), listed in /etc/group, held from your next login: the LXD daemon starts a privileged container with the host's / attached on request: root, with no password
+    libvirt (gid 996), held by this session, not listed in /etc/group: the system libvirt daemon starts a VM with the host's disks attached on request: root, with no password
+    cannot verify /etc/group: this process holds gid 4242, which has no name there, so whether it is one of the groups below cannot be told (a directory service is not consulted)
+  unit directories      FOUND, 19 examined
+    /etc/systemd/system is writable by the group adm (gid 4), which you are in
+    /run/systemd/system is writable by its owner, alice (uid 1001)
+    /usr/local/lib/systemd/system is writable by you, by an ACL or a capability the mode bits do not show
+    /usr/lib/systemd/system/b.service is writable by its owner, uid 4242, and by the group with gid 4243
+    /usr/lib/systemd/system-generators does not exist, and /usr/lib/systemd, where it would be created, is writable by the group with gid 0, and by everyone
+  root's PATH           FOUND, 13 examined
+    /opt/rootbin is writable by its owner, you
+    cannot verify /etc/sudoers (/etc/sudoers.d/99-secret): root's secure_path may be set in a sudoers file that could not be read (3 such, the first at /etc/sudoers.d/99-secret); the stock directories were examined instead
+    cannot verify /etc/sudoers: root's secure_path may be set on a line xudo does not model, in a sudoers file it read (1 such, the first at /etc/sudoers); the directories it did find in secure_path, and the stock ones, were examined
+    note: the directories /etc/sudoers names in secure_path, and the stock ones
+  your PATH             FOUND, 2 examined
+    /home/yamin/bin: /home/yamin, above it, is writable by its owner, you; it comes before /usr/bin/sudo, so whatever is put there is found first
+    "" is a relative entry, looked up in whatever directory the shell is in
+    cannot verify /srv/sealed/a/b (/srv/sealed/a): Permission denied (os error 13)
+    note: the entries from /usr/bin on (1) were not examined: nothing there is found before /usr/bin/sudo
+  root's shell startup  FOUND, 25 examined
+    /etc/environment is writable by the group with gid 0, and by everyone
+    /etc/profile.d/xy.sh [1 terminal escape sequence(s) removed] is writable by the group with gid 0, and by everyone
+    cannot verify /root: Permission denied (os error 13): none of the files root's shells read there (.profile, .bash_profile, .bash_login, .bashrc, .zshenv, .zprofile, .zshrc, .zlogin, .config/fish/config.fish) could be examined
+  xudo group            exists (gid 998); you are not in it, and `xudo doctor --fix` shows how to join
+  unverified is not clean: run `sudo xudo doctor` to read what this account cannot, and keep this run for the checks that only mean something as you
+
+This build performs no privileged operation. Agent detection is not a
+security boundary; the allowlist and the compiled-in deny-list are.

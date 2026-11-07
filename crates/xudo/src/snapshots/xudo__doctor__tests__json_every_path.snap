@@ -24,7 +24,17 @@ expression: "render::json_of(&hostile_report(true))"
       "trusted": false,
       "files_checked": null,
       "reason": "/etc/xudo is owned by uid 1000, not root"
+    },
+    "package_drift": {
+      "files": [],
+      "unavailable": "rules did not load"
     }
+  },
+  "sudoers_snippet": {
+    "installed_rule": null,
+    "not_in_effect": [],
+    "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
+    "unavailable": "test fixture has no sudoers directory"
   },
   "caller": {
     "classification": null,

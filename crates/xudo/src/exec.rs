@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use xudo_backend::Probe;
 use xudo_backend::snippet::GATE_AUTH;
@@ -130,22 +130,87 @@ pub(crate) fn ask(
 ) -> Result<BrokerResponse, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .set_write_timeout(Some(timeout))
+        .and_then(|()| stream.set_read_timeout(Some(timeout)))
         .map_err(|e| e.to_string())?;
     // A failed write shows up as a failed read below, so it isn't checked twice.
     let _ = stream.write_all(request.to_json().as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Write);
+    read_response(&mut stream, timeout)
+}
+
+/// One response, bounded by [`MAX_RESPONSE_BYTES`].
+///
+/// The first complete JSON value is the reply.
+fn read_response(stream: &mut UnixStream, timeout: Duration) -> Result<BrokerResponse, String> {
+    use std::cell::RefCell;
+    let stream = RefCell::new(stream);
+    read_response_with(timeout, &mut |remaining, buffer| {
+        tighten_then_read(
+            remaining,
+            &mut |value| stream.borrow().set_read_timeout(value),
+            &mut |buffer| stream.borrow_mut().read(buffer),
+            buffer,
+        )
+    })
+}
+
+fn tighten_then_read(
+    remaining: Duration,
+    set: &mut dyn FnMut(Option<Duration>) -> std::io::Result<()>,
+    read: &mut dyn FnMut(&mut [u8]) -> std::io::Result<usize>,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    // macOS refuses SO_RCVTIMEO once the peer has closed; the first timeout still bounds the read.
+    let _ = set(Some(remaining));
+    read(buffer)
+}
+
+fn read_response_with(
+    timeout: Duration,
+    read: &mut dyn FnMut(Duration, &mut [u8]) -> std::io::Result<usize>,
+) -> Result<BrokerResponse, String> {
     let mut bytes = Vec::new();
+    let deadline = Instant::now().checked_add(timeout);
     // One byte past the limit, so an oversized answer is seen and refused.
-    let limit = u64::try_from(MAX_RESPONSE_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    stream
-        .take(limit)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    BrokerResponse::parse(&bytes).map_err(|e| e.to_string())
+    let limit = MAX_RESPONSE_BYTES.saturating_add(1);
+    loop {
+        if bytes.len() >= limit {
+            return Err("broker response exceeds size limit".to_owned());
+        }
+        if response_candidate(&bytes) {
+            if let Some(done) = response_in(&bytes) {
+                return done;
+            }
+        }
+        let remaining = deadline
+            .and_then(|at| at.checked_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| "broker response deadline expired".to_owned())?;
+        let mut buf = [0u8; 8192];
+        let want = limit.saturating_sub(bytes.len()).min(buf.len());
+        let (head, _) = buf.split_at_mut(want);
+        match read(remaining, head) {
+            Ok(0) => return reply_from(&bytes),
+            Ok(n) => bytes.extend(head.iter().copied().take(n)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn response_candidate(bytes: &[u8]) -> bool {
+    bytes.iter().rev().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'}')
+}
+
+/// The reply in `bytes`, or why it is not one.
+fn reply_from(bytes: &[u8]) -> Result<BrokerResponse, String> {
+    BrokerResponse::parse(bytes).map_err(|error| error.to_string())
+}
+
+/// `Some` once `bytes` is a whole reply.
+fn response_in(bytes: &[u8]) -> Option<Result<BrokerResponse, String>> {
+    BrokerResponse::parse(bytes).ok().map(Ok)
 }
 
 /// The argv as a shell line, for a human to read and paste. Display only.
@@ -244,7 +309,7 @@ mod tests {
             let (mut s, _) = listener.accept().unwrap();
             let mut request = Vec::new();
             s.read_to_end(&mut request).unwrap();
-            let _ = s.write_all(&reply);
+            s.write_all(&reply).unwrap();
             request
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -259,6 +324,25 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// The plan, or a panic that includes the captured stderr.
+    fn expect_plan(result: Result<ExecPlan, ExitCode>, err: &str) -> ExecPlan {
+        result.unwrap_or_else(|status| panic!("plan returned {status:?}: {err}"))
+    }
+
+    #[test]
+    fn a_failed_plan_is_reported_with_the_brokers_stderr() {
+        let panic = std::panic::catch_unwind(|| {
+            expect_plan(
+                Err(ExitCode::Unusable),
+                "the broker is unreachable (timed out)",
+            );
+        })
+        .unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap().clone();
+        assert!(message.contains("Unusable"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
     }
 
     fn json(answer: &Answer) -> Vec<u8> {
@@ -285,7 +369,8 @@ mod tests {
                 backend: "/usr/bin/sudo",
                 gate: GATE_AUTH,
                 spawn: false
-            })
+            }),
+            "{err}"
         );
         assert!(err.is_empty());
     }
@@ -293,22 +378,198 @@ mod tests {
     #[test]
     fn a_host_with_only_sudo_rs_uses_it() {
         let reply = decided(allow(), Some(minted(GATE_AUTH)));
-        let (result, _, _) = against(reply, &Has(&["/usr/bin/sudo-rs"]), &argv());
-        assert_eq!(result.unwrap().backend, "/usr/bin/sudo-rs");
+        let (result, _, err) = against(reply, &Has(&["/usr/bin/sudo-rs"]), &argv());
+        assert_eq!(expect_plan(result, &err).backend, "/usr/bin/sudo-rs");
     }
 
     #[test]
     fn doas_is_used_when_sudo_is_absent() {
         let reply = decided(allow(), Some(minted(GATE_AUTH)));
-        let (result, _, _) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
-        assert_eq!(result.unwrap().backend, "/usr/bin/doas");
+        let (result, _, err) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
+        assert_eq!(expect_plan(result, &err).backend, "/usr/bin/doas");
     }
 
     #[test]
     fn doas_is_run_as_a_child_so_xudo_stays_an_ancestor() {
         let reply = decided(allow(), Some(minted(GATE_AUTH)));
-        let (result, _, _) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
-        assert!(result.unwrap().spawn);
+        let (result, _, err) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
+        assert!(expect_plan(result, &err).spawn, "{err}");
+    }
+
+    #[test]
+    fn a_reply_already_in_hand_is_used_when_the_broker_does_not_hang_up() {
+        // The broker writes a full reply and keeps the socket open past the
+        // client's timeout. `read_to_end` would block until `SO_RCVTIMEO` and
+        // fail with `WouldBlock` — the macOS failure — even though the reply
+        // is already received.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let (release, hold) = std::sync::mpsc::channel();
+        let broker = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut request = Vec::new();
+            s.read_to_end(&mut request).unwrap();
+            s.write_all(&reply).unwrap();
+            let _ = hold.recv();
+            request
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let started = std::time::Instant::now();
+        let result = plan(
+            &cli(),
+            &argv(),
+            &SUDO,
+            &socket,
+            Duration::from_secs(5),
+            &mut out,
+            &mut err,
+        );
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(expect_plan(result, &err).backend, "/usr/bin/sudo");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "waited {elapsed:?} for the broker to hang up: {err}"
+        );
+        let sent = BrokerRequest::parse(&broker.join().unwrap()).unwrap();
+        assert_eq!(sent.program, argv()[0]);
+    }
+
+    #[test]
+    fn retries_an_interrupted_broker_read() {
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let mut interrupted = false;
+        let mut position = 0;
+        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
+            if !interrupted {
+                interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let count = buffer.len().min(reply.len().saturating_sub(position));
+            buffer[..count].copy_from_slice(&reply[position..position + count]);
+            position += count;
+            Ok(count)
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_refused_timeout_update_does_not_discard_a_reply() {
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let mut set_value = None;
+        let mut position = 0;
+        let count = tighten_then_read(
+            Duration::from_millis(250),
+            &mut |value| {
+                set_value = value;
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            },
+            &mut |buffer| {
+                let count = buffer.len().min(reply.len().saturating_sub(position));
+                buffer[..count].copy_from_slice(&reply[position..position + count]);
+                position += count;
+                Ok(count)
+            },
+            &mut [0; 4096],
+        )
+        .unwrap();
+        assert_eq!(set_value, Some(Duration::from_millis(250)));
+        assert_eq!(count, reply.len());
+        assert_eq!(&reply[..count], &reply);
+    }
+
+    #[test]
+    fn response_parser_rejects_incomplete_and_oversized_candidates() {
+        assert!(!response_candidate(b"  \n"));
+        assert!(response_candidate(b"{}"));
+        assert!(response_in(&[]).is_none());
+        assert!(response_in(b"{").is_none());
+        assert!(response_in(b"}").is_none());
+        let mut sent_candidate = false;
+        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
+            if sent_candidate {
+                Ok(0)
+            } else {
+                sent_candidate = true;
+                buffer[0] = b'}';
+                Ok(1)
+            }
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_malformed_closing_brace_candidate_is_rejected_after_eof() {
+        let mut sent_candidate = false;
+        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
+            if sent_candidate {
+                Ok(0)
+            } else {
+                sent_candidate = true;
+                buffer[0] = b'}';
+                Ok(1)
+            }
+        });
+        assert!(result.is_err(), "malformed broker reply was accepted");
+    }
+
+    #[test]
+    fn an_expired_overall_deadline_stops_a_silent_broker() {
+        let result = read_response_with(Duration::from_millis(1), &mut |_, _| {
+            thread::sleep(Duration::from_millis(5));
+            Err(std::io::ErrorKind::Interrupted.into())
+        });
+        assert_eq!(result, Err("broker response deadline expired".to_owned()));
+    }
+
+    #[test]
+    fn a_zero_socket_read_timeout_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+        });
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let result = read_response(&mut stream, Duration::ZERO);
+        assert!(result.is_err());
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn a_trickling_broker_cannot_extend_the_exchange_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            for byte in reply {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = ask(
+            &socket,
+            Duration::from_millis(180),
+            &BrokerRequest::new(argv()[0].clone(), argv()[1..].to_vec(), "unattested"),
+        );
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "trickling reply was accepted: {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "deadline took {elapsed:?}"
+        );
+        broker.join().unwrap();
     }
 
     #[test]
@@ -496,6 +757,7 @@ mod tests {
     fn quoting_keeps_an_empty_or_hostile_argument_one_word() {
         let quoted = display_quoted(&["a".into(), String::new(), "$(x) y".into()]);
         assert_eq!(quoted, "a '' '$(x) y'");
+        assert_eq!(display_quoted(&["a".into(), "b".into()]), "a b");
     }
 
     #[test]

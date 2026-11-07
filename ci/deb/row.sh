@@ -26,6 +26,15 @@ cp /debs/old.deb /debs/new.deb /tmp/ && cd /tmp
 # Install: pulls sudo, writes the rule, creates an empty group.
 deb_install ./old.deb
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
+doctor_out=$(xudo doctor)
+printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
+rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
+matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
+[ "$matching_count" -eq "$rules_count" ] || fail "doctor did not report every shipped rule as matches shipped"
+cp "$rule" /etc/sudoers.d/xudo.conf
+doctor_out=$(xudo doctor)
+printf '%s\n' "$doctor_out" | grep -Fq '/etc/sudoers.d/xudo.conf is not in effect:' || fail "doctor missed dotted xudo snippet"
+rm /etc/sudoers.d/xudo.conf
 if command -v debsums >/dev/null 2>&1; then debsums -s xudo || fail "debsums"; else dpkg --verify xudo || fail "dpkg --verify"; fi
 meta $rule "440 root:root"
 ! grep -qs NOPASSWD "$rule" || fail "NOPASSWD found in generated sudoers rule"
@@ -64,6 +73,8 @@ shipped=$(find /etc/sudoers.d -mindepth 1 -maxdepth 1 ! -name xudo | sort)
 
 # Upgrade keeps the rule, a group member, and an operator's edit to a shipped rule.
 echo '# mine' >>/etc/xudo/rules.d/05-probe.toml
+doctor_out=$(xudo doctor)
+printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
