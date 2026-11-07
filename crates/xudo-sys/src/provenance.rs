@@ -518,6 +518,8 @@ mod tests {
             pid: 5,
             comm: b"x".to_vec(),
             ppid: 4,
+            session: 4,
+            tty_nr: 0,
             starttime: 9,
         });
         assert_eq!(converted.pid, 5);

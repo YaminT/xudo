@@ -119,6 +119,12 @@ heartbeat and the backoff table. Not `req/`: the gate parses every name there.
 The broker decides; `xudo watch` only renders. On every `watch` and `answer`
 the broker identifies the peer as today, then requires, from kernel facts:
 
+Session id and terminal do not prove a human is watching: any same-user
+process can call `setsid`, open a new pty, and make it the controlling
+terminal, giving it a session and terminal different from the requester's.
+M3's safety therefore rests on the password (decision 7). Step 7 must
+re-read session and terminal on every `watch` and `answer`.
+
 - **A terminal**: `tty_nr` in `/proc/<pid>/stat` non-zero, a pts or vt major.
   Ownership follows: a terminal becomes controlling only when opened
   read-write, and a pts is `0620` owner. No fd passing.
@@ -252,7 +258,7 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `xudod::policy`.
 - **Exit.** Same bytes, same `Settings` in broker and gate; a broken or
   user-writable config refuses at the gate.
-- **Tests.** `gate_and_broker_derive_identical_settings` (proptest),
+- **Tests.** `shared_loader_handles_absent_and_present_settings` (proptest),
   `gate_refuses_a_config_on_a_user_writable_path`,
   `the_password_alone_does_not_satisfy_a_rule_when_the_watch_is_required`,
   `a_project_layer_cannot_turn_confirm_human_path_off`.
@@ -273,6 +279,7 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `stat_parsing_survives_a_comm_with_parens_and_spaces`.
 - **Lane.** `just verify`; `just linux-test` (real `openpty`; `unshare` where
   the container allows it, fixtures where not).
+- **Status (2026-11-07):** done.
 
 ### 3. Wire schema 2
 

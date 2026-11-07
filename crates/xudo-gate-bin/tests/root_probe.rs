@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use xudo_backend::{InstallPlan, detect};
-use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION};
+use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION};
 use xudo_gate::{CONFIG_FILE as GATE_CONFIG_FILE, SPOOL_DIR};
 use xudo_sys::{
     Clock, HostClock, HostInstallOps, HostProbe, InstallProbe, ProbeResult, VerifiedProc, execute,
@@ -264,7 +264,7 @@ fn write_entry(pin: (u32, u64), generation_offset: u64) -> String {
         program: "/usr/bin/id".to_owned(),
         argv: vec!["-u".to_owned()],
         generation: generation.saturating_add(generation_offset),
-        deadline: MonotonicSecs(HostClock.monotonic_secs().saturating_add(120)),
+        deadline: BoottimeMillis(HostClock.boottime_millis().saturating_add(120_000)),
         confirmed: false,
         confirmed_by: None,
         claimed_classification: "human".to_owned(),

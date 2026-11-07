@@ -26,7 +26,9 @@ use xudo_sys::{
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{Grant, Minting, REQUEST_TTL_SECS, draw_nonce, entry_for, publish};
+use crate::mint::{
+    Grant, Minting, REQUEST_TTL_MILLIS, REQUEST_TTL_SECS, draw_nonce, entry_for, publish,
+};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
@@ -47,7 +49,7 @@ pub struct Platform<'a> {
     /// host reads it through `Syscalls::peer_cred`, behind a check of the
     /// socket's kind, and never through rustix's own decode.
     pub peers: &'a dyn PeerCalls,
-    /// `CLOCK_MONOTONIC`, for deadlines.
+    /// `CLOCK_BOOTTIME`, for deadlines.
     pub clock: &'a dyn Clock,
     /// The random source nonces are drawn from.
     pub entropy: &'a dyn Entropy,
@@ -212,8 +214,8 @@ fn mint<S: Spool>(
             return refuse(conn, platform.audit, &refusal, known.0, known.1);
         }
     };
-    let now = platform.clock.monotonic_secs();
-    let deadline = now.saturating_add(REQUEST_TTL_SECS);
+    let now = platform.clock.boottime_millis();
+    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
     let entry = match entry_for(
         &decision,
         &identity,
@@ -348,7 +350,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use xudo_audit::record::{Decision as AuditDecision, Record};
-    use xudo_gate::request::{MonotonicSecs, PendingRequest};
+    use xudo_gate::request::{BoottimeMillis, PendingRequest};
     use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
     use xudo_sys::{
         Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakeHygiene, FakePeer, FakeSpool,
@@ -613,7 +615,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             minted,
             Some(&Minted {
                 nonce: NONCE.to_owned(),
-                deadline: NOW + REQUEST_TTL_SECS,
+                deadline: NOW + REQUEST_TTL_MILLIS,
                 ttl_secs: REQUEST_TTL_SECS,
                 gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
             })
@@ -627,7 +629,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(entry.program, "/usr/bin/systemctl");
         assert_eq!(entry.argv, ["restart", "nginx.service"]);
         assert_eq!(entry.generation, policy().rules.generation.id());
-        assert_eq!(entry.deadline, MonotonicSecs(NOW + REQUEST_TTL_SECS));
+        assert_eq!(entry.deadline, BoottimeMillis(NOW + REQUEST_TTL_MILLIS));
         assert!(!entry.confirmed);
         assert_eq!(
             spool.calls(),
@@ -966,7 +968,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "cron.service".to_owned()],
             generation: 1,
-            deadline: MonotonicSecs(NOW + 60),
+            deadline: BoottimeMillis(NOW + 60),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "unattested".to_owned(),

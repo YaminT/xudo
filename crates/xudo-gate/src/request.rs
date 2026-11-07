@@ -15,7 +15,7 @@
 //! 1. **It is this wire format.** An unknown schema, an unknown key, or a
 //!    missing key is a hard parse failure, never a partially-understood request.
 //! 2. **It is live.** Past its deadline, it is refused. Deadlines are in
-//!    monotonic seconds, so moving the wall clock cannot extend one.
+//!    boottime milliseconds, so suspend cannot extend one.
 //! 3. **It is this caller's.** The entry names the pid *and* the start time of
 //!    the `xudo` process it was minted for. A pid alone is a name that can be
 //!    reissued; `(pid, starttime)` identifies one process for as long as the
@@ -40,19 +40,17 @@ use serde::{Deserialize, Serialize};
 pub const SPOOL_DIR: &str = "/run/xudo/req";
 
 /// The wire version of a spool entry.
-pub const REQUEST_SCHEMA_VERSION: u32 = 1;
+pub const REQUEST_SCHEMA_VERSION: u32 = 2;
 
 /// How long a nonce is, in hex characters (32 random bytes).
 pub const NONCE_HEX_LEN: usize = 64;
 
-/// A monotonic instant, in whole seconds since an unspecified epoch.
+/// A boottime instant, in milliseconds since an unspecified epoch.
 ///
 /// Wrapped rather than passed as a bare `u64` because the *only* correct source
-/// is `CLOCK_MONOTONIC`: a deadline anchored to the wall clock is a deadline an
-/// operator extends by fixing their timezone, and an attacker extends by any
-/// means that moves the clock backwards.
+/// is `CLOCK_BOOTTIME`: unlike `CLOCK_MONOTONIC`, it advances during suspend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct MonotonicSecs(pub u64);
+pub struct BoottimeMillis(pub u64);
 
 /// The identity of one process, pinned against pid reuse.
 ///
@@ -121,11 +119,11 @@ pub enum RequestError {
         field: String,
     },
     /// The entry's deadline has passed.
-    #[error("request expired: deadline was {deadline} monotonic seconds, it is now {now}")]
+    #[error("request expired: deadline was {deadline} boottime milliseconds, it is now {now}")]
     Expired {
         /// The deadline it carried.
         deadline: u64,
-        /// The current monotonic reading.
+        /// The current boottime reading.
         now: u64,
     },
     /// The entry was minted for a different process.
@@ -233,8 +231,8 @@ pub struct PendingRequest {
     pub argv: Vec<String>,
     /// The policy generation in force when this was minted.
     pub generation: u64,
-    /// When this stops being valid, in monotonic seconds.
-    pub deadline: MonotonicSecs,
+    /// When this stops being valid, in boottime milliseconds.
+    pub deadline: BoottimeMillis,
     /// Whether a human approved this request, out of band.
     ///
     /// Set by the broker after the confirmation channel returned an approval,
@@ -302,7 +300,7 @@ impl PendingRequest {
         &self,
         caller: CallerPin,
         generation: u64,
-        now: MonotonicSecs,
+        now: BoottimeMillis,
     ) -> Result<(), RequestError> {
         if self.schema_version != REQUEST_SCHEMA_VERSION {
             return Err(RequestError::WrongSchema {
@@ -423,7 +421,7 @@ mod tests {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
-            deadline: MonotonicSecs(200),
+            deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "enrolled-agent".to_owned(),
@@ -431,12 +429,25 @@ mod tests {
     }
 
     fn check(request: &PendingRequest) -> Result<(), RequestError> {
-        request.validate(pin(), 7, MonotonicSecs(100))
+        request.validate(pin(), 7, BoottimeMillis(100))
     }
 
     #[test]
     fn a_well_formed_live_entry_for_this_caller_validates() {
         assert_eq!(check(&live()), Ok(()));
+    }
+
+    #[test]
+    fn a_schema_one_spool_entry_is_refused() {
+        let mut entry = live();
+        entry.schema_version = 1;
+        assert_eq!(
+            entry.validate(pin(), 7, BoottimeMillis(100)),
+            Err(RequestError::WrongSchema {
+                found: 1,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
     }
 
     #[test]
@@ -498,8 +509,8 @@ mod tests {
         assert_eq!(
             check(&request),
             Err(RequestError::WrongSchema {
-                found: 2,
-                expected: 1
+                found: REQUEST_SCHEMA_VERSION.saturating_add(1),
+                expected: REQUEST_SCHEMA_VERSION
             })
         );
         assert_eq!(check(&request).unwrap_err().code(), "request_wrong_schema");
@@ -698,7 +709,7 @@ mod tests {
     fn denies_an_entry_past_its_deadline_and_at_it() {
         let request = live();
         assert_eq!(
-            request.validate(pin(), 7, MonotonicSecs(200)),
+            request.validate(pin(), 7, BoottimeMillis(200)),
             Err(RequestError::Expired {
                 deadline: 200,
                 now: 200
@@ -707,12 +718,12 @@ mod tests {
         );
         assert_eq!(
             request
-                .validate(pin(), 7, MonotonicSecs(10_000))
+                .validate(pin(), 7, BoottimeMillis(10_000))
                 .unwrap_err()
                 .code(),
             "request_expired"
         );
-        assert_eq!(request.validate(pin(), 7, MonotonicSecs(199)), Ok(()));
+        assert_eq!(request.validate(pin(), 7, BoottimeMillis(199)), Ok(()));
     }
 
     #[test]
@@ -728,7 +739,7 @@ mod tests {
         request.program = "sh".to_owned();
         request.caller_pid = 1;
         request.generation = 0;
-        request.deadline = MonotonicSecs(0);
+        request.deadline = BoottimeMillis(0);
         // Codes are one-to-one with variants, so comparing the code names the
         // variant without a one-armed `matches!` behind it.
         assert_eq!(

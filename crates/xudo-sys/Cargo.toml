@@ -21,7 +21,7 @@ bstr.workspace = true
 # the features: the broker's safe calls (below) and `live.rs`, which reads this
 # process's own ids and groups (process) for `doctor`'s report of other paths
 # to root. The broker's calls: the socket checks and `SO_PEERCRED` (net),
-# `pidfd_open` (process), the liveness poll (event), `CLOCK_MONOTONIC` (time),
+# `pidfd_open` (process), the liveness poll (event), `CLOCK_BOOTTIME` (time),
 # and `getrandom` (rand). The gate's come from it too: `PR_SET_NO_NEW_PRIVS`
 # (thread) and the `dup2` that fills a closed standard stream (stdio).
 # Features of a crate already in the tree, not new crates.
