@@ -6,3 +6,4 @@ install      exit 0
 plan for     doas
 snippet      accepted by /usr/bin/doas -C /dev/stdin
 check        exit 0
+install real  installed, but NOT VERIFIED

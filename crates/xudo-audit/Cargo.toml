@@ -1,0 +1,24 @@
+[package]
+name = "xudo-audit"
+description = "Tamper-evident audit records for xudo: a hash-chained append-only log. Pure — it builds and verifies records, it does not choose where they go."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# The journal entry's MESSAGE quotes agent-influenced text for a terminal; the
+# sanitizer `ido` and the confirmation prompt use, so the three cannot drift.
+term-sanitize = { path = "../term-sanitize", version = "0.0.1" }
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+
+[lints]
+workspace = true

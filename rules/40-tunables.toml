@@ -12,7 +12,7 @@
 # what is being applied.
 
 [[action]]
-id = "aido.sysctl.max-map-count"
+id = "xudo.sysctl.max-map-count"
 tier = "sys-tunable"
 exe = "/usr/sbin/sysctl"
 args = [
@@ -23,7 +23,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.sysctl.inotify-watches"
+id = "xudo.sysctl.inotify-watches"
 tier = "sys-tunable"
 exe = "/usr/sbin/sysctl"
 args = [
@@ -34,7 +34,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.time.set-ntp"
+id = "xudo.time.set-ntp"
 tier = "sys-tunable"
 exe = "/usr/bin/timedatectl"
 args = [

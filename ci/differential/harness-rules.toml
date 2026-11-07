@@ -1,0 +1,10 @@
+# Harness only, never shipped. A command that fails with a status of its own:
+# expr exits 2 on a syntax error, in GNU and in busybox.
+[[action]]
+id = "harness.expr.fails"
+tier = "diag-read"
+exe = "/usr/bin/expr"
+args = [
+  { name = "left", matcher = { literal = "1" } },
+  { name = "op", matcher = { literal = "+" } },
+]

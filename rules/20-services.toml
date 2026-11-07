@@ -12,7 +12,7 @@
 # which is why unit-name requires an explicit suffix.
 
 [[action]]
-id = "aido.svc.lifecycle"
+id = "xudo.svc.lifecycle"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
 args = [
@@ -31,7 +31,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.svc.reset-failed"
+id = "xudo.svc.reset-failed"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
 args = [
@@ -41,12 +41,12 @@ args = [
 ]
 
 [[action]]
-id = "aido.svc.reload-units"
+id = "xudo.svc.reload-units"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
 # Zero arguments beyond the pinned flags. Note that daemon-reload re-reads every
 # unit search path, so this is only as safe as those directories' ownership,
-# which aido-sys verifies before the gate execs.
+# which xudo-sys verifies before the gate execs.
 args = [
   { name = "no-pager", matcher = { literal = "--no-pager" } },
   { name = "verb", matcher = { literal = "daemon-reload" } },

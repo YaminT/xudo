@@ -5,3 +5,4 @@ install      exit 0
 plan for     sudo
 snippet      accepted by /usr/sbin/visudo -cf /dev/stdin
 check        exit 0
+install real  verified: the functional probe passed

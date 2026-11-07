@@ -1,0 +1,10 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    policy_unloadable
+
+  trace
+
+  next      the ruleset is invalid and xudo is failing closed; an administrator must run `xudo check` and repair it

@@ -1,0 +1,8 @@
+---
+source: crates/xudo/src/cli.rs
+expression: out
+---
+ok: 4 action(s) in 3 file(s), generation bbe4cec1f889
+overlap: xudo.pkg.remove-toolchain (10-a.toml:3) and xudo.pkg.remove-quick (20-b.toml:3) both accept /usr/bin/apt-get remove gcc
+possible overlap: xudo.net.lookup-internal (30-c.toml:3) and xudo.net.lookup-any (30-c.toml:9): cannot compare `host` (pattern "[a-z]+\\.internal") against `target` (pattern "[a-z.]+") exactly
+2 overlapping pair(s): a command more than one action accepts is refused to an agent if any of them is human-only, and confirmed as strictly as the strictest demands

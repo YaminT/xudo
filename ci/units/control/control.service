@@ -4,10 +4,10 @@
 # one removed line can be seen to push it over. It is never installed.
 
 [Unit]
-Description=aido units lane control service
+Description=xudo units lane control service
 
 [Service]
-ExecStart=/usr/libexec/aido/control
+ExecStart=/usr/libexec/xudo/control
 RuntimeMaxSec=30
 CapabilityBoundingSet=
 AmbientCapabilities=

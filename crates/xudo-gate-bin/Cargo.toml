@@ -1,0 +1,56 @@
+[package]
+name = "xudo-gate-bin"
+description = "The `xudo-gate` executable, installed as /usr/libexec/xudo/xudo-gate with xudo-gate-auth as a hardlink. A five-line entry point over the xudo-gate library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package, for the reason `xudo-bin` is: the library is compiled, and
+# so measured, exactly once, and `tests/binary.rs` runs the real binary.
+[[bin]]
+name = "xudo-gate"
+path = "src/main.rs"
+
+[dependencies]
+xudo-gate = { path = "../xudo-gate", version = "0.0.1" }
+
+# `tests/binary.rs` runs the binary as a process, under each name a hardlink
+# could give it. It lives in this package because Cargo builds the binary for,
+# and sets `CARGO_BIN_EXE_xudo-gate` in, only this package's integration tests.
+[dev-dependencies]
+# The root-lane guard every `tests/root_*.rs` begins with.
+xudo-tests = { path = "../xudo-tests", version = "0.0.1" }
+assert_cmd.workspace = true
+predicates.workspace = true
+# `tests/root_probe.rs` installs the real snippet and writes a spool entry by
+# hand, with the same code the product uses for both.
+xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
+xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
+# The broker runs in-process in the chain test, and its answer is read back.
+xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
+xudod = { path = "../xudod", version = "0.0.1" }
+# The pseudo-terminal `xudo exec` is driven on, the way `ido-bin`'s tests do it.
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "pty",
+  "fs",
+] }
+
+[features]
+# The tests that must run as uid 0: every `tests/root_*.rs`. Only
+# `ci/root-test.sh` (`just root-test`) runs them as root; the suites that enable
+# every feature build them and let them skip, loudly. Nothing shipped reads it.
+root-tests = []
+
+# Without the feature the target does not exist, so a lane that forgot it fails
+# ("requires the features") rather than running an empty binary and passing.
+[[test]]
+name = "root_probe"
+required-features = ["root-tests"]
+
+[lints]
+workspace = true

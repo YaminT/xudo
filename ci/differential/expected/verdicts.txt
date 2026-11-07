@@ -1,7 +1,7 @@
 # /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
   "verdict": "allow",
   "denial": null,
-  "action": "aido.svc.lifecycle",
+  "action": "xudo.svc.lifecycle",
 exit 0
 
 # /usr/bin/systemctl restart nginx.service
@@ -31,13 +31,13 @@ exit 17
 # /usr/bin/systemctl --no-pager --full status nginx.service
   "verdict": "allow",
   "denial": null,
-  "action": "aido.svc.status",
+  "action": "xudo.svc.status",
 exit 0
 
 # /usr/bin/journalctl --no-pager -u nginx.service -n 100
   "verdict": "allow",
   "denial": null,
-  "action": "aido.svc.logs",
+  "action": "xudo.svc.logs",
 exit 0
 
 # /usr/bin/journalctl --no-pager -u nginx.service -n 100000
@@ -49,13 +49,13 @@ exit 17
 # /usr/bin/ss -tulpnH
   "verdict": "allow",
   "denial": null,
-  "action": "aido.net.listeners",
+  "action": "xudo.net.listeners",
 exit 0
 
 # /usr/bin/apt-get -y --no-install-recommends install -- curl
   "verdict": "allow",
   "denial": null,
-  "action": "aido.pkg.install",
+  "action": "xudo.pkg.install",
 exit 0
 
 # /usr/bin/apt-get -y --no-install-recommends install -- ./evil.deb
@@ -73,13 +73,13 @@ exit 17
 # /usr/bin/apt-get -y remove -- build-essential
   "verdict": "allow_with_confirmation",
   "denial": null,
-  "action": "aido.pkg.remove",
+  "action": "xudo.pkg.remove",
 exit 18
 
 # /usr/sbin/sysctl -q -w vm.max_map_count 262144
   "verdict": "allow",
   "denial": null,
-  "action": "aido.sysctl.max-map-count",
+  "action": "xudo.sysctl.max-map-count",
 exit 0
 
 # /usr/sbin/sysctl -q -w kernel.core_pattern |/bin/sh
@@ -97,7 +97,7 @@ exit 17
 # /usr/bin/timedatectl set-ntp false
   "verdict": "allow",
   "denial": null,
-  "action": "aido.time.set-ntp",
+  "action": "xudo.time.set-ntp",
 exit 0
 
 # /bin/sh -c id

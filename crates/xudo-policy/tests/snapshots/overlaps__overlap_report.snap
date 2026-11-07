@@ -1,0 +1,10 @@
+---
+source: crates/xudo-policy/tests/overlaps.rs
+expression: "report.join(\"\\n\")"
+---
+overlap: xudo.pkg.remove (overlaps.toml:4) and xudo.pkg.remove-toolchain (overlaps.toml:15) both accept /usr/bin/apt-get -y remove -- gcc
+overlap: xudo.svc.status (overlaps.toml:35) and xudo.svc.status-full (overlaps.toml:45) both accept /usr/bin/systemctl status --full a.service
+overlap: xudo.sysctl.watches-low (overlaps.toml:67) and xudo.sysctl.watches-high (overlaps.toml:76) both accept /usr/sbin/sysctl fs.inotify.max_user_watches 65536
+overlap: xudo.dir.claim-srv (overlaps.toml:86) and xudo.dir.claim-app (overlaps.toml:92) both accept /usr/local/bin/claim /srv/app
+possible overlap: xudo.net.lookup-internal (overlaps.toml:105) and xudo.net.lookup-any (overlaps.toml:111): cannot compare `host` (pattern "[a-z]+\\.internal") against `target` (pattern "[a-z.]+") exactly
+possible overlap: xudo.sep.one (overlaps.toml:119) and xudo.sep.two (overlaps.toml:128): both accept `run --` position by position, but not as a canonical argument list, which is all the engine matches

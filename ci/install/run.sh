@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# `aido install` and `aido install --uninstall`, run for real as root inside a
+# `xudo install` and `xudo install --uninstall`, run for real as root inside a
 # container of its own, against real sudo, sudo-rs, and OpenDoas.
 #
-#   ci/install/run.sh <static linux aido binary>          (or: just install-root)
+#   ci/install/run.sh <static linux xudo binary>          (or: just install-root)
 #
 # Why this is not part of `just linux-test`: that suite runs as an unprivileged
 # user on purpose, because root ignores file modes and every "a writable file is
@@ -17,7 +17,7 @@
 # was; and uninstall removes exactly what install wrote and nothing else.
 #
 # The one thing it does NOT prove is that the gate runs as root through the rule:
-# `aido install` cannot yet ask the broker for a request (M2b plan item C1), so
+# `xudo install` cannot yet ask the broker for a request (M2b plan item C1), so
 # its functional probe is missing. row.sh asserts the install says so, loudly,
 # rather than claiming to have verified. The root lane (`just root-test`, job
 # `root-tests`) proves that path with a hand-written request, for sudo. This
@@ -34,7 +34,7 @@ rows=(
 )
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <static linux aido binary>" >&2
+    echo "usage: $0 <static linux xudo binary>" >&2
     exit 2
 fi
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -60,7 +60,7 @@ for spec in "${rows[@]}"; do
     IFS='|' read -r row image setup <<<"$spec"
     echo "== $row  ($image)"
     if ! docker run --rm \
-        -v "$bin:/usr/local/bin/aido:ro" \
+        -v "$bin:/usr/local/bin/xudo:ro" \
         -v "$here:/harness:ro" \
         -v "$out:/out" \
         "$image" sh /harness/row.sh "$row" "$setup"; then

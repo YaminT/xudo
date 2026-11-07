@@ -7,7 +7,7 @@
 
 #![no_main]
 
-use aido_policy::{Arg, Argv};
+use xudo_policy::{Arg, Argv};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -18,7 +18,7 @@
 # standing on.
 
 [[action]]
-id = "aido.pkg.install"
+id = "xudo.pkg.install"
 tier = "pkg-install"
 exe = "/usr/bin/apt-get"
 args = [
@@ -30,13 +30,13 @@ args = [
 ]
 
 [[action]]
-id = "aido.pkg.update"
+id = "xudo.pkg.update"
 tier = "pkg-install"
 exe = "/usr/bin/apt-get"
 args = [{ name = "verb", matcher = { literal = "update" } }]
 
 [[action]]
-id = "aido.pkg.remove"
+id = "xudo.pkg.remove"
 tier = "pkg-remove"
 exe = "/usr/bin/apt-get"
 confirm = "always"
@@ -48,7 +48,7 @@ args = [
 ]
 
 [[action]]
-id = "aido.pkg.dry-run-install"
+id = "xudo.pkg.dry-run-install"
 tier = "diag-read"
 # Simulation only. This is what the broker runs to render a preview into the
 # confirmation prompt, so a human approving a removal sees what will actually go.

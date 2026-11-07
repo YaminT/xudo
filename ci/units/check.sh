@@ -17,7 +17,7 @@
 #             every unit type.
 #   exposure  `systemd-analyze security --offline`: systemd's own score for how
 #             much a service's sandbox leaves open, held under a ceiling. It is
-#             the net under crates/aidod/tests/units.rs, which asserts each line
+#             the net under crates/xudod/tests/units.rs, which asserts each line
 #             by name and knows only the lines its author thought of. Applies to
 #             services only: given a socket it scores everything a socket does
 #             not declare, 9.6 UNSAFE, which means nothing.
@@ -166,7 +166,7 @@ self_test() {
     refuses "a hardening directive under the wrong heading" verify control.service \
         '/^ProtectKernelLogs=yes$/d;/^\[Unit\]$/a ProtectKernelLogs=yes' || failed=1
     refuses "a dependency no unit provides" verify control.service \
-        '/^\[Unit\]$/a Requires=aido-units-lane-missing.service' || failed=1
+        '/^\[Unit\]$/a Requires=xudo-units-lane-missing.service' || failed=1
     refuses "a socket directive misspelled" verify control.socket \
         's/^SocketMode=/SocketModee=/' || failed=1
     refuses "a sandbox directive removed" exposure control.service \

@@ -7,7 +7,7 @@
 #
 # ci/linux-test.sh and ci/root-test.sh both take this lock, at this path, so a
 # run of one waits for a run of the other. They share the two cache volumes
-# (aido-linux-cargo and aido-linux-target) and the Docker VM's memory, and
+# (xudo-linux-cargo and xudo-linux-target) and the Docker VM's memory, and
 # parallel agents working in separate worktrees would otherwise race both: the
 # target volume rebuilt from under each other, and enough concurrent rustc
 # processes to get one killed with no message. The root run also leaves
@@ -19,7 +19,7 @@
 # shell that took it exits.
 take_machine_lock() {
     local who=$1 holder announced=0
-    machine_lock="${TMPDIR:-/tmp}/aido-linux-test.lock"
+    machine_lock="${TMPDIR:-/tmp}/xudo-linux-test.lock"
     until mkdir "$machine_lock" 2>/dev/null; do
         holder=$(cat "$machine_lock/pid" 2>/dev/null || true)
         if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then

@@ -1,0 +1,9 @@
+# The one action `xudo install` runs to see the gate work as root: print the
+# effective uid, nothing else. The single literal argument leaves `-un`, `-G`
+# and a username (which would read another account) unmatched.
+
+[[action]]
+id = "xudo.probe.id"
+tier = "diag-read"
+exe = "/usr/bin/id"
+args = [{ name = "effective-uid", matcher = { literal = "-u" } }]

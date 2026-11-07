@@ -10,9 +10,9 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aido_audit::Outcome;
-use aido_config::XdgPaths;
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use xudo_audit::Outcome;
+use xudo_config::XdgPaths;
 
 use crate::agents_doc::{self, Added};
 use crate::celebrate::{Style, celebrate};
@@ -1059,9 +1059,9 @@ mod tests {
         let store = store(&h).unwrap();
         let chain = store.read_log().unwrap();
         store
-            .append_log(&aido_audit::Record::after(
+            .append_log(&xudo_audit::Record::after(
                 chain.records().last(),
-                aido_audit::Decision::Denied,
+                xudo_audit::Decision::Denied,
                 vec!["x".into()],
                 "other",
             ))

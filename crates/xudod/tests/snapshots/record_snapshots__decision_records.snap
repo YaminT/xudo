@@ -1,0 +1,102 @@
+---
+source: crates/xudod/tests/record_snapshots.rs
+expression: text
+---
+## minted
+{
+  "action": "xudo.svc.restart",
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "allowed",
+  "denial": null,
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=xudod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b",
+    "nonce=abababababababababababababababababababababababababababababababab",
+    "deadline=1900"
+  ],
+  "hash": "834bd49dc54cc82d6117352d669327bc205ed8eacc10398acd0faf96f41bae5c",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": "20-services.toml:3",
+  "schema_version": 1,
+  "seq": 1
+}
+
+## awaiting confirmation
+{
+  "action": "xudo.svc.restart",
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "awaiting_confirmation",
+  "denial": null,
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=xudod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b"
+  ],
+  "hash": "66a631d67ee6339e301a011d8aa96fd410f3270c68a9a0142ad6ec82e02e4c90",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": "20-services.toml:3",
+  "schema_version": 1,
+  "seq": 1
+}
+
+## denied
+{
+  "action": null,
+  "argv": [
+    "x"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "argv_rejected",
+  "deny_list_version": 1,
+  "evidence": [
+    "broker=xudod",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "claimed_classification=enrolled-agent-yolo",
+    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b"
+  ],
+  "hash": "8d0b6987104bae009696e680d3369209f94bfa4d4183d350996732c39c4a9eab",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}

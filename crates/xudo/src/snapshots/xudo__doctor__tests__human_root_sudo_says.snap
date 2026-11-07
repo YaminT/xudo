@@ -1,0 +1,34 @@
+---
+source: crates/xudo/src/doctor.rs
+expression: human(&report)
+---
+platform     test
+kernel       6.13 via SO_PEERPIDFD + PIDFD_GET_INFO (agent path available)
+rules dir    /usr/bin
+ruleset      1 action(s), 1 file(s), generation e7f87e5d34d9
+rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
+classified   unattested
+password     required
+hints        1 recorded, 0 trusted
+backend      sudo (Sudo version 1.9.16)
+backend caps 6 of 7 supported
+             absent: rejects argument wildcards
+exec path    xudo exec runs /usr/bin/sudo on the gate
+
+other paths to root, as root (uid 0): 1 found
+  any one of these is a way to root that does not go through xudo
+  passwordless rules    FOUND, 0 examined
+    sudo itself lists a rule for alice that needs no password: (ALL) NOPASSWD: ALL
+    note: sudo itself was asked about alice
+  group memberships     skipped
+    note: you are root, so no group grants you more; run `xudo doctor` as the user an agent runs as
+  unit directories      clean, 18 examined
+  root's PATH           clean, 7 examined
+    note: the stock secure_path directories; there is no /etc/sudoers
+  your PATH             clean, 0 examined
+    note: the entries from /usr/bin on (1) were not examined: nothing there is found before /usr/bin/sudo
+  root's shell startup  clean, 24 examined
+  xudo group            exists (gid 998); you are not in it, and `xudo doctor --fix` shows how to join
+
+This build performs no privileged operation. Agent detection is not a
+security boundary; the allowlist and the compiled-in deny-list are.
