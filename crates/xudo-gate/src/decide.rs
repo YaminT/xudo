@@ -36,7 +36,7 @@ use xudo_policy::{
 };
 
 use crate::env::child_environment;
-use crate::request::{CallerPin, MonotonicSecs, PendingRequest, RequestError};
+use crate::request::{BoottimeMillis, CallerPin, PendingRequest, RequestError};
 
 /// The caller, as the gate itself established it.
 ///
@@ -81,8 +81,8 @@ pub const UNKNOWN_UID: u32 = u32::MAX;
 pub struct GateContext {
     /// The policy generation currently in force, read from root-owned state.
     pub generation: u64,
-    /// The current monotonic reading.
-    pub now: MonotonicSecs,
+    /// The current boottime reading.
+    pub now: BoottimeMillis,
     /// Global settings, loaded from the root-owned config.
     pub settings: engine::Settings,
     /// Whether this invocation proves a human typed a password.
@@ -175,7 +175,7 @@ pub enum Stage {
     Lineage,
     /// Load the root-owned ruleset.
     Rules,
-    /// Read the monotonic clock.
+    /// Read the boottime clock.
     Clock,
     /// Open, list, or consume the spool.
     Spool,
@@ -201,7 +201,7 @@ impl Stage {
             Self::Lineage => "walk its lineage",
             Self::Rules => "load the root-owned ruleset",
             Self::Config => "load the root-owned configuration",
-            Self::Clock => "read the monotonic clock",
+            Self::Clock => "read the boottime clock",
             Self::Spool => "use the spool",
             Self::Program => "open the program",
             Self::Audit => "record the authorization",
@@ -412,13 +412,7 @@ pub fn decide(
         // here even though the front-end may already have shown a prompt: the
         // gate's evidence that a human approved is the broker's record, and
         // there isn't one.
-        Verdict::AllowWithConfirmation
-            if if context.settings.confirm_human_path {
-                !(pending.confirmed && context.password_confirms)
-            } else {
-                !(pending.confirmed || context.password_confirms)
-            } =>
-        {
+        Verdict::AllowWithConfirmation if !confirmation_satisfied(pending, &context) => {
             return Err(Refusal::ConfirmationMissing(Box::new(decision)));
         }
         Verdict::Allow | Verdict::AllowWithConfirmation => {}
@@ -458,6 +452,14 @@ pub fn decide(
         requested_rule_source: action.source.to_string(),
         nonce: pending.nonce.clone(),
     })
+}
+
+fn confirmation_satisfied(pending: &PendingRequest, context: &GateContext) -> bool {
+    if context.settings.confirm_human_path {
+        pending.confirmed && context.password_confirms
+    } else {
+        pending.confirmed || context.password_confirms
+    }
 }
 
 /// The canonical operands of a request, rendered for a decision envelope.
@@ -619,7 +621,7 @@ mod tests {
     use xudo_policy::{Classification, Hint, HintSource};
 
     use super::*;
-    use crate::request::{MonotonicSecs, REQUEST_SCHEMA_VERSION};
+    use crate::request::{BoottimeMillis, REQUEST_SCHEMA_VERSION};
 
     const NONCE: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     const GENERATION: u64 = 12;
@@ -699,7 +701,7 @@ args = [
     fn context() -> GateContext {
         GateContext {
             generation: GENERATION,
-            now: MonotonicSecs(100),
+            now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: false,
         }
@@ -715,7 +717,7 @@ args = [
             program: "/usr/bin/systemctl".to_owned(),
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             generation: GENERATION,
-            deadline: MonotonicSecs(200),
+            deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "enrolled-agent".to_owned(),
@@ -772,7 +774,7 @@ args = [
         // Shape and liveness are settled before policy, so a forged entry cannot
         // provoke a policy *answer* it can learn from.
         let mut pending = status_request(77);
-        pending.deadline = MonotonicSecs(50);
+        pending.deadline = BoottimeMillis(50);
         let refusal = decide(&rules(), &human(77), Some(&pending), context()).unwrap_err();
         assert_eq!(refusal.code(), "request_expired");
         assert_eq!(refusal.severity(), Severity::Normal);
@@ -1312,7 +1314,7 @@ args = [
         let denied = request(77, "xudo.reload.confirmed", &["daemon-reload", "--now"]);
         assert!(decide(&rules, &human(77), Some(&denied), typed).is_err());
         let expired = GateContext {
-            now: MonotonicSecs(300),
+            now: BoottimeMillis(300),
             ..typed
         };
         assert_eq!(

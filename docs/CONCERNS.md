@@ -2,6 +2,17 @@
 
 Running log. Newest section first. This is where commentary lives instead of a chat transcript, so it should be readable cold, months later, by someone who was not here.
 
+## 2026-11-07 — M3 step 2: boottime deadline units
+
+Use `CLOCK_BOOTTIME` milliseconds for broker and gate deadlines so suspend
+counts against the request TTL. Spool entries move to schema 2; the gate
+refuses schema 1 because its `CLOCK_MONOTONIC` seconds cannot safely be
+interpreted as boottime milliseconds. Wire response shape stays unchanged:
+`Minted.deadline` is now boottime milliseconds and `ttl_secs` remains seconds.
+Nested-pid-namespace detection is tested on fixtures only because the Linux
+lane cannot `unshare`. The audit decision record now labels its millisecond
+deadline `deadline_ms=`.
+
 ---
 
 ## 2026-11-07 — M3 step 1

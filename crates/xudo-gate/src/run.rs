@@ -40,7 +40,7 @@
 //!    entry named by a nonce is read on a descriptor of its own. Exactly one
 //!    must be pinned to an ancestor: none is [`Refusal::NoPendingRequest`],
 //!    more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
-//!    one `CLOCK_MONOTONIC` that a deadline is stamped and judged on, and a
+//!    one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!    reading of zero is refused as no reading.
 //! 9. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
 //!    through the verified directory descriptor before anything executes, and
@@ -99,7 +99,9 @@ use crate::decide::{
     exec_failure_record, refusal_record,
 };
 use crate::policy::{LoadedPolicy, PolicyError};
-use crate::request::{CallerPin, MonotonicSecs, PendingRequest, RequestError, SPOOL_DIR, is_nonce};
+use crate::request::{
+    BoottimeMillis, CallerPin, PendingRequest, RequestError, SPOOL_DIR, is_nonce,
+};
 
 /// The first descriptor the gate marks close-on-exec: everything above the
 /// three standard streams.
@@ -152,7 +154,7 @@ pub trait GateHost {
     fn syscalls(&self) -> &dyn Syscalls;
     /// What the gate settles about its own process.
     fn hygiene(&self) -> &dyn Hygiene;
-    /// The monotonic clock.
+    /// The boottime clock.
     fn clock(&self) -> &dyn Clock;
     /// Opens `/proc` and proves it is procfs.
     ///
@@ -504,7 +506,7 @@ fn proceed(
 
     let context = GateContext {
         generation: loaded.rules.generation.id(),
-        now: MonotonicSecs(now),
+        now: BoottimeMillis(now),
         settings: loaded.settings,
         password_confirms: entry.password_confirms(),
     };
@@ -546,20 +548,20 @@ fn proceed(
     Err(execute(host, &authorized, &program))
 }
 
-/// Reads the monotonic clock, refusing a reading that cannot be one.
+/// Reads boottime, refusing a reading that cannot be one.
 ///
-/// The clock is the broker's: [`xudo_sys::HostClock`], the one `CLOCK_MONOTONIC`
-/// a deadline is stamped and judged on. It cannot fail, and for a `tv_sec` the
-/// kernel never reports (a negative one) it answers zero. Zero is the
+/// The clock is the broker's: [`xudo_sys::HostClock`], the one `CLOCK_BOOTTIME`
+/// a deadline is stamped and judged on. It cannot fail, and for a negative
+/// reading it answers zero. Zero is the
 /// fail-closed reading for the broker, which then stamps a deadline already
 /// behind it, and the wrong direction here, where it would make every deadline
 /// look still ahead. No host is up for less than a second with a caller
 /// waiting on a request, so a zero is no reading, and the gate refuses it.
 fn read_clock(clock: &dyn Clock) -> Result<u64, Refusal> {
-    match clock.monotonic_secs() {
+    match clock.boottime_millis() {
         0 => Err(Refusal::Failed {
             stage: Stage::Clock,
-            reason: "the monotonic clock read zero seconds, which is no reading".to_owned(),
+            reason: "the boottime clock read zero milliseconds, which is no reading".to_owned(),
         }),
         secs => Ok(secs),
     }
@@ -811,7 +813,7 @@ args = [
             program: "/usr/bin/systemctl".to_owned(),
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             generation: rules().generation.id(),
-            deadline: MonotonicSecs(200),
+            deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "enrolled-agent".to_owned(),
@@ -1172,7 +1174,7 @@ args = [
         let caller = caller_for(Some(&found), CallerPin::new(500, 9_000));
         let context = GateContext {
             generation: rules().generation.id(),
-            now: MonotonicSecs(100),
+            now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: true,
         };
@@ -1751,7 +1753,7 @@ args = [
 
     #[test]
     fn a_clock_that_reads_zero_stops_the_gate_because_no_deadline_can_be_judged() {
-        // `HostClock` answers zero for a `tv_sec` the kernel never gives. That
+        // `HostClock` answers zero for a negative clock reading. That
         // is the fail-closed reading for the broker, which then stamps a
         // deadline already behind it, and it would be the fail-open one here:
         // every deadline would look still ahead. Zero is no reading.
@@ -1762,9 +1764,27 @@ args = [
             "gate_failed_clock",
         );
         assert!(exit.message.contains("severity normal"), "{}", exit.message);
-        // And a clock that reads one second is a clock.
+        // And a clock that reads one millisecond is a clock.
         assert_eq!(read_clock(&FixedClock(1)), Ok(1));
         assert!(read_clock(&FixedClock(0)).is_err());
+    }
+
+    #[test]
+    fn a_fake_boottime_reading_after_suspend_expires_the_deadline() {
+        let mut pending = ours();
+        pending.deadline = BoottimeMillis(900_000);
+        let now_after_suspend = FixedClock(900_001).boottime_millis();
+        assert_eq!(
+            pending.validate(
+                CallerPin::new(pending.caller_pid, pending.caller_starttime),
+                pending.generation,
+                BoottimeMillis(now_after_suspend),
+            ),
+            Err(crate::request::RequestError::Expired {
+                deadline: 900_000,
+                now: 900_001,
+            })
+        );
     }
 
     // ---- the invocation ---------------------------------------------------
@@ -1906,7 +1926,7 @@ args = [
         // Constructed without opening anything.
         assert!(format!("{host:?}").contains("SystemHost"));
         assert!(host.hygiene().pid() > 0);
-        assert!(host.clock().monotonic_secs() > 0);
+        assert!(host.clock().boottime_millis() > 0);
         // Nothing here is a ruleset, a spool, or a root-owned program.
         assert!(host.load_policy().is_err());
         assert!(host.open_spool().is_err());

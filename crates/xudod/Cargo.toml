@@ -27,6 +27,8 @@ xudo-sys = { path = "../xudo-sys", version = "0.0.1", features = ["fake"] }
 rustix = { version = "1.1", default-features = false, features = [
   "std",
   "process",
+  "pty",
+  "fs",
 ] }
 serde_json.workspace = true
 proptest.workspace = true

@@ -39,7 +39,7 @@ pub fn decided(
     evidence.push(format!("generation={}", generation.hex()));
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
-        evidence.push(format!("deadline={}", entry.deadline.0));
+        evidence.push(format!("deadline_ms={}", entry.deadline.0));
     }
 
     // A minted entry is recorded as the gate will read it, which is what
@@ -101,6 +101,9 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
         format!("rung={}", identity.rung.mechanism()),
         format!("peer_pid={}", identity.pid),
         format!("peer_starttime={}", identity.starttime),
+        format!("peer_sid={}", identity.sid),
+        format!("peer_tty={}", identity.tty),
+        format!("diverged={}", identity.diverged),
         format!("peer_uid={}", identity.uid),
         format!("peer_gid={}", identity.gid),
         format!("pinned={}", identity.pinned),
@@ -146,6 +149,9 @@ mod tests {
             uid: 1000,
             gid: 100,
             starttime: 998_877,
+            sid: 1,
+            tty: 0,
+            diverged: false,
             pinned: true,
             cgroup_id,
             euid_source: EuidSource::PidfdInfo,
@@ -198,7 +204,7 @@ mod tests {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
-            deadline: xudo_gate::request::MonotonicSecs(1_900),
+            deadline: xudo_gate::request::BoottimeMillis(1_900),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "enrolled-agent-yolo".to_owned(),
@@ -233,7 +239,7 @@ mod tests {
             "claimed_classification=enrolled-agent-yolo".to_owned(),
             format!("generation={}", generation().hex()),
             format!("nonce={}", "ab".repeat(32)),
-            "deadline=1900".to_owned(),
+            "deadline_ms=1900".to_owned(),
         ] {
             assert!(
                 record.evidence.contains(&expected),

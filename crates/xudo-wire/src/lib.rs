@@ -293,8 +293,8 @@ pub struct Minted {
     /// For correlation with the audit trail. The gate finds the entry by the
     /// caller's pinned identity, not by a nonce anyone presents to it.
     pub nonce: String,
-    /// When the entry stops being valid, in whole seconds of
-    /// `CLOCK_MONOTONIC` on this host.
+    /// When the entry stops being valid, in milliseconds of `CLOCK_BOOTTIME`
+    /// on this host.
     pub deadline: u64,
     /// How long that is from when it was minted, in seconds.
     pub ttl_secs: u64,

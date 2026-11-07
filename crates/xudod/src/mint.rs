@@ -41,7 +41,7 @@
 use std::fmt::Write as _;
 
 use xudo_audit::Approval;
-use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
+use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
 use xudo_policy::Decision;
 use xudo_sys::{
     Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
@@ -61,6 +61,8 @@ use crate::identify::PeerIdentity;
 /// `(pid, starttime)` and consumed on use, so its lifetime is not the window
 /// in which it can be abused.
 pub const REQUEST_TTL_SECS: u64 = 15 * 60;
+/// Request lifetime in the clock's millisecond unit.
+pub const REQUEST_TTL_MILLIS: u64 = REQUEST_TTL_SECS * 1_000;
 
 /// The most live entries the spool holds.
 pub const MAX_SPOOL_ENTRIES: usize = 64;
@@ -174,7 +176,7 @@ pub struct Minting<'a> {
     pub json: &'a str,
     /// The effective uid its caller connected with.
     pub uid: u32,
-    /// Now, in whole seconds of `CLOCK_MONOTONIC`.
+    /// Now, in milliseconds of `CLOCK_BOOTTIME`.
     pub now: u64,
 }
 
@@ -234,7 +236,7 @@ pub fn entry_for(
         program: request.program.clone(),
         argv: request.argv.clone(),
         generation,
-        deadline: MonotonicSecs(deadline),
+        deadline: BoottimeMillis(deadline),
         confirmed: false,
         confirmed_by: None,
         claimed_classification: request.claimed_classification.clone(),
@@ -344,7 +346,7 @@ fn classify<S: Spool + ?Sized>(
     let Some(existing) = parsed else {
         return Existing::Stale;
     };
-    let expired = existing.deadline <= MonotonicSecs(minting.now);
+    let expired = existing.deadline <= BoottimeMillis(minting.now);
     let misnamed = existing.nonce != text;
     let superseded = existing.caller_pid == minting.entry().caller_pid
         && existing.caller_starttime == minting.entry().caller_starttime;
@@ -406,6 +408,9 @@ mod tests {
             uid: 1000,
             gid: 100,
             starttime,
+            sid: 1,
+            tty: 0,
+            diverged: false,
             pinned: true,
             cgroup_id: None,
             euid_source: EuidSource::ProcStatus,
@@ -426,7 +431,7 @@ mod tests {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
-            deadline: MonotonicSecs(deadline),
+            deadline: BoottimeMillis(deadline),
             confirmed: false,
             confirmed_by: None,
             claimed_classification: "unattested".to_owned(),
@@ -919,6 +924,6 @@ mod tests {
     #[test]
     fn the_ttl_covers_sudos_default_conversation() {
         // passwd_timeout (5 minutes) times passwd_tries (3).
-        assert_eq!(REQUEST_TTL_SECS, 5 * 60 * 3);
+        assert_eq!(REQUEST_TTL_MILLIS, 5 * 60 * 3 * 1_000);
     }
 }

@@ -21,14 +21,16 @@
     clippy::disallowed_methods
 )]
 
+use std::fs::File;
 use std::io::Read as _;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 use rustix::io::Errno;
 use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use xudo_policy::{Decision, RuleFile, Verdict, load_rule_files};
 use xudo_sys::{
     Attestation, FakeAuditSink, FakeSpool, HostClock, HostEntropy, HostPeer, HostSyscalls,
@@ -123,6 +125,49 @@ fn a_live_peer_is_named_on_the_rung_the_kernel_version_predicts() {
 
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn a_live_peer_on_a_real_pty_has_kernel_session_and_terminal_facts() {
+    let path = scratch("pty-peer").join("peer.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let master: OwnedFd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let pty_name = ptsname(&master, Vec::new()).unwrap();
+    let slave = File::options()
+        .read(true)
+        .write(true)
+        .open(pty_name.to_str().unwrap())
+        .unwrap();
+    let mut child = Command::new("/usr/bin/setsid")
+        .args([
+            "-w",
+            "-c",
+            "/usr/bin/perl",
+            "-MSocket",
+            "-e",
+            "socket(my $s, AF_UNIX, SOCK_STREAM, 0) or die $!; connect($s, pack_sockaddr_un($ARGV[0])) or die $!; sleep 30;",
+        ])
+        .arg(&path)
+        .env_clear()
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let identity = identify(stream.as_fd(), &HostSyscalls, &HostPeer).unwrap();
+    assert_eq!(identity.pid, child.id());
+    assert!(!identity.diverged);
+    assert_eq!(identity.sid, i64::from(child.id()));
+    assert_ne!(
+        identity.tty, 0,
+        "a real controlling pty has a nonzero tty_nr"
+    );
+    drop(stream);
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]
@@ -223,6 +268,8 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         &request.to_json(),
     );
     let conn = UnixConnection::adopt(stream.as_fd(), xudod::IO_TIMEOUT).unwrap();
+    let identity = identify(stream.as_fd(), &HostSyscalls, &HostPeer).unwrap();
+    assert!(!identity.diverged);
     let mut audit = FakeAuditSink::new();
     let hygiene = xudo_sys::FakeHygiene::new(std::process::id());
     let mut platform = Platform {
@@ -235,7 +282,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         audit: &mut audit,
     };
     let spool = FakeSpool::new();
-    let before = xudo_sys::Clock::monotonic_secs(&HostClock);
+    let before = xudo_sys::Clock::boottime_millis(&HostClock);
     let served = serve(&conn, &mut platform, Ok(&spool));
     assert_eq!(served, Served::Minted);
     drop(conn);
@@ -249,7 +296,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     assert_eq!(decision.verdict, Verdict::Allow);
     let minted = minted.unwrap();
     assert!(xudo_gate::request::is_nonce(&minted.nonce));
-    assert!(minted.deadline >= before + xudod::mint::REQUEST_TTL_SECS);
+    assert!(minted.deadline >= before + xudod::mint::REQUEST_TTL_MILLIS);
 
     let files = spool.files();
     let entry = xudo_gate::PendingRequest::parse(
