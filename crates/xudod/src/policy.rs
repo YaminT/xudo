@@ -84,11 +84,18 @@ pub fn classify(identity: &PeerIdentity) -> CallerFacts {
 
 /// The decision for a request, made exactly as `xudo explain` makes it.
 pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerRequest) -> Decision {
+    let Some((program, argv, _)) = request.run_fields() else {
+        return Decision::deny(
+            xudo_policy::DenialCode::ArgvRejected,
+            Vec::new(),
+            Vec::new(),
+        );
+    };
     evaluate_command(
         &policy.rules.rules,
         caller,
-        &Arg::from(request.program.as_str()),
-        &Argv::new(request.argv.iter().map(String::as_str)),
+        &Arg::from(program),
+        &Argv::new(argv.iter().map(String::as_str)),
         policy.settings,
     )
 }
@@ -219,12 +226,32 @@ args = [
         let policy = policy_of(RULES);
         let caller = classify(&identity(true));
         let mut honest = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
-        honest.claimed_classification = "human".to_owned();
+        honest.question = xudo_wire::Question::Run {
+            program: "/usr/bin/systemctl".to_owned(),
+            argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            claimed_classification: "human".to_owned(),
+        };
         let mut lying = honest.clone();
-        lying.claimed_classification = "enrolled-agent-yolo".to_owned();
+        lying.question = xudo_wire::Question::Run {
+            program: "/usr/bin/systemctl".to_owned(),
+            argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            claimed_classification: "enrolled-agent-yolo".to_owned(),
+        };
         assert_eq!(
             decide(&policy, &caller, &honest),
             decide(&policy, &caller, &lying)
+        );
+    }
+
+    #[test]
+    fn decide_refuses_a_non_run_question_closed() {
+        let loaded = policy_of(RULES);
+        let caller = classify(&identity(true));
+        let mut request = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
+        request.question = xudo_wire::Question::Watch;
+        assert_eq!(
+            decide(&loaded, &caller, &request).denial,
+            Some(DenialCode::ArgvRejected)
         );
     }
 

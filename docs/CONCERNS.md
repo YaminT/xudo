@@ -1,5 +1,21 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-07 — M3 step 3: wire schema 2
+
+The broker protocol now carries one `question` per connection under schema 2.
+The `run` question uses the existing policy and mint path; `status`, `watch`,
+`answer`, `freeze` and `thaw` currently receive `request_unknown` until step 5
+adds their state. Request nonce IDs are exactly 64 lowercase hexadecimal
+characters. New question and answer strings and lists have explicit bounds.
+`Minted` now returns relative `expires_in_ms`; no client read `ttl_secs`, so
+both it and the client-visible boottime deadline were removed. Confirmation
+denials append as 9–11 and map to exit 18; refusal codes append as 15–17.
+Schema 1 requests receive `request_wrong_schema`.
+Serde also accepts array/positional enum forms and unit variants as plain strings; these pre-existing forms cannot carry extra fields.
+
+---
+
+
 Running log. Newest section first. This is where commentary lives instead of a chat transcript, so it should be readable cold, months later, by someone who was not here.
 
 ## 2026-11-07 — M3 step 2: boottime deadline units

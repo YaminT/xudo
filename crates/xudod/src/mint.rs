@@ -227,19 +227,22 @@ pub fn entry_for(
     let Some(action) = &decision.action else {
         return Err(MintError::NoAction);
     };
+    let Some((program, argv, claimed_classification)) = request.run_fields() else {
+        return Err(MintError::NoAction);
+    };
     Ok(PendingRequest {
         schema_version: REQUEST_SCHEMA_VERSION,
         nonce,
         caller_pid: identity.pid,
         caller_starttime: identity.starttime,
         action: action.as_str().to_owned(),
-        program: request.program.clone(),
-        argv: request.argv.clone(),
+        program: program.to_owned(),
+        argv: argv.to_vec(),
         generation,
         deadline: BoottimeMillis(deadline),
         confirmed: false,
         confirmed_by: None,
-        claimed_classification: request.claimed_classification.clone(),
+        claimed_classification: claimed_classification.to_owned(),
     })
 }
 
@@ -552,6 +555,16 @@ mod tests {
         });
         assert!(!minted.confirmed);
         assert_eq!(minted.confirmed_by, None);
+    }
+
+    #[test]
+    fn a_non_run_question_cannot_be_minted() {
+        let mut request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
+        request.question = xudo_wire::Question::Watch;
+        assert_eq!(
+            entry_for(&permitted(), &identity(1, 1), &request, 7, 1, nonce('a')),
+            Err(MintError::NoAction)
+        );
     }
 
     #[test]

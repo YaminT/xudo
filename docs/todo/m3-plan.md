@@ -292,6 +292,8 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `an_unknown_question_is_malformed`, `an_answer_without_a_token_is_malformed`,
   `a_status_id_that_is_not_a_nonce_is_malformed`.
 - **Lane.** `just verify`, `just fuzz`.
+- **Status (2026-11-07):** done. `run` is ported end to end; other questions
+  currently receive `request_unknown` until step 5 implements the state machine.
 
 ### 4. The state machine, pure
 

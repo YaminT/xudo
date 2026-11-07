@@ -134,6 +134,12 @@ pub enum DenialCode {
     /// for Y" is the shape of an attempted bypass, and folding it into
     /// `argv_rejected` would hide it among ordinary typos.
     ExeMismatch,
+    /// A human explicitly refused the confirmation request.
+    ConfirmationRefused,
+    /// The confirmation request expired before it was answered.
+    ConfirmationExpired,
+    /// A duplicate or backoff-limited confirmation request was throttled.
+    ConfirmationThrottled,
 }
 
 impl DenialCode {
@@ -148,6 +154,9 @@ impl DenialCode {
             Self::NoConfirmationChannel => 6,
             Self::HumanPathOnly => 7,
             Self::ExeMismatch => 8,
+            Self::ConfirmationRefused => 9,
+            Self::ConfirmationExpired => 10,
+            Self::ConfirmationThrottled => 11,
         }
     }
 
@@ -162,6 +171,9 @@ impl DenialCode {
             Self::NoConfirmationChannel => "no_confirmation_channel",
             Self::HumanPathOnly => "human_path_only",
             Self::ExeMismatch => "exe_mismatch",
+            Self::ConfirmationRefused => "confirmation_refused",
+            Self::ConfirmationExpired => "confirmation_expired",
+            Self::ConfirmationThrottled => "confirmation_throttled",
         }
     }
 
@@ -202,6 +214,13 @@ impl DenialCode {
             Self::ExeMismatch => {
                 "this action runs a different program than the one requested; run `xudo list` \
                  to find the action that names this program"
+            }
+            Self::ConfirmationRefused => "the human refused this request; do not retry it",
+            Self::ConfirmationExpired => {
+                "the request expired; ask a person to approve it again with `xudo watch` before running it"
+            }
+            Self::ConfirmationThrottled => {
+                "an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`"
             }
         }
     }
@@ -364,7 +383,15 @@ impl Decision {
             // status on purpose: from a caller's side both mean "nobody has
             // approved this", and both are retryable once a channel is live.
             (Verdict::AllowWithConfirmation, _)
-            | (Verdict::Deny, Some(DenialCode::NoConfirmationChannel)) => ExitCode::NotConfirmed,
+            | (
+                Verdict::Deny,
+                Some(
+                    DenialCode::NoConfirmationChannel
+                    | DenialCode::ConfirmationRefused
+                    | DenialCode::ConfirmationExpired
+                    | DenialCode::ConfirmationThrottled,
+                ),
+            ) => ExitCode::NotConfirmed,
             (Verdict::Deny, Some(DenialCode::PolicyUnloadable)) => ExitCode::Unusable,
             (Verdict::Deny, _) => ExitCode::Denied,
         }
@@ -377,7 +404,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 8] = [
+    const ALL_CODES: [DenialCode; 11] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -386,6 +413,9 @@ mod tests {
         DenialCode::NoConfirmationChannel,
         DenialCode::HumanPathOnly,
         DenialCode::ExeMismatch,
+        DenialCode::ConfirmationRefused,
+        DenialCode::ConfirmationExpired,
+        DenialCode::ConfirmationThrottled,
     ];
 
     #[test]
@@ -400,7 +430,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();
@@ -462,6 +492,28 @@ mod tests {
 
         let unconfirmed = Decision::deny(DenialCode::NoConfirmationChannel, Vec::new(), Vec::new());
         assert_eq!(unconfirmed.exit_code(), ExitCode::NotConfirmed);
+    }
+
+    #[test]
+    fn denies_confirmation_codes_from_falling_back_to_exit_17() {
+        let confirmation_codes = ALL_CODES
+            .into_iter()
+            .filter(|code| {
+                matches!(
+                    code,
+                    DenialCode::NoConfirmationChannel
+                        | DenialCode::ConfirmationRefused
+                        | DenialCode::ConfirmationExpired
+                        | DenialCode::ConfirmationThrottled
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(confirmation_codes.len(), 4);
+        for code in confirmation_codes {
+            let decision = Decision::deny(code, Vec::new(), Vec::new());
+            assert_eq!(decision.exit_code(), ExitCode::NotConfirmed, "{code:?}");
+            assert_eq!(decision.exit_code().as_i32(), 18, "{code:?}");
+        }
     }
 
     #[test]

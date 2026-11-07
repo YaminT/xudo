@@ -32,10 +32,9 @@ pub fn decided(
 ) -> Record {
     let mut evidence = vec!["broker=xudod".to_owned()];
     evidence.extend(identity_evidence(identity));
-    evidence.push(format!(
-        "claimed_classification={}",
-        request.claimed_classification
-    ));
+    if let Some((_, _, claimed)) = request.run_fields() {
+        evidence.push(format!("claimed_classification={claimed}"));
+    }
     evidence.push(format!("generation={}", generation.hex()));
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
@@ -79,10 +78,10 @@ pub fn refused(
         evidence.extend(identity_evidence(identity));
     }
     if let Some(request) = request {
-        evidence.push(format!(
-            "claimed_classification={}",
-            request.claimed_classification
-        ));
+        evidence.push(format!("question={}", question_kind(&request.question)));
+        if let Some((_, _, claimed)) = request.run_fields() {
+            evidence.push(format!("claimed_classification={claimed}"));
+        }
     }
     Record::after(
         previous,
@@ -93,6 +92,17 @@ pub fn refused(
     .with_denial(refusal.code.as_str())
     .with_evidence(evidence)
     .with_outcome(Outcome::NotExecuted)
+}
+
+fn question_kind(question: &xudo_wire::Question) -> &'static str {
+    match question {
+        xudo_wire::Question::Run { .. } => "run",
+        xudo_wire::Question::Status { .. } => "status",
+        xudo_wire::Question::Watch => "watch",
+        xudo_wire::Question::Answer { .. } => "answer",
+        xudo_wire::Question::Freeze { .. } => "freeze",
+        xudo_wire::Question::Thaw => "thaw",
+    }
 }
 
 /// The evidence for how the peer was identified.
@@ -117,9 +127,13 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
 
 /// The request's command as one argv, program first, exactly as asked.
 fn command_of(request: &BrokerRequest) -> Vec<String> {
-    let mut command = vec![request.program.clone()];
-    command.extend(request.argv.iter().cloned());
-    command
+    request
+        .run_fields()
+        .map_or_else(Vec::new, |(program, argv, _)| {
+            let mut command = vec![program.to_owned()];
+            command.extend(argv.iter().cloned());
+            command
+        })
 }
 
 /// The audit trail's word for a verdict.
@@ -175,6 +189,48 @@ mod tests {
         )
     }
 
+    #[test]
+    fn refusal_records_name_every_question_kind_without_its_secret_fields() {
+        let refusal = Refusal::client(RefusalCode::RequestUnknown, "private detail");
+        for (question, kind) in [
+            (
+                xudo_wire::Question::Run {
+                    program: "/bin/id".to_owned(),
+                    argv: Vec::new(),
+                    claimed_classification: "x".to_owned(),
+                },
+                "run",
+            ),
+            (xudo_wire::Question::Status { id: "a".repeat(64) }, "status"),
+            (xudo_wire::Question::Watch, "watch"),
+            (
+                xudo_wire::Question::Answer {
+                    id: "a".repeat(64),
+                    token: "secret-token".to_owned(),
+                    approve: true,
+                },
+                "answer",
+            ),
+            (
+                xudo_wire::Question::Freeze {
+                    reason: "secret-reason".to_owned(),
+                },
+                "freeze",
+            ),
+            (xudo_wire::Question::Thaw, "thaw"),
+        ] {
+            let request = BrokerRequest {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                question,
+            };
+            let record = refused(None, &refusal, None, Some(&request));
+            assert!(record.evidence.contains(&format!("question={kind}")));
+            let evidence = record.evidence.join(" ");
+            assert!(!evidence.contains("secret-token"));
+            assert!(!evidence.contains("secret-reason"));
+        }
+    }
+
     fn generation() -> Generation {
         xudo_policy::load_rule_files(Vec::new()).unwrap().generation
     }
@@ -191,6 +247,31 @@ mod tests {
         decision.action = Some(ActionId::new("xudo.svc.restart"));
         decision.rule_source = Some(Source::new("20-services.toml", 3));
         decision
+    }
+
+    #[test]
+    fn a_non_run_decision_record_does_not_invent_a_command_or_claim() {
+        let request = BrokerRequest {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Watch,
+        };
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let record = decided(
+            None,
+            &decision,
+            &caller(),
+            &identity(None),
+            &request,
+            &generation(),
+            None,
+        );
+        assert!(record.argv.is_empty());
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("claimed_classification="))
+        );
     }
 
     #[test]

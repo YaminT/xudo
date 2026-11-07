@@ -68,7 +68,7 @@ exe = "/bin/sh"
 args = [{ name = "flag", matcher = { literal = "-c" } }]
 "#;
 
-const ALL_CODES: [DenialCode; 8] = [
+const ALL_CODES: [DenialCode; 11] = [
     DenialCode::UnknownAction,
     DenialCode::ArgvRejected,
     DenialCode::DenyListed,
@@ -77,6 +77,9 @@ const ALL_CODES: [DenialCode; 8] = [
     DenialCode::NoConfirmationChannel,
     DenialCode::HumanPathOnly,
     DenialCode::ExeMismatch,
+    DenialCode::ConfirmationRefused,
+    DenialCode::ConfirmationExpired,
+    DenialCode::ConfirmationThrottled,
 ];
 
 const ALL_REASONS: [ConfirmReason; 3] = [
@@ -171,6 +174,9 @@ fn denial(code: DenialCode) -> Decision {
             ),
             Settings::default(),
         ),
+        DenialCode::ConfirmationRefused
+        | DenialCode::ConfirmationExpired
+        | DenialCode::ConfirmationThrottled => Decision::deny(code, Vec::new(), Vec::new()),
     }
 }
 

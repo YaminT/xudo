@@ -26,9 +26,7 @@ use xudo_sys::{
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{
-    Grant, Minting, REQUEST_TTL_MILLIS, REQUEST_TTL_SECS, draw_nonce, entry_for, publish,
-};
+use crate::mint::{Grant, Minting, REQUEST_TTL_MILLIS, draw_nonce, entry_for, publish};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
@@ -119,6 +117,19 @@ pub fn serve<S: Spool>(
         Ok(request) => request,
         Err(refusal) => return refuse(conn, platform.audit, &refusal, Some(&identity), None),
     };
+    if !matches!(request.question, xudo_wire::Question::Run { .. }) {
+        let refusal = Refusal::client(
+            RefusalCode::RequestUnknown,
+            "question is not implemented in this broker step",
+        );
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(&identity),
+            Some(&request),
+        );
+    }
     let spool = match spool {
         Ok(spool) => spool,
         Err(error) => {
@@ -282,8 +293,7 @@ fn mint<S: Spool>(
 
     let minted = Minted {
         nonce,
-        deadline,
-        ttl_secs: REQUEST_TTL_SECS,
+        expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
     };
     answer(
@@ -291,6 +301,10 @@ fn mint<S: Spool>(
         &BrokerResponse::decided(decision, Some(minted)),
         Served::Minted,
     )
+}
+
+fn remaining_millis(deadline: u64, now: u64) -> u64 {
+    deadline.saturating_sub(now)
 }
 
 /// Records a refusal and sends it.
@@ -368,6 +382,12 @@ mod tests {
     const GID: u32 = 100;
     const START: u64 = 998_877;
     const NOW: u64 = 10_000;
+
+    #[test]
+    fn an_expired_mint_reports_zero_remaining_lifetime() {
+        assert_eq!(remaining_millis(NOW, NOW + 1), 0);
+        assert_eq!(remaining_millis(NOW + 7, NOW), 7);
+    }
 
     /// Three rules: one that runs freely, one that always confirms, and one a
     /// careless operator wrote for a shell.
@@ -548,8 +568,36 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn refusal_of(answer: &Answer) -> Option<RefusalCode> {
         match answer {
             Answer::Refused { code, .. } => Some(*code),
-            Answer::Decided { .. } => None,
+            Answer::Decided { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
         }
+    }
+
+    #[test]
+    fn a_non_run_question_is_refused_until_its_state_machine_lands() {
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Watch,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        assert_eq!(outcome.served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::RequestUnknown)
+        );
+        assert_eq!(host.policy.loads.get(), 0);
+        assert!(spool.calls().is_empty());
+        assert_eq!(outcome.records.len(), 1);
+        assert!(
+            outcome.records[0]
+                .evidence
+                .contains(&"question=watch".to_owned())
+        );
     }
 
     #[test]
@@ -591,7 +639,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn decision_of(answer: &Answer) -> Option<(&Decision, Option<&Minted>)> {
         match answer {
             Answer::Decided { decision, minted } => Some((decision, minted.as_ref())),
-            Answer::Refused { .. } => None,
+            Answer::Refused { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
         }
     }
 
@@ -615,8 +666,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             minted,
             Some(&Minted {
                 nonce: NONCE.to_owned(),
-                deadline: NOW + REQUEST_TTL_MILLIS,
-                ttl_secs: REQUEST_TTL_SECS,
+                expires_in_ms: REQUEST_TTL_MILLIS,
                 gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
             })
         );
@@ -863,12 +913,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut future = valid.clone();
         future.schema_version = WIRE_SCHEMA_VERSION + 1;
         let mut relative = valid.clone();
-        relative.program = "systemctl".to_owned();
+        relative.question = xudo_wire::Question::Run {
+            program: "systemctl".to_owned(),
+            argv: vec!["restart".to_owned()],
+            claimed_classification: "x".to_owned(),
+        };
         let mut nul = valid.clone();
-        nul.argv = vec!["restart\0--force".to_owned()];
+        nul.question = xudo_wire::Question::Run {
+            program: "/usr/bin/systemctl".to_owned(),
+            argv: vec!["restart\0--force".to_owned()],
+            claimed_classification: "x".to_owned(),
+        };
         let mut not_utf8 =
-            br#"{"schema_version":1,"program":"/usr/bin/systemctl","argv":[""#.to_vec();
-        not_utf8.extend_from_slice(b"\xff\"],\"claimed_classification\":\"x\"}");
+            br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/systemctl","argv":[""#
+                .to_vec();
+        not_utf8.extend_from_slice(b"\xff\"],\"claimed_classification\":\"x\"}}}");
 
         for (bytes, code) in [
             (b"restart nginx".to_vec(), RefusalCode::RequestMalformed),
@@ -1222,7 +1281,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "x",
         );
         let decision = decide(&loaded, &caller, &request);
-        request.argv = vec!["restart".to_owned(), "\u{1}".repeat(12_000)];
+        request.question = xudo_wire::Question::Run {
+            program: "/usr/bin/systemctl".to_owned(),
+            argv: vec!["restart".to_owned(), "\u{1}".repeat(12_000)],
+            claimed_classification: "x".to_owned(),
+        };
         let evaluated = Evaluated {
             decision,
             caller,

@@ -22,7 +22,7 @@ use xudo_policy::decision::ConfirmReason;
 /// Every denial code. [`lists_every_denial_code`] stops compiling when a
 /// variant is added, and the build error lands here, where this array needs
 /// the new code so the snapshot gains its row.
-const ALL_CODES: [DenialCode; 8] = [
+const ALL_CODES: [DenialCode; 11] = [
     DenialCode::UnknownAction,
     DenialCode::ArgvRejected,
     DenialCode::DenyListed,
@@ -31,6 +31,9 @@ const ALL_CODES: [DenialCode; 8] = [
     DenialCode::NoConfirmationChannel,
     DenialCode::HumanPathOnly,
     DenialCode::ExeMismatch,
+    DenialCode::ConfirmationRefused,
+    DenialCode::ConfirmationExpired,
+    DenialCode::ConfirmationThrottled,
 ];
 
 /// Compile-time exhaustiveness for [`ALL_CODES`]: no wildcard arm, so a new
@@ -44,7 +47,10 @@ fn lists_every_denial_code(code: DenialCode) {
         | DenialCode::Frozen
         | DenialCode::NoConfirmationChannel
         | DenialCode::HumanPathOnly
-        | DenialCode::ExeMismatch => {}
+        | DenialCode::ExeMismatch
+        | DenialCode::ConfirmationRefused
+        | DenialCode::ConfirmationExpired
+        | DenialCode::ConfirmationThrottled => {}
     }
 }
 
