@@ -285,9 +285,15 @@ fn a_minted_request_leaves_the_brokers_and_the_gates_records_in_one_chain() {
     let request = BrokerRequest::new("/usr/bin/id", vec!["-u".to_owned()], "human");
     client.write_all(request.to_json().as_bytes()).unwrap();
     client.shutdown(Shutdown::Write).unwrap();
-    let mut trail = xudo_sys::AuditTrail::system("xudod");
-    assert_eq!(xudod::run(server.as_fd(), &mut trail), 0);
-    drop(server);
+    assert_eq!(
+        thread::spawn(move || {
+            let mut trail = xudo_sys::AuditTrail::system("xudod");
+            xudod::run(server.as_fd(), &mut trail)
+        })
+        .join()
+        .unwrap(),
+        0
+    );
     let mut answer = Vec::new();
     client.read_to_end(&mut answer).unwrap();
     let Answer::Decided {

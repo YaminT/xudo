@@ -14,6 +14,8 @@ use std::time::Duration;
 
 const SOCKET: &str = include_str!("../../../packaging/systemd/xudod.socket");
 const SERVICE: &str = include_str!("../../../packaging/systemd/xudod@.service");
+const PASBAN_SERVICE: &str = include_str!("../../../packaging/systemd/xudo-pasban.service");
+const PASBAN_TIMER: &str = include_str!("../../../packaging/systemd/xudo-pasban.timer");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/xudo.conf");
 
 /// One `Key=Value` line, with the section it is in.
@@ -290,7 +292,6 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "RuntimeMaxSec",
             "CapabilityBoundingSet",
             "AmbientCapabilities",
-            "NoNewPrivileges",
             "UMask",
             "ProtectSystem",
             "ReadWritePaths",
@@ -346,7 +347,8 @@ fn the_broker_is_root_without_a_single_capability() {
     assert!(values(&service, "Service", "PrivateUsers").is_empty());
     assert_eq!(value(&service, "Service", "CapabilityBoundingSet"), "");
     assert_eq!(value(&service, "Service", "AmbientCapabilities"), "");
-    assert_eq!(value(&service, "Service", "NoNewPrivileges"), "yes");
+    // systemd's NNP remount makes / nosuid and breaks the trust walk; xudod sets NNP itself.
+    assert!(values(&service, "Service", "NoNewPrivileges").is_empty());
     assert_eq!(value(&service, "Service", "UMask"), "0077");
 }
 
@@ -464,6 +466,15 @@ fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir(
             ["d", "/run/xudo", "0755", "root", "root", "-", "-"],
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
+            [
+                "f",
+                "/var/lib/xudo/audit.jsonl",
+                "0600",
+                "root",
+                "root",
+                "-",
+                "-"
+            ],
         ]
     );
     assert_eq!(
@@ -498,4 +509,175 @@ fn the_parser_this_test_relies_on_refuses_what_it_cannot_read() {
         unknown.is_err(),
         "a misspelled directive must fail the test"
     );
+}
+
+const PASBAN_SERVICE_KEYS: &[(&str, &[&str])] = &[
+    ("Unit", &["Description", "Documentation"]),
+    (
+        "Service",
+        &[
+            "Type",
+            "ExecStart",
+            "StandardOutput",
+            "StandardError",
+            "SyslogLevelPrefix",
+            "TimeoutStartSec",
+            "ExecStopPost",
+            "CapabilityBoundingSet",
+            "AmbientCapabilities",
+            "NoNewPrivileges",
+            "UMask",
+            "ProtectSystem",
+            "ProtectHome",
+            "PrivateTmp",
+            "PrivateDevices",
+            "ProcSubset",
+            "ProtectKernelTunables",
+            "ProtectKernelModules",
+            "ProtectKernelLogs",
+            "ProtectControlGroups",
+            "ProtectClock",
+            "ProtectHostname",
+            "PrivateNetwork",
+            "RestrictAddressFamilies",
+            "RestrictNamespaces",
+            "RestrictRealtime",
+            "RestrictSUIDSGID",
+            "LockPersonality",
+            "MemoryDenyWriteExecute",
+            "SystemCallArchitectures",
+            "SystemCallFilter",
+            "SystemCallErrorNumber",
+            "TasksMax",
+            "LimitNOFILE",
+        ],
+    ),
+];
+
+const PASBAN_TIMER_KEYS: &[(&str, &[&str])] = &[
+    ("Unit", &["Description", "Documentation"]),
+    ("Timer", &["OnCalendar", "Persistent", "RandomizedDelaySec"]),
+    ("Install", &["WantedBy"]),
+];
+
+#[test]
+fn pasban_runs_the_audit_check_and_nothing_is_writable() {
+    let service = parse(PASBAN_SERVICE);
+    only_known_keys(&service, PASBAN_SERVICE_KEYS);
+    assert_eq!(value(&service, "Service", "Type"), "oneshot");
+    assert_eq!(
+        value(&service, "Service", "ExecStart"),
+        format!(
+            "/usr/bin/xudo audit --log {}/{} --against-journal",
+            xudo_sys::AUDIT_DIR,
+            xudo_sys::AUDIT_FILE_NAME
+        )
+    );
+    // No User=: root, so the log it reads is a file it owns. Never a user
+    // namespace, where "root-owned" stops meaning root.
+    assert!(values(&service, "Service", "User").is_empty());
+    assert!(values(&service, "Service", "PrivateUsers").is_empty());
+    assert_eq!(value(&service, "Service", "CapabilityBoundingSet"), "");
+    assert_eq!(value(&service, "Service", "AmbientCapabilities"), "");
+    // The broker omits this because systemd's remount makes the ruleset
+    // nosuid. Pasban never reads the ruleset.
+    assert_eq!(value(&service, "Service", "NoNewPrivileges"), "yes");
+    assert_eq!(value(&service, "Service", "UMask"), "0077");
+    assert_eq!(value(&service, "Service", "ProtectSystem"), "strict");
+    assert!(
+        values(&service, "Service", "ReadWritePaths").is_empty(),
+        "the check only reads"
+    );
+    assert_eq!(value(&service, "Service", "ProcSubset"), "pid");
+    for key in [
+        "ProtectHome",
+        "PrivateTmp",
+        "PrivateDevices",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectKernelLogs",
+        "ProtectControlGroups",
+        "ProtectClock",
+        "ProtectHostname",
+    ] {
+        assert_eq!(value(&service, "Service", key), "yes", "{key}");
+    }
+}
+
+#[test]
+fn pasban_has_no_network_and_the_same_syscall_filter_as_the_broker() {
+    let service = parse(PASBAN_SERVICE);
+    assert_eq!(value(&service, "Service", "PrivateNetwork"), "yes");
+    assert_eq!(
+        value(&service, "Service", "RestrictAddressFamilies"),
+        "AF_UNIX"
+    );
+    let broker = parse(SERVICE);
+    assert_eq!(
+        values(&service, "Service", "SystemCallFilter"),
+        values(&broker, "Service", "SystemCallFilter")
+    );
+    assert_eq!(value(&service, "Service", "SystemCallErrorNumber"), "EPERM");
+    // One process for xudo and one for journalctl, with room for a thread.
+    // Unbounded is a fork bomb sitting on the audit log.
+    let tasks: u32 = value(&service, "Service", "TasksMax").parse().unwrap();
+    assert!((1..=8).contains(&tasks), "{tasks}");
+    let nofile: u32 = value(&service, "Service", "LimitNOFILE").parse().unwrap();
+    assert!((65_536..=1_048_576).contains(&nofile), "{nofile}");
+    assert_eq!(
+        value(&service, "Service", "SystemCallArchitectures"),
+        "native"
+    );
+    for key in [
+        "RestrictNamespaces",
+        "RestrictRealtime",
+        "RestrictSUIDSGID",
+        "LockPersonality",
+        "MemoryDenyWriteExecute",
+    ] {
+        assert_eq!(value(&service, "Service", key), "yes", "{key}");
+    }
+}
+
+#[test]
+fn a_pasban_failure_is_a_critical_journal_line() {
+    // SyslogLevel= would raise the clean result too. LogLevelMax= only drops
+    // lines. The program writes <2>, and this prefix is what stores it at
+    // priority 2. Both have to stay or the failure is an ordinary info line.
+    let service = parse(PASBAN_SERVICE);
+    assert_eq!(value(&service, "Service", "StandardOutput"), "journal");
+    assert_eq!(value(&service, "Service", "StandardError"), "journal");
+    assert_eq!(value(&service, "Service", "SyslogLevelPrefix"), "yes");
+    assert!(value(&service, "Service", "ExecStopPost").contains("SERVICE_RESULT"));
+    assert!(value(&service, "Service", "ExecStopPost").contains("EXIT_STATUS"));
+    assert!(
+        PASBAN_SERVICE.contains("<2>"),
+        "the unit must say why the prefix is load-bearing"
+    );
+    let timeout: u64 = value(&service, "Service", "TimeoutStartSec")
+        .parse()
+        .unwrap();
+    assert!((1..=300).contains(&timeout), "{timeout}");
+    for key in ["Environment", "EnvironmentFile", "PassEnvironment"] {
+        assert!(values(&service, "Service", key).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn pasban_runs_daily_and_the_operator_changes_the_period_with_a_drop_in() {
+    let timer = parse(PASBAN_TIMER);
+    only_known_keys(&timer, PASBAN_TIMER_KEYS);
+    assert_eq!(value(&timer, "Timer", "OnCalendar"), "daily");
+    assert_eq!(value(&timer, "Timer", "Persistent"), "true");
+    assert_eq!(value(&timer, "Timer", "RandomizedDelaySec"), "1h");
+    assert_eq!(value(&timer, "Install", "WantedBy"), "timers.target");
+    // The sentence is the whole instruction. A comment that no longer names
+    // the command is a period the operator cannot change without editing the
+    // packaged unit.
+    assert!(
+        PASBAN_TIMER.contains("systemctl edit xudo-pasban.timer"),
+        "{PASBAN_TIMER}"
+    );
+    assert!(PASBAN_TIMER.contains("OnCalendar="));
+    assert!(PASBAN_TIMER.contains("OnCalendar=weekly"));
 }

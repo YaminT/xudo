@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>How xudo works</title><meta name="description" content="The xudo beta request flow."><link rel="canonical" href="https://yamint.github.io/xudo/how-it-works.html"><link rel="stylesheet" href="style.css"></head>
+<body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
+<h1>How it works</h1><p><code>xudo explain</code> loads policy and reports what it would decide. It executes nothing.</p>
+<ol><li><code>xudo exec</code> sends the requested argv to the root broker over a Unix socket.</li><li>The broker identifies its peer from kernel-provided facts, evaluates root-owned rules and the compiled-in deny-list, and records the decision.</li><li>For an allowed request, the broker creates a bounded one-use request.</li><li>The host's <code>sudo</code>, <code>sudo-rs</code>, or <code>doas</code> invokes the password-authenticated gate.</li><li>The gate independently checks policy and the one-use request before executing the validated program.</li></ol>
+<p>Errors fail closed. In this beta every caller is unattested, and every privileged request uses the human password path.</p>
+<p><code>ido</code> stores exact argv for human review. It holds no privilege; privileged work still uses xudo's password path.</p>
+</main><footer><a href="./">xudo documentation</a></footer></body></html>
