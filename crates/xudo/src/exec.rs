@@ -131,6 +131,7 @@ pub(crate) fn ask(
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(timeout))
+        .and_then(|()| stream.set_read_timeout(Some(timeout)))
         .map_err(|e| e.to_string())?;
     // A failed write shows up as a failed read below, so it isn't checked twice.
     let _ = stream.write_all(request.to_json().as_bytes());
@@ -142,11 +143,27 @@ pub(crate) fn ask(
 ///
 /// The first complete JSON value is the reply.
 fn read_response(stream: &mut UnixStream, timeout: Duration) -> Result<BrokerResponse, String> {
+    use std::cell::RefCell;
+    let stream = RefCell::new(stream);
     read_response_with(timeout, &mut |remaining, buffer| {
-        stream
-            .set_read_timeout(Some(remaining))
-            .and_then(|()| stream.read(buffer))
+        tighten_then_read(
+            remaining,
+            &mut |value| stream.borrow().set_read_timeout(value),
+            &mut |buffer| stream.borrow_mut().read(buffer),
+            buffer,
+        )
     })
+}
+
+fn tighten_then_read(
+    remaining: Duration,
+    set: &mut dyn FnMut(Option<Duration>) -> std::io::Result<()>,
+    read: &mut dyn FnMut(&mut [u8]) -> std::io::Result<usize>,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    // macOS refuses SO_RCVTIMEO once the peer has closed; the first timeout still bounds the read.
+    let _ = set(Some(remaining));
+    read(buffer)
 }
 
 fn read_response_with(
@@ -438,6 +455,31 @@ mod tests {
             Ok(count)
         });
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_refused_timeout_update_does_not_discard_a_reply() {
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let mut set_value = None;
+        let mut position = 0;
+        let count = tighten_then_read(
+            Duration::from_millis(250),
+            &mut |value| {
+                set_value = value;
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            },
+            &mut |buffer| {
+                let count = buffer.len().min(reply.len().saturating_sub(position));
+                buffer[..count].copy_from_slice(&reply[position..position + count]);
+                position += count;
+                Ok(count)
+            },
+            &mut [0; 4096],
+        )
+        .unwrap();
+        assert_eq!(set_value, Some(Duration::from_millis(250)));
+        assert_eq!(count, reply.len());
+        assert_eq!(&reply[..count], &reply);
     }
 
     #[test]
