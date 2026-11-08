@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 pub const SPOOL_DIR: &str = "/run/xudo/req";
 
 /// The wire version of a spool entry.
-pub const REQUEST_SCHEMA_VERSION: u32 = 2;
+pub const REQUEST_SCHEMA_VERSION: u32 = 3;
 
 /// How long a nonce is, in hex characters (32 random bytes).
 pub const NONCE_HEX_LEN: usize = 64;
@@ -64,6 +64,73 @@ pub struct CallerPin {
     pub pid: u32,
     /// Its start time, in kernel clock ticks since boot.
     pub starttime: u64,
+}
+
+/// State of a human confirmation request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationState {
+    /// Waiting for a checked watcher.
+    Pending,
+    /// Approved by a checked watcher; password is still required by the gate.
+    Approved,
+    /// Refused by a watcher.
+    Denied,
+    /// The entry deadline passed.
+    Expired,
+}
+
+/// Kernel facts pinning the watcher who approved an entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherPin {
+    /// Effective uid from the peer credentials.
+    pub uid: u32,
+    /// Pid from the peer credentials.
+    pub pid: u32,
+    /// Process start time, preventing pid reuse.
+    pub starttime: u64,
+    /// Controlling terminal number.
+    pub tty: i64,
+    /// Session id.
+    pub sid: i64,
+}
+
+impl WatcherPin {
+    /// Whether this pin is an eligible watcher for the minted caller.
+    ///
+    /// Watchers must share the requester's uid; the plan's alternative "or 0"
+    /// is deliberately narrowed so root cannot approve another user's request.
+    pub fn is_eligible_for(&self, uid: u32, pid: u32, starttime: u64, sid: i64, tty: i64) -> bool {
+        self.uid == uid
+            && self.pid != 0
+            && self.sid != sid
+            && self.tty != tty
+            && is_watch_terminal(self.tty)
+            && !(self.pid == pid && self.starttime == starttime)
+    }
+
+    /// Stable audit text for the pinned watcher.
+    pub fn audit_text(&self) -> String {
+        format!(
+            "uid={},pid={},starttime={},tty={},sid={}",
+            self.uid, self.pid, self.starttime, self.tty, self.sid
+        )
+    }
+}
+
+/// Linux `tty_nr` major encoding: only pts devices and virtual consoles count.
+/// Major 4 minor 64+ is ttyS serial hardware, which is deliberately excluded.
+pub fn is_watch_terminal(tty_nr: i64) -> bool {
+    let Ok(tty) = u64::try_from(tty_nr) else {
+        return false;
+    };
+    if tty == 0 {
+        return false;
+    }
+    let major = ((tty >> 8) & 0x0fff) as u16;
+    let minor = (tty & 0xff) | ((tty >> 12) & 0xfff00);
+    (136..=143).contains(&major) || (major == 4 && (1..64).contains(&minor))
 }
 
 impl CallerPin {
@@ -144,6 +211,9 @@ pub enum RequestError {
     /// The entry claims a confirmation but records no channel for it.
     #[error("request is marked confirmed but names no channel that carried the approval")]
     UnattributedConfirmation,
+    /// The lifecycle fields contradict one another or are malformed.
+    #[error("confirmation state is inconsistent or malformed")]
+    InvalidConfirmationState,
     /// The policy changed after the entry was minted.
     #[error("request was minted under policy generation {minted}, current generation is {current}")]
     StaleGeneration {
@@ -196,6 +266,7 @@ impl RequestError {
             Self::Expired { .. } => "request_expired",
             Self::WrongCaller { .. } => "request_wrong_caller",
             Self::UnattributedConfirmation => "request_unattributed_confirmation",
+            Self::InvalidConfirmationState => "request_invalid_confirmation_state",
             Self::StaleGeneration { .. } => "request_stale_generation",
             Self::Ambiguous { .. } => "request_ambiguous",
             Self::ForgedNonce { .. } => "request_forged_nonce",
@@ -243,12 +314,28 @@ pub struct PendingRequest {
     /// whose rule demands confirmation are "the broker says a human approved" or
     /// "refuse", and the second is the default.
     pub confirmed: bool,
-    /// Which channel carried the approval.
+    /// Which checked watcher carried the approval.
     ///
     /// Required whenever [`Self::confirmed`] is set. A confirmation with no
     /// recorded channel cannot be reviewed after the fact, and an unreviewable
     /// approval is indistinguishable from one that never happened.
-    pub confirmed_by: Option<String>,
+    pub confirmed_by: Option<WatcherPin>,
+    /// The confirmation lifecycle state.
+    pub state: ConfirmationState,
+    /// Effective uid of the requester.
+    pub caller_uid: u32,
+    /// Session id of the requester when minted.
+    pub caller_sid: i64,
+    /// Controlling terminal number of the requester when minted.
+    pub caller_tty: i64,
+    /// Whether this request requires out-of-band approval.
+    pub needs_watch: bool,
+    /// Time the prompt was first shown to the `shown_to` watcher.
+    pub shown_at_ms: Option<BoottimeMillis>,
+    /// Watcher to whom the prompt timestamp applies.
+    pub shown_to: Option<WatcherPin>,
+    /// Length-framed SHA-256 of uid, program, and argv.
+    pub fingerprint: String,
     /// How the front-end classified the caller.
     ///
     /// An **unauthenticated hint**, recorded in the audit trail and given zero
@@ -265,7 +352,9 @@ impl PendingRequest {
     /// # Errors
     ///
     /// [`RequestError::Malformed`] for anything that is not this wire format,
-    /// including an unknown or missing key.
+    /// including an unknown key or a missing required key. Optional fields
+    /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
+    /// deserialize as `None`, as serde defines for `Option` fields.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         serde_json::from_str(text).map_err(|error| RequestError::Malformed {
             reason: error.to_string(),
@@ -320,12 +409,48 @@ impl PendingRequest {
             });
         }
         self.refuse_interior_nul()?;
-        let attributed = self
-            .confirmed_by
-            .as_ref()
-            .is_some_and(|channel| !channel.is_empty());
-        if self.confirmed && !attributed {
+        let watcher_valid = self.confirmed_by.as_ref().is_some_and(|watcher| {
+            watcher.is_eligible_for(
+                self.caller_uid,
+                self.caller_pid,
+                self.caller_starttime,
+                self.caller_sid,
+                self.caller_tty,
+            )
+        });
+        let consistent = match self.state {
+            ConfirmationState::Pending => !self.confirmed && self.confirmed_by.is_none(),
+            ConfirmationState::Approved => {
+                self.confirmed
+                    && self.needs_watch
+                    && self.shown_at_ms.is_some()
+                    && self.shown_to.is_some()
+                    && watcher_valid
+                    && self.confirmed_by == self.shown_to
+            }
+            ConfirmationState::Denied | ConfirmationState::Expired => false,
+        };
+        if self.confirmed && self.confirmed_by.is_none() {
             return Err(RequestError::UnattributedConfirmation);
+        }
+        if !consistent
+            || (self.shown_at_ms.is_some() && !self.needs_watch)
+            || (self.shown_at_ms.is_some() != self.shown_to.is_some())
+            || self.shown_to.as_ref().is_some_and(|watcher| {
+                !watcher.is_eligible_for(
+                    self.caller_uid,
+                    self.caller_pid,
+                    self.caller_starttime,
+                    self.caller_sid,
+                    self.caller_tty,
+                )
+            })
+            || self
+                .shown_at_ms
+                .is_some_and(|shown| shown.0 >= self.deadline.0)
+            || !is_fingerprint(&self.fingerprint)
+        {
+            return Err(RequestError::InvalidConfirmationState);
         }
 
         if self.generation != generation {
@@ -398,6 +523,14 @@ pub fn is_nonce(candidate: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Whether a request fingerprint is lowercase SHA-256 hex.
+fn is_fingerprint(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
@@ -424,6 +557,14 @@ mod tests {
             deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
         }
     }
@@ -432,19 +573,37 @@ mod tests {
         request.validate(pin(), 7, BoottimeMillis(100))
     }
 
+    fn approved() -> PendingRequest {
+        let mut request = live();
+        request.confirmed = true;
+        request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        let watcher = WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        };
+        request.confirmed_by = Some(watcher.clone());
+        request.shown_to = Some(watcher);
+        request
+    }
+
     #[test]
     fn a_well_formed_live_entry_for_this_caller_validates() {
         assert_eq!(check(&live()), Ok(()));
     }
 
     #[test]
-    fn a_schema_one_spool_entry_is_refused() {
+    fn a_previous_spool_schema_is_refused() {
         let mut entry = live();
-        entry.schema_version = 1;
+        entry.schema_version = REQUEST_SCHEMA_VERSION - 1;
         assert_eq!(
             entry.validate(pin(), 7, BoottimeMillis(100)),
             Err(RequestError::WrongSchema {
-                found: 1,
+                found: REQUEST_SCHEMA_VERSION - 1,
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
@@ -500,6 +659,226 @@ mod tests {
                 .code(),
             "request_malformed"
         );
+    }
+
+    #[test]
+    fn an_omitted_optional_timestamp_parses_as_none() {
+        let mut object: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        object.as_object_mut().unwrap().remove("shown_at_ms");
+        assert_eq!(
+            PendingRequest::parse(&object.to_string())
+                .unwrap()
+                .shown_at_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_confirmation_state_is_rejected_by_the_parser() {
+        let mut object: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        object.as_object_mut().unwrap().insert(
+            "state".to_owned(),
+            serde_json::Value::String("APPROVED".to_owned()),
+        );
+        assert_eq!(
+            PendingRequest::parse(&object.to_string())
+                .unwrap_err()
+                .code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_missing_a_confirmation_field_is_malformed() {
+        let mut object: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        object.as_object_mut().unwrap().remove("fingerprint");
+        assert_eq!(
+            PendingRequest::parse(&object.to_string())
+                .unwrap_err()
+                .code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn the_gate_refuses_denied_expired_and_inconsistent_approval_states() {
+        for state in [ConfirmationState::Denied, ConfirmationState::Expired] {
+            let mut request = live();
+            request.state = state;
+            assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+        }
+        let mut request = live();
+        request.confirmed = true;
+        request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.confirmed_by = Some(WatcherPin {
+            uid: 1001,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        request.shown_to = request.confirmed_by.clone();
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+
+        let mut request = live();
+        request.confirmed = true;
+        request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.confirmed_by = Some(WatcherPin {
+            uid: request.caller_uid,
+            pid: request.caller_pid,
+            starttime: request.caller_starttime,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        request.shown_to = request.confirmed_by.clone();
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_is_refused() {
+        let mut request = live();
+        request.fingerprint = "a".repeat(64);
+        assert_eq!(check(&request), Ok(()));
+        for fingerprint in ["g".repeat(64), "A".repeat(64), "0".repeat(63)] {
+            request.fingerprint = fingerprint;
+            assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+        }
+    }
+
+    #[test]
+    fn an_approval_without_needs_watch_is_refused() {
+        let mut request = approved();
+        request.needs_watch = false;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn an_approval_without_a_shown_timestamp_is_refused() {
+        let mut request = approved();
+        request.shown_at_ms = None;
+        request.shown_to = None;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_pending_entry_cannot_carry_an_approver() {
+        let mut request = live();
+        request.confirmed_by = Some(approved().confirmed_by.unwrap());
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_shown_timestamp_requires_needs_watch() {
+        let mut request = live();
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.shown_to = Some(approved().shown_to.unwrap());
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn an_approval_by_a_watcher_who_was_not_shown_the_prompt_is_rejected() {
+        let mut request = approved();
+        let mut other = request.shown_to.clone().unwrap();
+        other.pid = other.pid.saturating_add(1);
+        request.confirmed_by = Some(other);
+        assert_ne!(request.confirmed_by, request.shown_to);
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_shown_time_without_its_watcher_is_rejected() {
+        let watcher = approved().shown_to.unwrap();
+        let mut time_only = live();
+        time_only.needs_watch = true;
+        time_only.shown_at_ms = Some(BoottimeMillis(99));
+        assert_eq!(
+            check(&time_only),
+            Err(RequestError::InvalidConfirmationState)
+        );
+
+        let mut watcher_only = live();
+        watcher_only.needs_watch = true;
+        watcher_only.shown_to = Some(watcher);
+        assert_eq!(
+            check(&watcher_only),
+            Err(RequestError::InvalidConfirmationState)
+        );
+    }
+
+    #[test]
+    fn a_pending_entry_shown_to_an_ineligible_watcher_is_rejected() {
+        let mut wrong_uid = live();
+        wrong_uid.needs_watch = true;
+        wrong_uid.shown_at_ms = Some(BoottimeMillis(99));
+        let mut watcher = approved().shown_to.unwrap();
+        watcher.uid = wrong_uid.caller_uid.saturating_add(1);
+        wrong_uid.shown_to = Some(watcher);
+        assert_eq!(
+            check(&wrong_uid),
+            Err(RequestError::InvalidConfirmationState)
+        );
+
+        let mut same_tty = live();
+        same_tty.needs_watch = true;
+        same_tty.shown_at_ms = Some(BoottimeMillis(99));
+        let watcher = approved().shown_to.unwrap();
+        same_tty.caller_tty = watcher.tty;
+        same_tty.shown_to = Some(watcher);
+        assert_eq!(
+            check(&same_tty),
+            Err(RequestError::InvalidConfirmationState)
+        );
+    }
+
+    #[test]
+    fn a_shown_timestamp_at_or_after_the_deadline_is_refused() {
+        let mut request = approved();
+        request.shown_at_ms = Some(request.deadline);
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_watcher_in_the_requesters_session_is_refused() {
+        let mut request = approved();
+        request.caller_sid = 11;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_watcher_on_the_requesters_tty_is_refused() {
+        let mut request = approved();
+        request.caller_tty = (136 << 8) | 1;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_zero_tty_watcher_is_refused() {
+        let mut request = approved();
+        request.confirmed_by.as_mut().unwrap().tty = 0;
+        request.shown_to.as_mut().unwrap().tty = 0;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn a_zero_pid_watcher_is_refused() {
+        let mut request = approved();
+        request.confirmed_by.as_mut().unwrap().pid = 0;
+        request.shown_to.as_mut().unwrap().pid = 0;
+        assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn only_virtual_console_and_pts_terminals_are_watchable() {
+        for tty in [0, -1, 1 << 8 | 1, 4 << 8, 4 << 8 | 64, 5 << 8 | 1] {
+            assert!(!is_watch_terminal(tty), "accepted tty_nr {tty}");
+        }
+        for tty in [4 << 8 | 1, 4 << 8 | 63, 136 << 8 | 1, 143 << 8 | 255] {
+            assert!(is_watch_terminal(tty), "rejected tty_nr {tty}");
+        }
     }
 
     #[test]
@@ -622,16 +1001,11 @@ mod tests {
     fn denies_a_confirmation_nobody_can_be_held_to() {
         // An approval with no channel recorded cannot be reviewed afterwards,
         // which makes it indistinguishable from one that never happened.
-        for channel in [None, Some(String::new())] {
-            let mut request = live();
-            request.confirmed = true;
-            request.confirmed_by = channel.clone();
-            assert_eq!(
-                check(&request),
-                Err(RequestError::UnattributedConfirmation),
-                "accepted confirmation attributed to {channel:?}"
-            );
-        }
+        let mut request = live();
+        request.confirmed = true;
+        request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        assert_eq!(check(&request), Err(RequestError::UnattributedConfirmation));
         assert_eq!(
             RequestError::UnattributedConfirmation.code(),
             "request_unattributed_confirmation"
@@ -642,7 +1016,17 @@ mod tests {
     fn an_attributed_confirmation_is_accepted() {
         let mut request = live();
         request.confirmed = true;
-        request.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.confirmed_by = Some(WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        request.shown_to = request.confirmed_by.clone();
         assert_eq!(check(&request), Ok(()));
     }
 
@@ -778,6 +1162,7 @@ mod tests {
                 actual_starttime: 4,
             },
             RequestError::UnattributedConfirmation,
+            RequestError::InvalidConfirmationState,
             RequestError::StaleGeneration {
                 minted: 1,
                 current: 2,

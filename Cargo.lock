@@ -926,6 +926,7 @@ dependencies = [
  "proptest",
  "rustix",
  "serde_json",
+ "sha2",
  "thiserror",
  "xudo-audit",
  "xudo-backend",

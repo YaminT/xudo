@@ -267,6 +267,14 @@ fn write_entry(pin: (u32, u64), generation_offset: u64) -> String {
         deadline: BoottimeMillis(HostClock.boottime_millis().saturating_add(120_000)),
         confirmed: false,
         confirmed_by: None,
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: 1000,
+        caller_sid: 10,
+        caller_tty: 20,
+        needs_watch: false,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: "0".repeat(64),
         claimed_classification: "human".to_owned(),
     };
     let path = format!("{SPOOL_DIR}/{nonce}");

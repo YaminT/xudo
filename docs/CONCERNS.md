@@ -1,5 +1,27 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
+
+`xudod::confirm` models pending, approved, denied, and expired entries without
+I/O or clock reads. One shared `WatcherPin` rule is used by broker and gate:
+same uid as the requester, different session and terminal, live pid, and no
+requester process identity. The plan's alternative allowing uid 0 is
+deliberately narrowed: root watchers cannot approve another user's request.
+Watch terminals are pts majors 136–143 and virtual console major 4, minors
+1–63; ttyS serial devices (major 4, minor 64+) are not interactive watch
+terminals. `shown_at_ms` is pinned to the watcher who saw the prompt, so the
+2 s floor cannot be borrowed by a second watcher.
+
+An approval is consumed only from a coherent `Approved` entry before deadline,
+for the same uid, exact program/argv, policy generation, and governing action.
+Reloading policy or changing the governing action leaves the approval
+unconsumed. Minting honors `confirm_human_path`; a disabled setting does not
+create a watch requirement. Fingerprints frame uid, program, argument count,
+and every argument. The gate refuses inconsistent watcher state, unknown
+confirmation states, non-terminal pins, and absent required fields. The
+`confirm_human_path` path still requires both this approval and the password.
+Step 5 will connect these functions to spool transitions.
+
 ## 2026-11-07 — M3 step 3: wire schema 2
 
 The broker protocol now carries one `question` per connection under schema 2.

@@ -232,6 +232,7 @@ fn mint<S: Spool>(
         &identity,
         &request,
         policy.rules.generation.id(),
+        policy.settings.confirm_human_path,
         deadline,
         nonce,
     ) {
@@ -1030,6 +1031,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             deadline: BoottimeMillis(NOW + 60),
             confirmed: false,
             confirmed_by: None,
+            state: xudo_gate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
         }
     }
