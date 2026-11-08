@@ -221,6 +221,7 @@ pub fn entry_for(
     identity: &PeerIdentity,
     request: &BrokerRequest,
     generation: u64,
+    confirm_human_path: bool,
     deadline: u64,
     nonce: String,
 ) -> Result<PendingRequest, MintError> {
@@ -242,6 +243,18 @@ pub fn entry_for(
         deadline: BoottimeMillis(deadline),
         confirmed: false,
         confirmed_by: None,
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: identity.uid,
+        caller_sid: identity.sid,
+        caller_tty: identity.tty,
+        needs_watch: xudo_gate::demanded_confirmation(decision) && confirm_human_path,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: crate::confirm::fingerprint(
+            identity.uid,
+            program.as_bytes(),
+            &argv.iter().map(String::as_bytes).collect::<Vec<_>>(),
+        ),
         claimed_classification: claimed_classification.to_owned(),
     })
 }
@@ -437,6 +450,14 @@ mod tests {
             deadline: BoottimeMillis(deadline),
             confirmed: false,
             confirmed_by: None,
+            state: xudo_gate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
         }
     }
@@ -544,17 +565,63 @@ mod tests {
             &identity(4242, 5_000),
             &request,
             7,
+            true,
             1_900,
             nonce('a'),
         )
         .unwrap();
-        assert_eq!(minted, {
-            let mut expected = entry('a', 4242, 5_000, 1_900);
-            expected.claimed_classification = "enrolled-agent-yolo".to_owned();
-            expected
-        });
-        assert!(!minted.confirmed);
-        assert_eq!(minted.confirmed_by, None);
+        assert_eq!(
+            minted,
+            PendingRequest {
+                schema_version: REQUEST_SCHEMA_VERSION,
+                nonce: nonce('a'),
+                caller_pid: 4242,
+                caller_starttime: 5_000,
+                action: "xudo.svc.restart".to_owned(),
+                program: "/usr/bin/systemctl".to_owned(),
+                argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+                generation: 7,
+                deadline: BoottimeMillis(1_900),
+                confirmed: false,
+                confirmed_by: None,
+                state: xudo_gate::request::ConfirmationState::Pending,
+                caller_uid: 1000,
+                caller_sid: 1,
+                caller_tty: 0,
+                needs_watch: false,
+                shown_at_ms: None,
+                shown_to: None,
+                fingerprint: crate::confirm::fingerprint(
+                    1000,
+                    b"/usr/bin/systemctl",
+                    &[b"restart", b"nginx.service"],
+                ),
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirmation_setting_controls_watch_requirement_at_mint() {
+        let mut decision = permitted();
+        decision.confirm = xudo_policy::Confirm::Required {
+            reason: xudo_policy::ConfirmReason::RuleRequiresConfirmation,
+        };
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        for (setting, expected) in [(true, true), (false, false)] {
+            let minted = entry_for(
+                &decision,
+                &identity(4242, 5000),
+                &request,
+                7,
+                setting,
+                1900,
+                nonce('a'),
+            )
+            .unwrap();
+            assert_eq!(minted.needs_watch, expected);
+            assert_eq!(minted.state, xudo_gate::request::ConfirmationState::Pending);
+        }
     }
 
     #[test]
@@ -562,7 +629,15 @@ mod tests {
         let mut request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
         request.question = xudo_wire::Question::Watch;
         assert_eq!(
-            entry_for(&permitted(), &identity(1, 1), &request, 7, 1, nonce('a')),
+            entry_for(
+                &permitted(),
+                &identity(1, 1),
+                &request,
+                7,
+                true,
+                1,
+                nonce('a')
+            ),
             Err(MintError::NoAction)
         );
     }
@@ -573,7 +648,7 @@ mod tests {
         decision.action = None;
         let request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
         assert_eq!(
-            entry_for(&decision, &identity(1, 1), &request, 7, 1, nonce('a')),
+            entry_for(&decision, &identity(1, 1), &request, 7, true, 1, nonce('a')),
             Err(MintError::NoAction)
         );
     }

@@ -83,6 +83,14 @@ fn entry() -> PendingRequest {
         deadline: BoottimeMillis(1_900),
         confirmed: false,
         confirmed_by: None,
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: 1000,
+        caller_sid: 10,
+        caller_tty: 20,
+        needs_watch: false,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: "0".repeat(64),
         claimed_classification: "enrolled-agent-yolo".to_owned(),
     }
 }

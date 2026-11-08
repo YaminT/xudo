@@ -36,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod confirm;
 pub mod identify;
 pub mod mint;
 pub mod policy;

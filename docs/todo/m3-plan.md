@@ -306,7 +306,8 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
 - **Exit.** 100% coverage; the properties hold.
 - **Tests.** Properties: `no_transition_leaves_denied_or_expired`,
   `an_approval_never_outlives_the_entry_ttl`,
-  `appending_an_argument_changes_the_fingerprint`. Attacks:
+  `appending_an_argument_changes_the_fingerprint`,
+  `take_approval_never_consumes_non_approved_entries`. Attacks:
   `a_watcher_in_the_requesters_session_cannot_approve`,
   `a_watcher_on_the_requesters_tty_cannot_approve`,
   `a_watcher_without_a_terminal_cannot_approve`,
@@ -316,9 +317,31 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `a_wrong_last_word_is_refused_and_stays_pending`,
   `an_approval_after_the_entry_ttl_is_refused`,
   `an_approval_is_consumed_once_and_cannot_satisfy_a_different_argv_or_user`,
+  `an_approval_cannot_match_shorter_reordered_or_empty_argv_or_survive_any_late_time`,
+  `an_approval_does_not_survive_a_policy_reload`,
+  `an_approval_for_a_different_governing_action_stays_unconsumed`,
   `a_duplicate_request_does_not_prompt_twice`,
+  `request_fingerprint_frames_each_boundary_and_identity_field`,
+  `a_second_watcher_cannot_answer_immediately_after_their_first_view`,
+  `a_watcher_who_did_not_see_the_current_prompt_cannot_answer`, and gate
+  attacks `an_approval_without_needs_watch_is_refused`,
+  `an_approval_without_a_shown_timestamp_is_refused`,
+  `a_pending_entry_cannot_carry_an_approver`,
+  `a_shown_timestamp_requires_needs_watch`,
+  `a_shown_timestamp_at_or_after_the_deadline_is_refused`,
+  `a_watcher_in_the_requesters_session_is_refused`,
+  `a_watcher_on_the_requesters_tty_is_refused`,
+  `a_zero_tty_watcher_is_refused`, `a_zero_pid_watcher_is_refused`,
+  `an_unknown_confirmation_state_is_rejected_by_the_parser`,
+  `only_virtual_console_and_pts_terminals_are_watchable`,
   `backoff_doubles_and_caps_at_fifteen_minutes`.
 - **Lane.** `just verify`.
+- **Status (2026-11-08):** done. `take_approval` binds uid, exact argv, current
+  policy generation, governing action, and deadline. Broker and gate share
+  `WatcherPin` eligibility and terminal decoding; watcher uid must equal the
+  requester uid, and only pts and virtual consoles are accepted. `shown_at_ms`
+  is tied to its watcher. Minting respects `confirm_human_path`. The broker
+  does not dispatch confirmation questions until step 5.
 
 ### 5. The broker serves it
 

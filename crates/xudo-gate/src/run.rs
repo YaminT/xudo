@@ -529,9 +529,12 @@ fn proceed(
         program.identity().1
     ));
 
-    let confirmed_by = pending
-        .as_ref()
-        .and_then(|found| found.confirmed_by.clone());
+    let confirmed_by = pending.as_ref().and_then(|found| {
+        found
+            .confirmed_by
+            .as_ref()
+            .map(crate::request::WatcherPin::audit_text)
+    });
     let evidence = progress.evidence.clone();
     let build = |previous: Option<&Record>, approval: &Approved| {
         annotate(
@@ -816,6 +819,14 @@ args = [
             deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
         }
     }

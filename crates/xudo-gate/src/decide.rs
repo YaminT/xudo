@@ -720,6 +720,14 @@ args = [
             deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
         }
     }
@@ -868,7 +876,17 @@ args = [
     fn a_broker_recorded_approval_lets_the_same_request_through() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Approved;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules(), &agent(77), Some(&pending), context()).unwrap();
         assert_eq!(approved.action, "xudo.svc.status");
     }
@@ -883,7 +901,17 @@ args = [
             "gate_confirmation_missing"
         );
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Approved;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         assert!(decide(&rules(), &human(77), Some(&pending), context()).is_ok());
     }
 
@@ -1088,17 +1116,34 @@ args = [
     fn a_confirmed_authorization_records_which_channel_approved_it() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Approved;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules(), &agent(77), Some(&pending), context()).unwrap();
-        let record =
-            authorization_record(None, &approved, &agent(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &agent(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
 
         assert_eq!(record.decision, AuditDecision::AwaitingConfirmation);
-        assert!(
-            record
-                .evidence
-                .contains(&"confirmed_by=broker-tty:/dev/pts/3".to_owned())
-        );
+        assert!(record.evidence.contains(&format!(
+            "confirmed_by=uid=1000,pid=88,starttime=99,tty={},sid=11",
+            (136 << 8) | 1
+        )));
     }
 
     #[test]
@@ -1193,7 +1238,17 @@ args = [
             Some(ActionId::new("xudo.reload.confirmed"))
         );
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Approved;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
 
         // The authorization cites the rule that demanded the approval, not the
@@ -1201,8 +1256,16 @@ args = [
         assert_eq!(approved.action, "xudo.reload.confirmed");
         assert_eq!(approved.requested_action, "xudo.reload.quiet");
         assert_ne!(approved.rule_source, approved.requested_rule_source);
-        let record =
-            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &human(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
         assert_eq!(record.action.as_deref(), Some("xudo.reload.confirmed"));
         // And the binding `authorize` checks before writing holds on the
         // governing action, not the requested one.
@@ -1230,11 +1293,29 @@ args = [
         let rules = overlapping_rules();
         let mut pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Approved;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
         assert_eq!(approved.action, approved.requested_action);
-        let record =
-            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &human(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
         assert!(
             !record
                 .evidence
@@ -1267,7 +1348,16 @@ args = [
     #[test]
     fn a_watch_approval_never_stands_in_for_the_password() {
         let rules = overlapping_rules();
-        let pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
+        let mut pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.shown_to = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
         let watch_required = GateContext {
             settings: engine::Settings {
                 confirm_human_path: true,
@@ -1292,7 +1382,17 @@ args = [
         );
         let mut watched = pending.clone();
         watched.confirmed = true;
-        watched.confirmed_by = Some("checked-watch".to_owned());
+        watched.state = crate::request::ConfirmationState::Approved;
+        watched.needs_watch = true;
+        watched.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        watched.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        watched.shown_to = watched.confirmed_by.clone();
         assert_eq!(
             decide(&rules, &human(77), Some(&watched), watch_required)
                 .unwrap_err()
