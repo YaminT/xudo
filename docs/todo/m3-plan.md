@@ -432,8 +432,8 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
 - **Lane.** `just verify`, `just root-test`.
 - **Status (2026-11-09):** done. The broker writes the freeze marker under
   `/var/lib/xudo`; broker and gate OR its trusted, strict JSON parse with the
-  static config setting. Freeze denies pending entries through the audited
-  human-denial outcome and strike path. No tmpfiles change was needed because
+  static config setting. Freeze denies only enrolled-agent pending or approved entries
+  (none exist in M3), audited, with no strike; human entries are untouched. No tmpfiles change was needed because
   `/var/lib/xudo` is already provisioned root-owned mode 0700.
 
 ### 9. Packaging and the end-to-end proof

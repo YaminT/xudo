@@ -168,8 +168,11 @@ This command does not require a terminal.
 .B freeze
 Requires
 .BR \-\-reason \fITEXT\fR .
-Freeze the agent path with an operator supplied reason. Pending confirmation
-requests are denied and audited. The human password path remains available.
+Freeze the agent path with an operator supplied reason. Until agent
+enrollment ships (M4) this sets the flag but changes nothing for new requests
+or for human requests: every caller is unattested, and the human password path
+stays available. Pending or approved requests of an enrolled agent are denied
+and audited, without a backoff strike; a human's pending request is left alone.
 .TP
 .B thaw
 Remove the freeze marker and resume the agent path. Accepted only from uid 0;

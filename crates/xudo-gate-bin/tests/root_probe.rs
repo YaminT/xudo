@@ -138,27 +138,91 @@ fn gate_refuses_bad_configs_through_the_real_trust_walk() {
     root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
 }
 
+/// Sends one question to the real broker on its real socket, as this process.
+fn ask_broker(question: xudo_wire::Question) -> BrokerResponse {
+    let mut client = UnixStream::connect(SOCKET).unwrap();
+    let request = BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    };
+    client.write_all(request.to_json().as_bytes()).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).unwrap();
+    BrokerResponse::parse(&answer).unwrap()
+}
+
+/// The real broker publishes the freeze file into the real `/var/lib/xudo`
+/// (over a stale temporary a killed broker left), the policy both the broker
+/// and the gate load reads it as frozen, only root can thaw, and the human path
+/// keeps working while frozen.
+///
+/// A real gate run cannot be agent-classified before M4, so what the frozen
+/// flag changes for the agent path is asserted on the policy load result, the
+/// one value the gate's engine takes it from; the engine's own use of it is in
+/// `xudo-policy`'s tests.
 #[test]
 fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     if !begin_root_test("the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate") {
         return;
     }
+    let _journal = install_everything();
+    start_broker();
     let dir = Path::new("/var/lib/xudo");
     let marker = dir.join("frozen");
-    let data = br#"{"reason":"root lane test","uid":0,"time":1}"#;
+    let stale = dir.join(".tmp.frozen");
+    let _ = fs::remove_file(&marker);
     assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
     assert_eq!(
         fs::metadata(dir).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    fs::write(&marker, data).unwrap();
-    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(fs::read(&marker).unwrap(), data);
-    let loaded = xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
-    assert!(loaded.settings.frozen);
-    let gate = run_capture(GATE, &[], None).unwrap();
-    assert!(!gate.success);
-    fs::remove_file(marker).unwrap();
+    let load = || xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
+    assert!(!load().settings.frozen);
+
+    fs::write(&stale, b"half a record").unwrap();
+    let answer = ask_broker(xudo_wire::Question::Freeze {
+        reason: "root lane test".to_owned(),
+    });
+    assert_eq!(answer.answer, Answer::Done);
+    assert!(!stale.exists(), "the stale temporary disabled freeze");
+    let meta = fs::metadata(&marker).unwrap();
+    assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o600));
+    let record = fs::read_to_string(&marker).unwrap();
+    assert!(record.contains(r#""reason":"root lane test""#), "{record}");
+    assert!(load().settings.frozen);
+
+    // A second freeze reports success rather than failing on the first.
+    let again = ask_broker(xudo_wire::Question::Freeze {
+        reason: "again".to_owned(),
+    });
+    assert_eq!(again.answer, Answer::Done);
+
+    // The human path: the entry is written, the password typed, the gate runs.
+    let nonce = write_entry(own_pin(), 0);
+    let output = through_sudo();
+    assert!(output.success, "{output:?}");
+    assert_eq!(output.stdout.trim(), "0");
+    assert!(!entry_exists(&nonce));
+
+    // An ordinary user cannot thaw, and is told it is a matter of trust.
+    let refused = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo_binary())
+        .args(["--output", "json", "thaw"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("ChannelUntrusted"),
+        "{refused:?}"
+    );
+    assert!(marker.exists());
+
+    assert_eq!(ask_broker(xudo_wire::Question::Thaw).answer, Answer::Done);
+    assert!(!marker.exists());
+    assert!(!load().settings.frozen);
+    remove_snippet();
 }
 
 fn root_dir(path: &str, mode: u32) {

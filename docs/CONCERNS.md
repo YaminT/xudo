@@ -7,6 +7,19 @@ but the plan and engine say freeze stops the agent path and the human path
 keeps running. Step 8 was built per plan and engine; the owner may want the
 stricter version, so flag this for review.
 
+**Decision taken while the owner was away (review please).** In M3 every
+caller is `Unattested`, so the engine's `frozen` never fires on a new request
+and freeze changes nothing for new or human requests until M4 (agent
+enrollment). Review found the first build also denied every pending entry and
+added a backoff strike for it, which let any user deny another user's human
+request: a cross-user denial of service on the path freeze is meant to leave
+alone. Now freeze denies only pending or approved entries whose recorded
+classification is an enrolled agent's (none exist in M3), and a freeze denial
+adds no strike. Human requests stay pending. The recorded classification is
+the caller's claim; M4 must store the attested class on the entry first. If
+you want the stricter "freeze denies humans too", it is a one-line change in
+`frozen_agent_entry` plus the engine.
+
 ## 2026-11-09 — M3 step 7
 
 A lost race can leave a fresh pending entry that a human will see in `xudo watch`.
@@ -27,6 +40,9 @@ watcher requires stdin to be its controlling terminal, flushes typeahead, and
 does not alter terminal modes. Approval still adds to the password
 requirement. A same-uid process can still start its own watcher before M4
 supplies cgroup separation.
+
+The broker sorts by earliest deadline; this is the same as oldest mint time
+while all entries share one lifetime.
 
 ## 2026-11-09 — M3 step 6: bounded `exec` wait
 

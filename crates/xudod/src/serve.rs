@@ -439,7 +439,7 @@ fn expire_entries(
                 )
             })?;
         spool.remove(&id).map_err(|error| Refusal::from(&error))?;
-        let _ = record_outcome_locked(store, &entry, TerminalOutcome::Expired, now);
+        let _ = record_outcome_locked(store, &entry, TerminalOutcome::Expired, now, true);
     }
     Ok(())
 }
@@ -449,6 +449,7 @@ fn record_outcome_locked(
     entry: &xudo_gate::request::PendingRequest,
     outcome: TerminalOutcome,
     now: u64,
+    strike: bool,
 ) -> Result<(), Refusal> {
     let name = format!("{}.json", entry.caller_uid);
     let (old, data) = read_confirm_data(store, &name).map_err(|error| Refusal::from(&error))?;
@@ -474,24 +475,26 @@ fn record_outcome_locked(
             .saturating_sub(MAX_RECENT_OUTCOMES_PER_UID);
         data.outcomes.drain(..excess);
     }
-    let fp = &entry.fingerprint;
-    if data.backoff.len() >= MAX_BACKOFF_ENTRIES_PER_UID
-        && !data.backoff.iter().any(|old| old.fingerprint == *fp)
-    {
-        data.backoff.remove(0);
+    if strike {
+        let fp = &entry.fingerprint;
+        if data.backoff.len() >= MAX_BACKOFF_ENTRIES_PER_UID
+            && !data.backoff.iter().any(|old| old.fingerprint == *fp)
+        {
+            data.backoff.remove(0);
+        }
+        let strikes = data
+            .backoff
+            .iter()
+            .find(|old| old.fingerprint == *fp)
+            .map_or(1, |old| old.strikes.saturating_add(1));
+        let until_ms = now.saturating_add(crate::confirm::backoff_ms(strikes));
+        data.backoff.retain(|old| old.fingerprint != *fp);
+        data.backoff.push(BackoffEntry {
+            fingerprint: fp.clone(),
+            strikes,
+            until_ms,
+        });
     }
-    let strikes = data
-        .backoff
-        .iter()
-        .find(|old| old.fingerprint == *fp)
-        .map_or(1, |old| old.strikes.saturating_add(1));
-    let until_ms = now.saturating_add(crate::confirm::backoff_ms(strikes));
-    data.backoff.retain(|old| old.fingerprint != *fp);
-    data.backoff.push(BackoffEntry {
-        fingerprint: fp.clone(),
-        strikes,
-        until_ms,
-    });
     write_confirm(store, &name, old, &data).map_err(|error| Refusal::from(&error))
 }
 
@@ -1079,6 +1082,7 @@ fn freeze_with(
             .with_evidence(vec![
                 "broker=xudod".to_owned(),
                 format!("uid={}", identity.uid),
+                format!("reason={}", reason.escape_debug()),
             ])
             .with_outcome(xudo_audit::record::Outcome::NotExecuted)
         })
@@ -1093,17 +1097,35 @@ fn freeze_with(
         &FreezeRecord {
             reason: reason.to_owned(),
             uid: identity.uid,
-            time: platform.clock.boottime_millis(),
+            time: platform.clock.wall_millis(),
         },
         encode,
     )?;
-    match state.publish("frozen", &bytes) {
-        Ok(()) | Err(SpoolError::Exists { .. }) => {}
-        Err(error) => return Err(Refusal::from(&error)),
+    if bytes.len() > xudo_gate::policy::MAX_FREEZE_BYTES {
+        return Err(Refusal::client(
+            RefusalCode::RequestTooLarge,
+            "freeze reason is too large once encoded",
+        ));
     }
+    publish_freeze(state, &bytes)?;
     deny_pending(platform, spool, identity, request)?;
     Ok(done())
 }
+
+/// A killed broker can leave the temporary name behind, and the publish would
+/// then fail on it for ever. Under the directory lock no other freeze is
+/// mid-publish, so a name found here is stale.
+fn publish_freeze(state: &dyn Spool, bytes: &[u8]) -> Result<(), Refusal> {
+    let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
+    state.remove(FREEZE_TEMP).map_err(|e| Refusal::from(&e))?;
+    match state.publish("frozen", bytes) {
+        Ok(()) | Err(SpoolError::Exists { .. }) => Ok(()),
+        Err(error) => Err(Refusal::from(&error)),
+    }
+}
+
+/// What `Spool::publish` names its temporary file for `frozen`.
+const FREEZE_TEMP: &[u8] = b".tmp.frozen";
 
 fn encode_freeze_record(
     record: &FreezeRecord,
@@ -1148,7 +1170,7 @@ fn deny_pending(
         let Ok(mut entry) = parse_entry(&bytes) else {
             continue;
         };
-        if !entry.needs_watch || entry.state != xudo_gate::request::ConfirmationState::Pending {
+        if !frozen_agent_entry(&entry) {
             continue;
         }
         entry.state = xudo_gate::request::ConfirmationState::Denied;
@@ -1192,9 +1214,22 @@ fn deny_pending(
             &entry,
             TerminalOutcome::Denied,
             platform.clock.boottime_millis(),
+            false,
         )?;
     }
     Ok(())
+}
+
+/// The entries a freeze takes back: an enrolled agent's, pending or approved,
+/// which the gate would refuse while frozen anyway. The claim is a hint and
+/// only ever widens a denial; a human's request keeps its place because the
+/// password path keeps working. The claim is the caller's: M4 must record the
+/// attested class on the entry before a lie here can matter.
+fn frozen_agent_entry(entry: &xudo_gate::request::PendingRequest) -> bool {
+    use xudo_gate::request::ConfirmationState::{Approved, Pending};
+    entry.needs_watch
+        && matches!(entry.state, Pending | Approved)
+        && entry.claimed_classification.starts_with("enrolled-agent")
 }
 
 fn thaw(
@@ -1204,7 +1239,7 @@ fn thaw(
 ) -> Result<BrokerResponse, Refusal> {
     if identity.uid != 0 {
         return Err(Refusal::client(
-            RefusalCode::RequestUnknown,
+            RefusalCode::ChannelUntrusted,
             "thaw requires uid 0",
         ));
     }
@@ -1434,6 +1469,7 @@ fn watch(
             candidates.push((!already_shown, candidate.deadline.0, id, bytes, candidate));
         }
     }
+    // Earliest deadline is oldest mint time while every entry has the same lifetime.
     candidates.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -1703,6 +1739,7 @@ fn complete_answer(
             &entry,
             TerminalOutcome::Denied,
             platform.clock.boottime_millis(),
+            true,
         )?;
     }
     Ok(BrokerResponse {
@@ -2872,7 +2909,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         assert_eq!(
             refusal_of(&outcome.answer),
-            Some(RefusalCode::RequestUnknown)
+            Some(RefusalCode::ChannelUntrusted)
         );
     }
 
@@ -2890,7 +2927,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         assert_eq!(
             refusal_of(&outcome.answer),
-            Some(RefusalCode::RequestUnknown)
+            Some(RefusalCode::ChannelUntrusted)
         );
         assert!(host.freeze_file.files().is_empty());
         assert_eq!(host.audit.records().len(), 1);
@@ -3109,7 +3146,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             name: "state".to_owned(),
         };
         let pending = || {
-            let entry = shown_entry();
+            let entry = enrolled_entry(NONCE, UID);
             FakeSpool::new().with_file(entry.nonce.clone(), entry.to_json())
         };
 
@@ -3168,39 +3205,175 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn freeze_denies_every_pending_entry() {
+    fn freeze_denies_pending_agent_entries() {
         let mut host = Host::honest();
         let spool = FakeSpool::new();
-        let entry = shown_entry();
-        spool
-            .publish(&entry.nonce, entry.to_json().as_bytes())
-            .unwrap();
-        let request = BrokerRequest {
-            schema_version: WIRE_SCHEMA_VERSION,
-            question: xudo_wire::Question::Freeze {
-                reason: "maintenance".to_owned(),
-            },
-        };
+        let mut approved = enrolled_entry(&"b".repeat(64), 2000);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        for entry in [
+            enrolled_entry(NONCE, UID),
+            enrolled_entry(&"a".repeat(64), 2000),
+            enrolled_entry(&"c".repeat(64), 3000),
+            approved,
+        ] {
+            spool
+                .publish(&entry.nonce, entry.to_json().as_bytes())
+                .unwrap();
+        }
         let outcome = serve_with(
             &mut host,
-            &connection(Ok(request.to_json().into_bytes())),
+            &connection(Ok(freeze_request().to_json().into_bytes())),
             Ok(&spool),
         );
         assert_eq!(outcome.answer, Answer::Done);
         assert!(spool.files().is_empty());
-        assert!(
-            host.confirmations
-                .files()
-                .contains_key(format!("{UID}.json").as_bytes())
-        );
         let confirmation = host.confirmations.files();
-        let state: ConfirmData =
-            serde_json::from_slice(&confirmation[format!("{UID}.json").as_bytes()]).unwrap();
-        assert_eq!(
-            state.outcomes.last().map(|item| item.outcome),
-            Some(TerminalOutcome::Denied)
+        for uid in [UID, 2000, 3000] {
+            let state: ConfirmData =
+                serde_json::from_slice(&confirmation[format!("{uid}.json").as_bytes()]).unwrap();
+            assert_eq!(
+                state.outcomes.last().map(|item| item.outcome),
+                Some(TerminalOutcome::Denied)
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_does_not_deny_another_users_human_request() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let mut humans = Vec::new();
+        for (nonce, uid, class) in [
+            (NONCE.to_owned(), UID, "unattested"),
+            ("d".repeat(64), 2000, "human"),
+            ("e".repeat(64), 3000, "yolo-human"),
+        ] {
+            let mut entry = enrolled_entry(&nonce, uid);
+            class.clone_into(&mut entry.claimed_classification);
+            spool
+                .publish(&entry.nonce, entry.to_json().as_bytes())
+                .unwrap();
+            humans.push(entry.nonce);
+        }
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(freeze_request().to_json().into_bytes())),
+            Ok(&spool),
         );
-        assert_eq!(state.backoff.last().map(|item| item.strikes), Some(1));
+        assert_eq!(outcome.answer, Answer::Done);
+        for nonce in humans {
+            let bytes = spool.files()[nonce.as_bytes()].clone();
+            let kept = PendingRequest::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            assert_eq!(kept.state, xudo_gate::request::ConfirmationState::Pending);
+        }
+        assert!(host.confirmations.files().is_empty());
+        assert!(host.freeze_file.files().contains_key(b"frozen".as_slice()));
+    }
+
+    #[test]
+    fn freeze_adds_no_strike() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let entry = enrolled_entry(NONCE, UID);
+        spool
+            .publish(&entry.nonce, entry.to_json().as_bytes())
+            .unwrap();
+        serve_with(
+            &mut host,
+            &connection(Ok(freeze_request().to_json().into_bytes())),
+            Ok(&spool),
+        );
+        let files = host.confirmations.files();
+        let state: ConfirmData =
+            serde_json::from_slice(&files[format!("{UID}.json").as_bytes()]).unwrap();
+        assert!(state.backoff.is_empty());
+        assert_eq!(state.outcomes.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_freeze_temp_does_not_disable_freeze() {
+        let mut host = Host::honest();
+        host.freeze_file.publish(".tmp.frozen", b"half").unwrap();
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(freeze_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        let files = host.freeze_file.files();
+        assert!(files.contains_key(b"frozen".as_slice()));
+        assert!(!files.contains_key(b".tmp.frozen".as_slice()));
+        assert!(host.freeze_file.calls().contains(&SpoolCall::Lock));
+
+        let identity = test_identity(PID, START, 0, 0);
+        let again = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &freeze_request(),
+            "again",
+        )
+        .unwrap();
+        assert_eq!(again.answer, Answer::Done);
+    }
+
+    #[test]
+    fn freeze_refuses_a_lock_or_stale_temp_it_cannot_clear() {
+        let broken = SpoolError::InvalidName {
+            name: "state".to_owned(),
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        for state in [
+            FakeSpool::new().failing_lock(broken.clone()),
+            FakeSpool::new().failing_remove(broken.clone()),
+        ] {
+            let mut host = Host::honest();
+            host.freeze_file = state;
+            let error = freeze(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &freeze_request(),
+                "maintenance",
+            )
+            .unwrap_err();
+            assert_eq!(error.code, RefusalCode::SpoolUnusable);
+        }
+    }
+
+    #[test]
+    fn a_freeze_reason_that_escapes_past_the_readers_limit_is_refused() {
+        let reason = "\u{1}".repeat(xudo_wire::MAX_REASON_BYTES);
+        let mut host = Host::honest();
+        let error = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &test_identity(PID, START, 0, 0),
+            &freeze_request(),
+            &reason,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::RequestTooLarge);
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn the_freeze_record_carries_the_escaped_reason_and_wall_time() {
+        let mut host = Host::honest();
+        let reason = "line\nbreak";
+        freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &test_identity(PID, START, 0, 0),
+            &freeze_request(),
+            reason,
+        )
+        .unwrap();
+        let record = host.audit.records().last().unwrap();
+        assert!(record.evidence.contains(&"reason=line\\nbreak".to_owned()));
+        let marker = host.freeze_file.files()[b"frozen".as_slice()].clone();
+        let value: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+        assert!(value["time"].as_u64().unwrap() > 1_700_000_000_000);
     }
 
     #[test]
@@ -3208,7 +3381,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let entry = shown_entry();
         let store = FakeSpool::new();
         store.lock().unwrap();
-        record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW).unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW, true).unwrap();
         store.unlock();
         let mut host = Host::honest();
         host.confirmations = store;
@@ -3289,7 +3462,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let entry = shown_entry();
         let store = FakeSpool::new();
         store.lock().unwrap();
-        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW).unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW, true).unwrap();
         store.unlock();
         let mut host = Host::honest();
         host.confirmations = store;
@@ -3352,7 +3525,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         store.lock().unwrap();
         for i in 0..MAX_RECENT_OUTCOMES_PER_UID + 3 {
             entry.nonce = format!("{i:064x}");
-            record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW + i as u64).unwrap();
+            record_outcome_locked(
+                &store,
+                &entry,
+                TerminalOutcome::Denied,
+                NOW + i as u64,
+                true,
+            )
+            .unwrap();
         }
         store.unlock();
         let data: ConfirmData =
@@ -3514,7 +3694,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let entry = shown_entry();
         let store = FakeSpool::new().with_file("1000.json", b"bad".to_vec());
         assert_eq!(
-            record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW)
+            record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW, true)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -3589,8 +3769,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut entry = shown_entry();
         let store = FakeSpool::new();
         store.lock().unwrap();
-        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW).unwrap();
-        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW + 1).unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW, true).unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW + 1, true).unwrap();
         assert_eq!(
             serde_json::from_slice::<ConfirmData>(&store.files()[b"1000.json".as_slice()])
                 .unwrap()
@@ -3606,6 +3786,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &entry,
                 TerminalOutcome::Expired,
                 NOW + index as u64 + 2,
+                true,
             )
             .unwrap();
         }
@@ -5079,6 +5260,23 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         assert!(crate::confirm::mark_shown(&mut entry, watcher, NOW - 2_000));
         entry
+    }
+
+    fn enrolled_entry(nonce: &str, uid: u32) -> PendingRequest {
+        let mut entry = shown_entry();
+        entry.claimed_classification = "enrolled-agent".to_owned();
+        entry.nonce = nonce.to_owned();
+        entry.caller_uid = uid;
+        entry
+    }
+
+    fn freeze_request() -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        }
     }
 
     fn answer_request(id: &str, token: &str, approve: bool) -> BrokerRequest {
