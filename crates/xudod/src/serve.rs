@@ -59,6 +59,8 @@ pub struct Platform<'a> {
     pub audit: &'a mut dyn AuditSink,
     /// `/run/xudo/confirm`, accessed through the spool syscall seam.
     pub confirmations: Option<&'a dyn Spool>,
+    /// `/var/lib/xudo`, used only for the freeze marker.
+    pub freeze_file: Option<&'a dyn Spool>,
 }
 
 /// How a connection ended.
@@ -1003,19 +1005,10 @@ fn serve_confirmation_question(
         xudo_wire::Question::Answer { .. } => {
             answer_confirmation(platform, spool, identity, request)
         }
-        xudo_wire::Question::Freeze { .. } | xudo_wire::Question::Thaw => {
-            let refusal = Refusal::client(
-                RefusalCode::RequestUnknown,
-                "freeze and thaw are not enabled in this step",
-            );
-            return refuse(
-                conn,
-                platform.audit,
-                &refusal,
-                Some(identity),
-                Some(request),
-            );
+        xudo_wire::Question::Freeze { reason } => {
+            freeze(platform, spool, identity, request, reason)
         }
+        xudo_wire::Question::Thaw => thaw(platform, identity, request),
         xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
     };
     match result {
@@ -1028,6 +1021,213 @@ fn serve_confirmation_question(
             Some(request),
         ),
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreezeRecord {
+    reason: String,
+    uid: u32,
+    time: u64,
+}
+
+fn done() -> BrokerResponse {
+    BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: xudo_wire::Answer::Done,
+    }
+}
+
+fn freeze(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    reason: &str,
+) -> Result<BrokerResponse, Refusal> {
+    freeze_with(
+        platform,
+        spool,
+        identity,
+        request,
+        reason,
+        &serde_json::to_vec,
+    )
+}
+
+fn freeze_with(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    reason: &str,
+    encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
+) -> Result<BrokerResponse, Refusal> {
+    let state = platform.freeze_file.ok_or_else(|| {
+        Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
+    })?;
+    let record = platform
+        .audit
+        .append(&|previous| {
+            Record::after(
+                previous,
+                xudo_audit::record::Decision::Denied,
+                vec!["xudo freeze".to_owned()],
+                "human",
+            )
+            .with_denial("freeze")
+            .with_evidence(vec![
+                "broker=xudod".to_owned(),
+                format!("uid={}", identity.uid),
+            ])
+            .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+        })
+        .map_err(|_| {
+            Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "freeze audit record was refused",
+            )
+        })?;
+    drop(record);
+    let bytes = encoded_freeze_record(
+        &FreezeRecord {
+            reason: reason.to_owned(),
+            uid: identity.uid,
+            time: platform.clock.boottime_millis(),
+        },
+        encode,
+    )?;
+    match state.publish("frozen", &bytes) {
+        Ok(()) | Err(SpoolError::Exists { .. }) => {}
+        Err(error) => return Err(Refusal::from(&error)),
+    }
+    deny_pending(platform, spool, identity, request)?;
+    Ok(done())
+}
+
+fn encode_freeze_record(
+    record: &FreezeRecord,
+    encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    encode(record)
+}
+
+fn encoded_freeze_record(
+    record: &FreezeRecord,
+    encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
+) -> Result<Vec<u8>, Refusal> {
+    encode_freeze_record(record, encode).map_err(|_| {
+        Refusal::broker(
+            RefusalCode::BrokerUnusable,
+            "freeze record could not be encoded",
+        )
+    })
+}
+
+fn deny_pending(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+) -> Result<(), Refusal> {
+    let store = platform.confirmations.ok_or_else(|| {
+        Refusal::broker(
+            RefusalCode::SpoolUnusable,
+            "confirmation directory is unavailable",
+        )
+    })?;
+    let _confirm = SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?;
+    let _spool = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
+    let names = spool
+        .names_up_to(MAX_CONFIRM_NAMES)
+        .map_err(|e| Refusal::from(&e))?;
+    for name in names {
+        let Ok(bytes) = spool.read(&name, crate::mint::MAX_ENTRY_BYTES) else {
+            continue;
+        };
+        let Ok(mut entry) = parse_entry(&bytes) else {
+            continue;
+        };
+        if !entry.needs_watch || entry.state != xudo_gate::request::ConfirmationState::Pending {
+            continue;
+        }
+        entry.state = xudo_gate::request::ConfirmationState::Denied;
+        let caller = classify(identity);
+        let policy = platform.policy.load().map_err(|_| {
+            Refusal::broker(RefusalCode::PolicyUnloadable, "policy cannot be loaded")
+        })?;
+        let mut decision = decide(
+            &policy,
+            &caller,
+            &BrokerRequest::new(
+                entry.program.clone(),
+                entry.argv.clone(),
+                entry.claimed_classification.clone(),
+            ),
+        );
+        decision.verdict = xudo_policy::Verdict::Deny;
+        decision.denial = Some(xudo_policy::DenialCode::ConfirmationRefused);
+        let _receipt = platform
+            .audit
+            .append(&|previous| {
+                decided(
+                    previous,
+                    &decision,
+                    &caller,
+                    identity,
+                    request,
+                    &policy.rules.generation,
+                    None,
+                )
+            })
+            .map_err(|_| {
+                Refusal::broker(
+                    RefusalCode::BrokerUnusable,
+                    "pending denial audit record was refused",
+                )
+            })?;
+        spool.remove(&name).map_err(|e| Refusal::from(&e))?;
+        record_outcome_locked(
+            store,
+            &entry,
+            TerminalOutcome::Denied,
+            platform.clock.boottime_millis(),
+        )?;
+    }
+    Ok(())
+}
+
+fn thaw(
+    platform: &mut Platform<'_>,
+    identity: &PeerIdentity,
+    _request: &BrokerRequest,
+) -> Result<BrokerResponse, Refusal> {
+    if identity.uid != 0 {
+        return Err(Refusal::client(
+            RefusalCode::RequestUnknown,
+            "thaw requires uid 0",
+        ));
+    }
+    let state = platform.freeze_file.ok_or_else(|| {
+        Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
+    })?;
+    let _receipt = platform
+        .audit
+        .append(&|previous| {
+            Record::after(
+                previous,
+                xudo_audit::record::Decision::Allowed,
+                vec!["xudo thaw".to_owned()],
+                "human",
+            )
+            .with_evidence(vec!["broker=xudod".to_owned(), "uid=0".to_owned()])
+            .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+        })
+        .map_err(|_| {
+            Refusal::broker(RefusalCode::BrokerUnusable, "thaw audit record was refused")
+        })?;
+    state.remove(b"frozen").map_err(|e| Refusal::from(&e))?;
+    Ok(done())
 }
 
 fn pending_list(
@@ -1848,6 +2048,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         policy: FixedPolicy,
         audit: FakeAuditSink,
         confirmations: FakeSpool,
+        confirmations_available: bool,
+        freeze_file: FakeSpool,
+        freeze_available: bool,
     }
 
     impl Host {
@@ -1889,6 +2092,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 },
                 audit: FakeAuditSink::new(),
                 confirmations: FakeSpool::new(),
+                confirmations_available: true,
+                freeze_file: FakeSpool::new(),
+                freeze_available: true,
             }
         }
 
@@ -1901,7 +2107,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 entropy: &self.entropy,
                 policy: &self.policy,
                 audit: &mut self.audit,
-                confirmations: Some(&self.confirmations),
+                confirmations: self.confirmations_available.then_some(&self.confirmations),
+                freeze_file: self.freeze_available.then_some(&self.freeze_file),
             }
         }
     }
@@ -2551,27 +2758,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Served::Decided
         );
 
-        for question in [
-            xudo_wire::Question::Freeze {
-                reason: "maintenance".to_owned(),
-            },
-            xudo_wire::Question::Thaw,
-        ] {
-            let request = BrokerRequest {
-                schema_version: WIRE_SCHEMA_VERSION,
-                question,
-            };
-            let conn = connection(Ok(request.to_json().into_bytes()));
-            assert_eq!(
-                serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &request),
-                Served::Refused(Fault::Client)
-            );
-            assert_eq!(
-                refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
-                Some(RefusalCode::RequestUnknown)
-            );
-        }
-
         let run = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
         let conn = connection(Ok(run.to_json().into_bytes()));
         assert_eq!(
@@ -2675,19 +2861,346 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(watching_prompts(&outcome.answer).is_some());
 
         let mut host = Host::honest();
-        let freeze = BrokerRequest {
+        let thaw = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
             question: xudo_wire::Question::Thaw,
         };
         let outcome = serve_with(
             &mut host,
-            &connection(Ok(freeze.to_json().into_bytes())),
+            &connection(Ok(thaw.to_json().into_bytes())),
             Ok(&spool),
         );
         assert_eq!(
             refusal_of(&outcome.answer),
             Some(RefusalCode::RequestUnknown)
         );
+    }
+
+    #[test]
+    fn thaw_from_a_non_root_peer_is_refused() {
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Thaw,
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(request.to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::RequestUnknown)
+        );
+        assert!(host.freeze_file.files().is_empty());
+        assert_eq!(host.audit.records().len(), 1);
+    }
+
+    #[test]
+    fn freeze_audit_refusal_changes_nothing() {
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("test refusal");
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(request.to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::BrokerUnusable)
+        );
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn freeze_publishes_a_bounded_marker_after_audit() {
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(request.to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        let marker = host
+            .freeze_file
+            .files()
+            .get(b"frozen".as_slice())
+            .cloned()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+        assert_eq!(value["reason"], "maintenance");
+        assert_eq!(value["uid"], UID);
+    }
+
+    #[test]
+    fn freeze_refuses_missing_storage_and_publish_failures() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let spool = FakeSpool::new();
+        let mut host = Host::honest();
+        host.freeze_available = false;
+        let error = freeze(
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+
+        let mut host = Host::honest();
+        host.freeze_file = FakeSpool::new().failing_publish(SpoolError::InvalidName {
+            name: "frozen".to_owned(),
+        });
+        let error = freeze(
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+    }
+
+    #[test]
+    fn freeze_file_encoding_failure_is_reported() {
+        let record = FreezeRecord {
+            reason: "x".to_owned(),
+            uid: UID,
+            time: NOW,
+        };
+        let error = encoded_freeze_record(&record, &|_| {
+            Err(serde_json::from_str::<()>("invalid").unwrap_err())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::BrokerUnusable);
+
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "x".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let error = freeze_with(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &request,
+            "x",
+            &|_| Err(serde_json::from_str::<()>("invalid").unwrap_err()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::BrokerUnusable);
+    }
+
+    #[test]
+    fn freeze_refuses_when_pending_state_cannot_be_locked_or_listed() {
+        let broken = SpoolError::InvalidName {
+            name: "state".to_owned(),
+        };
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_lock(broken.clone());
+        let spool = FakeSpool::new();
+        let error = freeze(
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+        for request_spool in [
+            FakeSpool::new().failing_lock(broken.clone()),
+            FakeSpool::new().failing_names(broken.clone()),
+        ] {
+            let mut host = Host::honest();
+            let error = deny_pending(&mut host.platform(), &request_spool, &identity, &request)
+                .unwrap_err();
+            assert_eq!(error.code, RefusalCode::SpoolUnusable);
+        }
+    }
+
+    #[test]
+    fn freeze_refuses_without_confirmation_storage() {
+        let mut host = Host::honest();
+        host.confirmations_available = false;
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let error = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &request,
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+        assert!(!host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn freeze_skips_unreadable_malformed_and_non_pending_entries() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let mut non_watch = shown_entry();
+        non_watch.needs_watch = false;
+        let mut denied = shown_entry();
+        denied.state = xudo_gate::request::ConfirmationState::Denied;
+        let spool = FakeSpool::new()
+            .with_file("broken-json", b"bad".to_vec())
+            .with_file("unreadable", b"bad".to_vec())
+            .with_file("not-watch", non_watch.to_json())
+            .with_file("already-denied", denied.to_json())
+            .failing_read(b"unreadable".to_vec());
+        let mut host = Host::honest();
+        deny_pending(&mut host.platform(), &spool, &identity, &request).unwrap();
+        assert_eq!(spool.files().len(), 4);
+    }
+
+    #[test]
+    fn freeze_pending_denials_fail_closed_at_policy_audit_removal_and_outcome() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let broken = SpoolError::InvalidName {
+            name: "state".to_owned(),
+        };
+        let pending = || {
+            let entry = shown_entry();
+            FakeSpool::new().with_file(entry.nonce.clone(), entry.to_json())
+        };
+
+        let mut host = Host::honest();
+        host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
+            file: "config".to_owned(),
+        }));
+        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("refused");
+        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+
+        let mut host = Host::honest();
+        let spool = pending().failing_remove(broken.clone());
+        assert!(deny_pending(&mut host.platform(), &spool, &identity, &request).is_err());
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_publish(broken);
+        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+    }
+
+    #[test]
+    fn root_thaw_audits_then_removes_the_marker() {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.uid = 0;
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Thaw,
+        };
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen", b"marker").unwrap();
+        assert_eq!(
+            thaw(&mut host.platform(), &identity, &request)
+                .unwrap()
+                .answer,
+            Answer::Done
+        );
+        assert!(host.freeze_file.files().is_empty());
+
+        let mut host = Host::honest();
+        host.freeze_file = FakeSpool::new().failing_remove(SpoolError::InvalidName {
+            name: "frozen".to_owned(),
+        });
+        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
+
+        let mut host = Host::honest();
+        host.freeze_available = false;
+        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
+
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("refused");
+        host.freeze_file.publish("frozen", b"marker").unwrap();
+        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
+        assert!(!host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn freeze_denies_every_pending_entry() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let entry = shown_entry();
+        spool
+            .publish(&entry.nonce, entry.to_json().as_bytes())
+            .unwrap();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(request.to_json().into_bytes())),
+            Ok(&spool),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        assert!(spool.files().is_empty());
+        assert!(
+            host.confirmations
+                .files()
+                .contains_key(format!("{UID}.json").as_bytes())
+        );
+        let confirmation = host.confirmations.files();
+        let state: ConfirmData =
+            serde_json::from_slice(&confirmation[format!("{UID}.json").as_bytes()]).unwrap();
+        assert_eq!(
+            state.outcomes.last().map(|item| item.outcome),
+            Some(TerminalOutcome::Denied)
+        );
+        assert_eq!(state.backoff.last().map(|item| item.strikes), Some(1));
     }
 
     #[test]

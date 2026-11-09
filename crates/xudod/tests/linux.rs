@@ -284,6 +284,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         policy: &OneRule,
         audit: &mut audit,
         confirmations: None,
+        freeze_file: None,
     };
     let spool = FakeSpool::new();
     let before = xudo_sys::Clock::boottime_millis(&HostClock);

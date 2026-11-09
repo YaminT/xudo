@@ -165,6 +165,17 @@ the prompt is flushed; a rejected answer leaves the request pending.
 List this user's pending confirmation requests without answering them.
 This command does not require a terminal.
 .TP
+.B freeze
+Requires
+.BR \-\-reason \fITEXT\fR .
+Freeze the agent path with an operator supplied reason. Pending confirmation
+requests are denied and audited. The human password path remains available.
+.TP
+.B thaw
+Remove the freeze marker and resume the agent path. Accepted only from uid 0;
+run it as
+.BR "sudo xudo thaw" .
+.TP
 .B check
 Lint the loaded ruleset.
 Exits

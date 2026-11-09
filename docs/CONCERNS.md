@@ -1,5 +1,12 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-09 — M3 step 8: freeze semantics
+
+The owner was asked about freeze as “deny every request, human ones included,”
+but the plan and engine say freeze stops the agent path and the human path
+keeps running. Step 8 was built per plan and engine; the owner may want the
+stricter version, so flag this for review.
+
 ## 2026-11-09 — M3 step 7
 
 A lost race can leave a fresh pending entry that a human will see in `xudo watch`.

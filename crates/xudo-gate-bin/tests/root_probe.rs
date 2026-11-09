@@ -44,7 +44,7 @@ use std::fs::{self, File, Permissions};
 use std::io::{Read as _, Write as _};
 use std::net::Shutdown;
 use std::os::fd::AsFd as _;
-use std::os::unix::fs::{PermissionsExt, chown};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -136,6 +136,29 @@ fn gate_refuses_bad_configs_through_the_real_trust_walk() {
     );
     fs::remove_file(target).unwrap();
     root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+}
+
+#[test]
+fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
+    if !begin_root_test("the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate") {
+        return;
+    }
+    let dir = Path::new("/var/lib/xudo");
+    let marker = dir.join("frozen");
+    let data = br#"{"reason":"root lane test","uid":0,"time":1}"#;
+    assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
+    assert_eq!(
+        fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    fs::write(&marker, data).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&marker).unwrap(), data);
+    let loaded = xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
+    assert!(loaded.settings.frozen);
+    let gate = run_capture(GATE, &[], None).unwrap();
+    assert!(!gate.success);
+    fs::remove_file(marker).unwrap();
 }
 
 fn root_dir(path: &str, mode: u32) {
