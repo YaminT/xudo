@@ -7,6 +7,8 @@ use xudo_gate::request::{ConfirmationState, PendingRequest, WatcherPin};
 pub const BACKOFF_BASE_MS: u64 = 30_000;
 /// Maximum backoff duration.
 pub const BACKOFF_MAX_MS: u64 = 15 * 60 * 1_000;
+/// Maximum time allowed at the password prompt after an approval is used.
+pub const CONSUMED_TTL_MS: u64 = 120_000;
 
 /// Settings used by confirmation transitions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,7 +248,7 @@ pub fn take_approval(
     action: &str,
     now_ms: u64,
 ) -> (Option<PendingRequest>, Option<PendingRequest>) {
-    let Some(candidate) = entry else {
+    let Some(mut candidate) = entry else {
         return (None, None);
     };
     let exact_argv = candidate.program.as_bytes() == program
@@ -264,6 +266,11 @@ pub fn take_approval(
         && exact_argv
         && now_ms < candidate.deadline.0
     {
+        candidate.state = ConfirmationState::Consumed;
+        candidate.deadline.0 = candidate
+            .deadline
+            .0
+            .min(now_ms.saturating_add(CONSUMED_TTL_MS));
         (None, Some(candidate))
     } else {
         (Some(candidate), None)
@@ -327,7 +334,7 @@ mod tests {
     proptest! {
         #[test]
         fn take_approval_never_consumes_non_approved_entries(
-            state in prop_oneof![Just(ConfirmationState::Pending), Just(ConfirmationState::Denied), Just(ConfirmationState::Expired), Just(ConfirmationState::Approved)],
+            state in prop_oneof![Just(ConfirmationState::Pending), Just(ConfirmationState::Denied), Just(ConfirmationState::Expired), Just(ConfirmationState::Approved), Just(ConfirmationState::Consumed)],
         ) {
             let mut request = entry();
             request.state = state;
@@ -383,6 +390,54 @@ mod tests {
             Err(ConfirmError::IneligibleWatcher)
         );
         assert_eq!(request.state, ConfirmationState::Pending);
+    }
+
+    #[test]
+    fn a_second_rerun_does_not_get_the_approval() {
+        let mut approved = entry();
+        approved.deadline = BoottimeMillis(1_000_000);
+        assert!(mark_shown(&mut approved, watcher(), 1_000));
+        approve(&mut approved, 3_000, b"remove").unwrap();
+        let (_, consumed) = take_approval(
+            Some(approved),
+            1000,
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            4_000,
+        );
+        let consumed = consumed.unwrap();
+        assert_eq!(consumed.state, ConfirmationState::Consumed);
+        let (remaining, replay) = take_approval(
+            Some(consumed),
+            1000,
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            5_000,
+        );
+        assert!(replay.is_none());
+        assert_eq!(remaining.unwrap().state, ConfirmationState::Consumed);
+    }
+
+    #[test]
+    fn a_consumed_approval_expires_two_minutes_after_use() {
+        let mut approved = entry();
+        approved.deadline = BoottimeMillis(1_000_000);
+        assert!(mark_shown(&mut approved, watcher(), 1_000));
+        approve(&mut approved, 3_000, b"remove").unwrap();
+        let (_, consumed) = take_approval(
+            Some(approved),
+            1000,
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            5_000,
+        );
+        assert_eq!(consumed.unwrap().deadline.0, 125_000);
     }
 
     #[test]

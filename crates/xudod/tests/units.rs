@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::Duration;
+use xudod::CONFIRM_DIR;
 
 const SOCKET: &str = include_str!("../../../packaging/systemd/xudod.socket");
 const SERVICE: &str = include_str!("../../../packaging/systemd/xudod@.service");
@@ -361,8 +362,9 @@ fn the_only_writable_paths_are_confirmation_state_the_spool_and_audit_log() {
     assert_eq!(
         value(&service, "Service", "ReadWritePaths"),
         format!(
-            "-{} -/run/xudo/confirm -{}",
+            "-{} -{} -{}",
             xudo_gate::SPOOL_DIR,
+            CONFIRM_DIR,
             xudo_sys::AUDIT_DIR
         )
     );
@@ -469,7 +471,7 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
         [
             ["d", "/run/xudo", "0755", "root", "root", "-", "-"],
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
-            ["d", "/run/xudo/confirm", "0700", "root", "root", "-", "-"],
+            ["d", CONFIRM_DIR, "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
             [
                 "f",
