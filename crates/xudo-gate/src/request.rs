@@ -74,6 +74,8 @@ pub enum ConfirmationState {
     Pending,
     /// Approved by a checked watcher; password is still required by the gate.
     Approved,
+    /// Consumed by the broker; accepted for this gate execution only.
+    Consumed,
     /// Refused by a watcher.
     Denied,
     /// The entry deadline passed.
@@ -420,7 +422,7 @@ impl PendingRequest {
         });
         let consistent = match self.state {
             ConfirmationState::Pending => !self.confirmed && self.confirmed_by.is_none(),
-            ConfirmationState::Approved => {
+            ConfirmationState::Approved | ConfirmationState::Consumed => {
                 self.confirmed
                     && self.needs_watch
                     && self.shown_at_ms.is_some()
@@ -1017,6 +1019,24 @@ mod tests {
         let mut request = live();
         request.confirmed = true;
         request.state = ConfirmationState::Approved;
+        request.needs_watch = true;
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.confirmed_by = Some(WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        request.shown_to = request.confirmed_by.clone();
+        assert_eq!(check(&request), Ok(()));
+    }
+
+    #[test]
+    fn a_consumed_approval_is_gate_valid_for_execution() {
+        let mut request = live();
+        request.confirmed = true;
+        request.state = ConfirmationState::Consumed;
         request.needs_watch = true;
         request.shown_at_ms = Some(BoottimeMillis(99));
         request.confirmed_by = Some(WatcherPin {

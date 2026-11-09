@@ -31,10 +31,14 @@
 //! | [`policy`] | What does root's policy decide about this command? |
 //! | [`mint`] | What does the gate's entry say, and what may stay in the spool? |
 //! | [`record`] | What does the audit trail say about this answer? |
+
 //! | [`refusal`] | What is the client told when the answer is no answer? |
 //! | [`serve`] | In what order, and what happens when a step fails? |
 
 #![forbid(unsafe_code)]
+
+/// Runtime directory holding per-user watcher and confirmation state.
+pub const CONFIRM_DIR: &str = "/run/xudo/confirm";
 
 pub mod confirm;
 pub mod identify;
@@ -88,7 +92,7 @@ fn run_with_hygiene(
     match UnixConnection::adopt(socket, IO_TIMEOUT) {
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
-            let confirmations = SpoolDir::open(Path::new("/run/xudo/confirm"));
+            let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,

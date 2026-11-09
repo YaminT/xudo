@@ -12,9 +12,14 @@ older than three seconds and a matching `/proc` pid and start time. The
 front-end reports pending with exit 18. No new crate or coverage waiver was
 added.
 
-The expiry-first transition, bounded recent outcomes, requester-pinned terminal
-status, and first-watcher details are implemented with tests. `just verify`, `just linux-test`,
-`just root-test`, `just units`, and `just systemd-test` pass.
+The review found and fixed denial strikes, replayable approvals, consume-before-record
+ordering, password-only expiry sweeps, cross-uid failures from broken state files,
+oversized watcher prompts, and requester-session watcher liveness. Consumed gate
+entries now carry a distinct state and a deadline capped at the earlier of the
+entry TTL and two minutes after use. Confirm state uses a compact bounded format;
+unreadable state refuses that uid until operator repair. Regression tests cover
+each finding. `script -qc 'xudo watch' /dev/null` creates a new session and pty in
+one command (the known setsid-plus-pty limit); the password still holds.
 
 ## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
 
