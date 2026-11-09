@@ -31,8 +31,12 @@ xudo-tests = { path = "../xudo-tests", version = "0.0.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
-xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
-xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "termios",
+  "pty",
+  "fs",
+] }
 
 [features]
 # The tests that must run as uid 0: every `tests/root_*.rs`. Only

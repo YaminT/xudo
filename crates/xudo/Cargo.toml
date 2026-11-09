@@ -22,10 +22,21 @@ serde_json.workspace = true
 # a world-writable directory lets anyone choose a file name.
 term-sanitize = { path = "../term-sanitize", version = "0.0.1" }
 thiserror.workspace = true
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "termios",
+  "event",
+] }
 
 [dev-dependencies]
 insta.workspace = true
 tempfile = "3"
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "termios",
+  "pty",
+  "fs",
+] }
 
 [lints]
 workspace = true

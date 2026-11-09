@@ -99,6 +99,7 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
         xudo_wire::Question::Run { .. } => "run",
         xudo_wire::Question::Status { .. } => "status",
         xudo_wire::Question::Watch => "watch",
+        xudo_wire::Question::Pending => "pending",
         xudo_wire::Question::Answer { .. } => "answer",
         xudo_wire::Question::Freeze { .. } => "freeze",
         xudo_wire::Question::Thaw => "thaw",
@@ -203,6 +204,7 @@ mod tests {
             ),
             (xudo_wire::Question::Status { id: "a".repeat(64) }, "status"),
             (xudo_wire::Question::Watch, "watch"),
+            (xudo_wire::Question::Pending, "pending"),
             (
                 xudo_wire::Question::Answer {
                     id: "a".repeat(64),

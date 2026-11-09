@@ -282,7 +282,9 @@ pub fn serve(
         xudo_wire::Question::Watch => {
             !identity.diverged && xudo_gate::request::is_watch_terminal(identity.tty)
         }
-        xudo_wire::Question::Status { .. } | xudo_wire::Question::Answer { .. } => true,
+        xudo_wire::Question::Pending
+        | xudo_wire::Question::Status { .. }
+        | xudo_wire::Question::Answer { .. } => true,
         _ => false,
     };
     if should_expire {
@@ -997,6 +999,7 @@ fn serve_confirmation_question(
     let result = match &request.question {
         xudo_wire::Question::Status { id } => status(conn, platform, spool, identity, request, id),
         xudo_wire::Question::Watch => watch(platform, spool, identity),
+        xudo_wire::Question::Pending => pending_list(platform, spool, identity),
         xudo_wire::Question::Answer { .. } => {
             answer_confirmation(platform, spool, identity, request)
         }
@@ -1025,6 +1028,55 @@ fn serve_confirmation_question(
             Some(request),
         ),
     }
+}
+
+fn pending_list(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+) -> Result<BrokerResponse, Refusal> {
+    let now = platform.clock.boottime_millis();
+    let _guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
+    let names = spool
+        .names_up_to(MAX_CONFIRM_NAMES)
+        .map_err(|error| Refusal::from(&error))?;
+    let mut prompts = Vec::new();
+    let mut omitted = 0;
+    for name in names {
+        let Ok(bytes) = spool.read(&name, crate::mint::MAX_ENTRY_BYTES) else {
+            continue;
+        };
+        let Ok(entry) = parse_entry(&bytes) else {
+            continue;
+        };
+        if entry.caller_uid == identity.uid
+            && entry.needs_watch
+            && entry.state == xudo_gate::request::ConfirmationState::Pending
+            && entry.deadline.0 > now
+        {
+            let candidate = bounded_prompt(&entry, now);
+            let mut proposed = prompts.clone();
+            proposed.push(candidate.clone());
+            let response = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Watching {
+                    prompts: proposed,
+                    omitted,
+                },
+            };
+            if prompts.len() < xudo_wire::MAX_PROMPTS
+                && response.to_json().len() <= xudo_wire::MAX_RESPONSE_BYTES.saturating_sub(16)
+            {
+                prompts.push(candidate);
+            } else {
+                omitted = omitted.saturating_add(1);
+            }
+        }
+    }
+    Ok(BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: xudo_wire::Answer::Watching { prompts, omitted },
+    })
 }
 
 fn status(
@@ -1173,11 +1225,8 @@ fn watch(
         let Ok(mut entry) = parse_entry(&bytes) else {
             continue;
         };
-        if prompts.len() >= xudo_wire::MAX_PROMPTS {
-            break;
-        }
         if crate::confirm::watcher_eligible(&entry, watcher) {
-            let prompt = bounded_prompt(&entry);
+            let prompt = bounded_prompt(&entry, now);
             if !crate::confirm::mark_shown(&mut entry, watcher, now) {
                 continue;
             }
@@ -1186,39 +1235,31 @@ fn watch(
                 .replace(&id, &bytes, json.as_bytes())
                 .map_err(|e| Refusal::from(&e))?;
             prompts.push(prompt);
+            break;
         }
     }
     Ok(BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
-        answer: xudo_wire::Answer::Watching { prompts },
+        answer: xudo_wire::Answer::Watching {
+            prompts,
+            omitted: 0,
+        },
     })
 }
 
-fn bounded_prompt(entry: &xudo_gate::request::PendingRequest) -> String {
-    let marker = " … [truncated]";
-    let prefix = format!("{} {} ", entry.action, entry.nonce);
-    if prefix.len().saturating_add(marker.len()) > xudo_wire::MAX_PROMPT_BYTES {
-        return format!("[action id too long] {}{marker}", entry.nonce);
+fn bounded_prompt(
+    entry: &xudo_gate::request::PendingRequest,
+    now_ms: u64,
+) -> xudo_wire::WatchPrompt {
+    xudo_wire::WatchPrompt {
+        id: entry.nonce.clone(),
+        action: entry.action.clone(),
+        program: entry.program.clone(),
+        argv: entry.argv.clone(),
+        classification: entry.claimed_classification.clone(),
+        evidence: "watch approval is pending; the password remains required".to_owned(),
+        expires_in_ms: entry.deadline.0.saturating_sub(now_ms),
     }
-    let body = format!("{} {:?}", entry.program, entry.argv);
-    if prefix.len().saturating_add(body.len()) <= xudo_wire::MAX_PROMPT_BYTES {
-        return format!("{prefix}{body}");
-    }
-    let budget = xudo_wire::MAX_PROMPT_BYTES
-        .saturating_sub(prefix.len())
-        .saturating_sub(marker.len());
-    format!("{prefix}{}{marker}", truncate_utf8(&body, budget))
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        if output.len().saturating_add(character.len_utf8()) > max_bytes {
-            break;
-        }
-        output.push(character);
-    }
-    output
 }
 
 fn save_heartbeat(
@@ -2539,6 +2580,28 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn pending_question_dispatch_lists_entries() {
+        let caller = test_identity(PID, START, 0, 0);
+        let entry = shown_entry();
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Pending,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &request),
+            Served::Decided
+        );
+        assert!(matches!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::Watching { prompts, .. } if prompts.len() == 1
+        ));
+    }
+
+    #[test]
     fn serve_expires_before_status_answer_and_watch_dispatch() {
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new();
@@ -3288,7 +3351,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn one_long_argv_cannot_blind_the_watcher() {
+    fn one_long_argv_reaches_the_watcher_without_truncation() {
         let mut entry = shown_entry();
         entry.argv = vec!["界".repeat(1_000), "語".repeat(1_000)];
         entry.shown_at_ms = None;
@@ -3300,10 +3363,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let response = watch(&mut host.platform(), &spool, &watcher).unwrap();
         let prompts = watching_prompts(&response.answer).unwrap();
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].len() <= xudo_wire::MAX_PROMPT_BYTES);
-        assert!(prompts[0].starts_with("xudo.pkg.remove "));
-        assert!(prompts[0].ends_with("[truncated]"));
-        assert!(prompts[0].is_char_boundary(prompts[0].len()));
+        assert_eq!(prompts[0].action, "xudo.pkg.remove");
+        assert_eq!(prompts[0].argv, entry.argv);
+        assert_eq!(prompts[0].expires_in_ms, 100_000);
         let shown =
             PendingRequest::parse(std::str::from_utf8(&spool.files()[NONCE.as_bytes()]).unwrap())
                 .unwrap();
@@ -3312,17 +3374,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_overlong_action_id_is_marked_without_a_partial_word() {
+    fn watch_prompt_keeps_a_long_action_and_argv() {
         let mut entry = shown_entry();
         entry.action = "a".repeat(xudo_wire::MAX_PROMPT_BYTES);
-        let prompt = bounded_prompt(&entry);
-        assert!(prompt.len() <= xudo_wire::MAX_PROMPT_BYTES);
-        assert!(prompt.starts_with("[action id too long] "));
-        assert!(prompt.ends_with("[truncated]"));
+        let prompt = bounded_prompt(&entry, NOW);
+        assert_eq!(prompt.action, entry.action);
+        assert_eq!(prompt.expires_in_ms, 100_000);
     }
 
     #[test]
-    fn the_watcher_marks_only_the_sixty_four_prompts_it_can_deliver() {
+    fn the_watcher_delivers_one_prompt_per_heartbeat() {
         let spool = (0..=xudo_wire::MAX_PROMPTS).fold(FakeSpool::new(), |spool, index| {
             let mut entry = shown_entry();
             entry.nonce = format!("{index:064x}");
@@ -3337,7 +3398,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let watcher = test_identity(5000, 77, 2, 34816);
         let response = watch(&mut host.platform(), &spool, &watcher).unwrap();
         let prompts = watching_prompts(&response.answer).unwrap();
-        assert_eq!(prompts.len(), xudo_wire::MAX_PROMPTS);
+        assert_eq!(prompts.len(), 1);
         let shown = spool
             .files()
             .values()
@@ -3346,7 +3407,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     .is_ok_and(|entry| entry.shown_at_ms.is_some())
             })
             .count();
-        assert_eq!(shown, xudo_wire::MAX_PROMPTS);
+        assert_eq!(shown, 1);
     }
 
     #[test]
@@ -3880,6 +3941,227 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn a_too_fast_answer_does_not_lose_the_prompt() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut entry = shown_entry();
+        entry.shown_at_ms = Some(BoottimeMillis(NOW));
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let mut host = Host::honest();
+
+        let first = watch(&mut host.platform(), &spool, &watcher).unwrap();
+        assert_eq!(watching_prompts(&first.answer).unwrap().len(), 1);
+        let too_fast = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher,
+            &answer_request(NONCE, "remove", true),
+        )
+        .unwrap_err();
+        assert_eq!(too_fast.code, RefusalCode::AnswerRejected);
+
+        host.clock.0 = NOW + 2_000;
+        let retry = watch(&mut host.platform(), &spool, &watcher).unwrap();
+        assert_eq!(watching_prompts(&retry.answer).unwrap().len(), 1);
+        let approved = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher,
+            &answer_request(NONCE, "remove", true),
+        )
+        .unwrap();
+        assert_eq!(approved.answer, Answer::Done);
+    }
+
+    #[test]
+    fn a_second_request_is_shown_after_the_first_is_answered() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let first = shown_entry();
+        let mut second = first.clone();
+        second.nonce = "cd".repeat(32);
+        second.shown_at_ms = None;
+        second.shown_to = None;
+        let spool = FakeSpool::new()
+            .with_file(
+                first.nonce.as_bytes().to_vec(),
+                first.to_json().into_bytes(),
+            )
+            .with_file(
+                second.nonce.as_bytes().to_vec(),
+                second.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+
+        let first_prompt = watch(&mut host.platform(), &spool, &watcher).unwrap();
+        let first_id = watching_prompts(&first_prompt.answer).unwrap()[0]
+            .id
+            .clone();
+        assert_eq!(first_id, first.nonce);
+        answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher,
+            &answer_request(&first_id, "remove", true),
+        )
+        .unwrap();
+
+        let second_prompt = watch(&mut host.platform(), &spool, &watcher).unwrap();
+        let prompts = watching_prompts(&second_prompt.answer).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].id, second.nonce);
+        host.clock.0 += 2_000;
+        answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher,
+            &answer_request(&second.nonce, "remove", true),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pending_list_is_read_only_and_scoped_to_pending_entries_for_this_uid() {
+        let mut valid = shown_entry();
+        valid.shown_at_ms = None;
+        valid.shown_to = None;
+        let mut another_user = valid.clone();
+        another_user.nonce = format!("{:064x}", 1);
+        another_user.caller_uid = 2000;
+        let mut no_watch = valid.clone();
+        no_watch.nonce = format!("{:064x}", 2);
+        no_watch.needs_watch = false;
+        let mut approved = valid.clone();
+        approved.nonce = format!("{:064x}", 3);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        let mut expired = valid.clone();
+        expired.nonce = format!("{:064x}", 4);
+        expired.deadline = BoottimeMillis(NOW);
+        let spool = FakeSpool::new()
+            .with_file(
+                valid.nonce.as_bytes().to_vec(),
+                valid.to_json().into_bytes(),
+            )
+            .with_file(
+                another_user.nonce.as_bytes().to_vec(),
+                another_user.to_json().into_bytes(),
+            )
+            .with_file(
+                no_watch.nonce.as_bytes().to_vec(),
+                no_watch.to_json().into_bytes(),
+            )
+            .with_file(
+                approved.nonce.as_bytes().to_vec(),
+                approved.to_json().into_bytes(),
+            )
+            .with_file(
+                expired.nonce.as_bytes().to_vec(),
+                expired.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+        let response = pending_list(
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+        )
+        .unwrap();
+        let prompts = watching_prompts(&response.answer).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].id, valid.nonce);
+        assert_eq!(prompts[0].expires_in_ms, 100_000);
+        let still_pending = PendingRequest::parse(
+            std::str::from_utf8(&spool.files()[prompts[0].id.as_bytes()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(still_pending.shown_at_ms, None);
+        assert_eq!(still_pending.shown_to, None);
+    }
+
+    #[test]
+    fn pending_list_fails_closed_on_spool_enumeration_errors_and_skips_bad_files() {
+        let identity = test_identity(PID, START, 0, 0);
+        let mut host = Host::honest();
+        assert_eq!(
+            pending_list(
+                &mut host.platform(),
+                &FakeSpool::new().failing_lock(SpoolError::Gone {
+                    name: "lock".to_owned()
+                }),
+                &identity,
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+        let mut host = Host::honest();
+        assert_eq!(
+            pending_list(
+                &mut host.platform(),
+                &FakeSpool::new().failing_names(SpoolError::Gone {
+                    name: "names".to_owned()
+                }),
+                &identity,
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+        let spool = FakeSpool::new()
+            .with_file(b"bad-entry".to_vec(), b"not json".to_vec())
+            .with_file(b"unreadable".to_vec(), b"ignored".to_vec())
+            .failing_read(b"unreadable".to_vec());
+        let mut host = Host::honest();
+        let response = pending_list(&mut host.platform(), &spool, &identity).unwrap();
+        assert!(matches!(response.answer, Answer::Watching { prompts, .. } if prompts.is_empty()));
+    }
+
+    #[test]
+    fn pending_list_stops_at_the_wire_prompt_limit() {
+        let spool = (0..=xudo_wire::MAX_PROMPTS).fold(FakeSpool::new(), |spool, index| {
+            let mut entry = shown_entry();
+            entry.nonce = format!("{index:064x}");
+            spool.with_file(
+                entry.nonce.as_bytes().to_vec(),
+                entry.to_json().into_bytes(),
+            )
+        });
+        let mut host = Host::honest();
+        let response = pending_list(
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            watching_prompts(&response.answer).unwrap().len(),
+            xudo_wire::MAX_PROMPTS
+        );
+        let json: serde_json::Value = serde_json::from_str(&response.to_json()).unwrap();
+        assert_eq!(json["answer"]["watching"]["omitted"], 1);
+    }
+
+    #[test]
+    fn many_large_requests_cannot_blind_the_watcher() {
+        let spool = (0..24).fold(FakeSpool::new(), |spool, index| {
+            let mut entry = shown_entry();
+            entry.nonce = format!("{index:064x}");
+            entry.argv = vec!["x".repeat(20_000)];
+            spool.with_file(
+                entry.nonce.as_bytes().to_vec(),
+                entry.to_json().into_bytes(),
+            )
+        });
+        let mut host = Host::honest();
+        let response = pending_list(
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+        )
+        .unwrap();
+        assert!(response.to_json().len() <= xudo_wire::MAX_RESPONSE_BYTES);
+        assert!(matches!(response.answer, Answer::Watching { omitted, .. } if omitted > 0));
+    }
+
+    #[test]
     fn watch_list_failures_and_bad_entries_are_handled() {
         let watcher = test_identity(5000, 77, 2, 34816);
         let mut host = Host::honest();
@@ -3909,15 +4191,15 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new();
         let entries = FakeSpool::new()
-            .with_file("unreadable", b"bad".to_vec())
-            .with_file("malformed", b"bad".to_vec())
+            .with_file("00-unreadable", b"bad".to_vec())
+            .with_file("01-malformed", b"bad".to_vec())
             .with_file(
                 NONCE.as_bytes().to_vec(),
                 shown_entry().to_json().into_bytes(),
             )
-            .failing_read(b"unreadable".to_vec());
+            .failing_read(b"00-unreadable".to_vec());
         let response = watch(&mut host.platform(), &entries, &watcher).unwrap();
-        assert!(matches!(response.answer, Answer::Watching { prompts } if prompts.is_empty()));
+        assert!(matches!(response.answer, Answer::Watching { prompts, .. } if prompts.len() == 1));
 
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new();
@@ -4257,9 +4539,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
-    fn watching_prompts(answer: &Answer) -> Option<&[String]> {
+    fn watching_prompts(answer: &Answer) -> Option<&[xudo_wire::WatchPrompt]> {
         match answer {
-            Answer::Watching { prompts } => Some(prompts),
+            Answer::Watching { prompts, .. } => Some(prompts),
             Answer::Refused { .. }
             | Answer::Decided { .. }
             | Answer::Pending { .. }

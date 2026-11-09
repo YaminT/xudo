@@ -278,6 +278,7 @@ mod tests {
             },
             Answer::Watching {
                 prompts: Vec::new(),
+                omitted: 0,
             },
             Answer::Done,
         ] {

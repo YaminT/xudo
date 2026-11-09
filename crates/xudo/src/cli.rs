@@ -26,6 +26,7 @@ use crate::exec;
 use crate::probe::BrokerProbe;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
+use crate::watch;
 
 /// The root-owned settings file.
 pub const DEFAULT_CONFIG_FILE: &str = "/etc/xudo/config.toml";
@@ -178,6 +179,12 @@ pub enum Command {
         against_journal: bool,
     },
 
+    /// List pending confirmation requests without answering them.
+    Pending,
+
+    /// Watch for confirmation requests on this terminal and answer them.
+    Watch,
+
     /// Print the block that tells an agent what it may do.
     Agentdoc {
         /// Which harness to write for.
@@ -282,6 +289,25 @@ pub fn run_with_installer(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    run_with_installer_at_socket(
+        cli,
+        platform,
+        installer,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        out,
+        err,
+    )
+}
+
+/// [`run_with_installer`], with the broker socket supplied by the caller.
+pub fn run_with_installer_at_socket(
+    cli: &Cli,
+    platform: &Platform<'_>,
+    installer: &dyn Installer,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let ops = platform.ops;
     let probe = platform.probe;
     // Loaded up front but not unwrapped: `doctor` is the command an operator
@@ -368,6 +394,12 @@ pub fn run_with_installer(
             out,
             err,
         ),
+        Command::Pending => with_rules!(|l: &LoadedRules| {
+            watch::pending(socket, l.rules(), out, err, &mut watch::ask_live)
+        }),
+        Command::Watch => with_rules!(|l: &LoadedRules| {
+            watch::watch_live(socket, l.rules(), out, err, &mut watch::ask_live)
+        }),
         Command::Agentdoc { format } => with_rules!(|l: &LoadedRules| {
             let _ = write!(
                 out,
@@ -1191,6 +1223,9 @@ mod tests {
     )]
 
     use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
     use xudo_backend::Capability;
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
     use xudo_config::Setting;
@@ -1268,6 +1303,72 @@ mod tests {
                 String::from_utf8_lossy(&err).into_owned(),
             )
         }
+
+        fn run_at_socket(&self, args: &[&str], socket: &Path) -> (ExitCode, String, String) {
+            let mut full = vec!["xudo", "--rules", self.dir.to_str().unwrap()];
+            full.extend_from_slice(args);
+            let cli = Cli::try_parse_from(full).unwrap();
+            let ops = host_ops();
+            let platform = Platform {
+                ops: ops.as_ref(),
+                probe: &HostProbe,
+                host: &LiveHost,
+                path: None,
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_with_installer_at_socket(
+                &cli,
+                &platform,
+                &RefusingInstaller,
+                socket,
+                &mut out,
+                &mut err,
+            );
+            (
+                code,
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        }
+    }
+
+    #[test]
+    fn pending_command_uses_the_read_only_broker_question() {
+        let fixture = fixture("cli-pending");
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            let request = xudo_wire::BrokerRequest::parse(&bytes).unwrap();
+            assert_eq!(request.question, xudo_wire::Question::Pending);
+            let response = xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Watching {
+                    prompts: Vec::new(),
+                    omitted: 0,
+                },
+            };
+            stream.write_all(response.to_json().as_bytes()).unwrap();
+        });
+        let (code, out, err) = fixture.run_at_socket(&["pending"], &socket);
+        broker.join().unwrap();
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, "");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn watch_command_refuses_a_non_terminal_before_contacting_the_broker() {
+        let fixture = fixture("cli-watch-notty");
+        let socket = fixture.dir.join("no-broker.sock");
+        let (code, out, err) = fixture.run_at_socket(&["watch"], &socket);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("watch requires a terminal on stdin"), "{err}");
     }
 
     #[test]

@@ -1,5 +1,20 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-09 — M3 step 7
+
+A lost race can leave a fresh pending entry that a human will see in `xudo watch`.
+
+The broker returns one oldest eligible prompt on each heartbeat and pins its
+first-delivery time to that watcher. A rejected too-fast answer leaves the same
+prompt visible, and later requests are delivered after the current prompt is
+answered. The read-only `pending` response is byte-budgeted and reports omitted
+requests. Displayed argv is individually shell-quoted after control characters
+are escaped; claimed classification and broker evidence appear on separate
+lines. The watcher requires stdin to be its controlling terminal, flushes
+typeahead, and does not alter terminal modes. Approval still adds to the
+password requirement. A same-uid process can still start its own watcher before
+M4 supplies cgroup separation.
+
 ## 2026-11-09 — M3 step 6: bounded `exec` wait
 
 `confirmation_timeout_secs` is a front-end setting, defaults to 0, and is

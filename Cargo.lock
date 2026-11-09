@@ -771,6 +771,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "insta",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -812,11 +813,10 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "rustix",
  "serde_json",
  "xudo",
- "xudo-policy",
  "xudo-tests",
- "xudo-wire",
 ]
 
 [[package]]

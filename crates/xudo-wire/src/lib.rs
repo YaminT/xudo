@@ -124,6 +124,8 @@ pub enum Question {
     },
     /// Receive available confirmation prompts.
     Watch,
+    /// List this peer's pending confirmation requests without claiming a watcher slot.
+    Pending,
     /// Answer a confirmation prompt.
     Answer {
         /// The request nonce.
@@ -227,7 +229,7 @@ impl BrokerRequest {
                 refuse_nul("claimed_classification", claimed_classification)?;
             }
             Question::Status { id } => check_id(id)?,
-            Question::Watch | Question::Thaw => {}
+            Question::Watch | Question::Pending | Question::Thaw => {}
             Question::Answer { id, token, .. } => {
                 check_id(id)?;
                 bounded("token", token, MAX_TOKEN_BYTES)?;
@@ -390,6 +392,26 @@ pub struct BrokerResponse {
     pub answer: Answer,
 }
 
+/// One broker-checked request shown to a watcher.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchPrompt {
+    /// The one-use request nonce.
+    pub id: String,
+    /// Governing action id.
+    pub action: String,
+    /// Canonical absolute program.
+    pub program: String,
+    /// Canonical operands.
+    pub argv: Vec<String>,
+    /// The requester's unauthenticated classification hint.
+    pub classification: String,
+    /// Why the password remains required after approval.
+    pub evidence: String,
+    /// Remaining request lifetime in milliseconds.
+    pub expires_in_ms: u64,
+}
+
 /// What happened to a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -416,7 +438,10 @@ pub enum Answer {
     /// A watcher heartbeat and its bounded prompt list.
     Watching {
         /// The checked, bounded prompt list.
-        prompts: Vec<String>,
+        prompts: Vec<WatchPrompt>,
+        /// Number of additional pending prompts omitted to fit the response.
+        #[serde(default)]
+        omitted: usize,
     },
     /// A question completed without a decision.
     Done,
@@ -761,12 +786,8 @@ impl BrokerResponse {
             Answer::Pending { id, .. } => {
                 check_nonce(id).map_err(|reason| ResponseError::Malformed { reason })?;
             }
-            Answer::Watching { prompts } => {
-                if prompts.len() > MAX_PROMPTS
-                    || prompts
-                        .iter()
-                        .any(|p| p.len() > MAX_PROMPT_BYTES || p.contains('\0'))
-                {
+            Answer::Watching { prompts, .. } => {
+                if prompts.len() > MAX_PROMPTS || prompts.iter().any(|p| !valid_watch_prompt(p)) {
                     return Err(ResponseError::Malformed {
                         reason: "watch prompt list exceeds its bound".to_owned(),
                     });
@@ -818,6 +839,29 @@ impl BrokerResponse {
     pub fn to_json(&self) -> String {
         rendered_or(serde_json::to_string(self), FALLBACK_RESPONSE)
     }
+}
+
+fn valid_watch_prompt(prompt: &WatchPrompt) -> bool {
+    prompt.id.len() == NONCE_HEX_LEN
+        && prompt
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && prompt.program.starts_with('/')
+        && prompt.program.len() <= MAX_PROGRAM_BYTES
+        && !prompt.program.contains('\0')
+        && !prompt.action.is_empty()
+        && prompt.action.len() <= MAX_PROMPT_BYTES
+        && !prompt.action.contains('\0')
+        && prompt.argv.len() <= MAX_ARGV_COUNT
+        && prompt
+            .argv
+            .iter()
+            .all(|arg| arg.len() <= MAX_ARGUMENT_BYTES && !arg.contains('\0'))
+        && prompt.classification.len() <= MAX_CLASSIFICATION_BYTES
+        && !prompt.classification.contains('\0')
+        && prompt.evidence.len() <= MAX_PROMPT_BYTES
+        && !prompt.evidence.contains('\0')
 }
 
 /// Returns the rendered JSON, or `fallback` if rendering failed.
@@ -935,6 +979,7 @@ mod tests {
         for question in [
             Question::Status { id: id.clone() },
             Question::Watch,
+            Question::Pending,
             Question::Answer {
                 id: id.clone(),
                 token: "token".to_owned(),
@@ -1106,6 +1151,7 @@ mod tests {
             },
             Question::Status { id: id.clone() },
             Question::Watch,
+            Question::Pending,
             Question::Answer {
                 id: id.clone(),
                 token: "one-use".to_owned(),
@@ -1385,7 +1431,16 @@ mod tests {
                 expires_in_ms: 1234,
             },
             Answer::Watching {
-                prompts: vec!["approve remove".to_owned()],
+                prompts: vec![WatchPrompt {
+                    id: "a".repeat(64),
+                    action: "xudo.pkg.remove".to_owned(),
+                    program: "/usr/bin/apt-get".to_owned(),
+                    argv: vec!["remove".to_owned()],
+                    classification: "unattested".to_owned(),
+                    evidence: "password remains required".to_owned(),
+                    expires_in_ms: 1_000,
+                }],
+                omitted: 0,
             },
             Answer::Done,
             BrokerResponse::refused(RefusalCode::RequestUnknown).answer,
@@ -1471,7 +1526,8 @@ mod tests {
         let response = BrokerResponse {
             schema_version: WIRE_SCHEMA_VERSION,
             answer: Answer::Watching {
-                prompts: vec!["x".to_owned(); MAX_PROMPTS + 1],
+                prompts: vec![watch_prompt(); MAX_PROMPTS + 1],
+                omitted: 0,
             },
         };
         assert_eq!(
@@ -1483,7 +1539,11 @@ mod tests {
         let response = BrokerResponse {
             schema_version: WIRE_SCHEMA_VERSION,
             answer: Answer::Watching {
-                prompts: vec!["x".repeat(MAX_PROMPT_BYTES + 1)],
+                prompts: vec![WatchPrompt {
+                    action: "x".repeat(MAX_PROMPT_BYTES + 1),
+                    ..watch_prompt()
+                }],
+                omitted: 0,
             },
         };
         assert_eq!(
@@ -1495,7 +1555,11 @@ mod tests {
         let response = BrokerResponse {
             schema_version: WIRE_SCHEMA_VERSION,
             answer: Answer::Watching {
-                prompts: vec!["bad\0prompt".to_owned()],
+                prompts: vec![WatchPrompt {
+                    program: "/bad\0program".to_owned(),
+                    ..watch_prompt()
+                }],
+                omitted: 0,
             },
         };
         assert_eq!(
@@ -1504,6 +1568,75 @@ mod tests {
                 reason: "watch prompt list exceeds its bound".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn response_refuses_every_malformed_watch_prompt_field() {
+        let mut bad_id = watch_prompt();
+        bad_id.id = "A".repeat(NONCE_HEX_LEN);
+        let mut relative_program = watch_prompt();
+        relative_program.program = "bin/apt-get".to_owned();
+        let mut long_program = watch_prompt();
+        long_program.program = format!("/{}", "x".repeat(MAX_PROGRAM_BYTES));
+        let mut empty_action = watch_prompt();
+        empty_action.action.clear();
+        let mut nul_action = watch_prompt();
+        nul_action.action.push('\0');
+        let mut many_args = watch_prompt();
+        many_args.argv = vec!["x".to_owned(); MAX_ARGV_COUNT + 1];
+        let mut long_arg = watch_prompt();
+        long_arg.argv = vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)];
+        let mut nul_arg = watch_prompt();
+        nul_arg.argv = vec!["bad\0arg".to_owned()];
+        let mut long_class = watch_prompt();
+        long_class.classification = "x".repeat(MAX_CLASSIFICATION_BYTES + 1);
+        let mut nul_class = watch_prompt();
+        nul_class.classification.push('\0');
+        let mut long_evidence = watch_prompt();
+        long_evidence.evidence = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let mut nul_evidence = watch_prompt();
+        nul_evidence.evidence.push('\0');
+
+        for prompt in [
+            bad_id,
+            relative_program,
+            long_program,
+            empty_action,
+            nul_action,
+            many_args,
+            long_arg,
+            nul_arg,
+            long_class,
+            nul_class,
+            long_evidence,
+            nul_evidence,
+        ] {
+            let response = BrokerResponse {
+                schema_version: WIRE_SCHEMA_VERSION,
+                answer: Answer::Watching {
+                    prompts: vec![prompt],
+                    omitted: 0,
+                },
+            };
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()).unwrap_err(),
+                ResponseError::Malformed {
+                    reason: "watch prompt list exceeds its bound".to_owned()
+                }
+            );
+        }
+    }
+
+    fn watch_prompt() -> WatchPrompt {
+        WatchPrompt {
+            id: "a".repeat(64),
+            action: "xudo.pkg.remove".to_owned(),
+            program: "/usr/bin/apt-get".to_owned(),
+            argv: vec!["remove".to_owned()],
+            classification: "unattested".to_owned(),
+            evidence: "password remains required".to_owned(),
+            expires_in_ms: 1_000,
+        }
     }
 
     #[test]
