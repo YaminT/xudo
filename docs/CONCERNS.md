@@ -4,16 +4,22 @@
 
 A lost race can leave a fresh pending entry that a human will see in `xudo watch`.
 
-The broker returns one oldest eligible prompt on each heartbeat and pins its
-first-delivery time to that watcher. A rejected too-fast answer leaves the same
-prompt visible, and later requests are delivered after the current prompt is
-answered. The read-only `pending` response is byte-budgeted and reports omitted
-requests. Displayed argv is individually shell-quoted after control characters
-are escaped; claimed classification and broker evidence appear on separate
-lines. The watcher requires stdin to be its controlling terminal, flushes
-typeahead, and does not alter terminal modes. Approval still adds to the
-password requirement. A same-uid process can still start its own watcher before
-M4 supplies cgroup separation.
+The broker returns one eligible prompt per heartbeat, preferring a request
+already shown to that watcher and otherwise selecting the oldest mint (the
+earliest deadline, since entries use a fixed lifetime). It writes an entry only
+when it first pins its display to that watcher. The front-end follows every
+heartbeat: a changed prompt replaces the active one after flushing typeahead,
+and a missing prompt clears it. A rejected answer clears local state so the
+broker can re-deliver the same request if it is still pending, or advance to
+the next request if it expired, was denied, or was answered elsewhere. The
+read-only `pending` response is byte-budgeted and reports omitted requests.
+Displayed argv is individually shell-quoted after backslashes and control
+characters are escaped, with a warning when escaping changes the display;
+claimed classification and broker evidence appear on separate lines. The
+watcher requires stdin to be its controlling terminal, flushes typeahead, and
+does not alter terminal modes. Approval still adds to the password
+requirement. A same-uid process can still start its own watcher before M4
+supplies cgroup separation.
 
 ## 2026-11-09 — M3 step 6: bounded `exec` wait
 
