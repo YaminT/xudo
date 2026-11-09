@@ -426,6 +426,9 @@ pub enum Answer {
         code: RefusalCode,
         /// What to do about it. A fixed sentence per code.
         remediation: String,
+        /// Bounded broker detail for a channel refusal, when useful.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -699,6 +702,19 @@ impl BrokerResponse {
             answer: Answer::Refused {
                 code,
                 remediation: code.remediation().to_owned(),
+                detail: None,
+            },
+        }
+    }
+
+    /// A refusal with bounded diagnostic detail.
+    pub fn refused_with_detail(code: RefusalCode, detail: String) -> Self {
+        Self {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Refused {
+                code,
+                remediation: code.remediation().to_owned(),
+                detail: Some(detail),
             },
         }
     }
@@ -756,14 +772,26 @@ impl BrokerResponse {
                     });
                 }
             }
-            Answer::Done => {}
-            Answer::Refused { remediation, .. } => {
+            Answer::Refused {
+                remediation,
+                detail,
+                ..
+            } => {
                 if remediation.len() > MAX_PROMPT_BYTES || remediation.contains('\0') {
                     return Err(ResponseError::Malformed {
                         reason: "remediation exceeds its bound".to_owned(),
                     });
                 }
+                if detail
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_PROMPT_BYTES || value.contains('\0'))
+                {
+                    return Err(ResponseError::Malformed {
+                        reason: "refusal detail exceeds its bound".to_owned(),
+                    });
+                }
             }
+            Answer::Done => {}
         }
         // A refusal carries no envelope, so it has nothing to disagree about.
         let envelope = match &response.answer {
@@ -1427,6 +1455,7 @@ mod tests {
             answer: Answer::Refused {
                 code: RefusalCode::RequestUnknown,
                 remediation: "x".repeat(MAX_PROMPT_BYTES + 1),
+                detail: None,
             },
         };
         assert_eq!(
@@ -1475,6 +1504,25 @@ mod tests {
                 reason: "watch prompt list exceeds its bound".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn refusal_detail_is_optional_but_bounded_and_single_line() {
+        let valid = BrokerResponse::refused_with_detail(
+            RefusalCode::ChannelUntrusted,
+            "watcher already active: pid 77, tty 34816".to_owned(),
+        );
+        assert!(BrokerResponse::parse(valid.to_json().as_bytes()).is_ok());
+        for detail in ["x".repeat(MAX_PROMPT_BYTES + 1), "bad\0detail".to_owned()] {
+            let response =
+                BrokerResponse::refused_with_detail(RefusalCode::ChannelUntrusted, detail);
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()),
+                Err(ResponseError::Malformed {
+                    reason: "refusal detail exceeds its bound".to_owned()
+                })
+            );
+        }
     }
 
     #[test]

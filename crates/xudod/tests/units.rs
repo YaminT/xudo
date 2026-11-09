@@ -353,14 +353,18 @@ fn the_broker_is_root_without_a_single_capability() {
 }
 
 #[test]
-fn the_only_writable_paths_are_the_spool_and_the_audit_log() {
+fn the_only_writable_paths_are_confirmation_state_the_spool_and_audit_log() {
     let service = parse(SERVICE);
     assert_eq!(value(&service, "Service", "ProtectSystem"), "strict");
     // "-" lets the broker start, and refuse with a reason, when one is
     // missing; it widens nothing.
     assert_eq!(
         value(&service, "Service", "ReadWritePaths"),
-        format!("-{} -{}", xudo_gate::SPOOL_DIR, xudo_sys::AUDIT_DIR)
+        format!(
+            "-{} -/run/xudo/confirm -{}",
+            xudo_gate::SPOOL_DIR,
+            xudo_sys::AUDIT_DIR
+        )
     );
     for key in [
         "ProtectHome",
@@ -453,7 +457,7 @@ fn the_service_takes_nothing_from_an_environment() {
 }
 
 #[test]
-fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir() {
+fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
     let lines: Vec<Vec<&str>> = TMPFILES
         .lines()
         .map(str::trim)
@@ -465,6 +469,7 @@ fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir(
         [
             ["d", "/run/xudo", "0755", "root", "root", "-", "-"],
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
+            ["d", "/run/xudo/confirm", "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
             [
                 "f",

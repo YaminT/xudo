@@ -87,11 +87,17 @@ pub fn plan(
     };
 
     match response.answer {
-        Answer::Refused { code, remediation } => {
+        Answer::Refused {
+            code, remediation, ..
+        } => {
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
             Err(ExitCode::Unusable)
         }
-        Answer::Pending { .. } | Answer::Watching { .. } | Answer::Done => {
+        Answer::Pending { id, .. } => {
+            let _ = writeln!(err, "xudo: pending approval on xudo watch, request {id}");
+            Err(ExitCode::NotConfirmed)
+        }
+        Answer::Watching { .. } | Answer::Done => {
             let _ = writeln!(
                 err,
                 "xudo: broker returned an answer for an unsupported question"
@@ -396,12 +402,18 @@ mod tests {
             },
             Answer::Done,
         ] {
+            let is_pending = matches!(answer, Answer::Pending { .. });
             let response = BrokerResponse {
                 schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
                 answer,
             };
-            let (result, _, _) = against(response.to_json().into_bytes(), &SUDO, &argv());
-            assert_eq!(result, Err(ExitCode::Unusable));
+            let (result, _, err) = against(response.to_json().into_bytes(), &SUDO, &argv());
+            if is_pending {
+                assert_eq!(result, Err(ExitCode::NotConfirmed));
+                assert_eq!(err.lines().count(), 1);
+            } else {
+                assert_eq!(result, Err(ExitCode::Unusable));
+            }
         }
     }
 

@@ -367,6 +367,7 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `every_transition_leaves_one_record`,
   `a_full_confirm_directory_refuses_and_overwrites_nothing`.
 - **Lane.** `just verify`, `just linux-test`.
+- **Status (2026-11-09):** done. `just verify` passes at 100%; Linux, root, units, and systemd gates pass.
 
 ### 6. `xudo exec` returns pending, or waits when asked
 

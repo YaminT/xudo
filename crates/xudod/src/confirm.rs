@@ -219,6 +219,22 @@ pub fn is_duplicate(entry: &PendingRequest, candidate: &str, now_ms: u64) -> boo
         && entry.fingerprint == candidate
 }
 
+/// Marks an overdue pending or approved entry expired.
+pub fn expire(entry: &mut PendingRequest, now_ms: u64) -> bool {
+    if matches!(
+        entry.state,
+        ConfirmationState::Pending | ConfirmationState::Approved
+    ) && now_ms >= entry.deadline.0
+    {
+        entry.state = ConfirmationState::Expired;
+        entry.confirmed = false;
+        entry.confirmed_by = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Takes a matching approval from a collection, returning the remaining entry and consumed entry.
 /// The caller persists `remaining` before proceeding to the password gate.
 pub fn take_approval(
@@ -822,5 +838,28 @@ mod tests {
             ),
             Err(ConfirmError::Expired)
         );
+    }
+
+    #[test]
+    fn expiry_only_transitions_overdue_pending_or_approved_entries() {
+        let mut pending = entry();
+        let deadline = pending.deadline.0;
+        assert!(!expire(&mut pending, deadline - 1));
+        assert!(expire(&mut pending, deadline));
+        assert_eq!(pending.state, ConfirmationState::Expired);
+
+        let mut approved = entry();
+        approved.state = ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.confirmed_by = Some(watcher().pin());
+        let deadline = approved.deadline.0;
+        assert!(expire(&mut approved, deadline));
+        assert!(!approved.confirmed);
+        assert_eq!(approved.confirmed_by, None);
+
+        let mut denied = entry();
+        denied.state = ConfirmationState::Denied;
+        assert!(!expire(&mut denied, u64::MAX));
+        assert_eq!(denied.state, ConfirmationState::Denied);
     }
 }
