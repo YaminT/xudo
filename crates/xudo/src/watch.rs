@@ -255,7 +255,7 @@ pub fn watch_with(
         let _ = writeln!(err, "xudo: cannot prepare terminal input: {error}");
         return ExitCode::Unusable;
     }
-    let mut active = None;
+    let mut active: Option<WatchPrompt> = None;
     loop {
         let request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -269,8 +269,16 @@ pub fn watch_with(
             Answer::Watching { prompts, .. } => prompts,
             answer => return refused_or_unusable(answer, err),
         };
+        let delivered = prompts.into_iter().next();
+        let active_is_delivered = active
+            .as_ref()
+            .zip(delivered.as_ref())
+            .is_some_and(|(active, delivered)| active.id == delivered.id);
+        if !active_is_delivered {
+            active = None;
+        }
         if active.is_none()
-            && let Some(prompt) = prompts.into_iter().next()
+            && let Some(prompt) = delivered
         {
             if let Err(error) = terminal.flush_typeahead() {
                 let error = safe_error(&error);
@@ -323,8 +331,8 @@ pub fn watch_with(
                     code: RefusalCode::AnswerRejected,
                     ..
                 } => {
-                    let _ = writeln!(out, "xudo: answer rejected; request remains pending");
-                    render_prompt(prompt, rules, out, err, false);
+                    let _ = writeln!(out, "xudo: answer rejected; checking pending requests");
+                    active = None;
                 }
                 other => return refused_or_unusable(other, err),
             },
@@ -352,9 +360,9 @@ fn render_prompt(
     let argv = prompt
         .argv
         .iter()
-        .map(|arg| clean(&escape_controls(arg), &mut warnings))
+        .map(|arg| escaped_display(arg, &mut warnings))
         .collect::<Vec<_>>();
-    let classification = clean(&escape_controls(&prompt.classification), &mut warnings);
+    let classification = escaped_display(&prompt.classification, &mut warnings);
     let evidence = clean(&prompt.evidence, &mut warnings);
     let time = clean(&format!("{} ms", prompt.expires_in_ms), &mut warnings);
     let source = match rules.get(&ActionId::from(prompt.action.as_str())) {
@@ -395,7 +403,9 @@ fn render_prompt(
 fn escape_controls(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch == '\n' {
+        if ch == '\\' {
+            escaped.push_str("\\\\");
+        } else if ch == '\n' {
             escaped.push_str("\\n");
         } else if ch.is_control() {
             use std::fmt::Write as _;
@@ -405,6 +415,15 @@ fn escape_controls(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn escaped_display(value: &str, warnings: &mut Vec<String>) -> String {
+    let escaped = escape_controls(value);
+    let warning = "backslashes and control characters escaped for display";
+    if escaped != value && !warnings.iter().any(|item| item == warning) {
+        warnings.push(warning.to_owned());
+    }
+    clean(&escaped, warnings)
 }
 
 fn clean(value: &str, warnings: &mut Vec<String>) -> String {
@@ -885,7 +904,9 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains('\u{1b}'));
         assert!(out.contains(r"nginx\x1b[31mEVIL"));
-        assert!(err.is_empty());
+        insta::assert_snapshot!(String::from_utf8(err).unwrap(), @r###"
+        xudo: warning: backslashes and control characters escaped for display
+        "###);
     }
 
     #[test]
@@ -918,6 +939,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
     fn a_newline_in_argv_cannot_draw_a_second_prompt() {
         let mut prompt = prompt();
         *prompt.argv.get_mut(1).unwrap() = "nginx\nPENDING forged".to_owned();
+        prompt.argv.push(r"literal\nPENDING forged".to_owned());
         let mut out = Vec::new();
         let mut err = Vec::new();
         render_prompt(&prompt, &rules(), &mut out, &mut err, false);
@@ -929,7 +951,10 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             1
         );
         assert!(out.contains(r"'nginx\nPENDING forged'"), "{out}");
-        assert!(err.is_empty());
+        assert!(out.contains(r"'literal\\nPENDING forged'"), "{out}");
+        insta::assert_snapshot!(String::from_utf8(err).unwrap(), @r###"
+        xudo: warning: backslashes and control characters escaped for display
+        "###);
     }
 
     #[test]
@@ -1010,7 +1035,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
                 } else {
                     watches += 1;
                     let mut next = prompt();
-                    if watches > 1 {
+                    if watches > 2 {
                         next.id = "cd".repeat(32);
                     }
                     Ok(watching(vec![next]))
@@ -1042,7 +1067,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
     }
 
     #[test]
-    fn an_answer_rejection_keeps_the_prompt_pending() {
+    fn an_expired_prompt_does_not_block_the_next_request() {
         let mut terminal = FakeTerminal {
             tty: true,
             flushes: 0,
@@ -1050,7 +1075,6 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             fail_begin: false,
             fail_flush: false,
             lines: VecDeque::from([
-                Ok(Some("wrong\n".to_owned())),
                 Ok(Some("remove\n".to_owned())),
                 Err(io::ErrorKind::Interrupted.into()),
             ]),
@@ -1068,25 +1092,19 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             &mut |_, request| {
                 if matches!(&request.question, Question::Answer { .. }) {
                     answers += 1;
-                    if answers == 1 {
-                        Ok(refused(RefusalCode::AnswerRejected, None))
-                    } else {
-                        Ok(BrokerResponse {
-                            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
-                            answer: Answer::Done,
-                        })
-                    }
+                    assert_eq!(answers, 1);
+                    Ok(refused(RefusalCode::AnswerRejected, None))
                 } else {
                     watches += 1;
                     let mut next = prompt();
-                    if watches > 2 {
+                    if watches > 1 {
                         next.id = "cd".repeat(32);
                     }
                     Ok(watching(vec![next]))
                 }
             },
         );
-        assert_eq!(answers, 2);
+        assert_eq!(answers, 1);
         assert_eq!(terminal.flushes, 2);
         assert_eq!(result, ExitCode::Delegated);
         insta::assert_snapshot!(String::from_utf8(out).unwrap(), @r###"
@@ -1097,15 +1115,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
           broker evidence  watch approval is pending; the password remains required
           time left       87000 ms
           answer          type 'remove' to approve, n to deny
-        xudo: answer rejected; request remains pending
-        PENDING abababababababababababababababababababababababababababababababab
-          command         /usr/bin/apt-get remove nginx
-          action          xudo.pkg.remove at 20-packages.toml:2
-          classification  claimed (unverified): unattested
-          broker evidence  watch approval is pending; the password remains required
-          time left       87000 ms
-          answer          type 'remove' to approve, n to deny
-        xudo: answer recorded
+        xudo: answer rejected; checking pending requests
         PENDING cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
           command         /usr/bin/apt-get remove nginx
           action          xudo.pkg.remove at 20-packages.toml:2

@@ -1213,7 +1213,7 @@ fn watch(
         sid: identity.sid,
         diverged: identity.diverged,
     };
-    let mut prompts = Vec::new();
+    let mut candidates = Vec::new();
     let _guard = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
     let names = spool
         .names_up_to(MAX_CONFIRM_NAMES)
@@ -1222,21 +1222,34 @@ fn watch(
         let Ok(bytes) = spool.read(&id, crate::mint::MAX_ENTRY_BYTES) else {
             continue;
         };
-        let Ok(mut entry) = parse_entry(&bytes) else {
+        let Ok(entry) = parse_entry(&bytes) else {
             continue;
         };
         if crate::confirm::watcher_eligible(&entry, watcher) {
-            let prompt = bounded_prompt(&entry, now);
-            if !crate::confirm::mark_shown(&mut entry, watcher, now) {
+            let already_shown = entry.shown_to.as_ref() == Some(&watcher.pin());
+            let mut candidate = entry;
+            if !crate::confirm::mark_shown(&mut candidate, watcher, now) {
                 continue;
             }
+            candidates.push((!already_shown, candidate.deadline.0, id, bytes, candidate));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut prompts = Vec::new();
+    if let Some((needs_first_delivery, _, id, bytes, entry)) = candidates.into_iter().next() {
+        let prompt = bounded_prompt(&entry, now);
+        if needs_first_delivery {
             let json = entry.to_json();
             spool
                 .replace(&id, &bytes, json.as_bytes())
                 .map_err(|e| Refusal::from(&e))?;
-            prompts.push(prompt);
-            break;
         }
+        prompts.push(prompt);
     }
     Ok(BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -3408,6 +3421,89 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             })
             .count();
         assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn the_oldest_request_is_shown_first() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut newer = shown_entry();
+        newer.nonce = "cd".repeat(32);
+        newer.deadline = BoottimeMillis(NOW + 20_000);
+        let mut older = shown_entry();
+        older.deadline = BoottimeMillis(NOW + 10_000);
+        let spool = FakeSpool::new()
+            .with_file(
+                newer.nonce.as_bytes().to_vec(),
+                newer.to_json().into_bytes(),
+            )
+            .with_file(
+                older.nonce.as_bytes().to_vec(),
+                older.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+
+        let response = watch(&mut host.platform(), &spool, &watcher).unwrap();
+
+        assert_eq!(
+            watching_prompts(&response.answer).unwrap()[0].id,
+            older.nonce
+        );
+    }
+
+    #[test]
+    fn an_already_shown_request_stays_ahead_of_older_unshown_requests() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut previously_shown = shown_entry();
+        previously_shown.deadline = BoottimeMillis(NOW + 20_000);
+        let mut older_unshown = shown_entry();
+        older_unshown.nonce = "cd".repeat(32);
+        older_unshown.deadline = BoottimeMillis(NOW + 10_000);
+        older_unshown.shown_at_ms = None;
+        older_unshown.shown_to = None;
+        let spool = FakeSpool::new()
+            .with_file(
+                previously_shown.nonce.as_bytes().to_vec(),
+                previously_shown.to_json().into_bytes(),
+            )
+            .with_file(
+                older_unshown.nonce.as_bytes().to_vec(),
+                older_unshown.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+
+        let response = watch(&mut host.platform(), &spool, &watcher).unwrap();
+
+        assert_eq!(
+            watching_prompts(&response.answer).unwrap()[0].id,
+            previously_shown.nonce
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_does_not_rewrite_an_unchanged_entry() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut entry = shown_entry();
+        entry.shown_at_ms = None;
+        entry.shown_to = None;
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+
+        watch(&mut host.platform(), &spool, &watcher).unwrap();
+        let replace_calls = || {
+            spool
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, SpoolCall::Replace(_)))
+                .count()
+        };
+        let after_first_heartbeat = replace_calls();
+        watch(&mut host.platform(), &spool, &watcher).unwrap();
+
+        assert_eq!(after_first_heartbeat, 1);
+        assert_eq!(replace_calls(), after_first_heartbeat);
     }
 
     #[test]
