@@ -814,7 +814,9 @@ dependencies = [
  "predicates",
  "serde_json",
  "xudo",
+ "xudo-policy",
  "xudo-tests",
+ "xudo-wire",
 ]
 
 [[package]]

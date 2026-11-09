@@ -366,3 +366,16 @@ fn every_denial_code_record_and_rendering_are_pinned() {
         );
     }
 }
+
+#[test]
+fn a_pending_confirmation_envelope_is_pinned_in_both_renderers() {
+    let id = "0123456789abcdef".repeat(4);
+    insta::assert_snapshot!(
+        "human__pending_confirmation",
+        render::pending_human(&id, 12_345)
+    );
+    insta::assert_snapshot!(
+        "json__pending_confirmation",
+        render::pending_json(&id, 12_345)
+    );
+}

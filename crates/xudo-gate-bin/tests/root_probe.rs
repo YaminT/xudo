@@ -77,6 +77,7 @@ const RULES_DIR: &str = "/etc/xudo/rules.d";
 const CONFIG_FILE: &str = "/etc/xudo/config.toml";
 const AUDIT_DIR: &str = "/var/lib/xudo";
 const JOURNAL_DIR: &str = "/run/systemd/journal";
+const CONFIRM_DIR: &str = "/run/xudo/confirm";
 const USER: &str = "xudotest";
 /// The lane's account's password. Worth nothing: see `ci/root-test.sh`.
 const PASSWORD: &str = "xudotest-fixed-password";
@@ -210,6 +211,8 @@ fn install_everything() -> StandInJournal {
     root_dir("/run/xudo", 0o700);
     root_dir(SPOOL_DIR, 0o700);
     clear_spool();
+    root_dir(CONFIRM_DIR, 0o700);
+    let _ = fs::remove_file(format!("{CONFIRM_DIR}/1000.json"));
 
     // The rule, exactly as `xudo install` writes it.
     let backend = detect(&HostProbe).expect("the lane installs sudo before it runs");
@@ -637,6 +640,159 @@ fn spool_entries() -> usize {
 fn exec_probe() -> Pty {
     let xudo = xudo_binary();
     Pty::spawn(&[xudo.to_str().unwrap(), "exec", "--", "/usr/bin/id", "-u"])
+}
+
+/// Seeds the same root-owned heartbeat file the watch request maintains, tied
+/// to a live xudotest process on a distinct controlling terminal.
+fn live_test_watcher() -> Pty {
+    let watcher = Pty::spawn(&["/usr/bin/sleep", "60"]);
+    // setsid may fork before it can create a session. Find its live descendant
+    // that actually owns the controlling terminal, rather than pinning wrapper.
+    let root_pid = watcher.child.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let (pid, stat) = loop {
+        let found = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+            .find_map(|pid| {
+                let bytes = fs::read(format!("/proc/{pid}/stat")).ok()?;
+                let stat = xudo_sys::parse_stat("watcher", &bytes).ok()?;
+                if !xudo_gate::request::is_watch_terminal(stat.tty_nr) {
+                    return None;
+                }
+                let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                if !status
+                    .lines()
+                    .any(|line| line.starts_with("Uid:\t1000\t1000"))
+                {
+                    return None;
+                }
+                let mut parent = stat.ppid;
+                for _ in 0..8 {
+                    if parent == root_pid {
+                        return Some((pid, stat));
+                    }
+                    let bytes = fs::read(format!("/proc/{parent}/stat")).ok()?;
+                    parent = xudo_sys::parse_stat("watcher parent", &bytes).ok()?.ppid;
+                }
+                None
+            });
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher never acquired a valid pty"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let now = HostClock.boottime_millis();
+    root_file(
+        &format!("{CONFIRM_DIR}/1000.json"),
+        format!(
+            "{{\"h\":[{pid},{},{},{},{}],\"b\":[],\"o\":[]}}",
+            stat.starttime, stat.tty_nr, stat.session, now
+        )
+        .as_bytes(),
+        0o600,
+    );
+    watcher
+}
+
+fn require_watch_confirmation() {
+    let mut confirm_rule = RULES.to_owned();
+    confirm_rule.push_str("confirm = \"always\"\n");
+    root_file(
+        &format!("{RULES_DIR}/05-probe.toml"),
+        confirm_rule.as_bytes(),
+        0o644,
+    );
+}
+
+fn stdin_yes_exec(timeout: u64) -> std::process::Output {
+    root_file(
+        CONFIG_FILE,
+        format!("confirm_human_path = true\nconfirmation_timeout_secs = {timeout}\n").as_bytes(),
+        0o644,
+    );
+    let xudo = xudo_binary();
+    let mut child = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo)
+        .args(["--output", "json", "exec", "--", "/usr/bin/id", "-u"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn assert_run_is_still_pending(output: &std::process::Output) {
+    assert_eq!(output.status.code(), Some(18), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("\"verdict\":\"pending\""), "{stdout}");
+    assert!(
+        stderr.contains("pending approval") || stderr.contains("waiting for approval"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("yes"),
+        "stdin leaked into output: {stdout}"
+    );
+    let entries = fs::read_dir(SPOOL_DIR)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "pending spool entries: {entries:?}");
+    let bytes = fs::read(entries[0].path()).unwrap();
+    let request = PendingRequest::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        request.state,
+        xudo_gate::request::ConfirmationState::Pending
+    );
+    let log = fs::read(AUDIT_LOG).unwrap();
+    let chain = xudo_audit::verify_log(&log).unwrap();
+    let runs = chain
+        .records()
+        .iter()
+        .filter(|record| {
+            record.decision == xudo_audit::record::Decision::AwaitingConfirmation
+                && record.action.as_deref() == Some(ACTION)
+        })
+        .count();
+    assert_eq!(runs, 1, "the run was repeated: {:#?}", chain.records());
+}
+
+#[test]
+fn yes_on_stdin_cannot_answer_a_pending_run_with_zero_wait() {
+    if !begin_root_test("yes_on_stdin_cannot_answer_a_pending_run_with_zero_wait") {
+        return;
+    }
+    let _journal = install_everything();
+    require_watch_confirmation();
+    let _watcher = live_test_watcher();
+    start_broker();
+    let output = stdin_yes_exec(0);
+    assert_run_is_still_pending(&output);
+    clear_spool();
+}
+
+#[test]
+fn yes_on_stdin_cannot_answer_a_pending_run_while_waiting() {
+    if !begin_root_test("yes_on_stdin_cannot_answer_a_pending_run_while_waiting") {
+        return;
+    }
+    let _journal = install_everything();
+    require_watch_confirmation();
+    let _watcher = live_test_watcher();
+    start_broker();
+    let output = stdin_yes_exec(1);
+    assert_run_is_still_pending(&output);
+    clear_spool();
 }
 
 #[test]

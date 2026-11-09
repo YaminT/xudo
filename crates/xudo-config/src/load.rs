@@ -280,12 +280,12 @@ mod tests {
             &mut settings,
             Layer::Project,
             ".xudo/policy.toml",
-            "confirmation_timeout_secs = 15\nfrozen = true\n",
+            "confirmation_timeout_secs = 0\nfrozen = true\n",
         )
         .unwrap();
         assert_eq!(
             settings.get(Setting::ConfirmationTimeoutSecs).value,
-            Value::Integer(15)
+            Value::Integer(0)
         );
         assert_eq!(settings.get(Setting::Frozen).value, Value::Bool(true));
     }

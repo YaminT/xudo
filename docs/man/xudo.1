@@ -136,6 +136,20 @@ The program is an absolute path, after
 .BR \-\- .
 The command's own status is the process status.
 A policy refusal happens before the command runs.
+If a human watch approval is pending, the default timeout returns at once
+with exit status 18 and leaves the request pending.
+Set
+.B confirmation_timeout_secs
+in the settings file to wait for approval; it defaults to 0 and accepts values
+from 0 through 600 seconds. The settings file,
+.IR /etc/xudo/config.toml ,
+must be readable by the invoking user; otherwise exec fails closed with status
+19. A positive timeout of n seconds starts after the broker first reports the
+pending request. If the broker is silent, xudo waits at most n+5 seconds from
+that point. After an approval, the consuming run request has a separate maximum
+of 5 seconds. With
+.B \-\-output json,
+each pending update is one compact JSON object per line (JSON Lines).
 .TP
 .B check
 Lint the loaded ruleset.
@@ -196,7 +210,7 @@ The keys are
 .B confirm_human_path
 (default false),
 .B confirmation_timeout_secs
-(default 60),
+(default 0, maximum 600 seconds),
 .B frozen
 (default false),
 .B audit_sink
@@ -288,6 +302,7 @@ Denied by policy, or an audit log that is not intact.
 .B 18
 Confirmation is required, or there is no live confirmation channel.
 Both mean nobody has approved the action.
+An approval request still pending at the configured timeout also exits 18.
 .TP
 .B 19
 .B xudo
