@@ -925,6 +925,7 @@ dependencies = [
  "insta",
  "proptest",
  "rustix",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

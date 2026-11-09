@@ -17,6 +17,7 @@
 //! request is known before anything is said about the spool or the policy.
 //! Nothing after a failure runs.
 
+use serde::{Deserialize, Serialize};
 use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
@@ -56,6 +57,8 @@ pub struct Platform<'a> {
     /// The audit trail. A permitted request is minted only once its record is
     /// on it; refusals are recorded best-effort.
     pub audit: &'a mut dyn AuditSink,
+    /// `/run/xudo/confirm`, accessed through the spool syscall seam.
+    pub confirmations: Option<&'a dyn Spool>,
 }
 
 /// How a connection ended.
@@ -97,14 +100,124 @@ struct Evaluated {
     policy: LoadedPolicy,
 }
 
+enum ConfirmRun {
+    Continue(Box<Evaluated>),
+    Served(Served),
+}
+
+fn confirm_run(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    evaluated: Evaluated,
+) -> ConfirmRun {
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
+    if decision.verdict != xudo_policy::Verdict::AllowWithConfirmation
+        || !policy.settings.confirm_human_path
+    {
+        return ConfirmRun::Continue(Box::new(Evaluated {
+            decision,
+            caller,
+            identity,
+            request,
+            policy,
+        }));
+    }
+    let now = platform.clock.boottime_millis();
+    if !has_live_watcher(platform.confirmations, platform.peers, identity.uid, now) {
+        let denied = confirmation_denial(decision, xudo_policy::DenialCode::NoConfirmationChannel);
+        let _ = platform.audit.append(&|previous| {
+            decided(
+                previous,
+                &denied,
+                &caller,
+                &identity,
+                &request,
+                &policy.rules.generation,
+                None,
+            )
+        });
+        return ConfirmRun::Served(answer(
+            conn,
+            &BrokerResponse::decided(denied, None),
+            Served::Decided,
+        ));
+    }
+    if let Some(approved) = take_matching_approval(
+        spool,
+        &request,
+        &identity,
+        decision.action.as_ref().map(xudo_policy::ActionId::as_str),
+        policy.rules.generation.id(),
+        now,
+    ) {
+        if clear_backoff(platform.confirmations, identity.uid, &approved.fingerprint).is_err() {
+            return ConfirmRun::Served(refuse(
+                conn,
+                platform.audit,
+                &Refusal::broker(
+                    RefusalCode::SpoolUnusable,
+                    "cannot clear confirmation backoff",
+                ),
+                Some(&identity),
+                Some(&request),
+            ));
+        }
+        let evaluated = Evaluated {
+            decision,
+            caller,
+            identity,
+            request,
+            policy,
+        };
+        return ConfirmRun::Served(mint_approved(conn, platform, spool, evaluated, approved));
+    }
+    let code = if active_backoff(platform.confirmations, identity.uid, &request, now)
+        || pending_duplicate(spool, &request, identity.uid, now)
+    {
+        xudo_policy::DenialCode::ConfirmationThrottled
+    } else {
+        return ConfirmRun::Continue(Box::new(Evaluated {
+            decision,
+            caller,
+            identity,
+            request,
+            policy,
+        }));
+    };
+    let denied = confirmation_denial(decision, code);
+    let _ = platform.audit.append(&|previous| {
+        decided(
+            previous,
+            &denied,
+            &caller,
+            &identity,
+            &request,
+            &policy.rules.generation,
+            None,
+        )
+    });
+    ConfirmRun::Served(answer(
+        conn,
+        &BrokerResponse::decided(denied, None),
+        Served::Decided,
+    ))
+}
+
 /// Serves one connection: identifies, reads, decides, mints, answers.
 ///
 /// `spool` is the result of opening the spool, opened before the connection
 /// is served and refused only once the request is known.
-pub fn serve<S: Spool>(
+pub fn serve(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    spool: Result<&S, &SpoolError>,
+    spool: Result<&dyn Spool, &SpoolError>,
 ) -> Served {
     if let Err(error) = platform.hygiene.forbid_new_privileges() {
         return refuse_hygiene_failure(conn, platform.audit, &error);
@@ -117,19 +230,6 @@ pub fn serve<S: Spool>(
         Ok(request) => request,
         Err(refusal) => return refuse(conn, platform.audit, &refusal, Some(&identity), None),
     };
-    if !matches!(request.question, xudo_wire::Question::Run { .. }) {
-        let refusal = Refusal::client(
-            RefusalCode::RequestUnknown,
-            "question is not implemented in this broker step",
-        );
-        return refuse(
-            conn,
-            platform.audit,
-            &refusal,
-            Some(&identity),
-            Some(&request),
-        );
-    }
     let spool = match spool {
         Ok(spool) => spool,
         Err(error) => {
@@ -142,6 +242,38 @@ pub fn serve<S: Spool>(
             );
         }
     };
+    let should_expire = match &request.question {
+        xudo_wire::Question::Run { .. } => platform.confirmations.is_some(),
+        xudo_wire::Question::Watch => {
+            !identity.diverged && xudo_gate::request::is_watch_terminal(identity.tty)
+        }
+        xudo_wire::Question::Status { .. } | xudo_wire::Question::Answer { .. } => true,
+        _ => false,
+    };
+    if should_expire {
+        if let Err(refusal) = expire_entries(platform, spool, &request) {
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(&identity),
+                Some(&request),
+            );
+        }
+    }
+    serve_request(conn, platform, spool, identity, request)
+}
+
+fn serve_request(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: PeerIdentity,
+    request: BrokerRequest,
+) -> Served {
+    if !matches!(request.question, xudo_wire::Question::Run { .. }) {
+        return serve_confirmation_question(conn, platform, spool, &identity, &request);
+    }
     let policy = match platform.policy.load() {
         Ok(policy) => policy,
         Err(error) => {
@@ -157,6 +289,24 @@ pub fn serve<S: Spool>(
 
     let caller = classify(&identity);
     let decision = decide(&policy, &caller, &request);
+    let evaluated = Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    };
+    let evaluated = match confirm_run(conn, platform, spool, evaluated) {
+        ConfirmRun::Served(served) => return served,
+        ConfirmRun::Continue(evaluated) => *evaluated,
+    };
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
     if !decision.verdict.is_permitted() {
         // Nothing is enabled by this record, so a sink that cannot take it
         // does not change the answer.
@@ -191,6 +341,874 @@ pub fn serve<S: Spool>(
     )
 }
 
+fn expire_entries(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    request: &BrokerRequest,
+) -> Result<(), Refusal> {
+    let store = platform.confirmations.ok_or_else(|| {
+        Refusal::broker(
+            RefusalCode::SpoolUnusable,
+            "confirmation directory is unavailable",
+        )
+    })?;
+    let _confirm_guard = SpoolGuard::lock(store).map_err(|error| Refusal::from(&error))?;
+    let _spool_guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
+    let now = platform.clock.boottime_millis();
+    let names = spool
+        .names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1)
+        .map_err(|error| Refusal::from(&error))?;
+    for id in names {
+        let Ok(bytes) = spool.read(&id, crate::mint::MAX_ENTRY_BYTES) else {
+            continue;
+        };
+        let Ok(mut entry) = parse_entry(&bytes) else {
+            continue;
+        };
+        if !crate::confirm::expire(&mut entry, now) {
+            continue;
+        }
+        let command: Vec<String> = std::iter::once(entry.program.clone())
+            .chain(entry.argv.clone())
+            .collect();
+        let audit_request = BrokerRequest::new(
+            entry.program.clone(),
+            entry.argv.clone(),
+            entry.claimed_classification.clone(),
+        );
+        let record = platform
+            .audit
+            .append(&|previous| {
+                xudo_audit::record::Record::after(
+                    previous,
+                    xudo_audit::record::Decision::Denied,
+                    command.clone(),
+                    "unattested",
+                )
+                .with_denial("confirmation_expired")
+                .with_evidence(vec![
+                    "broker=xudod".to_owned(),
+                    format!("nonce={}", entry.nonce),
+                    format!("question={:?}", audit_request.question),
+                ])
+                .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .map_err(|_| {
+                Refusal::broker(
+                    RefusalCode::BrokerUnusable,
+                    "expiry audit record was refused",
+                )
+            })?;
+        let _ = record;
+        record_outcome_locked(store, &entry, TerminalOutcome::Expired, now)?;
+        spool.remove(&id).map_err(|error| Refusal::from(&error))?;
+    }
+    let _ = request;
+    Ok(())
+}
+
+fn record_outcome_locked(
+    store: &dyn Spool,
+    entry: &xudo_gate::request::PendingRequest,
+    outcome: TerminalOutcome,
+    now: u64,
+) -> Result<(), Refusal> {
+    let name = format!("{}.json", entry.caller_uid);
+    let old = store.read(name.as_bytes(), 16 * 1024).ok();
+    let mut data = old
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<ConfirmData>(bytes).ok())
+        .unwrap_or(ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        });
+    data.outcomes
+        .retain(|item| item.until_ms > now && item.id != entry.nonce);
+    data.outcomes.push(RecentOutcome {
+        id: entry.nonce.clone(),
+        outcome,
+        until_ms: now.saturating_add(crate::mint::REQUEST_TTL_MILLIS),
+        pid: entry.caller_pid,
+        starttime: entry.caller_starttime,
+    });
+    if data.outcomes.len() > MAX_RECENT_OUTCOMES_PER_UID {
+        let excess = data
+            .outcomes
+            .len()
+            .saturating_sub(MAX_RECENT_OUTCOMES_PER_UID);
+        data.outcomes.drain(..excess);
+    }
+    if outcome == TerminalOutcome::Expired {
+        let fp = &entry.fingerprint;
+        if data.backoff.len() >= MAX_BACKOFF_ENTRIES_PER_UID
+            && !data.backoff.iter().any(|old| old.fingerprint == *fp)
+        {
+            data.backoff.remove(0);
+        }
+        let strikes = data
+            .backoff
+            .iter()
+            .find(|old| old.fingerprint == *fp)
+            .map_or(1, |old| old.strikes.saturating_add(1));
+        let until_ms = now.saturating_add(crate::confirm::backoff_ms(strikes));
+        data.backoff.retain(|old| old.fingerprint != *fp);
+        data.backoff.push(BackoffEntry {
+            fingerprint: fp.clone(),
+            strikes,
+            until_ms,
+        });
+    }
+    let bytes = encode_confirm_data(&data);
+    match old {
+        Some(expected) => store.replace(name.as_bytes(), &expected, &bytes),
+        None => store.publish(&name, &bytes),
+    }
+    .map_err(|error| Refusal::from(&error))
+}
+
+fn request_fingerprint(request: &BrokerRequest, uid: u32) -> Option<String> {
+    let (program, argv, _) = request.run_fields()?;
+    Some(crate::confirm::fingerprint(
+        uid,
+        program.as_bytes(),
+        &argv.iter().map(String::as_bytes).collect::<Vec<_>>(),
+    ))
+}
+
+fn active_backoff(store: Option<&dyn Spool>, uid: u32, request: &BrokerRequest, now: u64) -> bool {
+    let (Some(store), Some(fingerprint)) = (store, request_fingerprint(request, uid)) else {
+        return true;
+    };
+    let name = format!("{uid}.json");
+    store
+        .read(name.as_bytes(), 16 * 1024)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ConfirmData>(&bytes).ok())
+        .is_some_and(|data| {
+            data.backoff
+                .iter()
+                .any(|entry| entry.fingerprint == fingerprint && now < entry.until_ms)
+        })
+}
+
+fn clear_backoff(store: Option<&dyn Spool>, uid: u32, fingerprint: &str) -> Result<(), SpoolError> {
+    let store = store.ok_or_else(|| SpoolError::Io {
+        operation: "confirmation state".to_owned(),
+        at: "/run/xudo/confirm".to_owned(),
+        code: None,
+        reason: "directory unavailable".to_owned(),
+    })?;
+    let _guard = SpoolGuard::lock(store)?;
+    let name = format!("{uid}.json");
+    let old = store.read(name.as_bytes(), 16 * 1024)?;
+    let mut data: ConfirmData = serde_json::from_slice(&old).map_err(|error| SpoolError::Io {
+        operation: "parse confirmation state".to_owned(),
+        at: "/run/xudo/confirm".to_owned(),
+        code: None,
+        reason: error.to_string(),
+    })?;
+    let original = data.backoff.len();
+    data.backoff
+        .retain(|entry| entry.fingerprint != fingerprint);
+    if data.backoff.len() == original {
+        return Ok(());
+    }
+    let bytes = encode_confirm_data(&data);
+    store.replace(name.as_bytes(), &old, &bytes)
+}
+
+fn take_matching_approval(
+    spool: &dyn Spool,
+    request: &BrokerRequest,
+    identity: &PeerIdentity,
+    action: Option<&str>,
+    generation: u64,
+    now: u64,
+) -> Option<xudo_gate::request::PendingRequest> {
+    let (program, argv, _) = request.run_fields()?;
+    let action = action?;
+    let _guard = SpoolGuard::lock(spool).ok()?;
+    let names = spool.names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1).ok()?;
+    let argv_bytes = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
+    for name in names {
+        let bytes = spool.read(&name, crate::mint::MAX_ENTRY_BYTES).ok()?;
+        let Ok(entry) = parse_entry(&bytes) else {
+            continue;
+        };
+        let (_, consumed) = crate::confirm::take_approval(
+            Some(entry),
+            identity.uid,
+            program.as_bytes(),
+            &argv_bytes,
+            generation,
+            action,
+            now,
+        );
+        if let Some(approved) = consumed {
+            if spool.consume(&name).is_ok() {
+                return Some(approved);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn mint_approved(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    evaluated: Evaluated,
+    mut entry: xudo_gate::request::PendingRequest,
+) -> Served {
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
+    let Some((program, argv, _)) = request.run_fields() else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::client(
+                RefusalCode::RequestMalformed,
+                "approval did not match a run",
+            ),
+            Some(&identity),
+            Some(&request),
+        );
+    };
+    let Ok(nonce) = draw_nonce(platform.entropy) else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "cannot draw a nonce"),
+            Some(&identity),
+            Some(&request),
+        );
+    };
+    entry.nonce = nonce;
+    entry.caller_pid = identity.pid;
+    entry.caller_starttime = identity.starttime;
+    entry.caller_uid = identity.uid;
+    entry.caller_sid = identity.sid;
+    entry.caller_tty = identity.tty;
+    program.clone_into(&mut entry.program);
+    entry.argv = argv.to_vec();
+    let json = entry.to_json();
+    let build = |previous: Option<&Record>, grant: &Grant| {
+        decided(
+            previous,
+            &decision,
+            &caller,
+            &identity,
+            &request,
+            &policy.rules.generation,
+            Some(&grant.0),
+        )
+    };
+    let Ok(authorized) = authorize(&mut *platform.audit, Grant(entry), &build) else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "approval audit record was refused",
+            ),
+            Some(&identity),
+            Some(&request),
+        );
+    };
+    let minting = Minting {
+        authorized: &authorized,
+        json: &json,
+        uid: identity.uid,
+        now: platform.clock.boottime_millis(),
+    };
+    if let Err(error) = publish(spool, platform.peers, &minting) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::from(&error),
+            Some(&identity),
+            Some(&request),
+        );
+    }
+    let minted = Minted {
+        nonce: authorized.approval().0.nonce.clone(),
+        expires_in_ms: remaining_millis(
+            authorized.approval().0.deadline.0,
+            platform.clock.boottime_millis(),
+        ),
+        gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+    };
+    answer(
+        conn,
+        &BrokerResponse::decided(decision, Some(minted)),
+        Served::Minted,
+    )
+}
+
+fn pending_duplicate(spool: &dyn Spool, request: &BrokerRequest, uid: u32, now: u64) -> bool {
+    let Some((program, argv, _)) = request.run_fields() else {
+        return false;
+    };
+    let fingerprint = crate::confirm::fingerprint(
+        uid,
+        program.as_bytes(),
+        &argv.iter().map(String::as_bytes).collect::<Vec<_>>(),
+    );
+    let Ok(_guard) = SpoolGuard::lock(spool) else {
+        return true;
+    };
+    let Ok(names) = spool.names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1) else {
+        return true;
+    };
+    names.into_iter().any(|name| {
+        spool
+            .read(&name, crate::mint::MAX_ENTRY_BYTES)
+            .ok()
+            .and_then(|bytes| parse_entry(&bytes).ok())
+            .is_some_and(|entry| crate::confirm::is_duplicate(&entry, &fingerprint, now))
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmData {
+    heartbeat: Option<WatcherHeartbeat>,
+    backoff: Vec<BackoffEntry>,
+    #[serde(default)]
+    outcomes: Vec<RecentOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecentOutcome {
+    id: String,
+    outcome: TerminalOutcome,
+    until_ms: u64,
+    pid: u32,
+    starttime: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TerminalOutcome {
+    Denied,
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatcherHeartbeat {
+    pid: u32,
+    starttime: u64,
+    tty: i64,
+    sid: i64,
+    at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackoffEntry {
+    fingerprint: String,
+    strikes: u32,
+    until_ms: u64,
+}
+
+const MAX_CONFIRM_UIDS: usize = 4_096;
+const MAX_BACKOFF_ENTRIES_PER_UID: usize = 64;
+const MAX_RECENT_OUTCOMES_PER_UID: usize = 64;
+
+// A plain struct of strings and integers cannot fail to serialize. Were it to,
+// the empty record cannot be parsed, and every reader treats that as no watcher.
+fn encode_confirm_data(data: &ConfirmData) -> Vec<u8> {
+    serde_json::to_vec(data).unwrap_or_default()
+}
+
+fn confirmation_denial(mut decision: Decision, code: xudo_policy::DenialCode) -> Decision {
+    decision.verdict = xudo_policy::Verdict::Deny;
+    decision.denial = Some(code);
+    decision
+}
+
+fn has_live_watcher(store: Option<&dyn Spool>, peers: &dyn PeerCalls, uid: u32, now: u64) -> bool {
+    let Some(store) = store else { return false };
+    let Ok(bytes) = store.read(format!("{uid}.json").as_bytes(), 16 * 1024) else {
+        return false;
+    };
+    let Ok(data) = serde_json::from_slice::<ConfirmData>(&bytes) else {
+        return false;
+    };
+    let Some(heartbeat) = data.heartbeat else {
+        return false;
+    };
+    if now.saturating_sub(heartbeat.at_ms) > 3_000 || heartbeat.pid == 0 {
+        return false;
+    }
+    peers
+        .read_proc(heartbeat.pid, xudo_sys::ProcFile::Stat)
+        .ok()
+        .and_then(|bytes| {
+            xudo_sys::parse_stat(&format!("/proc/{}/stat", heartbeat.pid), &bytes).ok()
+        })
+        .is_some_and(|stat| stat.pid == heartbeat.pid && stat.starttime == heartbeat.starttime)
+}
+
+fn serve_confirmation_question(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+) -> Served {
+    let result = match &request.question {
+        xudo_wire::Question::Status { id } => status(conn, platform, spool, identity, request, id),
+        xudo_wire::Question::Watch => watch(platform, spool, identity),
+        xudo_wire::Question::Answer { .. } => {
+            answer_confirmation(platform, spool, identity, request)
+        }
+        xudo_wire::Question::Freeze { .. } | xudo_wire::Question::Thaw => {
+            let refusal = Refusal::client(
+                RefusalCode::RequestUnknown,
+                "freeze and thaw are not enabled in this step",
+            );
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(identity),
+                Some(request),
+            );
+        }
+        xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
+    };
+    match result {
+        Ok(response) => answer(conn, &response, Served::Decided),
+        Err(refusal) => refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        ),
+    }
+}
+
+fn status(
+    _conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    _request: &BrokerRequest,
+    id: &str,
+) -> Result<BrokerResponse, Refusal> {
+    let Ok(bytes) = spool.read(id.as_bytes(), crate::mint::MAX_ENTRY_BYTES) else {
+        return status_outcome(platform, identity, id);
+    };
+    let entry = parse_entry(&bytes)?;
+    if entry.caller_uid != identity.uid
+        || entry.caller_pid != identity.pid
+        || entry.caller_starttime != identity.starttime
+    {
+        return Err(Refusal::client(
+            RefusalCode::ChannelUntrusted,
+            "status is limited to the requesting process",
+        ));
+    }
+    let response = match entry.state {
+        xudo_gate::request::ConfirmationState::Pending => xudo_wire::Answer::Pending {
+            id: entry.nonce,
+            expires_in_ms: entry
+                .deadline
+                .0
+                .saturating_sub(platform.clock.boottime_millis()),
+        },
+        state => {
+            let code = if state == xudo_gate::request::ConfirmationState::Expired {
+                xudo_policy::DenialCode::ConfirmationExpired
+            } else {
+                xudo_policy::DenialCode::ConfirmationRefused
+            };
+            let command = std::iter::once(entry.program.clone())
+                .chain(entry.argv.clone())
+                .collect();
+            let mut decision =
+                Decision::deny(code, command, Vec::new()).about_program(&entry.program);
+            decision.action = Some(xudo_policy::ActionId::new(entry.action.clone()));
+            let minted = if state == xudo_gate::request::ConfirmationState::Approved {
+                decision.verdict = xudo_policy::Verdict::AllowWithConfirmation;
+                decision.denial = None;
+                Some(Minted {
+                    nonce: entry.nonce.clone(),
+                    expires_in_ms: entry
+                        .deadline
+                        .0
+                        .saturating_sub(platform.clock.boottime_millis()),
+                    gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+                })
+            } else {
+                None
+            };
+            return Ok(BrokerResponse::decided(decision, minted));
+        }
+    };
+    Ok(BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: response,
+    })
+}
+
+fn status_outcome(
+    platform: &Platform<'_>,
+    identity: &PeerIdentity,
+    id: &str,
+) -> Result<BrokerResponse, Refusal> {
+    let store = platform
+        .confirmations
+        .ok_or_else(|| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
+    let bytes = store
+        .read(format!("{}.json", identity.uid).as_bytes(), 16 * 1024)
+        .map_err(|_| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
+    let data: ConfirmData = serde_json::from_slice(&bytes)
+        .map_err(|_| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
+    let now = platform.clock.boottime_millis();
+    let outcome = data
+        .outcomes
+        .iter()
+        .find(|item| {
+            item.id == id
+                && item.until_ms > now
+                && item.pid == identity.pid
+                && item.starttime == identity.starttime
+        })
+        .ok_or_else(|| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
+    let code = match outcome.outcome {
+        TerminalOutcome::Denied => xudo_policy::DenialCode::ConfirmationRefused,
+        TerminalOutcome::Expired => xudo_policy::DenialCode::ConfirmationExpired,
+    };
+    Ok(BrokerResponse::decided(
+        Decision::deny(code, Vec::new(), Vec::new()),
+        None,
+    ))
+}
+
+fn watch(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+) -> Result<BrokerResponse, Refusal> {
+    if identity.diverged || !xudo_gate::request::is_watch_terminal(identity.tty) {
+        return Err(Refusal::client(
+            RefusalCode::ChannelUntrusted,
+            "watch requires a checked terminal",
+        ));
+    }
+    let now = platform.clock.boottime_millis();
+    save_heartbeat(platform, identity, now)?;
+    let watcher = crate::confirm::WatcherFacts {
+        uid: identity.uid,
+        pid: identity.pid,
+        starttime: identity.starttime,
+        tty: identity.tty,
+        sid: identity.sid,
+        diverged: identity.diverged,
+    };
+    let mut prompts = Vec::new();
+    let _guard = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
+    let names = spool.names_up_to(65).map_err(|e| Refusal::from(&e))?;
+    for id in names {
+        let Ok(bytes) = spool.read(&id, crate::mint::MAX_ENTRY_BYTES) else {
+            continue;
+        };
+        let Ok(mut entry) = parse_entry(&bytes) else {
+            continue;
+        };
+        if crate::confirm::watcher_eligible(&entry, watcher)
+            && crate::confirm::mark_shown(&mut entry, watcher, now)
+        {
+            let prompt = format!("{} {} {:?}", entry.nonce, entry.program, entry.argv);
+            let json = entry.to_json();
+            spool
+                .replace(&id, &bytes, json.as_bytes())
+                .map_err(|e| Refusal::from(&e))?;
+            prompts.push(prompt);
+        }
+    }
+    Ok(BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: xudo_wire::Answer::Watching { prompts },
+    })
+}
+
+fn save_heartbeat(
+    platform: &mut Platform<'_>,
+    identity: &PeerIdentity,
+    now: u64,
+) -> Result<(), Refusal> {
+    let store = platform.confirmations.ok_or_else(|| {
+        Refusal::broker(
+            RefusalCode::SpoolUnusable,
+            "confirmation directory is unavailable",
+        )
+    })?;
+    let _guard = SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?;
+    let heartbeat = WatcherHeartbeat {
+        pid: identity.pid,
+        starttime: identity.starttime,
+        tty: identity.tty,
+        sid: identity.sid,
+        at_ms: now,
+    };
+    let name = format!("{}.json", identity.uid);
+    let old = store.read(name.as_bytes(), 16 * 1024).ok();
+    if let Some(bytes) = &old {
+        if let Ok(data) = serde_json::from_slice::<ConfirmData>(bytes) {
+            if let Some(first) = data.heartbeat {
+                if first.pid != identity.pid || first.starttime != identity.starttime {
+                    let active = now.saturating_sub(first.at_ms) <= 3_000
+                        && platform
+                            .peers
+                            .read_proc(first.pid, xudo_sys::ProcFile::Stat)
+                            .ok()
+                            .and_then(|b| xudo_sys::parse_stat("watcher", &b).ok())
+                            .is_some_and(|s| s.pid == first.pid && s.starttime == first.starttime);
+                    if active {
+                        return Err(Refusal::client(
+                            RefusalCode::ChannelUntrusted,
+                            format!(
+                                "watcher already active: pid {}, tty {}",
+                                first.pid, first.tty
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let data = old
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<ConfirmData>(bytes).ok())
+        .unwrap_or(ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        });
+    if data.backoff.len() > MAX_BACKOFF_ENTRIES_PER_UID {
+        return Err(Refusal::broker(
+            RefusalCode::SpoolUnusable,
+            "confirmation backoff table exceeds its bound",
+        ));
+    }
+    if old.is_none()
+        && store
+            .names_up_to(MAX_CONFIRM_UIDS + 1)
+            .map_err(|e| Refusal::from(&e))?
+            .len()
+            >= MAX_CONFIRM_UIDS
+    {
+        return Err(Refusal::broker(
+            RefusalCode::SpoolFull,
+            "confirmation directory is full",
+        ));
+    }
+    let mut updated = data;
+    updated.outcomes.retain(|outcome| outcome.until_ms > now);
+    updated.heartbeat = Some(heartbeat);
+    let bytes = encode_confirm_data(&updated);
+    match old {
+        Some(expected) => store.replace(name.as_bytes(), &expected, &bytes),
+        None => store.publish(&name, &bytes),
+    }
+    .map_err(|error| Refusal::from(&error))?;
+    Ok(())
+}
+
+fn answer_confirmation(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+) -> Result<BrokerResponse, Refusal> {
+    let xudo_wire::Question::Answer { id, token, approve } = &request.question else {
+        return Err(Refusal::client(
+            RefusalCode::RequestMalformed,
+            "answer question required",
+        ));
+    };
+    let (id, token, approve) = (id.as_str(), token.as_str(), *approve);
+    let _confirm_guard = if approve {
+        None
+    } else {
+        let store = platform.confirmations.ok_or_else(|| {
+            Refusal::broker(
+                RefusalCode::SpoolUnusable,
+                "confirmation directory is unavailable",
+            )
+        })?;
+        Some(SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?)
+    };
+    let _guard = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
+    let bytes = spool
+        .read(id.as_bytes(), crate::mint::MAX_ENTRY_BYTES)
+        .map_err(|_| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
+    let mut entry = parse_entry(&bytes)?;
+    let watcher = crate::confirm::WatcherFacts {
+        uid: identity.uid,
+        pid: identity.pid,
+        starttime: identity.starttime,
+        tty: identity.tty,
+        sid: identity.sid,
+        diverged: identity.diverged,
+    };
+    let answer = if approve {
+        crate::confirm::Answer::Approve(token.as_bytes())
+    } else {
+        crate::confirm::Answer::Deny
+    };
+    crate::confirm::answer(
+        &mut entry,
+        watcher,
+        platform.clock.boottime_millis(),
+        crate::confirm::Settings::default(),
+        answer,
+    )
+    .map_err(|_| Refusal::client(RefusalCode::AnswerRejected, "answer was refused"))?;
+    complete_answer(
+        platform,
+        spool,
+        identity,
+        request,
+        AnsweredEntry {
+            id: id.to_owned(),
+            bytes,
+            entry,
+        },
+        approve,
+    )
+}
+
+struct AnsweredEntry {
+    id: String,
+    bytes: Vec<u8>,
+    entry: xudo_gate::request::PendingRequest,
+}
+
+fn complete_answer(
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    answered: AnsweredEntry,
+    approve: bool,
+) -> Result<BrokerResponse, Refusal> {
+    let AnsweredEntry { id, bytes, entry } = answered;
+    let caller = classify(identity);
+    let policy = platform
+        .policy
+        .load()
+        .map_err(|_| Refusal::broker(RefusalCode::PolicyUnloadable, "policy cannot be loaded"))?;
+    let decision_request = BrokerRequest::new(
+        entry.program.clone(),
+        entry.argv.clone(),
+        entry.claimed_classification.clone(),
+    );
+    let mut decision = decide(&policy, &caller, &decision_request);
+    if !approve {
+        decision.verdict = xudo_policy::Verdict::Deny;
+        decision.denial = Some(xudo_policy::DenialCode::ConfirmationRefused);
+    }
+    if approve {
+        let grant = Grant(entry.clone());
+        let generation = &policy.rules.generation;
+        let authorized = authorize(&mut *platform.audit, grant, &|previous, grant| {
+            decided(
+                previous,
+                &decision,
+                &caller,
+                identity,
+                request,
+                generation,
+                Some(&grant.0),
+            )
+        })
+        .map_err(|error| {
+            Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                format!("approval audit record was refused: {error}"),
+            )
+        })?;
+        let replace = spool.replace(
+            id.as_bytes(),
+            &bytes,
+            authorized.approval().0.to_json().as_bytes(),
+        );
+        replace.map_err(|e| Refusal::from(&e))?;
+    } else {
+        let _ = platform
+            .audit
+            .append(&|previous| {
+                decided(
+                    previous,
+                    &decision,
+                    &caller,
+                    identity,
+                    request,
+                    &policy.rules.generation,
+                    None,
+                )
+            })
+            .map_err(|_| {
+                Refusal::broker(
+                    RefusalCode::BrokerUnusable,
+                    "denial audit record was refused",
+                )
+            })?;
+        record_outcome_locked(
+            platform.confirmations.ok_or_else(|| {
+                Refusal::broker(
+                    RefusalCode::SpoolUnusable,
+                    "confirmation directory is unavailable",
+                )
+            })?,
+            &entry,
+            TerminalOutcome::Denied,
+            platform.clock.boottime_millis(),
+        )?;
+        spool.remove(id.as_bytes()).map_err(|e| Refusal::from(&e))?;
+    }
+    Ok(BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: xudo_wire::Answer::Done,
+    })
+}
+
+struct SpoolGuard<'a, S: Spool + ?Sized>(&'a S);
+
+impl<'a, S: Spool + ?Sized> SpoolGuard<'a, S> {
+    fn lock(spool: &'a S) -> Result<Self, SpoolError> {
+        spool.lock()?;
+        Ok(Self(spool))
+    }
+}
+
+impl<S: Spool + ?Sized> Drop for SpoolGuard<'_, S> {
+    fn drop(&mut self) {
+        self.0.unlock();
+    }
+}
+
+fn parse_entry(bytes: &[u8]) -> Result<xudo_gate::request::PendingRequest, Refusal> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| xudo_gate::request::PendingRequest::parse(s).ok())
+        .ok_or_else(|| Refusal::client(RefusalCode::RequestUnknown, "request entry is invalid"))
+}
+
 /// Reads and parses the request.
 fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
     let bytes = conn
@@ -200,10 +1218,10 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
 }
 
 /// Mints the entry for a permitted decision and answers with it.
-fn mint<S: Spool>(
+fn mint(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    spool: &S,
+    spool: &dyn Spool,
     evaluated: Evaluated,
 ) -> Served {
     let Evaluated {
@@ -297,11 +1315,18 @@ fn mint<S: Spool>(
         expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
     };
-    answer(
-        conn,
-        &BrokerResponse::decided(decision, Some(minted)),
-        Served::Minted,
-    )
+    let response = if authorized.approval().0.needs_watch {
+        BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: xudo_wire::Answer::Pending {
+                id: minted.nonce,
+                expires_in_ms: minted.expires_in_ms,
+            },
+        }
+    } else {
+        BrokerResponse::decided(decision, Some(minted))
+    };
+    answer(conn, &response, Served::Minted)
 }
 
 fn remaining_millis(deadline: u64, now: u64) -> u64 {
@@ -317,11 +1342,15 @@ fn refuse(
     request: Option<&BrokerRequest>,
 ) -> Served {
     let _ = audit.append(&|previous| refused(previous, refusal, identity, request));
-    answer(
-        conn,
-        &BrokerResponse::refused(refusal.code),
-        Served::Refused(refusal.fault),
-    )
+    let response = if refusal.code == RefusalCode::ChannelUntrusted && !refusal.detail.is_empty() {
+        BrokerResponse::refused_with_detail(
+            refusal.code,
+            refusal.detail.chars().take(256).collect(),
+        )
+    } else {
+        BrokerResponse::refused(refusal.code)
+    };
+    answer(conn, &response, Served::Refused(refusal.fault))
 }
 
 /// Sends the response, reporting `served` if it arrived.
@@ -455,6 +1484,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entropy: FakeEntropy,
         policy: FixedPolicy,
         audit: FakeAuditSink,
+        confirmations: FakeSpool,
     }
 
     impl Host {
@@ -495,6 +1525,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     loads: Cell::new(0),
                 },
                 audit: FakeAuditSink::new(),
+                confirmations: FakeSpool::new(),
             }
         }
 
@@ -507,6 +1538,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 entropy: &self.entropy,
                 policy: &self.policy,
                 audit: &mut self.audit,
+                confirmations: Some(&self.confirmations),
             }
         }
     }
@@ -519,6 +1551,19 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn stat_line(pid: u32, starttime: u64) -> Vec<u8> {
         let mut tail: Vec<String> = vec!["S".into(), "1".into()];
         tail.extend(std::iter::repeat_n("0".to_owned(), 17));
+        tail.push(starttime.to_string());
+        format!("{pid} (xudo) {}", tail.join(" ")).into_bytes()
+    }
+
+    fn stat_line_with_terminal(pid: u32, starttime: u64, sid: i64, tty: i64) -> Vec<u8> {
+        let mut tail: Vec<String> = vec![
+            "S".into(),
+            "1".into(),
+            "1".into(),
+            sid.to_string(),
+            tty.to_string(),
+        ];
+        tail.extend(std::iter::repeat_n("0".to_owned(), 14));
         tail.push(starttime.to_string());
         format!("{pid} (xudo) {}", tail.join(" ")).into_bytes()
     }
@@ -540,6 +1585,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         asking("/usr/bin/systemctl", &["restart", "nginx.service"])
     }
 
+    fn confirming_policy() -> LoadedPolicy {
+        let mut policy = policy();
+        policy.settings.confirm_human_path = true;
+        policy
+    }
+
+    fn turn_on_confirmation(host: &mut Host) {
+        host.policy.answer = Ok(confirming_policy());
+    }
+
     const NONCE: &str = "abababababababababababababababababababababababababababababababab";
 
     /// What one connection produced: how it ended, the answer the client
@@ -555,8 +1610,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         conn: &FakeConnection,
         spool: Result<&FakeSpool, &SpoolError>,
     ) -> Outcome {
+        let spool = spool.map(|spool| spool as &dyn Spool);
         let served = serve(conn, &mut host.platform(), spool);
-        let response = BrokerResponse::parse(&conn.written()).unwrap();
+        let written = conn.written();
+        let response = BrokerResponse::parse(&written).unwrap();
         assert_eq!(response.schema_version, WIRE_SCHEMA_VERSION);
         let records = host.audit.records().to_vec();
         Outcome {
@@ -577,7 +1634,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_non_run_question_is_refused_until_its_state_machine_lands() {
+    fn a_watcher_without_a_terminal_is_refused() {
         let mut host = Host::honest();
         let request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -589,7 +1646,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(outcome.served, Served::Refused(Fault::Client));
         assert_eq!(
             refusal_of(&outcome.answer),
-            Some(RefusalCode::RequestUnknown)
+            Some(RefusalCode::ChannelUntrusted)
         );
         assert_eq!(host.policy.loads.get(), 0);
         assert!(spool.calls().is_empty());
@@ -599,6 +1656,1663 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .evidence
                 .contains(&"question=watch".to_owned())
         );
+    }
+
+    #[test]
+    fn no_live_watcher_denies_and_mints_nothing() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        assert_eq!(outcome.served, Served::Decided);
+        let (decision, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
+        assert!(minted.is_none());
+        assert!(spool.files().is_empty());
+        assert_eq!(outcome.records.len(), 1);
+    }
+
+    #[test]
+    fn no_live_watcher_deny_precedes_consuming_an_approval() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: UID,
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+        };
+        approved.confirmed_by = Some(watcher.clone());
+        approved.shown_to = Some(watcher);
+        let spool = FakeSpool::new().with_file(
+            approved.nonce.as_bytes().to_vec(),
+            approved.to_json().into_bytes(),
+        );
+        let outcome = serve_with(
+            &mut host,
+            &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            Ok(&spool),
+        );
+        let (decision, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
+        assert!(minted.is_none());
+        assert_eq!(spool.files().len(), 1);
+        assert_eq!(outcome.records.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_heartbeat_is_not_a_live_channel() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let heartbeat = WatcherHeartbeat {
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+            at_ms: NOW - 3_001,
+        };
+        let data = ConfirmData {
+            heartbeat: Some(heartbeat),
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        host.confirmations =
+            FakeSpool::new().with_file("1000.json", serde_json::to_vec(&data).unwrap());
+        host.peers = FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line(PID, START)))
+            .with_exit(Ok(false))
+            .with_proc(5000, ProcFile::Stat, stat_line(5000, 77));
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        let (decision, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
+        assert!(minted.is_none());
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_live_watcher() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let heartbeat = WatcherHeartbeat {
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+            at_ms: NOW,
+        };
+        let data = ConfirmData {
+            heartbeat: Some(heartbeat),
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        host.confirmations =
+            FakeSpool::new().with_file("1000.json", serde_json::to_vec(&data).unwrap());
+        host.peers = FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line(PID, START)))
+            .with_exit(Ok(false))
+            .with_proc(5000, ProcFile::Stat, stat_line(5000, 78));
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        let (decision, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
+        assert!(minted.is_none());
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_request_does_not_prompt_twice() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let heartbeat = WatcherHeartbeat {
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+            at_ms: NOW,
+        };
+        host.confirmations = FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(heartbeat),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        host.peers = FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line(PID, START)))
+            .with_exit(Ok(false))
+            .with_proc(5000, ProcFile::Stat, stat_line(5000, 77));
+        let first = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let first_outcome = serve_with(&mut host, &first, Ok(&spool));
+        assert!(pending_id(&first_outcome.answer).is_some());
+        let pending = spool.files().into_iter().next().unwrap();
+        let spool = FakeSpool::new().with_file(pending.0, pending.1);
+        let mut retry_host = Host::honest();
+        turn_on_confirmation(&mut retry_host);
+        let heartbeat = WatcherHeartbeat {
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+            at_ms: NOW,
+        };
+        retry_host.confirmations = FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(heartbeat),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        retry_host.peers = FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line(PID, START)))
+            .with_exit(Ok(false))
+            .with_proc(5000, ProcFile::Stat, stat_line(5000, 77));
+        let second = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let second_outcome = serve_with(&mut retry_host, &second, Ok(&spool));
+        let (decision, minted) = decision_of(&second_outcome.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::ConfirmationThrottled));
+        assert!(minted.is_none());
+        assert_eq!(spool.files().len(), 1);
+    }
+
+    #[test]
+    fn a_rerun_consumes_one_approval_for_the_same_argv() {
+        let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let mut first_host = Host::honest();
+        turn_on_confirmation(&mut first_host);
+        first_host.confirmations = live_confirmation_store();
+        first_host.peers = peer_with_live_watcher();
+        let first_spool = FakeSpool::new();
+        let first = serve_with(&mut first_host, &request, Ok(&first_spool));
+        let id = pending_id(&first.answer).unwrap();
+        let mut entry = entry_in(&first_spool);
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: UID,
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+        };
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        entry.confirmed = true;
+        entry.confirmed_by = Some(watcher.clone());
+        entry.shown_at_ms = Some(BoottimeMillis(NOW - 2_000));
+        entry.shown_to = Some(watcher);
+        let approved_spool =
+            FakeSpool::new().with_file(id.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let mut retry_host = Host::honest();
+        turn_on_confirmation(&mut retry_host);
+        retry_host.confirmations = live_confirmation_store();
+        retry_host.peers = peer_with_live_watcher();
+        let retry_request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let retry = serve_with(&mut retry_host, &retry_request, Ok(&approved_spool));
+        let (decision, minted) = decision_of(&retry.answer).unwrap();
+        assert!(decision.verdict.is_permitted());
+        assert_eq!(
+            minted.as_ref().map(|value| value.nonce.as_str()),
+            Some(id.as_str())
+        );
+        assert_eq!(approved_spool.files().len(), 1);
+        let reminted_bytes = approved_spool.files().get(id.as_bytes()).unwrap().clone();
+        let reminted =
+            PendingRequest::parse(std::str::from_utf8(&reminted_bytes).unwrap()).unwrap();
+        assert_eq!(
+            reminted.state,
+            xudo_gate::request::ConfirmationState::Approved
+        );
+    }
+
+    #[test]
+    fn approval_store_clear_failure_refuses_after_consuming_the_match() {
+        let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let parsed = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let fingerprint = request_fingerprint(&parsed, UID).unwrap();
+        let mut entry = shown_entry();
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        entry.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        entry.confirmed_by = Some(pin.clone());
+        entry.shown_to = Some(pin);
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let state = ConfirmData {
+            heartbeat: Some(WatcherHeartbeat {
+                pid: 5000,
+                starttime: 77,
+                tty: 34816,
+                sid: 2,
+                at_ms: NOW,
+            }),
+            backoff: vec![BackoffEntry {
+                fingerprint,
+                strikes: 1,
+                until_ms: NOW + 1_000,
+            }],
+            outcomes: Vec::new(),
+        };
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        host.peers = peer_with_live_watcher();
+        host.confirmations = FakeSpool::new()
+            .with_file("1000.json", serde_json::to_vec(&state).unwrap())
+            .failing_replace(SpoolError::Gone {
+                name: "confirm".to_owned(),
+            });
+        let outcome = serve_with(&mut host, &request, Ok(&spool));
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::SpoolUnusable)
+        );
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn approved_remint_refusals_are_reported_without_a_gate_entry() {
+        let make_entry = || {
+            let mut entry = shown_entry();
+            entry.state = xudo_gate::request::ConfirmationState::Approved;
+            entry.confirmed = true;
+            let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+            entry.confirmed_by = Some(pin.clone());
+            entry.shown_to = Some(pin);
+            entry
+        };
+        let make_evaluated = |host: &Host, request: BrokerRequest| {
+            let conn = connection(Ok(Vec::new()));
+            let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+            let policy = confirming_policy();
+            let caller = classify(&identity);
+            let decision = decide(&policy, &caller, &request);
+            Evaluated {
+                decision,
+                caller,
+                identity,
+                request,
+                policy,
+            }
+        };
+        let entry = make_entry();
+
+        let mut host = Host::honest();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let evaluated = make_evaluated(&host, request);
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &FakeSpool::new(),
+            evaluated,
+            entry.clone(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+
+        let mut host = Host::honest();
+        host.entropy = FakeEntropy::new().with(Err(SysError::unsupported("getrandom")));
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let evaluated = make_evaluated(&host, request);
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &FakeSpool::new(),
+            evaluated,
+            entry.clone(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Broker));
+
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("audit down");
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let evaluated = make_evaluated(&host, request);
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &FakeSpool::new(),
+            evaluated,
+            entry.clone(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Broker));
+
+        let mut host = Host::honest();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let evaluated = make_evaluated(&host, request);
+        let spool = FakeSpool::new().failing_publish(SpoolError::Gone {
+            name: "publish".to_owned(),
+        });
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            entry,
+        );
+        assert_eq!(served, Served::Refused(Fault::Broker));
+    }
+
+    #[test]
+    fn status_from_another_process_is_refused() {
+        let entry = shown_entry();
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        let other = test_identity(PID + 1, START + 1, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let err = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &spool,
+            &other,
+            &request,
+            NONCE,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RefusalCode::ChannelUntrusted);
+    }
+
+    #[test]
+    fn status_returns_pending_to_its_requesting_pin() {
+        let entry = shown_entry();
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let response = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            NONCE,
+        )
+        .unwrap();
+        assert!(matches!(response.answer, Answer::Pending { id, .. } if id == NONCE));
+    }
+
+    #[test]
+    fn confirmation_question_dispatch_covers_supported_and_deferred_questions() {
+        let caller = test_identity(PID, START, 0, 0);
+        let entry = shown_entry();
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let mut host = Host::honest();
+        host.confirmations = live_confirmation_store();
+        let status_request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let conn = connection(Ok(status_request.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller,
+                &status_request
+            ),
+            Served::Decided
+        );
+
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let watch_request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Watch,
+        };
+        let conn = connection(Ok(watch_request.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &watcher,
+                &watch_request
+            ),
+            Served::Decided
+        );
+
+        let answer_request = answer_request(NONCE, "remove", true);
+        let conn = connection(Ok(answer_request.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &watcher,
+                &answer_request
+            ),
+            Served::Decided
+        );
+
+        for question in [
+            xudo_wire::Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+            xudo_wire::Question::Thaw,
+        ] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            let conn = connection(Ok(request.to_json().into_bytes()));
+            assert_eq!(
+                serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &request),
+                Served::Refused(Fault::Client)
+            );
+            assert_eq!(
+                refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+                Some(RefusalCode::RequestUnknown)
+            );
+        }
+
+        let run = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+        let conn = connection(Ok(run.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &run),
+            Served::Refused(Fault::Broker)
+        );
+
+        let unknown = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: "cd".repeat(32),
+            },
+        };
+        let conn = connection(Ok(unknown.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &unknown),
+            Served::Refused(Fault::Client)
+        );
+    }
+
+    #[test]
+    fn serve_expires_before_status_answer_and_watch_dispatch() {
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let status = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let spool = FakeSpool::new();
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(status.to_json().into_bytes())),
+            Ok(&spool),
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::RequestUnknown)
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "confirm".to_owned(),
+        });
+        let run = asking("/usr/bin/systemctl", &["restart", "nginx.service"]);
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &run, Ok(&spool));
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::SpoolUnusable)
+        );
+
+        let mut host = Host::honest();
+        host.peers = FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line_with_terminal(PID, START, 2, 34816)))
+            .with_proc(
+                PID,
+                ProcFile::Status,
+                format!("NSpid:\t{PID}\n").into_bytes(),
+            )
+            .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
+            .with_exit(Ok(false));
+        host.confirmations = FakeSpool::new();
+        let watch = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Watch,
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(watch.to_json().into_bytes())),
+            Ok(&spool),
+        );
+        assert!(watching_prompts(&outcome.answer).is_some());
+
+        let mut host = Host::honest();
+        let freeze = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Thaw,
+        };
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(freeze.to_json().into_bytes())),
+            Ok(&spool),
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::RequestUnknown)
+        );
+    }
+
+    #[test]
+    fn status_reports_a_denial_after_the_entry_is_gone() {
+        let entry = shown_entry();
+        let store = FakeSpool::new();
+        store.lock().unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW).unwrap();
+        store.unlock();
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let response =
+            status_outcome(&host.platform(), &test_identity(PID, START, 0, 0), NONCE).unwrap();
+        assert!(
+            matches!(response.answer, Answer::Decided { decision, minted: None } if decision.denial == Some(DenialCode::ConfirmationRefused))
+        );
+    }
+
+    #[test]
+    fn status_reports_expiry() {
+        let entry = shown_entry();
+        let store = FakeSpool::new();
+        store.lock().unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW).unwrap();
+        store.unlock();
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let response =
+            status_outcome(&host.platform(), &test_identity(PID, START, 0, 0), NONCE).unwrap();
+        assert!(
+            matches!(response.answer, Answer::Decided { decision, minted: None } if decision.denial == Some(DenialCode::ConfirmationExpired))
+        );
+    }
+
+    #[test]
+    fn status_reports_live_approved_and_expired_entries() {
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        };
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.confirmed_by = Some(watcher_pin(&test_identity(5000, 77, 2, 34816)));
+        let approved_spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes());
+        let mut host = Host::honest();
+        let answer = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &approved_spool,
+            &identity,
+            &request,
+            NONCE,
+        )
+        .unwrap();
+        assert!(decision_of(&answer.answer).unwrap().1.is_some());
+
+        let mut expired = shown_entry();
+        expired.state = xudo_gate::request::ConfirmationState::Expired;
+        let expired_spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), expired.to_json().into_bytes());
+        let answer = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &expired_spool,
+            &identity,
+            &request,
+            NONCE,
+        )
+        .unwrap();
+        assert!(
+            matches!(answer.answer, Answer::Decided { decision, minted: None } if decision.denial == Some(DenialCode::ConfirmationExpired))
+        );
+    }
+
+    #[test]
+    fn recent_outcomes_are_bounded() {
+        let mut entry = shown_entry();
+        let store = FakeSpool::new();
+        store.lock().unwrap();
+        for i in 0..MAX_RECENT_OUTCOMES_PER_UID + 3 {
+            entry.nonce = format!("{i:064x}");
+            record_outcome_locked(&store, &entry, TerminalOutcome::Denied, NOW + i as u64).unwrap();
+        }
+        store.unlock();
+        let data: ConfirmData =
+            serde_json::from_slice(&store.files()[b"1000.json".as_slice()]).unwrap();
+        assert_eq!(data.outcomes.len(), MAX_RECENT_OUTCOMES_PER_UID);
+        assert_eq!(data.outcomes[0].id, format!("{:064x}", 3));
+    }
+
+    #[test]
+    fn expiry_strikes_double_and_the_backoff_table_drops_its_oldest_entry() {
+        let mut entry = shown_entry();
+        let store = FakeSpool::new();
+        store.lock().unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW).unwrap();
+        record_outcome_locked(&store, &entry, TerminalOutcome::Expired, NOW + 1).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ConfirmData>(&store.files()[b"1000.json".as_slice()])
+                .unwrap()
+                .backoff[0]
+                .strikes,
+            2
+        );
+        for index in 0..MAX_BACKOFF_ENTRIES_PER_UID {
+            entry.fingerprint = format!("fingerprint-{index}");
+            entry.nonce = format!("{index:064x}");
+            record_outcome_locked(
+                &store,
+                &entry,
+                TerminalOutcome::Expired,
+                NOW + index as u64 + 2,
+            )
+            .unwrap();
+        }
+        store.unlock();
+        let data: ConfirmData =
+            serde_json::from_slice(&store.files()[b"1000.json".as_slice()]).unwrap();
+        assert_eq!(data.backoff.len(), MAX_BACKOFF_ENTRIES_PER_UID);
+        assert!(
+            !data
+                .backoff
+                .iter()
+                .any(|item| item.fingerprint == shown_entry().fingerprint)
+        );
+    }
+
+    #[test]
+    fn backoff_reads_and_clears_cover_the_confirmation_store_failures() {
+        let request =
+            BrokerRequest::new("/usr/bin/apt-get", vec!["remove".to_owned()], "unattested");
+        assert!(active_backoff(None, UID, &request, NOW));
+        assert!(!active_backoff(
+            Some(&FakeSpool::new().with_file("1000.json", b"bad".to_vec())),
+            UID,
+            &request,
+            NOW
+        ));
+        assert!(clear_backoff(None, UID, "fingerprint").is_err());
+        let no_match = FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: None,
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        assert!(clear_backoff(Some(&no_match), UID, "absent").is_ok());
+        let bad_lock = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "lock".to_owned(),
+        });
+        assert!(clear_backoff(Some(&bad_lock), UID, "absent").is_err());
+        assert!(clear_backoff(Some(&FakeSpool::new()), UID, "absent").is_err());
+        let bad_json = FakeSpool::new().with_file("1000.json", b"bad".to_vec());
+        assert!(clear_backoff(Some(&bad_json), UID, "absent").is_err());
+        let fingerprint = request_fingerprint(&request, UID).unwrap();
+        let state = ConfirmData {
+            heartbeat: None,
+            backoff: vec![BackoffEntry {
+                fingerprint: fingerprint.clone(),
+                strikes: 1,
+                until_ms: NOW + 1000,
+            }],
+            outcomes: Vec::new(),
+        };
+        let failing = FakeSpool::new()
+            .with_file("1000.json", serde_json::to_vec(&state).unwrap())
+            .failing_replace(SpoolError::Gone {
+                name: "state".to_owned(),
+            });
+        assert!(active_backoff(Some(&failing), UID, &request, NOW));
+        assert!(clear_backoff(Some(&failing), UID, &fingerprint).is_err());
+    }
+
+    #[test]
+    fn matching_approval_searches_cover_malformed_and_failed_spool_paths() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID, START, 0, 0);
+        let generation = policy().rules.generation.id();
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new(),
+                &BrokerRequest {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    question: xudo_wire::Question::Status {
+                        id: NONCE.to_owned()
+                    }
+                },
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new(),
+                &request,
+                &identity,
+                None,
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new().failing_lock(SpoolError::Gone {
+                    name: "lock".to_owned()
+                }),
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new().failing_names(SpoolError::Gone {
+                    name: "names".to_owned()
+                }),
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new()
+                    .with_file("0bad", b"x".to_vec())
+                    .failing_read(b"0bad".to_vec()),
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_approval_entries_are_skipped_but_failed_consumption_is_not() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID, START, 0, 0);
+        let mut entry = shown_entry();
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        entry.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        entry.confirmed_by = Some(pin.clone());
+        entry.shown_to = Some(pin);
+        let valid = entry.to_json().into_bytes();
+        let generation = policy().rules.generation.id();
+        let malformed_then_valid = FakeSpool::new()
+            .with_file("0bad", b"x".to_vec())
+            .with_file(NONCE.as_bytes().to_vec(), valid.clone());
+        assert!(
+            take_matching_approval(
+                &malformed_then_valid,
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_some()
+        );
+        let consume_error = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), valid)
+            .failing_consume(SpoolError::Gone {
+                name: NONCE.to_owned(),
+            });
+        assert!(
+            take_matching_approval(
+                &consume_error,
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                generation,
+                NOW
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_duplicate_failures_are_throttled_closed() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        assert!(!pending_duplicate(
+            &FakeSpool::new(),
+            &BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: xudo_wire::Question::Thaw
+            },
+            UID,
+            NOW
+        ));
+        assert!(pending_duplicate(
+            &FakeSpool::new().failing_lock(SpoolError::Gone {
+                name: "lock".to_owned()
+            }),
+            &request,
+            UID,
+            NOW
+        ));
+        assert!(pending_duplicate(
+            &FakeSpool::new().failing_names(SpoolError::Gone {
+                name: "names".to_owned()
+            }),
+            &request,
+            UID,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn watcher_heartbeat_parse_and_empty_cases_are_not_live() {
+        let peers = FakePeer::new();
+        assert!(!has_live_watcher(None, &peers, UID, NOW));
+        assert!(!has_live_watcher(
+            Some(&FakeSpool::new().with_file("1000.json", b"bad".to_vec())),
+            &peers,
+            UID,
+            NOW
+        ));
+        let empty = ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        assert!(!has_live_watcher(
+            Some(&FakeSpool::new().with_file("1000.json", serde_json::to_vec(&empty).unwrap())),
+            &peers,
+            UID,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn an_expired_entry_is_recorded_struck_and_removed_before_dedup() {
+        let mut entry = shown_entry();
+        entry.deadline = BoottimeMillis(NOW);
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert!(spool.files().is_empty());
+        assert_eq!(host.audit.records().len(), 1);
+        let data: ConfirmData =
+            serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
+        assert_eq!(data.backoff.len(), 1);
+        assert_eq!(data.backoff[0].strikes, 1);
+        assert_eq!(data.outcomes[0].outcome, TerminalOutcome::Expired);
+    }
+
+    #[test]
+    fn expiry_refusals_leave_the_entry_available_for_retry() {
+        let mut entry = shown_entry();
+        entry.deadline = BoottimeMillis(NOW);
+        let bytes = entry.to_json().into_bytes();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "confirm".to_owned(),
+        });
+        let spool = FakeSpool::new().with_file(entry.nonce.as_bytes().to_vec(), bytes.clone());
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&bytes));
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        host.audit = FakeAuditSink::failing("audit down");
+        let spool = FakeSpool::new().with_file(entry.nonce.as_bytes().to_vec(), bytes.clone());
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::BrokerUnusable
+        );
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&bytes));
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let spool = FakeSpool::new()
+            .with_file(entry.nonce.as_bytes().to_vec(), bytes.clone())
+            .failing_remove(SpoolError::Io {
+                operation: "remove".to_owned(),
+                at: "spool".to_owned(),
+                code: None,
+                reason: "failed".to_owned(),
+            });
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&bytes));
+    }
+
+    #[test]
+    fn expiry_requires_the_confirmation_directory() {
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = None;
+        let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+        assert_eq!(
+            expire_entries(&mut platform, &FakeSpool::new(), &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    #[test]
+    fn expiry_skips_unreadable_and_unparseable_entries() {
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let spool = FakeSpool::new()
+            .with_file("unreadable", b"x".to_vec())
+            .with_file("malformed", b"not-json".to_vec())
+            .failing_read(b"unreadable".to_vec());
+        let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert_eq!(spool.files().len(), 2);
+        assert!(host.audit.records().is_empty());
+    }
+
+    #[test]
+    fn an_approval_the_audit_sink_refuses_is_not_applied() {
+        let entry = shown_entry();
+        let before = entry.to_json().into_bytes();
+        let spool = FakeSpool::new().with_file(entry.nonce.as_bytes().to_vec(), before.clone());
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let request = answer_request(NONCE, "remove", true);
+        let result = answer_confirmation(&mut host.platform(), &spool, &watcher, &request);
+        assert!(result.is_err());
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&before));
+    }
+
+    #[test]
+    fn answer_refusals_cover_bad_questions_and_store_failures() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let not_answer = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Thaw,
+        };
+        assert_eq!(
+            answer_confirmation(&mut host.platform(), &spool, &watcher, &not_answer)
+                .unwrap_err()
+                .code,
+            RefusalCode::RequestMalformed
+        );
+
+        let denial = answer_request(NONCE, "no", false);
+        let mut platform = host.platform();
+        platform.confirmations = None;
+        assert_eq!(
+            answer_confirmation(&mut platform, &spool, &watcher, &denial)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        let spool = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "lock".to_owned(),
+        });
+        assert_eq!(
+            answer_confirmation(
+                &mut host.platform(),
+                &spool,
+                &watcher,
+                &answer_request(NONCE, "remove", true)
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let malformed = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), b"bad".to_vec());
+        assert_eq!(
+            answer_confirmation(
+                &mut host.platform(),
+                &malformed,
+                &watcher,
+                &answer_request(NONCE, "remove", true)
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::RequestUnknown
+        );
+
+        let mut too_fast = shown_entry();
+        too_fast.shown_at_ms = Some(BoottimeMillis(NOW));
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), too_fast.to_json().into_bytes());
+        assert_eq!(
+            answer_confirmation(
+                &mut host.platform(),
+                &spool,
+                &watcher,
+                &answer_request(NONCE, "remove", true)
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::AnswerRejected
+        );
+    }
+
+    #[test]
+    fn denial_completion_refusals_cover_audit_outcome_and_removal() {
+        let identity = test_identity(5000, 77, 2, 34816);
+        let mut entry = shown_entry();
+        entry.state = xudo_gate::request::ConfirmationState::Denied;
+        let bytes = entry.to_json().into_bytes();
+        let request = answer_request(NONCE, "no", false);
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+
+        let mut host = Host::honest();
+        host.audit = FakeAuditSink::failing("audit down");
+        let answered = AnsweredEntry {
+            id: NONCE.to_owned(),
+            bytes: bytes.clone(),
+            entry: entry.clone(),
+        };
+        assert_eq!(
+            complete_answer(
+                &mut host.platform(),
+                &spool,
+                &identity,
+                &request,
+                answered,
+                false
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::BrokerUnusable
+        );
+
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = None;
+        let answered = AnsweredEntry {
+            id: NONCE.to_owned(),
+            bytes: bytes.clone(),
+            entry: entry.clone(),
+        };
+        assert_eq!(
+            complete_answer(&mut platform, &spool, &identity, &request, answered, false)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let state = ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new()
+            .with_file("1000.json", serde_json::to_vec(&state).unwrap())
+            .failing_replace(SpoolError::Gone {
+                name: "state".to_owned(),
+            });
+        let answered = AnsweredEntry {
+            id: NONCE.to_owned(),
+            bytes: bytes.clone(),
+            entry: entry.clone(),
+        };
+        assert_eq!(
+            complete_answer(
+                &mut host.platform(),
+                &spool,
+                &identity,
+                &request,
+                answered,
+                false
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        host.confirmations =
+            FakeSpool::new().with_file("1000.json", serde_json::to_vec(&state).unwrap());
+        let remove_error = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), bytes.clone())
+            .failing_remove(SpoolError::Gone {
+                name: NONCE.to_owned(),
+            });
+        let answered = AnsweredEntry {
+            id: NONCE.to_owned(),
+            bytes,
+            entry,
+        };
+        assert_eq!(
+            complete_answer(
+                &mut host.platform(),
+                &remove_error,
+                &identity,
+                &request,
+                answered,
+                false
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    #[test]
+    fn every_transition_leaves_one_record() {
+        let entry = shown_entry();
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let request = answer_request(NONCE, "remove", true);
+        let response =
+            answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        assert_eq!(response.answer, Answer::Done);
+        assert_eq!(host.audit.records().len(), 1);
+        let entry =
+            PendingRequest::parse(std::str::from_utf8(&spool.files()[NONCE.as_bytes()]).unwrap())
+                .unwrap();
+        assert_eq!(entry.state, xudo_gate::request::ConfirmationState::Approved);
+        let record = &host.audit.records()[0];
+        assert!(!record.evidence.join(" ").contains("remove"));
+        assert!(!record.evidence.join(" ").contains("secret-token"));
+    }
+
+    #[test]
+    fn a_denial_records_once_removes_the_entry_and_never_audits_the_token() {
+        let entry = shown_entry();
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: None,
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let request = answer_request(NONCE, "private-token", false);
+        answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        assert!(spool.files().is_empty());
+        assert_eq!(host.audit.records().len(), 1);
+        assert!(
+            !host.audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("private-token")
+        );
+    }
+
+    #[test]
+    fn watch_marks_only_eligible_entries_and_writes_a_heartbeat() {
+        let mut entry = shown_entry();
+        entry.shown_at_ms = None;
+        entry.shown_to = None;
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let response = watch(&mut host.platform(), &spool, &watcher).unwrap();
+        let prompts = watching_prompts(&response.answer).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            host.confirmations
+                .files()
+                .contains_key(b"1000.json".as_slice())
+        );
+        let shown =
+            PendingRequest::parse(std::str::from_utf8(&spool.files()[NONCE.as_bytes()]).unwrap())
+                .unwrap();
+        assert_eq!(shown.shown_to, Some(watcher_pin(&watcher)));
+    }
+
+    #[test]
+    fn watch_list_failures_and_bad_entries_are_handled() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let lock_error = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "lock".to_owned(),
+        });
+        assert_eq!(
+            watch(&mut host.platform(), &lock_error, &watcher)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let list_error = FakeSpool::new().failing_names(SpoolError::Gone {
+            name: "names".to_owned(),
+        });
+        assert_eq!(
+            watch(&mut host.platform(), &list_error, &watcher)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let entries = FakeSpool::new()
+            .with_file("unreadable", b"bad".to_vec())
+            .with_file("malformed", b"bad".to_vec())
+            .with_file(
+                NONCE.as_bytes().to_vec(),
+                shown_entry().to_json().into_bytes(),
+            )
+            .failing_read(b"unreadable".to_vec());
+        let response = watch(&mut host.platform(), &entries, &watcher).unwrap();
+        assert!(matches!(response.answer, Answer::Watching { prompts } if prompts.is_empty()));
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        let mut entry = shown_entry();
+        entry.shown_at_ms = None;
+        entry.shown_to = None;
+        let bytes = entry.to_json().into_bytes();
+        let replace_error = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), bytes)
+            .failing_replace(SpoolError::Gone {
+                name: NONCE.to_owned(),
+            });
+        assert_eq!(
+            watch(&mut host.platform(), &replace_error, &watcher)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    fn watcher_pin(identity: &PeerIdentity) -> xudo_gate::request::WatcherPin {
+        xudo_gate::request::WatcherPin {
+            uid: identity.uid,
+            pid: identity.pid,
+            starttime: identity.starttime,
+            tty: identity.tty,
+            sid: identity.sid,
+        }
+    }
+
+    #[test]
+    fn a_second_watcher_is_refused_and_told_the_first() {
+        let heartbeat = WatcherHeartbeat {
+            pid: 6000,
+            starttime: 88,
+            tty: 34817,
+            sid: 3,
+            at_ms: NOW,
+        };
+        let store = FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(heartbeat),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let mut host = Host::honest();
+        host.confirmations = store;
+        host.peers = FakePeer::new().with_proc(6000, ProcFile::Stat, stat_line(6000, 88));
+        let err = save_heartbeat(
+            &mut host.platform(),
+            &test_identity(5000, 77, 2, 34816),
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RefusalCode::ChannelUntrusted);
+        assert!(err.detail.contains("6000"));
+        assert!(err.detail.contains("34817"));
+        let response = BrokerResponse::refused_with_detail(err.code, err.detail.clone());
+        let parsed = BrokerResponse::parse(response.to_json().as_bytes()).unwrap();
+        let detail = refusal_detail(&parsed.answer).unwrap();
+        assert!(detail.contains("6000"));
+        assert!(detail.contains("34817"));
+        assert_eq!(
+            host.confirmations
+                .files()
+                .get(b"1000.json".as_slice())
+                .unwrap(),
+            &serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(WatcherHeartbeat {
+                    pid: 6000,
+                    starttime: 88,
+                    tty: 34817,
+                    sid: 3,
+                    at_ms: NOW
+                }),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_full_confirm_directory_refuses_and_overwrites_nothing() {
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), b"{}".to_vec())
+        });
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let before = host.confirmations.files();
+        let mut another_uid = test_identity(PID, START, 2, 34816);
+        another_uid.uid = 50_000;
+        let err = save_heartbeat(&mut host.platform(), &another_uid, NOW).unwrap_err();
+        assert_eq!(err.code, RefusalCode::SpoolFull);
+        assert_eq!(host.confirmations.files(), before);
+    }
+
+    #[test]
+    fn heartbeat_update_refusals_and_stale_state_are_covered() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = None;
+        assert_eq!(
+            save_heartbeat(&mut platform, &watcher, NOW)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_names(SpoolError::Gone {
+            name: "names".to_owned(),
+        });
+        assert_eq!(
+            save_heartbeat(&mut host.platform(), &watcher, NOW)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let oversized = ConfirmData {
+            heartbeat: None,
+            backoff: (0..=MAX_BACKOFF_ENTRIES_PER_UID)
+                .map(|i| BackoffEntry {
+                    fingerprint: format!("{i}"),
+                    strikes: 1,
+                    until_ms: NOW + 1_000,
+                })
+                .collect(),
+            outcomes: Vec::new(),
+        };
+        let mut host = Host::honest();
+        host.confirmations =
+            FakeSpool::new().with_file("1000.json", serde_json::to_vec(&oversized).unwrap());
+        assert_eq!(
+            save_heartbeat(&mut host.platform(), &watcher, NOW)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new()
+            .with_file("1000.json", b"not-json".to_vec())
+            .failing_replace(SpoolError::Gone {
+                name: "state".to_owned(),
+            });
+        assert_eq!(
+            save_heartbeat(&mut host.platform(), &watcher, NOW)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+
+        let stale = ConfirmData {
+            heartbeat: Some(WatcherHeartbeat {
+                pid: 6000,
+                starttime: 88,
+                tty: 34817,
+                sid: 3,
+                at_ms: NOW - 3_001,
+            }),
+            backoff: Vec::new(),
+            outcomes: vec![RecentOutcome {
+                id: NONCE.to_owned(),
+                outcome: TerminalOutcome::Denied,
+                until_ms: NOW - 1,
+                pid: PID,
+                starttime: START,
+            }],
+        };
+        let mut host = Host::honest();
+        host.confirmations =
+            FakeSpool::new().with_file("1000.json", serde_json::to_vec(&stale).unwrap());
+        assert!(save_heartbeat(&mut host.platform(), &watcher, NOW).is_ok());
+        let saved: ConfirmData =
+            serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
+        assert!(saved.outcomes.is_empty());
+    }
+
+    fn live_confirmation_store() -> FakeSpool {
+        FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(WatcherHeartbeat {
+                    pid: 5000,
+                    starttime: 77,
+                    tty: 34816,
+                    sid: 2,
+                    at_ms: NOW,
+                }),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn peer_with_live_watcher() -> FakePeer {
+        FakePeer::new()
+            .with_cred(Ok(PeerCred {
+                pid: PID,
+                uid: UID,
+                gid: GID,
+            }))
+            .with_stat(Ok(stat_line(PID, START)))
+            .with_exit(Ok(false))
+            .with_proc(5000, ProcFile::Stat, stat_line(5000, 77))
+    }
+
+    fn test_identity(pid: u32, starttime: u64, sid: i64, tty: i64) -> PeerIdentity {
+        PeerIdentity {
+            rung: xudo_sys::Attestation::PeerPidfdInfo,
+            pid,
+            uid: UID,
+            gid: GID,
+            starttime,
+            sid,
+            tty,
+            diverged: false,
+            pinned: true,
+            cgroup_id: None,
+            euid_source: crate::identify::EuidSource::PidfdInfo,
+        }
+    }
+
+    fn shown_entry() -> PendingRequest {
+        let policy = policy();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID, START, 0, 0);
+        let caller = classify(&identity);
+        let decision = decide(&policy, &caller, &request);
+        let mut entry = entry_for(
+            &decision,
+            &identity,
+            &request,
+            policy.rules.generation.id(),
+            true,
+            NOW + 100_000,
+            NONCE.to_owned(),
+        )
+        .unwrap();
+        let watcher = crate::confirm::WatcherFacts {
+            uid: UID,
+            pid: 5000,
+            starttime: 77,
+            tty: 34816,
+            sid: 2,
+            diverged: false,
+        };
+        assert!(crate::confirm::mark_shown(&mut entry, watcher, NOW - 2_000));
+        entry
+    }
+
+    fn answer_request(id: &str, token: &str, approve: bool) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Answer {
+                id: id.to_owned(),
+                token: token.to_owned(),
+                approve,
+            },
+        }
     }
 
     #[test]
@@ -647,6 +3361,251 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    fn pending_id(answer: &Answer) -> Option<String> {
+        match answer {
+            Answer::Pending { id, .. } => Some(id.clone()),
+            Answer::Refused { .. }
+            | Answer::Decided { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
+        }
+    }
+
+    fn watching_prompts(answer: &Answer) -> Option<&[String]> {
+        match answer {
+            Answer::Watching { prompts } => Some(prompts),
+            Answer::Refused { .. }
+            | Answer::Decided { .. }
+            | Answer::Pending { .. }
+            | Answer::Done => None,
+        }
+    }
+
+    fn refusal_detail(answer: &Answer) -> Option<&str> {
+        match answer {
+            Answer::Refused { detail, .. } => detail.as_deref(),
+            Answer::Decided { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
+        }
+    }
+
+    #[test]
+    fn answer_extractors_refuse_the_wrong_shape() {
+        assert_eq!(pending_id(&Answer::Done), None);
+        assert_eq!(watching_prompts(&Answer::Done), None);
+        assert_eq!(refusal_detail(&Answer::Done), None);
+    }
+
+    fn gone(name: &str) -> SpoolError {
+        SpoolError::Gone {
+            name: name.to_owned(),
+        }
+    }
+
+    fn expired_entry_spool() -> FakeSpool {
+        let mut entry = shown_entry();
+        entry.deadline = BoottimeMillis(NOW);
+        FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        )
+    }
+
+    fn a_status_request() -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Status {
+                id: NONCE.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn expiry_refuses_when_the_spool_lock_or_listing_fails() {
+        let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+        let mut host = Host::honest();
+        let locked = FakeSpool::new().failing_lock(gone("spool lock"));
+        assert_eq!(
+            expire_entries(&mut host.platform(), &locked, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        let unlistable = FakeSpool::new().failing_names(gone("names"));
+        assert_eq!(
+            expire_entries(&mut host.platform(), &unlistable, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    #[test]
+    fn an_expiry_that_cannot_be_recorded_leaves_the_entry_in_place() {
+        let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_publish(gone("state"));
+        let spool = expired_entry_spool();
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(spool.files().len(), 1);
+    }
+
+    #[test]
+    fn a_status_request_has_no_fingerprint() {
+        assert_eq!(request_fingerprint(&a_status_request(), UID), None);
+    }
+
+    #[test]
+    fn status_refuses_an_entry_that_does_not_parse() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), b"bad".to_vec());
+        let request = a_status_request();
+        let result = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+            &request,
+            NONCE,
+        );
+        assert_eq!(result.unwrap_err().code, RefusalCode::RequestUnknown);
+    }
+
+    #[test]
+    fn status_of_a_gone_entry_without_usable_outcomes_is_unknown() {
+        let identity = test_identity(PID, START, 0, 0);
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = None;
+        assert_eq!(
+            status_outcome(&platform, &identity, NONCE)
+                .unwrap_err()
+                .code,
+            RefusalCode::RequestUnknown
+        );
+        host.confirmations = FakeSpool::new().with_file("1000.json", b"bad".to_vec());
+        assert_eq!(
+            status_outcome(&host.platform(), &identity, NONCE)
+                .unwrap_err()
+                .code,
+            RefusalCode::RequestUnknown
+        );
+    }
+
+    #[test]
+    fn a_watcher_whose_state_cannot_be_locked_is_refused() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_lock(gone("confirm"));
+        assert_eq!(
+            watch(&mut host.platform(), &FakeSpool::new(), &watcher)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        let mut host = Host::honest();
+        let locked = FakeSpool::new().failing_lock(gone("spool"));
+        assert_eq!(
+            watch(&mut host.platform(), &locked, &watcher)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    #[test]
+    fn a_denial_whose_state_cannot_be_locked_is_refused() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_lock(gone("confirm"));
+        assert_eq!(
+            answer_confirmation(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &watcher,
+                &answer_request(NONCE, "no", false)
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+    }
+
+    #[test]
+    fn an_answer_to_an_unknown_request_is_refused() {
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut host = Host::honest();
+        assert_eq!(
+            answer_confirmation(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &watcher,
+                &answer_request(NONCE, "remove", true)
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::RequestUnknown
+        );
+    }
+
+    #[test]
+    fn an_approval_cannot_complete_without_policy_or_a_writable_entry() {
+        let identity = test_identity(5000, 77, 2, 34816);
+        let entry = shown_entry();
+        let bytes = entry.to_json().into_bytes();
+        let request = answer_request(NONCE, "remove", true);
+        let answered = || AnsweredEntry {
+            id: NONCE.to_owned(),
+            bytes: bytes.clone(),
+            entry: entry.clone(),
+        };
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+
+        let mut host = Host::honest();
+        host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
+            file: "/etc/xudo/config.toml".to_owned(),
+        }));
+        assert_eq!(
+            complete_answer(
+                &mut host.platform(),
+                &spool,
+                &identity,
+                &request,
+                answered(),
+                true
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::PolicyUnloadable
+        );
+
+        let mut host = Host::honest();
+        let failing = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), bytes.clone())
+            .failing_replace(gone("entry"));
+        assert_eq!(
+            complete_answer(
+                &mut host.platform(),
+                &failing,
+                &identity,
+                &request,
+                answered(),
+                true
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(failing.files().get(NONCE.as_bytes()), Some(&bytes));
+    }
+
     fn entry_in(spool: &FakeSpool) -> PendingRequest {
         let files = spool.files();
         PendingRequest::parse(std::str::from_utf8(&files[NONCE.as_bytes()]).unwrap()).unwrap()
@@ -685,6 +3644,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(
             spool.calls(),
             [
+                SpoolCall::Lock,
+                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::Unlock,
                 SpoolCall::Lock,
                 SpoolCall::Names,
                 SpoolCall::Publish(NONCE.to_owned()),
@@ -767,7 +3729,15 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let (decision, minted) = decision_of(&outcome.answer).unwrap();
             assert_eq!(decision.denial, Some(denial), "{program}");
             assert_eq!(minted, None);
-            assert_eq!(spool.calls(), [], "{program}");
+            assert_eq!(
+                spool.calls(),
+                [
+                    SpoolCall::Lock,
+                    SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                    SpoolCall::Unlock
+                ],
+                "{program}"
+            );
             assert_eq!(outcome.records.len(), 1);
             assert_eq!(outcome.records[0].denial.as_deref(), Some(denial.as_str()));
         }
@@ -994,7 +3964,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             refusal_of(&outcome.answer),
             Some(RefusalCode::PolicyUnloadable)
         );
-        assert_eq!(spool.calls(), []);
+        assert_eq!(
+            spool.calls(),
+            [
+                SpoolCall::Lock,
+                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::Unlock
+            ]
+        );
     }
 
     #[test]
@@ -1008,7 +3985,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             refusal_of(&outcome.answer),
             Some(RefusalCode::BrokerUnusable)
         );
-        assert_eq!(spool.calls(), []);
+        assert_eq!(
+            spool.calls(),
+            [
+                SpoolCall::Lock,
+                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::Unlock
+            ]
+        );
         assert!(
             outcome.records[0]
                 .evidence
@@ -1067,7 +4051,15 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             refusal_of(&outcome.answer),
             Some(RefusalCode::BrokerUnusable)
         );
-        assert_eq!(spool.calls(), [], "no entry without its record");
+        assert_eq!(
+            spool.calls(),
+            [
+                SpoolCall::Lock,
+                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::Unlock
+            ],
+            "no entry without its record"
+        );
         assert!(spool.files().is_empty());
     }
 
@@ -1238,7 +4230,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let untrusted = SpoolError::NotADirectory {
             at: "/run/xudo/req".to_owned(),
         };
-        let served = serve::<FakeSpool>(&conn, &mut host.platform(), Err(&untrusted));
+        let served = serve(&conn, &mut host.platform(), Err(&untrusted));
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(served.exit_status(), UNUSABLE);
     }

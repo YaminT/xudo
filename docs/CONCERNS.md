@@ -1,5 +1,21 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-09 — M3 step 5: broker confirmation serving is done
+
+The broker dispatches `status`, `watch`, and `answer`; a watched `run` returns a
+pending id, and a run needing confirmation is denied as
+`no_confirmation_channel` without minting when no live watcher is present.
+Approval uses `confirm::answer`, audit authorization, and inode-checked
+`Spool::replace`. ConfirmDir stores one bounded JSON record per uid, including
+the watcher heartbeat and backoff table. Liveness requires a heartbeat no
+older than three seconds and a matching `/proc` pid and start time. The
+front-end reports pending with exit 18. No new crate or coverage waiver was
+added.
+
+The expiry-first transition, bounded recent outcomes, requester-pinned terminal
+status, and first-watcher details are implemented with tests. `just verify`, `just linux-test`,
+`just root-test`, `just units`, and `just systemd-test` pass.
+
 ## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
 
 `xudod::confirm` models pending, approved, denied, and expired entries without

@@ -283,6 +283,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         entropy: &HostEntropy,
         policy: &OneRule,
         audit: &mut audit,
+        confirmations: None,
     };
     let spool = FakeSpool::new();
     let before = xudo_sys::Clock::boottime_millis(&HostClock);

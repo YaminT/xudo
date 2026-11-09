@@ -88,6 +88,7 @@ fn run_with_hygiene(
     match UnixConnection::adopt(socket, IO_TIMEOUT) {
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
+            let confirmations = SpoolDir::open(Path::new("/run/xudo/confirm"));
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
@@ -97,8 +98,9 @@ fn run_with_hygiene(
                 entropy: &HostEntropy,
                 policy: &policy,
                 audit,
+                confirmations: xudo_sys::as_seam(&confirmations).ok(),
             };
-            serve(&conn, &mut platform, spool.as_ref()).exit_status()
+            serve(&conn, &mut platform, xudo_sys::as_seam(&spool)).exit_status()
         }
         Err(error) => {
             let refusal = Refusal::broker(RefusalCode::BrokerUnusable, error.to_string());
