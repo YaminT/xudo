@@ -93,6 +93,7 @@ fn run_with_hygiene(
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
+            let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
@@ -103,6 +104,7 @@ fn run_with_hygiene(
                 policy: &policy,
                 audit,
                 confirmations: xudo_sys::as_seam(&confirmations).ok(),
+                freeze_file: xudo_sys::as_seam(&freeze_file).ok(),
             };
             serve(&conn, &mut platform, xudo_sys::as_seam(&spool)).exit_status()
         }

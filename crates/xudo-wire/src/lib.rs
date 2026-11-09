@@ -1141,6 +1141,17 @@ mod tests {
     }
 
     #[test]
+    fn refuses_an_overlong_or_nul_freeze_reason() {
+        for reason in ["x".repeat(MAX_REASON_BYTES + 1), "bad\0reason".to_owned()] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: Question::Freeze { reason },
+            };
+            assert!(request.check().is_err());
+        }
+    }
+
+    #[test]
     fn every_question_round_trips() {
         let id = "a".repeat(64);
         for question in [

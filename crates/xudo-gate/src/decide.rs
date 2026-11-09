@@ -916,7 +916,7 @@ args = [
     }
 
     #[test]
-    fn a_frozen_agent_path_leaves_the_human_path_open() {
+    fn the_human_path_runs_while_frozen() {
         let mut ctx = context();
         ctx.settings.frozen = true;
         let pending = status_request(77);
@@ -927,6 +927,19 @@ args = [
             "frozen"
         );
         assert!(decide(&rules(), &human(77), Some(&pending), ctx).is_ok());
+    }
+
+    #[test]
+    fn an_entry_minted_before_freeze_is_refused_by_the_gate_for_an_agent() {
+        let minted_before_freeze = status_request(77);
+        let mut ctx = context();
+        ctx.settings.frozen = true;
+        assert_eq!(
+            decide(&rules(), &agent(77), Some(&minted_before_freeze), ctx)
+                .unwrap_err()
+                .code(),
+            "frozen"
+        );
     }
 
     #[test]

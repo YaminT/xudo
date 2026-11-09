@@ -333,7 +333,16 @@ args = [
             .load()
             .unwrap();
         assert!(loaded.rules.rules.is_empty());
-        assert_eq!(loaded.settings, Settings::default());
+        assert_eq!(
+            loaded.settings.confirm_agent_actions,
+            Settings::default().confirm_agent_actions
+        );
+        assert_eq!(
+            loaded.settings.confirm_human_path,
+            Settings::default().confirm_human_path
+        );
+        // A missing `/var/lib/xudo` cannot establish absence of the marker.
+        assert!(loaded.settings.frozen);
     }
 
     #[cfg(target_os = "linux")]

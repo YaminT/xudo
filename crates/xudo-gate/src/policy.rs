@@ -8,6 +8,18 @@ use xudo_sys::{TrustError, TrustedRulesError, load_trusted_rules, read_trusted_f
 
 /// The largest settings file the gate reads.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+/// The freeze marker is small and never controls an allocation.
+pub const MAX_FREEZE_BYTES: usize = 2048;
+/// The broker-owned freeze marker.
+pub const FREEZE_FILE: &str = "/var/lib/xudo/frozen";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreezeRecord {
+    reason: String,
+    uid: u32,
+    time: u64,
+}
 
 /// The rules and settings in force.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,23 +69,46 @@ pub fn load(rules_dir: &Path, config_file: &Path) -> Result<LoadedPolicy, Policy
         config_file,
         &load_trusted_rules,
         &read_trusted_file,
+        &read_trusted_file,
     )
 }
 
 type RulesRead = dyn Fn(&Path) -> Result<LoadedRuleSet, TrustedRulesError>;
 type ConfigRead = dyn Fn(&Path, usize) -> Result<Option<Vec<u8>>, TrustError>;
 
+#[cfg(test)]
+type FreezeReadFn = fn(&Path, usize) -> Result<Option<Vec<u8>>, TrustError>;
+#[cfg(test)]
+const ABSENT_FREEZE: FreezeReadFn = |_, _| Ok(None);
+
 fn load_with(
     rules_dir: &Path,
     config_file: &Path,
     rules_read: &RulesRead,
     config_read: &ConfigRead,
+    freeze_read: &ConfigRead,
 ) -> Result<LoadedPolicy, PolicyError> {
     let rules = rules_read(rules_dir).map_err(PolicyError::Rules)?;
     let config =
         config_read(config_file, MAX_CONFIG_BYTES).map_err(PolicyError::ConfigUntrusted)?;
-    let settings = settings_from(config.as_deref(), config_file).map_err(PolicyError::Config)?;
+    let mut settings =
+        settings_from(config.as_deref(), config_file).map_err(PolicyError::Config)?;
+    settings.frozen |= freeze_state(freeze_read(Path::new(FREEZE_FILE), MAX_FREEZE_BYTES));
     Ok(LoadedPolicy { rules, settings })
+}
+
+fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
+    match read {
+        Ok(None) => false,
+        Ok(Some(bytes)) => match serde_json::from_slice::<FreezeRecord>(&bytes) {
+            Ok(record) => {
+                let _ = (record.reason, record.uid, record.time);
+                true
+            }
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// Derives engine settings from the bytes shared by the gate and broker.
@@ -119,6 +154,7 @@ mod tests {
                 assert_eq!(limit, MAX_CONFIG_BYTES);
                 Ok(None)
             },
+            &ABSENT_FREEZE,
         )
         .unwrap();
         assert_eq!(loaded.settings, Settings::default());
@@ -137,6 +173,7 @@ mod tests {
             Path::new("config.toml"),
             &empty_rules,
             &|_, _| Ok(Some(b"unknown = true".to_vec())),
+            &ABSENT_FREEZE,
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown"), "{error}");
@@ -154,8 +191,45 @@ mod tests {
                     uid: 1000,
                 })
             },
+            &ABSENT_FREEZE,
         )
         .unwrap_err();
         assert!(error.to_string().contains("not root"), "{error}");
+    }
+
+    #[test]
+    fn an_unreadable_freeze_file_means_frozen() {
+        assert!(freeze_state(Err(TrustError::NotRootOwned {
+            at: FREEZE_FILE.to_owned(),
+            uid: 1000,
+        })));
+    }
+
+    #[test]
+    fn a_freeze_file_failing_the_trust_walk_means_frozen() {
+        let loaded = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &|path, _| {
+                assert_eq!(path, Path::new(FREEZE_FILE));
+                Err(TrustError::Writable {
+                    at: FREEZE_FILE.to_owned(),
+                    mode: 0o777,
+                })
+            },
+        )
+        .unwrap();
+        assert!(loaded.settings.frozen);
+    }
+
+    #[test]
+    fn malformed_freeze_data_means_frozen_and_absence_does_not() {
+        assert!(freeze_state(Ok(Some(b"not json".to_vec()))));
+        assert!(!freeze_state(Ok(None)));
+        assert!(freeze_state(Ok(Some(
+            br#"{"reason":"maintenance","uid":0,"time":1}"#.to_vec()
+        ))));
     }
 }

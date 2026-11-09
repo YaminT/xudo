@@ -185,6 +185,16 @@ pub enum Command {
     /// Watch for confirmation requests on this terminal and answer them.
     Watch,
 
+    /// Stop requests on the agent path until thawed by root.
+    Freeze {
+        /// Why the broker is being frozen.
+        #[arg(long, required = true, value_name = "TEXT")]
+        reason: String,
+    },
+
+    /// Resume the agent path. Requires uid 0.
+    Thaw,
+
     /// Print the block that tells an agent what it may do.
     Agentdoc {
         /// Which harness to write for.
@@ -400,6 +410,9 @@ pub fn run_with_installer_at_socket(
         Command::Watch => with_rules!(|l: &LoadedRules| {
             watch::watch_live(socket, l.rules(), out, err, &mut watch::ask_live)
         }),
+        Command::Freeze { .. } | Command::Thaw => {
+            broker_control_command(socket, &cli.command, out, err)
+        }
         Command::Agentdoc { format } => with_rules!(|l: &LoadedRules| {
             let _ = write!(
                 out,
@@ -408,6 +421,49 @@ pub fn run_with_installer_at_socket(
             );
             ExitCode::Delegated
         }),
+    }
+}
+
+fn broker_control_command(
+    socket: &Path,
+    command: &Command,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let question = match command {
+        Command::Freeze { reason } => xudo_wire::Question::Freeze {
+            reason: reason.clone(),
+        },
+        Command::Thaw => xudo_wire::Question::Thaw,
+        _ => return ExitCode::Unusable,
+    };
+    broker_control(socket, question, out, err, &watch::ask_live)
+}
+
+fn broker_control(
+    socket: &Path,
+    question: xudo_wire::Question,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    ask: &dyn Fn(&Path, &xudo_wire::BrokerRequest) -> Result<xudo_wire::BrokerResponse, String>,
+) -> ExitCode {
+    let request = xudo_wire::BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    };
+    match ask(socket, &request) {
+        Ok(response) if response.answer == xudo_wire::Answer::Done => {
+            let _ = writeln!(out, "done");
+            ExitCode::Delegated
+        }
+        Ok(response) => {
+            let _ = writeln!(err, "xudo: {:?}", response.answer);
+            ExitCode::Denied
+        }
+        Err(error) => {
+            let _ = writeln!(err, "xudo: {error}");
+            ExitCode::Unusable
+        }
     }
 }
 
@@ -1359,6 +1415,103 @@ mod tests {
         assert_eq!(code, ExitCode::Delegated);
         assert_eq!(out, "");
         assert_eq!(err, "");
+    }
+
+    #[test]
+    fn freeze_command_dispatches_and_fails_closed_without_the_broker() {
+        let (code, _, _) =
+            fixture("cli-freeze-no-broker").run(&["freeze", "--reason", "maintenance"]);
+        assert_eq!(code, ExitCode::Unusable);
+        let (code, _, _) = fixture("cli-thaw-no-broker").run(&["thaw"]);
+        assert_eq!(code, ExitCode::Unusable);
+    }
+
+    #[test]
+    fn broker_control_renders_done_refusal_and_transport_error() {
+        let seen_question = std::cell::RefCell::new(None);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ask_done = |_: &Path, request: &xudo_wire::BrokerRequest| {
+            *seen_question.borrow_mut() = Some(request.question.clone());
+            Ok(xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Done,
+            })
+        };
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Thaw,
+                &mut out,
+                &mut err,
+                &ask_done
+            ),
+            ExitCode::Delegated
+        );
+        assert_eq!(*seen_question.borrow(), Some(xudo_wire::Question::Thaw));
+        assert_eq!(out, b"done\n");
+
+        let ask_refused = |_: &Path, request: &xudo_wire::BrokerRequest| {
+            assert!(
+                matches!(&request.question, xudo_wire::Question::Freeze { reason } if reason == "maintenance")
+            );
+            Ok(xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Refused {
+                    code: xudo_wire::RefusalCode::RequestUnknown,
+                    remediation: "refused".to_owned(),
+                    detail: None,
+                },
+            })
+        };
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Freeze {
+                    reason: "maintenance".to_owned()
+                },
+                &mut out,
+                &mut err,
+                &ask_refused
+            ),
+            ExitCode::Denied
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("Refused"));
+
+        let ask_error = |_: &Path, _: &xudo_wire::BrokerRequest| Err("offline".to_owned());
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Thaw,
+                &mut out,
+                &mut err,
+                &ask_error
+            ),
+            ExitCode::Unusable
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("offline"));
+
+        assert_eq!(
+            broker_control_command(
+                Path::new("socket"),
+                &Command::Doctor {
+                    json: false,
+                    fix: false
+                },
+                &mut out,
+                &mut Vec::new()
+            ),
+            ExitCode::Unusable
+        );
+        assert_eq!(
+            broker_control_command(
+                Path::new("missing-socket"),
+                &Command::Thaw,
+                &mut out,
+                &mut err
+            ),
+            ExitCode::Unusable
+        );
     }
 
     #[test]
