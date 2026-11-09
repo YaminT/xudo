@@ -26,7 +26,11 @@ stale even for pending and approved watch entries. Since timeout-zero `exec`
 exits immediately, another mint could silently erase a request or approval and
 let alternating requests evade duplicate throttling. The sweep now preserves
 those entries through their TTL, counts them against their recorded uid, and
-leaves expiry to the audited expiry path.
+leaves expiry to the audited expiry path. A live pending or approved watch entry
+for the same caller pin now refuses every new run as `confirmation_throttled`;
+non-watch and consumed entries still supersede. If the confirmation directory
+is unavailable, expired watch entries are silently pruned after a 60-second
+grace; while it is available the audited expiry path owns their removal.
 
 ## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
 

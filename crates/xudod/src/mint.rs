@@ -11,10 +11,13 @@
 //!
 //! Applied under the spool's exclusive lock, every time an entry is minted:
 //!
-//! * **One live entry per caller.** An older entry for the same
-//!   `(pid, starttime)` is removed first, so the gate's lookup by its caller's
-//!   pin finds exactly one entry or none, never two to choose between.
-//! * **Expired entries go.** Anything at or past its deadline is removed.
+//! * **One gate lookup entry per caller.** A pending or approved watch entry
+//!   for the same `(pid, starttime)` refuses a new run and stays in place; a
+//!   non-watch or consumed entry is superseded so the gate's lookup finds one
+//!   entry or none, never two to choose between.
+//! * **Expired entries go.** Non-watch entries and non-waiting watch entries
+//!   at or past their deadline are removed; waiting watch entries remain for
+//!   the audited expiry sweep, then for a 60-second fallback grace.
 //! * **Entries nobody can use go.** A non-watch entry whose caller is no longer the
 //!   process it was minted for — exited, or its pid now someone else's — can
 //!   never be consumed: the gate checks its own caller against the pin. So an
@@ -65,6 +68,10 @@ use crate::identify::PeerIdentity;
 pub const REQUEST_TTL_SECS: u64 = 15 * 60;
 /// Request lifetime in the clock's millisecond unit.
 pub const REQUEST_TTL_MILLIS: u64 = REQUEST_TTL_SECS * 1_000;
+
+/// Extra time an expired watch request stays available for the audited expiry
+/// sweep before a mint may prune it when the confirmation store is absent.
+const EXPIRED_WATCH_GRACE_MILLIS: u64 = 60_000;
 
 /// The most live entries the spool holds.
 pub const MAX_SPOOL_ENTRIES: usize = 64;
@@ -143,6 +150,9 @@ pub enum MintError {
         /// The nonce drawn.
         nonce: String,
     },
+    /// This process already has a pending or approved watched request.
+    #[error("this process already has a pending confirmation request")]
+    ConfirmationThrottled,
 }
 
 /// The entry as an approval: the command and action its audit record must
@@ -300,6 +310,7 @@ fn prune_and_publish<S: Spool + ?Sized>(
                 this_uid = this_uid.saturating_add(usize::from(same_uid));
             }
             Existing::Stale => spool.remove(&name).map_err(MintError::Spool)?,
+            Existing::ConfirmationThrottled => return Err(MintError::ConfirmationThrottled),
             Existing::Foreign => {}
         }
     }
@@ -334,6 +345,8 @@ enum Existing {
     /// Something to remove: expired, superseded, misnamed, unreadable, a
     /// temporary file, or a non-watch entry whose caller cannot be shown alive.
     Stale,
+    /// The asking process already has a waiting watched request.
+    ConfirmationThrottled,
     /// A name the broker does not own.
     Foreign,
 }
@@ -364,11 +377,8 @@ fn classify<S: Spool + ?Sized>(
     let Some(existing) = parsed else {
         return Existing::Stale;
     };
-    let expired = existing.deadline <= BoottimeMillis(minting.now);
     let misnamed = existing.nonce != text;
-    let superseded = existing.caller_pid == minting.entry().caller_pid
-        && existing.caller_starttime == minting.entry().caller_starttime;
-    if misnamed || superseded {
+    if misnamed {
         return Existing::Stale;
     }
     let request_survives_requester = existing.needs_watch
@@ -377,6 +387,26 @@ fn classify<S: Spool + ?Sized>(
             xudo_gate::request::ConfirmationState::Pending
                 | xudo_gate::request::ConfirmationState::Approved
         );
+    let same_pin = existing.caller_pid == minting.entry().caller_pid
+        && existing.caller_starttime == minting.entry().caller_starttime;
+    let past_watch_grace = existing
+        .deadline
+        .0
+        .saturating_add(EXPIRED_WATCH_GRACE_MILLIS)
+        <= minting.now;
+    if request_survives_requester && past_watch_grace {
+        return Existing::Stale;
+    }
+    // A watched request owns the caller's gate lookup slot until the audited
+    // expiry sweep runs, or until the grace period permits fallback pruning.
+    if request_survives_requester && same_pin {
+        return Existing::ConfirmationThrottled;
+    }
+    let superseded = same_pin;
+    if superseded {
+        return Existing::Stale;
+    }
+    let expired = existing.deadline <= BoottimeMillis(minting.now);
     if expired && !request_survives_requester {
         return Existing::Stale;
     }
@@ -536,6 +566,15 @@ mod tests {
         host: &FakePeer,
         minting: &PendingRequest,
     ) -> Result<(), MintError> {
+        publish_at(spool, host, minting, NOW)
+    }
+
+    fn publish_at(
+        spool: &FakeSpool,
+        host: &FakePeer,
+        minting: &PendingRequest,
+        now: u64,
+    ) -> Result<(), MintError> {
         let authorized = authorized(minting);
         publish(
             spool,
@@ -544,7 +583,7 @@ mod tests {
                 authorized: &authorized,
                 json: &minting.to_json(),
                 uid: 1000,
-                now: NOW,
+                now,
             },
         )
     }
@@ -967,6 +1006,64 @@ mod tests {
 
         assert!(spool.files().contains_key(request_a.nonce.as_bytes()));
         assert!(spool.files().contains_key(request_b.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn one_process_alternating_requests_cannot_supersede_its_pending_entry() {
+        let pending_a = watch_entry('b', 4242);
+        let spool = spool_with(&[&pending_a]);
+        let request_b = watch_entry('c', 4242);
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &request_b),
+            Err(MintError::ConfirmationThrottled)
+        );
+        let request_a_again = watch_entry('d', 4242);
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &request_a_again),
+            Err(MintError::ConfirmationThrottled)
+        );
+        assert_eq!(spool.files().len(), 1);
+        assert_eq!(
+            spool.files()[pending_a.nonce.as_bytes()],
+            pending_a.to_json().into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_password_only_request_cannot_supersede_a_pending_entry_of_the_same_process() {
+        let pending = watch_entry('b', 4242);
+        let spool = spool_with(&[&pending]);
+        let password_only = entry('a', 4242, 7, NOW + 900);
+        assert!(!password_only.needs_watch);
+
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &password_only),
+            Err(MintError::ConfirmationThrottled)
+        );
+        assert_eq!(spool.files().len(), 1);
+        assert_eq!(
+            spool.files()[pending.nonce.as_bytes()],
+            pending.to_json().into_bytes()
+        );
+    }
+
+    #[test]
+    fn an_expired_waiting_entry_is_pruned_after_grace_even_without_the_confirm_dir() {
+        let expired = watch_entry('b', 4242);
+        let deadline = expired.deadline.0;
+        let spool = spool_with(&[&expired]);
+        let next = entry('a', 5000, 8, deadline + EXPIRED_WATCH_GRACE_MILLIS + 900);
+
+        publish_at(
+            &spool,
+            &FakePeer::new(),
+            &next,
+            deadline + EXPIRED_WATCH_GRACE_MILLIS,
+        )
+        .unwrap();
+
+        assert!(!spool.files().contains_key(expired.nonce.as_bytes()));
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
     }
 
     #[test]
