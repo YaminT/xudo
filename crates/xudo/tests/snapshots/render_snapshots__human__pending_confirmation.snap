@@ -1,0 +1,7 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::pending_human(&id, 12_345)"
+---
+PENDING
+  request   01234567
+  expires   12345 ms

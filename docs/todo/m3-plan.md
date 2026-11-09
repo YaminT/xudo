@@ -390,6 +390,12 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `an_approved_status_naming_another_gate_is_refused`; snapshots of the
   pending envelope.
 - **Lane.** `just verify`.
+- **Status (2026-11-09):** done. Timeout 0 returns a snapshotted pending
+  envelope without polling; positive timeouts poll status every 500 ms and
+  return pending, denied, or unusable after the documented bounds. A positive
+  wait consumes approval with the same run request before handing off to the
+  installed gate. The front-end reads `confirmation_timeout_secs` (default 0,
+  maximum 600) and never reads confirmation input.
 
 ### 7. `xudo watch` and `xudo pending`
 

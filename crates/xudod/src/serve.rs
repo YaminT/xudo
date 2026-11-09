@@ -2157,7 +2157,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_rerun_consumes_one_approval_for_the_same_argv() {
+    fn a_rerun_consumes_one_approval_for_the_same_user_and_argv() {
         let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
         let mut first_host = Host::honest();
         turn_on_confirmation(&mut first_host);

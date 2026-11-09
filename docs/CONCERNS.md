@@ -1,5 +1,34 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-09 — M3 step 6: bounded `exec` wait
+
+`confirmation_timeout_secs` is a front-end setting, defaults to 0, and is
+bounded at 600 seconds. A positive wait polls the broker's pinned `status`
+question every 500 ms; an approved status causes the same run request to be
+sent again so the broker consumes the one-use approval before the gate runs;
+that consuming request is capped at five seconds. The n / n+5 second wait
+bound begins after the first pending answer. If approval expires or is consumed
+before the re-run, `xudo` returns 18 and leaves no newly consumed gate entry;
+the broker removes an expired approval through its expiry transition.
+
+The requester never reads stdin, stdout, or `/dev/tty` for confirmation. JSON
+pending updates are compact JSON Lines. `UnixStream::connect` itself has no
+timeout, so the socket connection attempt is still outside the read/write
+deadlines; this is pre-existing in `ask` and remains a boundedness limitation.
+Timeout and pending output are snapshotted in both renderers.
+
+The 600-second validation is in shared `Settings::apply`, so a system config
+above that value now fails closed in the broker and gate as well as the front
+end. That propagation is intentional.
+
+## 2026-11-09 — M3 step 5 review notes
+
+Two low-severity concerns remain, and both fail closed. A throttled request
+from the same process writes its grant record before its denial record. A
+hand-written client can hold a pending entry and re-run a different approved
+command, causing the gate to refuse its own approval as ambiguous. Neither
+path executes a command without the gate's independent checks.
+
 ## 2026-11-09 — M3 step 5: broker confirmation serving is done
 
 The broker dispatches `status`, `watch`, and `answer`; a watched `run` returns a

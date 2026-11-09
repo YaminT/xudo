@@ -7,10 +7,29 @@ use std::time::{Duration, Instant};
 
 use xudo_backend::Probe;
 use xudo_backend::snippet::GATE_AUTH;
+use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use xudo_policy::{DenialCode, ExitCode};
-use xudo_wire::{Answer, BrokerRequest, BrokerResponse, MAX_RESPONSE_BYTES};
+use xudo_wire::{Answer, BrokerRequest, BrokerResponse, MAX_RESPONSE_BYTES, Question};
 
 use crate::cli::{Cli, emit};
+
+type StatusPoll<'a> =
+    dyn FnMut(Duration, &BrokerRequest) -> Result<Option<BrokerResponse>, ExitCode> + 'a;
+
+fn selected_backend(probe: &dyn Probe, err: &mut dyn Write) -> Option<&'static str> {
+    // Cheap pick on purpose: `detect` runs slow probes, and this runs every time.
+    let Some(backend) = ["/usr/bin/sudo", "/usr/bin/sudo-rs", "/usr/bin/doas"]
+        .into_iter()
+        .find(|path| probe.exists(path))
+    else {
+        let _ = writeln!(
+            err,
+            "xudo: no sudo, sudo-rs, or doas installed; run `xudo doctor`"
+        );
+        return None;
+    };
+    Some(backend)
+}
 
 /// How long a broker gets to answer before we give up on it.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -18,7 +37,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// What `main` execs, in place: `backend gate`, nothing else.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExecPlan {
-    /// The backend, an absolute path.
+    /// The backend, one of the compiled-in absolute paths.
     pub backend: &'static str,
     /// The gate, its only argument.
     pub gate: &'static str,
@@ -40,7 +59,19 @@ pub fn plan_live(
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
     let socket = Path::new(xudo_wire::BROKER_SOCKET);
-    plan(cli, argv, &xudo_sys::HostProbe, socket, TIMEOUT, out, err)
+    let Some(timeout) = configured_timeout(cli, err) else {
+        return Err(ExitCode::Unusable);
+    };
+    plan_with_confirmation_timeout(
+        cli,
+        argv,
+        &xudo_sys::HostProbe,
+        socket,
+        TIMEOUT,
+        timeout,
+        out,
+        err,
+    )
 }
 
 /// Asks the broker about `argv`. `Ok` means exec the plan; `Err` is the exit status.
@@ -57,19 +88,31 @@ pub fn plan(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
+    plan_with_confirmation_timeout(cli, argv, probe, socket, timeout, Duration::ZERO, out, err)
+}
+
+/// Asks the broker and waits for an out-of-band approval for at most `wait`.
+///
+/// # Errors
+///
+/// Returns the exit status when the request is refused, remains pending, or
+/// the broker cannot be used.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_with_confirmation_timeout(
+    cli: &Cli,
+    argv: &[String],
+    probe: &dyn Probe,
+    socket: &Path,
+    timeout: Duration,
+    wait: Duration,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
     let Some((program, operands)) = argv.split_first() else {
         let _ = writeln!(err, "xudo: nothing to run; pass a command after `--`");
         return Err(ExitCode::Unusable);
     };
-    // Cheap pick on purpose: `detect` runs slow probes, and this runs every time.
-    let Some(backend) = ["/usr/bin/sudo", "/usr/bin/sudo-rs", "/usr/bin/doas"]
-        .into_iter()
-        .find(|path| probe.exists(path))
-    else {
-        let _ = writeln!(
-            err,
-            "xudo: no sudo, sudo-rs, or doas installed; run `xudo doctor`"
-        );
+    let Some(backend) = selected_backend(probe, err) else {
         return Err(ExitCode::Unusable);
     };
 
@@ -93,10 +136,33 @@ pub fn plan(
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
             Err(ExitCode::Unusable)
         }
-        Answer::Pending { id, .. } => {
-            let _ = writeln!(err, "xudo: pending approval on xudo watch, request {id}");
-            Err(ExitCode::NotConfirmed)
-        }
+        Answer::Pending { id, expires_in_ms } => pending_or_wait(
+            cli,
+            &id,
+            expires_in_ms,
+            wait,
+            out,
+            err,
+            &mut |wait, status_request| {
+                let started = Instant::now();
+                let mut status = |remaining| {
+                    ask(
+                        socket,
+                        timeout.min(remaining).min(Duration::from_millis(500)),
+                        status_request,
+                    )
+                };
+                let mut elapsed = || started.elapsed();
+                let mut sleep = std::thread::sleep;
+                poll_status_with(&id, wait, &mut status, &mut elapsed, &mut sleep)
+            },
+        )
+        .and_then(|answer| match answer {
+            None => Err(ExitCode::NotConfirmed),
+            Some(answer) => handle_status_answer(
+                cli, answer, &id, &request, socket, timeout, backend, err, out,
+            ),
+        }),
         Answer::Watching { .. } | Answer::Done => {
             let _ = writeln!(
                 err,
@@ -126,13 +192,221 @@ pub fn plan(
                 let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
                 return Err(ExitCode::Unusable);
             }
+            let spawn = backend == "/usr/bin/doas";
             Ok(ExecPlan {
                 backend,
                 gate: GATE_AUTH,
-                spawn: backend == "/usr/bin/doas",
+                spawn,
             })
         }
     }
+}
+
+fn valid_request_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn configured_timeout(cli: &Cli, err: &mut dyn Write) -> Option<Duration> {
+    let mut config = ConfigSettings::default();
+    let contents = match std::fs::read_to_string(&cli.config_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            let _ = writeln!(
+                err,
+                "xudo: failing closed; the settings file could not be read"
+            );
+            return None;
+        }
+    };
+    if !contents.is_empty() {
+        let name = cli.config_file.display().to_string();
+        if let Err(load_err) = apply_file(&mut config, Layer::System, &name, &contents) {
+            let _ = writeln!(err, "xudo: {load_err}");
+            let _ = writeln!(
+                err,
+                "xudo: failing closed; the settings file was not applied"
+            );
+            return None;
+        }
+    }
+    timeout_from_value(&config.get(Setting::ConfirmationTimeoutSecs).value, err)
+}
+
+fn timeout_from_value(value: &ConfigValue, err: &mut dyn Write) -> Option<Duration> {
+    match value {
+        ConfigValue::Integer(seconds) => Some(Duration::from_secs(*seconds)),
+        ConfigValue::Bool(_) | ConfigValue::Text(_) => {
+            let _ = writeln!(err, "xudo: confirmation_timeout_secs has an invalid value");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pending_or_wait(
+    cli: &Cli,
+    id: &str,
+    expires_in_ms: u64,
+    wait: Duration,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    poll: &mut StatusPoll<'_>,
+) -> Result<Option<BrokerResponse>, ExitCode> {
+    if !valid_request_id(id) {
+        let _ = writeln!(err, "xudo: broker returned an invalid request id");
+        return Err(ExitCode::Unusable);
+    }
+    let request = BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question: Question::Status { id: id.to_owned() },
+    };
+    let mut pending = || match cli.output {
+        crate::cli::Format::Human => {
+            write!(out, "{}", crate::render::pending_human(id, expires_in_ms))
+        }
+        crate::cli::Format::Json => {
+            writeln!(out, "{}", crate::render::pending_json(id, expires_in_ms))
+        }
+    };
+    if wait.is_zero() {
+        let _ = pending();
+        let _ = writeln!(
+            err,
+            "xudo: pending approval on xudo watch, request {}…",
+            crate::render::short_id(id)
+        );
+        return Ok(None);
+    }
+    let seconds = wait.as_secs();
+    let _ = pending();
+    let _ = writeln!(
+        err,
+        "xudo: waiting for approval on xudo watch, request {}…, {seconds} s",
+        crate::render::short_id(id)
+    );
+    let result = poll(wait, &request);
+    if result.as_ref().is_ok_and(Option::is_none) {
+        let _ = pending();
+    }
+    result
+}
+
+fn poll_status_with(
+    id: &str,
+    wait: Duration,
+    status: &mut dyn FnMut(Duration) -> Result<BrokerResponse, String>,
+    elapsed: &mut dyn FnMut() -> Duration,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Option<BrokerResponse>, ExitCode> {
+    let mut silent = false;
+    loop {
+        let passed = elapsed();
+        // The n-second window, and its optional five-second silence extension,
+        // start after the initial Pending answer reaches the front end.
+        let deadline = if silent {
+            wait.saturating_add(Duration::from_secs(5))
+        } else {
+            wait
+        };
+        if passed >= deadline {
+            return if silent {
+                Err(ExitCode::Unusable)
+            } else {
+                Ok(None)
+            };
+        }
+        sleep(Duration::from_millis(500).min(deadline.saturating_sub(passed)));
+        let remaining = deadline.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return if silent {
+                Err(ExitCode::Unusable)
+            } else {
+                Ok(None)
+            };
+        }
+        match status(Duration::from_millis(500).min(remaining)) {
+            Ok(response) => match &response.answer {
+                Answer::Pending { id: status_id, .. } if status_id == id => silent = false,
+                Answer::Pending { .. } => return Err(ExitCode::Unusable),
+                Answer::Decided { .. } => return Ok(Some(response)),
+                Answer::Refused { .. } | Answer::Watching { .. } | Answer::Done => {
+                    return Err(ExitCode::Unusable);
+                }
+            },
+            Err(_) => silent = true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_status_answer(
+    cli: &Cli,
+    response: BrokerResponse,
+    id: &str,
+    request: &BrokerRequest,
+    socket: &Path,
+    timeout: Duration,
+    backend: &'static str,
+    err: &mut dyn Write,
+    out: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    let Answer::Decided { decision, minted } = response.answer else {
+        return Err(ExitCode::NotConfirmed);
+    };
+    if !decision.verdict.is_permitted() {
+        if matches!(
+            decision.denial,
+            Some(DenialCode::ConfirmationRefused | DenialCode::ConfirmationExpired)
+        ) {
+            return Err(emit(cli, &decision, out));
+        }
+        let _ = writeln!(err, "xudo: the broker returned an invalid approval status");
+        return Err(ExitCode::Unusable);
+    }
+    let Some(minted) = minted else {
+        let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+        return Err(ExitCode::Unusable);
+    };
+    if minted.nonce != id || minted.gate != GATE_AUTH {
+        let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+        return Err(ExitCode::Unusable);
+    }
+    // The extra n+5 s bound begins after the first watch answer. Keep the
+    // consuming run short even when the original broker timeout is longer.
+    let consumed = ask(socket, timeout.min(Duration::from_secs(5)), request).map_err(|why| {
+        let _ = writeln!(
+            err,
+            "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+        );
+        ExitCode::Unusable
+    })?;
+    let Answer::Decided { decision, minted } = consumed.answer else {
+        // Expiry or a concurrent consumer can invalidate the approval between
+        // status and this run. The broker has atomically taken or expired it;
+        // report pending/refused (18), never a generic unusable result.
+        let _ = writeln!(err, "xudo: the approval expired or was already consumed");
+        return Err(ExitCode::NotConfirmed);
+    };
+    if !decision.verdict.is_permitted() {
+        return Err(emit(cli, &decision, out));
+    }
+    let Some(minted) = minted else {
+        let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+        return Err(ExitCode::Unusable);
+    };
+    if minted.nonce != id || minted.gate != GATE_AUTH {
+        let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+        return Err(ExitCode::Unusable);
+    }
+    Ok(ExecPlan {
+        backend,
+        gate: GATE_AUTH,
+        spawn: backend == "/usr/bin/doas",
+    })
 }
 
 /// One request, one response, both bounded.
@@ -367,11 +641,751 @@ mod tests {
         serde_json::to_vec(&response).unwrap()
     }
 
+    fn confirmation_denied(code: DenialCode) -> BrokerResponse {
+        BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: Decision::deny(code, Vec::new(), Vec::new()),
+                minted: None,
+            },
+        }
+    }
+
+    fn one_reply(
+        reply: &BrokerResponse,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        thread::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = reply.to_json().into_bytes();
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(&reply).unwrap();
+        });
+        (dir, socket, broker)
+    }
+
     fn decided(decision: Decision, minted: Option<Minted>) -> Vec<u8> {
         json(&Answer::Decided { decision, minted })
     }
 
     const SUDO: Has = Has(&["/usr/bin/sudo"]);
+
+    #[test]
+    fn timeout_zero_renders_pending_output_and_watch_hint() {
+        let cli = cli();
+        let id = "a".repeat(64);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = pending_or_wait(
+            &cli,
+            &id,
+            25_000,
+            Duration::ZERO,
+            &mut out,
+            &mut err,
+            &mut no_status_reply,
+        );
+        assert_eq!(result, Ok(None));
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(out.contains("PENDING"), "{out}");
+        assert!(err.contains("pending approval on xudo watch"), "{err}");
+        assert_eq!(err.lines().count(), 1);
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn no_status_reply(_: Duration, _: &BrokerRequest) -> Result<Option<BrokerResponse>, ExitCode> {
+        Ok(None)
+    }
+
+    #[test]
+    fn a_wait_that_gets_no_status_reply_reports_pending_again() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = pending_or_wait(
+            &cli(),
+            &"a".repeat(64),
+            25_000,
+            Duration::from_secs(1),
+            &mut out,
+            &mut err,
+            &mut no_status_reply,
+        );
+        assert_eq!(result, Ok(None));
+        assert_eq!(
+            String::from_utf8(out).unwrap().matches("PENDING").count(),
+            2
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("waiting for approval")
+        );
+    }
+
+    #[test]
+    fn broker_pending_ids_must_be_exact_lowercase_hex() {
+        assert!(valid_request_id(&"a".repeat(64)));
+        assert!(valid_request_id(&"0".repeat(64)));
+        assert!(!valid_request_id(&"A".repeat(64)));
+        assert!(!valid_request_id(&"g".repeat(64)));
+        assert!(!valid_request_id(&"a".repeat(63)));
+        assert!(!valid_request_id(&format!("{}x", "a".repeat(64))));
+    }
+
+    #[test]
+    fn refuses_an_invalid_pending_id_before_rendering_it() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = pending_or_wait(
+            &cli(),
+            &"A".repeat(64),
+            10_000,
+            Duration::ZERO,
+            &mut out,
+            &mut err,
+            &mut no_status_reply,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(out.is_empty());
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("invalid request id")
+        );
+    }
+
+    #[test]
+    fn exec_never_waits_past_the_configured_timeout() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut slept = Duration::ZERO;
+        let response = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Pending {
+                id: "a".repeat(64),
+                expires_in_ms: 10_000,
+            },
+        };
+        let result = poll_status_with(
+            &"a".repeat(64),
+            Duration::from_secs(1),
+            &mut |_| Ok(response.clone()),
+            &mut || elapsed.get(),
+            &mut |duration| {
+                elapsed.set(elapsed.get() + duration);
+                slept += duration;
+            },
+        );
+        assert_eq!(result, Ok(None));
+        assert_eq!(slept, Duration::from_secs(1));
+        assert_eq!(elapsed.get(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn status_polling_rejects_another_request_and_unsupported_answers() {
+        let id = "a".repeat(64);
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let other = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Pending {
+                id: "b".repeat(64),
+                expires_in_ms: 5_000,
+            },
+        };
+        assert_eq!(
+            poll_status_with(
+                &id,
+                Duration::from_secs(1),
+                &mut |_| Ok(other.clone()),
+                &mut || elapsed.get(),
+                &mut |duration| elapsed.set(elapsed.get() + duration),
+            ),
+            Err(ExitCode::Unusable)
+        );
+        for answer in [
+            Answer::Refused {
+                code: RefusalCode::RequestUnknown,
+                remediation: "retry".into(),
+                detail: None,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+            },
+            Answer::Done,
+        ] {
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let response = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer,
+            };
+            assert_eq!(
+                poll_status_with(
+                    &id,
+                    Duration::from_secs(1),
+                    &mut |_| Ok(response.clone()),
+                    &mut || elapsed.get(),
+                    &mut |duration| elapsed.set(elapsed.get() + duration),
+                ),
+                Err(ExitCode::Unusable)
+            );
+        }
+    }
+
+    #[test]
+    fn status_polling_stops_before_sleeping_or_polling_after_its_deadline() {
+        let polls = std::cell::Cell::new(0);
+        let sleeps = std::cell::Cell::new(0);
+        let mut status = |_: Duration| {
+            polls.set(polls.get() + 1);
+            Err("must not poll".into())
+        };
+        let mut sleep = |_: Duration| sleeps.set(sleeps.get() + 1);
+        let _ = status(Duration::ZERO);
+        sleep(Duration::ZERO);
+        polls.set(0);
+        sleeps.set(0);
+        assert_eq!(
+            poll_status_with(
+                &"a".repeat(64),
+                Duration::from_secs(1),
+                &mut status,
+                &mut || Duration::from_secs(1),
+                &mut sleep,
+            ),
+            Ok(None)
+        );
+        assert_eq!(polls.get(), 0);
+        assert_eq!(sleeps.get(), 0);
+
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = poll_status_with(
+            &"a".repeat(64),
+            Duration::from_secs(1),
+            &mut |_| {
+                elapsed.set(Duration::from_secs(6));
+                Err("silent".into())
+            },
+            &mut || elapsed.get(),
+            &mut |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+    }
+
+    #[test]
+    fn exec_prints_a_pending_envelope_then_a_denied_one_when_denied_during_the_wait() {
+        let cli = cli();
+        let id = "b".repeat(64);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let response = confirmation_denied(DenialCode::ConfirmationRefused);
+        let polled = pending_or_wait(
+            &cli,
+            &id,
+            10_000,
+            Duration::from_secs(1),
+            &mut out,
+            &mut err,
+            &mut |wait, request| {
+                assert_eq!(wait, Duration::from_secs(1));
+                assert_eq!(
+                    std::mem::discriminant(&request.question),
+                    std::mem::discriminant(&Question::Status { id: String::new() })
+                );
+                Ok(Some(response.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let request = BrokerRequest::new(argv()[0].clone(), argv()[1..].to_vec(), "unattested");
+        let _ = handle_status_answer(
+            &cli,
+            polled,
+            &id,
+            &request,
+            Path::new("/nonexistent"),
+            TIMEOUT,
+            "/usr/bin/sudo",
+            &mut err,
+            &mut out,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("PENDING"), "{out}");
+        assert!(out.contains("DENY"), "{out}");
+        assert!(out.contains("confirmation_refused"), "{out}");
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("waiting for approval")
+        );
+    }
+
+    #[test]
+    fn a_positive_timeout_that_expires_renders_the_pending_envelope_again() {
+        let cli = cli();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            pending_or_wait(
+                &cli,
+                &"a".repeat(64),
+                9_000,
+                Duration::from_secs(1),
+                &mut out,
+                &mut err,
+                &mut |_, _| Ok(None),
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap().matches("PENDING").count(),
+            2
+        );
+        assert!(String::from_utf8(err).unwrap().contains("1 s"));
+    }
+
+    #[test]
+    fn status_denial_codes_are_rendered_as_not_confirmed() {
+        for code in [
+            DenialCode::ConfirmationRefused,
+            DenialCode::ConfirmationExpired,
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                handle_status_answer(
+                    &cli(),
+                    confirmation_denied(code),
+                    &"a".repeat(64),
+                    &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                    Path::new("/nonexistent"),
+                    TIMEOUT,
+                    "/usr/bin/sudo",
+                    &mut err,
+                    &mut out,
+                ),
+                Err(ExitCode::NotConfirmed)
+            );
+            assert!(String::from_utf8(out).unwrap().contains(code.as_str()));
+        }
+    }
+
+    #[test]
+    fn status_without_a_terminal_decision_is_not_consumed() {
+        let response = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Pending {
+                id: "a".repeat(64),
+                expires_in_ms: 1,
+            },
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                response,
+                &"a".repeat(64),
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                Path::new("/nonexistent"),
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::NotConfirmed)
+        );
+    }
+
+    #[test]
+    fn an_invalid_or_unminted_status_approval_fails_closed() {
+        for response in [
+            confirmation_denied(DenialCode::UnknownAction),
+            BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: Answer::Decided {
+                    decision: allow(),
+                    minted: None,
+                },
+            },
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                handle_status_answer(
+                    &cli(),
+                    response,
+                    &"a".repeat(64),
+                    &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                    Path::new("/nonexistent"),
+                    TIMEOUT,
+                    "/usr/bin/sudo",
+                    &mut err,
+                    &mut out,
+                ),
+                Err(ExitCode::Unusable)
+            );
+        }
+    }
+
+    #[test]
+    fn an_approved_status_cannot_continue_when_the_broker_is_unreachable() {
+        let id = "a".repeat(64);
+        let response = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: id.clone(),
+                    expires_in_ms: 1,
+                    gate: GATE_AUTH.into(),
+                }),
+            },
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                response,
+                &id,
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                Path::new("/nonexistent/broker.sock"),
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("broker is unreachable")
+        );
+    }
+
+    #[test]
+    fn a_rerun_that_does_not_consume_approval_exits_not_confirmed() {
+        let id = "a".repeat(64);
+        let status = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: id.clone(),
+                    expires_in_ms: 1,
+                    gate: GATE_AUTH.into(),
+                }),
+            },
+        };
+        let (dir, socket, broker) = one_reply(&BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Done,
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                status,
+                &id,
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                &socket,
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::NotConfirmed)
+        );
+        broker.join().unwrap();
+        drop(dir);
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("expired or was already consumed")
+        );
+    }
+
+    #[test]
+    fn a_consumed_approval_must_return_the_same_gate_and_nonce() {
+        let id = "a".repeat(64);
+        for minted_entry in [
+            Minted {
+                nonce: id.clone(),
+                expires_in_ms: 1,
+                gate: "/other".into(),
+            },
+            Minted {
+                nonce: "b".repeat(64),
+                expires_in_ms: 1,
+                gate: GATE_AUTH.into(),
+            },
+        ] {
+            let status = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: Answer::Decided {
+                    decision: allow(),
+                    minted: Some(Minted {
+                        nonce: id.clone(),
+                        expires_in_ms: 1,
+                        gate: GATE_AUTH.into(),
+                    }),
+                },
+            };
+            let (dir, socket, broker) = one_reply(&BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: Answer::Decided {
+                    decision: allow(),
+                    minted: Some(minted_entry),
+                },
+            });
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                handle_status_answer(
+                    &cli(),
+                    status,
+                    &id,
+                    &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                    &socket,
+                    TIMEOUT,
+                    "/usr/bin/sudo",
+                    &mut err,
+                    &mut out,
+                ),
+                Err(ExitCode::Unusable)
+            );
+            broker.join().unwrap();
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn a_rerun_that_denies_after_approval_still_exits_not_confirmed() {
+        let id = "a".repeat(64);
+        let status = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: id.clone(),
+                    expires_in_ms: 1,
+                    gate: GATE_AUTH.into(),
+                }),
+            },
+        };
+        let denied = confirmation_denied(DenialCode::ConfirmationRefused);
+        let (dir, socket, broker) = one_reply(&denied);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                status,
+                &id,
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                &socket,
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::NotConfirmed)
+        );
+        broker.join().unwrap();
+        drop(dir);
+    }
+
+    #[test]
+    fn a_consumed_run_without_a_minted_entry_fails_closed() {
+        let id = "a".repeat(64);
+        let status = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: id.clone(),
+                    expires_in_ms: 1,
+                    gate: GATE_AUTH.into(),
+                }),
+            },
+        };
+        let (dir, socket, broker) = one_reply(&BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: None,
+            },
+        });
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                status,
+                &id,
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                &socket,
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        broker.join().unwrap();
+        drop(dir);
+        assert!(String::from_utf8(err).unwrap().contains("minted no entry"));
+    }
+
+    #[test]
+    fn a_broker_that_goes_silent_while_pending_is_exit_19() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = poll_status_with(
+            &"a".repeat(64),
+            Duration::from_secs(1),
+            &mut |_| Err("silent".to_owned()),
+            &mut || elapsed.get(),
+            &mut |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert_eq!(elapsed.get(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn an_approved_status_naming_another_gate_is_refused() {
+        let response = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: "c".repeat(64),
+                    expires_in_ms: 1,
+                    gate: "/usr/libexec/xudo/other-gate".into(),
+                }),
+            },
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                response,
+                &"c".repeat(64),
+                &BrokerRequest::new("/usr/bin/apt-get", vec!["install".into()], "unattested"),
+                Path::new("/nonexistent"),
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out
+            ),
+            Err(ExitCode::Unusable)
+        );
+    }
+
+    #[test]
+    fn the_front_end_reads_the_bounded_confirmation_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = cli();
+        cli.config_file = dir.path().join("config.toml");
+        let mut err = Vec::new();
+        assert_eq!(configured_timeout(&cli, &mut err), Some(Duration::ZERO));
+        std::fs::write(&cli.config_file, "confirmation_timeout_secs = 7\n").unwrap();
+        assert_eq!(
+            configured_timeout(&cli, &mut err),
+            Some(Duration::from_secs(7))
+        );
+        std::fs::write(&cli.config_file, "confirmation_timeout_secs = 601\n").unwrap();
+        assert_eq!(configured_timeout(&cli, &mut err), None);
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("at most 600 seconds")
+        );
+        cli.config_file = dir.path().to_path_buf();
+        let mut err = Vec::new();
+        assert_eq!(configured_timeout(&cli, &mut err), None);
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("settings file could not be read")
+        );
+        assert_eq!(
+            timeout_from_value(&ConfigValue::Integer(2), &mut Vec::new()),
+            Some(Duration::from_secs(2))
+        );
+        for value in [ConfigValue::Bool(true), ConfigValue::Text("x".into())] {
+            let mut err = Vec::new();
+            assert_eq!(timeout_from_value(&value, &mut err), None);
+            assert!(String::from_utf8(err).unwrap().contains("invalid value"));
+        }
+    }
+
+    #[test]
+    fn a_rerun_consumes_one_approval_for_the_same_user_and_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let id = "d".repeat(64);
+        let pending = json(&Answer::Pending {
+            id: id.clone(),
+            expires_in_ms: 30_000,
+        });
+        let matching_mint = Minted {
+            nonce: id.clone(),
+            expires_in_ms: 30_000,
+            gate: GATE_AUTH.into(),
+        };
+        let approved_status = decided(allow(), Some(matching_mint.clone()));
+        let consumed_run = decided(allow(), Some(matching_mint));
+        let broker = thread::spawn(move || {
+            let mut received = Vec::new();
+            for (index, response) in [pending, approved_status, consumed_run]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                received.push(BrokerRequest::parse(&request).unwrap());
+                if index == 1 {
+                    assert_eq!(
+                        std::mem::discriminant(&received[index].question),
+                        std::mem::discriminant(&Question::Status { id: String::new() })
+                    );
+                }
+                stream.write_all(&response).unwrap();
+            }
+            received
+        });
+        let mut cli = cli();
+        cli.output = crate::cli::Format::Json;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_with_confirmation_timeout(
+            &cli,
+            &argv(),
+            &SUDO,
+            &socket,
+            TIMEOUT,
+            Duration::from_secs(1),
+            &mut out,
+            &mut err,
+        );
+        assert!(result.is_ok());
+        let requests = broker.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[2]);
+        assert_eq!(
+            std::mem::discriminant(&requests[0].question),
+            std::mem::discriminant(&Question::Run {
+                program: String::new(),
+                argv: Vec::new(),
+                claimed_classification: String::new(),
+            })
+        );
+    }
 
     #[test]
     fn a_permitted_command_returns_the_plan_for_the_installed_gate() {
@@ -781,6 +1795,23 @@ mod tests {
         assert_eq!(
             plan_live(&cli(), &[], &mut out, &mut err),
             Err(ExitCode::Unusable)
+        );
+    }
+
+    #[test]
+    fn plan_live_refuses_a_settings_path_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = cli();
+        cli.config_file = dir.path().to_path_buf();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_live(&cli, &argv(), &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("settings file could not be read")
         );
     }
 

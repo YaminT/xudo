@@ -337,17 +337,23 @@ pub fn run_with_installer(
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
         // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
-        Command::Exec { argv } => exec::plan(
-            cli,
-            argv,
-            probe,
-            Path::new(xudo_wire::BROKER_SOCKET),
-            exec::TIMEOUT,
-            out,
-            err,
-        )
-        .err()
-        .unwrap_or(ExitCode::Unusable),
+        Command::Exec { argv } => {
+            let Some(wait) = exec::configured_timeout(cli, err) else {
+                return ExitCode::Unusable;
+            };
+            exec::plan_with_confirmation_timeout(
+                cli,
+                argv,
+                probe,
+                Path::new(xudo_wire::BROKER_SOCKET),
+                exec::TIMEOUT,
+                wait,
+                out,
+                err,
+            )
+            .err()
+            .unwrap_or(ExitCode::Unusable)
+        }
         Command::Check => with_rules!(|l: &LoadedRules| check(l, out, err)),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
@@ -3202,6 +3208,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "/usr/bin/systemctl",
             "restart",
             "nginx",
+        ]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("settings file was not applied"), "{err}");
+
+        let (code, _, err) = fx.run(&[
+            "--config-file",
+            path.to_str().unwrap(),
+            "exec",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
         ]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(err.contains("settings file was not applied"), "{err}");
