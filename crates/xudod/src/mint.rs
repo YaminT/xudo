@@ -15,13 +15,15 @@
 //!   `(pid, starttime)` is removed first, so the gate's lookup by its caller's
 //!   pin finds exactly one entry or none, never two to choose between.
 //! * **Expired entries go.** Anything at or past its deadline is removed.
-//! * **Entries nobody can use go.** An entry whose caller is no longer the
+//! * **Entries nobody can use go.** A non-watch entry whose caller is no longer the
 //!   process it was minted for — exited, or its pid now someone else's — can
 //!   never be consumed: the gate checks its own caller against the pin. So an
 //!   entry counts as live only while `/proc/<pid>/stat` still shows the pinned
 //!   `(pid, starttime)`, and a caller that cannot be shown alive is pruned.
 //!   Without this, one group member could run 64 clients one after another,
 //!   each exiting before the next, and refuse everyone for fifteen minutes.
+//!   Pending and approved watch entries are different: timeout-zero clients
+//!   exit by design, so those entries remain until the audited expiry sweep.
 //! * **Junk goes.** A temporary file left by a broker that died mid-write —
 //!   no write can be in progress while the lock is held — and any nonce-named
 //!   entry that cannot be read back as a request.
@@ -330,7 +332,7 @@ enum Existing {
         same_uid: bool,
     },
     /// Something to remove: expired, superseded, misnamed, unreadable, a
-    /// temporary file, or an entry whose caller cannot be shown alive.
+    /// temporary file, or a non-watch entry whose caller cannot be shown alive.
     Stale,
     /// A name the broker does not own.
     Foreign,
@@ -366,8 +368,23 @@ fn classify<S: Spool + ?Sized>(
     let misnamed = existing.nonce != text;
     let superseded = existing.caller_pid == minting.entry().caller_pid
         && existing.caller_starttime == minting.entry().caller_starttime;
-    if expired || misnamed || superseded {
+    if misnamed || superseded {
         return Existing::Stale;
+    }
+    let request_survives_requester = existing.needs_watch
+        && matches!(
+            existing.state,
+            xudo_gate::request::ConfirmationState::Pending
+                | xudo_gate::request::ConfirmationState::Approved
+        );
+    if expired && !request_survives_requester {
+        return Existing::Stale;
+    }
+    if request_survives_requester {
+        return Existing::Live {
+            size: bytes.len(),
+            same_uid: existing.caller_uid == minting.uid,
+        };
     }
     match live_caller(callers, &existing) {
         Some(uids) => Existing::Live {
@@ -867,6 +884,115 @@ mod tests {
             spool.with_file(each.nonce.clone(), each.to_json())
         });
         (entries, spool)
+    }
+
+    fn watch_entry(letter: char, pid: u32) -> PendingRequest {
+        let mut entry = entry(letter, pid, 7, NOW + 100);
+        entry.needs_watch = true;
+        entry
+    }
+
+    #[test]
+    fn a_pending_entry_survives_its_requester_exiting() {
+        let pending = watch_entry('b', 4243);
+        let spool = spool_with(&[&pending]);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+
+        assert!(spool.files().contains_key(pending.nonce.as_bytes()));
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn an_approval_survives_until_the_rerun() {
+        let mut approved = watch_entry('b', 4243);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.shown_at_ms = Some(BoottimeMillis(0));
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: approved.caller_uid,
+            pid: 5000,
+            starttime: 77,
+            tty: (136 << 8) | 1,
+            sid: approved.caller_sid + 1,
+        };
+        approved.confirmed_by = Some(watcher.clone());
+        approved.shown_to = Some(watcher);
+        let spool = spool_with(&[&approved]);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+
+        assert!(spool.files().contains_key(approved.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn a_consumed_watch_entry_still_tracks_its_gate_caller() {
+        let mut consumed = watch_entry('b', 4243);
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        consumed.confirmed = true;
+        consumed.shown_at_ms = Some(BoottimeMillis(0));
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: consumed.caller_uid,
+            pid: 5000,
+            starttime: 77,
+            tty: (136 << 8) | 1,
+            sid: consumed.caller_sid + 1,
+        };
+        consumed.confirmed_by = Some(watcher.clone());
+        consumed.shown_to = Some(watcher);
+        let spool = spool_with(&[&consumed]);
+        let caller_is_live = running(FakePeer::new(), &consumed, 1000, 1000);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &caller_is_live, &next).unwrap();
+
+        assert!(spool.files().contains_key(consumed.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn alternating_requests_cannot_sweep_each_others_pending_entry() {
+        let request_a = watch_entry('b', 4243);
+        let request_b = watch_entry('c', 4244);
+        let spool = spool_with(&[&request_a]);
+
+        publish_as_1000(&spool, &FakePeer::new(), &request_b).unwrap();
+        publish_as_1000(
+            &spool,
+            &FakePeer::new(),
+            &entry('a', 4242, 5_000, NOW + 900),
+        )
+        .unwrap();
+
+        assert!(spool.files().contains_key(request_a.nonce.as_bytes()));
+        assert!(spool.files().contains_key(request_b.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn a_dead_caller_watch_entry_still_counts_toward_its_uids_quota() {
+        let entries: Vec<PendingRequest> = (0..MAX_ENTRIES_PER_UID)
+            .map(|index| {
+                let mut entry = watch_entry(
+                    char::from(b'b' + u8::try_from(index).unwrap()),
+                    20_000 + u32::try_from(index).unwrap(),
+                );
+                entry.nonce = format!("{:064x}", index + 1);
+                entry
+            })
+            .collect();
+        let refs: Vec<&PendingRequest> = entries.iter().collect();
+        let spool = spool_with(&refs);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &next),
+            Err(MintError::UidFull {
+                uid: 1000,
+                entries: MAX_ENTRIES_PER_UID,
+            })
+        );
+        assert_eq!(spool.files().len(), MAX_ENTRIES_PER_UID);
     }
 
     #[test]

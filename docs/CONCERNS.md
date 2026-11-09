@@ -21,6 +21,13 @@ unreadable state refuses that uid until operator repair. Regression tests cover
 each finding. `script -qc 'xudo watch' /dev/null` creates a new session and pty in
 one command (the known setsid-plus-pty limit); the password still holds.
 
+A follow-up review found that mint's spool sweep treated an exited requester as
+stale even for pending and approved watch entries. Since timeout-zero `exec`
+exits immediately, another mint could silently erase a request or approval and
+let alternating requests evade duplicate throttling. The sweep now preserves
+those entries through their TTL, counts them against their recorded uid, and
+leaves expiry to the audited expiry path.
+
 ## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
 
 `xudod::confirm` models pending, approved, denied, and expired entries without
