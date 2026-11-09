@@ -15,6 +15,10 @@ pub const DEADLINE_CLOCK: ClockId = ClockId::Boottime;
 pub trait Clock {
     /// Milliseconds of `CLOCK_BOOTTIME`.
     fn boottime_millis(&self) -> u64;
+
+    /// Milliseconds since the Unix epoch. For records read by people, never
+    /// for a deadline.
+    fn wall_millis(&self) -> u64;
 }
 
 /// The running kernel's `CLOCK_BOOTTIME`.
@@ -22,6 +26,13 @@ pub trait Clock {
 pub struct HostClock;
 
 impl Clock for HostClock {
+    fn wall_millis(&self) -> u64 {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn boottime_millis(&self) -> u64 {
         let now = rustix::time::clock_gettime(DEADLINE_CLOCK);
         let secs = u64::try_from(now.tv_sec).unwrap_or(0);
@@ -35,6 +46,10 @@ impl Clock for HostClock {
 pub struct FixedClock(pub u64);
 
 impl Clock for FixedClock {
+    fn wall_millis(&self) -> u64 {
+        self.0.saturating_add(1_700_000_000_000)
+    }
+
     fn boottime_millis(&self) -> u64 {
         self.0
     }
@@ -63,6 +78,12 @@ mod tests {
         // A swap to `ClockId::Realtime` fails here and nowhere else.
         let now = HostClock.boottime_millis();
         assert!(now < 1_000_000_000_000, "{now} looks like wall-clock time");
+    }
+
+    #[test]
+    fn the_wall_clock_is_milliseconds_since_the_epoch() {
+        assert!(HostClock.wall_millis() > 1_700_000_000_000);
+        assert_eq!(FixedClock(5).wall_millis(), 1_700_000_000_005);
     }
 
     #[test]
