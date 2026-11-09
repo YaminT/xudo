@@ -93,7 +93,9 @@ impl From<&MintError> for Refusal {
         match error {
             MintError::NoAction => Self::broker(RefusalCode::BrokerUnusable, error.to_string()),
             MintError::Spool(_) => Self::broker(RefusalCode::SpoolUnusable, error.to_string()),
-            MintError::Full { .. } | MintError::UidFull { .. } => {
+            MintError::Full { .. }
+            | MintError::UidFull { .. }
+            | MintError::ConfirmationThrottled => {
                 Self::client(RefusalCode::SpoolFull, error.to_string())
             }
             MintError::Collision { .. } => {
@@ -182,6 +184,11 @@ mod tests {
                 },
                 RefusalCode::NonceCollision,
                 Fault::Broker,
+            ),
+            (
+                MintError::ConfirmationThrottled,
+                RefusalCode::SpoolFull,
+                Fault::Client,
             ),
         ] {
             let refusal = Refusal::from(&failure);

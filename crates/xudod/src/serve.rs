@@ -27,7 +27,7 @@ use xudo_sys::{
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{Grant, Minting, REQUEST_TTL_MILLIS, draw_nonce, entry_for, publish};
+use crate::mint::{Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce, entry_for, publish};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
@@ -137,7 +137,7 @@ fn confirm_run(
         &identity,
         now,
     ) {
-        return serve_confirmation_denial(
+        return ConfirmRun::Served(serve_confirmation_denial(
             conn,
             platform,
             Evaluated {
@@ -148,7 +148,7 @@ fn confirm_run(
                 policy,
             },
             xudo_policy::DenialCode::NoConfirmationChannel,
-        );
+        ));
     }
     if let Some(approved) = take_matching_approval(
         spool,
@@ -199,7 +199,7 @@ fn confirm_run(
             policy,
         }));
     };
-    serve_confirmation_denial(
+    ConfirmRun::Served(serve_confirmation_denial(
         conn,
         platform,
         Evaluated {
@@ -210,7 +210,7 @@ fn confirm_run(
             policy,
         },
         code,
-    )
+    ))
 }
 
 fn serve_confirmation_denial(
@@ -218,7 +218,7 @@ fn serve_confirmation_denial(
     platform: &mut Platform<'_>,
     evaluated: Evaluated,
     code: xudo_policy::DenialCode,
-) -> ConfirmRun {
+) -> Served {
     let Evaluated {
         decision,
         caller,
@@ -238,11 +238,11 @@ fn serve_confirmation_denial(
             None,
         )
     });
-    ConfirmRun::Served(answer(
+    answer(
         conn,
         &BrokerResponse::decided(denied, None),
         Served::Decided,
-    ))
+    )
 }
 
 /// Serves one connection: identifies, reads, decides, mints, answers.
@@ -1571,12 +1571,17 @@ fn mint(
         now,
     };
     if let Err(error) = publish(spool, platform.peers, &minting) {
-        return refuse(
+        return mint_failure(
             conn,
-            platform.audit,
-            &Refusal::from(&error),
-            known.0,
-            known.1,
+            platform,
+            &error,
+            Evaluated {
+                decision,
+                caller,
+                identity,
+                request,
+                policy,
+            },
         );
     }
 
@@ -1585,7 +1590,16 @@ fn mint(
         expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
     };
-    let response = if authorized.approval().0.needs_watch {
+    let response = minted_response(&authorized.approval().0, decision, minted);
+    answer(conn, &response, Served::Minted)
+}
+
+fn minted_response(
+    entry: &xudo_gate::request::PendingRequest,
+    decision: Decision,
+    minted: Minted,
+) -> BrokerResponse {
+    if entry.needs_watch {
         BrokerResponse {
             schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
             answer: xudo_wire::Answer::Pending {
@@ -1595,8 +1609,33 @@ fn mint(
         }
     } else {
         BrokerResponse::decided(decision, Some(minted))
-    };
-    answer(conn, &response, Served::Minted)
+    }
+}
+
+fn mint_failure(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    error: &MintError,
+    evaluated: Evaluated,
+) -> Served {
+    if *error == MintError::ConfirmationThrottled {
+        return serve_confirmation_denial(
+            conn,
+            platform,
+            evaluated,
+            xudo_policy::DenialCode::ConfirmationThrottled,
+        );
+    }
+    let Evaluated {
+        identity, request, ..
+    } = evaluated;
+    refuse(
+        conn,
+        platform.audit,
+        &Refusal::from(error),
+        Some(&identity),
+        Some(&request),
+    )
 }
 
 fn remaining_millis(deadline: u64, now: u64) -> u64 {
@@ -3748,6 +3787,27 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(
             decision_of(&outcome.answer).unwrap().0.denial,
             Some(DenialCode::ConfirmationThrottled)
+        );
+    }
+
+    #[test]
+    fn a_same_process_waiting_entry_is_denied_and_audited_on_mint() {
+        let pending = shown_entry();
+        let pending_bytes = pending.to_json().into_bytes();
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), pending_bytes.clone());
+        let mut host = Host::honest();
+
+        let outcome = serve_with(&mut host, &restart(), Ok(&spool));
+
+        assert_eq!(outcome.served, Served::Decided);
+        assert_eq!(
+            decision_of(&outcome.answer).unwrap().0.denial,
+            Some(DenialCode::ConfirmationThrottled)
+        );
+        assert_eq!(spool.files()[NONCE.as_bytes()], pending_bytes);
+        assert_eq!(
+            outcome.records.last().unwrap().denial.as_deref(),
+            Some("confirmation_throttled")
         );
     }
 
