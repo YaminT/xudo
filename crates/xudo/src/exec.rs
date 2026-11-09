@@ -385,6 +385,10 @@ fn handle_status_answer(
         ExitCode::Unusable
     })?;
     let Answer::Decided { decision, minted } = consumed.answer else {
+        if matches!(consumed.answer, Answer::Refused { .. }) {
+            let _ = writeln!(err, "xudo: the broker refused the approval re-run");
+            return Err(ExitCode::Unusable);
+        }
         // Expiry or a concurrent consumer can invalidate the approval between
         // status and this run. The broker has atomically taken or expired it;
         // report pending/refused (18), never a generic unusable result.
@@ -501,7 +505,7 @@ fn response_in(bytes: &[u8]) -> Option<Result<BrokerResponse, String>> {
 }
 
 /// The argv as a shell line, for a human to read and paste. Display only.
-fn display_quoted(argv: &[String]) -> String {
+pub(crate) fn display_quoted(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
             let plain = !arg.is_empty()
@@ -814,6 +818,7 @@ mod tests {
             },
             Answer::Watching {
                 prompts: Vec::new(),
+                omitted: 0,
             },
             Answer::Done,
         ] {
@@ -1200,6 +1205,47 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_approval_rerun_exits_unusable() {
+        let id = "a".repeat(64);
+        let status = BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: allow(),
+                minted: Some(Minted {
+                    nonce: id.clone(),
+                    expires_in_ms: 1,
+                    gate: GATE_AUTH.into(),
+                }),
+            },
+        };
+        let (dir, socket, broker) =
+            one_reply(&BrokerResponse::refused(RefusalCode::BrokerUnusable));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            handle_status_answer(
+                &cli(),
+                status,
+                &id,
+                &BrokerRequest::new("/usr/bin/apt-get", Vec::new(), "unattested"),
+                &socket,
+                TIMEOUT,
+                "/usr/bin/sudo",
+                &mut err,
+                &mut out,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("broker refused the approval re-run")
+        );
+        broker.join().unwrap();
+        drop(dir);
+    }
+
+    #[test]
     fn a_consumed_run_without_a_minted_entry_fails_closed() {
         let id = "a".repeat(64);
         let status = BrokerResponse {
@@ -1413,6 +1459,7 @@ mod tests {
             },
             Answer::Watching {
                 prompts: Vec::new(),
+                omitted: 0,
             },
             Answer::Done,
         ] {

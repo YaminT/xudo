@@ -412,6 +412,11 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `type_ahead_before_the_prompt_is_flushed`,
   `watch_refuses_to_start_without_a_terminal`.
 - **Lane.** `just verify`, `just linux-test`.
+- **Status (2026-11-09):** done. `watch` heartbeats once per second, flushes
+  terminal input before each prompt, and delegates the last-word and 2 s checks
+  to the broker. `pending` is read-only and does not require a terminal. Every
+  line prompt and message is covered by `insta`; a pseudo-terminal drives both
+  approval and denial.
 
 ### 8. Freeze and thaw
 

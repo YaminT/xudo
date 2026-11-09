@@ -151,6 +151,20 @@ of 5 seconds. With
 .B \-\-output json,
 each pending update is one compact JSON object per line (JSON Lines).
 .TP
+.B watch
+Watch for pending confirmation requests on this terminal.
+The broker checks the watcher's session and terminal on each heartbeat and
+answer. A line shows the canonical command, governing rule, classification,
+evidence, time left, and the action's final word. Type that word to approve,
+or
+.B n
+to deny. Approval still requires the command's password. Input typed before
+the prompt is flushed; a rejected answer leaves the request pending.
+.TP
+.B pending
+List this user's pending confirmation requests without answering them.
+This command does not require a terminal.
+.TP
 .B check
 Lint the loaded ruleset.
 Exits

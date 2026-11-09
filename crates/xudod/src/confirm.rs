@@ -109,7 +109,7 @@ pub fn mark_shown(entry: &mut PendingRequest, watcher: WatcherFacts, now_ms: u64
     }
     let pin = watcher.pin();
     if entry.shown_to.as_ref() == Some(&pin) {
-        return false;
+        return true;
     }
     if now_ms >= entry.deadline.0 {
         entry.state = ConfirmationState::Expired;
@@ -533,7 +533,8 @@ mod tests {
     fn an_answer_before_the_two_second_floor_is_refused_and_stays_pending() {
         let mut request = entry();
         assert!(mark_shown(&mut request, watcher(), 1_000));
-        assert!(!mark_shown(&mut request, watcher(), 2_000));
+        assert!(mark_shown(&mut request, watcher(), 2_000));
+        assert_eq!(request.shown_at_ms, Some(BoottimeMillis(1_000)));
         assert_eq!(
             approve(&mut request, 2_999, b"remove"),
             Err(ConfirmError::TooFast)
