@@ -434,10 +434,8 @@ fn expire_entries(
                     "expiry audit record was refused",
                 )
             })?;
-        if record_outcome_locked(store, &entry, TerminalOutcome::Expired, now).is_err() {
-            continue;
-        }
         spool.remove(&id).map_err(|error| Refusal::from(&error))?;
+        let _ = record_outcome_locked(store, &entry, TerminalOutcome::Expired, now);
     }
     Ok(())
 }
@@ -914,8 +912,8 @@ const MAX_CONFIRM_DATA_BYTES: usize = r#"{"h":null,"b":[],"o":[]}"#.len()
     + MAX_RECENT_OUTCOMES_PER_UID;
 const _: () = assert!(MAX_CONFIRM_DATA_BYTES <= CONFIRM_FILE_LIMIT);
 
-// A plain struct of strings and integers cannot fail to serialize. Were it to,
-// the empty record cannot be parsed, and every reader treats that as no watcher.
+// A plain struct of strings and integers cannot fail to serialize. The
+// explicit `None` path still refuses to write if serialization ever fails.
 const CONFIRM_FILE_LIMIT: usize = 16 * 1024;
 
 /// The state as bytes, or `None` when it cannot be serialized or would exceed
@@ -1059,17 +1057,32 @@ fn status(
                 .saturating_sub(platform.clock.boottime_millis()),
         },
         state => {
-            let code = if state == xudo_gate::request::ConfirmationState::Expired {
-                xudo_policy::DenialCode::ConfirmationExpired
-            } else {
-                xudo_policy::DenialCode::ConfirmationRefused
+            let code = match state {
+                xudo_gate::request::ConfirmationState::Expired => {
+                    Some(xudo_policy::DenialCode::ConfirmationExpired)
+                }
+                xudo_gate::request::ConfirmationState::Denied => {
+                    Some(xudo_policy::DenialCode::ConfirmationRefused)
+                }
+                xudo_gate::request::ConfirmationState::Consumed
+                | xudo_gate::request::ConfirmationState::Pending
+                | xudo_gate::request::ConfirmationState::Approved => None,
             };
             let command = std::iter::once(entry.program.clone())
                 .chain(entry.argv.clone())
                 .collect();
-            let mut decision =
-                Decision::deny(code, command, Vec::new()).about_program(&entry.program);
+            let mut decision = Decision::deny(
+                code.unwrap_or(xudo_policy::DenialCode::ConfirmationRefused),
+                command,
+                Vec::new(),
+            )
+            .about_program(&entry.program);
             decision.action = Some(xudo_policy::ActionId::new(entry.action.clone()));
+            if state == xudo_gate::request::ConfirmationState::Consumed {
+                decision.verdict = xudo_policy::Verdict::Allow;
+                decision.denial = None;
+                decision.remediation = None;
+            }
             let minted = if state == xudo_gate::request::ConfirmationState::Approved {
                 decision.verdict = xudo_policy::Verdict::AllowWithConfirmation;
                 decision.denial = None;
@@ -2579,6 +2592,71 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn status_reports_a_consumed_approval_as_allowed_and_used() {
+        let mut consumed = shown_entry();
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        consumed.confirmed = true;
+        let watcher = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        consumed.confirmed_by = Some(watcher.clone());
+        consumed.shown_to = Some(watcher);
+        consumed.shown_at_ms = Some(BoottimeMillis(0));
+        let spool = FakeSpool::new().with_file(
+            consumed.nonce.as_bytes().to_vec(),
+            consumed.to_json().into_bytes(),
+        );
+        let request = a_status_request();
+        let mut host = Host::honest();
+
+        let response = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+            &request,
+            NONCE,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response.answer,
+            Answer::Decided { decision, minted: None }
+                if decision.verdict == Verdict::Allow && decision.denial.is_none()
+        ));
+    }
+
+    #[test]
+    fn status_reports_a_denied_entry_as_refused() {
+        let mut denied = shown_entry();
+        denied.state = xudo_gate::request::ConfirmationState::Denied;
+        denied.confirmed = false;
+        denied.confirmed_by = None;
+        denied.shown_at_ms = None;
+        denied.shown_to = None;
+        let spool = FakeSpool::new().with_file(
+            denied.nonce.as_bytes().to_vec(),
+            denied.to_json().into_bytes(),
+        );
+        let request = a_status_request();
+        let mut host = Host::honest();
+
+        let response = status(
+            &connection(Ok(request.to_json().into_bytes())),
+            &mut host.platform(),
+            &spool,
+            &test_identity(PID, START, 0, 0),
+            &request,
+            NONCE,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response.answer,
+            Answer::Decided { decision, minted: None }
+                if decision.denial == Some(DenialCode::ConfirmationRefused)
+        ));
+    }
+
+    #[test]
     fn status_reports_expiry() {
         let entry = shown_entry();
         let store = FakeSpool::new();
@@ -3255,6 +3333,27 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(data.backoff.len(), 1);
         assert_eq!(data.backoff[0].strikes, 1);
         assert_eq!(data.outcomes[0].outcome, TerminalOutcome::Expired);
+    }
+
+    #[test]
+    fn an_expiry_is_not_audited_twice_when_outcome_storage_fails() {
+        let mut entry = shown_entry();
+        entry.deadline = BoottimeMillis(NOW);
+        let spool = FakeSpool::new().with_file(
+            entry.nonce.as_bytes().to_vec(),
+            entry.to_json().into_bytes(),
+        );
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new().failing_replace(SpoolError::Gone {
+            name: "confirm".to_owned(),
+        });
+        let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
+
+        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert!(spool.files().is_empty());
+        assert_eq!(host.audit.records().len(), 1);
+        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert_eq!(host.audit.records().len(), 1);
     }
 
     #[test]
