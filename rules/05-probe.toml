@@ -1,9 +1,20 @@
-# The one action `xudo install` runs to see the gate work as root: print the
+# The action `xudo install` runs to see the gate work as root: print the
 # effective uid, nothing else. The single literal argument leaves `-un`, `-G`
 # and a username (which would read another account) unmatched.
+#
+# Two programs, one shape. Install runs the first whose executable is, at that
+# moment, a regular file. `/usr/bin/id` is that file on Debian and Ubuntu 24.04.
+# On Ubuntu 26.04 it is a uutils symlink, and `/usr/bin/gnuid` is the regular
+# GNU binary. A symlink is never a probe, and neither is a missing path.
 
 [[action]]
 id = "xudo.probe.id"
 tier = "diag-read"
 exe = "/usr/bin/id"
+args = [{ name = "effective-uid", matcher = { literal = "-u" } }]
+
+[[action]]
+id = "xudo.probe.gnuid"
+tier = "diag-read"
+exe = "/usr/bin/gnuid"
 args = [{ name = "effective-uid", matcher = { literal = "-u" } }]

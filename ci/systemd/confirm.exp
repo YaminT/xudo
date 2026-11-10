@@ -5,7 +5,22 @@
 set timeout 20
 if {$argc != 1} { exit 2 }
 set action [lindex $argv 0]
+# The program the gate is allowed to run. row.sh exports the first regular file
+# of /usr/bin/id and /usr/bin/gnuid. An unset value used to fall back to
+# /usr/bin/id, a uutils symlink on stock Ubuntu 26.04, so a case could pass
+# without running the program the gate allows.
+if {![info exists env(XUDO_GATE_EXE)] || $env(XUDO_GATE_EXE) eq ""} {
+    puts stderr "FAIL: XUDO_GATE_EXE is unset"
+    exit 2
+}
+set probe $env(XUDO_GATE_EXE)
+if {![regexp {^/usr/bin/(id|gnuid)$} $probe]} {
+    puts stderr "FAIL: XUDO_GATE_EXE is not a probe program"
+    exit 2
+}
+# The system id, outside the gate. uutils answers this; the gate will not run it.
 set user_uid [exec /usr/bin/id -u xudotest]
+set probe_cmd "/usr/bin/xudo exec -- $probe -u"
 proc stop_watcher {watcher uid} {
     catch {send -i $watcher "\003"}
     expect {
@@ -33,7 +48,7 @@ if {$action eq "same-session"} {
     log_user 0
     log_file -noappend /var/tmp/same-session-pty.out
     file delete -force /var/tmp/same-session-result
-    spawn su --pty -s /bin/sh -c {/usr/bin/xudo watch </dev/tty >/var/tmp/requester-watch.out 2>&1 & watcher=$!; echo WATCH_STARTED; read -r line; /usr/bin/xudo exec -- /usr/bin/id -u >/var/tmp/requester-exec.out 2>&1; rc=$?; kill -TERM "$watcher"; wait "$watcher" 2>/dev/null; echo EXEC_RC:$rc >/var/tmp/same-session-result; exit 0} xudotest
+    spawn su --pty -s /bin/sh -c "/usr/bin/xudo watch </dev/tty >/var/tmp/requester-watch.out 2>&1 & watcher=\$!; echo WATCH_STARTED; read -r line; $probe_cmd >/var/tmp/requester-exec.out 2>&1; rc=\$?; kill -TERM \"\$watcher\"; wait \"\$watcher\" 2>/dev/null; echo EXEC_RC:\$rc >/var/tmp/same-session-result; exit 0" xudotest
     set requester $spawn_id
     expect {
         -i $requester -re {WATCH_STARTED} {}
@@ -91,7 +106,7 @@ if {$action eq "userns"} {
         catch {puts stderr $expect_out(buffer)}
         exit 1
     }
-    spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
+    spawn su --pty -s /bin/sh -c $probe_cmd xudotest
     set requester $spawn_id
     expect {
         -i $requester eof {}
@@ -140,11 +155,11 @@ if {!$ready} {
 set start [clock milliseconds]
 
 if {$action eq "self-stdin"} {
-    set command {printf 'u\n' | /usr/bin/xudo exec -- /usr/bin/id -u}
+    set command "printf 'u\\n' | $probe_cmd"
 } elseif {$action eq "self-tty"} {
-    set command {/usr/bin/xudo exec -- /usr/bin/id -u </dev/null}
+    set command "$probe_cmd </dev/null"
 } else {
-    set command {/usr/bin/xudo exec -- /usr/bin/id -u}
+    set command $probe_cmd
 }
 spawn su --pty -s /bin/sh -c $command xudotest
 set requester $spawn_id
@@ -186,7 +201,7 @@ if {$action eq "timeout"} {
 
 if {$action eq "approve" || $action eq "deny"} {
     if {$requester_code != 18} { puts stderr "FAIL: initial pending status $requester_code"; exit 1 }
-    spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
+    spawn su --pty -s /bin/sh -c $probe_cmd xudotest
     set rerun $spawn_id
     set saw_password 0
     expect {
@@ -210,12 +225,12 @@ if {$action eq "approve" || $action eq "deny"} {
     # The word typed by the requester must not have approved anything: the
     # entry is still pending, and running the command again is not approved.
     catch {exec /bin/sh -c {/usr/bin/su -s /bin/sh -c /usr/bin/xudo\ pending xudotest 2>&1 </dev/null}} pend
-    if {![regexp {PENDING [0-9a-f]{64}} $pend] || ![regexp {/usr/bin/id -u} $pend]} {
+    if {![regexp {PENDING [0-9a-f]{64}} $pend] || ![regexp "$probe -u" $pend]} {
         stop_watcher $watcher $user_uid
         puts stderr "FAIL: $action: entry is no longer pending: $pend"
         exit 1
     }
-    spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
+    spawn su --pty -s /bin/sh -c $probe_cmd xudotest
     set rerun $spawn_id
     set rerun_out ""
     expect {

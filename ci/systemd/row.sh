@@ -14,14 +14,27 @@ echo "-- ${PRETTY_NAME} / $(systemctl --version | awk 'NR==1{print}') / system $
 
 apt-get update -qq
 cd /opt
-# Ubuntu 26.04 ships uutils `id` as a symlink, which the gate refuses; replace
-# it with the regular GNU coreutils binary at the path in the shipped ruleset.
-if [ -L /usr/bin/id ]; then
-    apt-get install -y -qq --allow-remove-essential coreutils-from-gnu coreutils-from-uutils-
-    install -m 0755 /usr/bin/gnuid /var/tmp/xudo-id
-    mv /var/tmp/xudo-id /usr/bin/id
-    echo "NOTE: replaced uutils id with GNU id"
-fi
+# The gate refuses a symlink. Same order as rules/05-probe.toml: the first
+# path that is a regular non-symlink file is the one every later case runs.
+# The package's own install probe makes this choice; this only follows it.
+regular_file() { [ -e "$1" ] && [ ! -L "$1" ] && [ -f "$1" ]; }
+gate_exe=
+for candidate in /usr/bin/id /usr/bin/gnuid; do
+    if regular_file "$candidate"; then
+        gate_exe=$candidate
+        break
+    fi
+done
+case $gate_exe in
+/usr/bin/id) probe_action=xudo.probe.id ;;
+/usr/bin/gnuid) probe_action=xudo.probe.gnuid ;;
+*)
+    echo "FAIL: no regular probe program" >&2
+    exit 1
+    ;;
+esac
+export XUDO_GATE_EXE=$gate_exe
+export XUDO_PROBE_ACTION=$probe_action
 if ! apt-get install -y ./xudo.deb >/var/tmp/xudo-install.log 2>&1; then
     cat /var/tmp/xudo-install.log >&2
     echo "FAIL: apt install" >&2
@@ -95,7 +108,7 @@ pty() {
     echo "$rc"
 }
 
-rc=$(pty pw /usr/bin/id -u)
+rc=$(pty pw "$gate_exe" -u)
 if [ "$rc" -eq 0 ] && grep -qi password /var/tmp/case.out && grep -qx 0 /var/tmp/case.out; then
     good "id -u prompts, prints 0, exits 0"
 else
@@ -103,7 +116,7 @@ else
     cat /var/tmp/case.out >&2
 fi
 
-rc=$(pty pw /usr/bin/id -G)
+rc=$(pty pw "$gate_exe" -G)
 if [ "$rc" -eq 17 ]; then
     good "id -G exits 17"
 else
@@ -111,7 +124,7 @@ else
     cat /var/tmp/case.out >&2
 fi
 
-rc=$(pty wrong /usr/bin/id -u)
+rc=$(pty wrong "$gate_exe" -u)
 if [ "$rc" -ne 0 ] && grep -qi password /var/tmp/case.out && ! grep -qx 0 /var/tmp/case.out; then
     good "wrong password is nonzero and runs nothing"
 else
@@ -124,12 +137,12 @@ cat >/etc/xudo/config.toml <<'EOF'
 confirm_human_path = true
 confirmation_timeout_secs = 0
 EOF
-cat >/etc/xudo/rules.d/99-systemd-confirm.toml <<'EOF'
+cat >/etc/xudo/rules.d/99-systemd-confirm.toml <<EOF
 [[action]]
 id = "harness.u"
 tier = "diag-read"
 confirm = "always"
-exe = "/usr/bin/id"
+exe = "$gate_exe"
 args = [{ name = "effective-uid", matcher = { literal = "-u" } }]
 EOF
 chmod 0644 /etc/xudo/config.toml
@@ -154,7 +167,7 @@ pending_out() {
 lists_the_request() {
     printf '%s\n' "$1" | grep -Eq '^PENDING [0-9a-f]{64}$' &&
         printf '%s\n' "$1" | grep -q 'harness\.u' &&
-        printf '%s\n' "$1" | grep -Eq '^ +command +/usr/bin/id -u$'
+        printf '%s\n' "$1" | grep -Eq "^[[:space:]]+command[[:space:]]+${gate_exe} -u\$"
 }
 spool_entries() { find /run/xudo/req -mindepth 1 2>/dev/null | wc -l; }
 
@@ -163,9 +176,9 @@ spool_entries() { find /run/xudo/req -mindepth 1 2>/dev/null | wc -l; }
 # until its deadline. Check it is that entry, then empty the spool.
 n=$(spool_entries)
 if [ "$n" -eq 1 ] && python3 -c '
-import json, sys
+import json, os, sys
 d = json.load(open(sys.argv[1]))
-sys.exit(0 if d.get("action") == "xudo.probe.id" and d.get("argv") == ["-u"] else 1)
+sys.exit(0 if d.get("action") == os.environ["XUDO_PROBE_ACTION"] and d.get("argv") == ["-u"] else 1)
 ' /run/xudo/req/*; then
     good "password_cases_leave_only_the_wrong_password_entry"
 else
@@ -177,7 +190,7 @@ pending=$(pending_out)
 pre_spool=$(spool_entries)
 if [ -z "$pending" ] && [ "$pre_spool" -eq 0 ]; then
     start=$(date +%s%3N)
-    rc=$(pty pw /usr/bin/id -u)
+    rc=$(pty pw "$gate_exe" -u)
     elapsed=$(($(date +%s%3N) - start))
     if [ "$rc" -eq 18 ] && grep -qi no_confirmation_channel /var/tmp/case.out && [ "$elapsed" -le 5000 ]; then
         good "no_watcher_denies_at_once"
