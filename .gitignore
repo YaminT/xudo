@@ -43,6 +43,33 @@ credentials.*
 minisign.key
 cosign.key
 
+# Unpublished maintainer notes. Kept on disk for the people who work in this
+# tree. A clean clone does not have them, and the build must not need them.
+
+# Agent and contributor rules.
+/CLAUDE.md
+
+# Generated repo-root agent instructions.
+/AGENTS.md
+
+# Architecture plan.
+/docs/design-plan.md
+
+# Dated decision log.
+/docs/CONCERNS.md
+
+# Enhancement backlog.
+/docs/SUGGESTIONS.md
+
+# Draft GitHub repository metadata.
+/docs/github-metadata.md
+
+# Current blockers, for the people doing the work.
+/docs/re.md
+
+# Milestone plans and sequencing.
+/docs/todo/
+
 # Coding-agent and assistant state. Local working context, not project history.
 # boof task worktrees: boof creates them here today, so this entry is required.
 # Remove it once boof's worktree root moves outside the checkout.

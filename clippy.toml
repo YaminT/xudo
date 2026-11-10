@@ -1,5 +1,5 @@
 # Each entry below is a documented root-exploit vector, not a style opinion.
-# See CLAUDE.md § "Banned in privileged code".
+# Banned in privileged code. The reason sits on the entry.
 msrv = "1.85"
 
 disallowed-methods = [

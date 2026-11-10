@@ -6,19 +6,17 @@ overview, generated agent documentation, and marketing text of any kind. When
 any of them disagrees with this file, this file is right and the other document
 is the bug. Changes to product behaviour are made *here first*, then propagated.
 
-Division of labour with the other load-bearing documents:
+Division of labour:
 
 | Document | Owns |
 |---|---|
 | `howiwork.md` (this file) | What the product is, which components exist, how a request flows, what each mode and outcome means |
-| `CLAUDE.md` | Engineering and security rules for writing the code (coverage, banned constructs, test discipline) |
-| `docs/design-plan.md` | The detailed architecture and threat model behind this file |
-| `docs/CONCERNS.md` | Why decisions were made, dated, newest first |
-| `docs/todo/README.md` | Sequencing and current state |
+| `docs/crates.md` | The workspace crate list, checked against `Cargo.toml` |
 
-The three invariants below are part of this file. Nothing written here or
-anywhere else may weaken them; a future edit to this file that contradicts them
-is an error in the edit, not a new truth.
+Contributor rules and the design history are maintainer notes and are not part
+of the published tree. The three invariants below are part of this file.
+Nothing written here or anywhere else may weaken them; a future edit to this
+file that contradicts them is an error in the edit, not a new truth.
 
 ---
 

@@ -1,8 +1,9 @@
 # Contributing
 
-Start with `just setup`, then run `just verify` before committing. The complete
-engineering and security rules, including commit message rules, are in
-[CLAUDE.md](CLAUDE.md); follow them rather than duplicating them here.
+Start with `just setup`, then run `just verify` before committing. Coverage is
+100% on lines, regions, and functions; a waiver is an attribute on the item
+plus a comment naming a concrete reason. The product invariants are in
+[howiwork.md](howiwork.md). Follow them rather than duplicating them here.
 
 Some lanes need Docker: `just linux-test`, `just root-test`, `just units`,
 `just differential`, `just install-root`, `just deb-test`, and
