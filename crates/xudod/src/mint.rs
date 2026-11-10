@@ -94,10 +94,16 @@ pub const MAX_WATCH_ENTRIES: usize = 16;
 /// The most waiting watch entries belonging to one uid.
 pub const MAX_WATCH_ENTRIES_PER_UID: usize = 2;
 
+/// Number of spool names broker scans must request to cover every live entry
+/// and distinguish a spool that exceeds the broker's own limits.
+pub const MAX_SPOOL_NAMES_TO_WALK: usize = MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1;
+
 // One uid must never be able to take the whole spool.
 const _: () = assert!(MAX_ENTRIES_PER_UID < MAX_SPOOL_ENTRIES);
 const _: () = assert!(MAX_WATCH_ENTRIES_PER_UID < MAX_WATCH_ENTRIES);
-const _: () = assert!(MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES < xudo_gate::run::MAX_SPOOL_NAMES);
+const _: () = assert!(MAX_SPOOL_NAMES_TO_WALK == MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1);
+const _: () = assert!(MAX_SPOOL_NAMES_TO_WALK <= xudo_gate::run::MAX_SPOOL_NAMES + 1);
+const _: () = assert!(MAX_WATCH_ENTRIES * MAX_ENTRY_BYTES <= MAX_SPOOL_BYTES);
 
 /// The largest entry the broker reads back, in bytes.
 ///
@@ -113,7 +119,7 @@ const _: () = assert!(MAX_ENTRY_BYTES > xudo_wire::MAX_REQUEST_BYTES);
 // reads no entry past its own `MAX_ENTRY_BYTES`. The broker's ceilings sit
 // well below the gate's, so the gate's bounds only ever bite on a spool the
 // broker did not keep.
-const _: () = assert!(MAX_SPOOL_ENTRIES < xudo_gate::run::MAX_SPOOL_NAMES);
+const _: () = assert!(MAX_SPOOL_NAMES_TO_WALK <= xudo_gate::run::MAX_SPOOL_NAMES + 1);
 const _: () = assert!(MAX_ENTRY_BYTES <= xudo_gate::run::MAX_ENTRY_BYTES);
 
 /// Random bytes in a nonce: 32, so 64 hex characters.
