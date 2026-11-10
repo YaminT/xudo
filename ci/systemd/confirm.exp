@@ -1,5 +1,7 @@
 # Drives one requester and one watcher on separate ptys. Usage:
-# confirm.exp approve|deny|pending|timeout|self-stdin|self-tty|same-session
+# confirm.exp approve|deny|pending|timeout|self-stdin|self-tty|same-session|userns
+# Exit 0 only when every assertion held; the requester's real exit code is
+# printed as REQUESTER_RC=<n> for the caller.
 set timeout 20
 if {$argc != 1} { exit 2 }
 set action [lindex $argv 0]
@@ -64,6 +66,53 @@ if {$action eq "same-session"} {
 }
 log_user 0
 log_file -a -noappend /var/tmp/watch-session.out
+if {$action eq "userns"} {
+    # Root makes the namespace (an unprivileged one may be blocked by the
+    # host), maps only the xudotest uid and the xudo gid, then drops to them.
+    set xudo_gid [lindex [split [exec /usr/bin/getent group xudo] :] 2]
+    spawn /usr/bin/unshare --user --map-users=$user_uid:$user_uid:1 --map-groups=$xudo_gid:$xudo_gid:1 --setuid=$user_uid --setgid=$xudo_gid /usr/bin/xudo watch
+    set watcher $spawn_id
+    set alive 0
+    for {set attempt 0} {$attempt < 50} {incr attempt} {
+        if {![catch {exec /usr/bin/pgrep -u $user_uid -x xudo}]} { set alive 1; break }
+        after 100
+    }
+    if {!$alive} {
+        puts stderr "FAIL: userns watcher did not start"
+        catch {expect -i $watcher -timeout 2 eof}
+        catch {puts stderr $expect_out(buffer)}
+        exit 1
+    }
+    # Long enough for it to have connected and sent a heartbeat, were it going to.
+    after 2500
+    if {[catch {exec /usr/bin/pgrep -u $user_uid -x xudo}]} {
+        puts stderr "FAIL: userns watcher exited early (refused for another reason?)"
+        catch {expect -i $watcher -timeout 2 eof}
+        catch {puts stderr $expect_out(buffer)}
+        exit 1
+    }
+    spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
+    set requester $spawn_id
+    expect {
+        -i $requester eof {}
+        -i $requester timeout { puts stderr "FAIL: userns requester timed out"; exit 1 }
+    }
+    set out $expect_out(buffer)
+    set result [wait -i $requester]
+    set code [lindex $result 3]
+    puts "REQUESTER_RC=$code"
+    set stillalive [expr {![catch {exec /usr/bin/pgrep -u $user_uid -x xudo}]}]
+    set buf ""
+    catch {expect -i $watcher -timeout 0 -re {.+} { append buf $expect_out(buffer) }}
+    stop_watcher $watcher $user_uid
+    if {!$stillalive} { puts stderr "FAIL: userns watcher was not running during the request"; exit 1 }
+    if {[regexp {type 'u' to approve} $buf]} { puts stderr "FAIL: userns watcher was shown the prompt"; exit 1 }
+    if {$code != 18 || ![regexp {no_confirmation_channel} $out]} {
+        puts stderr "FAIL: userns requester rc=$code, wanted 18 with no_confirmation_channel: $out"
+        exit 1
+    }
+    exit 0
+}
 set ready 0
 for {set launch 0} {$launch < 3 && !$ready} {incr launch} {
     file delete -force $heartbeat_file
@@ -130,6 +179,7 @@ expect {
 }
 set requester_result [wait -i $requester]
 set requester_code [lindex $requester_result 3]
+puts "REQUESTER_RC=$requester_code"
 if {$action eq "timeout"} {
     puts "WAIT_MS=[expr {[clock milliseconds] - $start}]"
 }
@@ -138,8 +188,9 @@ if {$action eq "approve" || $action eq "deny"} {
     if {$requester_code != 18} { puts stderr "FAIL: initial pending status $requester_code"; exit 1 }
     spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
     set rerun $spawn_id
+    set saw_password 0
     expect {
-        -i $rerun -nocase -re {password} { send -i $rerun "pw\r"; exp_continue }
+        -i $rerun -nocase -re {password} { set saw_password 1; send -i $rerun "pw\r"; exp_continue }
         -i $rerun timeout { puts stderr "FAIL: rerun timed out"; catch {exec /usr/bin/pkill -TERM -u $user_uid -x xudo}; exit 1 }
         -i $rerun eof {}
     }
@@ -147,11 +198,36 @@ if {$action eq "approve" || $action eq "deny"} {
     set rerun_code [lindex $rerun_result 3]
     stop_watcher $watcher $user_uid
     if {$action eq "approve"} {
+        if {!$saw_password} { puts stderr "FAIL: approved rerun never asked for the password"; exit 1 }
         if {$rerun_code != 0} { puts stderr "FAIL: approved rerun status $rerun_code"; exit 1 }
         if {[catch {exec /usr/bin/tr -d \r < /var/tmp/watch-session.out | /usr/bin/grep -qx 0}]} { puts stderr "FAIL: approved command did not run as uid 0"; exit 1 }
     } else {
         if {$rerun_code != 18} { puts stderr "FAIL: denied rerun status $rerun_code"; exit 1 }
         if {![catch {exec /usr/bin/tr -d \r < /var/tmp/watch-session.out | /usr/bin/grep -qx 0}]} { puts stderr "FAIL: denied command ran as uid 0"; exit 1 }
+    }
+} elseif {$action eq "self-stdin" || $action eq "self-tty"} {
+    if {$requester_code != 18} { stop_watcher $watcher $user_uid; puts stderr "FAIL: $action status $requester_code"; exit 1 }
+    # The word typed by the requester must not have approved anything: the
+    # entry is still pending, and running the command again is not approved.
+    catch {exec /bin/sh -c {/usr/bin/su -s /bin/sh -c /usr/bin/xudo\ pending xudotest 2>&1 </dev/null}} pend
+    if {![regexp {PENDING [0-9a-f]{64}} $pend] || ![regexp {/usr/bin/id -u} $pend]} {
+        stop_watcher $watcher $user_uid
+        puts stderr "FAIL: $action: entry is no longer pending: $pend"
+        exit 1
+    }
+    spawn su --pty -s /bin/sh -c {/usr/bin/xudo exec -- /usr/bin/id -u} xudotest
+    set rerun $spawn_id
+    set rerun_out ""
+    expect {
+        -i $rerun -nocase -re {password} { send -i $rerun "pw\r"; exp_continue }
+        -i $rerun timeout { puts stderr "FAIL: $action rerun timed out"; stop_watcher $watcher $user_uid; exit 1 }
+        -i $rerun eof { append rerun_out $expect_out(buffer) }
+    }
+    set rerun_code [lindex [wait -i $rerun] 3]
+    stop_watcher $watcher $user_uid
+    if {$rerun_code != 18 || [regexp -line {^0\r?$} $rerun_out]} {
+        puts stderr "FAIL: $action: rerun was approved (status $rerun_code): $rerun_out"
+        exit 1
     }
 } else {
     stop_watcher $watcher $user_uid

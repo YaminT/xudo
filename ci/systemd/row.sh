@@ -50,7 +50,7 @@ else
     cat /var/tmp/xudo-install.log >&2
 fi
 
-apt-get install -y -qq expect python3 procps >/dev/null
+apt-get install -y -qq expect python3 procps uidmap >/dev/null
 id xudotest >/dev/null 2>&1 || useradd --create-home --user-group xudotest
 echo 'xudotest:pw' | chpasswd
 usermod -aG xudo xudotest
@@ -135,8 +135,34 @@ EOF
 chmod 0644 /etc/xudo/config.toml
 chmod 0644 /etc/xudo/rules.d/99-systemd-confirm.toml
 
-pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
-if [ -z "$pending" ]; then
+# clear_confirm <case> <none|some|any>: assert what the spool holds (any: the earlier case legitimately leaves password-path entries), then empty it.
+clear_confirm() {
+    n=$(spool_entries)
+    case $2 in
+    none) [ "$n" -eq 0 ] || bad "$1: spool holds $n entries after the case, wanted none ($(ls /run/xudo/req | tr '\n' ' '))" ;;
+    any) ;;
+    some) [ "$n" -gt 0 ] || bad "$1: spool is empty after the case, wanted the pending entry" ;;
+    esac
+    rm -f /run/xudo/confirm/*.json /run/xudo/req/*
+}
+# What xudotest sees from `xudo pending`, with terminal noise removed.
+pending_out() {
+    su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 |
+        tr -d '\r' | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b\][^\x1b]*\x1b\\//g' || true
+}
+# True when `xudo pending` lists a request for harness.u, id -u.
+lists_the_request() {
+    printf '%s\n' "$1" | grep -Eq '^PENDING [0-9a-f]{64}$' &&
+        printf '%s\n' "$1" | grep -q 'harness\.u' &&
+        printf '%s\n' "$1" | grep -Eq '^ +command +/usr/bin/id -u$'
+}
+spool_entries() { find /run/xudo/req -mindepth 1 2>/dev/null | wc -l; }
+
+# The password cases above mint entries the gate may never consume.
+clear_confirm password_cases any
+pending=$(pending_out)
+pre_spool=$(spool_entries)
+if [ -z "$pending" ] && [ "$pre_spool" -eq 0 ]; then
     start=$(date +%s%3N)
     rc=$(pty pw /usr/bin/id -u)
     elapsed=$(($(date +%s%3N) - start))
@@ -146,42 +172,48 @@ if [ -z "$pending" ]; then
         bad "no_watcher_denies_at_once (rc=$rc elapsed=${elapsed}ms)"
         cat /var/tmp/case.out >&2
     fi
-    pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
-    if [ -z "$pending" ]; then
+    pending=$(pending_out)
+    post_spool=$(spool_entries)
+    if [ -z "$pending" ] && [ "$post_spool" -eq 0 ]; then
         good "no_watcher_mints_nothing"
     else
-        bad "no_watcher_mints_nothing"
+        bad "no_watcher_mints_nothing (spool entries: $post_spool)"
+        printf '%s\n' "$pending" >&2
+        ls -la /run/xudo/req >&2
+    fi
+else
+    bad "no_watcher_denies_at_once (unexpected pre-existing pending entry or spool entry)"
+    printf '%s\n' "$pending" >&2
+    ls -la /run/xudo/req >&2
+fi
+
+# Expiry at the TTL is covered by the broker's unit tests; here the entry is
+# only shown to remain after a timeout-0 request returns.
+pending=
+name=timeout_zero_returns_pending_and_the_entry_stays
+if expect /harness/confirm.exp pending >/var/tmp/confirm-pending.log 2>&1; then
+    rc=$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/confirm-pending.log)
+    pending=$(pending_out)
+    if [ "$rc" = 18 ] && lists_the_request "$pending" && [ "$(spool_entries)" -gt 0 ]; then
+        good "$name (rc=$rc)"
+    else
+        bad "$name (rc=$rc, entry missing)"
         printf '%s\n' "$pending" >&2
     fi
 else
-    bad "no_watcher_denies_at_once (unexpected pre-existing pending entry)"
-fi
-
-clear_confirm() {
-    rm -f /run/xudo/confirm/*.json /run/xudo/req/*
-}
-pending=
-if expect /harness/confirm.exp pending >/var/tmp/confirm-pending.log 2>&1; then
-    pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
-    if [ -n "$pending" ]; then
-        good "timeout_zero_returns_pending_and_the_entry_stays_until_ttl"
-    else
-        bad "timeout_zero_returns_pending_and_the_entry_stays_until_ttl (entry missing)"
-    fi
-else
-    bad "timeout_zero_returns_pending_and_the_entry_stays_until_ttl"
+    bad "$name"
     cat /var/tmp/confirm-pending.log >&2
 fi
 if [ -n "$pending" ]; then
     sleep 2
-    still=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
-    if [ -n "$still" ]; then
-        good "pending_entry_survives_until_ttl_check"
+    still=$(pending_out)
+    if lists_the_request "$still"; then
+        good "pending_entry_survives_two_more_seconds"
     else
-        bad "pending_entry_survives_until_ttl_check (entry disappeared)"
+        bad "pending_entry_survives_two_more_seconds (entry disappeared)"
     fi
 fi
-clear_confirm
+clear_confirm "$name" some
 
 # The positive timeout is tested against a live pending request; the watcher
 # leaves it unanswered so the wait itself can be measured.
@@ -191,7 +223,11 @@ confirmation_timeout_secs = 2
 EOF
 starts_before=$(journalctl -b -u 'xudod@*' --no-pager -o cat 2>/dev/null | grep -c 'Started xudod@' || true)
 start=$(date +%s%3N)
-if expect /harness/confirm.exp timeout >/var/tmp/confirm-timeout.log 2>&1; then rc=18; else rc=1; fi
+if expect /harness/confirm.exp timeout >/var/tmp/confirm-timeout.log 2>&1; then
+    rc=$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/confirm-timeout.log)
+else
+    rc=expect-failed
+fi
 elapsed=$(($(date +%s%3N) - start))
 starts_after=$(journalctl -b -u 'xudod@*' --no-pager -o cat 2>/dev/null | grep -c 'Started xudod@' || true)
 poll_starts=$((starts_after - starts_before))
@@ -203,7 +239,7 @@ else
     cat /var/tmp/confirm-timeout.log >&2
     cat /var/tmp/watch-session.out >&2 || true
 fi
-clear_confirm
+clear_confirm timeout_positive some
 if [ "$poll_starts" -gt 0 ]; then
     if [ -n "$wait_ms" ]; then
         cost=$((wait_ms / poll_starts))
@@ -222,6 +258,7 @@ confirmation_timeout_secs = 0
 EOF
 
 # A fresh pending request is answered by a second user session on another pty.
+# confirm.exp fails unless the re-run asked for the password.
 if expect /harness/confirm.exp approve >/var/tmp/confirm-approve.log 2>&1; then
     roundtrip=$(sed -n 's/^ROUNDTRIP_MS=//p' /var/tmp/confirm-approve.log)
     good "approve_then_rerun_then_password_runs_as_root (watch round-trip ${roundtrip}ms)"
@@ -230,7 +267,7 @@ else
     cat /var/tmp/confirm-approve.log >&2
     cat /var/tmp/watch-session.out >&2 || true
 fi
-clear_confirm
+clear_confirm approve none
 
 if expect /harness/confirm.exp deny >/var/tmp/confirm-deny.log 2>&1; then
     good "deny_runs_nothing_and_exits_18"
@@ -238,29 +275,31 @@ else
     bad "deny_runs_nothing_and_exits_18"
     cat /var/tmp/confirm-deny.log >&2
 fi
-clear_confirm
+clear_confirm deny none
 
-# The requester stdin is a pipe containing the expected word. It cannot answer
-# the broker's separate watch question.
+# The requester's stdin is a pipe holding the expected word. It cannot answer
+# the broker's separate watch question. A positive timeout makes the requester
+# wait, so an approval would be seen; confirm.exp then checks the entry is still
+# pending and a re-run is not approved.
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 3
+EOF
 if expect /harness/confirm.exp self-stdin >/var/tmp/self-stdin.out 2>&1; then
     good "self_approval_from_the_requesters_stdin_fails"
 else
     bad "self_approval_from_the_requesters_stdin_fails"
     cat /var/tmp/self-stdin.out >&2
 fi
-clear_confirm
+clear_confirm self-stdin some
 
-cat >/etc/xudo/config.toml <<'EOF'
-confirm_human_path = true
-confirmation_timeout_secs = 3
-EOF
 if expect /harness/confirm.exp self-tty >/var/tmp/self-tty.out 2>&1; then
     good "self_approval_through_dev_tty_fails"
 else
     bad "self_approval_through_dev_tty_fails"
     cat /var/tmp/self-tty.out >&2
 fi
-clear_confirm
+clear_confirm self-tty some
 cat >/etc/xudo/config.toml <<'EOF'
 confirm_human_path = true
 confirmation_timeout_secs = 0
@@ -273,30 +312,57 @@ else
     bad "watch_started_in_the_requesters_session_is_refused"
     cat /var/tmp/same-session.out >&2
 fi
-clear_confirm
+clear_confirm same-session none
 
-# Some container runtimes disable user namespaces. Distinguish that fixture
-# limitation explicitly; never turn it into a silent pass.
-set +e
-timeout 8 su --pty -s /bin/sh -c 'unshare -Ur /usr/bin/xudo watch' xudotest >/var/tmp/userns-watch.out 2>&1
-rc=$?
-set -e
-if [ "$rc" -ne 124 ] && grep -qiE 'channel|namespace|terminal' /var/tmp/userns-watch.out; then
-    good "watch_in_a_user_namespace_is_refused"
-elif [ "$rc" -ne 124 ] && grep -qiE 'operation not permitted|not permitted|permission denied' /var/tmp/userns-watch.out; then
-    echo "PASS: watch_in_a_user_namespace_is_refused (unshare unavailable; covered by fixture tests)"
-else
-    bad "watch_in_a_user_namespace_is_refused (rc=$rc; unexpected unshare failure)"
-    cat /var/tmp/userns-watch.out >&2
+# A watcher in a user namespace with a non-identity uid map is not live. Root
+# makes the namespace, so the host's restriction on unprivileged ones (AppArmor)
+# does not apply, and no sysctl is changed. Needs util-linux >= 2.39 for
+# --map-users. Skipping is never silent: it fails the lane unless
+# XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1 (see run.sh).
+userns=watch_in_a_user_namespace_is_refused
+skip_reason=
+unshare_ver=$(unshare --version 2>/dev/null | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+if [ -z "$unshare_ver" ]; then
+    skip_reason="cannot read the unshare version"
+elif [ "$(printf '%s\n2.39\n' "$unshare_ver" | sort -V | head -1)" != 2.39 ]; then
+    skip_reason="util-linux $unshare_ver has no --map-users"
 fi
+if [ -z "$skip_reason" ]; then
+    xg=$(getent group xudo | cut -d: -f3)
+    tu=$(id -u xudotest)
+    # util-linux 2.39 maps through newuidmap, which wants a subuid/subgid grant
+    # for exactly these ids (disposable container; the range is one id each).
+    echo "root:$tu:1" >>/etc/subuid
+    echo "root:$xg:1" >>/etc/subgid
+    if ! unshare --user --map-users="$tu:$tu:1" --map-groups="$xg:$xg:1" true >/var/tmp/userns-probe.out 2>&1; then
+        skip_reason="root cannot create a user namespace here: $(tr '\n' ' ' </var/tmp/userns-probe.out)"
+    fi
+fi
+if [ -n "$skip_reason" ]; then
+    echo "SKIP: $userns: $skip_reason"
+    if [ "${XUDO_SYSTEMD_ALLOW_USERNS_SKIP:-}" = 1 ]; then
+        echo "NOTE: $userns skipped by XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1"
+    else
+        bad "$userns skipped, and XUDO_SYSTEMD_ALLOW_USERNS_SKIP is not set"
+    fi
+elif expect /harness/confirm.exp userns >/var/tmp/userns.out 2>&1; then
+    good "$userns (rc=$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/userns.out))"
+else
+    bad "$userns"
+    cat /var/tmp/userns.out >&2
+fi
+clear_confirm userns none
 
 # Freeze is global in this harness: the approved human path must still prompt
-# for and accept the password. Thaw is root-only.
+# for and accept the password. Thaw is root-only, and refused by the broker
+# (not by sudo) for anyone else.
+frozen=/var/lib/xudo/frozen
 test_uid=$(id -u xudotest)
 pkill -TERM -u "$test_uid" -x xudo 2>/dev/null || true
 sleep 1
-clear_confirm
-if xudo freeze --reason 'systemd M3 proof' >/var/tmp/freeze.out 2>&1; then
+clear_confirm before_freeze none
+if xudo freeze --reason 'systemd M3 proof' >/var/tmp/freeze.out 2>&1 && [ -f "$frozen" ]; then
+    good "freeze_creates_the_frozen_file"
     if expect /harness/confirm.exp approve >/var/tmp/frozen-approve.log 2>&1; then
         good "freeze_then_human_password_path_runs"
     else
@@ -304,23 +370,24 @@ if xudo freeze --reason 'systemd M3 proof' >/var/tmp/freeze.out 2>&1; then
         cat /var/tmp/frozen-approve.log /var/tmp/case.out >&2 || true
     fi
 else
-    bad "freeze_then_human_password_path_runs"
+    bad "freeze_creates_the_frozen_file"
     cat /var/tmp/freeze.out >&2
 fi
-clear_confirm
+clear_confirm freeze_approve none
 set +e
-su --pty -s /bin/sh -c 'sudo -n /usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
+su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
 rc=$?
 set -e
-if [ "$rc" -ne 0 ]; then
-    good "sudo_xudo_thaw_is_refused_for_unprivileged_user"
+if [ "$rc" -ne 0 ] && grep -q 'thaw requires uid 0' /var/tmp/nonroot-thaw.out && [ -f "$frozen" ]; then
+    good "xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user (rc=$rc)"
 else
-    bad "sudo_xudo_thaw_is_refused_for_unprivileged_user"
+    bad "xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user (rc=$rc, frozen file: $([ -f "$frozen" ] && echo present || echo gone))"
+    cat /var/tmp/nonroot-thaw.out >&2
 fi
-if sudo /usr/bin/xudo thaw >/var/tmp/root-thaw.out 2>&1; then
-    good "sudo_xudo_thaw_works_as_root"
+if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ]; then
+    good "xudo_thaw_works_as_root_and_removes_the_frozen_file"
 else
-    bad "sudo_xudo_thaw_works_as_root"
+    bad "xudo_thaw_works_as_root_and_removes_the_frozen_file"
     cat /var/tmp/root-thaw.out >&2
 fi
 
