@@ -458,9 +458,11 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
 
 ### 10. Closeout
 
-A dated `CONCERNS.md` entry; this directory's `README.md` (status, rows 8, 9,
-16); `howiwork.md` "Where the build stands"; one `SECURITY.md` paragraph on
-the same-uid limit below.
+**Done 2026-11-10.** Closeout recorded in `../CONCERNS.md`, this directory's
+`README.md` (status, rows 8, 9, 16), `howiwork.md` "Where the build stands",
+and `../../SECURITY.md` (same-uid limit). The man page documents `watch`,
+`pending`, `freeze`, `thaw`, `confirmation_timeout_secs`, and
+`confirm_human_path`.
 
 ## Decisions (owner, 2026-11-07)
 

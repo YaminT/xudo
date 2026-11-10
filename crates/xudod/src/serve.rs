@@ -1069,6 +1069,20 @@ fn freeze_with(
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
     })?;
+    let bytes = encoded_freeze_record(
+        &FreezeRecord {
+            reason: reason.to_owned(),
+            uid: identity.uid,
+            time: platform.clock.wall_millis(),
+        },
+        encode,
+    )?;
+    if bytes.len() > xudo_gate::policy::MAX_FREEZE_BYTES {
+        return Err(Refusal::client(
+            RefusalCode::RequestTooLarge,
+            "freeze reason is too large once encoded",
+        ));
+    }
     let record = platform
         .audit
         .append(&|previous| {
@@ -1093,20 +1107,6 @@ fn freeze_with(
             )
         })?;
     drop(record);
-    let bytes = encoded_freeze_record(
-        &FreezeRecord {
-            reason: reason.to_owned(),
-            uid: identity.uid,
-            time: platform.clock.wall_millis(),
-        },
-        encode,
-    )?;
-    if bytes.len() > xudo_gate::policy::MAX_FREEZE_BYTES {
-        return Err(Refusal::client(
-            RefusalCode::RequestTooLarge,
-            "freeze reason is too large once encoded",
-        ));
-    }
     publish_freeze(state, &bytes)?;
     deny_pending(platform, spool, identity, request)?;
     Ok(done())
@@ -1117,7 +1117,9 @@ fn freeze_with(
 /// mid-publish, so a name found here is stale.
 fn publish_freeze(state: &dyn Spool, bytes: &[u8]) -> Result<(), Refusal> {
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
-    state.remove(FREEZE_TEMP).map_err(|e| Refusal::from(&e))?;
+    state
+        .remove(&freeze_temp())
+        .map_err(|e| Refusal::from(&e))?;
     match state.publish("frozen", bytes) {
         Ok(()) | Err(SpoolError::Exists { .. }) => Ok(()),
         Err(error) => Err(Refusal::from(&error)),
@@ -1125,7 +1127,9 @@ fn publish_freeze(state: &dyn Spool, bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 /// What `Spool::publish` names its temporary file for `frozen`.
-const FREEZE_TEMP: &[u8] = b".tmp.frozen";
+fn freeze_temp() -> Vec<u8> {
+    format!("{}frozen", xudo_sys::TEMP_PREFIX).into_bytes()
+}
 
 fn encode_freeze_record(
     record: &FreezeRecord,
@@ -3342,7 +3346,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_freeze_reason_that_escapes_past_the_readers_limit_is_refused() {
+    fn an_oversized_freeze_leaves_no_freeze_record() {
         let reason = "\u{1}".repeat(xudo_wire::MAX_REASON_BYTES);
         let mut host = Host::honest();
         let error = freeze(
@@ -3355,6 +3359,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         .unwrap_err();
         assert_eq!(error.code, RefusalCode::RequestTooLarge);
         assert!(host.freeze_file.files().is_empty());
+        assert!(host.audit.records().is_empty());
     }
 
     #[test]

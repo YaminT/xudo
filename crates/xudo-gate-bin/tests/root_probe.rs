@@ -51,6 +51,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+struct FreezeMarkerGuard(std::path::PathBuf);
+
+impl Drop for FreezeMarkerGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 use xudo_backend::{InstallPlan, detect};
 use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION};
 use xudo_gate::{CONFIG_FILE as GATE_CONFIG_FILE, SPOOL_DIR};
@@ -170,8 +178,9 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     start_broker();
     let dir = Path::new("/var/lib/xudo");
     let marker = dir.join("frozen");
-    let stale = dir.join(".tmp.frozen");
+    let stale = dir.join(format!("{}frozen", xudo_sys::TEMP_PREFIX));
     let _ = fs::remove_file(&marker);
+    let _marker_guard = FreezeMarkerGuard(marker.clone());
     assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
     assert_eq!(
         fs::metadata(dir).unwrap().permissions().mode() & 0o777,
