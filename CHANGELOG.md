@@ -5,6 +5,8 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+- The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so stock Ubuntu 26.04 verifies.
+
 ## 0.1.0-beta.1 - 2026-11-10
 
 ### Added
