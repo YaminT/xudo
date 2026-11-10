@@ -1226,6 +1226,7 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         out,
         "\n* security-relevant: never settable from the environment."
     );
+    let _ = writeln!(out, "confirm_agent_actions has no effect until M4.");
     ExitCode::Delegated
 }
 
@@ -3489,6 +3490,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(out.contains("<default>"), "{out}");
         assert!(out.contains("use_pty"), "{out}");
         assert!(out.contains("<compiled-in>"), "{out}");
+        assert!(
+            out.contains("confirm_agent_actions has no effect until M4"),
+            "{out}"
+        );
         // Security-relevant settings are marked, and the legend explains it.
         assert!(out.contains("* confirm_agent_actions"), "{out}");
         assert!(out.contains("  color"), "{out}");

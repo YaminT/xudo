@@ -166,7 +166,7 @@ pub enum MintError {
         nonce: String,
     },
     /// This process already has a pending or approved watched request.
-    #[error("this process already has a pending confirmation request")]
+    #[error("watch confirmation is throttled by a per-process or capacity limit")]
     ConfirmationThrottled,
 }
 
@@ -998,6 +998,29 @@ mod tests {
     }
 
     #[test]
+    fn watch_mints_succeed_one_below_each_quota() {
+        let mut same_uid = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID - 1 {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            same_uid = same_uid.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        let next = watch_entry('a', 4242);
+        publish_as_1000(&same_uid, &FakePeer::new(), &next).unwrap();
+        assert_eq!(same_uid.files().len(), MAX_WATCH_ENTRIES_PER_UID);
+
+        let mut global = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES - 1 {
+            let mut watched = watch_entry('b', 30_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 2_000 + u32::try_from(index).unwrap();
+            global = global.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        publish_as_1000(&global, &FakePeer::new(), &next).unwrap();
+        assert_eq!(global.files().len(), MAX_WATCH_ENTRIES);
+    }
+
+    #[test]
     fn a_pending_entry_survives_its_requester_exiting() {
         let pending = watch_entry('b', 4243);
         let spool = spool_with(&[&pending]);
@@ -1176,15 +1199,45 @@ mod tests {
     proptest! {
         #[test]
         fn any_mix_of_watch_entries_never_blocks_a_fresh_password_mint(
-            watch_count in 0..=MAX_WATCH_ENTRIES,
+            watch_states in prop::collection::vec(0u8..3, 0..=MAX_WATCH_ENTRIES),
+            owned_watch_count in 0..=MAX_WATCH_ENTRIES,
             password_count in 0..MAX_SPOOL_ENTRIES,
         ) {
             let mut spool = FakeSpool::new();
             let mut host = FakePeer::new();
-            for index in 0..watch_count {
+            for (index, state) in watch_states.into_iter().enumerate() {
                 let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
                 watched.nonce = format!("{:064x}", index + 1);
-                watched.caller_uid = 4_000 + u32::try_from(index).unwrap();
+                watched.caller_uid = if index < owned_watch_count {
+                    1000
+                } else {
+                    4_000 + u32::try_from(index).unwrap()
+                };
+                let watcher = xudo_gate::request::WatcherPin {
+                    uid: watched.caller_uid,
+                    pid: 50_000 + u32::try_from(index).unwrap(),
+                    starttime: 77,
+                    tty: (136 << 8) | 1,
+                    sid: watched.caller_sid + 1,
+                };
+                match state {
+                    0 => {}
+                    1 => {
+                        watched.state = xudo_gate::request::ConfirmationState::Approved;
+                        watched.confirmed = true;
+                        watched.confirmed_by = Some(watcher.clone());
+                        watched.shown_to = Some(watcher);
+                        watched.shown_at_ms = Some(BoottimeMillis(NOW - 2));
+                    }
+                    _ => {
+                        watched.state = xudo_gate::request::ConfirmationState::Consumed;
+                        watched.confirmed = true;
+                        watched.confirmed_by = Some(watcher.clone());
+                        watched.shown_to = Some(watcher);
+                        watched.shown_at_ms = Some(BoottimeMillis(NOW - 2));
+                        host = running(host, &watched, watched.caller_uid, watched.caller_uid);
+                    }
+                }
                 spool = spool.with_file(watched.nonce.clone(), watched.to_json());
             }
             for index in 0..password_count {
