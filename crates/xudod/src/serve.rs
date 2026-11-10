@@ -395,7 +395,7 @@ fn expire_entries(
     let _spool_guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
     let now = platform.clock.boottime_millis();
     let names = spool
-        .names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1)
+        .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
         .map_err(|error| Refusal::from(&error))?;
     for id in names {
         let Ok(bytes) = spool.read(&id, crate::mint::MAX_ENTRY_BYTES) else {
@@ -606,7 +606,9 @@ fn take_matching_approval(
     let (program, argv, _) = request.run_fields()?;
     let action = action?;
     let _guard = SpoolGuard::lock(spool).ok()?;
-    let names = spool.names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1).ok()?;
+    let names = spool
+        .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
+        .ok()?;
     let argv_bytes = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
     for name in names {
         let bytes = spool.read(&name, crate::mint::MAX_ENTRY_BYTES).ok()?;
@@ -775,7 +777,7 @@ fn pending_duplicate(spool: &dyn Spool, request: &BrokerRequest, uid: u32, now: 
     let Ok(_guard) = SpoolGuard::lock(spool) else {
         return true;
     };
-    let Ok(names) = spool.names_up_to(crate::mint::MAX_SPOOL_ENTRIES + 1) else {
+    let Ok(names) = spool.names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK) else {
         return true;
     };
     names.into_iter().any(|name| {
@@ -3933,6 +3935,68 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn scans_find_the_last_entry_in_a_full_mixed_spool() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID, START, 0, 0);
+        let last_nonce = "f".repeat(64);
+        let fillers = || {
+            (0..crate::mint::MAX_SPOOL_ENTRIES + crate::mint::MAX_WATCH_ENTRIES - 1).fold(
+                FakeSpool::new(),
+                |spool, index| {
+                    let mut entry = someone_elses_entry();
+                    entry.nonce = format!("{:064x}", index + 1);
+                    spool.with_file(entry.nonce.clone(), entry.to_json())
+                },
+            )
+        };
+
+        let mut approved = shown_entry();
+        approved.nonce = last_nonce.clone();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        approved.confirmed_by = Some(pin.clone());
+        approved.shown_to = Some(pin);
+        let approval_spool = fillers().with_file(last_nonce.clone(), approved.to_json());
+        assert!(
+            take_matching_approval(
+                &approval_spool,
+                &request,
+                &identity,
+                Some("xudo.pkg.remove"),
+                policy().rules.generation.id(),
+                NOW,
+            )
+            .is_some()
+        );
+
+        let mut duplicate = shown_entry();
+        duplicate.nonce = last_nonce.clone();
+        let duplicate_spool = fillers().with_file(last_nonce.clone(), duplicate.to_json());
+        assert!(pending_duplicate(&duplicate_spool, &request, UID, NOW));
+
+        let mut expired = shown_entry();
+        expired.nonce = last_nonce.clone();
+        expired.deadline = BoottimeMillis(NOW);
+        let expiry_spool = fillers().with_file(last_nonce.as_bytes().to_vec(), expired.to_json());
+        let mut host = Host::honest();
+        host.confirmations = FakeSpool::new();
+        expire_entries(&mut host.platform(), &expiry_spool, &request).unwrap();
+        assert!(!expiry_spool.files().contains_key(last_nonce.as_bytes()));
+        assert_eq!(host.audit.records().len(), 1);
+        assert!(
+            host.audit.records()[0]
+                .evidence
+                .iter()
+                .any(|item| item.contains(&last_nonce))
+        );
+    }
+
+    #[test]
     fn malformed_approval_entries_are_skipped_but_failed_consumption_is_not() {
         let request = BrokerRequest::new(
             "/usr/bin/apt-get",
@@ -5672,7 +5736,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             spool.calls(),
             [
                 SpoolCall::Lock,
-                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::NamesUpTo(crate::mint::MAX_SPOOL_NAMES_TO_WALK),
                 SpoolCall::Unlock,
                 SpoolCall::Lock,
                 SpoolCall::Names,
@@ -5760,7 +5824,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 spool.calls(),
                 [
                     SpoolCall::Lock,
-                    SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                    SpoolCall::NamesUpTo(crate::mint::MAX_SPOOL_NAMES_TO_WALK),
                     SpoolCall::Unlock
                 ],
                 "{program}"
@@ -5995,7 +6059,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             spool.calls(),
             [
                 SpoolCall::Lock,
-                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::NamesUpTo(crate::mint::MAX_SPOOL_NAMES_TO_WALK),
                 SpoolCall::Unlock
             ]
         );
@@ -6016,7 +6080,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             spool.calls(),
             [
                 SpoolCall::Lock,
-                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::NamesUpTo(crate::mint::MAX_SPOOL_NAMES_TO_WALK),
                 SpoolCall::Unlock
             ]
         );
@@ -6082,7 +6146,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             spool.calls(),
             [
                 SpoolCall::Lock,
-                SpoolCall::NamesUpTo(MAX_SPOOL_ENTRIES + 1),
+                SpoolCall::NamesUpTo(crate::mint::MAX_SPOOL_NAMES_TO_WALK),
                 SpoolCall::Unlock
             ],
             "no entry without its record"
