@@ -64,7 +64,7 @@ while all entries share one lifetime.
 The shipped `.deb` passed the confirmation acceptance under systemd as PID 1
 on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. On all three images these cases
 passed: `no_watcher_denies_at_once` (exit 18, no entry minted),
-`timeout_zero_returns_pending_and_the_entry_stays_until_ttl` (including the
+`timeout_zero_returns_pending_and_the_entry_stays` (including the
 pending-entry survival check),
 `approve_then_rerun_then_password_runs_as_root`,
 `deny_runs_nothing_and_exits_18`,
@@ -72,9 +72,10 @@ pending-entry survival check),
 `self_approval_from_the_requesters_stdin_fails`,
 `self_approval_through_dev_tty_fails`,
 `watch_started_in_the_requesters_session_is_refused`,
+`freeze_creates_the_frozen_file`,
 `freeze_then_human_password_path_runs`,
-`sudo_xudo_thaw_is_refused_for_unprivileged_user`, and
-`sudo_xudo_thaw_works_as_root`.
+`xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user`, and
+`xudo_thaw_works_as_root_and_removes_the_frozen_file`.
 
 `watch_in_a_user_namespace_is_refused` runs for real in `just systemd-test` on
 all three images. The user-namespace case is run by root, so the host's

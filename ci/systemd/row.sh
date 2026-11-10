@@ -135,12 +135,12 @@ EOF
 chmod 0644 /etc/xudo/config.toml
 chmod 0644 /etc/xudo/rules.d/99-systemd-confirm.toml
 
-# clear_confirm <case> <none|some|any>: assert what the spool holds (any: the earlier case legitimately leaves password-path entries), then empty it.
+# clear_confirm <case> <none|some|none_left>: assert what the spool holds (none_left: already checked by the caller), then empty it.
 clear_confirm() {
     n=$(spool_entries)
     case $2 in
     none) [ "$n" -eq 0 ] || bad "$1: spool holds $n entries after the case, wanted none ($(ls /run/xudo/req | tr '\n' ' '))" ;;
-    any) ;;
+    none_left) ;;
     some) [ "$n" -gt 0 ] || bad "$1: spool is empty after the case, wanted the pending entry" ;;
     esac
     rm -f /run/xudo/confirm/*.json /run/xudo/req/*
@@ -158,8 +158,21 @@ lists_the_request() {
 }
 spool_entries() { find /run/xudo/req -mindepth 1 2>/dev/null | wc -l; }
 
-# The password cases above mint entries the gate may never consume.
-clear_confirm password_cases any
+# The wrong-password case leaves exactly one entry: the broker minted it, sudo
+# refused all three passwords, so the gate never ran to consume it; it stays
+# until its deadline. Check it is that entry, then empty the spool.
+n=$(spool_entries)
+if [ "$n" -eq 1 ] && python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get("action") == "xudo.probe.id" and d.get("argv") == ["-u"] else 1)
+' /run/xudo/req/*; then
+    good "password_cases_leave_only_the_wrong_password_entry"
+else
+    bad "password_cases_leave_only_the_wrong_password_entry ($n entries: $(ls /run/xudo/req | tr '\n' ' '))"
+    cat /run/xudo/req/* >&2 || true
+fi
+clear_confirm password_cases none_left
 pending=$(pending_out)
 pre_spool=$(spool_entries)
 if [ -z "$pending" ] && [ "$pre_spool" -eq 0 ]; then
