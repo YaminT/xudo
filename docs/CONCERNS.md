@@ -9,11 +9,11 @@ M3 exit tests:
 3. **Done.** No watcher denies immediately: `no_watcher_denies_at_once` in the systemd-test lane.
 4. **Partly done.** stdin, `/dev/tty`, same-session, and same-terminal attacks are covered by the step 9 lane. A same-uid agent can use `setsid` and `script -qc 'xudo watch'`; session and tty do not prove a human. M4's cgroup scope completes this guarantee.
 5. **Done.** Sanitized prompt, reaction floor, duplicate suppression, backoff, watch-only approval, read-only pending, and snapshots: broker/front-end unit tests and `just systemd-test`.
-6. **Partly done.** The user-namespace watcher check is fixture-only: containers refuse `unshare -U`; see `watch_in_a_user_namespace_is_refused` in step 9.
+6. **Done.** `watch_in_a_user_namespace_is_refused` runs for real in `just systemd-test` on all three images; see step 9.
 7. **Partly done.** Freeze/thaw tests pass, including the root lane. Freeze has no effect on new or human requests until M4 because all M3 callers are unattested. The orchestrator decision remains flagged for the owner; the owner had earlier been told freeze would deny human requests too. See the step 8 entry below.
 8. **Done.** `just verify`, `just root-test`, `just units`, `just systemd-test`, and the step 9 Linux acceptance matrix passed.
 
-Open limits: same-uid watcher separation needs M4 cgroups; the user-namespace live check is unavailable in containers; `UnixStream::connect` is unbounded; each status poll starts a broker at about 296–299 ms, and watch round-trip takes about one second (step 9 measurements).
+Open limits: same-uid watcher separation needs M4 cgroups; `UnixStream::connect` is unbounded; each status poll starts a broker at about 296–299 ms, and watch round-trip takes about one second (step 9 measurements).
 
 ## 2026-11-09 — M3 step 8: freeze semantics
 
@@ -76,11 +76,23 @@ pending-entry survival check),
 `sudo_xudo_thaw_is_refused_for_unprivileged_user`, and
 `sudo_xudo_thaw_works_as_root`.
 
-`watch_in_a_user_namespace_is_refused` could not run its `unshare -U` child:
-the container runtime returned “Operation not permitted” on each image. The
-lane prints this limitation and counts the fixture coverage, including
-`a_diverged_watcher_cannot_approve`; the live unshare path itself was not
-exercisable and this is not a silent pass.
+`watch_in_a_user_namespace_is_refused` runs for real in `just systemd-test` on
+all three images. The user-namespace case is run by root, so the host's
+`kernel.apparmor_restrict_unprivileged_userns=1` does not apply and no sysctl
+is touched. The watcher runs inside a namespace that maps only the xudotest uid
+and the xudo gid, which the broker treats as diverged; the requester must get
+`no_confirmation_channel` while that watcher is demonstrably running.
+
+util-linux 2.39 (Ubuntu 24.04) maps through `newuidmap`, so the harness grants
+root a one-id subuid/subgid range inside the throwaway container.
+
+A case that cannot run is never silent: it prints `SKIP: <case>: <reason>` and
+fails the lane unless `XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1` names that one opt-out.
+
+The approve case now requires sudo's password prompt to appear. Non-root thaw
+is refused by the broker (“thaw requires uid 0”, exit 17), not by sudo. Freeze
+is checked by the presence of `/var/lib/xudo/frozen`. Expiry at the TTL is
+covered by the broker's unit tests, not by this lane.
 
 | Systemd image | Watch round-trip | Positive wait (`n = 2`) | Broker starts / average start cost |
 | --- | ---: | ---: | ---: |

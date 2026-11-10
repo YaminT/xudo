@@ -5,6 +5,13 @@
 # Nothing else on the host is changed. ci/systemd/row.sh asserts inside.
 #
 #   ci/systemd/run.sh <musl triple>       (or: just systemd-test)
+#
+# Every case must run and pass. The one case that can legitimately be
+# impossible in an image, watch_in_a_user_namespace_is_refused (it needs
+# util-linux >= 2.39 and root able to create a user namespace), prints
+# "SKIP: <case>: <reason>" and fails the lane, unless the operator sets
+#   XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1
+# which turns that one named skip into a printed NOTE. Nothing else is skippable.
 set -eu
 
 if [ "$#" -ne 1 ]; then
@@ -29,7 +36,7 @@ deb="$root/target/deb/xudo_${deb_ver}_${arch}.deb"
 
 # Debian 13, Ubuntu 24.04, and Ubuntu 26.04. 26.04 stays while it boots the
 # same way; row.sh reports a distro that cannot verify.
-images=${XUDO_SYSTEMD_IMAGES:-"debian:13 ubuntu:24.04 ubuntu:26.04"}
+images="debian:13 ubuntu:24.04 ubuntu:26.04"
 name=
 cleanup() {
     if [ -n "$name" ]; then
@@ -101,7 +108,7 @@ for image in $images; do
     fi
 
     # Line-buffer: without a tty the row's stdout would arrive in one lump.
-    if ! docker exec "$name" stdbuf -oL -eL sh /harness/row.sh; then
+    if ! docker exec -e XUDO_SYSTEMD_ALLOW_USERNS_SKIP="${XUDO_SYSTEMD_ALLOW_USERNS_SKIP:-}" "$name" stdbuf -oL -eL sh /harness/row.sh; then
         echo "FAIL: row $image" >&2
         fail=1
     fi
