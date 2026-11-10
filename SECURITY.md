@@ -20,9 +20,11 @@ needed to separate the agent from the human.
 Open a private security advisory on the GitHub repository. Please do not open a
 public issue for anything that could be exploited.
 
-If you are reporting a design flaw rather than a bug, that is welcome and useful
-— the threat model is in `docs/design-plan.md` and the reasoning behind each
-control is in `docs/CONCERNS.md`.
+If you are reporting a design flaw rather than a bug, that is welcome and useful.
+The limits of the design are the rest of this file. The product invariants are
+in `howiwork.md`: agent detection is not a security boundary, the agent path is
+never broader than the human path, and confirmation lives outside the
+requester's process tree.
 
 ## What this does not protect against
 
@@ -56,8 +58,7 @@ one you know you lack.
 - **Not every user-writable filesystem is refused yet.** A mount that root made
   from a block device or loop file a user can write passes, and so does an
   overlay whose upper layer a user can write: what is checked is who made the
-  mount and the marks it carries, not what backs it (`docs/CONCERNS.md`,
-  2026-10-19).
+  mount and the marks it carries, not what backs it.
 
 ## What `xudo doctor` reports about other paths to root
 

@@ -2,7 +2,7 @@
 //!
 //! `render::human` and `render::json` are what a person reads and what an
 //! agent branches on, so their exact output is a reviewed artifact: a diff in
-//! either is a policy or UX change (`CLAUDE.md` § Tests are adversarial).
+//! either is a policy or UX change.
 //! Every verdict shape is pinned — the allow, all three confirmation reasons,
 //! and all eight denial codes — each through a decision produced the way the
 //! real caller produces it wherever a producer exists. So are the two shapes

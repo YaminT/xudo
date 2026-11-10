@@ -5,8 +5,7 @@
 #   ci/root-test.sh [cargo test arguments]        (or: just root-test ...)
 #
 # The mirror of ci/linux-test.sh. The same hazards decide its shape, with the
-# middle one turned around (docs/CONCERNS.md, 2026-10-14, 2026-10-15, and
-# 2026-10-21):
+# middle one turned around (2026-10-14, 2026-10-15, and 2026-10-21):
 #
 # * Never on the bind mount. Docker Desktop's mount misreports the checkout as
 #   root-owned to a root process, and intermittently reports a directory

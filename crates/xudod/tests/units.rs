@@ -206,8 +206,7 @@ fn the_per_source_limit_states_what_it_costs_beside_the_limit() {
     // starts. The limit stays, because one uid must not hold every slot, and
     // the rule an operator must keep (/run/xudo is never shared with a pid
     // namespace systemd cannot see into) is written directly above it, so that
-    // neither is changed without the other (docs/CONCERNS.md, the broker
-    // entry, open item 8).
+    // neither is changed without the other.
     if let Err(why) = the_note_beside_the_limits(SOCKET) {
         panic!("{why}");
     }

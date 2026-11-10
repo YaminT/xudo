@@ -1,10 +1,11 @@
 //! The crate inventories name exactly the workspace's members.
 //!
-//! `CLAUDE.md`, `docs/design-plan.md`, and `docs/todo/README.md` each keep a
-//! table of the crates, and a list kept by hand is a list that drifts: the plan
-//! said "twelve crates" while the manifest had thirteen, and the todo index's
-//! table left out `xudo-audit`, `xudo-gate`, and `xudo-sys-raw`. A map of a
-//! privilege broker with a crate missing from it is a map with a hole in it.
+//! `docs/crates.md` is the published table. `CLAUDE.md`, `docs/design-plan.md`,
+//! and `docs/todo/README.md` keep one too, for the people who work in this tree.
+//! A list kept by hand is a list that drifts: the plan said "twelve crates"
+//! while the manifest had thirteen, and the todo index's table left out
+//! `xudo-audit`, `xudo-gate`, and `xudo-sys-raw`. A map of a privilege broker
+//! with a crate missing from it is a map with a hole in it.
 //!
 //! So each table is checked against `[workspace] members` in `Cargo.toml`, in
 //! both directions:
@@ -16,7 +17,10 @@
 //! * a row still marked in review for a crate that has become a member fails,
 //!   so the change that merges a crate must flip its marker, and cannot forget.
 //!
-//! The one sentence that states the member count in words is held to it too.
+//! The one sentence that states the member count in words is held to it too,
+//! when the design plan is in the checkout. That file and the other two local
+//! tables are not published: the check runs only when the file exists.
+//! `docs/crates.md` is always checked.
 //!
 //! # A reader that cannot be fooled into passing
 //!
@@ -344,13 +348,103 @@ fn members(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn inventory_problems(file: &str, anchor: &str) -> Vec<String> {
-    let root = workspace_root();
-    match inventory(&read(&root, file), anchor) {
-        Ok(rows) => problems(file, &rows, &members(&root)),
+fn inventory_problems_in(root: &Path, file: &str, anchor: &str) -> Vec<String> {
+    match inventory(&read(root, file), anchor) {
+        Ok(rows) => problems(file, &rows, &members(root)),
         Err(why) => vec![format!("{file}: {why}")],
     }
 }
+
+/// `None` when `file` is not in this checkout. Local plans are not published,
+/// so a clean clone has nothing to check there.
+fn inventory_if_present(root: &Path, file: &str, anchor: &str) -> Option<Vec<String>> {
+    if !root.join(file).is_file() {
+        return None;
+    }
+    Some(inventory_problems_in(root, file, anchor))
+}
+
+fn require_inventory_if_present(root: &Path, file: &str, anchor: &str) {
+    // Runs only when the file exists. Absence is success.
+    if let Some(found) = inventory_if_present(root, file, anchor) {
+        assert_clean(&found);
+    }
+}
+
+/// What is wrong with the one `<N> crates, not five` sentence, if it is not
+/// the member count. An absent file is not this function's problem.
+fn count_line_problems(file: &str, doc: &str, member_count: usize) -> Vec<String> {
+    let mut hits = doc.lines().filter(|line| line.contains("crates, not five"));
+    let (Some(line), None) = (hits.next(), hits.next()) else {
+        return vec![format!(
+            "{file} must have exactly one line saying `<N> crates, not five`"
+        )];
+    };
+    if claimed_count(line) == Some(member_count) {
+        return Vec::new();
+    }
+    vec![format!(
+        "{file} says `{line}`, but Cargo.toml has {member_count} workspace members"
+    )]
+}
+
+fn count_if_present(root: &Path, file: &str) -> Option<Vec<String>> {
+    if !root.join(file).is_file() {
+        return None;
+    }
+    Some(count_line_problems(
+        file,
+        &read(root, file),
+        members(root).len(),
+    ))
+}
+
+fn require_count_if_present(root: &Path, file: &str) {
+    // The design plan is local-only. A checkout without it skips this check.
+    if let Some(found) = count_if_present(root, file) {
+        assert_clean(&found);
+    }
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("inventory-{name}"));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn plant(root: &Path, relative: &str, text: &str) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, text).unwrap();
+}
+
+fn demo_tree(root: &Path) {
+    plant(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/demo\"]\n",
+    );
+    plant(
+        root,
+        "crates/demo/Cargo.toml",
+        "[package]\nname = \"demo\"\n",
+    );
+}
+
+fn demo_table(anchor: &str) -> String {
+    format!("{anchor}\n\n| Crate | Role |\n|---|---|\n| `demo` | One crate. |\n")
+}
+
+/// Local-only tables. Checked when the checkout still has the file.
+const LOCAL_TABLES: &[(&str, &str)] = &[
+    ("CLAUDE.md", "## Crate layout"),
+    ("docs/design-plan.md", "### Crate layout"),
+    (
+        "docs/todo/README.md",
+        "## Where the project actually stands",
+    ),
+];
 
 fn assert_clean(found: &[String]) {
     assert!(
@@ -363,41 +457,95 @@ fn assert_clean(found: &[String]) {
 }
 
 #[test]
-fn claude_md_crate_table_is_exactly_the_workspace_members() {
-    assert_clean(&inventory_problems("CLAUDE.md", "## Crate layout"));
-}
-
-#[test]
-fn the_design_plans_crate_layout_is_exactly_the_workspace_members() {
-    assert_clean(&inventory_problems(
-        "docs/design-plan.md",
-        "### Crate layout",
+fn the_tracked_crate_table_is_exactly_the_workspace_members() {
+    assert_clean(&inventory_problems_in(
+        &workspace_root(),
+        "docs/crates.md",
+        "## Crate layout",
     ));
 }
 
 #[test]
-fn the_todo_indexs_done_table_is_exactly_the_workspace_members() {
-    assert_clean(&inventory_problems(
-        "docs/todo/README.md",
-        "## Where the project actually stands",
-    ));
-}
+fn local_only_inventories_are_checked_only_when_the_file_exists() {
+    // A clean checkout does not publish these files. Both arms run here, against
+    // a directory that has them and one that does not, so the result does not
+    // depend on whether this checkout kept the local copies. When it did, those
+    // copies have to match the manifest too.
+    let absent = scratch("local-absent");
+    for (file, anchor) in LOCAL_TABLES {
+        require_inventory_if_present(&absent, file, anchor);
+    }
+    require_count_if_present(&absent, "docs/design-plan.md");
 
-#[test]
-fn the_design_plans_crate_count_is_the_manifests() {
+    let present = scratch("local-present");
+    demo_tree(&present);
+    for (file, anchor) in LOCAL_TABLES {
+        plant(&present, file, &demo_table(anchor));
+    }
+    let plan = present.join("docs/design-plan.md");
+    let mut text = fs::read_to_string(&plan).unwrap();
+    text.insert_str(0, "1 crates, not five.\n\n");
+    fs::write(&plan, text).unwrap();
+    for (file, anchor) in LOCAL_TABLES {
+        require_inventory_if_present(&present, file, anchor);
+    }
+    require_count_if_present(&present, "docs/design-plan.md");
+
     let root = workspace_root();
-    let plan = read(&root, "docs/design-plan.md");
-    let mut hits = plan
-        .lines()
-        .filter(|line| line.contains("crates, not five"));
-    let (Some(line), None) = (hits.next(), hits.next()) else {
-        panic!("docs/design-plan.md must have exactly one line saying `<N> crates, not five`");
-    };
-    let members = members(&root).len();
-    assert_eq!(
-        claimed_count(line),
-        Some(members),
-        "docs/design-plan.md says `{line}`, but Cargo.toml has {members} workspace members"
+    for (file, anchor) in LOCAL_TABLES {
+        require_inventory_if_present(&root, file, anchor);
+    }
+    require_count_if_present(&root, "docs/design-plan.md");
+}
+
+#[test]
+fn a_present_inventory_that_is_not_the_workspace_is_reported() {
+    let root = scratch("drift");
+    demo_tree(&root);
+    plant(&root, "CLAUDE.md", "# Notes\n");
+    let missing_table = inventory_problems_in(&root, "CLAUDE.md", "## Crate layout");
+    assert!(
+        missing_table
+            .iter()
+            .any(|problem| problem.contains("expected one line")),
+        "{missing_table:?}"
+    );
+
+    plant(
+        &root,
+        "docs/crates.md",
+        &demo_table("## Crate layout").replace("`demo`", "`gone`"),
+    );
+    let drifted = inventory_if_present(&root, "docs/crates.md", "## Crate layout").unwrap();
+    assert!(
+        drifted.iter().any(|problem| problem.contains("no row")),
+        "{drifted:?}"
+    );
+    assert!(inventory_if_present(&root, "docs/missing.md", "## Crate layout").is_none());
+}
+
+#[test]
+fn a_count_sentence_is_held_to_the_member_count_when_the_file_exists() {
+    // Local-only sentence in the design plan. The arms below do not read it.
+    assert!(count_line_problems("plan", "1 crates, not five.\n", 1).is_empty());
+    let wrong = count_line_problems("plan", "Two crates, not five.\n", 1);
+    assert!(
+        wrong.iter().any(|problem| problem.contains("has 1")),
+        "{wrong:?}"
+    );
+    let missing = count_line_problems("plan", "no sentence\n", 1);
+    assert!(
+        missing
+            .iter()
+            .any(|problem| problem.contains("exactly one line")),
+        "{missing:?}"
+    );
+    let twice = count_line_problems("plan", "1 crates, not five.\n1 crates, not five.\n", 1);
+    assert!(
+        twice
+            .iter()
+            .any(|problem| problem.contains("exactly one line")),
+        "{twice:?}"
     );
 }
 

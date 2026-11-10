@@ -3,8 +3,8 @@
 #
 #   ci/linux-test.sh [cargo test arguments]        (or: just linux-test ...)
 #
-# Three hazards decide the shape, all found the hard way (docs/CONCERNS.md,
-# 2026-10-14 and 2026-10-19):
+# Three hazards decide the shape, all found the hard way (2026-10-14 and
+# 2026-10-19):
 #
 # * Never on the bind mount. Docker Desktop's mount misreports the checkout as
 #   root-owned to a root process, and intermittently reports a directory

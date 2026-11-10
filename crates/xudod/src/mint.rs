@@ -3,7 +3,7 @@
 //!
 //! An entry is minted only for a permitted decision. On the password path a
 //! decision that demands confirmation is permitted too — the password `sudo`
-//! asks for *is* the confirmation (decision 6 in `docs/todo/README.md`) — so it
+//! asks for *is* the confirmation — so it
 //! mints with `confirmed = false`, and the gate's `-auth` name is what tells
 //! the gate a password was typed.
 //!

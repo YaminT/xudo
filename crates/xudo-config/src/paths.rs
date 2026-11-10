@@ -22,9 +22,9 @@
 //! # Pure
 //!
 //! Nothing here reads the environment. The values are handed in, because
-//! `std::env::var` is banned in this project's privileged crates for the reason
-//! given in `CLAUDE.md`, and because a path resolver that reads its own inputs
-//! cannot be tested against the cases that matter.
+//! `std::env::var` is banned in this project's privileged crates, because the
+//! caller controls the environment, and because a path resolver that reads its
+//! own inputs cannot be tested against the cases that matter.
 
 use std::path::{Path, PathBuf};
 

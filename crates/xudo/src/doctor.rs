@@ -23,7 +23,7 @@
 //!
 //! * Applying would mean reading a yes from this process's terminal, and a
 //!   confirmation read from the requester's own terminal is one an agent
-//!   driving that terminal can type (`CLAUDE.md`, invariant 3).
+//!   driving that terminal can type.
 //! * Applying would mean running `sudo` from inside xudo, and `sudo` may not
 //!   ask: a credential cached by an earlier command, or a standing `NOPASSWD`
 //!   rule — one of the very things this report finds — would let an agent
