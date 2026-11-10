@@ -56,6 +56,8 @@ The design plan numbers **milestones M1–M7** (technical layers). The user numb
 | `phase-4-ido.md` | `ido` — the buffered human-run command queue, its TUI, `AGENTS.md` integration, and the `willyoumarryme` acceptance test |
 | `phase-5-configuration.md` | Configuration layering and precedence for every binary, plus shipped predefined profiles |
 | `m2b-finish-plan.md` | The exit test for M2b and the step-by-step sequence to reach it (written 2026-10-21) |
+| `m3-plan.md` | M3 design, steps and exit test (done 2026-11-10) |
+| `release-plan.md` | What is left (2026-11-10): owner decisions, release blockers, pre-M4 security criteria, improvements, and plan-document flaws |
 
 Milestones M1(remainder)–M7 are listed below rather than in separate files, because each is already specified in the design plan; what follows is the delta and the ordering.
 
