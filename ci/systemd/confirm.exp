@@ -5,19 +5,21 @@
 set timeout 20
 if {$argc != 1} { exit 2 }
 set action [lindex $argv 0]
-# The system id, outside the gate. uutils answers this; the gate will not run it.
-set user_uid [exec /usr/bin/id -u xudotest]
 # The program the gate is allowed to run. row.sh exports the first regular file
-# of /usr/bin/id and /usr/bin/gnuid. Absent means this harness is on a stock
-# image where /usr/bin/id itself is that file.
-set probe "/usr/bin/id"
-if {[info exists env(XUDO_GATE_EXE)] && $env(XUDO_GATE_EXE) ne ""} {
-    set probe $env(XUDO_GATE_EXE)
+# of /usr/bin/id and /usr/bin/gnuid. An unset value used to fall back to
+# /usr/bin/id, a uutils symlink on stock Ubuntu 26.04, so a case could pass
+# without running the program the gate allows.
+if {![info exists env(XUDO_GATE_EXE)] || $env(XUDO_GATE_EXE) eq ""} {
+    puts stderr "FAIL: XUDO_GATE_EXE is unset"
+    exit 2
 }
+set probe $env(XUDO_GATE_EXE)
 if {![regexp {^/usr/bin/(id|gnuid)$} $probe]} {
     puts stderr "FAIL: XUDO_GATE_EXE is not a probe program"
     exit 2
 }
+# The system id, outside the gate. uutils answers this; the gate will not run it.
+set user_uid [exec /usr/bin/id -u xudotest]
 set probe_cmd "/usr/bin/xudo exec -- $probe -u"
 proc stop_watcher {watcher uid} {
     catch {send -i $watcher "\003"}

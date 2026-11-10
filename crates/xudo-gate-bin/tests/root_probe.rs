@@ -433,8 +433,7 @@ fn the_real_gate_requires_watch_approval_in_addition_to_the_password() {
         return;
     }
     let _journal = install_everything();
-    let mut confirm_rule = RULES.to_owned();
-    confirm_rule.push_str("confirm = \"always\"\n");
+    let confirm_rule = rules_with_id_confirmation();
     root_file(
         &format!("{RULES_DIR}/05-probe.toml"),
         confirm_rule.as_bytes(),
@@ -796,9 +795,18 @@ fn live_test_watcher() -> Pty {
     watcher
 }
 
+fn rules_with_id_confirmation() -> String {
+    // Keep `confirm` inside the id action. Appending it to the whole rules
+    // string would now attach it to gnuid, the last `[[action]]` table.
+    let marker = "\n[[action]]\nid = \"xudo.probe.gnuid\"";
+    let (id_rule, gnuid_rule) = RULES
+        .split_once(marker)
+        .expect("the shipped probe rules keep id before gnuid");
+    format!("{id_rule}\nconfirm = \"always\"{marker}{gnuid_rule}")
+}
+
 fn require_watch_confirmation() {
-    let mut confirm_rule = RULES.to_owned();
-    confirm_rule.push_str("confirm = \"always\"\n");
+    let confirm_rule = rules_with_id_confirmation();
     root_file(
         &format!("{RULES_DIR}/05-probe.toml"),
         confirm_rule.as_bytes(),

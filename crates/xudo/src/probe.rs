@@ -84,6 +84,9 @@ fn chosen_probe(files: &dyn ProbeFiles) -> Option<&'static ProbeCommand> {
         .find(|probe| files.is_regular_file(Path::new(probe.program)))
 }
 
+/// The phrase `ci/deb/row.sh` greps in the package install log.
+const NO_REGULAR_PROBE: &str = "no probe program is a regular file";
+
 /// Why the probe did not run when no candidate was a regular file.
 fn no_regular_probe() -> String {
     let mut listed = String::new();
@@ -93,9 +96,7 @@ fn no_regular_probe() -> String {
         }
         listed.push_str(probe.program);
     }
-    format!(
-        "no probe program is a regular file ({listed}); a symlink or a missing program was not run"
-    )
+    format!("{NO_REGULAR_PROBE} ({listed}); a symlink or a missing program was not run")
 }
 
 /// Probes through the broker at `socket`, running the gate with `runner`.
@@ -497,7 +498,9 @@ mod tests {
             files: &files,
         };
         let text = unavailable(&probe.verify(&argv()));
-        assert!(text.contains("was not run"), "{text}");
+        // `ci/deb/row.sh` greps this phrase. `was not run` is a weaker substring.
+        assert_eq!(NO_REGULAR_PROBE, "no probe program is a regular file");
+        assert!(text.contains(NO_REGULAR_PROBE), "{text}");
         assert!(
             text.contains("/usr/bin/id") && text.contains("/usr/bin/gnuid"),
             "{text}"
@@ -560,10 +563,6 @@ mod tests {
             !host.is_regular_file(Path::new("/usr/bin")),
             "a directory qualified"
         );
-        assert!(
-            !host.is_regular_file(Path::new("/usr/bin/id/../../etc/passwd")),
-            "a path with .. qualified"
-        );
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("regular");
@@ -575,7 +574,13 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert!(!host.is_regular_file(&link), "a symlink qualified");
+        assert!(xudo_sys::trust::verify_path(&link).is_err());
 
+        // A `..` component has to be refused by the trust walk, not by lstat.
+        // `/usr/bin/id/../../etc/passwd` dies in lstat because `id` is not a
+        // directory, so it never reaches that refusal. The same regular file
+        // written with `..` (`/usr/bin/id` becomes `/usr/bin/../bin/id`) lstats
+        // as a file, and `verify_path` then refuses `..`.
         let stock = [
             "/usr/bin/id",
             "/usr/bin/gnuid",
@@ -583,11 +588,31 @@ mod tests {
             "/bin/true",
             "/bin/ls",
         ];
+        let regular = stock
+            .iter()
+            .copied()
+            .find(|path| host.is_regular_file(Path::new(path)));
         assert!(
-            stock
-                .iter()
-                .any(|path| host.is_regular_file(Path::new(path))),
-            "no root-owned regular file among {stock:?}; the true branch was not run"
+            regular.is_some(),
+            "no root-owned regular file among {stock:?}"
         );
+        let regular = regular.unwrap();
+        let plain = Path::new(regular);
+        let parent = plain.parent().unwrap();
+        let parent_name = parent.file_name().unwrap();
+        let dotted = parent
+            .join("..")
+            .join(parent_name)
+            .join(plain.file_name().unwrap());
+        let facts = xudo_sys::trust::stat_path(&dotted).unwrap();
+        assert_eq!(facts.kind, xudo_sys::trust::Kind::File);
+        let refusal = xudo_sys::trust::verify_path(&dotted).unwrap_err();
+        assert_eq!(
+            refusal,
+            xudo_sys::trust::TrustError::NotAbsolute {
+                at: dotted.display().to_string()
+            }
+        );
+        assert!(!host.is_regular_file(&dotted), "a path with .. qualified");
     }
 }

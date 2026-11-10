@@ -5,8 +5,6 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
-- The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so stock Ubuntu 26.04 verifies.
-
 ## 0.1.0-beta.1 - 2026-11-10
 
 ### Added
@@ -38,8 +36,8 @@ All notable changes to xudo are documented here. This project follows
   Landlock confinement are not in this beta.
 - No release has been published. The release workflow signs the package with
   cosign keyless signing when a version tag is pushed.
-- Install probe reports `installed, but NOT VERIFIED` on doas and on
-  multicall-coreutils systems such as stock Ubuntu 26.04 and Alpine. The
-  Ubuntu 26.04 systemd and differential lanes install GNU `id`. Those passes
-  do not show probe support for uutils `/usr/bin/id`.
+- Install probe reports `installed, but NOT VERIFIED` on doas and on a
+  multicall-coreutils system with no regular probe program, such as Alpine.
+- The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a
+  regular file, so stock Ubuntu 26.04 verifies.
 - The audit trail records authorization, not outcomes.
