@@ -38,6 +38,7 @@ if [ -z "${2:-}" ]; then
     deb-systemd-helper enable xudo-pasban.timer >/dev/null
     deb-systemd-invoke start xudo-pasban.timer >/dev/null || true
     write_rule=1
+    cat /usr/share/xudo/first-install-notice >&2
 elif [ -e /etc/sudoers.d/xudo ] || [ -L /etc/sudoers.d/xudo ]; then
     write_rule=1
 elif [ -e /etc/doas.d/60-xudo.conf ] || [ -L /etc/doas.d/60-xudo.conf ] ||
@@ -64,11 +65,3 @@ if [ "$write_rule" -eq 1 ]; then
         fi
     fi
 fi
-
-cat <<'MSG'
-
-xudo (beta): every invocation asks for your password. There is no agent
-path in this release, and nobody was added to the xudo group.
-Agent detection is not a security boundary. Read SECURITY.md first:
-/usr/share/doc/xudo/SECURITY.md
-MSG

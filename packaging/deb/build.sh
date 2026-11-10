@@ -29,6 +29,7 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
     "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
     "$stage/etc/xudo/rules.d" \
     "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
+mkdir -p "$stage/usr/share/xudo"
 
 install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
 ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
@@ -43,7 +44,7 @@ mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \
     "$stage/usr/share/doc/xudo/"
-install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/doc/xudo/"
+install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/xudo/first-install-notice"
 {
     printf 'xudo (%s) unstable; urgency=low\n\n' "$version"
     awk '
