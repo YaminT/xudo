@@ -34,8 +34,8 @@ deb_ver=$(printf '%s\n' "$raw" | tr '-' '~')
 deb="$root/target/deb/xudo_${deb_ver}_${arch}.deb"
 [ -f "$deb" ] || { echo "FAIL: built package not at $deb" >&2; exit 1; }
 
-# Debian 13, Ubuntu 24.04, and Ubuntu 26.04. 26.04 stays while it boots the
-# same way; row.sh reports a distro that cannot verify.
+# Debian 13, Ubuntu 24.04, and Ubuntu 26.04, each as the image ships it.
+# 26.04's /usr/bin/id is a uutils symlink; the install probe uses gnuid.
 images="debian:13 ubuntu:24.04 ubuntu:26.04"
 name=
 cleanup() {
