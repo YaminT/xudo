@@ -17,10 +17,14 @@ getent group xudo >/dev/null || groupadd --system xudo
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/xudo.conf
 else
-    # Same modes as packaging/tmpfiles.d/xudo.conf. Recommends may be off.
+    # Same paths and modes as packaging/tmpfiles.d/xudo.conf. Recommends may be off.
     install -d -m 0755 -o root -g root /run/xudo
     install -d -m 0700 -o root -g root /run/xudo/req
+    install -d -m 0700 -o root -g root /run/xudo/confirm
     install -d -m 0700 -o root -g root /var/lib/xudo
+    if [ ! -e /var/lib/xudo/audit.jsonl ]; then
+        install -m 0600 -o root -g root /dev/null /var/lib/xudo/audit.jsonl
+    fi
 fi
 
 # Upgraded units are ignored until systemd rereads them.
