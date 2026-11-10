@@ -10,6 +10,7 @@ fn stale_confirmation_claim(text: &str) -> bool {
     lower.split(['.', '!', '?']).any(|sentence| {
         sentence.contains("out-of-band confirmation")
             && (sentence.contains("not in this release")
+                || sentence.contains("not in this beta")
                 || sentence.contains("does not exist")
                 || sentence.contains("is not built"))
     })
@@ -40,7 +41,11 @@ fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
 #[test]
 fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = vec!["README.md".to_owned(), "SECURITY.md".to_owned()];
+    let mut files = vec![
+        "README.md".to_owned(),
+        "SECURITY.md".to_owned(),
+        "CHANGELOG.md".to_owned(),
+    ];
     markdown_and_html_files(&root.join("site"), &mut files);
 
     let stale: Vec<_> = files
@@ -59,9 +64,54 @@ fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
 }
 
 #[test]
+fn changelog_puts_an_empty_unreleased_above_the_shipped_version() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let version = manifest
+        .lines()
+        .skip_while(|line| line.trim() != "[workspace.package]")
+        .skip(1)
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("version")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_owned)
+        })
+        .unwrap();
+    let headings: Vec<_> = changelog
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .collect();
+    assert_eq!(headings.first().copied(), Some("## Unreleased"));
+    assert!(
+        headings
+            .get(1)
+            .is_some_and(|heading| heading.starts_with(&format!("## {version}"))),
+        "shipped section is not {version}: {headings:?}"
+    );
+    let unreleased = changelog.split("## Unreleased").nth(1).unwrap();
+    let body = unreleased.split("\n## ").next().unwrap();
+    assert!(
+        body.trim().is_empty(),
+        "Unreleased should stay empty until the next release: {body}"
+    );
+}
+
+#[test]
 fn the_check_catches_stale_claims_and_allows_current_status() {
     assert!(stale_confirmation_claim(
         "Out-of-band confirmation is not in this release."
+    ));
+    assert!(stale_confirmation_claim(
+        "Out-of-band confirmation is not in this beta."
+    ));
+    assert!(!stale_confirmation_claim(
+        "Out-of-band confirmation is built and off by default. The passwordless path is not in this beta."
     ));
     assert!(stale_confirmation_claim(
         "The passwordless path and out-of-band confirmation are not in this release."

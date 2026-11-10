@@ -9,13 +9,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
-xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
-xudo-config = { path = "../xudo-config", version = "0.0.1" }
-xudo-gate = { path = "../xudo-gate", version = "0.0.1" }
-xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
-xudo-sys = { path = "../xudo-sys", version = "0.0.1" }
-xudo-wire = { path = "../xudo-wire", version = "0.0.1" }
+xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
+xudo-backend = { path = "../xudo-backend", version = "0.1.0-beta.1" }
+xudo-config = { path = "../xudo-config", version = "0.1.0-beta.1" }
+xudo-gate = { path = "../xudo-gate", version = "0.1.0-beta.1" }
+xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
+xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
 sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -24,7 +24,9 @@ serde_json.workspace = true
 [dev-dependencies]
 insta.workspace = true
 # The in-memory audit sink, for tests only.
-xudo-sys = { path = "../xudo-sys", version = "0.0.1", features = ["fake"] }
+xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1", features = [
+  "fake",
+] }
 # Errno values, to script the answers a real kernel gives; and in the Linux
 # tests, `waitid(WNOWAIT)` to hold a peer as a zombie, and this process's ids.
 rustix = { version = "1.1", default-features = false, features = [

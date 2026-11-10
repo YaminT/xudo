@@ -9,12 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
-xudo-backend = { path = "../xudo-backend", version = "0.0.1" }
-xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
+xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
+xudo-backend = { path = "../xudo-backend", version = "0.1.0-beta.1" }
+xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 # The five system calls that need `unsafe`. The only crate that may depend on
 # it; everything else reaches those calls through `Syscalls`.
-xudo-sys-raw = { path = "../xudo-sys-raw", version = "0.0.1" }
+xudo-sys-raw = { path = "../xudo-sys-raw", version = "0.1.0-beta.1" }
 bstr.workspace = true
 # Descriptor-relative opens and `fstat`, through rustix's safe API, so the
 # ruleset is verified on the descriptors it is read through. Two users share
@@ -87,12 +87,12 @@ required-features = ["root-tests"]
 
 [dev-dependencies]
 # The root-lane guard every `tests/root_*.rs` begins with.
-xudo-tests = { path = "../xudo-tests", version = "0.0.1" }
+xudo-tests = { path = "../xudo-tests", version = "0.1.0-beta.1" }
 # The system log's path must be the one the configuration crate names, and the
 # journal's alert priority must meet the gate's high-severity mark; both are
 # checked against the other crate rather than restated.
-xudo-config = { path = "../xudo-config", version = "0.0.1" }
-xudo-gate = { path = "../xudo-gate", version = "0.0.1" }
+xudo-config = { path = "../xudo-config", version = "0.1.0-beta.1" }
+xudo-gate = { path = "../xudo-gate", version = "0.1.0-beta.1" }
 # The mountinfo parser is held to the kernel's escaping for arbitrary bytes.
 proptest.workspace = true
 

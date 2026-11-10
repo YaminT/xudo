@@ -4,7 +4,7 @@ expression: "render::json_of(&report)"
 ---
 {
   "schema_version": 1,
-  "xudo_version": "0.0.1",
+  "xudo_version": "0.1.0-beta.1",
   "platform": "test",
   "exec_path": "xudo exec runs /usr/bin/sudo on the gate",
   "kernel": {
