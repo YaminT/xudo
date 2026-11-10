@@ -68,7 +68,7 @@ exe = "/bin/sh"
 args = [{ name = "flag", matcher = { literal = "-c" } }]
 "#;
 
-const ALL_CODES: [DenialCode; 8] = [
+const ALL_CODES: [DenialCode; 11] = [
     DenialCode::UnknownAction,
     DenialCode::ArgvRejected,
     DenialCode::DenyListed,
@@ -77,6 +77,9 @@ const ALL_CODES: [DenialCode; 8] = [
     DenialCode::NoConfirmationChannel,
     DenialCode::HumanPathOnly,
     DenialCode::ExeMismatch,
+    DenialCode::ConfirmationRefused,
+    DenialCode::ConfirmationExpired,
+    DenialCode::ConfirmationThrottled,
 ];
 
 const ALL_REASONS: [ConfirmReason; 3] = [
@@ -150,6 +153,7 @@ fn denial(code: DenialCode) -> Decision {
             Settings {
                 frozen: true,
                 confirm_agent_actions: true,
+                confirm_human_path: false,
             },
         ),
         DenialCode::HumanPathOnly => decide(
@@ -170,6 +174,9 @@ fn denial(code: DenialCode) -> Decision {
             ),
             Settings::default(),
         ),
+        DenialCode::ConfirmationRefused
+        | DenialCode::ConfirmationExpired
+        | DenialCode::ConfirmationThrottled => Decision::deny(code, Vec::new(), Vec::new()),
     }
 }
 
@@ -358,4 +365,17 @@ fn every_denial_code_record_and_rendering_are_pinned() {
             render::json(&decision)
         );
     }
+}
+
+#[test]
+fn a_pending_confirmation_envelope_is_pinned_in_both_renderers() {
+    let id = "0123456789abcdef".repeat(4);
+    insta::assert_snapshot!(
+        "human__pending_confirmation",
+        render::pending_human(&id, 12_345)
+    );
+    insta::assert_snapshot!(
+        "json__pending_confirmation",
+        render::pending_json(&id, 12_345)
+    );
 }

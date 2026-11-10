@@ -5,7 +5,46 @@
 
 use std::fmt::Write as _;
 
+use serde::Serialize;
+
 use xudo_policy::{Confirm, Decision, TraceStep, Verdict};
+
+/// The caller-visible envelope while an out-of-band approval is pending.
+#[derive(Serialize)]
+pub struct PendingEnvelope<'a> {
+    /// Decision envelope schema.
+    pub schema_version: u32,
+    /// This request has not been approved yet.
+    pub verdict: &'static str,
+    /// Full nonce for a later status request or watch interaction.
+    pub request_id: &'a str,
+    /// Remaining request lifetime, supplied by the broker.
+    pub expires_in_ms: u64,
+}
+
+/// Renders the pending approval in human-readable form.
+pub fn pending_human(id: &str, expires_in_ms: u64) -> String {
+    format!(
+        "PENDING\n  request   {}\n  expires   {expires_in_ms} ms\n",
+        short_id(id)
+    )
+}
+
+/// Renders the pending approval as a machine-readable envelope.
+pub fn pending_json(id: &str, expires_in_ms: u64) -> String {
+    let envelope = PendingEnvelope {
+        schema_version: xudo_policy::decision::ENVELOPE_SCHEMA_VERSION,
+        verdict: "pending",
+        request_id: id,
+        expires_in_ms,
+    };
+    to_compact(&envelope)
+}
+
+/// A short id for prose; JSON keeps the full nonce.
+pub fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
 
 /// Renders a decision as prose, with the trace.
 ///
@@ -107,6 +146,11 @@ pub fn json_of<T: serde::Serialize>(value: &T) -> String {
 /// Serializes anything, degrading to a denial envelope on failure.
 fn to_pretty<T: serde::Serialize>(value: &T) -> String {
     ascii_only(&serde_json::to_string_pretty(value).unwrap_or_else(|e| fallback(&e)))
+}
+
+/// Serializes compactly for JSON Lines, degrading to a denial envelope on failure.
+fn to_compact<T: serde::Serialize>(value: &T) -> String {
+    ascii_only(&serde_json::to_string(value).unwrap_or_else(|e| fallback(&e)))
 }
 
 /// JSON text with every byte outside printable ASCII written as a `\uXXXX`
@@ -347,6 +391,28 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .as_str()
                 .is_some_and(|s| s.contains("cannot serialize")),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_compact_serializer_failure_degrades_to_a_denial_envelope() {
+        struct Unserializable;
+
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("test: cannot serialize"))
+            }
+        }
+
+        let text = to_compact(&Unserializable);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["verdict"], "deny");
+        assert_eq!(parsed["denial"], "policy_unloadable");
+        assert!(
+            parsed["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("cannot serialize")
         );
     }
 

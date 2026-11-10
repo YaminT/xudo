@@ -26,6 +26,7 @@ use crate::exec;
 use crate::probe::BrokerProbe;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
+use crate::watch;
 
 /// The root-owned settings file.
 pub const DEFAULT_CONFIG_FILE: &str = "/etc/xudo/config.toml";
@@ -178,6 +179,22 @@ pub enum Command {
         against_journal: bool,
     },
 
+    /// List pending confirmation requests without answering them.
+    Pending,
+
+    /// Watch for confirmation requests on this terminal and answer them.
+    Watch,
+
+    /// Stop requests on the agent path until thawed by root.
+    Freeze {
+        /// Why the broker is being frozen.
+        #[arg(long, required = true, value_name = "TEXT")]
+        reason: String,
+    },
+
+    /// Resume the agent path. Requires uid 0.
+    Thaw,
+
     /// Print the block that tells an agent what it may do.
     Agentdoc {
         /// Which harness to write for.
@@ -282,6 +299,25 @@ pub fn run_with_installer(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    run_with_installer_at_socket(
+        cli,
+        platform,
+        installer,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        out,
+        err,
+    )
+}
+
+/// [`run_with_installer`], with the broker socket supplied by the caller.
+pub fn run_with_installer_at_socket(
+    cli: &Cli,
+    platform: &Platform<'_>,
+    installer: &dyn Installer,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let ops = platform.ops;
     let probe = platform.probe;
     // Loaded up front but not unwrapped: `doctor` is the command an operator
@@ -337,17 +373,23 @@ pub fn run_with_installer(
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
         // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
-        Command::Exec { argv } => exec::plan(
-            cli,
-            argv,
-            probe,
-            Path::new(xudo_wire::BROKER_SOCKET),
-            exec::TIMEOUT,
-            out,
-            err,
-        )
-        .err()
-        .unwrap_or(ExitCode::Unusable),
+        Command::Exec { argv } => {
+            let Some(wait) = exec::configured_timeout(cli, err) else {
+                return ExitCode::Unusable;
+            };
+            exec::plan_with_confirmation_timeout(
+                cli,
+                argv,
+                probe,
+                Path::new(xudo_wire::BROKER_SOCKET),
+                exec::TIMEOUT,
+                wait,
+                out,
+                err,
+            )
+            .err()
+            .unwrap_or(ExitCode::Unusable)
+        }
         Command::Check => with_rules!(|l: &LoadedRules| check(l, out, err)),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
@@ -362,6 +404,15 @@ pub fn run_with_installer(
             out,
             err,
         ),
+        Command::Pending => with_rules!(|l: &LoadedRules| {
+            watch::pending(socket, l.rules(), out, err, &mut watch::ask_live)
+        }),
+        Command::Watch => with_rules!(|l: &LoadedRules| {
+            watch::watch_live(socket, l.rules(), out, err, &mut watch::ask_live)
+        }),
+        Command::Freeze { .. } | Command::Thaw => {
+            broker_control_command(socket, &cli.command, out, err)
+        }
         Command::Agentdoc { format } => with_rules!(|l: &LoadedRules| {
             let _ = write!(
                 out,
@@ -370,6 +421,49 @@ pub fn run_with_installer(
             );
             ExitCode::Delegated
         }),
+    }
+}
+
+fn broker_control_command(
+    socket: &Path,
+    command: &Command,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let question = match command {
+        Command::Freeze { reason } => xudo_wire::Question::Freeze {
+            reason: reason.clone(),
+        },
+        Command::Thaw => xudo_wire::Question::Thaw,
+        _ => return ExitCode::Unusable,
+    };
+    broker_control(socket, question, out, err, &watch::ask_live)
+}
+
+fn broker_control(
+    socket: &Path,
+    question: xudo_wire::Question,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    ask: &dyn Fn(&Path, &xudo_wire::BrokerRequest) -> Result<xudo_wire::BrokerResponse, String>,
+) -> ExitCode {
+    let request = xudo_wire::BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    };
+    match ask(socket, &request) {
+        Ok(response) if response.answer == xudo_wire::Answer::Done => {
+            let _ = writeln!(out, "done");
+            ExitCode::Delegated
+        }
+        Ok(response) => {
+            let _ = writeln!(err, "xudo: {:?}", response.answer);
+            ExitCode::Denied
+        }
+        Err(error) => {
+            let _ = writeln!(err, "xudo: {error}");
+            ExitCode::Unusable
+        }
     }
 }
 
@@ -1089,6 +1183,7 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     Some(Settings {
         confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value
             == ConfigValue::Bool(true),
+        confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
 }
@@ -1131,6 +1226,7 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         out,
         "\n* security-relevant: never settable from the environment."
     );
+    let _ = writeln!(out, "confirm_agent_actions has no effect until M4.");
     ExitCode::Delegated
 }
 
@@ -1184,6 +1280,9 @@ mod tests {
     )]
 
     use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
     use xudo_backend::Capability;
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
     use xudo_config::Setting;
@@ -1261,6 +1360,169 @@ mod tests {
                 String::from_utf8_lossy(&err).into_owned(),
             )
         }
+
+        fn run_at_socket(&self, args: &[&str], socket: &Path) -> (ExitCode, String, String) {
+            let mut full = vec!["xudo", "--rules", self.dir.to_str().unwrap()];
+            full.extend_from_slice(args);
+            let cli = Cli::try_parse_from(full).unwrap();
+            let ops = host_ops();
+            let platform = Platform {
+                ops: ops.as_ref(),
+                probe: &HostProbe,
+                host: &LiveHost,
+                path: None,
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_with_installer_at_socket(
+                &cli,
+                &platform,
+                &RefusingInstaller,
+                socket,
+                &mut out,
+                &mut err,
+            );
+            (
+                code,
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        }
+    }
+
+    #[test]
+    fn pending_command_uses_the_read_only_broker_question() {
+        let fixture = fixture("cli-pending");
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            let request = xudo_wire::BrokerRequest::parse(&bytes).unwrap();
+            assert_eq!(request.question, xudo_wire::Question::Pending);
+            let response = xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Watching {
+                    prompts: Vec::new(),
+                    omitted: 0,
+                },
+            };
+            stream.write_all(response.to_json().as_bytes()).unwrap();
+        });
+        let (code, out, err) = fixture.run_at_socket(&["pending"], &socket);
+        broker.join().unwrap();
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, "");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn freeze_command_dispatches_and_fails_closed_without_the_broker() {
+        let (code, _, _) =
+            fixture("cli-freeze-no-broker").run(&["freeze", "--reason", "maintenance"]);
+        assert_eq!(code, ExitCode::Unusable);
+        let (code, _, _) = fixture("cli-thaw-no-broker").run(&["thaw"]);
+        assert_eq!(code, ExitCode::Unusable);
+    }
+
+    #[test]
+    fn broker_control_renders_done_refusal_and_transport_error() {
+        let seen_question = std::cell::RefCell::new(None);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ask_done = |_: &Path, request: &xudo_wire::BrokerRequest| {
+            *seen_question.borrow_mut() = Some(request.question.clone());
+            Ok(xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Done,
+            })
+        };
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Thaw,
+                &mut out,
+                &mut err,
+                &ask_done
+            ),
+            ExitCode::Delegated
+        );
+        assert_eq!(*seen_question.borrow(), Some(xudo_wire::Question::Thaw));
+        assert_eq!(out, b"done\n");
+
+        let ask_refused = |_: &Path, request: &xudo_wire::BrokerRequest| {
+            assert!(
+                matches!(&request.question, xudo_wire::Question::Freeze { reason } if reason == "maintenance")
+            );
+            Ok(xudo_wire::BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: xudo_wire::Answer::Refused {
+                    code: xudo_wire::RefusalCode::RequestUnknown,
+                    remediation: "refused".to_owned(),
+                    detail: None,
+                },
+            })
+        };
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Freeze {
+                    reason: "maintenance".to_owned()
+                },
+                &mut out,
+                &mut err,
+                &ask_refused
+            ),
+            ExitCode::Denied
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("Refused"));
+
+        let ask_error = |_: &Path, _: &xudo_wire::BrokerRequest| Err("offline".to_owned());
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Thaw,
+                &mut out,
+                &mut err,
+                &ask_error
+            ),
+            ExitCode::Unusable
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("offline"));
+
+        assert_eq!(
+            broker_control_command(
+                Path::new("socket"),
+                &Command::Doctor {
+                    json: false,
+                    fix: false
+                },
+                &mut out,
+                &mut Vec::new()
+            ),
+            ExitCode::Unusable
+        );
+        assert_eq!(
+            broker_control_command(
+                Path::new("missing-socket"),
+                &Command::Thaw,
+                &mut out,
+                &mut err
+            ),
+            ExitCode::Unusable
+        );
+    }
+
+    #[test]
+    fn watch_command_refuses_a_non_terminal_before_contacting_the_broker() {
+        let fixture = fixture("cli-watch-notty");
+        let socket = fixture.dir.join("no-broker.sock");
+        let (code, out, err) = fixture.run_at_socket(&["watch"], &socket);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("watch requires a terminal on stdin"), "{err}");
     }
 
     #[test]
@@ -3204,6 +3466,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         ]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(err.contains("settings file was not applied"), "{err}");
+
+        let (code, _, err) = fx.run(&[
+            "--config-file",
+            path.to_str().unwrap(),
+            "exec",
+            "--",
+            "/usr/bin/systemctl",
+            "restart",
+            "nginx.service",
+        ]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("settings file was not applied"), "{err}");
     }
 
     #[test]
@@ -3216,6 +3490,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(out.contains("<default>"), "{out}");
         assert!(out.contains("use_pty"), "{out}");
         assert!(out.contains("<compiled-in>"), "{out}");
+        assert!(
+            out.contains("confirm_agent_actions has no effect until M4"),
+            "{out}"
+        );
         // Security-relevant settings are marked, and the legend explains it.
         assert!(out.contains("* confirm_agent_actions"), "{out}");
         assert!(out.contains("  color"), "{out}");

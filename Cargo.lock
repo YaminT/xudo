@@ -248,7 +248,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "ido"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "clap",
  "serde",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "ido-bin"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "ido",
  "rustix",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "term-sanitize"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "proptest",
 ]
@@ -767,10 +767,11 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "xudo"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "clap",
  "insta",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -786,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-audit"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "insta",
  "serde",
@@ -798,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-backend"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -807,11 +808,12 @@ dependencies = [
 
 [[package]]
 name = "xudo-bin"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "rustix",
  "serde_json",
  "xudo",
  "xudo-tests",
@@ -819,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-config"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -829,8 +831,9 @@ dependencies = [
 
 [[package]]
 name = "xudo-gate"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
+ "insta",
  "serde",
  "serde_json",
  "thiserror",
@@ -842,13 +845,14 @@ dependencies = [
 
 [[package]]
 name = "xudo-gate-bin"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "assert_cmd",
  "predicates",
  "rustix",
  "xudo-audit",
  "xudo-backend",
+ "xudo-config",
  "xudo-gate",
  "xudo-sys",
  "xudo-tests",
@@ -858,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-policy"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "bstr",
  "insta",
@@ -873,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-sys"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "bstr",
  "proptest",
@@ -891,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-sys-raw"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "libc",
  "rustix",
@@ -900,14 +904,14 @@ dependencies = [
 
 [[package]]
 name = "xudo-tests"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "xudo-wire"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "insta",
  "serde",
@@ -918,11 +922,14 @@ dependencies = [
 
 [[package]]
 name = "xudod"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "insta",
+ "proptest",
  "rustix",
+ "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "xudo-audit",
  "xudo-backend",
@@ -935,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "xudod-bin"
-version = "0.0.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "xudo-sys",
  "xudo-wire",

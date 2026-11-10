@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 
 use xudo_audit::record::Record;
-use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION};
+use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION};
 use xudo_policy::{ActionId, CallerFacts, Classification, Decision, DenialCode, Source, Verdict};
 use xudo_sys::{Attestation, SpoolError};
 use xudo_wire::{BrokerRequest, RefusalCode};
@@ -30,6 +30,9 @@ fn identity() -> PeerIdentity {
         uid: 1000,
         gid: 100,
         starttime: 998_877,
+        sid: 1,
+        tty: 0,
+        diverged: true,
         pinned: true,
         cgroup_id: Some(77),
         euid_source: EuidSource::PidfdInfo,
@@ -77,9 +80,17 @@ fn entry() -> PendingRequest {
         program: "/usr/bin/systemctl".to_owned(),
         argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
         generation: 7,
-        deadline: MonotonicSecs(1_900),
+        deadline: BoottimeMillis(1_900),
         confirmed: false,
         confirmed_by: None,
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: 1000,
+        caller_sid: 10,
+        caller_tty: 20,
+        needs_watch: false,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: "0".repeat(64),
         claimed_classification: "enrolled-agent-yolo".to_owned(),
     }
 }

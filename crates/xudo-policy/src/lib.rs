@@ -63,7 +63,7 @@ pub mod rule;
 
 pub use argv::{Arg, Argv};
 pub use caller::{CallerFacts, Classification, Hint, HintSource};
-pub use decision::{Confirm, Decision, DenialCode, ExitCode, TraceStep, Verdict};
+pub use decision::{Confirm, ConfirmReason, Decision, DenialCode, ExitCode, TraceStep, Verdict};
 pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_list};
 pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{

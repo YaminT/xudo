@@ -1,8 +1,246 @@
 # Concerns, decisions, and things you need to know
 
-Running log. Newest section first. This is where commentary lives instead of a chat transcript, so it should be readable cold, months later, by someone who was not here.
+## 2026-11-10 — Journald send retries EINTR inside its deadline
+
+`sendto` with `SO_SNDTIMEO` is not restarted after a signal, so `EINTR` means the datagram was not queued. The mirror treated that errno as a refusal. A signal during a blocked send denied the decision, and that is what failed `a_stalled_journald_refuses_within_the_timeout_instead_of_hanging` under a loaded `just verify`. The send now retries until the original monotonic deadline, with the socket timeout shrunk to the time still left (and one microsecond held back so timeval rounding cannot outlast it). Any other error, or the deadline, refuses. A signal storm cannot extend the wait or hang it.
+
+Other blocking calls in `xudo-sys` were checked and do not have this bug. Nothing here calls `connect`. The broker connection's `read_to_end` and `write_all` already retry `EINTR` inside std, so a signal is not a refusal there; they also leave the original `SO_RCVTIMEO` / `SO_SNDTIMEO` in place, so a signal can stretch that wait — a different bug. The pidfd liveness poll is non-blocking (timeout zero): `EINTR` is already fail-closed, and a zero budget cannot retry one interrupt without spinning or racing the clock. `pread` and the non-blocking audit `flock` likewise fail closed on `EINTR` and have no timed wait to resume.
+
+## 2026-11-10 — Confirmation scans cover the full spool
+
+Freeze denial, pending listing, and watcher scans now share the broker's 80-entry walk bound. Their full mixed-spool regression covers the final entry, including an approved enrolled-agent denial and audit. Wire and gate parsers also recheck decoded schema versions, with regression coverage for stale spool schemas and nested duplicate response keys.
+
+## 2026-11-10 — M3 closeout
+
+M3 exit tests:
+
+1. **Done.** Shared trusted settings: gate and broker load through the shared trusted loader (step 1 tests).
+2. **Done.** Approval, denial, TTL, and timeout: `just systemd-test`; the step 9 Debian 13, Ubuntu 24.04, and Ubuntu 26.04 lanes passed.
+3. **Done.** No watcher denies immediately: `no_watcher_denies_at_once` in the systemd-test lane.
+4. **Partly done.** stdin, `/dev/tty`, same-session, and same-terminal attacks are covered by the step 9 lane. A same-uid agent can use `setsid` and `script -qc 'xudo watch'`; session and tty do not prove a human. M4's cgroup scope completes this guarantee.
+5. **Done.** Sanitized prompt, reaction floor, duplicate suppression, backoff, watch-only approval, read-only pending, and snapshots: broker/front-end unit tests and `just systemd-test`.
+6. **Done.** `watch_in_a_user_namespace_is_refused` runs for real in `just systemd-test` on all three images; see step 9.
+7. **Partly done.** Freeze/thaw tests pass, including the root lane. Freeze has no effect on new or human requests until M4 because all M3 callers are unattested. The orchestrator decision remains flagged for the owner; the owner had earlier been told freeze would deny human requests too. See the step 8 entry below.
+8. **Done.** `just verify`, `just root-test`, `just units`, `just systemd-test`, and the step 9 Linux acceptance matrix passed.
+
+Open limits: same-uid watcher separation needs M4 cgroups; `UnixStream::connect` is unbounded; each status poll starts a broker at about 296–299 ms, and watch round-trip takes about one second (step 9 measurements).
+
+## 2026-11-09 — M3 step 8: freeze semantics
+
+The owner was asked about freeze as “deny every request, human ones included,”
+but the plan and engine say freeze stops the agent path and the human path
+keeps running. Step 8 was built per plan and engine; the owner may want the
+stricter version, so flag this for review.
+
+**Decision taken while the owner was away (review please).** In M3 every
+caller is `Unattested`, so the engine's `frozen` never fires on a new request
+and freeze changes nothing for new or human requests until M4 (agent
+enrollment). Review found the first build also denied every pending entry and
+added a backoff strike for it, which let any user deny another user's human
+request: a cross-user denial of service on the path freeze is meant to leave
+alone. Now freeze denies only pending or approved entries whose recorded
+classification is an enrolled agent's (none exist in M3), and a freeze denial
+adds no strike. Human requests stay pending. The recorded classification is
+the caller's claim; M4 must store the attested class on the entry first. If
+you want the stricter "freeze denies humans too", it is a one-line change in
+`frozen_agent_entry` plus the engine.
+
+## 2026-11-09 — M3 step 7
+
+A lost race can leave a fresh pending entry that a human will see in `xudo watch`.
+
+The broker returns one eligible prompt per heartbeat, preferring a request
+already shown to that watcher and otherwise selecting the oldest mint (the
+earliest deadline, since entries use a fixed lifetime). It writes an entry only
+when it first pins its display to that watcher. The front-end follows every
+heartbeat: a changed prompt replaces the active one after flushing typeahead,
+and a missing prompt clears it. A rejected answer clears local state so the
+broker can re-deliver the same request if it is still pending, or advance to
+the next request if it expired, was denied, or was answered elsewhere. The
+read-only `pending` response is byte-budgeted and reports omitted requests.
+Displayed argv is individually shell-quoted after backslashes and control
+characters are escaped, with a warning when escaping changes the display;
+claimed classification and broker evidence appear on separate lines. The
+watcher requires stdin to be its controlling terminal, flushes typeahead, and
+does not alter terminal modes. Approval still adds to the password
+requirement. A same-uid process can still start its own watcher before M4
+supplies cgroup separation.
+
+The broker sorts by earliest deadline; this is the same as oldest mint time
+while all entries share one lifetime.
+
+## 2026-11-09 — M3 step 9: packaging and end-to-end proof
+
+The shipped `.deb` passed the confirmation acceptance under systemd as PID 1
+on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. On all three images these cases
+passed: `no_watcher_denies_at_once` (exit 18, no entry minted),
+`timeout_zero_returns_pending_and_the_entry_stays` (including the
+pending-entry survival check),
+`approve_then_rerun_then_password_runs_as_root`,
+`deny_runs_nothing_and_exits_18`,
+`a_positive_timeout_returns_pending_or_denied_within_the_bound`,
+`self_approval_from_the_requesters_stdin_fails`,
+`self_approval_through_dev_tty_fails`,
+`watch_started_in_the_requesters_session_is_refused`,
+`freeze_creates_the_frozen_file`,
+`freeze_then_human_password_path_runs`,
+`xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user`, and
+`xudo_thaw_works_as_root_and_removes_the_frozen_file`.
+
+`watch_in_a_user_namespace_is_refused` runs for real in `just systemd-test` on
+all three images. The user-namespace case is run by root, so the host's
+`kernel.apparmor_restrict_unprivileged_userns=1` does not apply and no sysctl
+is touched. The watcher runs inside a namespace that maps only the xudotest uid
+and the xudo gid, which the broker treats as diverged; the requester must get
+`no_confirmation_channel` while that watcher is demonstrably running.
+
+util-linux 2.39 (Ubuntu 24.04) maps through `newuidmap`, so the harness grants
+root a one-id subuid/subgid range inside the throwaway container.
+
+A case that cannot run is never silent: it prints `SKIP: <case>: <reason>` and
+fails the lane unless `XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1` names that one opt-out.
+
+The approve case now requires sudo's password prompt to appear. Non-root thaw
+is refused by the broker (“thaw requires uid 0”, exit 17), not by sudo. Freeze
+is checked by the presence of `/var/lib/xudo/frozen`. Expiry at the TTL is
+covered by the broker's unit tests, not by this lane.
+
+| Systemd image | Watch round-trip | Positive wait (`n = 2`) | Broker starts / average start cost |
+| --- | ---: | ---: | ---: |
+| Debian 13 | 1,012 ms | 2,096 ms | 7 / 299 ms |
+| Ubuntu 24.04 | 993 ms | 2,077 ms | 7 / 296 ms |
+| Ubuntu 26.04 | 1,014 ms | 2,089 ms | 7 / 298 ms |
+
+The positive-wait measurement is from request submission to its exit, before
+watcher cleanup; each is within the configured 2-second timeout plus the
+5-second bound. The separate end-to-end lane took about 4 minutes 20 seconds
+for the three-image matrix. A positive timeout starts one sandboxed broker
+for each status poll: these runs measured about 296–299 ms per start. The
+default timeout remains zero and does not poll.
+
+`just units` accepted every packaged unit; the highest exposure stayed at
+1.2, the existing ceiling. `just root-test` passed all 45 root tests.
+`just verify` finished with `gate: all checks passed`. The step-7 note above
+records the sorting comment correction: earliest deadline is oldest mint time
+while all entries share one lifetime.
+
+## 2026-11-09 — M3 step 6: bounded `exec` wait
+
+`confirmation_timeout_secs` is a front-end setting, defaults to 0, and is
+bounded at 600 seconds. A positive wait polls the broker's pinned `status`
+question every 500 ms; an approved status causes the same run request to be
+sent again so the broker consumes the one-use approval before the gate runs;
+that consuming request is capped at five seconds. The n / n+5 second wait
+bound begins after the first pending answer. If approval expires or is consumed
+before the re-run, `xudo` returns 18 and leaves no newly consumed gate entry;
+the broker removes an expired approval through its expiry transition.
+
+The requester never reads stdin, stdout, or `/dev/tty` for confirmation. JSON
+pending updates are compact JSON Lines. `UnixStream::connect` itself has no
+timeout, so the socket connection attempt is still outside the read/write
+deadlines; this is pre-existing in `ask` and remains a boundedness limitation.
+Timeout and pending output are snapshotted in both renderers.
+
+The 600-second validation is in shared `Settings::apply`, so a system config
+above that value now fails closed in the broker and gate as well as the front
+end. That propagation is intentional.
+
+## 2026-11-09 — M3 step 5 review notes
+
+Two low-severity concerns remain, and both fail closed. A throttled request
+from the same process writes its grant record before its denial record. A
+hand-written client can hold a pending entry and re-run a different approved
+command, causing the gate to refuse its own approval as ambiguous. Neither
+path executes a command without the gate's independent checks.
+
+## 2026-11-09 — M3 step 5: broker confirmation serving is done
+
+The broker dispatches `status`, `watch`, and `answer`; a watched `run` returns a
+pending id, and a run needing confirmation is denied as
+`no_confirmation_channel` without minting when no live watcher is present.
+Approval uses `confirm::answer`, audit authorization, and inode-checked
+`Spool::replace`. ConfirmDir stores one bounded JSON record per uid, including
+the watcher heartbeat and backoff table. Liveness requires a heartbeat no
+older than three seconds and a matching `/proc` pid and start time. The
+front-end reports pending with exit 18. No new crate or coverage waiver was
+added.
+
+The review found and fixed denial strikes, replayable approvals, consume-before-record
+ordering, password-only expiry sweeps, cross-uid failures from broken state files,
+oversized watcher prompts, and requester-session watcher liveness. Consumed gate
+entries now carry a distinct state and a deadline capped at the earlier of the
+entry TTL and two minutes after use. Confirm state uses a compact bounded format;
+unreadable state refuses that uid until operator repair. Regression tests cover
+each finding. `script -qc 'xudo watch' /dev/null` creates a new session and pty in
+one command (the known setsid-plus-pty limit); the password still holds.
+
+A follow-up review found that mint's spool sweep treated an exited requester as
+stale even for pending and approved watch entries. Since timeout-zero `exec`
+exits immediately, another mint could silently erase a request or approval and
+let alternating requests evade duplicate throttling. The sweep now preserves
+those entries through their TTL, counts them against their recorded uid, and
+leaves expiry to the audited expiry path. A live pending or approved watch entry
+for the same caller pin now refuses every new run as `confirmation_throttled`;
+non-watch and consumed entries still supersede. If the confirmation directory
+is unavailable, expired watch entries are silently pruned after a 60-second
+grace; while it is available the audited expiry path owns their removal.
+
+## 2026-11-08 — M3 step 4: pure confirmation state, adversarial closeout
+
+`xudod::confirm` models pending, approved, denied, and expired entries without
+I/O or clock reads. One shared `WatcherPin` rule is used by broker and gate:
+same uid as the requester, different session and terminal, live pid, and no
+requester process identity. The plan's alternative allowing uid 0 is
+deliberately narrowed: root watchers cannot approve another user's request.
+Watch terminals are pts majors 136–143 and virtual console major 4, minors
+1–63; ttyS serial devices (major 4, minor 64+) are not interactive watch
+terminals. `shown_at_ms` is pinned to the watcher who saw the prompt, so the
+2 s floor cannot be borrowed by a second watcher.
+
+An approval is consumed only from a coherent `Approved` entry before deadline,
+for the same uid, exact program/argv, policy generation, and governing action.
+Reloading policy or changing the governing action leaves the approval
+unconsumed. Minting honors `confirm_human_path`; a disabled setting does not
+create a watch requirement. Fingerprints frame uid, program, argument count,
+and every argument. The gate refuses inconsistent watcher state, unknown
+confirmation states, non-terminal pins, and absent required fields. The
+`confirm_human_path` path still requires both this approval and the password.
+Step 5 will connect these functions to spool transitions.
+
+## 2026-11-07 — M3 step 3: wire schema 2
+
+The broker protocol now carries one `question` per connection under schema 2.
+The `run` question uses the existing policy and mint path; `status`, `watch`,
+`answer`, `freeze` and `thaw` currently receive `request_unknown` until step 5
+adds their state. Request nonce IDs are exactly 64 lowercase hexadecimal
+characters. New question and answer strings and lists have explicit bounds.
+`Minted` now returns relative `expires_in_ms`; no client read `ttl_secs`, so
+both it and the client-visible boottime deadline were removed. Confirmation
+denials append as 9–11 and map to exit 18; refusal codes append as 15–17.
+Schema 1 requests receive `request_wrong_schema`.
+Serde also accepts array/positional enum forms and unit variants as plain strings; these pre-existing forms cannot carry extra fields.
 
 ---
+
+
+Running log. Newest section first. This is where commentary lives instead of a chat transcript, so it should be readable cold, months later, by someone who was not here.
+
+## 2026-11-07 — M3 step 2: boottime deadline units
+
+Use `CLOCK_BOOTTIME` milliseconds for broker and gate deadlines so suspend
+counts against the request TTL. Spool entries move to schema 2; the gate
+refuses schema 1 because its `CLOCK_MONOTONIC` seconds cannot safely be
+interpreted as boottime milliseconds. Wire response shape stays unchanged:
+`Minted.deadline` is now boottime milliseconds and `ttl_secs` remains seconds.
+Nested-pid-namespace detection is tested on fixtures only because the Linux
+lane cannot `unshare`. The audit decision record now labels its millisecond
+deadline `deadline_ms=`.
+
+---
+
+## 2026-11-07 — M3 step 1
+
+The gate and broker now derive settings from `/etc/xudo/config.toml` through the shared `xudo-gate::policy::load` trusted-file walk; open item 8 below is closed. `confirm_human_path = true` requires both a watch approval and the password. Until M3 step 5, the broker still mints the entry and the gate refuses after the password when this setting is on; the key is off by default.
 
 ## 2026-11-07 — doctor reports rule drift and skipped sudoers snippets
 
@@ -864,13 +1102,8 @@ records the order, because Rust's own runtime fills a closed descriptor before
    `MAX_SPOOL_NAMES` (4096, against the broker's 64) is a bound on what a
    spool someone else filled can make it read, and the listing stops one name
    past it (`Spool::names_up_to`, reconciliation 4).
-8. **The gate does not read `/etc/xudo/config.toml`.** Before M3's `freeze` or
-   M4's enrolment can make `frozen` or `confirm_agent_actions` bite, the gate
-   must read the same file through the same walk and derive the same settings
-   as the broker, and the two must be one function: `settings_from` is in
-   `xudod::policy` today, which `xudo-gate` cannot depend on (the dependency
-   runs the other way), so it belongs in `xudo-gate` (or lower) and the broker
-   should call it from there.
+8. **Closed — M3 step 1.** The gate loads the trusted config and shares
+   `xudo-gate::settings_from` with the broker; see the dated entry at the top.
 9. **The audit trail is the gate's alone until D1** (reconciliation 3), and the
    post-execution outcome of an exec-in-place gate is D1's to decide.
 10. **A time namespace** is argued, not measured (reconciliation 2).

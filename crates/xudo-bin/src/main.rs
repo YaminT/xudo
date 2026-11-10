@@ -34,7 +34,7 @@ fn exec(
         Ok(plan) => plan,
         Err(status) => return exit_status(status.as_i32()),
     };
-    // The path is a constant from the library, absolute, never searched for.
+    // The path is absolute and never searched for.
     #[allow(clippy::disallowed_methods)]
     let mut command = std::process::Command::new(plan.backend);
     command.arg(plan.gate);

@@ -122,6 +122,8 @@ pub struct Settings {
     ///
     /// Defaults to `true` via [`Settings::default`].
     pub confirm_agent_actions: bool,
+    /// Whether human-path confirmation rules also require a watch approval.
+    pub confirm_human_path: bool,
     /// Whether the agent path is frozen.
     pub frozen: bool,
 }
@@ -130,6 +132,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             confirm_agent_actions: true,
+            confirm_human_path: false,
             frozen: false,
         }
     }
@@ -591,7 +594,7 @@ mod tests {
         let strict = RuleSet::load(vec![always]).unwrap();
         let off = Settings {
             confirm_agent_actions: false,
-            frozen: false,
+            ..Settings::default()
         };
         assert_eq!(
             evaluate(&strict, &agent(), &restart_request(), off).verdict,
@@ -667,6 +670,7 @@ mod tests {
         let frozen = Settings {
             confirm_agent_actions: true,
             frozen: true,
+            ..Settings::default()
         };
         let denied = evaluate(&rules(), &agent(), &restart_request(), frozen);
         assert_eq!(denied.denial, Some(DenialCode::Frozen));
@@ -954,6 +958,7 @@ mod tests {
         let frozen = Settings {
             confirm_agent_actions: true,
             frozen: true,
+            ..Settings::default()
         };
         assert_eq!(
             evaluate(&rules(), &unattested, &restart_request(), frozen).verdict,
@@ -1292,6 +1297,7 @@ mod tests {
         let frozen = Settings {
             confirm_agent_actions: true,
             frozen: true,
+            ..Settings::default()
         };
         // Even with nothing in the ruleset: the freeze is the answer, not a
         // missing rule that would send an operator hunting.

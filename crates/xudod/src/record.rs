@@ -32,14 +32,13 @@ pub fn decided(
 ) -> Record {
     let mut evidence = vec!["broker=xudod".to_owned()];
     evidence.extend(identity_evidence(identity));
-    evidence.push(format!(
-        "claimed_classification={}",
-        request.claimed_classification
-    ));
+    if let Some((_, _, claimed)) = request.run_fields() {
+        evidence.push(format!("claimed_classification={claimed}"));
+    }
     evidence.push(format!("generation={}", generation.hex()));
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
-        evidence.push(format!("deadline={}", entry.deadline.0));
+        evidence.push(format!("deadline_ms={}", entry.deadline.0));
     }
 
     // A minted entry is recorded as the gate will read it, which is what
@@ -79,10 +78,10 @@ pub fn refused(
         evidence.extend(identity_evidence(identity));
     }
     if let Some(request) = request {
-        evidence.push(format!(
-            "claimed_classification={}",
-            request.claimed_classification
-        ));
+        evidence.push(format!("question={}", question_kind(&request.question)));
+        if let Some((_, _, claimed)) = request.run_fields() {
+            evidence.push(format!("claimed_classification={claimed}"));
+        }
     }
     Record::after(
         previous,
@@ -95,12 +94,27 @@ pub fn refused(
     .with_outcome(Outcome::NotExecuted)
 }
 
+fn question_kind(question: &xudo_wire::Question) -> &'static str {
+    match question {
+        xudo_wire::Question::Run { .. } => "run",
+        xudo_wire::Question::Status { .. } => "status",
+        xudo_wire::Question::Watch => "watch",
+        xudo_wire::Question::Pending => "pending",
+        xudo_wire::Question::Answer { .. } => "answer",
+        xudo_wire::Question::Freeze { .. } => "freeze",
+        xudo_wire::Question::Thaw => "thaw",
+    }
+}
+
 /// The evidence for how the peer was identified.
 fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
     let mut evidence = vec![
         format!("rung={}", identity.rung.mechanism()),
         format!("peer_pid={}", identity.pid),
         format!("peer_starttime={}", identity.starttime),
+        format!("peer_sid={}", identity.sid),
+        format!("peer_tty={}", identity.tty),
+        format!("diverged={}", identity.diverged),
         format!("peer_uid={}", identity.uid),
         format!("peer_gid={}", identity.gid),
         format!("pinned={}", identity.pinned),
@@ -114,9 +128,13 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
 
 /// The request's command as one argv, program first, exactly as asked.
 fn command_of(request: &BrokerRequest) -> Vec<String> {
-    let mut command = vec![request.program.clone()];
-    command.extend(request.argv.iter().cloned());
-    command
+    request
+        .run_fields()
+        .map_or_else(Vec::new, |(program, argv, _)| {
+            let mut command = vec![program.to_owned()];
+            command.extend(argv.iter().cloned());
+            command
+        })
 }
 
 /// The audit trail's word for a verdict.
@@ -146,6 +164,9 @@ mod tests {
             uid: 1000,
             gid: 100,
             starttime: 998_877,
+            sid: 1,
+            tty: 0,
+            diverged: false,
             pinned: true,
             cgroup_id,
             euid_source: EuidSource::PidfdInfo,
@@ -169,6 +190,49 @@ mod tests {
         )
     }
 
+    #[test]
+    fn refusal_records_name_every_question_kind_without_its_secret_fields() {
+        let refusal = Refusal::client(RefusalCode::RequestUnknown, "private detail");
+        for (question, kind) in [
+            (
+                xudo_wire::Question::Run {
+                    program: "/bin/id".to_owned(),
+                    argv: Vec::new(),
+                    claimed_classification: "x".to_owned(),
+                },
+                "run",
+            ),
+            (xudo_wire::Question::Status { id: "a".repeat(64) }, "status"),
+            (xudo_wire::Question::Watch, "watch"),
+            (xudo_wire::Question::Pending, "pending"),
+            (
+                xudo_wire::Question::Answer {
+                    id: "a".repeat(64),
+                    token: "secret-token".to_owned(),
+                    approve: true,
+                },
+                "answer",
+            ),
+            (
+                xudo_wire::Question::Freeze {
+                    reason: "secret-reason".to_owned(),
+                },
+                "freeze",
+            ),
+            (xudo_wire::Question::Thaw, "thaw"),
+        ] {
+            let request = BrokerRequest {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                question,
+            };
+            let record = refused(None, &refusal, None, Some(&request));
+            assert!(record.evidence.contains(&format!("question={kind}")));
+            let evidence = record.evidence.join(" ");
+            assert!(!evidence.contains("secret-token"));
+            assert!(!evidence.contains("secret-reason"));
+        }
+    }
+
     fn generation() -> Generation {
         xudo_policy::load_rule_files(Vec::new()).unwrap().generation
     }
@@ -188,6 +252,31 @@ mod tests {
     }
 
     #[test]
+    fn a_non_run_decision_record_does_not_invent_a_command_or_claim() {
+        let request = BrokerRequest {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Watch,
+        };
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let record = decided(
+            None,
+            &decision,
+            &caller(),
+            &identity(None),
+            &request,
+            &generation(),
+            None,
+        );
+        assert!(record.argv.is_empty());
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("claimed_classification="))
+        );
+    }
+
+    #[test]
     fn a_minted_decision_records_the_pin_the_rule_the_nonce_and_the_unheeded_claim() {
         let entry = PendingRequest {
             schema_version: xudo_gate::request::REQUEST_SCHEMA_VERSION,
@@ -198,9 +287,17 @@ mod tests {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
-            deadline: xudo_gate::request::MonotonicSecs(1_900),
+            deadline: xudo_gate::request::BoottimeMillis(1_900),
             confirmed: false,
             confirmed_by: None,
+            state: xudo_gate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent-yolo".to_owned(),
         };
         let record = decided(
@@ -233,7 +330,7 @@ mod tests {
             "claimed_classification=enrolled-agent-yolo".to_owned(),
             format!("generation={}", generation().hex()),
             format!("nonce={}", "ab".repeat(32)),
-            "deadline=1900".to_owned(),
+            "deadline_ms=1900".to_owned(),
         ] {
             assert!(
                 record.evidence.contains(&expected),

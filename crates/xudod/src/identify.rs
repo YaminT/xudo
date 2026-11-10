@@ -63,6 +63,12 @@ pub struct PeerIdentity {
     pub gid: u32,
     /// Its start time, from `/proc/<pid>/stat`, in clock ticks since boot.
     pub starttime: u64,
+    /// Session id from the peer's `/proc/<pid>/stat`.
+    pub sid: i64,
+    /// Controlling terminal number; zero means no controlling terminal.
+    pub tty: i64,
+    /// Whether namespace facts diverge from the broker's identity namespace.
+    pub diverged: bool,
     /// Whether a pidfd held the process while `/proc` was read and the
     /// re-check through it found the process unreaped afterwards.
     ///
@@ -242,10 +248,19 @@ pub fn identify(
         None => None,
     };
 
-    let starttime = read_starttime(cred.pid, peers)?;
+    let stat = read_stat(cred.pid, peers)?;
+    let status = peers.read_proc(cred.pid, ProcFile::Status);
+    let namespaces = namespace_facts(cred.pid, peers, status.as_ref().ok().map(Vec::as_slice));
     let (current_euid, euid_source) = match info.as_ref().and_then(PidfdInfo::creds) {
         Some(creds) => (creds.euid, EuidSource::PidfdInfo),
-        None => (read_euid(cred.pid, peers)?, EuidSource::ProcStatus),
+        None => match status {
+            Ok(bytes) => (
+                parse_status_euid(&format!("/proc/{}/status", cred.pid), &bytes)
+                    .map_err(IdentifyError::Proc)?,
+                EuidSource::ProcStatus,
+            ),
+            Err(error) => return Err(IdentifyError::Proc(error)),
+        },
     };
     if current_euid != cred.uid {
         return Err(IdentifyError::CredentialsChanged {
@@ -264,7 +279,10 @@ pub fn identify(
         pid: cred.pid,
         uid: cred.uid,
         gid: cred.gid,
-        starttime,
+        starttime: stat.starttime,
+        sid: stat.session,
+        tty: stat.tty_nr,
+        diverged: namespaces,
         pinned: pin.is_some(),
         cgroup_id: info.as_ref().and_then(PidfdInfo::cgroup_id),
         euid_source,
@@ -317,7 +335,7 @@ fn kernel_record(
 }
 
 /// The start time in `/proc/<pid>/stat`, from a file that names `pid`.
-fn read_starttime(pid: u32, peers: &dyn PeerCalls) -> Result<u64, IdentifyError> {
+fn read_stat(pid: u32, peers: &dyn PeerCalls) -> Result<xudo_sys::ProcStat, IdentifyError> {
     let path = format!("/proc/{pid}/stat");
     let stat = peers
         .read_proc(pid, ProcFile::Stat)
@@ -329,16 +347,41 @@ fn read_starttime(pid: u32, peers: &dyn PeerCalls) -> Result<u64, IdentifyError>
             found: stat.pid,
         });
     }
-    Ok(stat.starttime)
+    Ok(stat)
 }
 
-/// The effective uid in `/proc/<pid>/status`.
-fn read_euid(pid: u32, peers: &dyn PeerCalls) -> Result<u32, IdentifyError> {
-    let path = format!("/proc/{pid}/status");
-    peers
-        .read_proc(pid, ProcFile::Status)
-        .and_then(|bytes| parse_status_euid(&path, &bytes))
-        .map_err(IdentifyError::Proc)
+fn namespace_facts(pid: u32, peers: &dyn PeerCalls, status: Option<&[u8]>) -> bool {
+    let nested_pid = status
+        .and_then(parse_nspid_count)
+        .is_none_or(|count| count != 1);
+    let identity_uid = peers
+        .read_proc(pid, ProcFile::UidMap)
+        .is_ok_and(|bytes| is_identity_uid_map(&bytes));
+    nested_pid || !identity_uid
+}
+
+fn is_identity_uid_map(uid_map: &[u8]) -> bool {
+    let fields: Vec<_> = uid_map
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect();
+    fields.as_slice() == [&b"0"[..], &b"0"[..], &b"4294967295"[..]]
+}
+
+fn parse_nspid_count(status: &[u8]) -> Option<usize> {
+    let line = status
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"NSpid:"))?;
+    let values = line.get(6..).unwrap_or_default();
+    let ids: Vec<_> = values
+        .split(u8::is_ascii_whitespace)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.iter().all(|id| id.iter().all(u8::is_ascii_digit)) {
+        Some(ids.len())
+    } else {
+        None
+    }
 }
 
 /// Confirms, through the pidfd, that the pinned process has not exited.
@@ -416,8 +459,15 @@ mod tests {
     }
 
     fn stat(pid: u32, starttime: u64) -> Vec<u8> {
-        let mut tail: Vec<String> = vec!["S".into(), "1".into()];
-        for _ in 0..17 {
+        let mut tail: Vec<String> = vec![
+            "S".into(),
+            "1".into(),
+            "1".into(),
+            "1".into(),
+            "0".into(),
+            "-1".into(),
+        ];
+        for _ in 0..13 {
             tail.push("0".to_owned());
         }
         tail.push(starttime.to_string());
@@ -425,6 +475,20 @@ mod tests {
     }
 
     fn status(euid: u32) -> Vec<u8> {
+        format!(
+            "Name:\txudo\nUid:\t{UID}\t{euid}\t{euid}\t{euid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\nNSpid:\t{PID}\n"
+        )
+        .into_bytes()
+    }
+
+    fn status_with_nspid(euid: u32, nspid: &str) -> Vec<u8> {
+        format!(
+            "Name:\txudo\nUid:\t{UID}\t{euid}\t{euid}\t{euid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\nNSpid:\t{nspid}\n"
+        )
+        .into_bytes()
+    }
+
+    fn status_without_nspid(euid: u32) -> Vec<u8> {
         format!(
             "Name:\txudo\nUid:\t{UID}\t{euid}\t{euid}\t{euid}\nGid:\t{GID}\t{GID}\t{GID}\t{GID}\n"
         )
@@ -455,7 +519,112 @@ mod tests {
             .with_cred(Ok(cred()))
             .with_stat(Ok(stat(PID, START)))
             .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
             .with_exit(Ok(false))
+    }
+
+    fn namespace_peer(status: Vec<u8>, uid_map: Option<&[u8]>) -> FakePeer {
+        let peer = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status))
+            .with_exit(Ok(false));
+        match uid_map {
+            Some(map) => peer.with_proc(PID, ProcFile::UidMap, map.to_vec()),
+            None => peer,
+        }
+    }
+
+    #[test]
+    fn a_process_without_a_controlling_terminal_reads_tty_zero() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status(UID), Some(b"0 0 4294967295\n")),
+        )
+        .unwrap();
+        assert_eq!(identity.tty, 0);
+        assert_eq!(identity.sid, 1);
+        assert!(!identity.diverged);
+    }
+
+    #[test]
+    fn a_peer_in_a_nested_pid_namespace_is_diverged() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status_with_nspid(UID, "7 1"), Some(b"0 0 4294967295\n")),
+        )
+        .unwrap();
+        assert!(identity.diverged);
+    }
+
+    #[test]
+    fn a_peer_with_a_non_identity_uid_map_is_diverged() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status(UID), Some(b"0 100000 65536\n")),
+        )
+        .unwrap();
+        assert!(identity.diverged);
+    }
+
+    #[test]
+    fn an_unreadable_uid_map_is_diverged_not_clean() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status(UID), None),
+        )
+        .unwrap();
+        assert!(identity.diverged);
+    }
+
+    #[test]
+    fn a_status_without_nspid_is_diverged() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status_without_nspid(UID), Some(b"0 0 4294967295\n")),
+        )
+        .unwrap();
+        assert!(identity.diverged);
+    }
+
+    #[test]
+    fn a_malformed_nspid_is_diverged() {
+        let sock = socket();
+        let identity = identify(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &namespace_peer(status_with_nspid(UID, "7 nope"), Some(b"0 0 4294967295\n")),
+        )
+        .unwrap();
+        assert!(identity.diverged);
+    }
+
+    #[test]
+    fn an_unreadable_status_refuses_when_the_pidfd_has_no_credentials() {
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Err(SysError::read("status", "permission denied")))
+            .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec());
+        let syscalls = top_rung(Err(errno("ioctl(PIDFD_GET_INFO)", Errno::NOTTY)));
+        assert_eq!(
+            identify(sock.as_fd(), &syscalls, &peers),
+            Err(IdentifyError::Proc(SysError::read(
+                "status",
+                "permission denied"
+            )))
+        );
     }
 
     #[test]
@@ -472,18 +641,22 @@ mod tests {
                 uid: UID,
                 gid: GID,
                 starttime: START,
+                sid: 1,
+                tty: 0,
+                diverged: false,
                 pinned: true,
                 cgroup_id: Some(77),
                 euid_source: EuidSource::PidfdInfo,
             }
         );
-        // The record answered the euid, so status was never read; and the
-        // re-check is the last call, after the only /proc read.
+        // Namespace facts are read after stat and before the pidfd re-check.
         assert_eq!(
             peers.calls(),
             vec![
                 PeerCall::PeerCred,
                 PeerCall::ReadProc(PID, ProcFile::Stat),
+                PeerCall::ReadProc(PID, ProcFile::Status),
+                PeerCall::ReadProc(PID, ProcFile::UidMap),
                 PeerCall::HasExited,
             ]
         );
@@ -515,6 +688,7 @@ mod tests {
                     PeerCall::PeerCred,
                     PeerCall::ReadProc(PID, ProcFile::Stat),
                     PeerCall::ReadProc(PID, ProcFile::Status),
+                    PeerCall::ReadProc(PID, ProcFile::UidMap),
                     PeerCall::HasExited,
                 ],
                 "the re-check must follow the last /proc read"
@@ -539,6 +713,7 @@ mod tests {
                 PeerCall::PidfdOpen(PID),
                 PeerCall::ReadProc(PID, ProcFile::Stat),
                 PeerCall::ReadProc(PID, ProcFile::Status),
+                PeerCall::ReadProc(PID, ProcFile::UidMap),
                 PeerCall::HasExited,
             ]
         );

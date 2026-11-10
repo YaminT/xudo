@@ -40,7 +40,7 @@
 //!    entry named by a nonce is read on a descriptor of its own. Exactly one
 //!    must be pinned to an ancestor: none is [`Refusal::NoPendingRequest`],
 //!    more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
-//!    one `CLOCK_MONOTONIC` that a deadline is stamped and judged on, and a
+//!    one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!    reading of zero is refused as no reading.
 //! 9. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
 //!    through the verified directory descriptor before anything executes, and
@@ -83,18 +83,25 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use xudo_audit::record::Record;
-use xudo_policy::{CallerFacts, Classification, LoadedRuleSet, engine};
+use xudo_policy::{CallerFacts, Classification};
+#[cfg(test)]
+use xudo_policy::{LoadedRuleSet, engine};
+#[cfg(test)]
+use xudo_sys::TrustedRulesError;
 use xudo_sys::{
     AuditSink, Authorized, Clock, HostClock, HostHygiene, HostPrograms, HostSyscalls, Hygiene,
-    ProcRef, ProcSource, Program, Programs, Spool, SpoolDir, SpoolError, Syscalls,
-    TrustedRulesError, VerifiedProc, authorize, lineage,
+    ProcRef, ProcSource, Program, Programs, Spool, SpoolDir, SpoolError, Syscalls, VerifiedProc,
+    authorize, lineage,
 };
 
 use crate::decide::{
     Approved, GateCaller, GateContext, Refusal, Stage, UNKNOWN_UID, authorization_record, decide,
     exec_failure_record, refusal_record,
 };
-use crate::request::{CallerPin, MonotonicSecs, PendingRequest, RequestError, SPOOL_DIR, is_nonce};
+use crate::policy::{LoadedPolicy, PolicyError};
+use crate::request::{
+    BoottimeMillis, CallerPin, PendingRequest, RequestError, SPOOL_DIR, is_nonce,
+};
 
 /// The first descriptor the gate marks close-on-exec: everything above the
 /// three standard streams.
@@ -114,6 +121,8 @@ pub const AUTH_NAME: &[u8] = b"xudo-gate-auth";
 
 /// Where the root-owned ruleset is read from.
 pub const RULES_DIR: &str = "/etc/xudo/rules.d";
+/// The root-owned settings file rechecked by the gate.
+pub const CONFIG_FILE: &str = "/etc/xudo/config.toml";
 
 /// The most bytes of one spool entry the gate reads on the strength of a name.
 ///
@@ -145,7 +154,7 @@ pub trait GateHost {
     fn syscalls(&self) -> &dyn Syscalls;
     /// What the gate settles about its own process.
     fn hygiene(&self) -> &dyn Hygiene;
-    /// The monotonic clock.
+    /// The boottime clock.
     fn clock(&self) -> &dyn Clock;
     /// Opens `/proc` and proves it is procfs.
     ///
@@ -153,13 +162,12 @@ pub trait GateHost {
     ///
     /// [`xudo_sys::SysError`] when it cannot be opened or is not procfs.
     fn open_proc(&self) -> Result<Box<dyn ProcSource>, xudo_sys::SysError>;
-    /// Loads the root-owned ruleset through the trust walk.
+    /// Loads root's rules and settings through the trust walk.
     ///
     /// # Errors
     ///
-    /// [`TrustedRulesError`] when any component or file is not root's, or the
-    /// files are not a ruleset.
-    fn load_rules(&self) -> Result<LoadedRuleSet, TrustedRulesError>;
+    /// [`PolicyError`] when either trusted input cannot be read or parsed.
+    fn load_policy(&self) -> Result<LoadedPolicy, PolicyError>;
     /// Opens the spool through the trust walk.
     ///
     /// # Errors
@@ -213,8 +221,8 @@ impl GateHost for SystemHost {
         VerifiedProc::open().map(into_source)
     }
 
-    fn load_rules(&self) -> Result<LoadedRuleSet, TrustedRulesError> {
-        xudo_sys::load_trusted_rules(Path::new(RULES_DIR))
+    fn load_policy(&self) -> Result<LoadedPolicy, PolicyError> {
+        crate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE))
     }
 
     fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
@@ -468,7 +476,21 @@ fn proceed(
         .evidence
         .push(format!("lineage={}", ancestors.describe()));
 
-    let loaded = stage(Stage::Rules, host.load_rules())?;
+    let loaded = match host.load_policy() {
+        Ok(loaded) => loaded,
+        Err(error @ PolicyError::Rules(_)) => {
+            return Err(Refusal::Failed {
+                stage: Stage::Rules,
+                reason: error.to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(Refusal::Failed {
+                stage: Stage::Config,
+                reason: error.to_string(),
+            });
+        }
+    };
     let spool = stage(Stage::Spool, host.open_spool())?;
     let now = read_clock(host.clock())?;
 
@@ -483,12 +505,12 @@ fn proceed(
     progress.pending.clone_from(&pending);
 
     let context = GateContext {
-        generation: loaded.generation.id(),
-        now: MonotonicSecs(now),
-        settings: engine::Settings::default(),
+        generation: loaded.rules.generation.id(),
+        now: BoottimeMillis(now),
+        settings: loaded.settings,
         password_confirms: entry.password_confirms(),
     };
-    let approved = decide(&loaded.rules, &caller, pending.as_ref(), context)?;
+    let approved = decide(&loaded.rules.rules, &caller, pending.as_ref(), context)?;
     progress.evidence.push(entry.confirmation().to_owned());
 
     // Consumed before anything runs: the entry is used at most once, and a
@@ -507,9 +529,12 @@ fn proceed(
         program.identity().1
     ));
 
-    let confirmed_by = pending
-        .as_ref()
-        .and_then(|found| found.confirmed_by.clone());
+    let confirmed_by = pending.as_ref().and_then(|found| {
+        found
+            .confirmed_by
+            .as_ref()
+            .map(crate::request::WatcherPin::audit_text)
+    });
     let evidence = progress.evidence.clone();
     let build = |previous: Option<&Record>, approval: &Approved| {
         annotate(
@@ -526,20 +551,20 @@ fn proceed(
     Err(execute(host, &authorized, &program))
 }
 
-/// Reads the monotonic clock, refusing a reading that cannot be one.
+/// Reads boottime, refusing a reading that cannot be one.
 ///
-/// The clock is the broker's: [`xudo_sys::HostClock`], the one `CLOCK_MONOTONIC`
-/// a deadline is stamped and judged on. It cannot fail, and for a `tv_sec` the
-/// kernel never reports (a negative one) it answers zero. Zero is the
+/// The clock is the broker's: [`xudo_sys::HostClock`], the one `CLOCK_BOOTTIME`
+/// a deadline is stamped and judged on. It cannot fail, and for a negative
+/// reading it answers zero. Zero is the
 /// fail-closed reading for the broker, which then stamps a deadline already
 /// behind it, and the wrong direction here, where it would make every deadline
 /// look still ahead. No host is up for less than a second with a caller
 /// waiting on a request, so a zero is no reading, and the gate refuses it.
 fn read_clock(clock: &dyn Clock) -> Result<u64, Refusal> {
-    match clock.monotonic_secs() {
+    match clock.boottime_millis() {
         0 => Err(Refusal::Failed {
             stage: Stage::Clock,
-            reason: "the monotonic clock read zero seconds, which is no reading".to_owned(),
+            reason: "the boottime clock read zero milliseconds, which is no reading".to_owned(),
         }),
         secs => Ok(secs),
     }
@@ -791,9 +816,17 @@ args = [
             program: "/usr/bin/systemctl".to_owned(),
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             generation: rules().generation.id(),
-            deadline: MonotonicSecs(200),
+            deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
         }
     }
@@ -858,7 +891,7 @@ args = [
         hygiene: FakeHygiene,
         clock: FixedClock,
         proc: Result<MapSource, SysError>,
-        rules: Result<LoadedRuleSet, TrustedRulesError>,
+        policy: Result<LoadedPolicy, PolicyError>,
         spool: Result<Rc<FakeSpool>, SpoolError>,
         rival: bool,
         programs: FakePrograms,
@@ -900,7 +933,10 @@ args = [
                 hygiene: FakeHygiene::new(GATE_PID),
                 clock: FixedClock(NOW),
                 proc: Ok(proc_tree()),
-                rules: Ok(rules()),
+                policy: Ok(LoadedPolicy {
+                    rules: rules(),
+                    settings: engine::Settings::default(),
+                }),
                 spool: Ok(Rc::clone(spool)),
                 rival: false,
                 programs: FakePrograms::serving(path, owner),
@@ -927,8 +963,8 @@ args = [
                 .clone()
                 .map(|source| Box::new(source) as Box<dyn ProcSource>)
         }
-        fn load_rules(&self) -> Result<LoadedRuleSet, TrustedRulesError> {
-            self.rules.clone()
+        fn load_policy(&self) -> Result<LoadedPolicy, PolicyError> {
+            self.policy.clone()
         }
         fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
             self.spool_opened.set(true);
@@ -1149,7 +1185,7 @@ args = [
         let caller = caller_for(Some(&found), CallerPin::new(500, 9_000));
         let context = GateContext {
             generation: rules().generation.id(),
-            now: MonotonicSecs(100),
+            now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: true,
         };
@@ -1598,14 +1634,39 @@ args = [
     fn a_ruleset_that_fails_the_trust_walk_stops_the_gate_before_the_spool_is_opened() {
         let (_, seen) = stops_at(
             |host| {
-                host.rules = Err(TrustedRulesError::Trust(TrustError::NotRootOwned {
-                    at: "/etc/xudo".to_owned(),
-                    uid: 1000,
-                }));
+                host.policy = Err(PolicyError::Rules(TrustedRulesError::Trust(
+                    TrustError::NotRootOwned {
+                        at: "/etc/xudo".to_owned(),
+                        uid: 1000,
+                    },
+                )));
             },
             "gate_failed_rules",
         );
         assert_eq!(seen[1], "spool=false");
+    }
+
+    #[test]
+    fn gate_refuses_a_config_on_a_user_writable_path() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Err(PolicyError::ConfigUntrusted(TrustError::Writable {
+            at: "/etc/xudo/config.toml".to_owned(),
+            mode: 0o666,
+        }));
+        let exit = run(&mut host, &auth());
+        assert!(
+            exit.message.contains("gate_failed_config"),
+            "{}",
+            exit.message
+        );
+        assert!(consumed(&spool).is_empty());
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(host.audit.records().len(), 1);
+        assert_eq!(
+            host.audit.records()[0].denial.as_deref(),
+            Some("gate_failed_config")
+        );
     }
 
     #[test]
@@ -1703,7 +1764,7 @@ args = [
 
     #[test]
     fn a_clock_that_reads_zero_stops_the_gate_because_no_deadline_can_be_judged() {
-        // `HostClock` answers zero for a `tv_sec` the kernel never gives. That
+        // `HostClock` answers zero for a negative clock reading. That
         // is the fail-closed reading for the broker, which then stamps a
         // deadline already behind it, and it would be the fail-open one here:
         // every deadline would look still ahead. Zero is no reading.
@@ -1714,9 +1775,27 @@ args = [
             "gate_failed_clock",
         );
         assert!(exit.message.contains("severity normal"), "{}", exit.message);
-        // And a clock that reads one second is a clock.
+        // And a clock that reads one millisecond is a clock.
         assert_eq!(read_clock(&FixedClock(1)), Ok(1));
         assert!(read_clock(&FixedClock(0)).is_err());
+    }
+
+    #[test]
+    fn a_fake_boottime_reading_after_suspend_expires_the_deadline() {
+        let mut pending = ours();
+        pending.deadline = BoottimeMillis(900_000);
+        let now_after_suspend = FixedClock(900_001).boottime_millis();
+        assert_eq!(
+            pending.validate(
+                CallerPin::new(pending.caller_pid, pending.caller_starttime),
+                pending.generation,
+                BoottimeMillis(now_after_suspend),
+            ),
+            Err(crate::request::RequestError::Expired {
+                deadline: 900_000,
+                now: 900_001,
+            })
+        );
     }
 
     // ---- the invocation ---------------------------------------------------
@@ -1841,6 +1920,10 @@ args = [
             xudo_config::SystemPaths::default().rules_dir()
         );
         assert_eq!(
+            PathBuf::from(CONFIG_FILE),
+            xudo_config::SystemPaths::default().config()
+        );
+        assert_eq!(
             PathBuf::from(SPOOL_DIR),
             xudo_config::SystemPaths::default().runtime.join("req")
         );
@@ -1854,9 +1937,12 @@ args = [
         // Constructed without opening anything.
         assert!(format!("{host:?}").contains("SystemHost"));
         assert!(host.hygiene().pid() > 0);
-        assert!(host.clock().monotonic_secs() > 0);
+        #[cfg(target_os = "linux")]
+        assert!(host.clock().boottime_millis() > 0);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(host.clock().boottime_millis(), 0);
         // Nothing here is a ruleset, a spool, or a root-owned program.
-        assert!(host.load_rules().is_err());
+        assert!(host.load_policy().is_err());
         assert!(host.open_spool().is_err());
         assert!(
             host.programs()

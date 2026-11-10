@@ -123,3 +123,62 @@ fn the_check_notices_a_lane_missing_from_the_recipe() {
     let excused: BTreeSet<String> = ["fuzz".to_owned()].into();
     assert!(missing(&excused, &got).is_empty());
 }
+
+/// Job-level `needs` edges in the small, regular job maps used by our workflows.
+fn workflow_needs(workflow: &str, job: &str) -> Vec<String> {
+    let mut in_job = false;
+    let mut section = Vec::new();
+    for line in workflow.lines() {
+        if in_job && line.starts_with("  ") && !line.starts_with("    ") {
+            break;
+        }
+        if line.trim() == format!("{job}:") {
+            in_job = true;
+        }
+        if in_job {
+            section.push(line);
+        }
+    }
+    assert!(in_job, "no job {job}");
+    let Some(needs) = section
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("needs:"))
+    else {
+        return Vec::new();
+    };
+    needs
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn release_signing_waits_for_the_reusable_ci_workflow() {
+    let ci = fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let release = fs::read_to_string(repo().join(".github/workflows/release.yml")).unwrap();
+    assert!(ci.lines().any(|line| line.trim() == "workflow_call:"));
+    assert!(release.contains("uses: ./.github/workflows/ci.yml"));
+
+    let build_needs = workflow_needs(&release, "build");
+    assert!(build_needs.iter().any(|job| job == "ci"), "{build_needs:?}");
+    let sign_needs = workflow_needs(&release, "sign");
+    assert!(
+        sign_needs.iter().any(|job| job == "build"),
+        "{sign_needs:?}"
+    );
+
+    // Follow needs edges from sign; the reusable CI call must be an ancestor.
+    let mut pending = sign_needs;
+    let mut visited = BTreeSet::new();
+    while let Some(job) = pending.pop() {
+        if visited.insert(job.clone()) {
+            pending.extend(workflow_needs(&release, &job));
+        }
+    }
+    assert!(visited.contains("ci"), "sign ancestors: {visited:?}");
+}

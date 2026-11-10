@@ -136,6 +136,19 @@ pub enum SpoolError {
     },
 }
 
+/// An opened spool, or why it did not open, as the seam: no closure for the
+/// caller to leave unrun when the open fails.
+///
+/// # Errors
+///
+/// The error the open failed with, unchanged.
+pub fn as_seam(opened: &Result<SpoolDir, SpoolError>) -> Result<&dyn Spool, &SpoolError> {
+    match opened {
+        Ok(spool) => Ok(spool),
+        Err(error) => Err(error),
+    }
+}
+
 /// The operations the broker performs on the spool, as a seam.
 pub trait Spool {
     /// Takes the spool's exclusive lock, waiting for any other holder.
@@ -220,6 +233,16 @@ pub trait Spool {
     /// other failure. The temporary file is removed on every failure after it
     /// was created.
     fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), SpoolError>;
+
+    /// Replaces an entry only while its current contents still match the
+    /// version read under this lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Gone`] if the name was consumed or its inode
+    /// changed, and [`SpoolError::Io`] or [`SpoolError::InvalidName`] when the
+    /// replacement cannot be written safely.
+    fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError>;
 }
 
 /// The real spool directory, held open by descriptor.
@@ -526,6 +549,91 @@ impl Spool for SpoolDir {
             }
         }
     }
+
+    fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
+        self.replace_with_hook(name, expected, bytes, &|| {})
+    }
+}
+
+impl SpoolDir {
+    fn replace_with_hook(
+        &self,
+        name: &[u8],
+        expected: &[u8],
+        bytes: &[u8],
+        before_exchange: &dyn Fn(),
+    ) -> Result<(), SpoolError> {
+        let component = plain(name)?;
+        let display = name.as_bstr().to_string();
+        let current = openat(
+            &self.dir,
+            component,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .and_then(|fd| fstat(&fd).map(|stat| (fd, stat)))
+        .map_err(|errno| SpoolError::Gone {
+            name: errno.to_string(),
+        })?;
+        let current_bytes = self.read(name, 32 * 1024)?;
+        if current_bytes != expected {
+            return Err(SpoolError::Gone { name: display });
+        }
+        let current_inode = current.1.st_ino;
+        let temp = format!("{TEMP_PREFIX}replace-{display}");
+        let private = Mode::RUSR | Mode::WUSR;
+        let created = openat(
+            &self.dir,
+            temp.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            private,
+        )
+        .map_err(|errno| self.failure("create replacement", &errno.into()))?;
+        let result = fchmod(&created, private)
+            .map(|()| created)
+            .map_err(std::io::Error::from)
+            .and_then(|fd| std::fs::File::from(fd).write_all(bytes))
+            .and_then(|()| {
+                before_exchange();
+                renameat_with(
+                    &self.dir,
+                    temp.as_str(),
+                    &self.dir,
+                    component,
+                    RenameFlags::EXCHANGE,
+                )
+                .map_err(std::io::Error::from)?;
+                let displaced = openat(
+                    &self.dir,
+                    temp.as_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .and_then(|fd| fstat(&fd).map(|stat| stat.st_ino));
+                if !matches!(displaced, Ok(inode) if inode == current_inode) {
+                    // The exchange requires the destination to exist, so a gate
+                    // that consumed it cannot be undone by this replacement.
+                    let _ = renameat_with(
+                        &self.dir,
+                        temp.as_str(),
+                        &self.dir,
+                        component,
+                        RenameFlags::EXCHANGE,
+                    );
+                    return Err(std::io::Error::other(
+                        "entry inode changed during replacement",
+                    ));
+                }
+                unlinkat(&self.dir, temp.as_str(), AtFlags::empty()).map_err(std::io::Error::from)
+            });
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = unlinkat(&self.dir, temp.as_str(), AtFlags::empty());
+                Err(self.publish_failure(&display, &error))
+            }
+        }
+    }
 }
 
 /// One call a [`FakeSpool`] received.
@@ -547,6 +655,8 @@ pub enum SpoolCall {
     Consume(Vec<u8>),
     /// [`Spool::publish`] under this name.
     Publish(String),
+    /// [`Spool::replace`] of this name.
+    Replace(Vec<u8>),
 }
 
 /// An in-memory spool, for tests.
@@ -567,6 +677,7 @@ pub struct FakeSpool {
     remove_error: Option<SpoolError>,
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
+    replace_error: Option<SpoolError>,
 }
 
 impl FakeSpool {
@@ -621,6 +732,13 @@ impl FakeSpool {
     #[must_use]
     pub fn failing_publish(mut self, error: SpoolError) -> Self {
         self.publish_error = Some(error);
+        self
+    }
+
+    /// Makes [`Spool::replace`] fail.
+    #[must_use]
+    pub fn failing_replace(mut self, error: SpoolError) -> Self {
+        self.replace_error = Some(error);
         self
     }
 
@@ -720,6 +838,21 @@ impl Spool for FakeSpool {
         files.insert(name.as_bytes().to_vec(), bytes.to_vec());
         Ok(())
     }
+
+    fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
+        self.record(SpoolCall::Replace(name.to_vec()));
+        scripted(self.replace_error.as_ref())?;
+        let mut files = self.files.borrow_mut();
+        match files.get_mut(name) {
+            Some(current) if current.as_slice() == expected => {
+                *current = bytes.to_vec();
+                Ok(())
+            }
+            _ => Err(SpoolError::Gone {
+                name: name.as_bstr().to_string(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +866,12 @@ mod tests {
     )]
 
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // The variant's name: `matches!` leaves an arm no passing test reaches.
+    fn kind(result: Result<(), SpoolError>) -> String {
+        let text = format!("{:?}", result.unwrap_err());
+        text.split([' ', '(']).next().unwrap().to_owned()
+    }
 
     use rustix::io::Errno;
 
@@ -924,6 +1063,129 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("abc")).unwrap(), b"first");
         assert_eq!(spool.names().unwrap(), vec![b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn approving_a_consumed_entry_does_not_recreate_it() {
+        let fake = FakeSpool::new().with_file("request", b"pending".to_vec());
+        fake.lock().unwrap();
+        fake.consume(b"request").unwrap();
+        assert_eq!(
+            kind(fake.replace(b"request", b"pending", b"approved")),
+            "Gone"
+        );
+        fake.unlock();
+        assert!(!fake.files().contains_key(b"request".as_slice()));
+    }
+
+    #[test]
+    fn the_fake_replaces_an_entry_only_when_it_still_holds_what_was_read() {
+        let fake = FakeSpool::new().with_file("request", b"pending".to_vec());
+        fake.lock().unwrap();
+        fake.replace(b"request", b"pending", b"approved").unwrap();
+        assert_eq!(kind(fake.replace(b"request", b"pending", b"x")), "Gone");
+        fake.unlock();
+        assert_eq!(
+            fake.files().get(b"request".as_slice()).unwrap(),
+            b"approved"
+        );
+    }
+
+    #[test]
+    fn fake_replace_can_fail_without_changing_the_entry() {
+        let fake = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_replace(SpoolError::Gone {
+                name: "request".to_owned(),
+            });
+        fake.lock().unwrap();
+        assert!(fake.replace(b"request", b"pending", b"approved").is_err());
+        fake.unlock();
+        assert_eq!(fake.files().get(b"request".as_slice()).unwrap(), b"pending");
+    }
+
+    #[test]
+    fn replacing_a_spool_entry_exchanges_only_the_inode_read_under_lock() {
+        let (spool, dir) = spool("replace");
+        spool.publish("request", b"pending").unwrap();
+        spool.lock().unwrap();
+        spool.replace(b"request", b"pending", b"approved").unwrap();
+        assert_eq!(spool.read(b"request", 64).unwrap(), b"approved");
+        assert_eq!(std::fs::read(dir.join("request")).unwrap(), b"approved");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        spool.unlock();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replacement_refuses_a_gone_changed_invalid_or_busy_name() {
+        let (spool, dir) = spool("replace-refusals");
+        spool.publish("request", b"pending").unwrap();
+        spool.lock().unwrap();
+        assert_eq!(kind(spool.replace(b"missing", b"x", b"y")), "Gone");
+        assert_eq!(kind(spool.replace(b"request", b"other", b"y")), "Gone");
+        assert_eq!(
+            kind(spool.replace(b"../request", b"pending", b"y")),
+            "InvalidName"
+        );
+        std::fs::write(dir.join(format!("{TEMP_PREFIX}replace-request")), b"busy").unwrap();
+        assert_eq!(kind(spool.replace(b"request", b"pending", b"y")), "Io");
+        assert_eq!(spool.read(b"request", 64).unwrap(), b"pending");
+        spool.unlock();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_opened_spool_or_its_error_passes_through_the_seam() {
+        let (real, dir) = spool("seam");
+        let real: Result<SpoolDir, SpoolError> = Ok(real);
+        assert!(as_seam(&real).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+        let refused = SpoolDir::open(Path::new("/nonexistent/xudo"));
+        assert!(as_seam(&refused).is_err());
+    }
+
+    #[test]
+    fn replacement_refuses_an_entry_too_large_to_compare() {
+        let (spool, dir) = spool("replace-large");
+        let big = vec![b'x'; 32 * 1024 + 1];
+        spool.publish("request", &big).unwrap();
+        spool.lock().unwrap();
+        assert_eq!(kind(spool.replace(b"request", &big, b"y")), "TooLarge");
+        spool.unlock();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replacement_fails_when_the_entry_is_unlinked_before_exchange() {
+        let (spool, dir) = spool("replace-unlinked");
+        spool.publish("request", b"pending").unwrap();
+        spool.lock().unwrap();
+        let result = spool.replace_with_hook(b"request", b"pending", b"approved", &|| {
+            std::fs::remove_file(dir.join("request")).unwrap();
+        });
+        assert_eq!(kind(result), "Io");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        spool.unlock();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replacement_restores_a_name_changed_before_exchange() {
+        let (spool, dir) = spool("replace-race");
+        spool.publish("request", b"pending").unwrap();
+        spool.lock().unwrap();
+        let changed = dir.join("racer");
+        let result = spool.replace_with_hook(b"request", b"pending", b"approved", &|| {
+            std::fs::write(&changed, b"pending").unwrap();
+            std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&changed, dir.join("request")).unwrap();
+        });
+        assert_eq!(kind(result), "Io");
+        assert_eq!(spool.read(b"request", 64).unwrap(), b"pending");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        spool.unlock();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

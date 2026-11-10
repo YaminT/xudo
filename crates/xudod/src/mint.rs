@@ -11,24 +11,30 @@
 //!
 //! Applied under the spool's exclusive lock, every time an entry is minted:
 //!
-//! * **One live entry per caller.** An older entry for the same
-//!   `(pid, starttime)` is removed first, so the gate's lookup by its caller's
-//!   pin finds exactly one entry or none, never two to choose between.
-//! * **Expired entries go.** Anything at or past its deadline is removed.
-//! * **Entries nobody can use go.** An entry whose caller is no longer the
+//! * **One gate lookup entry per caller.** A pending or approved watch entry
+//!   for the same `(pid, starttime)` refuses a new run and stays in place; a
+//!   non-watch or consumed entry is superseded so the gate's lookup finds one
+//!   entry or none, never two to choose between.
+//! * **Expired entries go.** Non-watch entries and non-waiting watch entries
+//!   at or past their deadline are removed; waiting watch entries remain for
+//!   the audited expiry sweep, then for a 60-second fallback grace.
+//! * **Entries nobody can use go.** A non-watch entry whose caller is no longer the
 //!   process it was minted for — exited, or its pid now someone else's — can
 //!   never be consumed: the gate checks its own caller against the pin. So an
 //!   entry counts as live only while `/proc/<pid>/stat` still shows the pinned
 //!   `(pid, starttime)`, and a caller that cannot be shown alive is pruned.
 //!   Without this, one group member could run 64 clients one after another,
 //!   each exiting before the next, and refuse everyone for fifteen minutes.
+//!   Pending and approved watch entries are different: timeout-zero clients
+//!   exit by design, so those entries remain until the audited expiry sweep.
 //! * **Junk goes.** A temporary file left by a broker that died mid-write —
 //!   no write can be in progress while the lock is held — and any nonce-named
 //!   entry that cannot be read back as a request.
-//! * **Bounded.** At most [`MAX_SPOOL_ENTRIES`] live entries and
-//!   [`MAX_SPOOL_BYTES`] of them, so no member of the `xudo` group can fill
-//!   `/run` by asking; and at most [`MAX_ENTRIES_PER_UID`] whose live caller
-//!   runs as the asking uid, so filling the spool takes eight members, not one.
+//! * **Bounded.** The password path has its own [`MAX_SPOOL_ENTRIES`] entry,
+//!   [`MAX_SPOOL_BYTES`] byte, and [`MAX_ENTRIES_PER_UID`] per-uid limits.
+//!   Watch entries have separate [`MAX_WATCH_ENTRIES`] and
+//!   [`MAX_WATCH_ENTRIES_PER_UID`] limits, so watcher requests cannot consume
+//!   the password path's capacity.
 //!   The entry does not record a uid, so the count reads each live caller's
 //!   real and effective uids from `/proc/<pid>/status` and counts the entry
 //!   against both: a caller that exec'd a set-user-ID program after minting
@@ -41,7 +47,7 @@
 use std::fmt::Write as _;
 
 use xudo_audit::Approval;
-use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
+use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
 use xudo_policy::Decision;
 use xudo_sys::{
     Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
@@ -61,6 +67,12 @@ use crate::identify::PeerIdentity;
 /// `(pid, starttime)` and consumed on use, so its lifetime is not the window
 /// in which it can be abused.
 pub const REQUEST_TTL_SECS: u64 = 15 * 60;
+/// Request lifetime in the clock's millisecond unit.
+pub const REQUEST_TTL_MILLIS: u64 = REQUEST_TTL_SECS * 1_000;
+
+/// Extra time an expired watch request stays available for the audited expiry
+/// sweep before a mint may prune it when the confirmation store is absent.
+const EXPIRED_WATCH_GRACE_MILLIS: u64 = 60_000;
 
 /// The most live entries the spool holds.
 pub const MAX_SPOOL_ENTRIES: usize = 64;
@@ -76,8 +88,21 @@ pub const MAX_SPOOL_BYTES: usize = 1024 * 1024;
 /// socket lets one uid hold open (`MaxConnectionsPerSource=`).
 pub const MAX_ENTRIES_PER_UID: usize = 8;
 
+/// The most waiting watch entries across all users.
+pub const MAX_WATCH_ENTRIES: usize = 16;
+
+/// The most waiting watch entries belonging to one uid.
+pub const MAX_WATCH_ENTRIES_PER_UID: usize = 2;
+
+/// Number of spool names broker scans must request to cover every live entry
+/// and distinguish a spool that exceeds the broker's own limits.
+pub const MAX_SPOOL_NAMES_TO_WALK: usize = MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1;
+
 // One uid must never be able to take the whole spool.
 const _: () = assert!(MAX_ENTRIES_PER_UID < MAX_SPOOL_ENTRIES);
+const _: () = assert!(MAX_WATCH_ENTRIES_PER_UID < MAX_WATCH_ENTRIES);
+const _: () = assert!(MAX_SPOOL_NAMES_TO_WALK == MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1);
+const _: () = assert!(MAX_WATCH_ENTRIES * MAX_ENTRY_BYTES <= MAX_SPOOL_BYTES);
 
 /// The largest entry the broker reads back, in bytes.
 ///
@@ -93,7 +118,6 @@ const _: () = assert!(MAX_ENTRY_BYTES > xudo_wire::MAX_REQUEST_BYTES);
 // reads no entry past its own `MAX_ENTRY_BYTES`. The broker's ceilings sit
 // well below the gate's, so the gate's bounds only ever bite on a spool the
 // broker did not keep.
-const _: () = assert!(MAX_SPOOL_ENTRIES < xudo_gate::run::MAX_SPOOL_NAMES);
 const _: () = assert!(MAX_ENTRY_BYTES <= xudo_gate::run::MAX_ENTRY_BYTES);
 
 /// Random bytes in a nonce: 32, so 64 hex characters.
@@ -139,6 +163,9 @@ pub enum MintError {
         /// The nonce drawn.
         nonce: String,
     },
+    /// This process already has a pending or approved watched request.
+    #[error("watch confirmation is throttled by a per-process or capacity limit")]
+    ConfirmationThrottled,
 }
 
 /// The entry as an approval: the command and action its audit record must
@@ -174,7 +201,7 @@ pub struct Minting<'a> {
     pub json: &'a str,
     /// The effective uid its caller connected with.
     pub uid: u32,
-    /// Now, in whole seconds of `CLOCK_MONOTONIC`.
+    /// Now, in milliseconds of `CLOCK_BOOTTIME`.
     pub now: u64,
 }
 
@@ -219,10 +246,14 @@ pub fn entry_for(
     identity: &PeerIdentity,
     request: &BrokerRequest,
     generation: u64,
+    confirm_human_path: bool,
     deadline: u64,
     nonce: String,
 ) -> Result<PendingRequest, MintError> {
     let Some(action) = &decision.action else {
+        return Err(MintError::NoAction);
+    };
+    let Some((program, argv, claimed_classification)) = request.run_fields() else {
         return Err(MintError::NoAction);
     };
     Ok(PendingRequest {
@@ -231,13 +262,25 @@ pub fn entry_for(
         caller_pid: identity.pid,
         caller_starttime: identity.starttime,
         action: action.as_str().to_owned(),
-        program: request.program.clone(),
-        argv: request.argv.clone(),
+        program: program.to_owned(),
+        argv: argv.to_vec(),
         generation,
-        deadline: MonotonicSecs(deadline),
+        deadline: BoottimeMillis(deadline),
         confirmed: false,
         confirmed_by: None,
-        claimed_classification: request.claimed_classification.clone(),
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: identity.uid,
+        caller_sid: identity.sid,
+        caller_tty: identity.tty,
+        needs_watch: xudo_gate::demanded_confirmation(decision) && confirm_human_path,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: crate::confirm::fingerprint(
+            identity.uid,
+            program.as_bytes(),
+            &argv.iter().map(String::as_bytes).collect::<Vec<_>>(),
+        ),
+        claimed_classification: claimed_classification.to_owned(),
     })
 }
 
@@ -272,25 +315,45 @@ fn prune_and_publish<S: Spool + ?Sized>(
     let mut entries = 0usize;
     let mut bytes = 0usize;
     let mut this_uid = 0usize;
+    let mut watch_entries = 0usize;
+    let mut watch_uid = 0usize;
     for name in spool.names().map_err(MintError::Spool)? {
         match classify(spool, callers, &name, minting) {
-            Existing::Live { size, same_uid } => {
-                entries = entries.saturating_add(1);
-                bytes = bytes.saturating_add(size);
-                this_uid = this_uid.saturating_add(usize::from(same_uid));
+            Existing::Live {
+                size,
+                same_uid,
+                watch,
+            } => {
+                if watch {
+                    watch_entries = watch_entries.saturating_add(1);
+                    watch_uid = watch_uid.saturating_add(usize::from(same_uid));
+                } else {
+                    entries = entries.saturating_add(1);
+                    bytes = bytes.saturating_add(size);
+                    this_uid = this_uid.saturating_add(usize::from(same_uid));
+                }
             }
             Existing::Stale => spool.remove(&name).map_err(MintError::Spool)?,
+            Existing::ConfirmationThrottled => return Err(MintError::ConfirmationThrottled),
             Existing::Foreign => {}
         }
     }
-    if entries >= MAX_SPOOL_ENTRIES || bytes.saturating_add(minting.json.len()) > MAX_SPOOL_BYTES {
-        return Err(MintError::Full { entries, bytes });
-    }
-    if this_uid >= MAX_ENTRIES_PER_UID {
-        return Err(MintError::UidFull {
-            uid: minting.uid,
-            entries: this_uid,
-        });
+    if minting.entry().needs_watch {
+        if watch_entries >= MAX_WATCH_ENTRIES || watch_uid >= MAX_WATCH_ENTRIES_PER_UID {
+            return Err(MintError::ConfirmationThrottled);
+        }
+    } else {
+        if entries >= MAX_SPOOL_ENTRIES
+            || bytes.saturating_add(minting.json.len()) > MAX_SPOOL_BYTES
+        {
+            return Err(MintError::Full { entries, bytes });
+        }
+        if this_uid >= MAX_ENTRIES_PER_UID {
+            return Err(MintError::UidFull {
+                uid: minting.uid,
+                entries: this_uid,
+            });
+        }
     }
     match spool.publish(&minting.entry().nonce, minting.json.as_bytes()) {
         Ok(()) => Ok(()),
@@ -310,10 +373,14 @@ enum Existing {
         size: usize,
         /// Whether its caller runs as the asking uid, really or effectively.
         same_uid: bool,
+        /// Whether the entry uses the separate watch quota.
+        watch: bool,
     },
     /// Something to remove: expired, superseded, misnamed, unreadable, a
-    /// temporary file, or an entry whose caller cannot be shown alive.
+    /// temporary file, or a non-watch entry whose caller cannot be shown alive.
     Stale,
+    /// The asking process already has a waiting watched request.
+    ConfirmationThrottled,
     /// A name the broker does not own.
     Foreign,
 }
@@ -344,17 +411,51 @@ fn classify<S: Spool + ?Sized>(
     let Some(existing) = parsed else {
         return Existing::Stale;
     };
-    let expired = existing.deadline <= MonotonicSecs(minting.now);
     let misnamed = existing.nonce != text;
-    let superseded = existing.caller_pid == minting.entry().caller_pid
-        && existing.caller_starttime == minting.entry().caller_starttime;
-    if expired || misnamed || superseded {
+    if misnamed {
         return Existing::Stale;
+    }
+    let request_survives_requester = existing.needs_watch
+        && matches!(
+            existing.state,
+            xudo_gate::request::ConfirmationState::Pending
+                | xudo_gate::request::ConfirmationState::Approved
+        );
+    let same_pin = existing.caller_pid == minting.entry().caller_pid
+        && existing.caller_starttime == minting.entry().caller_starttime;
+    let past_watch_grace = existing
+        .deadline
+        .0
+        .saturating_add(EXPIRED_WATCH_GRACE_MILLIS)
+        <= minting.now;
+    if request_survives_requester && past_watch_grace {
+        return Existing::Stale;
+    }
+    // A watched request owns the caller's gate lookup slot until the audited
+    // expiry sweep runs, or until the grace period permits fallback pruning.
+    if request_survives_requester && same_pin {
+        return Existing::ConfirmationThrottled;
+    }
+    let superseded = same_pin;
+    if superseded {
+        return Existing::Stale;
+    }
+    let expired = existing.deadline <= BoottimeMillis(minting.now);
+    if expired && !request_survives_requester {
+        return Existing::Stale;
+    }
+    if request_survives_requester {
+        return Existing::Live {
+            size: bytes.len(),
+            same_uid: existing.caller_uid == minting.uid,
+            watch: true,
+        };
     }
     match live_caller(callers, &existing) {
         Some(uids) => Existing::Live {
             size: bytes.len(),
             same_uid: uids.real == minting.uid || uids.effective == minting.uid,
+            watch: existing.needs_watch,
         },
         None => Existing::Stale,
     }
@@ -387,6 +488,7 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
+    use proptest::prelude::*;
     use xudo_audit::record::{Decision as AuditDecision, Record};
     use xudo_policy::{ActionId, DenialCode, Verdict};
     use xudo_sys::{
@@ -406,6 +508,9 @@ mod tests {
             uid: 1000,
             gid: 100,
             starttime,
+            sid: 1,
+            tty: 0,
+            diverged: false,
             pinned: true,
             cgroup_id: None,
             euid_source: EuidSource::ProcStatus,
@@ -426,9 +531,17 @@ mod tests {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
             generation: 7,
-            deadline: MonotonicSecs(deadline),
+            deadline: BoottimeMillis(deadline),
             confirmed: false,
             confirmed_by: None,
+            state: xudo_gate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
         }
     }
@@ -490,6 +603,15 @@ mod tests {
         host: &FakePeer,
         minting: &PendingRequest,
     ) -> Result<(), MintError> {
+        publish_at(spool, host, minting, NOW)
+    }
+
+    fn publish_at(
+        spool: &FakeSpool,
+        host: &FakePeer,
+        minting: &PendingRequest,
+        now: u64,
+    ) -> Result<(), MintError> {
         let authorized = authorized(minting);
         publish(
             spool,
@@ -498,7 +620,7 @@ mod tests {
                 authorized: &authorized,
                 json: &minting.to_json(),
                 uid: 1000,
-                now: NOW,
+                now,
             },
         )
     }
@@ -536,17 +658,81 @@ mod tests {
             &identity(4242, 5_000),
             &request,
             7,
+            true,
             1_900,
             nonce('a'),
         )
         .unwrap();
-        assert_eq!(minted, {
-            let mut expected = entry('a', 4242, 5_000, 1_900);
-            expected.claimed_classification = "enrolled-agent-yolo".to_owned();
-            expected
-        });
-        assert!(!minted.confirmed);
-        assert_eq!(minted.confirmed_by, None);
+        assert_eq!(
+            minted,
+            PendingRequest {
+                schema_version: REQUEST_SCHEMA_VERSION,
+                nonce: nonce('a'),
+                caller_pid: 4242,
+                caller_starttime: 5_000,
+                action: "xudo.svc.restart".to_owned(),
+                program: "/usr/bin/systemctl".to_owned(),
+                argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+                generation: 7,
+                deadline: BoottimeMillis(1_900),
+                confirmed: false,
+                confirmed_by: None,
+                state: xudo_gate::request::ConfirmationState::Pending,
+                caller_uid: 1000,
+                caller_sid: 1,
+                caller_tty: 0,
+                needs_watch: false,
+                shown_at_ms: None,
+                shown_to: None,
+                fingerprint: crate::confirm::fingerprint(
+                    1000,
+                    b"/usr/bin/systemctl",
+                    &[b"restart", b"nginx.service"],
+                ),
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirmation_setting_controls_watch_requirement_at_mint() {
+        let mut decision = permitted();
+        decision.confirm = xudo_policy::Confirm::Required {
+            reason: xudo_policy::ConfirmReason::RuleRequiresConfirmation,
+        };
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        for (setting, expected) in [(true, true), (false, false)] {
+            let minted = entry_for(
+                &decision,
+                &identity(4242, 5000),
+                &request,
+                7,
+                setting,
+                1900,
+                nonce('a'),
+            )
+            .unwrap();
+            assert_eq!(minted.needs_watch, expected);
+            assert_eq!(minted.state, xudo_gate::request::ConfirmationState::Pending);
+        }
+    }
+
+    #[test]
+    fn a_non_run_question_cannot_be_minted() {
+        let mut request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
+        request.question = xudo_wire::Question::Watch;
+        assert_eq!(
+            entry_for(
+                &permitted(),
+                &identity(1, 1),
+                &request,
+                7,
+                true,
+                1,
+                nonce('a')
+            ),
+            Err(MintError::NoAction)
+        );
     }
 
     #[test]
@@ -555,7 +741,7 @@ mod tests {
         decision.action = None;
         let request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
         assert_eq!(
-            entry_for(&decision, &identity(1, 1), &request, 7, 1, nonce('a')),
+            entry_for(&decision, &identity(1, 1), &request, 7, true, 1, nonce('a')),
             Err(MintError::NoAction)
         );
     }
@@ -776,6 +962,295 @@ mod tests {
         (entries, spool)
     }
 
+    fn watch_entry(letter: char, pid: u32) -> PendingRequest {
+        let mut entry = entry(letter, pid, 7, NOW + 100);
+        entry.needs_watch = true;
+        entry
+    }
+
+    #[test]
+    fn watch_entries_are_throttled_at_their_uid_and_global_limits() {
+        let mut same_uid = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            same_uid = same_uid.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        let next = watch_entry('a', 4242);
+        assert_eq!(
+            publish_as_1000(&same_uid, &FakePeer::new(), &next),
+            Err(MintError::ConfirmationThrottled)
+        );
+
+        let mut global = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES {
+            let mut watched = watch_entry('b', 30_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 2_000 + u32::try_from(index).unwrap();
+            global = global.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        assert_eq!(
+            publish_as_1000(&global, &FakePeer::new(), &next),
+            Err(MintError::ConfirmationThrottled)
+        );
+    }
+
+    #[test]
+    fn watch_mints_succeed_one_below_each_quota() {
+        let mut same_uid = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID - 1 {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            same_uid = same_uid.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        let next = watch_entry('a', 4242);
+        publish_as_1000(&same_uid, &FakePeer::new(), &next).unwrap();
+        assert_eq!(same_uid.files().len(), MAX_WATCH_ENTRIES_PER_UID);
+
+        let mut global = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES - 1 {
+            let mut watched = watch_entry('b', 30_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 2_000 + u32::try_from(index).unwrap();
+            global = global.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        publish_as_1000(&global, &FakePeer::new(), &next).unwrap();
+        assert_eq!(global.files().len(), MAX_WATCH_ENTRIES);
+    }
+
+    #[test]
+    fn a_pending_entry_survives_its_requester_exiting() {
+        let pending = watch_entry('b', 4243);
+        let spool = spool_with(&[&pending]);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+
+        assert!(spool.files().contains_key(pending.nonce.as_bytes()));
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn an_approval_survives_until_the_rerun() {
+        let mut approved = watch_entry('b', 4243);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.shown_at_ms = Some(BoottimeMillis(0));
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: approved.caller_uid,
+            pid: 5000,
+            starttime: 77,
+            tty: (136 << 8) | 1,
+            sid: approved.caller_sid + 1,
+        };
+        approved.confirmed_by = Some(watcher.clone());
+        approved.shown_to = Some(watcher);
+        let spool = spool_with(&[&approved]);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+
+        assert!(spool.files().contains_key(approved.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn a_consumed_watch_entry_still_tracks_its_gate_caller() {
+        let mut consumed = watch_entry('b', 4243);
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        consumed.confirmed = true;
+        consumed.shown_at_ms = Some(BoottimeMillis(0));
+        let watcher = xudo_gate::request::WatcherPin {
+            uid: consumed.caller_uid,
+            pid: 5000,
+            starttime: 77,
+            tty: (136 << 8) | 1,
+            sid: consumed.caller_sid + 1,
+        };
+        consumed.confirmed_by = Some(watcher.clone());
+        consumed.shown_to = Some(watcher);
+        let spool = spool_with(&[&consumed]);
+        let caller_is_live = running(FakePeer::new(), &consumed, 1000, 1000);
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &caller_is_live, &next).unwrap();
+
+        assert!(spool.files().contains_key(consumed.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn alternating_requests_cannot_sweep_each_others_pending_entry() {
+        let request_a = watch_entry('b', 4243);
+        let request_b = watch_entry('c', 4244);
+        let spool = spool_with(&[&request_a]);
+
+        publish_as_1000(&spool, &FakePeer::new(), &request_b).unwrap();
+        publish_as_1000(
+            &spool,
+            &FakePeer::new(),
+            &entry('a', 4242, 5_000, NOW + 900),
+        )
+        .unwrap();
+
+        assert!(spool.files().contains_key(request_a.nonce.as_bytes()));
+        assert!(spool.files().contains_key(request_b.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn one_process_alternating_requests_cannot_supersede_its_pending_entry() {
+        let pending_a = watch_entry('b', 4242);
+        let spool = spool_with(&[&pending_a]);
+        let request_b = watch_entry('c', 4242);
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &request_b),
+            Err(MintError::ConfirmationThrottled)
+        );
+        let request_a_again = watch_entry('d', 4242);
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &request_a_again),
+            Err(MintError::ConfirmationThrottled)
+        );
+        assert_eq!(spool.files().len(), 1);
+        assert_eq!(
+            spool.files()[pending_a.nonce.as_bytes()],
+            pending_a.to_json().into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_password_only_request_cannot_supersede_a_pending_entry_of_the_same_process() {
+        let pending = watch_entry('b', 4242);
+        let spool = spool_with(&[&pending]);
+        let password_only = entry('a', 4242, 7, NOW + 900);
+        assert!(!password_only.needs_watch);
+
+        assert_eq!(
+            publish_as_1000(&spool, &FakePeer::new(), &password_only),
+            Err(MintError::ConfirmationThrottled)
+        );
+        assert_eq!(spool.files().len(), 1);
+        assert_eq!(
+            spool.files()[pending.nonce.as_bytes()],
+            pending.to_json().into_bytes()
+        );
+    }
+
+    #[test]
+    fn an_expired_waiting_entry_is_pruned_after_grace_even_without_the_confirm_dir() {
+        let expired = watch_entry('b', 4242);
+        let deadline = expired.deadline.0;
+        let spool = spool_with(&[&expired]);
+        let next = entry('a', 5000, 8, deadline + EXPIRED_WATCH_GRACE_MILLIS + 900);
+
+        publish_at(
+            &spool,
+            &FakePeer::new(),
+            &next,
+            deadline + EXPIRED_WATCH_GRACE_MILLIS,
+        )
+        .unwrap();
+
+        assert!(!spool.files().contains_key(expired.nonce.as_bytes()));
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn watch_entries_do_not_consume_password_path_uid_slots() {
+        let mut spool = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID {
+            let mut watched = watch_entry(
+                char::from(b'b' + u8::try_from(index).unwrap()),
+                20_000 + u32::try_from(index).unwrap(),
+            );
+            watched.nonce = format!("{:064x}", index + 1);
+            spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+        assert_eq!(spool.files().len(), MAX_WATCH_ENTRIES_PER_UID + 1);
+    }
+
+    #[test]
+    fn watch_entries_cannot_exhaust_the_spool_for_the_password_path() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        for index in 0..MAX_WATCH_ENTRIES {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 4_000 + u32::try_from(index).unwrap();
+            spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        for index in 0..MAX_SPOOL_ENTRIES - 1 {
+            let mut password = entry('c', 30_000 + u32::try_from(index).unwrap(), 7, NOW + 100);
+            password.nonce = format!("{:064x}", MAX_WATCH_ENTRIES + index + 1);
+            let uid = 2_000 + u32::try_from(index.div_euclid(MAX_ENTRIES_PER_UID)).unwrap();
+            host = running(host, &password, uid, uid);
+            spool = spool.with_file(password.nonce.clone(), password.to_json());
+        }
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &host, &next).unwrap();
+        assert_eq!(spool.files().len(), MAX_WATCH_ENTRIES + MAX_SPOOL_ENTRIES);
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    proptest! {
+        #[test]
+        fn any_mix_of_watch_entries_never_blocks_a_fresh_password_mint(
+            watch_states in prop::collection::vec(0u8..3, 0..=MAX_WATCH_ENTRIES),
+            owned_watch_count in 0..=MAX_WATCH_ENTRIES,
+            password_count in 0..MAX_SPOOL_ENTRIES,
+        ) {
+            let mut spool = FakeSpool::new();
+            let mut host = FakePeer::new();
+            for (index, state) in watch_states.into_iter().enumerate() {
+                let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+                watched.nonce = format!("{:064x}", index + 1);
+                watched.caller_uid = if index < owned_watch_count {
+                    1000
+                } else {
+                    4_000 + u32::try_from(index).unwrap()
+                };
+                let watcher = xudo_gate::request::WatcherPin {
+                    uid: watched.caller_uid,
+                    pid: 50_000 + u32::try_from(index).unwrap(),
+                    starttime: 77,
+                    tty: (136 << 8) | 1,
+                    sid: watched.caller_sid + 1,
+                };
+                match state {
+                    0 => {}
+                    1 => {
+                        watched.state = xudo_gate::request::ConfirmationState::Approved;
+                        watched.confirmed = true;
+                        watched.confirmed_by = Some(watcher.clone());
+                        watched.shown_to = Some(watcher);
+                        watched.shown_at_ms = Some(BoottimeMillis(NOW - 2));
+                    }
+                    _ => {
+                        watched.state = xudo_gate::request::ConfirmationState::Consumed;
+                        watched.confirmed = true;
+                        watched.confirmed_by = Some(watcher.clone());
+                        watched.shown_to = Some(watcher);
+                        watched.shown_at_ms = Some(BoottimeMillis(NOW - 2));
+                        host = running(host, &watched, watched.caller_uid, watched.caller_uid);
+                    }
+                }
+                spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+            }
+            for index in 0..password_count {
+                let mut password = entry('c', 30_000 + u32::try_from(index).unwrap(), 7, NOW + 100);
+                password.nonce = format!("{:064x}", MAX_WATCH_ENTRIES + index + 1);
+                let uid = 2_000 + u32::try_from(index.div_euclid(MAX_ENTRIES_PER_UID)).unwrap();
+                host = running(host, &password, uid, uid);
+                spool = spool.with_file(password.nonce.clone(), password.to_json());
+            }
+            let next = entry('a', 4242, 5_000, NOW + 900);
+
+            prop_assert!(publish_as_1000(&spool, &host, &next).is_ok());
+        }
+    }
+
     #[test]
     fn sixty_four_exited_callers_cannot_lock_everyone_else_out() {
         // The attack: one group member runs clients one after another, each
@@ -919,6 +1394,6 @@ mod tests {
     #[test]
     fn the_ttl_covers_sudos_default_conversation() {
         // passwd_timeout (5 minutes) times passwd_tries (3).
-        assert_eq!(REQUEST_TTL_SECS, 5 * 60 * 3);
+        assert_eq!(REQUEST_TTL_MILLIS, 5 * 60 * 3 * 1_000);
     }
 }

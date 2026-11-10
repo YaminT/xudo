@@ -35,7 +35,7 @@ UMask=0077
 ProtectSystem=strict
 # The spool and the audit log. "-": if tmpfiles has not created one, the broker
 # still starts and refuses with a reason, rather than failing before it can say.
-ReadWritePaths=-/run/xudo/req -/var/lib/xudo
+ReadWritePaths=-/run/xudo/req -/run/xudo/confirm -/var/lib/xudo
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

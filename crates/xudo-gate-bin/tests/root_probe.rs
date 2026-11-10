@@ -44,16 +44,24 @@ use std::fs::{self, File, Permissions};
 use std::io::{Read as _, Write as _};
 use std::net::Shutdown;
 use std::os::fd::AsFd as _;
-use std::os::unix::fs::{PermissionsExt, chown};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+struct FreezeMarkerGuard(std::path::PathBuf);
+
+impl Drop for FreezeMarkerGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 use xudo_backend::{InstallPlan, detect};
-use xudo_gate::SPOOL_DIR;
-use xudo_gate::request::{MonotonicSecs, PendingRequest, REQUEST_SCHEMA_VERSION};
+use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION};
+use xudo_gate::{CONFIG_FILE as GATE_CONFIG_FILE, SPOOL_DIR};
 use xudo_sys::{
     Clock, HostClock, HostInstallOps, HostProbe, InstallProbe, ProbeResult, VerifiedProc, execute,
     lineage, load_trusted_rules, run_capture,
@@ -74,8 +82,10 @@ impl InstallProbe for NoProbe {
 const GATE: &str = env!("CARGO_BIN_EXE_xudo-gate");
 const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 const RULES_DIR: &str = "/etc/xudo/rules.d";
+const CONFIG_FILE: &str = "/etc/xudo/config.toml";
 const AUDIT_DIR: &str = "/var/lib/xudo";
 const JOURNAL_DIR: &str = "/run/systemd/journal";
+const CONFIRM_DIR: &str = "/run/xudo/confirm";
 const USER: &str = "xudotest";
 /// The lane's account's password. Worth nothing: see `ci/root-test.sh`.
 const PASSWORD: &str = "xudotest-fixed-password";
@@ -89,6 +99,139 @@ fn begin_root_test(test: &str) -> bool {
         return false;
     }
     true
+}
+
+#[test]
+fn gate_reads_the_root_owned_config_from_etc() {
+    if !begin_root_test("gate_reads_the_root_owned_config_from_etc") {
+        return;
+    }
+    let _journal = install_everything();
+    let loaded = xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
+    assert!(loaded.settings.confirm_human_path);
+}
+
+#[test]
+fn gate_refuses_bad_configs_through_the_real_trust_walk() {
+    if !begin_root_test("gate_refuses_bad_configs_through_the_real_trust_walk") {
+        return;
+    }
+    let _journal = install_everything();
+    let paths = xudo_config::SystemPaths::default();
+    assert_eq!(Path::new(GATE_CONFIG_FILE), paths.config());
+
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o666);
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "world-writable config passed the gate trust walk"
+    );
+
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+    let target = "/etc/xudo/config-target.toml";
+    root_file(target, b"confirm_human_path = true\n", 0o644);
+    fs::remove_file(CONFIG_FILE).unwrap();
+    std::os::unix::fs::symlink(target, CONFIG_FILE).unwrap();
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "symlinked config passed the gate trust walk"
+    );
+
+    fs::remove_file(CONFIG_FILE).unwrap();
+    root_file(CONFIG_FILE, b"unknown_m3_setting = true\n", 0o644);
+    assert!(
+        xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).is_err(),
+        "unknown config key passed the gate parser"
+    );
+    fs::remove_file(target).unwrap();
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+}
+
+/// Sends one question to the real broker on its real socket, as this process.
+fn ask_broker(question: xudo_wire::Question) -> BrokerResponse {
+    let mut client = UnixStream::connect(SOCKET).unwrap();
+    let request = BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    };
+    client.write_all(request.to_json().as_bytes()).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).unwrap();
+    BrokerResponse::parse(&answer).unwrap()
+}
+
+/// The real broker publishes the freeze file into the real `/var/lib/xudo`
+/// (over a stale temporary a killed broker left), the policy both the broker
+/// and the gate load reads it as frozen, only root can thaw, and the human path
+/// keeps working while frozen.
+///
+/// A real gate run cannot be agent-classified before M4, so what the frozen
+/// flag changes for the agent path is asserted on the policy load result, the
+/// one value the gate's engine takes it from; the engine's own use of it is in
+/// `xudo-policy`'s tests.
+#[test]
+fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
+    if !begin_root_test("the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate") {
+        return;
+    }
+    let _journal = install_everything();
+    start_broker();
+    let dir = Path::new("/var/lib/xudo");
+    let marker = dir.join("frozen");
+    let stale = dir.join(format!("{}frozen", xudo_sys::TEMP_PREFIX));
+    let _ = fs::remove_file(&marker);
+    let _marker_guard = FreezeMarkerGuard(marker.clone());
+    assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
+    assert_eq!(
+        fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let load = || xudo_gate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE)).unwrap();
+    assert!(!load().settings.frozen);
+
+    fs::write(&stale, b"half a record").unwrap();
+    let answer = ask_broker(xudo_wire::Question::Freeze {
+        reason: "root lane test".to_owned(),
+    });
+    assert_eq!(answer.answer, Answer::Done);
+    assert!(!stale.exists(), "the stale temporary disabled freeze");
+    let meta = fs::metadata(&marker).unwrap();
+    assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o600));
+    let record = fs::read_to_string(&marker).unwrap();
+    assert!(record.contains(r#""reason":"root lane test""#), "{record}");
+    assert!(load().settings.frozen);
+
+    // A second freeze reports success rather than failing on the first.
+    let again = ask_broker(xudo_wire::Question::Freeze {
+        reason: "again".to_owned(),
+    });
+    assert_eq!(again.answer, Answer::Done);
+
+    // The human path: the entry is written, the password typed, the gate runs.
+    let nonce = write_entry(own_pin(), 0);
+    let output = through_sudo();
+    assert!(output.success, "{output:?}");
+    assert_eq!(output.stdout.trim(), "0");
+    assert!(!entry_exists(&nonce));
+
+    // An ordinary user cannot thaw, and is told it is a matter of trust.
+    let refused = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo_binary())
+        .args(["--output", "json", "thaw"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("ChannelUntrusted"),
+        "{refused:?}"
+    );
+    assert!(marker.exists());
+
+    assert_eq!(ask_broker(xudo_wire::Question::Thaw).answer, Answer::Done);
+    assert!(!marker.exists());
+    assert!(!load().settings.frozen);
+    remove_snippet();
 }
 
 fn root_dir(path: &str, mode: u32) {
@@ -157,12 +300,15 @@ fn install_everything() -> StandInJournal {
         RULES.as_bytes(),
         0o644,
     );
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
     root_dir("/var/lib", 0o755);
     root_dir(AUDIT_DIR, 0o700);
     let _ = fs::remove_file(format!("{AUDIT_DIR}/audit.jsonl"));
     root_dir("/run/xudo", 0o700);
     root_dir(SPOOL_DIR, 0o700);
     clear_spool();
+    root_dir(CONFIRM_DIR, 0o700);
+    let _ = fs::remove_file(format!("{CONFIRM_DIR}/1000.json"));
 
     // The rule, exactly as `xudo install` writes it.
     let backend = detect(&HostProbe).expect("the lane installs sudo before it runs");
@@ -217,9 +363,17 @@ fn write_entry(pin: (u32, u64), generation_offset: u64) -> String {
         program: "/usr/bin/id".to_owned(),
         argv: vec!["-u".to_owned()],
         generation: generation.saturating_add(generation_offset),
-        deadline: MonotonicSecs(HostClock.monotonic_secs().saturating_add(120)),
+        deadline: BoottimeMillis(HostClock.boottime_millis().saturating_add(120_000)),
         confirmed: false,
         confirmed_by: None,
+        state: xudo_gate::request::ConfirmationState::Pending,
+        caller_uid: 1000,
+        caller_sid: 10,
+        caller_tty: 20,
+        needs_watch: false,
+        shown_at_ms: None,
+        shown_to: None,
+        fingerprint: "0".repeat(64),
         claimed_classification: "human".to_owned(),
     };
     let path = format!("{SPOOL_DIR}/{nonce}");
@@ -271,6 +425,43 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         "the journal was sent nothing"
     );
     remove_snippet();
+}
+
+#[test]
+fn the_real_gate_requires_watch_approval_in_addition_to_the_password() {
+    if !begin_root_test("the_real_gate_requires_watch_approval_in_addition_to_the_password") {
+        return;
+    }
+    let _journal = install_everything();
+    let mut confirm_rule = RULES.to_owned();
+    confirm_rule.push_str("confirm = \"always\"\n");
+    root_file(
+        &format!("{RULES_DIR}/05-probe.toml"),
+        confirm_rule.as_bytes(),
+        0o644,
+    );
+    root_file(CONFIG_FILE, b"confirm_human_path = true\n", 0o644);
+    let nonce = write_entry(own_pin(), 0);
+
+    let output = through_sudo();
+
+    assert!(
+        !output.success,
+        "gate ran a confirm-tier command without watch approval: {output:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected command output: {output:?}"
+    );
+    assert!(
+        output.stderr.contains("gate_confirmation_missing"),
+        "gate did not refuse after the password: {output:?}"
+    );
+    assert!(
+        entry_exists(&nonce),
+        "refused request should remain unconsumed"
+    );
+    clear_spool();
 }
 
 #[test]
@@ -545,6 +736,159 @@ fn spool_entries() -> usize {
 fn exec_probe() -> Pty {
     let xudo = xudo_binary();
     Pty::spawn(&[xudo.to_str().unwrap(), "exec", "--", "/usr/bin/id", "-u"])
+}
+
+/// Seeds the same root-owned heartbeat file the watch request maintains, tied
+/// to a live xudotest process on a distinct controlling terminal.
+fn live_test_watcher() -> Pty {
+    let watcher = Pty::spawn(&["/usr/bin/sleep", "60"]);
+    // setsid may fork before it can create a session. Find its live descendant
+    // that actually owns the controlling terminal, rather than pinning wrapper.
+    let root_pid = watcher.child.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let (pid, stat) = loop {
+        let found = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+            .find_map(|pid| {
+                let bytes = fs::read(format!("/proc/{pid}/stat")).ok()?;
+                let stat = xudo_sys::parse_stat("watcher", &bytes).ok()?;
+                if !xudo_gate::request::is_watch_terminal(stat.tty_nr) {
+                    return None;
+                }
+                let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                if !status
+                    .lines()
+                    .any(|line| line.starts_with("Uid:\t1000\t1000"))
+                {
+                    return None;
+                }
+                let mut parent = stat.ppid;
+                for _ in 0..8 {
+                    if parent == root_pid {
+                        return Some((pid, stat));
+                    }
+                    let bytes = fs::read(format!("/proc/{parent}/stat")).ok()?;
+                    parent = xudo_sys::parse_stat("watcher parent", &bytes).ok()?.ppid;
+                }
+                None
+            });
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher never acquired a valid pty"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let now = HostClock.boottime_millis();
+    root_file(
+        &format!("{CONFIRM_DIR}/1000.json"),
+        format!(
+            "{{\"h\":[{pid},{},{},{},{}],\"b\":[],\"o\":[]}}",
+            stat.starttime, stat.tty_nr, stat.session, now
+        )
+        .as_bytes(),
+        0o600,
+    );
+    watcher
+}
+
+fn require_watch_confirmation() {
+    let mut confirm_rule = RULES.to_owned();
+    confirm_rule.push_str("confirm = \"always\"\n");
+    root_file(
+        &format!("{RULES_DIR}/05-probe.toml"),
+        confirm_rule.as_bytes(),
+        0o644,
+    );
+}
+
+fn stdin_yes_exec(timeout: u64) -> std::process::Output {
+    root_file(
+        CONFIG_FILE,
+        format!("confirm_human_path = true\nconfirmation_timeout_secs = {timeout}\n").as_bytes(),
+        0o644,
+    );
+    let xudo = xudo_binary();
+    let mut child = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo)
+        .args(["--output", "json", "exec", "--", "/usr/bin/id", "-u"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"yes\n").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn assert_run_is_still_pending(output: &std::process::Output) {
+    assert_eq!(output.status.code(), Some(18), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("\"verdict\":\"pending\""), "{stdout}");
+    assert!(
+        stderr.contains("pending approval") || stderr.contains("waiting for approval"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("yes"),
+        "stdin leaked into output: {stdout}"
+    );
+    let entries = fs::read_dir(SPOOL_DIR)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "pending spool entries: {entries:?}");
+    let bytes = fs::read(entries[0].path()).unwrap();
+    let request = PendingRequest::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        request.state,
+        xudo_gate::request::ConfirmationState::Pending
+    );
+    let log = fs::read(AUDIT_LOG).unwrap();
+    let chain = xudo_audit::verify_log(&log).unwrap();
+    let runs = chain
+        .records()
+        .iter()
+        .filter(|record| {
+            record.decision == xudo_audit::record::Decision::AwaitingConfirmation
+                && record.action.as_deref() == Some(ACTION)
+        })
+        .count();
+    assert_eq!(runs, 1, "the run was repeated: {:#?}", chain.records());
+}
+
+#[test]
+fn yes_on_stdin_cannot_answer_a_pending_run_with_zero_wait() {
+    if !begin_root_test("yes_on_stdin_cannot_answer_a_pending_run_with_zero_wait") {
+        return;
+    }
+    let _journal = install_everything();
+    require_watch_confirmation();
+    let _watcher = live_test_watcher();
+    start_broker();
+    let output = stdin_yes_exec(0);
+    assert_run_is_still_pending(&output);
+    clear_spool();
+}
+
+#[test]
+fn yes_on_stdin_cannot_answer_a_pending_run_while_waiting() {
+    if !begin_root_test("yes_on_stdin_cannot_answer_a_pending_run_while_waiting") {
+        return;
+    }
+    let _journal = install_everything();
+    require_watch_confirmation();
+    let _watcher = live_test_watcher();
+    start_broker();
+    let output = stdin_yes_exec(1);
+    assert_run_is_still_pending(&output);
+    clear_spool();
 }
 
 #[test]

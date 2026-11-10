@@ -15,6 +15,10 @@ pub struct ProcStat {
     pub comm: Vec<u8>,
     /// The parent process id.
     pub ppid: u32,
+    /// Session id from field 6.
+    pub session: i64,
+    /// Controlling terminal number from field 7; zero means none.
+    pub tty_nr: i64,
     /// Start time in clock ticks since boot.
     ///
     /// Carried everywhere alongside the pid because a pid alone is not an
@@ -72,7 +76,8 @@ pub fn parse_stat(path: &str, bytes: &[u8]) -> Result<ProcStat, SysError> {
     // Everything after the closing parenthesis: state, ppid, pgrp, session,
     // tty_nr, tpgid, flags, minflt, cminflt, majflt, cmajflt, utime, stime,
     // cutime, cstime, priority, nice, num_threads, itrealvalue, starttime.
-    // These are field 3 onward, so ppid is index 1 and starttime is index 19.
+    // These are field 3 onward: ppid is index 1, session 3, tty_nr 4,
+    // and starttime 19.
     // `close` is an index into `bytes`, so `close + 1` is at most `len` and this
     // slice always exists; an empty tail simply means the line stopped at the
     // closing parenthesis, which the field checks below report.
@@ -90,8 +95,18 @@ pub fn parse_stat(path: &str, bytes: &[u8]) -> Result<ProcStat, SysError> {
         pid,
         comm,
         ppid: parse_u32(path, parent_field)?,
+        // `start_field` above proves both later fields exist too.
+        session: parse_i64(path, fields.get(3).copied().unwrap_or_default())?,
+        tty_nr: parse_i64(path, fields.get(4).copied().unwrap_or_default())?,
         starttime: parse_u64(path, start_field)?,
     })
+}
+
+fn parse_i64(path: &str, bytes: &[u8]) -> Result<i64, SysError> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| SysError::malformed(path, "signed integer field is invalid"))
 }
 
 /// A cgroup v2 path, e.g. `/user.slice/user-1000.slice/session-3.scope`.
@@ -430,6 +445,8 @@ mod tests {
                 pid: 412,
                 comm: b"bash".to_vec(),
                 ppid: 411,
+                session: 1,
+                tty_nr: 0,
                 starttime: 98_765,
             }
         );
@@ -437,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_comm_containing_a_close_paren_cannot_shift_the_later_fields() {
+    fn stat_parsing_survives_a_comm_with_parens_and_spaces() {
         // The attack this parser exists to defeat. A process named
         // `evil) 1 999 (` makes a first-paren parser read 999 as the ppid and
         // point an ancestry walk at a process of the attacker's choosing.
@@ -446,6 +463,18 @@ mod tests {
         assert_eq!(parsed.ppid, 411, "ppid was shifted by a crafted comm");
         assert_eq!(parsed.starttime, 98_765);
         assert_eq!(parsed.comm, b"evil) 1 999 (".to_vec());
+    }
+
+    #[test]
+    fn rejects_a_tty_number_that_is_not_signed_decimal() {
+        let line = stat_line(412, "bash", 411, 98_765).replace("1 1 0 -1", "1 1 not-a-tty -1");
+        assert!(parse_stat("1/stat", line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_a_session_number_that_is_not_signed_decimal() {
+        let line = stat_line(412, "bash", 411, 98_765).replace("1 1 0 -1", "1 not-a-session 0 -1");
+        assert!(parse_stat("1/stat", line.as_bytes()).is_err());
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub enum Setting {
     /// narrowing the confirmation requirement takes a root-authored `trust.d`
     /// record plus a per-invocation flag, both enforced by the broker.
     ConfirmAgentActions,
+    /// Require an out-of-band human watch approval on the human path.
+    ConfirmHumanPath,
     /// How long a pending confirmation waits before it is denied.
     ConfirmationTimeoutSecs,
     /// Whether the agent path is frozen.
@@ -54,8 +56,9 @@ pub enum Setting {
 
 impl Setting {
     /// Every setting, for exhaustive reporting and schema export.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ConfirmAgentActions,
+        Self::ConfirmHumanPath,
         Self::ConfirmationTimeoutSecs,
         Self::Frozen,
         Self::AuditSink,
@@ -67,6 +70,7 @@ impl Setting {
     pub fn key(self) -> &'static str {
         match self {
             Self::ConfirmAgentActions => "confirm_agent_actions",
+            Self::ConfirmHumanPath => "confirm_human_path",
             Self::ConfirmationTimeoutSecs => "confirmation_timeout_secs",
             Self::Frozen => "frozen",
             Self::AuditSink => "audit_sink",
@@ -79,7 +83,7 @@ impl Setting {
     ///
     /// Everything except presentation. The environment may not set these.
     pub fn is_security_relevant(self) -> bool {
-        !matches!(self, Self::Color)
+        !matches!(self, Self::Color | Self::ConfirmationTimeoutSecs)
     }
 
     /// Whether this setting can be configured at all.
@@ -100,7 +104,7 @@ impl Setting {
     pub fn narrows(self, current: &Value, candidate: &Value) -> bool {
         match (self, current, candidate) {
             (
-                Self::ConfirmAgentActions | Self::Frozen,
+                Self::ConfirmAgentActions | Self::ConfirmHumanPath | Self::Frozen,
                 Value::Bool(current),
                 Value::Bool(candidate),
             ) => *candidate || !*current,
@@ -184,6 +188,14 @@ pub enum MergeError {
         /// What was supplied.
         actual: String,
     },
+    /// A confirmation wait is longer than the supported bound.
+    #[error("{key} must be at most 600 seconds, got {value}")]
+    OutOfRange {
+        /// The setting's key.
+        key: String,
+        /// The rejected value.
+        value: String,
+    },
     /// A setting that is compiled in was set.
     #[error("{key} is compiled in and cannot be configured; remove it")]
     NotConfigurable {
@@ -210,8 +222,12 @@ impl Default for Settings {
             Tracked::default_value(Value::Bool(true)),
         );
         values.insert(
+            Setting::ConfirmHumanPath,
+            Tracked::default_value(Value::Bool(false)),
+        );
+        values.insert(
             Setting::ConfirmationTimeoutSecs,
-            Tracked::default_value(Value::Integer(60)),
+            Tracked::default_value(Value::Integer(0)),
         );
         values.insert(Setting::Frozen, Tracked::default_value(Value::Bool(false)));
         values.insert(
@@ -281,6 +297,14 @@ impl Settings {
                 key: setting.key().to_owned(),
                 expected: current.value.type_name().to_owned(),
                 actual: value.type_name().to_owned(),
+            });
+        }
+        if setting == Setting::ConfirmationTimeoutSecs
+            && matches!(&value, Value::Integer(seconds) if *seconds > 600)
+        {
+            return Err(MergeError::OutOfRange {
+                key: setting.key().to_owned(),
+                value: value.render(),
             });
         }
         if origin.layer.is_narrowing_only() && !setting.narrows(&current.value, &value) {
@@ -381,6 +405,26 @@ mod tests {
     }
 
     #[test]
+    fn a_project_layer_cannot_turn_confirm_human_path_off() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.get(Setting::ConfirmHumanPath).value,
+            Value::Bool(false)
+        );
+        settings
+            .apply(Setting::ConfirmHumanPath, Value::Bool(true), project(1))
+            .unwrap();
+        let error = settings
+            .apply(Setting::ConfirmHumanPath, Value::Bool(false), project(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("may only narrow"), "{error}");
+        assert_eq!(
+            settings.get(Setting::ConfirmHumanPath).value,
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn a_system_layer_wins_over_a_default_and_reports_its_file_and_line() {
         let mut settings = Settings::default();
         settings
@@ -407,7 +451,6 @@ mod tests {
         for setting in [
             Setting::ConfirmAgentActions,
             Setting::Frozen,
-            Setting::ConfirmationTimeoutSecs,
             Setting::AuditSink,
         ] {
             let value = settings.get(setting).value.clone();
@@ -474,6 +517,13 @@ mod tests {
         settings
             .apply(
                 Setting::ConfirmationTimeoutSecs,
+                Value::Integer(60),
+                system(1),
+            )
+            .unwrap();
+        settings
+            .apply(
+                Setting::ConfirmationTimeoutSecs,
                 Value::Integer(30),
                 project(1),
             )
@@ -493,6 +543,34 @@ mod tests {
         assert!(err.to_string().contains("may only narrow"), "{err}");
         assert!(err.to_string().contains("30"), "{err}");
         assert!(err.to_string().contains("600"), "{err}");
+    }
+
+    #[test]
+    fn the_confirmation_timeout_defaults_to_zero_and_refuses_more_than_ten_minutes() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.get(Setting::ConfirmationTimeoutSecs).value,
+            Value::Integer(0)
+        );
+        settings
+            .apply(
+                Setting::ConfirmationTimeoutSecs,
+                Value::Integer(600),
+                system(1),
+            )
+            .unwrap();
+        let err = settings
+            .apply(
+                Setting::ConfirmationTimeoutSecs,
+                Value::Integer(601),
+                system(2),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 600 seconds"), "{err}");
+        assert_eq!(
+            settings.get(Setting::ConfirmationTimeoutSecs).value,
+            Value::Integer(600)
+        );
     }
 
     #[test]
@@ -674,12 +752,15 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), count);
-        // Only presentation is not security-relevant.
+        // Presentation and the front-end wait duration are not security-relevant.
         let relaxed: Vec<Setting> = Setting::ALL
             .into_iter()
             .filter(|s| !s.is_security_relevant())
             .collect();
-        assert_eq!(relaxed, vec![Setting::Color]);
+        assert_eq!(
+            relaxed,
+            vec![Setting::ConfirmationTimeoutSecs, Setting::Color]
+        );
         for setting in Setting::ALL {
             assert!(format!("{setting:?}").len() > 3);
         }

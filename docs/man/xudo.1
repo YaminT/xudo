@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-07" "xudo 0.0.1" "User Commands"
+.TH XUDO 1 "2026-11-07" "xudo 0.1.0-beta.1" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -136,6 +136,48 @@ The program is an absolute path, after
 .BR \-\- .
 The command's own status is the process status.
 A policy refusal happens before the command runs.
+If a human watch approval is pending, the default timeout returns at once
+with exit status 18 and leaves the request pending.
+Set
+.B confirmation_timeout_secs
+in the settings file to wait for approval; it defaults to 0 and accepts values
+from 0 through 600 seconds. The settings file,
+.IR /etc/xudo/config.toml ,
+must be readable by the invoking user; otherwise exec fails closed with status
+19. A positive timeout of n seconds starts after the broker first reports the
+pending request. If the broker is silent, xudo waits at most n+5 seconds from
+that point. After an approval, the consuming run request has a separate maximum
+of 5 seconds. With
+.B \-\-output json,
+each pending update is one compact JSON object per line (JSON Lines).
+.TP
+.B watch
+Watch for pending confirmation requests on this terminal.
+The broker checks the watcher's session and terminal on each heartbeat and
+answer. A line shows the canonical command, governing rule, classification,
+evidence, time left, and the action's final word. Type that word to approve,
+or
+.B n
+to deny. Approval still requires the command's password. Input typed before
+the prompt is flushed; a rejected answer leaves the request pending.
+.TP
+.B pending
+List this user's pending confirmation requests without answering them.
+This command does not require a terminal.
+.TP
+.B freeze
+Requires
+.BR \-\-reason \fITEXT\fR .
+Freeze the agent path with an operator supplied reason. Until agent
+enrollment ships (M4) this sets the flag but changes nothing for new requests
+or for human requests: every caller is unattested, and the human password path
+stays available. Pending or approved requests of an enrolled agent are denied
+and audited, without a backoff strike; a human's pending request is left alone.
+.TP
+.B thaw
+Remove the freeze marker and resume the agent path. Accepted only from uid 0;
+run it as
+.BR "sudo xudo thaw" .
 .TP
 .B check
 Lint the loaded ruleset.
@@ -193,8 +235,10 @@ A file that does not parse, or that contains an unrecognised key, exits
 The keys are
 .B confirm_agent_actions
 (default true),
+.B confirm_human_path
+(default false),
 .B confirmation_timeout_secs
-(default 60),
+(default 0, maximum 600 seconds),
 .B frozen
 (default false),
 .B audit_sink
@@ -204,6 +248,8 @@ The keys are
 (default true), and
 .BR use_pty ,
 which is compiled in as true and is refused if set.
+When enabled, a rule that requires confirmation also requires an out-of-band
+watch approval; the password alone does not satisfy it.
 The command marks security-relevant settings and says they are never
 settable from the environment.
 This binary does not read the environment for them.
@@ -284,6 +330,7 @@ Denied by policy, or an audit log that is not intact.
 .B 18
 Confirmation is required, or there is no live confirmation channel.
 Both mean nobody has approved the action.
+An approval request still pending at the configured timeout also exits 18.
 .TP
 .B 19
 .B xudo
