@@ -10,7 +10,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 > **Status, 2026-11-06.** Phase 3 step 2 is implemented: the systemd unit omits `NoNewPrivileges=yes`, and the broker sets it through the hygiene seam before serving. Failure is audited, refused, and exits non-zero. `just systemd-test` checks `NoNewPrivs: 1` and the full password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
 
-> **Status, 2026-11-10. M3 is built and done.** `xudo watch` provides out-of-band confirmation; it is off by default, and every path still requires the password. Gaps: same-uid watcher separation awaits M4 cgroups, the user-namespace check runs in the systemd lane, freeze does not affect new or human requests before M4, and polling/connect have limits. See `../CONCERNS.md`, 2026-11-10.
+> **Status, 2026-11-10. M3 is built and done.** `xudo watch` provides out-of-band confirmation; it is off by default, and every path still requires the password. Gaps: same-uid watcher separation awaits M4 cgroups, freeze does not affect new or human requests before M4, and polling/connect have limits. See `../CONCERNS.md`, 2026-11-10.
 
 > **Status, 2026-11-05.** Phase 3 step 1 is implemented in `packaging/deb/`: the unsigned human-path `.deb`, maintainer scripts, and Ubuntu 24.04/26.04 plus Debian 13 install matrix are wired into CI. Signing, publication, and the remaining phase 3 deliverables await later steps and the owner's explicit release approval.
 
