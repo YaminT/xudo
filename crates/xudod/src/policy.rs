@@ -309,6 +309,20 @@ args = [
     }
 
     #[test]
+    fn settings_refuse_an_audit_sink_other_than_journald() {
+        let error = xudo_gate::settings_from(
+            Some(b"audit_sink = \"syslog\"\n"),
+            Path::new("/etc/xudo/config.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("audit_sink only accepts \"journald\"")
+        );
+    }
+
+    #[test]
     fn a_broken_settings_file_is_a_refusal_not_a_fallback() {
         let file = Path::new("/etc/xudo/config.toml");
         let err =
