@@ -492,7 +492,7 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
 }
 
 #[test]
-fn deb_postinst_fallback_creates_every_tmpfiles_path() {
+fn deb_postinst_fallback_matches_tmpfiles_paths_modes_and_owners() {
     let fallback = POSTINST
         .split("else\n    # Same paths and modes as packaging/tmpfiles.d/xudo.conf.")
         .nth(1)
@@ -501,15 +501,39 @@ fn deb_postinst_fallback_creates_every_tmpfiles_path() {
         .next()
         .unwrap_or("");
     assert!(!fallback.is_empty(), "postinst fallback is missing");
-    for path in TMPFILES
+    let rows: Vec<Vec<&str>> = TMPFILES
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_whitespace().nth(1))
-    {
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert!(
+        rows.iter().all(|row| row.len() >= 5),
+        "tmpfiles row is missing type, path, mode, user, or group"
+    );
+    for row in &rows {
+        let path = row[1];
+        let mode = row[2];
+        let user = row[3];
+        let group = row[4];
+        let line = fallback
+            .lines()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("install") && words.any(|word| word == path)
+            })
+            .unwrap_or_else(|| panic!("fallback omits tmpfiles path {path}"));
         assert!(
-            fallback.contains(path),
-            "fallback omits tmpfiles path {path}"
+            line.contains(&format!("-m {mode}")),
+            "fallback mode for {path} is not {mode}: {line}"
+        );
+        assert!(
+            line.contains(&format!("-o {user}")),
+            "fallback owner for {path} is not {user}: {line}"
+        );
+        assert!(
+            line.contains(&format!("-g {group}")),
+            "fallback group for {path} is not {group}: {line}"
         );
     }
 }
