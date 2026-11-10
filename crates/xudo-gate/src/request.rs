@@ -42,6 +42,16 @@ pub const SPOOL_DIR: &str = "/run/xudo/req";
 /// The wire version of a spool entry.
 pub const REQUEST_SCHEMA_VERSION: u32 = 3;
 
+fn finish_parse(request: PendingRequest) -> Result<PendingRequest, RequestError> {
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
+        return Err(RequestError::WrongSchema {
+            found: request.schema_version,
+            expected: REQUEST_SCHEMA_VERSION,
+        });
+    }
+    Ok(request)
+}
+
 /// How long a nonce is, in hex characters (32 random bytes).
 pub const NONCE_HEX_LEN: usize = 64;
 
@@ -382,7 +392,7 @@ impl PendingRequest {
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
                 reason: error.to_string(),
             })?;
-        Ok(request)
+        finish_parse(request)
     }
 
     /// Renders the entry back to JSON.
@@ -628,6 +638,23 @@ mod tests {
         entry.schema_version = REQUEST_SCHEMA_VERSION - 1;
         assert_eq!(
             entry.validate(pin(), 7, BoottimeMillis(100)),
+            Err(RequestError::WrongSchema {
+                found: REQUEST_SCHEMA_VERSION - 1,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
+        assert_eq!(
+            PendingRequest::parse(&entry.to_json()).unwrap_err().code(),
+            "request_wrong_schema"
+        );
+        assert_eq!(
+            PendingRequest::parse(r#"{"schema_version":1,"nonce":"legacy"}"#)
+                .unwrap_err()
+                .code(),
+            "request_wrong_schema"
+        );
+        assert_eq!(
+            finish_parse(entry).map(|_| ()),
             Err(RequestError::WrongSchema {
                 found: REQUEST_SCHEMA_VERSION - 1,
                 expected: REQUEST_SCHEMA_VERSION,

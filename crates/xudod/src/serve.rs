@@ -908,7 +908,6 @@ struct BackoffEntry {
 const MAX_CONFIRM_UIDS: usize = 4_096;
 const MAX_BACKOFF_ENTRIES_PER_UID: usize = 64;
 const MAX_RECENT_OUTCOMES_PER_UID: usize = 64;
-const MAX_CONFIRM_NAMES: usize = 65;
 
 const MAX_OUTCOME_BYTES: usize = 2 + 4 + 64 + 7 + 20 + 10 + 20;
 const MAX_BACKOFF_BYTES: usize = 2 + 2 + 64 + 10 + 20;
@@ -1167,7 +1166,7 @@ fn deny_pending(
     let _confirm = SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?;
     let _spool = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
     let names = spool
-        .names_up_to(MAX_CONFIRM_NAMES)
+        .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
         .map_err(|e| Refusal::from(&e))?;
     for name in names {
         let Ok(bytes) = spool.read(&name, crate::mint::MAX_ENTRY_BYTES) else {
@@ -1279,7 +1278,7 @@ fn pending_list(
     let now = platform.clock.boottime_millis();
     let _guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
     let names = spool
-        .names_up_to(MAX_CONFIRM_NAMES)
+        .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
         .map_err(|error| Refusal::from(&error))?;
     let mut prompts = Vec::new();
     let mut omitted = 0;
@@ -1457,7 +1456,7 @@ fn watch(
     let mut candidates = Vec::new();
     let _guard = SpoolGuard::lock(spool).map_err(|e| Refusal::from(&e))?;
     let names = spool
-        .names_up_to(MAX_CONFIRM_NAMES)
+        .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
         .map_err(|e| Refusal::from(&e))?;
     for id in names {
         let Ok(bytes) = spool.read(&id, crate::mint::MAX_ENTRY_BYTES) else {
@@ -3993,6 +3992,72 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .evidence
                 .iter()
                 .any(|item| item.contains(&last_nonce))
+        );
+    }
+
+    #[test]
+    fn freeze_pending_and_watch_scan_the_last_entry_in_a_full_spool() {
+        let identity = test_identity(PID, START, 0, 0);
+        let last_nonce = "f".repeat(64);
+        let fillers = || {
+            (0..crate::mint::MAX_SPOOL_ENTRIES + crate::mint::MAX_WATCH_ENTRIES - 1).fold(
+                FakeSpool::new(),
+                |spool, index| {
+                    let mut entry = someone_elses_entry();
+                    entry.nonce = format!("{:064x}", index + 1);
+                    spool.with_file(entry.nonce.clone(), entry.to_json())
+                },
+            )
+        };
+
+        let mut approved = enrolled_entry(&last_nonce, UID);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let freeze_spool = fillers().with_file(last_nonce.clone(), approved.to_json());
+        let mut host = Host::honest();
+        deny_pending(
+            &mut host.platform(),
+            &freeze_spool,
+            &identity,
+            &freeze_request(),
+        )
+        .unwrap();
+        assert!(!freeze_spool.files().contains_key(last_nonce.as_bytes()));
+        assert_eq!(host.audit.records().len(), 1);
+        let denial_record = &host.audit.records()[0];
+        assert_eq!(denial_record.decision, xudo_audit::record::Decision::Denied);
+        assert_eq!(
+            denial_record.denial.as_deref(),
+            Some("confirmation_refused")
+        );
+        assert!(
+            denial_record
+                .argv
+                .iter()
+                .any(|item| item == "/usr/bin/apt-get")
+        );
+
+        let mut pending_last = shown_entry();
+        pending_last.nonce = last_nonce.clone();
+        let pending_spool = fillers().with_file(last_nonce.clone(), pending_last.to_json());
+        let mut host = Host::honest();
+        let response = pending_list(&mut host.platform(), &pending_spool, &identity).unwrap();
+        assert!(
+            watching_prompts(&response.answer)
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt.id == last_nonce)
+        );
+
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let watch_spool = fillers().with_file(last_nonce.clone(), pending_last.to_json());
+        let mut host = Host::honest();
+        let response = watch(&mut host.platform(), &watch_spool, &watcher).unwrap();
+        assert!(
+            watching_prompts(&response.answer)
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt.id == last_nonce)
         );
     }
 

@@ -196,6 +196,12 @@ impl BrokerRequest {
     }
 
     fn check(&self) -> Result<(), RequestError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
+            return Err(RequestError::WrongSchema {
+                found: self.schema_version,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
         match &self.question {
             Question::Run {
                 program,
@@ -773,7 +779,18 @@ impl BrokerResponse {
             serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
                 reason: error.to_string(),
             })?;
-        match &response.answer {
+        response.check()?;
+        Ok(response)
+    }
+
+    fn check(&self) -> Result<(), ResponseError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
+            return Err(ResponseError::WrongSchema {
+                found: self.schema_version,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
+        match &self.answer {
             Answer::Decided { minted, .. } => {
                 if let Some(minted) = minted {
                     check_nonce(&minted.nonce)
@@ -820,7 +837,7 @@ impl BrokerResponse {
             Answer::Done => {}
         }
         // A refusal carries no envelope, so it has nothing to disagree about.
-        let envelope = match &response.answer {
+        let envelope = match &self.answer {
             Answer::Decided { decision, .. } => decision.schema_version,
             Answer::Pending { .. }
             | Answer::Watching { .. }
@@ -833,7 +850,7 @@ impl BrokerResponse {
                 expected: ENVELOPE_SCHEMA_VERSION,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Renders the response as JSON.
@@ -1053,6 +1070,21 @@ mod tests {
                 found: 3,
                 expected: WIRE_SCHEMA_VERSION,
             }
+        );
+    }
+
+    #[test]
+    fn decoded_request_schema_is_rechecked() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            question: Question::Thaw,
+        };
+        assert_eq!(
+            request.check(),
+            Err(RequestError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
         );
     }
 
@@ -1762,6 +1794,21 @@ mod tests {
     }
 
     #[test]
+    fn decoded_response_schema_is_rechecked() {
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            answer: Answer::Done,
+        };
+        assert_eq!(
+            response.check(),
+            Err(ResponseError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
     fn a_duplicate_key_response_is_refused() {
         let repeated_schema = br#"{"schema_version":2,"schema_version":2,"answer":"done"}"#;
         let duplicate_error = serde_json::from_slice::<BrokerResponse>(repeated_schema)
@@ -1772,6 +1819,26 @@ mod tests {
             Err(ResponseError::Malformed {
                 reason: duplicate_error,
             })
+        );
+
+        let nested_duplicate = format!(
+            "{{\"schema_version\":2,\"answer\":{{\"decided\":{{\"decision\":{},\"minted\":{{\"nonce\":\"{}\",\"nonce\":\"{}\",\"expires_in_ms\":900000,\"gate\":\"/usr/libexec/xudo/xudo-gate-auth\"}}}}}}}}",
+            serde_json::to_string(&Decision::deny(
+                DenialCode::ArgvRejected,
+                vec!["x".to_owned()],
+                Vec::new(),
+            ))
+            .unwrap(),
+            "ab".repeat(32),
+            "cd".repeat(32),
+        );
+        assert_eq!(
+            BrokerResponse::parse(nested_duplicate.as_bytes()).unwrap_err(),
+            ResponseError::Malformed {
+                reason: serde_json::from_str::<BrokerResponse>(&nested_duplicate)
+                    .unwrap_err()
+                    .to_string(),
+            }
         );
     }
 
