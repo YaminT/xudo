@@ -3,6 +3,21 @@
 All notable changes to xudo are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.0-beta.1 - 2026-11-10
+
+### Added
+
+- M3 out-of-band confirmation through `xudo watch`, including pending
+  requests, freeze and thaw controls, and per-user and global watch quotas.
+- Strict wire-message parsing and a journald-only `audit_sink` setting.
+
+### Security
+
+- Human confirmation is disabled by default (`confirm_human_path=false`); every
+  request continues to use the host password path.
+- `just telemetry` runs the strace no-telemetry check, also run by the CI job
+  "no telemetry".
+
 ## Unreleased
 
 ### Added
