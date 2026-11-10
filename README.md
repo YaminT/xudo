@@ -16,6 +16,8 @@ sudo apt install ./xudo_<ver>_<arch>.deb
 
 xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 
+The broker requires systemd and journald. Without them every privileged request is refused; `systemd` is recommended by the package and may be omitted by explicitly installing without recommendations.
+
 ## Example
 
 From a checkout, inspect the example rules with `--rules ./rules`:

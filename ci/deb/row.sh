@@ -25,6 +25,13 @@ cp /debs/old.deb /debs/new.deb /tmp/ && cd /tmp
 
 # Install: pulls sudo, writes the rule, creates an empty group.
 deb_install ./old.deb
+grep -Fq 'every privileged request asks for a password' /tmp/apt.log || fail "first install notice missing"
+grep -Fq 'There is no' /tmp/apt.log || fail "first install notice omitted agent-path status"
+grep -Fq 'https://github.com/YaminT/xudo/blob/main/SECURITY.md' /tmp/apt.log || fail "first install notice omitted SECURITY.md URL"
+grep -Fq 'Agent detection is not a security boundary' /tmp/apt.log || fail "first install notice omitted detection boundary"
+grep -Fq 'sudo adduser <you> xudo' /tmp/apt.log || fail "first install notice omitted group instructions"
+grep -Fq 'xudo doctor --fix' /tmp/apt.log || fail "first install notice omitted doctor instructions"
+grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted systemd/journald requirement"
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
@@ -78,6 +85,9 @@ printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+if grep -Fq 'every privileged request asks for a password' /tmp/apt.log; then
+    fail "upgrade printed the first install notice"
+fi
 [ "$(dpkg-query -W -f='${Version}' xudo)" != "$(dpkg-deb -f /tmp/old.deb Version)" ] || fail "version did not change"
 meta $rule "440 root:root"
 grep -q '^# mine' /etc/xudo/rules.d/05-probe.toml || fail "upgrade lost the operator's edit"
