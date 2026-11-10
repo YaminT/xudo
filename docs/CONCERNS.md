@@ -1,5 +1,11 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-10 — Journald send retries EINTR inside its deadline
+
+`sendto` with `SO_SNDTIMEO` is not restarted after a signal, so `EINTR` means the datagram was not queued. The mirror treated that errno as a refusal. A signal during a blocked send denied the decision, and that is what failed `a_stalled_journald_refuses_within_the_timeout_instead_of_hanging` under a loaded `just verify`. The send now retries until the original monotonic deadline, with the socket timeout shrunk to the time still left (and one microsecond held back so timeval rounding cannot outlast it). Any other error, or the deadline, refuses. A signal storm cannot extend the wait or hang it.
+
+Other blocking calls in `xudo-sys` were checked and do not have this bug. Nothing here calls `connect`. The broker connection's `read_to_end` and `write_all` already retry `EINTR` inside std, so a signal is not a refusal there; they also leave the original `SO_RCVTIMEO` / `SO_SNDTIMEO` in place, so a signal can stretch that wait — a different bug. The pidfd liveness poll is non-blocking (timeout zero): `EINTR` is already fail-closed, and a zero budget cannot retry one interrupt without spinning or racing the clock. `pread` and the non-blocking audit `flock` likewise fail closed on `EINTR` and have no timed wait to resume.
+
 ## 2026-11-10 — Confirmation scans cover the full spool
 
 Freeze denial, pending listing, and watcher scans now share the broker's 80-entry walk bound. Their full mixed-spool regression covers the final entry, including an approved enrolled-agent denial and audit. Wire and gate parsers also recheck decoded schema versions, with regression coverage for stale spool schemas and nested duplicate response keys.

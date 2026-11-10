@@ -257,3 +257,13 @@ fn exec_with_no_broker_exits_nineteen() {
         .code(19)
         .stderr(contains("xudo doctor"));
 }
+
+#[test]
+fn version_reports_the_beta_version_and_audit_status() {
+    Command::cargo_bin("xudo")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout("xudo 0.1.0-beta.1 (beta, not externally audited)\n");
+}

@@ -16,7 +16,7 @@ name = "xudo"
 path = "src/main.rs"
 
 [dependencies]
-xudo = { path = "../xudo", version = "0.0.1" }
+xudo = { path = "../xudo", version = "0.1.0-beta.1" }
 clap.workspace = true
 
 # `tests/binary.rs` runs the binary as a process. It lives in this package, not
@@ -27,7 +27,7 @@ clap.workspace = true
 # silently stale on a developer's machine.
 [dev-dependencies]
 # The root-lane guard every `tests/root_*.rs` begins with.
-xudo-tests = { path = "../xudo-tests", version = "0.0.1" }
+xudo-tests = { path = "../xudo-tests", version = "0.1.0-beta.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true

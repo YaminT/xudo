@@ -3,6 +3,6 @@ message: "If you use xudo in your work, please cite it."
 title: "xudo"
 authors:
   - name: "xudo contributors"
-version: "0.0.1"
+version: "0.1.0-beta.1"
 license: Apache-2.0
 repository-code: "https://github.com/YaminT/xudo"
