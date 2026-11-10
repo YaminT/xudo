@@ -175,24 +175,17 @@ impl BrokerRequest {
         let text = std::str::from_utf8(bytes).map_err(|error| RequestError::NotUtf8 {
             offset: error.valid_up_to(),
         })?;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-            if let Some(found) = value
-                .get("schema_version")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok())
-            {
-                if found != WIRE_SCHEMA_VERSION {
-                    return Err(RequestError::WrongSchema {
-                        found,
-                        expected: WIRE_SCHEMA_VERSION,
-                    });
-                }
-            }
-        }
+        let value = parse_json_object(text).map_err(|reason| RequestError::Malformed { reason })?;
         let request: Self =
-            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+            serde_json::from_value(value).map_err(|error| RequestError::Malformed {
                 reason: error.to_string(),
             })?;
+        if request.schema_version != WIRE_SCHEMA_VERSION {
+            return Err(RequestError::WrongSchema {
+                found: request.schema_version,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
         request.check()?;
         Ok(request)
     }
@@ -758,8 +751,10 @@ impl BrokerResponse {
         let text = std::str::from_utf8(bytes).map_err(|error| ResponseError::NotUtf8 {
             offset: error.valid_up_to(),
         })?;
+        let value =
+            parse_json_object(text).map_err(|reason| ResponseError::Malformed { reason })?;
         let response: Self =
-            serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
+            serde_json::from_value(value).map_err(|error| ResponseError::Malformed {
                 reason: error.to_string(),
             })?;
         if response.schema_version != WIRE_SCHEMA_VERSION {
@@ -841,6 +836,14 @@ impl BrokerResponse {
     }
 }
 
+fn parse_json_object(text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("top-level JSON value must be an object".to_owned());
+    }
+    Ok(value)
+}
+
 fn valid_watch_prompt(prompt: &WatchPrompt) -> bool {
     prompt.id.len() == NONCE_HEX_LEN
         && prompt
@@ -910,6 +913,15 @@ mod tests {
     #[test]
     fn a_question_without_a_schema_version_is_malformed() {
         let bytes = br#"{"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_array_form_request_is_refused() {
+        let bytes = br#"[2,"watch"]"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestMalformed
@@ -1000,10 +1012,22 @@ mod tests {
 
     #[test]
     fn a_schema_1_request_is_refused_wrong_schema() {
-        let bytes = br#"{"schema_version":1,"program":"/usr/bin/id","argv":[],"claimed_classification":"x"}"#;
+        let bytes = br#"{"schema_version":1,"question":"watch"}"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestWrongSchema
+        );
+    }
+
+    #[test]
+    fn a_request_with_a_different_schema_is_refused_after_deserialization() {
+        let bytes = br#"{"schema_version":3,"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err(),
+            RequestError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            }
         );
     }
 
@@ -1687,6 +1711,28 @@ mod tests {
         assert_eq!(
             verdict_of(&BrokerResponse::refused(RefusalCode::SpoolFull).answer),
             None
+        );
+    }
+
+    #[test]
+    fn an_array_form_response_is_refused() {
+        assert_eq!(
+            BrokerResponse::parse(br#"[2,"done"]"#),
+            Err(ResponseError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_with_a_different_schema_is_refused() {
+        let bytes = br#"{"schema_version":3,"answer":{"done":null}}"#;
+        assert_eq!(
+            BrokerResponse::parse(bytes),
+            Err(ResponseError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            })
         );
     }
 

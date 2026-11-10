@@ -358,9 +358,26 @@ impl PendingRequest {
     /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
     /// deserialize as `None`, as serde defines for `Option` fields.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
-        serde_json::from_str(text).map_err(|error| RequestError::Malformed {
-            reason: error.to_string(),
-        })
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
+        if !value.is_object() {
+            return Err(RequestError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            });
+        }
+        let request: Self =
+            serde_json::from_value(value).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
+        if request.schema_version != REQUEST_SCHEMA_VERSION {
+            return Err(RequestError::WrongSchema {
+                found: request.schema_version,
+                expected: REQUEST_SCHEMA_VERSION,
+            });
+        }
+        Ok(request)
     }
 
     /// Renders the entry back to JSON.
@@ -615,6 +632,51 @@ mod tests {
     fn a_round_trip_through_json_changes_nothing() {
         let request = live();
         assert_eq!(PendingRequest::parse(&request.to_json()).unwrap(), request);
+    }
+
+    #[test]
+    fn an_array_form_spool_entry_is_refused() {
+        let array = serde_json::json!([
+            REQUEST_SCHEMA_VERSION,
+            NONCE,
+            4242,
+            998_877,
+            "xudo.svc.restart",
+            "/usr/bin/systemctl",
+            ["restart", "nginx.service"],
+            7,
+            200,
+            false,
+            null,
+            "pending",
+            1000,
+            10,
+            20,
+            false,
+            null,
+            null,
+            "0".repeat(64),
+            "enrolled-agent"
+        ]);
+        assert_eq!(
+            PendingRequest::parse(&array.to_string()),
+            Err(RequestError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_different_schema_is_refused_during_parse() {
+        let mut entry = live();
+        entry.schema_version = REQUEST_SCHEMA_VERSION + 1;
+        assert_eq!(
+            PendingRequest::parse(&entry.to_json()),
+            Err(RequestError::WrongSchema {
+                found: REQUEST_SCHEMA_VERSION + 1,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
     }
 
     /// The parser's own complaint, if this is a shape failure.
