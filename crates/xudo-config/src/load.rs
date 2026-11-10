@@ -81,6 +81,17 @@ pub fn apply_file(
         reason: e.to_string(),
     })?;
 
+    if parsed
+        .audit_sink
+        .as_deref()
+        .is_some_and(|sink| sink != "journald")
+    {
+        return Err(LoadError::Parse {
+            file: file.to_owned(),
+            reason: "audit_sink only accepts \"journald\"".to_owned(),
+        });
+    }
+
     // Ordered so a file's errors are reported in a stable order regardless of
     // how the keys were written.
     let entries: [(Setting, Option<Value>); 7] = [
@@ -349,7 +360,7 @@ mod tests {
                 Setting::ConfirmationTimeoutSecs,
             ),
             ("frozen = true", Setting::Frozen),
-            ("audit_sink = \"syslog\"", Setting::AuditSink),
+            ("audit_sink = \"journald\"", Setting::AuditSink),
             ("color = false", Setting::Color),
         ];
         for (line, setting) in cases {
@@ -368,6 +379,19 @@ mod tests {
             .filter(|s| s.is_configurable())
             .count();
         assert_eq!(covered, configurable, "a configurable setting is untested");
+    }
+
+    #[test]
+    fn audit_sink_other_than_journald_is_refused() {
+        let mut settings = Settings::default();
+        let error = apply_file(
+            &mut settings,
+            Layer::System,
+            "xudo.toml",
+            "audit_sink = \"syslog\"\n",
+        )
+        .expect_err("unsupported audit sink must fail parsing");
+        assert!(error.to_string().contains("only accepts \"journald\""));
     }
 
     #[test]
