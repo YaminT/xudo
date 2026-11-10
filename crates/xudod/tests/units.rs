@@ -18,6 +18,7 @@ const SERVICE: &str = include_str!("../../../packaging/systemd/xudod@.service");
 const PASBAN_SERVICE: &str = include_str!("../../../packaging/systemd/xudo-pasban.service");
 const PASBAN_TIMER: &str = include_str!("../../../packaging/systemd/xudo-pasban.timer");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/xudo.conf");
+const POSTINST: &str = include_str!("../../../packaging/deb/postinst");
 
 /// One `Key=Value` line, with the section it is in.
 #[derive(Debug)]
@@ -488,6 +489,29 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
         std::path::Path::new(xudo_wire::BROKER_SOCKET).parent(),
         Some(std::path::Path::new("/run/xudo"))
     );
+}
+
+#[test]
+fn deb_postinst_fallback_creates_every_tmpfiles_path() {
+    let fallback = POSTINST
+        .split("else\n    # Same paths and modes as packaging/tmpfiles.d/xudo.conf.")
+        .nth(1)
+        .unwrap_or("")
+        .split("\nfi")
+        .next()
+        .unwrap_or("");
+    assert!(!fallback.is_empty(), "postinst fallback is missing");
+    for path in TMPFILES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().nth(1))
+    {
+        assert!(
+            fallback.contains(path),
+            "fallback omits tmpfiles path {path}"
+        );
+    }
 }
 
 #[test]
