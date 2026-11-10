@@ -876,7 +876,7 @@ args = [
     fn a_broker_recorded_approval_lets_the_same_request_through() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.state = crate::request::ConfirmationState::Approved;
+        pending.state = crate::request::ConfirmationState::Consumed;
         pending.needs_watch = true;
         pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         pending.confirmed_by = Some(crate::request::WatcherPin {
@@ -901,7 +901,7 @@ args = [
             "gate_confirmation_missing"
         );
         pending.confirmed = true;
-        pending.state = crate::request::ConfirmationState::Approved;
+        pending.state = crate::request::ConfirmationState::Consumed;
         pending.needs_watch = true;
         pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         pending.confirmed_by = Some(crate::request::WatcherPin {
@@ -1129,7 +1129,7 @@ args = [
     fn a_confirmed_authorization_records_which_channel_approved_it() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.state = crate::request::ConfirmationState::Approved;
+        pending.state = crate::request::ConfirmationState::Consumed;
         pending.needs_watch = true;
         pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         pending.confirmed_by = Some(crate::request::WatcherPin {
@@ -1251,7 +1251,7 @@ args = [
             Some(ActionId::new("xudo.reload.confirmed"))
         );
         pending.confirmed = true;
-        pending.state = crate::request::ConfirmationState::Approved;
+        pending.state = crate::request::ConfirmationState::Consumed;
         pending.needs_watch = true;
         pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         pending.confirmed_by = Some(crate::request::WatcherPin {
@@ -1306,7 +1306,7 @@ args = [
         let rules = overlapping_rules();
         let mut pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
         pending.confirmed = true;
-        pending.state = crate::request::ConfirmationState::Approved;
+        pending.state = crate::request::ConfirmationState::Consumed;
         pending.needs_watch = true;
         pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         pending.confirmed_by = Some(crate::request::WatcherPin {
@@ -1395,7 +1395,7 @@ args = [
         );
         let mut watched = pending.clone();
         watched.confirmed = true;
-        watched.state = crate::request::ConfirmationState::Approved;
+        watched.state = crate::request::ConfirmationState::Consumed;
         watched.needs_watch = true;
         watched.shown_at_ms = Some(crate::request::BoottimeMillis(99));
         watched.confirmed_by = Some(crate::request::WatcherPin {

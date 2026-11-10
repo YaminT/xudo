@@ -439,7 +439,10 @@ impl PendingRequest {
         });
         let consistent = match self.state {
             ConfirmationState::Pending => !self.confirmed && self.confirmed_by.is_none(),
-            ConfirmationState::Approved | ConfirmationState::Consumed => {
+            ConfirmationState::Approved
+            | ConfirmationState::Denied
+            | ConfirmationState::Expired => false,
+            ConfirmationState::Consumed => {
                 self.confirmed
                     && self.needs_watch
                     && self.shown_at_ms.is_some()
@@ -447,7 +450,6 @@ impl PendingRequest {
                     && watcher_valid
                     && self.confirmed_by == self.shown_to
             }
-            ConfirmationState::Denied | ConfirmationState::Expired => false,
         };
         if self.confirmed && self.confirmed_by.is_none() {
             return Err(RequestError::UnattributedConfirmation);
@@ -803,6 +805,14 @@ mod tests {
     }
 
     #[test]
+    fn an_approved_but_unconsumed_entry_is_refused_by_the_gate() {
+        assert_eq!(
+            check(&approved()),
+            Err(RequestError::InvalidConfirmationState)
+        );
+    }
+
+    #[test]
     fn a_malformed_fingerprint_is_refused() {
         let mut request = live();
         request.fingerprint = "a".repeat(64);
@@ -1080,7 +1090,7 @@ mod tests {
     fn an_attributed_confirmation_is_accepted() {
         let mut request = live();
         request.confirmed = true;
-        request.state = ConfirmationState::Approved;
+        request.state = ConfirmationState::Consumed;
         request.needs_watch = true;
         request.shown_at_ms = Some(BoottimeMillis(99));
         request.confirmed_by = Some(WatcherPin {
