@@ -167,6 +167,7 @@ fn exercise_real_pty(input: &str, approve: bool, expected_token: &str, pre_input
         .unwrap();
     fcntl_setfl(&master, OFlags::NONBLOCK).unwrap();
     let (mut child, mut transcript) = wait_prompt_and_answer(child, &master, input);
+    read_until_marker(&master, &mut transcript, "pty test finished");
     let status = child.wait().unwrap();
     let mut tail = [0_u8; 4096];
     while let Ok(count) = rustix::io::read(&master, &mut tail) {
@@ -184,6 +185,21 @@ fn exercise_real_pty(input: &str, approve: bool, expected_token: &str, pre_input
         Some((approve, expected_token.to_owned()))
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn read_until_marker(master: &OwnedFd, transcript: &mut Vec<u8>, marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buffer = [0_u8; 4096];
+    while !String::from_utf8_lossy(transcript).contains(marker) && Instant::now() < deadline {
+        match rustix::io::read(master, &mut buffer) {
+            Ok(count) if count > 0 => transcript.extend_from_slice(&buffer[..count]),
+            Ok(_) => break,
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("pty read failed: {error}"),
+        }
+    }
 }
 
 fn wait_prompt_and_answer(
