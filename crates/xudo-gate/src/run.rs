@@ -1937,7 +1937,10 @@ args = [
         // Constructed without opening anything.
         assert!(format!("{host:?}").contains("SystemHost"));
         assert!(host.hygiene().pid() > 0);
+        #[cfg(target_os = "linux")]
         assert!(host.clock().boottime_millis() > 0);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(host.clock().boottime_millis(), 0);
         // Nothing here is a ruleset, a spool, or a root-owned program.
         assert!(host.load_policy().is_err());
         assert!(host.open_spool().is_err());
