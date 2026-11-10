@@ -78,7 +78,6 @@ impl LoadedRules {
         // Rendered with `Path::display`, which is this project's one permitted
         // lossy conversion and only ever for text shown to a human. The bytes
         // that are compared and hashed are the entry's own name, untouched.
-        // See CLAUDE.md § "Banned in privileged code".
         let mut entries: Vec<(PathBuf, OsString)> = std::fs::read_dir(dir)
             .map_err(|e| LoadError::Directory {
                 dir: dir.display().to_string(),

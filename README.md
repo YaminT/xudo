@@ -67,7 +67,7 @@ args = [
 ]
 ```
 
-There are no argument globs. The native format and matcher behavior are documented in [docs/design-plan.md](docs/design-plan.md) and the shipped TOML rules under [rules/](rules/).
+There are no argument globs. Each argument is constrained by position. The shipped rules are the TOML files under [rules/](rules/).
 
 ## FAQ
 
@@ -107,9 +107,8 @@ The default build has no network code or telemetry. CI traces the shipped releas
 
 - [howiwork.md](howiwork.md): source of truth for behavior
 - [SECURITY.md](SECURITY.md): reporting route and security limits
-- [docs/design-plan.md](docs/design-plan.md): architecture and threat model
+- [docs/crates.md](docs/crates.md): workspace crates
 - [docs/man/](docs/man/): available manual pages
-- [CLAUDE.md](CLAUDE.md): contributor and engineering rules
 
 ## License
 

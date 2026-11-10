@@ -22,8 +22,8 @@
 //! device for some files; and two mounts of one filesystem share a device while
 //! differing in exactly the options judged below. Measured on Linux 6.12: two
 //! btrfs mounts listed as `0:72`, files on them reporting `0:73` and `0:74`, and
-//! `fdinfo` telling the two mounts of subvolume `0:74` apart (see
-//! `docs/CONCERNS.md`, 2026-10-19).
+//! `fdinfo` telling the two mounts of subvolume `0:74` apart (measured
+//! 2026-10-19).
 //!
 //! The id cannot be reissued to another mount while the descriptor is open,
 //! because an open descriptor keeps its mount alive. A mount detached after the
@@ -54,9 +54,8 @@
 //!   mountinfo does not name. Everything is refused there. A kernel built
 //!   without user namespaces has only the initial one.
 //!
-//! What is accepted, and why, is recorded in `docs/CONCERNS.md`: in short,
-//! anything else root mounted, network and virtual filesystems included,
-//! because root chose to put it there.
+//! What is accepted is anything else root mounted, network and virtual
+//! filesystems included, because root chose to put it there.
 //!
 //! # Where the table comes from
 //!

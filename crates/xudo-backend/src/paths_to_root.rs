@@ -1298,8 +1298,8 @@ fn listed_names(
 /// One passwordless rule, as a finding.
 ///
 /// The rule's text is made a string for a reader, lossily: it is shown, never
-/// compared — the same exception `CLAUDE.md` makes for `Path::display` — and
-/// everything this module decides about the rule was decided on its bytes.
+/// compared, and everything this module decides about the rule was decided on
+/// its bytes.
 fn passwordless(ctx: &Ctx<'_>, file: &Path, rule: &RuleLine) -> Finding {
     Finding::PasswordlessRule {
         file: file.to_path_buf(),

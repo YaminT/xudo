@@ -5,7 +5,8 @@
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-# Coverage floor. 100 unless a written waiver exists — see CLAUDE.md.
+# Coverage floor. 100 unless a written waiver exists on the item: a
+# coverage(off) attribute plus a comment naming a concrete reason.
 cov_lines := "100"
 cov_regions := "100"
 cov_functions := "100"
@@ -344,7 +345,7 @@ setup: install-hooks
 
 # What CI runs on a pull request, including the slow lanes. `root-test` and
 # `install-root` joined it when the install executor landed and the root lane
-# stopped being non-blocking (docs/CONCERNS.md, 2026-10-22). Every `just <lane>`
+# stopped being non-blocking (2026-10-22). Every `just <lane>`
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
 # fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
