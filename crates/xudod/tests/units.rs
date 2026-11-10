@@ -491,6 +491,25 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
 }
 
 #[test]
+fn confirmation_state_is_provisioned_and_writable_by_the_broker() {
+    let service = parse(SERVICE);
+    assert!(
+        value(&service, "Service", "ReadWritePaths")
+            .split_whitespace()
+            .any(|path| path == format!("-{CONFIRM_DIR}"))
+    );
+    assert!(TMPFILES.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.len() == 7
+            && fields[0] == "d"
+            && fields[1] == CONFIRM_DIR
+            && fields[2] == "0700"
+            && fields[3] == "root"
+            && fields[4] == "root"
+    }));
+}
+
+#[test]
 fn the_parser_this_test_relies_on_refuses_what_it_cannot_read() {
     // A test that parsed nothing would pass everything.
     assert!(parse(SOCKET).len() > 8);
