@@ -29,6 +29,7 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
     "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
     "$stage/etc/xudo/rules.d" \
     "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
+mkdir -p "$stage/usr/share/xudo"
 
 install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
 ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
@@ -43,9 +44,36 @@ mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \
     "$stage/usr/share/doc/xudo/"
-printf 'xudo (%s) unstable; urgency=low\n\n  * Beta release.\n\n -- xudo contributors <noreply@xudo.invalid>  %s\n' \
-    "$version" "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')" |
-    gzip -9n >"$stage/usr/share/doc/xudo/changelog.gz"
+install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/xudo/first-install-notice"
+{
+    printf 'xudo (%s) unstable; urgency=low\n\n' "$version"
+    awk '
+        function wrap(prefix, text, width, cut, part) {
+            width = 78 - length(prefix)
+            while (length(text) > width) {
+                cut = width
+                while (cut > 1 && substr(text, cut, 1) != " ") cut--
+                if (cut == 1) cut = width
+                part = substr(text, 1, cut)
+                sub(/[[:space:]]+$/, "", part)
+                print prefix part
+                text = substr(text, cut + 1)
+                sub(/^[[:space:]]+/, "", text)
+                prefix = sprintf("%*s", length(prefix), "")
+                width = 78 - length(prefix)
+            }
+            print prefix text
+        }
+        /^## Unreleased/ { active = 1; next }
+        /^## / && active { exit }
+        !active { next }
+        /^### / { wrap("  * ", substr($0, 5)); next }
+        /^- / { wrap("    - ", substr($0, 3)); next }
+        /^  / { sub(/^[[:space:]]+/, ""); wrap("      ", $0); next }
+    ' "$root/CHANGELOG.md"
+    printf '\n -- YaminT <YaminT@users.noreply.github.com>  %s\n' \
+        "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')"
+} | gzip -9n >"$stage/usr/share/doc/xudo/changelog.gz"
 for m in "$root"/docs/man/*.1; do gzip -9n <"$m" >"$stage/usr/share/man/man1/$(basename "$m").gz"; done
 for m in "$root"/docs/man/*.5; do gzip -9n <"$m" >"$stage/usr/share/man/man5/$(basename "$m").gz"; done
 

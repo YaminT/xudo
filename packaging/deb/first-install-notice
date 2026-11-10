@@ -1,0 +1,8 @@
+
+xudo (beta): every privileged request asks for a password. There is no
+agent path in this release. Agent detection is not a security boundary.
+Read SECURITY.md at https://github.com/YaminT/xudo/blob/main/SECURITY.md.
+The xudo group is empty by design,
+so `xudo exec` is refused until you run `sudo adduser <you> xudo` and log
+in again; `xudo doctor --fix` proposes the same change. Without systemd
+(journald), every privileged request is refused.

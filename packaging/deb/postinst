@@ -17,10 +17,14 @@ getent group xudo >/dev/null || groupadd --system xudo
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create /usr/lib/tmpfiles.d/xudo.conf
 else
-    # Same modes as packaging/tmpfiles.d/xudo.conf. Recommends may be off.
+    # Same paths and modes as packaging/tmpfiles.d/xudo.conf. Recommends may be off.
     install -d -m 0755 -o root -g root /run/xudo
     install -d -m 0700 -o root -g root /run/xudo/req
+    install -d -m 0700 -o root -g root /run/xudo/confirm
     install -d -m 0700 -o root -g root /var/lib/xudo
+    if [ ! -e /var/lib/xudo/audit.jsonl ]; then
+        install -m 0600 -o root -g root /dev/null /var/lib/xudo/audit.jsonl
+    fi
 fi
 
 # Upgraded units are ignored until systemd rereads them.
@@ -34,6 +38,7 @@ if [ -z "${2:-}" ]; then
     deb-systemd-helper enable xudo-pasban.timer >/dev/null
     deb-systemd-invoke start xudo-pasban.timer >/dev/null || true
     write_rule=1
+    cat /usr/share/xudo/first-install-notice >&2
 elif [ -e /etc/sudoers.d/xudo ] || [ -L /etc/sudoers.d/xudo ]; then
     write_rule=1
 elif [ -e /etc/doas.d/60-xudo.conf ] || [ -L /etc/doas.d/60-xudo.conf ] ||
@@ -60,11 +65,3 @@ if [ "$write_rule" -eq 1 ]; then
         fi
     fi
 fi
-
-cat <<'MSG'
-
-xudo (beta): every invocation asks for your password. There is no agent
-path in this release, and nobody was added to the xudo group.
-Agent detection is not a security boundary. Read SECURITY.md first:
-/usr/share/doc/xudo/SECURITY.md
-MSG
