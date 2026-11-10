@@ -71,7 +71,9 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
-pub use clock::{Clock, DEADLINE_CLOCK, FixedClock, HostClock};
+#[cfg(target_os = "linux")]
+pub use clock::DEADLINE_CLOCK;
+pub use clock::{Clock, FixedClock, HostClock};
 pub use connection::{
     AdoptError, Connection, FakeConnection, ReadFailure, UnixConnection, connected_unix_stream,
 };
