@@ -9,7 +9,11 @@ matter.
 The broker and password-authenticated gate are built. Every caller is currently
 classified as `Unattested`, so every request uses the password path. The
 package does not install a `NOPASSWD` rule. The passwordless agent path,
-out-of-band confirmation, and Landlock confinement are not in this release.
+Landlock confinement, and same-uid watcher separation are not in this release.
+Out-of-band confirmation through `xudo watch` is built but off by default; every
+path still requires the password. Session and terminal checks do not prove a
+human: a same-uid agent can run `script -qc 'xudo watch'`. M4's cgroup scope is
+needed to separate the agent from the human.
 
 ## Reporting
 

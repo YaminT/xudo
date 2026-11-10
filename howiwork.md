@@ -350,9 +350,10 @@ M1 (policy core, explain) done. M2a (backend model) done. M2b done in code
 and tests (2026-10-30): the broker mints entries, the gate consumes one and
 runs it as root, `xudo exec` and `xudo install` ask the broker, both write one
 hash-chained audit trail, and the same ruleset behaves the same through sudo,
-sudo-rs and OpenDoas. Only the password path exists. The broker runs under its
-real systemd sandbox, and Pasban verifies the audit chain daily. The doas install
-probe remains NOT VERIFIED. Then: M3 out-of-band confirmation,
-M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls
+sudo-rs and OpenDoas. M3 is built: out-of-band confirmation via `xudo watch`
+is off by default, and every path still requires the password. The broker runs
+under its real systemd sandbox, and Pasban verifies the audit chain daily. The
+doas install probe remains NOT VERIFIED. Next: M4 enrollment and the passwordless
+path, M5 temporary permissions, narrowing and volume controls
 (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
 M7 confinement and external audit.

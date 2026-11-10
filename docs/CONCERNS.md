@@ -1,5 +1,20 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-10 — M3 closeout
+
+M3 exit tests:
+
+1. **Done.** Shared trusted settings: gate and broker load through the shared trusted loader (step 1 tests).
+2. **Done.** Approval, denial, TTL, and timeout: `just systemd-test`; the step 9 Debian 13, Ubuntu 24.04, and Ubuntu 26.04 lanes passed.
+3. **Done.** No watcher denies immediately: `no_watcher_denies_at_once` in the systemd-test lane.
+4. **Partly done.** stdin, `/dev/tty`, same-session, and same-terminal attacks are covered by the step 9 lane. A same-uid agent can use `setsid` and `script -qc 'xudo watch'`; session and tty do not prove a human. M4's cgroup scope completes this guarantee.
+5. **Done.** Sanitized prompt, reaction floor, duplicate suppression, backoff, watch-only approval, read-only pending, and snapshots: broker/front-end unit tests and `just systemd-test`.
+6. **Partly done.** The user-namespace watcher check is fixture-only: containers refuse `unshare -U`; see `watch_in_a_user_namespace_is_refused` in step 9.
+7. **Partly done.** Freeze/thaw tests pass, including the root lane. Freeze has no effect on new or human requests until M4 because all M3 callers are unattested. The orchestrator decision remains flagged for the owner; the owner had earlier been told freeze would deny human requests too. See the step 8 entry below.
+8. **Done.** `just verify`, `just root-test`, `just units`, `just systemd-test`, and the step 9 Linux acceptance matrix passed.
+
+Open limits: same-uid watcher separation needs M4 cgroups; the user-namespace live check is unavailable in containers; `UnixStream::connect` is unbounded; each status poll starts a broker at about 296–299 ms, and watch round-trip takes about one second (step 9 measurements).
+
 ## 2026-11-09 — M3 step 8: freeze semantics
 
 The owner was asked about freeze as “deny every request, human ones included,”
