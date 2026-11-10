@@ -15,10 +15,12 @@ x86_64-*) arch=amd64 ;;
 aarch64-*) arch=arm64 ;;
 *) echo "unsupported triple $triple" >&2; exit 1 ;;
 esac
-version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
+# Cargo's spelling, hyphen included. CHANGELOG headings use this text.
+# The rewrite below is only for the Debian version, so match the notes first.
+cargo_version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
 # A hyphen starts a Debian revision, so 0.1.0-beta.1 would sort above 0.1.0.
 # Tilde stays in the upstream version and sorts before the final release.
-version=$(printf '%s\n' "$version" | tr '-' '~')
+version=$(printf '%s\n' "$cargo_version" | tr '-' '~')
 bin=$root/target/$triple/release
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)}
 export SOURCE_DATE_EPOCH=$epoch
@@ -47,7 +49,14 @@ install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyr
 install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/xudo/first-install-notice"
 {
     printf 'xudo (%s) unstable; urgency=low\n\n' "$version"
-    awk '
+    # A VERSION override (the upgrade package) has no changelog section.
+    awk -v ver="$cargo_version" '
+        function heading(line, prefix, rest) {
+            prefix = "## " ver
+            if (index(line, prefix) != 1) return 0
+            rest = substr(line, length(prefix) + 1)
+            return rest == "" || substr(rest, 1, 1) == " "
+        }
         function wrap(prefix, text, width, cut, part) {
             width = 78 - length(prefix)
             while (length(text) > width) {
@@ -64,12 +73,13 @@ install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/xud
             }
             print prefix text
         }
-        /^## Unreleased/ { active = 1; next }
+        heading($0) { active = 1; found = 1; next }
         /^## / && active { exit }
         !active { next }
         /^### / { wrap("  * ", substr($0, 5)); next }
         /^- / { wrap("    - ", substr($0, 3)); next }
         /^  / { sub(/^[[:space:]]+/, ""); wrap("      ", $0); next }
+        END { if (!found) print "  * Release of this version." }
     ' "$root/CHANGELOG.md"
     printf '\n -- YaminT <YaminT@users.noreply.github.com>  %s\n' \
         "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')"
