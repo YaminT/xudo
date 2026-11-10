@@ -175,19 +175,17 @@ impl BrokerRequest {
         let text = std::str::from_utf8(bytes).map_err(|error| RequestError::NotUtf8 {
             offset: error.valid_up_to(),
         })?;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-            if let Some(found) = value
-                .get("schema_version")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok())
-            {
-                if found != WIRE_SCHEMA_VERSION {
-                    return Err(RequestError::WrongSchema {
-                        found,
-                        expected: WIRE_SCHEMA_VERSION,
-                    });
-                }
-            }
+        let value = parse_json_object(text).map_err(|reason| RequestError::Malformed { reason })?;
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
+            return Err(RequestError::WrongSchema {
+                found,
+                expected: WIRE_SCHEMA_VERSION,
+            });
         }
         let request: Self =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
@@ -198,6 +196,12 @@ impl BrokerRequest {
     }
 
     fn check(&self) -> Result<(), RequestError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
+            return Err(RequestError::WrongSchema {
+                found: self.schema_version,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
         match &self.question {
             Question::Run {
                 program,
@@ -758,17 +762,35 @@ impl BrokerResponse {
         let text = std::str::from_utf8(bytes).map_err(|error| ResponseError::NotUtf8 {
             offset: error.valid_up_to(),
         })?;
+        let value =
+            parse_json_object(text).map_err(|reason| ResponseError::Malformed { reason })?;
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
+            return Err(ResponseError::WrongSchema {
+                found,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
         let response: Self =
             serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
                 reason: error.to_string(),
             })?;
-        if response.schema_version != WIRE_SCHEMA_VERSION {
+        response.check()?;
+        Ok(response)
+    }
+
+    fn check(&self) -> Result<(), ResponseError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
             return Err(ResponseError::WrongSchema {
-                found: response.schema_version,
+                found: self.schema_version,
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
-        match &response.answer {
+        match &self.answer {
             Answer::Decided { minted, .. } => {
                 if let Some(minted) = minted {
                     check_nonce(&minted.nonce)
@@ -815,7 +837,7 @@ impl BrokerResponse {
             Answer::Done => {}
         }
         // A refusal carries no envelope, so it has nothing to disagree about.
-        let envelope = match &response.answer {
+        let envelope = match &self.answer {
             Answer::Decided { decision, .. } => decision.schema_version,
             Answer::Pending { .. }
             | Answer::Watching { .. }
@@ -828,7 +850,7 @@ impl BrokerResponse {
                 expected: ENVELOPE_SCHEMA_VERSION,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Renders the response as JSON.
@@ -839,6 +861,14 @@ impl BrokerResponse {
     pub fn to_json(&self) -> String {
         rendered_or(serde_json::to_string(self), FALLBACK_RESPONSE)
     }
+}
+
+fn parse_json_object(text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("top-level JSON value must be an object".to_owned());
+    }
+    Ok(value)
 }
 
 fn valid_watch_prompt(prompt: &WatchPrompt) -> bool {
@@ -910,6 +940,15 @@ mod tests {
     #[test]
     fn a_question_without_a_schema_version_is_malformed() {
         let bytes = br#"{"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_array_form_request_is_refused() {
+        let bytes = br#"[2,"watch"]"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestMalformed
@@ -1004,6 +1043,48 @@ mod tests {
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestWrongSchema
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_request_is_refused() {
+        let repeated_schema =
+            br#"{"schema_version":2,"schema_version":2,"question":{"thaw":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_schema).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+        let repeated_program = br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/true","program":"/usr/bin/false","argv":[],"claimed_classification":"x"}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_program).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn a_request_with_a_different_schema_is_refused_before_shape_parsing() {
+        let bytes = br#"{"schema_version":3,"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err(),
+            RequestError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn decoded_request_schema_is_rechecked() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            question: Question::Thaw,
+        };
+        assert_eq!(
+            request.check(),
+            Err(RequestError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
         );
     }
 
@@ -1687,6 +1768,77 @@ mod tests {
         assert_eq!(
             verdict_of(&BrokerResponse::refused(RefusalCode::SpoolFull).answer),
             None
+        );
+    }
+
+    #[test]
+    fn an_array_form_response_is_refused() {
+        assert_eq!(
+            BrokerResponse::parse(br#"[2,"done"]"#),
+            Err(ResponseError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_with_a_different_schema_is_refused() {
+        let bytes = br#"{"schema_version":3,"answer":{"done":null}}"#;
+        assert_eq!(
+            BrokerResponse::parse(bytes),
+            Err(ResponseError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn decoded_response_schema_is_rechecked() {
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            answer: Answer::Done,
+        };
+        assert_eq!(
+            response.check(),
+            Err(ResponseError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_response_is_refused() {
+        let repeated_schema = br#"{"schema_version":2,"schema_version":2,"answer":"done"}"#;
+        let duplicate_error = serde_json::from_slice::<BrokerResponse>(repeated_schema)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            BrokerResponse::parse(repeated_schema),
+            Err(ResponseError::Malformed {
+                reason: duplicate_error,
+            })
+        );
+
+        let nested_duplicate = format!(
+            "{{\"schema_version\":2,\"answer\":{{\"decided\":{{\"decision\":{},\"minted\":{{\"nonce\":\"{}\",\"nonce\":\"{}\",\"expires_in_ms\":900000,\"gate\":\"/usr/libexec/xudo/xudo-gate-auth\"}}}}}}}}",
+            serde_json::to_string(&Decision::deny(
+                DenialCode::ArgvRejected,
+                vec!["x".to_owned()],
+                Vec::new(),
+            ))
+            .unwrap(),
+            "ab".repeat(32),
+            "cd".repeat(32),
+        );
+        assert_eq!(
+            BrokerResponse::parse(nested_duplicate.as_bytes()).unwrap_err(),
+            ResponseError::Malformed {
+                reason: serde_json::from_str::<BrokerResponse>(&nested_duplicate)
+                    .unwrap_err()
+                    .to_string(),
+            }
         );
     }
 

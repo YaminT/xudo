@@ -1,5 +1,9 @@
 # Concerns, decisions, and things you need to know
 
+## 2026-11-10 — Confirmation scans cover the full spool
+
+Freeze denial, pending listing, and watcher scans now share the broker's 80-entry walk bound. Their full mixed-spool regression covers the final entry, including an approved enrolled-agent denial and audit. Wire and gate parsers also recheck decoded schema versions, with regression coverage for stale spool schemas and nested duplicate response keys.
+
 ## 2026-11-10 — M3 closeout
 
 M3 exit tests:

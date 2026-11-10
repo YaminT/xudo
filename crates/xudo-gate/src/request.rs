@@ -42,6 +42,16 @@ pub const SPOOL_DIR: &str = "/run/xudo/req";
 /// The wire version of a spool entry.
 pub const REQUEST_SCHEMA_VERSION: u32 = 3;
 
+fn finish_parse(request: PendingRequest) -> Result<PendingRequest, RequestError> {
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
+        return Err(RequestError::WrongSchema {
+            found: request.schema_version,
+            expected: REQUEST_SCHEMA_VERSION,
+        });
+    }
+    Ok(request)
+}
+
 /// How long a nonce is, in hex characters (32 random bytes).
 pub const NONCE_HEX_LEN: usize = 64;
 
@@ -358,9 +368,31 @@ impl PendingRequest {
     /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
     /// deserialize as `None`, as serde defines for `Option` fields.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
-        serde_json::from_str(text).map_err(|error| RequestError::Malformed {
-            reason: error.to_string(),
-        })
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
+        if !value.is_object() {
+            return Err(RequestError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            });
+        }
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != REQUEST_SCHEMA_VERSION
+        {
+            return Err(RequestError::WrongSchema {
+                found,
+                expected: REQUEST_SCHEMA_VERSION,
+            });
+        }
+        let request: Self =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
+        finish_parse(request)
     }
 
     /// Renders the entry back to JSON.
@@ -422,7 +454,10 @@ impl PendingRequest {
         });
         let consistent = match self.state {
             ConfirmationState::Pending => !self.confirmed && self.confirmed_by.is_none(),
-            ConfirmationState::Approved | ConfirmationState::Consumed => {
+            ConfirmationState::Approved
+            | ConfirmationState::Denied
+            | ConfirmationState::Expired => false,
+            ConfirmationState::Consumed => {
                 self.confirmed
                     && self.needs_watch
                     && self.shown_at_ms.is_some()
@@ -430,7 +465,6 @@ impl PendingRequest {
                     && watcher_valid
                     && self.confirmed_by == self.shown_to
             }
-            ConfirmationState::Denied | ConfirmationState::Expired => false,
         };
         if self.confirmed && self.confirmed_by.is_none() {
             return Err(RequestError::UnattributedConfirmation);
@@ -609,12 +643,102 @@ mod tests {
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
+        assert_eq!(
+            PendingRequest::parse(&entry.to_json()).unwrap_err().code(),
+            "request_wrong_schema"
+        );
+        assert_eq!(
+            PendingRequest::parse(r#"{"schema_version":1,"nonce":"legacy"}"#)
+                .unwrap_err()
+                .code(),
+            "request_wrong_schema"
+        );
+        assert_eq!(
+            finish_parse(entry).map(|_| ()),
+            Err(RequestError::WrongSchema {
+                found: REQUEST_SCHEMA_VERSION - 1,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
     }
 
     #[test]
     fn a_round_trip_through_json_changes_nothing() {
         let request = live();
         assert_eq!(PendingRequest::parse(&request.to_json()).unwrap(), request);
+    }
+
+    #[test]
+    fn a_duplicate_key_spool_entry_is_refused() {
+        let entry = live().to_json();
+        let duplicate_schema = entry.replacen(
+            &format!("\"schema_version\":{REQUEST_SCHEMA_VERSION}"),
+            &format!(
+                "\"schema_version\":{REQUEST_SCHEMA_VERSION},\"schema_version\":{REQUEST_SCHEMA_VERSION}"
+            ),
+            1,
+        );
+        assert_eq!(
+            PendingRequest::parse(&duplicate_schema).unwrap_err().code(),
+            "request_malformed"
+        );
+
+        let duplicate_program = entry.replacen(
+            "\"program\":\"/usr/bin/systemctl\"",
+            "\"program\":\"/usr/bin/systemctl\",\"program\":\"/usr/bin/false\"",
+            1,
+        );
+        assert_eq!(
+            PendingRequest::parse(&duplicate_program)
+                .unwrap_err()
+                .code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn an_array_form_spool_entry_is_refused() {
+        let array = serde_json::json!([
+            REQUEST_SCHEMA_VERSION,
+            NONCE,
+            4242,
+            998_877,
+            "xudo.svc.restart",
+            "/usr/bin/systemctl",
+            ["restart", "nginx.service"],
+            7,
+            200,
+            false,
+            null,
+            "pending",
+            1000,
+            10,
+            20,
+            false,
+            null,
+            null,
+            "0".repeat(64),
+            "enrolled-agent"
+        ]);
+        assert_eq!(
+            PendingRequest::parse(&array.to_string()),
+            Err(RequestError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_different_schema_is_refused_during_parse() {
+        let mut entry = live();
+        entry.schema_version = REQUEST_SCHEMA_VERSION + 1;
+        assert_eq!(
+            PendingRequest::parse(&entry.to_json()),
+            Err(RequestError::WrongSchema {
+                found: REQUEST_SCHEMA_VERSION + 1,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
     }
 
     /// The parser's own complaint, if this is a shape failure.
@@ -738,6 +862,14 @@ mod tests {
         });
         request.shown_to = request.confirmed_by.clone();
         assert_eq!(check(&request), Err(RequestError::InvalidConfirmationState));
+    }
+
+    #[test]
+    fn an_approved_but_unconsumed_entry_is_refused_by_the_gate() {
+        assert_eq!(
+            check(&approved()),
+            Err(RequestError::InvalidConfirmationState)
+        );
     }
 
     #[test]
@@ -1018,7 +1150,7 @@ mod tests {
     fn an_attributed_confirmation_is_accepted() {
         let mut request = live();
         request.confirmed = true;
-        request.state = ConfirmationState::Approved;
+        request.state = ConfirmationState::Consumed;
         request.needs_watch = true;
         request.shown_at_ms = Some(BoottimeMillis(99));
         request.confirmed_by = Some(WatcherPin {
