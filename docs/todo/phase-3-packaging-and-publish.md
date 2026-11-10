@@ -34,7 +34,7 @@ Goal: someone on Ubuntu or Debian can install `xudo` with one command, understan
 
 This is the load-bearing decision of the whole phase, so it comes first.
 
-A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. Before M4 there is no reviewed enrollment path, no broker, and no out-of-band confirmation, so a passwordless rule would be a standing root grant with no compensating control.
+A `.deb` postinst runs as root. If it installs a `NOPASSWD` sudoers rule, then the single most dangerous moment in this product's life is an unattended `apt install` on a machine whose owner has read nothing. M3 out-of-band confirmation is built and off by default (`confirm_human_path=false`); every request still uses the human password path. Before M4 there is no reviewed enrollment path, so a passwordless rule would be a standing root grant with no compensating control.
 
 Therefore the beta package:
 
@@ -44,7 +44,7 @@ Therefore the beta package:
 - does **not** add any user to the `xudo` group (see § 3);
 - prints, on first install, that every invocation will prompt for a password and that the passwordless agent path is not in this release.
 
-The passwordless path arrives in a later release, behind an explicit `xudo enable-agent-path` that requires reading a warning and authenticating. Shipping it as a package default would be indefensible.
+M3 out-of-band confirmation via `xudo watch` is built but off by default. The passwordless agent path arrives in a later release, behind an explicit `xudo enable-agent-path` that requires reading a warning and authenticating. Shipping it as a package default would be indefensible.
 
 ---
 
@@ -157,9 +157,8 @@ State plainly in the README why there is no `curl | sh` installer. That paragrap
 ### Also worth doing
 
 - **Launchpad PPA** for Ubuntu reach; it is what Ubuntu users look for first.
-- `.rpm` via `cargo-generate-rpm`, `APKBUILD`, `PKGBUILD`, and a Nix module — cheap once the `.deb` maintainer scripts exist, and the Alpine/doas lane is already in the test matrix.
-- `cargo-auditable` in the release build so the shipped binary carries its dependency list; publish an SBOM (CycloneDX or SPDX) per release.
-- Reproducible builds, and sign release artifacts with cosign (keyless).
+- **After the beta (M7):** `.rpm` via `cargo-generate-rpm`, `APKBUILD`, `PKGBUILD`, and a Nix module.
+- **After the beta (M7):** `cargo-auditable` in the release build, an SBOM (CycloneDX or SPDX) per release, and reproducible builds. (Cosign signing remains part of beta release publishing.)
 
 ---
 
@@ -218,7 +217,7 @@ Every one of these appears in the README, the package description, and `xudo --v
 - **Agent detection is not a security boundary.** A same-uid process can forge every cheap signal, and a human can ask a genuinely-enrolled agent to run a command, which is indistinguishable at the syscall layer. A successful impersonation buys exactly one thing: skipping the password on an action that is *already allowlisted*. Size the allowlist accordingly.
 - **The deny-list is defence in depth, not the boundary.** The set of programs that can be turned into a root shell is not enumerable.
 - **`xudo` cannot protect a host that already has other paths to root.** `xudo doctor` reports pre-existing `NOPASSWD` entries, `wheel`/`sudo`/`docker`/`lxd` membership, writable unit directories, writable `PATH` entries, and writable shell rc files — any one of which makes `xudo` decorative.
-- **What is not in this release**: the passwordless agent path, the broker, out-of-band confirmation, Landlock confinement.
+- **What is not in this release**: the passwordless agent path and Landlock confinement. M3 out-of-band confirmation via `xudo watch` is built but off by default (`confirm_human_path=false`); every path still requires the password.
 - **No telemetry**, and how to verify it: a CI check tracing selected invocations of the shipped release-musl binaries under `strace` (failing outside `AF_UNIX`/`AF_LOCAL`) and checking their normal Cargo dependency tree for known networking crates.
 
 ---
@@ -241,7 +240,6 @@ Run in containers, per distro, on both architectures.
 | No `NOPASSWD` in the beta | `grep -r NOPASSWD /etc/sudoers.d/xudo` finds nothing, and `xudo-gate-nopass` is absent from the package |
 | Nobody was added to a group | The `xudo` group exists and is empty after install |
 | `lintian` | Clean, with any override justified in a comment |
-| Reproducible build | Two builds from the same source produce identical artifacts |
 | Install-command documentation | A CI check that the README contains no `curl … | …sh` pattern |
 
 ---
@@ -250,8 +248,8 @@ Run in containers, per distro, on both architectures.
 
 - `debian/` packaging with hand-written maintainer scripts, or `cargo-deb` metadata plus script overrides.
 - Signed `.deb` artifacts on GitHub Releases. The `xudo-keyring` package and the apt repository are deferred (open decision 3 in `README.md`); § 4's one-line install is written for the Releases form until then.
-- `.rpm`, `APKBUILD`, `PKGBUILD`, Nix module.
-- Signed release artifacts, SBOM, `cargo-auditable` build.
+- Signed release artifacts.
+- **After the beta (M7):** `.rpm`, `APKBUILD`, `PKGBUILD`, Nix module, SBOM, `cargo-auditable` build, and reproducible builds.
 - README, `SECURITY.md`, `CITATION.cff`, `AGENTS.md`, `llms.txt`, docs site with JSON-LD.
 - The container install/remove/purge matrix wired into CI.
 - Man pages for `xudo(1)` and `xudo-rules(5)`; `ido(1)` and `ido-queue(5)` exist in `../man/` and a test keeps `ido(1)` in step with the command surface.
