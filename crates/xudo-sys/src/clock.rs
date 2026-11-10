@@ -2,16 +2,18 @@
 //!
 //! The broker stamps every spool entry with a deadline and the gate refuses an
 //! entry past it, so the two must read the **same** clock. That clock is
-//! `CLOCK_BOOTTIME`, read here, in milliseconds: unlike monotonic time it
-//! includes suspend. Both binaries read it through [`HostClock`], so there is one
-//! definition of "now" for a deadline, not two that could drift.
+//! `CLOCK_BOOTTIME`, read here on Linux in milliseconds: unlike monotonic time
+//! it includes suspend. On other platforms [`HostClock`] reports no reading, so
+//! privileged paths fail closed.
 
+#[cfg(target_os = "linux")]
 use rustix::time::ClockId;
 
 /// Clock used to stamp and judge request deadlines.
+#[cfg(target_os = "linux")]
 pub const DEADLINE_CLOCK: ClockId = ClockId::Boottime;
 
-/// A source of boottime milliseconds.
+/// A source of boottime milliseconds. Returns zero when no reading is available.
 pub trait Clock {
     /// Milliseconds of `CLOCK_BOOTTIME`.
     fn boottime_millis(&self) -> u64;
@@ -21,7 +23,7 @@ pub trait Clock {
     fn wall_millis(&self) -> u64;
 }
 
-/// The running kernel's `CLOCK_BOOTTIME`.
+/// The running kernel's `CLOCK_BOOTTIME` on Linux; unavailable elsewhere.
 #[derive(Clone, Copy, Debug)]
 pub struct HostClock;
 
@@ -34,10 +36,19 @@ impl Clock for HostClock {
     }
 
     fn boottime_millis(&self) -> u64 {
-        let now = rustix::time::clock_gettime(DEADLINE_CLOCK);
-        let secs = u64::try_from(now.tv_sec).unwrap_or(0);
-        let nanos = u32::try_from(now.tv_nsec).unwrap_or(0);
-        u64::try_from(std::time::Duration::new(secs, nanos).as_millis()).unwrap_or(0)
+        #[cfg(target_os = "linux")]
+        {
+            let now = rustix::time::clock_gettime(DEADLINE_CLOCK);
+            let secs = u64::try_from(now.tv_sec).unwrap_or(0);
+            let nanos = u32::try_from(now.tv_nsec).unwrap_or(0);
+            u64::try_from(std::time::Duration::new(secs, nanos).as_millis()).unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No supported deadline clock exists on this platform. Zero is
+            // treated by the gate and broker as a failed clock reading.
+            0
+        }
     }
 }
 
@@ -69,6 +80,7 @@ mod tests {
         assert!(format!("{HostClock:?}").contains("HostClock"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_host_clock_is_milliseconds_since_boot_and_not_the_wall_clock() {
         // A deadline anchored to the wall clock is one an operator extends by
@@ -92,8 +104,15 @@ mod tests {
         assert_eq!(FixedClock(7), FixedClock(7));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn deadlines_use_boottime_because_ci_hosts_do_not_suspend() {
         assert_eq!(DEADLINE_CLOCK, ClockId::Boottime);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn host_clock_fails_closed_without_a_supported_deadline_clock() {
+        assert_eq!(HostClock.boottime_millis(), 0);
     }
 }
