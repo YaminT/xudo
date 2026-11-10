@@ -367,16 +367,21 @@ impl PendingRequest {
                 reason: "top-level JSON value must be an object".to_owned(),
             });
         }
-        let request: Self =
-            serde_json::from_value(value).map_err(|error| RequestError::Malformed {
-                reason: error.to_string(),
-            })?;
-        if request.schema_version != REQUEST_SCHEMA_VERSION {
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != REQUEST_SCHEMA_VERSION
+        {
             return Err(RequestError::WrongSchema {
-                found: request.schema_version,
+                found,
                 expected: REQUEST_SCHEMA_VERSION,
             });
         }
+        let request: Self =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
         Ok(request)
     }
 
@@ -634,6 +639,34 @@ mod tests {
     fn a_round_trip_through_json_changes_nothing() {
         let request = live();
         assert_eq!(PendingRequest::parse(&request.to_json()).unwrap(), request);
+    }
+
+    #[test]
+    fn a_duplicate_key_spool_entry_is_refused() {
+        let entry = live().to_json();
+        let duplicate_schema = entry.replacen(
+            &format!("\"schema_version\":{REQUEST_SCHEMA_VERSION}"),
+            &format!(
+                "\"schema_version\":{REQUEST_SCHEMA_VERSION},\"schema_version\":{REQUEST_SCHEMA_VERSION}"
+            ),
+            1,
+        );
+        assert_eq!(
+            PendingRequest::parse(&duplicate_schema).unwrap_err().code(),
+            "request_malformed"
+        );
+
+        let duplicate_program = entry.replacen(
+            "\"program\":\"/usr/bin/systemctl\"",
+            "\"program\":\"/usr/bin/systemctl\",\"program\":\"/usr/bin/false\"",
+            1,
+        );
+        assert_eq!(
+            PendingRequest::parse(&duplicate_program)
+                .unwrap_err()
+                .code(),
+            "request_malformed"
+        );
     }
 
     #[test]

@@ -176,16 +176,21 @@ impl BrokerRequest {
             offset: error.valid_up_to(),
         })?;
         let value = parse_json_object(text).map_err(|reason| RequestError::Malformed { reason })?;
-        let request: Self =
-            serde_json::from_value(value).map_err(|error| RequestError::Malformed {
-                reason: error.to_string(),
-            })?;
-        if request.schema_version != WIRE_SCHEMA_VERSION {
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
             return Err(RequestError::WrongSchema {
-                found: request.schema_version,
+                found,
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
+        let request: Self =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
         request.check()?;
         Ok(request)
     }
@@ -753,16 +758,21 @@ impl BrokerResponse {
         })?;
         let value =
             parse_json_object(text).map_err(|reason| ResponseError::Malformed { reason })?;
-        let response: Self =
-            serde_json::from_value(value).map_err(|error| ResponseError::Malformed {
-                reason: error.to_string(),
-            })?;
-        if response.schema_version != WIRE_SCHEMA_VERSION {
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
             return Err(ResponseError::WrongSchema {
-                found: response.schema_version,
+                found,
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
+        let response: Self =
+            serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
+                reason: error.to_string(),
+            })?;
         match &response.answer {
             Answer::Decided { minted, .. } => {
                 if let Some(minted) = minted {
@@ -1012,7 +1022,7 @@ mod tests {
 
     #[test]
     fn a_schema_1_request_is_refused_wrong_schema() {
-        let bytes = br#"{"schema_version":1,"question":"watch"}"#;
+        let bytes = br#"{"schema_version":1,"program":"/usr/bin/id","argv":[],"claimed_classification":"x"}"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestWrongSchema
@@ -1020,7 +1030,22 @@ mod tests {
     }
 
     #[test]
-    fn a_request_with_a_different_schema_is_refused_after_deserialization() {
+    fn a_duplicate_key_request_is_refused() {
+        let repeated_schema =
+            br#"{"schema_version":2,"schema_version":2,"question":{"thaw":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_schema).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+        let repeated_program = br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/true","program":"/usr/bin/false","argv":[],"claimed_classification":"x"}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_program).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn a_request_with_a_different_schema_is_refused_before_shape_parsing() {
         let bytes = br#"{"schema_version":3,"question":{"watch":null}}"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err(),
@@ -1732,6 +1757,20 @@ mod tests {
             Err(ResponseError::WrongSchema {
                 found: 3,
                 expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_response_is_refused() {
+        let repeated_schema = br#"{"schema_version":2,"schema_version":2,"answer":"done"}"#;
+        let duplicate_error = serde_json::from_slice::<BrokerResponse>(repeated_schema)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            BrokerResponse::parse(repeated_schema),
+            Err(ResponseError::Malformed {
+                reason: duplicate_error,
             })
         );
     }
