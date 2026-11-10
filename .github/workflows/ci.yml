@@ -152,7 +152,7 @@ jobs:
   # deleted, `root-test` added to the `ci` recipe in the justfile.
   # Branch protection lives outside this repository: if it lists required
   # checks, this job's name ("root tests (container)") has to be among them, or a
-  # red lane still merges. docs/CONCERNS.md, 2026-10-22, has the reasoning.
+  # red lane still merges. Branch protection is configured outside this file.
   root-tests:
     name: root tests (container)
     runs-on: ubuntu-24.04

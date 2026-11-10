@@ -66,7 +66,8 @@ assert_cmd = "2"
 predicates = "3"
 
 # Lints are declared once here and inherited by every crate via
-# `[lints] workspace = true`. Rationale for each group is in CLAUDE.md.
+# `[lints] workspace = true`, so a member cannot relax them. A panic in a
+# decision path is undefined policy.
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 unsafe_code = "forbid"

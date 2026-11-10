@@ -1,7 +1,7 @@
 //! The standing invariants, expressed as properties rather than examples.
 //!
-//! These are the load-bearing security claims of the whole project. Each one is
-//! stated in `CLAUDE.md` and must never be deleted: if an invariant here starts
+//! These are the load-bearing security claims of the whole project. Each one
+//! must never be deleted: if an invariant here starts
 //! failing, the design has been broken, not the test.
 //!
 //! Example tests check the cases an author thought of. These check the cases

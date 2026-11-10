@@ -1,6 +1,6 @@
 //! The README never teaches `curl ... | sh`.
 //!
-//! The install is a checksum-verified download (docs/todo/phase-3), and the
+//! The install is a checksum-verified download, and the
 //! reasoning for refusing a piped installer belongs in the README, so the
 //! pattern may be named in prose but never given as a command.
 

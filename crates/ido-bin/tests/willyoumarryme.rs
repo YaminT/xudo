@@ -24,7 +24,7 @@
 //! process-spawn storms lost nothing. With the second name a symlink, which
 //! adds no name to the file, 330 runs lost nothing and the log held no denial.
 //! `the_suite_never_hard_links_the_binary_it_runs` keeps it so. The package
-//! installs a hard link (`docs/todo/phase-3-packaging-and-publish.md`);
+//! installs a hard link;
 //! checking that layout is the package's job, on the platform that ships it.
 //! What this suite tests is that `argv[0]` picks the celebration. To see the
 //! denial yourself, loop the suite and watch

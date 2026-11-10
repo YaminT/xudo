@@ -25,8 +25,8 @@
 //!
 //! `sys.rs` reads `SO_PEERCRED` itself because rustix's `socket_peercred`
 //! decodes the pid into a type that cannot be zero, and the kernel answers 0 for
-//! a peer outside the caller's pid namespace (docs/CONCERNS.md, the M2b step 2
-//! entry, open item 8). Putting rustix's call back decodes every peer a test
+//! a peer outside the caller's pid namespace. Putting rustix's call back
+//! decodes every peer a test
 //! will ever make correctly and fails only on the one it was removed for, so no
 //! behavioural test can tell. The last section of this file therefore looks for
 //! the call's name, as a token, in every Rust file, and checks that the lint

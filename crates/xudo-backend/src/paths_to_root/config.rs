@@ -14,8 +14,8 @@
 //!   the next line by what precedes it (an escape, a comment, a quote, a token
 //!   under way, a carriage return), and four rounds of review each found
 //!   another case where this module and the real lexer disagreed (verified
-//!   against sudo 1.9.16p2 and `OpenDoas` 6.8.2). So the decision, recorded in
-//!   `docs/CONCERNS.md`, is to stop modelling continuations: every physical
+//!   against sudo 1.9.16p2 and `OpenDoas` 6.8.2). So the decision is to stop
+//!   modelling continuations: every physical
 //!   line whose last byte, past trailing whitespace, is a backslash (whatever
 //!   precedes it, in either dialect, a whole-line comment included) makes what
 //!   it may join **unmodelled**. Every rule on that logical line, and on the
@@ -71,8 +71,8 @@
 //!   `denies_an_include_on_a_line_the_program_did_not_join_hiding_the_callers_grant`
 //!   and `denies_a_continuation_splitting_a_doas_identity_as_another_users`.
 //!   This is a containment, not a fix: reading the program's own answer for the
-//!   caller (`doas -C <file> <cmd>`, `sudo -l -U <user>`) is plan item D3
-//!   (`docs/todo/m2b-finish-plan.md`), and replaces this reader, and the
+//!   caller (`doas -C <file> <cmd>`, `sudo -l -U <user>`) is later work, and
+//!   replaces this reader, and the
 //!   include finding, where it can run.
 //! * Within one physical line the scan is left to right with escape semantics,
 //!   for tag and comment detection (see `read_line`): a `#` ends the part of
