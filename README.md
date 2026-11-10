@@ -16,6 +16,8 @@ sudo apt install ./xudo_<ver>_<arch>.deb
 
 xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 
+The broker requires systemd and journald. Without them every privileged request is refused; `systemd` is recommended by the package and may be omitted by explicitly installing without recommendations.
+
 ## Example
 
 From a checkout, inspect the example rules with `--rules ./rules`:
@@ -36,7 +38,7 @@ Then run `xudo exec -- /usr/bin/systemctl --no-pager --no-ask-password restart n
 
 Agent detection is not a security boundary. The passwordless agent path is not in this release, so a successful impersonation cannot skip the password today. The allowlist is the boundary; the compiled-in deny-list is defense in depth because the set of programs that can become a root shell is not enumerable. `xudo doctor` reports some other paths to root, but cannot prove that a host has none.
 
-The broker and password-authenticated gate are built and packaged. The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release. The default build has no network code or telemetry. CI traces the shipped release-musl binaries (`xudo`, `ido`, and `xudo-gate-auth`) across selected commands, failing on socket families outside `AF_UNIX`/`AF_LOCAL`; it also checks their normal Cargo dependency tree for known networking crates.
+M1 (policy core, explain) done. M2a (backend model) done. M2b done in code and tests (2026-10-30): the broker mints entries, the gate consumes one and runs it as root, `xudo exec` and `xudo install` ask the broker, both write one hash-chained audit trail, and the same ruleset behaves the same through sudo, sudo-rs and OpenDoas. M3 is built: out-of-band confirmation via `xudo watch` is off by default, and every path still requires the password. The broker runs under its real systemd sandbox, and Pasban verifies the audit chain daily. The doas install probe remains NOT VERIFIED. Next: M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here), M7 confinement and external audit. `confirm_human_path=false` by default. `just telemetry` runs the strace no-telemetry check, also run by the CI job “no telemetry”. The passwordless agent path and Landlock confinement are not in this release.
 
 The install probe reports `installed, but NOT VERIFIED` on doas and multicall-coreutils systems. Examples include stock Ubuntu 26.04 and Alpine, where `/usr/bin/id` is uutils or a multicall applet. The Ubuntu 26.04 systemd and differential lanes pass because they install GNU `id`.
 
@@ -79,7 +81,7 @@ No. A command must match an action in the root-owned rules and pass the compiled
 
 ### Is this safe? What are the limits?
 
-This is beta software and has not been externally audited. A broad rule can grant broad root access, the deny-list is not a complete boundary, and other host paths to root remain outside xudo's control. Agent detection is not a security boundary; the allowlist is. The passwordless agent path, out-of-band confirmation, and Landlock confinement are not in this release.
+This is beta software and has not been externally audited. A broad rule can grant broad root access, the deny-list is not a complete boundary, and other host paths to root remain outside xudo's control. Agent detection is not a security boundary; the allowlist is. M1 (policy core, explain) done. M2a (backend model) done. M2b done in code and tests (2026-10-30): the broker mints entries, the gate consumes one and runs it as root, `xudo exec` and `xudo install` ask the broker, both write one hash-chained audit trail, and the same ruleset behaves the same through sudo, sudo-rs and OpenDoas. M3 is built: out-of-band confirmation via `xudo watch` is off by default, and every path still requires the password. The broker runs under its real systemd sandbox, and Pasban verifies the audit chain daily. The doas install probe remains NOT VERIFIED. Next: M4 enrollment and the passwordless path, M5 temporary permissions, narrowing and volume controls (pasban's revocation substrate), M6 ergonomics (`airead` surfaces here), M7 confinement and external audit. `confirm_human_path=false` by default. `just telemetry` runs the strace no-telemetry check, also run by the CI job “no telemetry”. The passwordless agent path and Landlock confinement are not in this release.
 
 ### Does this work with Claude Code, Codex CLI, Gemini CLI, or Aider?
 

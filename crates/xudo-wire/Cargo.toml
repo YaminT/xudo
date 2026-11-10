@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-xudo-policy = { path = "../xudo-policy", version = "0.0.1" }
+xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

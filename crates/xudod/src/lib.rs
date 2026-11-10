@@ -31,11 +31,16 @@
 //! | [`policy`] | What does root's policy decide about this command? |
 //! | [`mint`] | What does the gate's entry say, and what may stay in the spool? |
 //! | [`record`] | What does the audit trail say about this answer? |
+
 //! | [`refusal`] | What is the client told when the answer is no answer? |
 //! | [`serve`] | In what order, and what happens when a step fails? |
 
 #![forbid(unsafe_code)]
 
+/// Runtime directory holding per-user watcher and confirmation state.
+pub const CONFIRM_DIR: &str = "/run/xudo/confirm";
+
+pub mod confirm;
 pub mod identify;
 pub mod mint;
 pub mod policy;
@@ -87,6 +92,8 @@ fn run_with_hygiene(
     match UnixConnection::adopt(socket, IO_TIMEOUT) {
         Ok(conn) => {
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
+            let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
+            let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
@@ -96,8 +103,10 @@ fn run_with_hygiene(
                 entropy: &HostEntropy,
                 policy: &policy,
                 audit,
+                confirmations: xudo_sys::as_seam(&confirmations).ok(),
+                freeze_file: xudo_sys::as_seam(&freeze_file).ok(),
             };
-            serve(&conn, &mut platform, spool.as_ref()).exit_status()
+            serve(&conn, &mut platform, xudo_sys::as_seam(&spool)).exit_status()
         }
         Err(error) => {
             let refusal = Refusal::broker(RefusalCode::BrokerUnusable, error.to_string());
@@ -135,7 +144,10 @@ mod tests {
     fn code_of(answer: &Answer) -> Option<RefusalCode> {
         match answer {
             Answer::Refused { code, .. } => Some(*code),
-            Answer::Decided { .. } => None,
+            Answer::Decided { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
         }
     }
 

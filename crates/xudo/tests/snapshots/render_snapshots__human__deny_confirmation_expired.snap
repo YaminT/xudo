@@ -1,0 +1,10 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    confirmation_expired
+
+  trace
+
+  next      the request expired; ask a person to approve it again with `xudo watch` before running it

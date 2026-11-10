@@ -93,7 +93,9 @@ impl From<&MintError> for Refusal {
         match error {
             MintError::NoAction => Self::broker(RefusalCode::BrokerUnusable, error.to_string()),
             MintError::Spool(_) => Self::broker(RefusalCode::SpoolUnusable, error.to_string()),
-            MintError::Full { .. } | MintError::UidFull { .. } => {
+            MintError::Full { .. }
+            | MintError::UidFull { .. }
+            | MintError::ConfirmationThrottled => {
                 Self::client(RefusalCode::SpoolFull, error.to_string())
             }
             MintError::Collision { .. } => {
@@ -138,9 +140,9 @@ mod tests {
         });
         assert_eq!(spool.code, RefusalCode::SpoolUnusable);
         assert_eq!(spool.fault, Fault::Broker);
-        let policy = Refusal::from(&PolicyError::ConfigNotUtf8 {
+        let policy = Refusal::from(&PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
             file: "f".to_owned(),
-        });
+        }));
         assert_eq!(policy.code, RefusalCode::PolicyUnloadable);
         assert_eq!(policy.fault, Fault::Broker);
     }
@@ -182,6 +184,11 @@ mod tests {
                 },
                 RefusalCode::NonceCollision,
                 Fault::Broker,
+            ),
+            (
+                MintError::ConfirmationThrottled,
+                RefusalCode::SpoolFull,
+                Fault::Client,
             ),
         ] {
             let refusal = Refusal::from(&failure);

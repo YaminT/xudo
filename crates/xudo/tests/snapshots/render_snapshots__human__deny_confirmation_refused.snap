@@ -1,0 +1,10 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    confirmation_refused
+
+  trace
+
+  next      the human refused this request; do not retry it

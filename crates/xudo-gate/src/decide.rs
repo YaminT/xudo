@@ -36,7 +36,7 @@ use xudo_policy::{
 };
 
 use crate::env::child_environment;
-use crate::request::{CallerPin, MonotonicSecs, PendingRequest, RequestError};
+use crate::request::{BoottimeMillis, CallerPin, PendingRequest, RequestError};
 
 /// The caller, as the gate itself established it.
 ///
@@ -81,18 +81,19 @@ pub const UNKNOWN_UID: u32 = u32::MAX;
 pub struct GateContext {
     /// The policy generation currently in force, read from root-owned state.
     pub generation: u64,
-    /// The current monotonic reading.
-    pub now: MonotonicSecs,
+    /// The current boottime reading.
+    pub now: BoottimeMillis,
     /// Global settings, loaded from the root-owned config.
     pub settings: engine::Settings,
     /// Whether this invocation proves a human typed a password.
     ///
     /// True only for the `xudo-gate-auth` name, which `sudo` reaches only after
     /// a PAM conversation on a fresh pty that the requesting process tree cannot
-    /// answer without the secret. On that path the password **is** the
-    /// confirmation, so a rule that demands one is satisfied by it. Never true
-    /// for a request that was merely approved: that is the broker's
-    /// `confirmed`, which carries the channel that approved it.
+    /// answer without the secret. It satisfies the password half of a
+    /// confirmation requirement; when `confirm_human_path` is enabled, a
+    /// checked watch approval is required as well. Never true for a request
+    /// that was merely approved: that is the broker's `confirmed`, which adds
+    /// the watch fact but never replaces this password fact.
     pub password_confirms: bool,
 }
 
@@ -174,7 +175,7 @@ pub enum Stage {
     Lineage,
     /// Load the root-owned ruleset.
     Rules,
-    /// Read the monotonic clock.
+    /// Read the boottime clock.
     Clock,
     /// Open, list, or consume the spool.
     Spool,
@@ -184,6 +185,8 @@ pub enum Stage {
     Audit,
     /// Build the exec vector and exec.
     Exec,
+    /// Load and parse the root-owned configuration.
+    Config,
 }
 
 impl Stage {
@@ -197,7 +200,8 @@ impl Stage {
             Self::Procfs => "verify /proc",
             Self::Lineage => "walk its lineage",
             Self::Rules => "load the root-owned ruleset",
-            Self::Clock => "read the monotonic clock",
+            Self::Config => "load the root-owned configuration",
+            Self::Clock => "read the boottime clock",
             Self::Spool => "use the spool",
             Self::Program => "open the program",
             Self::Audit => "record the authorization",
@@ -215,6 +219,7 @@ impl Stage {
             Self::Procfs => "gate_failed_procfs",
             Self::Lineage => "gate_failed_lineage",
             Self::Rules => "gate_failed_rules",
+            Self::Config => "gate_failed_config",
             Self::Clock => "gate_failed_clock",
             Self::Spool => "gate_failed_spool",
             Self::Program => "gate_failed_program",
@@ -407,7 +412,7 @@ pub fn decide(
         // here even though the front-end may already have shown a prompt: the
         // gate's evidence that a human approved is the broker's record, and
         // there isn't one.
-        Verdict::AllowWithConfirmation if !pending.confirmed && !context.password_confirms => {
+        Verdict::AllowWithConfirmation if !confirmation_satisfied(pending, &context) => {
             return Err(Refusal::ConfirmationMissing(Box::new(decision)));
         }
         Verdict::Allow | Verdict::AllowWithConfirmation => {}
@@ -447,6 +452,14 @@ pub fn decide(
         requested_rule_source: action.source.to_string(),
         nonce: pending.nonce.clone(),
     })
+}
+
+fn confirmation_satisfied(pending: &PendingRequest, context: &GateContext) -> bool {
+    if context.settings.confirm_human_path {
+        pending.confirmed && context.password_confirms
+    } else {
+        pending.confirmed || context.password_confirms
+    }
 }
 
 /// The canonical operands of a request, rendered for a decision envelope.
@@ -608,7 +621,7 @@ mod tests {
     use xudo_policy::{Classification, Hint, HintSource};
 
     use super::*;
-    use crate::request::{MonotonicSecs, REQUEST_SCHEMA_VERSION};
+    use crate::request::{BoottimeMillis, REQUEST_SCHEMA_VERSION};
 
     const NONCE: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     const GENERATION: u64 = 12;
@@ -688,7 +701,7 @@ args = [
     fn context() -> GateContext {
         GateContext {
             generation: GENERATION,
-            now: MonotonicSecs(100),
+            now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: false,
         }
@@ -704,9 +717,17 @@ args = [
             program: "/usr/bin/systemctl".to_owned(),
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             generation: GENERATION,
-            deadline: MonotonicSecs(200),
+            deadline: BoottimeMillis(200),
             confirmed: false,
             confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 10,
+            caller_tty: 20,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
         }
     }
@@ -761,7 +782,7 @@ args = [
         // Shape and liveness are settled before policy, so a forged entry cannot
         // provoke a policy *answer* it can learn from.
         let mut pending = status_request(77);
-        pending.deadline = MonotonicSecs(50);
+        pending.deadline = BoottimeMillis(50);
         let refusal = decide(&rules(), &human(77), Some(&pending), context()).unwrap_err();
         assert_eq!(refusal.code(), "request_expired");
         assert_eq!(refusal.severity(), Severity::Normal);
@@ -855,7 +876,17 @@ args = [
     fn a_broker_recorded_approval_lets_the_same_request_through() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules(), &agent(77), Some(&pending), context()).unwrap();
         assert_eq!(approved.action, "xudo.svc.status");
     }
@@ -870,12 +901,22 @@ args = [
             "gate_confirmation_missing"
         );
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         assert!(decide(&rules(), &human(77), Some(&pending), context()).is_ok());
     }
 
     #[test]
-    fn a_frozen_agent_path_leaves_the_human_path_open() {
+    fn the_human_path_runs_while_frozen() {
         let mut ctx = context();
         ctx.settings.frozen = true;
         let pending = status_request(77);
@@ -886,6 +927,19 @@ args = [
             "frozen"
         );
         assert!(decide(&rules(), &human(77), Some(&pending), ctx).is_ok());
+    }
+
+    #[test]
+    fn an_entry_minted_before_freeze_is_refused_by_the_gate_for_an_agent() {
+        let minted_before_freeze = status_request(77);
+        let mut ctx = context();
+        ctx.settings.frozen = true;
+        assert_eq!(
+            decide(&rules(), &agent(77), Some(&minted_before_freeze), ctx)
+                .unwrap_err()
+                .code(),
+            "frozen"
+        );
     }
 
     #[test]
@@ -1075,17 +1129,34 @@ args = [
     fn a_confirmed_authorization_records_which_channel_approved_it() {
         let mut pending = status_request(77);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules(), &agent(77), Some(&pending), context()).unwrap();
-        let record =
-            authorization_record(None, &approved, &agent(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &agent(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
 
         assert_eq!(record.decision, AuditDecision::AwaitingConfirmation);
-        assert!(
-            record
-                .evidence
-                .contains(&"confirmed_by=broker-tty:/dev/pts/3".to_owned())
-        );
+        assert!(record.evidence.contains(&format!(
+            "confirmed_by=uid=1000,pid=88,starttime=99,tty={},sid=11",
+            (136 << 8) | 1
+        )));
     }
 
     #[test]
@@ -1180,7 +1251,17 @@ args = [
             Some(ActionId::new("xudo.reload.confirmed"))
         );
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
 
         // The authorization cites the rule that demanded the approval, not the
@@ -1188,8 +1269,16 @@ args = [
         assert_eq!(approved.action, "xudo.reload.confirmed");
         assert_eq!(approved.requested_action, "xudo.reload.quiet");
         assert_ne!(approved.rule_source, approved.requested_rule_source);
-        let record =
-            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &human(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
         assert_eq!(record.action.as_deref(), Some("xudo.reload.confirmed"));
         // And the binding `authorize` checks before writing holds on the
         // governing action, not the requested one.
@@ -1217,11 +1306,29 @@ args = [
         let rules = overlapping_rules();
         let mut pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
         pending.confirmed = true;
-        pending.confirmed_by = Some("broker-tty:/dev/pts/3".to_owned());
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
         assert_eq!(approved.action, approved.requested_action);
-        let record =
-            authorization_record(None, &approved, &human(77), pending.confirmed_by.as_deref());
+        let record = authorization_record(
+            None,
+            &approved,
+            &human(77),
+            pending
+                .confirmed_by
+                .as_ref()
+                .map(crate::request::WatcherPin::audit_text)
+                .as_deref(),
+        );
         assert!(
             !record
                 .evidence
@@ -1252,13 +1359,65 @@ args = [
     }
 
     #[test]
-    fn a_rule_that_confirms_is_satisfied_by_the_password_and_by_nothing_else_the_caller_can_say() {
+    fn a_watch_approval_never_stands_in_for_the_password() {
         let rules = overlapping_rules();
-        let pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
-        // Without a password and without the broker's approval: refused.
-        let refused = decide(&rules, &human(77), Some(&pending), context()).unwrap_err();
+        let mut pending = request(77, "xudo.reload.confirmed", &["daemon-reload"]);
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.shown_to = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        let watch_required = GateContext {
+            settings: engine::Settings {
+                confirm_human_path: true,
+                ..engine::Settings::default()
+            },
+            password_confirms: false,
+            ..context()
+        };
+        let refused = decide(&rules, &human(77), Some(&pending), watch_required).unwrap_err();
         assert_eq!(refused.code(), "gate_confirmation_missing");
-        // On the -auth name the password is the confirmation.
+        // A password is still insufficient when the setting requires a watch.
+        let typed = GateContext {
+            settings: watch_required.settings,
+            password_confirms: true,
+            ..watch_required
+        };
+        assert_eq!(
+            decide(&rules, &human(77), Some(&pending), typed)
+                .unwrap_err()
+                .code(),
+            "gate_confirmation_missing"
+        );
+        let mut watched = pending.clone();
+        watched.confirmed = true;
+        watched.state = crate::request::ConfirmationState::Consumed;
+        watched.needs_watch = true;
+        watched.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        watched.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        watched.shown_to = watched.confirmed_by.clone();
+        assert_eq!(
+            decide(&rules, &human(77), Some(&watched), watch_required)
+                .unwrap_err()
+                .code(),
+            "gate_confirmation_missing"
+        );
+        let watched_and_typed = GateContext {
+            password_confirms: true,
+            ..watch_required
+        };
+        assert!(decide(&rules, &human(77), Some(&watched), watched_and_typed).is_ok());
+        // With the channel off, the existing password path remains valid.
         let typed = GateContext {
             password_confirms: true,
             ..context()
@@ -1268,7 +1427,7 @@ args = [
         let denied = request(77, "xudo.reload.confirmed", &["daemon-reload", "--now"]);
         assert!(decide(&rules, &human(77), Some(&denied), typed).is_err());
         let expired = GateContext {
-            now: MonotonicSecs(300),
+            now: BoottimeMillis(300),
             ..typed
         };
         assert_eq!(
@@ -1313,6 +1472,7 @@ args = [
             Stage::Program,
             Stage::Audit,
             Stage::Exec,
+            Stage::Config,
         ];
         let mut codes: Vec<&str> = stages.iter().map(|stage| stage.code()).collect();
         codes.sort_unstable();

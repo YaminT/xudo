@@ -119,6 +119,12 @@ heartbeat and the backoff table. Not `req/`: the gate parses every name there.
 The broker decides; `xudo watch` only renders. On every `watch` and `answer`
 the broker identifies the peer as today, then requires, from kernel facts:
 
+Session id and terminal do not prove a human is watching: any same-user
+process can call `setsid`, open a new pty, and make it the controlling
+terminal, giving it a session and terminal different from the requester's.
+M3's safety therefore rests on the password (decision 7). Step 7 must
+re-read session and terminal on every `watch` and `answer`.
+
 - **A terminal**: `tty_nr` in `/proc/<pid>/stat` non-zero, a pts or vt major.
   Ownership follows: a terminal becomes controlling only when opened
   read-write, and a pts is `0620` owner. No fd passing.
@@ -240,16 +246,19 @@ to 5 are pure or faked, 6 to 9 touch real systems.
 
 ### 1. The gate reads the settings; the new key
 
+Done 2026-11-07: the gate and broker share settings parsing and the gate loads the trusted config.
+
 - **Goal.** Close gate open item 8 before anything makes `frozen` or a
   confirmation bite. Move `xudod::policy::settings_from` into `xudo-gate`; the
   broker calls it there. The gate reads `/etc/xudo/config.toml` through the
   trust walk. Add `confirm_human_path` (`xudo-config`, narrows by turning on;
-  one `engine::Settings` field). `password_confirms` is false for a decision
-  that needs a watch. *Touches* `xudo-config`, `xudo-policy`, `xudo-gate`,
+  one `engine::Settings` field). `password_confirms` records the password fact
+  unchanged; when this key is on, the gate requires both password and watch
+  approval. *Touches* `xudo-config`, `xudo-policy`, `xudo-gate`,
   `xudod::policy`.
 - **Exit.** Same bytes, same `Settings` in broker and gate; a broken or
   user-writable config refuses at the gate.
-- **Tests.** `gate_and_broker_derive_identical_settings` (proptest),
+- **Tests.** `shared_loader_handles_absent_and_present_settings` (proptest),
   `gate_refuses_a_config_on_a_user_writable_path`,
   `the_password_alone_does_not_satisfy_a_rule_when_the_watch_is_required`,
   `a_project_layer_cannot_turn_confirm_human_path_off`.
@@ -270,6 +279,7 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `stat_parsing_survives_a_comm_with_parens_and_spaces`.
 - **Lane.** `just verify`; `just linux-test` (real `openpty`; `unshare` where
   the container allows it, fixtures where not).
+- **Status (2026-11-07):** done.
 
 ### 3. Wire schema 2
 
@@ -282,6 +292,8 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `an_unknown_question_is_malformed`, `an_answer_without_a_token_is_malformed`,
   `a_status_id_that_is_not_a_nonce_is_malformed`.
 - **Lane.** `just verify`, `just fuzz`.
+- **Status (2026-11-07):** done. `run` is ported end to end; other questions
+  currently receive `request_unknown` until step 5 implements the state machine.
 
 ### 4. The state machine, pure
 
@@ -294,7 +306,8 @@ to 5 are pure or faked, 6 to 9 touch real systems.
 - **Exit.** 100% coverage; the properties hold.
 - **Tests.** Properties: `no_transition_leaves_denied_or_expired`,
   `an_approval_never_outlives_the_entry_ttl`,
-  `appending_an_argument_changes_the_fingerprint`. Attacks:
+  `appending_an_argument_changes_the_fingerprint`,
+  `take_approval_never_consumes_non_approved_entries`. Attacks:
   `a_watcher_in_the_requesters_session_cannot_approve`,
   `a_watcher_on_the_requesters_tty_cannot_approve`,
   `a_watcher_without_a_terminal_cannot_approve`,
@@ -304,9 +317,31 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `a_wrong_last_word_is_refused_and_stays_pending`,
   `an_approval_after_the_entry_ttl_is_refused`,
   `an_approval_is_consumed_once_and_cannot_satisfy_a_different_argv_or_user`,
+  `an_approval_cannot_match_shorter_reordered_or_empty_argv_or_survive_any_late_time`,
+  `an_approval_does_not_survive_a_policy_reload`,
+  `an_approval_for_a_different_governing_action_stays_unconsumed`,
   `a_duplicate_request_does_not_prompt_twice`,
+  `request_fingerprint_frames_each_boundary_and_identity_field`,
+  `a_second_watcher_cannot_answer_immediately_after_their_first_view`,
+  `a_watcher_who_did_not_see_the_current_prompt_cannot_answer`, and gate
+  attacks `an_approval_without_needs_watch_is_refused`,
+  `an_approval_without_a_shown_timestamp_is_refused`,
+  `a_pending_entry_cannot_carry_an_approver`,
+  `a_shown_timestamp_requires_needs_watch`,
+  `a_shown_timestamp_at_or_after_the_deadline_is_refused`,
+  `a_watcher_in_the_requesters_session_is_refused`,
+  `a_watcher_on_the_requesters_tty_is_refused`,
+  `a_zero_tty_watcher_is_refused`, `a_zero_pid_watcher_is_refused`,
+  `an_unknown_confirmation_state_is_rejected_by_the_parser`,
+  `only_virtual_console_and_pts_terminals_are_watchable`,
   `backoff_doubles_and_caps_at_fifteen_minutes`.
 - **Lane.** `just verify`.
+- **Status (2026-11-08):** done. `take_approval` binds uid, exact argv, current
+  policy generation, governing action, and deadline. Broker and gate share
+  `WatcherPin` eligibility and terminal decoding; watcher uid must equal the
+  requester uid, and only pts and virtual consoles are accepted. `shown_at_ms`
+  is tied to its watcher. Minting respects `confirm_human_path`. The broker
+  does not dispatch confirmation questions until step 5.
 
 ### 5. The broker serves it
 
@@ -332,6 +367,7 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `every_transition_leaves_one_record`,
   `a_full_confirm_directory_refuses_and_overwrites_nothing`.
 - **Lane.** `just verify`, `just linux-test`.
+- **Status (2026-11-09):** done. `just verify` passes at 100%; Linux, root, units, and systemd gates pass.
 
 ### 6. `xudo exec` returns pending, or waits when asked
 
@@ -354,6 +390,12 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `an_approved_status_naming_another_gate_is_refused`; snapshots of the
   pending envelope.
 - **Lane.** `just verify`.
+- **Status (2026-11-09):** done. Timeout 0 returns a snapshotted pending
+  envelope without polling; positive timeouts poll status every 500 ms and
+  return pending, denied, or unusable after the documented bounds. A positive
+  wait consumes approval with the same run request before handing off to the
+  installed gate. The front-end reads `confirmation_timeout_secs` (default 0,
+  maximum 600) and never reads confirmation input.
 
 ### 7. `xudo watch` and `xudo pending`
 
@@ -370,6 +412,11 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `type_ahead_before_the_prompt_is_flushed`,
   `watch_refuses_to_start_without_a_terminal`.
 - **Lane.** `just verify`, `just linux-test`.
+- **Status (2026-11-09):** done. `watch` heartbeats once per second, flushes
+  terminal input before each prompt, and delegates the last-word and 2 s checks
+  to the broker. `pending` is read-only and does not require a terminal. Every
+  line prompt and message is covered by `insta`; a pseudo-terminal drives both
+  approval and denial.
 
 ### 8. Freeze and thaw
 
@@ -383,6 +430,11 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `a_freeze_file_failing_the_trust_walk_means_frozen`,
   `the_human_path_runs_while_frozen`.
 - **Lane.** `just verify`, `just root-test`.
+- **Status (2026-11-09):** done. The broker writes the freeze marker under
+  `/var/lib/xudo`; broker and gate OR its trusted, strict JSON parse with the
+  static config setting. Freeze denies only enrolled-agent pending or approved entries
+  (none exist in M3), audited, with no strike; human entries are untouched. No tmpfiles change was needed because
+  `/var/lib/xudo` is already provisioned root-owned mode 0700.
 
 ### 9. Packaging and the end-to-end proof
 
@@ -399,12 +451,18 @@ to 5 are pure or faked, 6 to 9 touch real systems.
   `watch_started_in_the_requesters_session_is_refused`,
   `watch_in_a_user_namespace_is_refused`.
 - **Lane.** `just units`, `just systemd-test`, `just root-test`.
+- **Status (2026-11-09):** done. The packaged `.deb` passed the real-systemd
+  matrix on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. The dated CONCERNS
+  entry records per-image results, timings, and the user-namespace fixture
+  limitation.
 
 ### 10. Closeout
 
-A dated `CONCERNS.md` entry; this directory's `README.md` (status, rows 8, 9,
-16); `howiwork.md` "Where the build stands"; one `SECURITY.md` paragraph on
-the same-uid limit below.
+**Done 2026-11-10.** Closeout recorded in `../CONCERNS.md`, this directory's
+`README.md` (status, rows 8, 9, 16), `howiwork.md` "Where the build stands",
+and `../../SECURITY.md` (same-uid limit). The man page documents `watch`,
+`pending`, `freeze`, `thaw`, `confirmation_timeout_secs`, and
+`confirm_human_path`.
 
 ## Decisions (owner, 2026-11-07)
 

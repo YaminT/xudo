@@ -15,10 +15,12 @@ x86_64-*) arch=amd64 ;;
 aarch64-*) arch=arm64 ;;
 *) echo "unsupported triple $triple" >&2; exit 1 ;;
 esac
-version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
+# Cargo's spelling, hyphen included. CHANGELOG headings use this text.
+# The rewrite below is only for the Debian version, so match the notes first.
+cargo_version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
 # A hyphen starts a Debian revision, so 0.1.0-beta.1 would sort above 0.1.0.
 # Tilde stays in the upstream version and sorts before the final release.
-version=$(printf '%s\n' "$version" | tr '-' '~')
+version=$(printf '%s\n' "$cargo_version" | tr '-' '~')
 bin=$root/target/$triple/release
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)}
 export SOURCE_DATE_EPOCH=$epoch
@@ -29,6 +31,7 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
     "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
     "$stage/etc/xudo/rules.d" \
     "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
+mkdir -p "$stage/usr/share/xudo"
 
 install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
 ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
@@ -43,9 +46,44 @@ mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \
     "$stage/usr/share/doc/xudo/"
-printf 'xudo (%s) unstable; urgency=low\n\n  * Beta release.\n\n -- xudo contributors <noreply@xudo.invalid>  %s\n' \
-    "$version" "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')" |
-    gzip -9n >"$stage/usr/share/doc/xudo/changelog.gz"
+install -m 0644 "$root/packaging/deb/first-install-notice" "$stage/usr/share/xudo/first-install-notice"
+{
+    printf 'xudo (%s) unstable; urgency=low\n\n' "$version"
+    # A VERSION override (the upgrade package) has no changelog section.
+    awk -v ver="$cargo_version" '
+        function heading(line, prefix, rest) {
+            prefix = "## " ver
+            if (index(line, prefix) != 1) return 0
+            rest = substr(line, length(prefix) + 1)
+            return rest == "" || substr(rest, 1, 1) == " "
+        }
+        function wrap(prefix, text, width, cut, part) {
+            width = 78 - length(prefix)
+            while (length(text) > width) {
+                cut = width
+                while (cut > 1 && substr(text, cut, 1) != " ") cut--
+                if (cut == 1) cut = width
+                part = substr(text, 1, cut)
+                sub(/[[:space:]]+$/, "", part)
+                print prefix part
+                text = substr(text, cut + 1)
+                sub(/^[[:space:]]+/, "", text)
+                prefix = sprintf("%*s", length(prefix), "")
+                width = 78 - length(prefix)
+            }
+            print prefix text
+        }
+        heading($0) { active = 1; found = 1; next }
+        /^## / && active { exit }
+        !active { next }
+        /^### / { wrap("  * ", substr($0, 5)); next }
+        /^- / { wrap("    - ", substr($0, 3)); next }
+        /^  / { sub(/^[[:space:]]+/, ""); wrap("      ", $0); next }
+        END { if (!found) print "  * Release of this version." }
+    ' "$root/CHANGELOG.md"
+    printf '\n -- YaminT <YaminT@users.noreply.github.com>  %s\n' \
+        "$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')"
+} | gzip -9n >"$stage/usr/share/doc/xudo/changelog.gz"
 for m in "$root"/docs/man/*.1; do gzip -9n <"$m" >"$stage/usr/share/man/man1/$(basename "$m").gz"; done
 for m in "$root"/docs/man/*.5; do gzip -9n <"$m" >"$stage/usr/share/man/man5/$(basename "$m").gz"; done
 

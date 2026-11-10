@@ -11,12 +11,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::Duration;
+use xudod::CONFIRM_DIR;
 
 const SOCKET: &str = include_str!("../../../packaging/systemd/xudod.socket");
 const SERVICE: &str = include_str!("../../../packaging/systemd/xudod@.service");
 const PASBAN_SERVICE: &str = include_str!("../../../packaging/systemd/xudo-pasban.service");
 const PASBAN_TIMER: &str = include_str!("../../../packaging/systemd/xudo-pasban.timer");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/xudo.conf");
+const POSTINST: &str = include_str!("../../../packaging/deb/postinst");
 
 /// One `Key=Value` line, with the section it is in.
 #[derive(Debug)]
@@ -353,14 +355,19 @@ fn the_broker_is_root_without_a_single_capability() {
 }
 
 #[test]
-fn the_only_writable_paths_are_the_spool_and_the_audit_log() {
+fn the_only_writable_paths_are_confirmation_state_the_spool_and_audit_log() {
     let service = parse(SERVICE);
     assert_eq!(value(&service, "Service", "ProtectSystem"), "strict");
     // "-" lets the broker start, and refuse with a reason, when one is
     // missing; it widens nothing.
     assert_eq!(
         value(&service, "Service", "ReadWritePaths"),
-        format!("-{} -{}", xudo_gate::SPOOL_DIR, xudo_sys::AUDIT_DIR)
+        format!(
+            "-{} -{} -{}",
+            xudo_gate::SPOOL_DIR,
+            CONFIRM_DIR,
+            xudo_sys::AUDIT_DIR
+        )
     );
     for key in [
         "ProtectHome",
@@ -453,7 +460,7 @@ fn the_service_takes_nothing_from_an_environment() {
 }
 
 #[test]
-fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir() {
+fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
     let lines: Vec<Vec<&str>> = TMPFILES
         .lines()
         .map(str::trim)
@@ -465,6 +472,7 @@ fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir(
         [
             ["d", "/run/xudo", "0755", "root", "root", "-", "-"],
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
+            ["d", CONFIRM_DIR, "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
             [
                 "f",
@@ -481,6 +489,53 @@ fn tmpfiles_creates_a_reachable_run_dir_a_private_spool_and_a_private_audit_dir(
         std::path::Path::new(xudo_wire::BROKER_SOCKET).parent(),
         Some(std::path::Path::new("/run/xudo"))
     );
+}
+
+#[test]
+fn deb_postinst_fallback_matches_tmpfiles_paths_modes_and_owners() {
+    let fallback = POSTINST
+        .split("else\n    # Same paths and modes as packaging/tmpfiles.d/xudo.conf.")
+        .nth(1)
+        .unwrap_or("")
+        .split("\nfi")
+        .next()
+        .unwrap_or("");
+    assert!(!fallback.is_empty(), "postinst fallback is missing");
+    let rows: Vec<Vec<&str>> = TMPFILES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert!(
+        rows.iter().all(|row| row.len() >= 5),
+        "tmpfiles row is missing type, path, mode, user, or group"
+    );
+    for row in &rows {
+        let path = row[1];
+        let mode = row[2];
+        let user = row[3];
+        let group = row[4];
+        let line = fallback
+            .lines()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("install") && words.any(|word| word == path)
+            })
+            .unwrap_or_else(|| panic!("fallback omits tmpfiles path {path}"));
+        assert!(
+            line.contains(&format!("-m {mode}")),
+            "fallback mode for {path} is not {mode}: {line}"
+        );
+        assert!(
+            line.contains(&format!("-o {user}")),
+            "fallback owner for {path} is not {user}: {line}"
+        );
+        assert!(
+            line.contains(&format!("-g {group}")),
+            "fallback group for {path} is not {group}: {line}"
+        );
+    }
 }
 
 #[test]

@@ -17,7 +17,7 @@ name = "ido"
 path = "src/main.rs"
 
 [dependencies]
-ido = { path = "../ido", version = "0.0.1" }
+ido = { path = "../ido", version = "0.1.0-beta.1" }
 # Raw mode, window size, and the uid, through rustix's safe API, so the
 # workspace-wide `forbid(unsafe_code)` holds here too. Already in the tree
 # through `tempfile` and `terminal_size`; no new crate.
@@ -28,7 +28,7 @@ rustix = { version = "1.1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-xudo-audit = { path = "../xudo-audit", version = "0.0.1" }
+xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 rustix = { version = "1.1", default-features = false, features = [
   "std",
   "termios",

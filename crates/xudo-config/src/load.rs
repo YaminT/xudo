@@ -52,6 +52,7 @@ pub enum LoadError {
 #[serde(deny_unknown_fields)]
 struct File {
     confirm_agent_actions: Option<bool>,
+    confirm_human_path: Option<bool>,
     confirmation_timeout_secs: Option<u64>,
     frozen: Option<bool>,
     audit_sink: Option<String>,
@@ -80,12 +81,27 @@ pub fn apply_file(
         reason: e.to_string(),
     })?;
 
+    if parsed
+        .audit_sink
+        .as_deref()
+        .is_some_and(|sink| sink != "journald")
+    {
+        return Err(LoadError::Parse {
+            file: file.to_owned(),
+            reason: "audit_sink only accepts \"journald\"".to_owned(),
+        });
+    }
+
     // Ordered so a file's errors are reported in a stable order regardless of
     // how the keys were written.
-    let entries: [(Setting, Option<Value>); 6] = [
+    let entries: [(Setting, Option<Value>); 7] = [
         (
             Setting::ConfirmAgentActions,
             parsed.confirm_agent_actions.map(Value::Bool),
+        ),
+        (
+            Setting::ConfirmHumanPath,
+            parsed.confirm_human_path.map(Value::Bool),
         ),
         (
             Setting::ConfirmationTimeoutSecs,
@@ -275,12 +291,12 @@ mod tests {
             &mut settings,
             Layer::Project,
             ".xudo/policy.toml",
-            "confirmation_timeout_secs = 15\nfrozen = true\n",
+            "confirmation_timeout_secs = 0\nfrozen = true\n",
         )
         .unwrap();
         assert_eq!(
             settings.get(Setting::ConfirmationTimeoutSecs).value,
-            Value::Integer(15)
+            Value::Integer(0)
         );
         assert_eq!(settings.get(Setting::Frozen).value, Value::Bool(true));
     }
@@ -338,12 +354,13 @@ mod tests {
         // the file struct, which would make it silently unconfigurable.
         let cases = [
             ("confirm_agent_actions = true", Setting::ConfirmAgentActions),
+            ("confirm_human_path = true", Setting::ConfirmHumanPath),
             (
                 "confirmation_timeout_secs = 45",
                 Setting::ConfirmationTimeoutSecs,
             ),
             ("frozen = true", Setting::Frozen),
-            ("audit_sink = \"syslog\"", Setting::AuditSink),
+            ("audit_sink = \"journald\"", Setting::AuditSink),
             ("color = false", Setting::Color),
         ];
         for (line, setting) in cases {
@@ -362,6 +379,19 @@ mod tests {
             .filter(|s| s.is_configurable())
             .count();
         assert_eq!(covered, configurable, "a configurable setting is untested");
+    }
+
+    #[test]
+    fn audit_sink_other_than_journald_is_refused() {
+        let mut settings = Settings::default();
+        let error = apply_file(
+            &mut settings,
+            Layer::System,
+            "xudo.toml",
+            "audit_sink = \"syslog\"\n",
+        )
+        .expect_err("unsupported audit sink must fail parsing");
+        assert!(error.to_string().contains("only accepts \"journald\""));
     }
 
     #[test]

@@ -25,6 +25,14 @@ cp /debs/old.deb /debs/new.deb /tmp/ && cd /tmp
 
 # Install: pulls sudo, writes the rule, creates an empty group.
 deb_install ./old.deb
+grep -Fq 'every privileged request asks for a password' /tmp/apt.log || fail "first install notice missing"
+grep -Fq 'There is no' /tmp/apt.log || fail "first install notice omitted agent-path status"
+grep -Fq '/usr/share/doc/xudo/SECURITY.md' /tmp/apt.log || fail "first install notice omitted local SECURITY.md path"
+grep -Fq 'https://github.com/YaminT/xudo/blob/main/SECURITY.md' /tmp/apt.log || fail "first install notice omitted SECURITY.md URL"
+grep -Fq 'Agent detection is not a security boundary' /tmp/apt.log || fail "first install notice omitted detection boundary"
+grep -Fq 'sudo usermod -aG xudo <you>' /tmp/apt.log || fail "first install notice omitted group instructions"
+grep -Fq 'xudo doctor --fix' /tmp/apt.log || fail "first install notice omitted doctor instructions"
+grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted systemd/journald requirement"
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
@@ -43,15 +51,13 @@ getent group xudo >/dev/null || fail "no xudo group"
 [ -z "$(getent group xudo | cut -d: -f4)" ] || fail "xudo group is not empty"
 meta /var/lib/xudo "700 root:root"
 grep -Eq '^f[[:space:]]+/var/lib/xudo/audit.jsonl[[:space:]]+0600[[:space:]]+root[[:space:]]+root([[:space:]]|$)' /usr/lib/tmpfiles.d/xudo.conf || fail "tmpfiles audit-log rule missing"
-if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create /usr/lib/tmpfiles.d/xudo.conf
-else
-    install -m 0600 -o root -g root /dev/null /var/lib/xudo/audit.jsonl
-fi
+grep -Eq '^d[[:space:]]+/run/xudo/confirm[[:space:]]+0700[[:space:]]+root[[:space:]]+root([[:space:]]|$)' /usr/lib/tmpfiles.d/xudo.conf || fail "tmpfiles confirm rule missing"
+# postinst creates these. Creating them here would pass when postinst did not.
 meta /var/lib/xudo/audit.jsonl "600 root:root"
 [ ! -s /var/lib/xudo/audit.jsonl ] || fail "new audit log is not empty"
 meta /run/xudo "755 root:root"
 meta /run/xudo/req "700 root:root"
+meta /run/xudo/confirm "700 root:root"
 [ -L "$socket" ] || fail "socket was not enabled"
 [ -f /usr/lib/systemd/system/xudo-pasban.service ] || fail "pasban service not in the package"
 [ -f /usr/lib/systemd/system/xudo-pasban.timer ] || fail "pasban timer not in the package"
@@ -78,6 +84,9 @@ printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+if grep -Fq 'every privileged request asks for a password' /tmp/apt.log; then
+    fail "upgrade printed the first install notice"
+fi
 [ "$(dpkg-query -W -f='${Version}' xudo)" != "$(dpkg-deb -f /tmp/old.deb Version)" ] || fail "version did not change"
 meta $rule "440 root:root"
 grep -q '^# mine' /etc/xudo/rules.d/05-probe.toml || fail "upgrade lost the operator's edit"

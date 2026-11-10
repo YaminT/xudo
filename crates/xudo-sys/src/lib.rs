@@ -71,6 +71,8 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
+#[cfg(target_os = "linux")]
+pub use clock::DEADLINE_CLOCK;
 pub use clock::{Clock, FixedClock, HostClock};
 pub use connection::{
     AdoptError, Connection, FakeConnection, ReadFailure, UnixConnection, connected_unix_stream,
@@ -98,7 +100,7 @@ pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
 pub use source::{DirSource, MapSource, ProcSource};
-pub use spool::{FakeSpool, Spool, SpoolCall, SpoolDir, SpoolError, TEMP_PREFIX};
+pub use spool::{FakeSpool, Spool, SpoolCall, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,

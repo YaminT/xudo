@@ -455,7 +455,7 @@ proptest! {
         confirm_agent_actions in any::<bool>(),
     ) {
         let rules = RuleSet::load(vec![action.clone()]).unwrap();
-        let settings = Settings { confirm_agent_actions, frozen };
+        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
         let d = xudo_policy::evaluate(
             &rules,
             &caller(agent, Vec::new()),
@@ -741,7 +741,7 @@ proptest! {
         let before = RuleSet::load(rules.clone()).unwrap();
         let after = RuleSet::load(grown).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen };
+        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
 
         let then = evaluate_command(&before, &facts, &program, &argv, settings);
         let now = evaluate_command(&after, &facts, &program, &argv, settings);
@@ -782,7 +782,7 @@ proptest! {
         let forward = RuleSet::load(rules.clone()).unwrap();
         let shuffled = RuleSet::load(reordered).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen: false };
+        let settings = Settings { confirm_agent_actions, frozen: false, ..Settings::default() };
 
         let a = evaluate_command(&forward, &facts, &program, &argv, settings);
         let b = evaluate_command(&shuffled, &facts, &program, &argv, settings);
@@ -818,7 +818,7 @@ proptest! {
         let (program, argv) = command_for(&rules, pick, &choices, &random, sampled);
         let set = RuleSet::load(rules.clone()).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen };
+        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
         let whole = evaluate_command(&set, &facts, &program, &argv, settings);
 
         for action in &rules {

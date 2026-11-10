@@ -14,7 +14,7 @@ serde_json.workspace = true
 sha2.workspace = true
 # The journal entry's MESSAGE quotes agent-influenced text for a terminal; the
 # sanitizer `ido` and the confirmation prompt use, so the three cannot drift.
-term-sanitize = { path = "../term-sanitize", version = "0.0.1" }
+term-sanitize = { path = "../term-sanitize", version = "0.1.0-beta.1" }
 thiserror.workspace = true
 
 [dev-dependencies]

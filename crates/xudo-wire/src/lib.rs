@@ -54,7 +54,26 @@ use xudo_policy::decision::ENVELOPE_SCHEMA_VERSION;
 pub const BROKER_SOCKET: &str = "/run/xudo/broker.sock";
 
 /// The wire version of both messages.
-pub const WIRE_SCHEMA_VERSION: u32 = 1;
+pub const WIRE_SCHEMA_VERSION: u32 = 2;
+
+/// Maximum UTF-8 bytes in a program path.
+pub const MAX_PROGRAM_BYTES: usize = 4096;
+/// Maximum number of operands.
+pub const MAX_ARGV_COUNT: usize = 256;
+/// Maximum UTF-8 bytes in one operand.
+pub const MAX_ARGUMENT_BYTES: usize = 4096;
+/// Maximum UTF-8 bytes in the caller classification hint.
+pub const MAX_CLASSIFICATION_BYTES: usize = 128;
+/// Exact nonce identifier length.
+pub const NONCE_HEX_LEN: usize = 64;
+/// Maximum UTF-8 bytes in an answer token.
+pub const MAX_TOKEN_BYTES: usize = 256;
+/// Maximum UTF-8 bytes in a freeze reason.
+pub const MAX_REASON_BYTES: usize = 1024;
+/// Maximum number of watcher prompts.
+pub const MAX_PROMPTS: usize = 64;
+/// Maximum UTF-8 bytes in one watcher prompt or remediation.
+pub const MAX_PROMPT_BYTES: usize = 4096;
 
 /// The largest request the broker reads, in bytes.
 ///
@@ -75,32 +94,215 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 // A response carries a decision about a request, so it is never the smaller.
 const _: () = assert!(MAX_RESPONSE_BYTES > MAX_REQUEST_BYTES);
 
-/// What the front-end asks.
-///
-/// Every field is required and an unknown key is a parse failure.
+/// What the front-end asks. Every connection carries exactly one question.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerRequest {
     /// Wire version; must be [`WIRE_SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// The program to run, by absolute path.
+    /// The one question on this connection.
+    pub question: Question,
+}
+
+/// A question for the broker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum Question {
+    /// Evaluate a command using the broker's root-owned policy.
+    Run {
+        /// Absolute path of the program to execute.
+        program: String,
+        /// Operands after the program.
+        argv: Vec<String>,
+        /// Unauthenticated classification hint for the audit record.
+        claimed_classification: String,
+    },
+    /// Read the status of a pending or completed request.
+    Status {
+        /// The 64 character lowercase hexadecimal nonce.
+        id: String,
+    },
+    /// Receive available confirmation prompts.
+    Watch,
+    /// List this peer's pending confirmation requests without claiming a watcher slot.
+    Pending,
+    /// Answer a confirmation prompt.
+    Answer {
+        /// The request nonce.
+        id: String,
+        /// The one use token issued to a watcher.
+        token: String,
+        /// Whether the human approves.
+        approve: bool,
+    },
+    /// Freeze confirmation handling with an operator supplied reason.
+    Freeze {
+        /// Short operator supplied reason.
+        reason: String,
+    },
+    /// Resume confirmation handling.
+    Thaw,
+}
+
+impl BrokerRequest {
+    /// Builds a schema 2 run request.
+    pub fn new(
+        program: impl Into<String>,
+        argv: Vec<String>,
+        claimed_classification: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Run {
+                program: program.into(),
+                argv,
+                claimed_classification: claimed_classification.into(),
+            },
+        }
+    }
+
+    /// Parses and validates one request.
     ///
-    /// Compared byte for byte with the program a rule names. Never searched
-    /// for on a `PATH`.
-    pub program: String,
-    /// The operands, after the program name.
+    /// # Errors
     ///
-    /// Strings, so valid UTF-8 by construction: the spool entry the broker
-    /// mints stores strings, so a non-UTF-8 argument is refused where it
-    /// arrives rather than converted into something nobody reviewed.
-    pub argv: Vec<String>,
-    /// How the front-end classified its own caller.
-    ///
-    /// An **unauthenticated hint**. The broker classifies from kernel-attested
-    /// facts and copies this into the audit record and the spool entry only so
-    /// that an investigator can see what was claimed and that it changed
-    /// nothing.
-    pub claimed_classification: String,
+    /// Returns the first size, encoding, schema, shape, or content refusal.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestError> {
+        if bytes.len() > MAX_REQUEST_BYTES {
+            return Err(RequestError::TooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        let text = std::str::from_utf8(bytes).map_err(|error| RequestError::NotUtf8 {
+            offset: error.valid_up_to(),
+        })?;
+        let value = parse_json_object(text).map_err(|reason| RequestError::Malformed { reason })?;
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
+            return Err(RequestError::WrongSchema {
+                found,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
+        let request: Self =
+            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
+                reason: error.to_string(),
+            })?;
+        request.check()?;
+        Ok(request)
+    }
+
+    fn check(&self) -> Result<(), RequestError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
+            return Err(RequestError::WrongSchema {
+                found: self.schema_version,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
+        match &self.question {
+            Question::Run {
+                program,
+                argv,
+                claimed_classification,
+            } => {
+                bounded("program", program, MAX_PROGRAM_BYTES)?;
+                if !program.starts_with('/') {
+                    return Err(RequestError::ProgramNotAbsolute {
+                        program: program.clone(),
+                    });
+                }
+                refuse_nul("program", program)?;
+                if argv.len() > MAX_ARGV_COUNT {
+                    return Err(RequestError::FieldTooLarge {
+                        field: "argv count".to_owned(),
+                        limit: MAX_ARGV_COUNT,
+                    });
+                }
+                for (i, arg) in argv.iter().enumerate() {
+                    bounded(&format!("argv[{i}]"), arg, MAX_ARGUMENT_BYTES)?;
+                    refuse_nul(&format!("argv[{i}]"), arg)?;
+                }
+                bounded(
+                    "claimed_classification",
+                    claimed_classification,
+                    MAX_CLASSIFICATION_BYTES,
+                )?;
+                refuse_nul("claimed_classification", claimed_classification)?;
+            }
+            Question::Status { id } => check_id(id)?,
+            Question::Watch | Question::Pending | Question::Thaw => {}
+            Question::Answer { id, token, .. } => {
+                check_id(id)?;
+                bounded("token", token, MAX_TOKEN_BYTES)?;
+                refuse_nul("token", token)?;
+                if token.is_empty() {
+                    return Err(RequestError::Malformed {
+                        reason: "answer token is empty".to_owned(),
+                    });
+                }
+            }
+            Question::Freeze { reason } => {
+                bounded("reason", reason, MAX_REASON_BYTES)?;
+                refuse_nul("reason", reason)?;
+                if reason.is_empty() {
+                    return Err(RequestError::Malformed {
+                        reason: "freeze reason is empty".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run fields, if this is a run question.
+    pub fn run_fields(&self) -> Option<(&str, &[String], &str)> {
+        match &self.question {
+            Question::Run {
+                program,
+                argv,
+                claimed_classification,
+            } => Some((program, argv, claimed_classification)),
+            _ => None,
+        }
+    }
+
+    /// Renders JSON; fallback is a malformed request and therefore fails closed.
+    pub fn to_json(&self) -> String {
+        rendered_or(serde_json::to_string(self), "{}")
+    }
+}
+
+fn bounded(field: &str, value: &str, limit: usize) -> Result<(), RequestError> {
+    if value.len() > limit {
+        return Err(RequestError::FieldTooLarge {
+            field: field.to_owned(),
+            limit,
+        });
+    }
+    Ok(())
+}
+fn check_id(id: &str) -> Result<(), RequestError> {
+    if id.len() != NONCE_HEX_LEN
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RequestError::Malformed {
+            reason: "id must be 64 lowercase hexadecimal characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+fn refuse_nul(field: &str, value: &str) -> Result<(), RequestError> {
+    if value.contains('\0') {
+        return Err(RequestError::InteriorNul {
+            field: field.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Why a request was refused before it was evaluated.
@@ -132,6 +334,14 @@ pub enum RequestError {
         /// The parser's account of why.
         reason: String,
     },
+    /// A field exceeds its protocol bound.
+    #[error("{field} exceeds its {limit}-byte or item limit")]
+    FieldTooLarge {
+        /// Field that exceeded its bound.
+        field: String,
+        /// Maximum byte or item count.
+        limit: usize,
+    },
     /// The request declares a schema this build does not implement.
     #[error("the request declares schema {found}, this broker implements {expected}")]
     WrongSchema {
@@ -162,91 +372,18 @@ impl RequestError {
     pub fn code(&self) -> RefusalCode {
         match self {
             Self::TooLarge { .. } => RefusalCode::RequestTooLarge,
+            Self::FieldTooLarge { field, .. }
+                if field == "program" || field.starts_with("argv[") || field == "argv count" =>
+            {
+                RefusalCode::RequestTooLarge
+            }
             Self::NotUtf8 { .. } => RefusalCode::RequestNotUtf8,
-            Self::Malformed { .. } => RefusalCode::RequestMalformed,
+            Self::FieldTooLarge { .. } | Self::Malformed { .. } => RefusalCode::RequestMalformed,
             Self::WrongSchema { .. } => RefusalCode::RequestWrongSchema,
             Self::ProgramNotAbsolute { .. } => RefusalCode::ProgramNotAbsolute,
             Self::InteriorNul { .. } => RefusalCode::InteriorNul,
         }
     }
-}
-
-impl BrokerRequest {
-    /// Builds a request for `program` with `argv` as its operands.
-    pub fn new(
-        program: impl Into<String>,
-        argv: Vec<String>,
-        claimed_classification: impl Into<String>,
-    ) -> Self {
-        Self {
-            schema_version: WIRE_SCHEMA_VERSION,
-            program: program.into(),
-            argv,
-            claimed_classification: claimed_classification.into(),
-        }
-    }
-
-    /// Parses and checks one request, as it arrived.
-    ///
-    /// # Errors
-    ///
-    /// The first check that fails, as the matching [`RequestError`].
-    pub fn parse(bytes: &[u8]) -> Result<Self, RequestError> {
-        if bytes.len() > MAX_REQUEST_BYTES {
-            return Err(RequestError::TooLarge {
-                limit: MAX_REQUEST_BYTES,
-            });
-        }
-        let text = std::str::from_utf8(bytes).map_err(|error| RequestError::NotUtf8 {
-            offset: error.valid_up_to(),
-        })?;
-        let request: Self =
-            serde_json::from_str(text).map_err(|error| RequestError::Malformed {
-                reason: error.to_string(),
-            })?;
-        request.check()?;
-        Ok(request)
-    }
-
-    /// The checks a well-formed request must still pass.
-    fn check(&self) -> Result<(), RequestError> {
-        if self.schema_version != WIRE_SCHEMA_VERSION {
-            return Err(RequestError::WrongSchema {
-                found: self.schema_version,
-                expected: WIRE_SCHEMA_VERSION,
-            });
-        }
-        if !self.program.starts_with('/') {
-            return Err(RequestError::ProgramNotAbsolute {
-                program: self.program.clone(),
-            });
-        }
-        refuse_nul("program", &self.program)?;
-        for (index, argument) in self.argv.iter().enumerate() {
-            refuse_nul(&format!("argv[{index}]"), argument)?;
-        }
-        Ok(())
-    }
-
-    /// Renders the request as JSON.
-    ///
-    /// Falls back to `{}`, which every broker refuses as malformed, rather
-    /// than panicking: this is plain data, so serialization has no failure
-    /// mode, and the fallback keeps the function free of a branch nothing
-    /// could reach.
-    pub fn to_json(&self) -> String {
-        rendered_or(serde_json::to_string(self), "{}")
-    }
-}
-
-/// Refuses one string that contains a NUL.
-fn refuse_nul(field: &str, value: &str) -> Result<(), RequestError> {
-    if value.contains('\0') {
-        return Err(RequestError::InteriorNul {
-            field: field.to_owned(),
-        });
-    }
-    Ok(())
 }
 
 /// What the broker answers.
@@ -257,6 +394,26 @@ pub struct BrokerResponse {
     pub schema_version: u32,
     /// What happened to the request.
     pub answer: Answer,
+}
+
+/// One broker-checked request shown to a watcher.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchPrompt {
+    /// The one-use request nonce.
+    pub id: String,
+    /// Governing action id.
+    pub action: String,
+    /// Canonical absolute program.
+    pub program: String,
+    /// Canonical operands.
+    pub argv: Vec<String>,
+    /// The requester's unauthenticated classification hint.
+    pub classification: String,
+    /// Why the password remains required after approval.
+    pub evidence: String,
+    /// Remaining request lifetime in milliseconds.
+    pub expires_in_ms: u64,
 }
 
 /// What happened to a request.
@@ -275,12 +432,32 @@ pub enum Answer {
         /// permitted and the entry was written.
         minted: Option<Minted>,
     },
+    /// A confirmation decision is awaiting an answer.
+    Pending {
+        /// Request nonce.
+        id: String,
+        /// Remaining lifetime in milliseconds.
+        expires_in_ms: u64,
+    },
+    /// A watcher heartbeat and its bounded prompt list.
+    Watching {
+        /// The checked, bounded prompt list.
+        prompts: Vec<WatchPrompt>,
+        /// Number of additional pending prompts omitted to fit the response.
+        #[serde(default)]
+        omitted: usize,
+    },
+    /// A question completed without a decision.
+    Done,
     /// The broker refused before, or instead of, a decision.
     Refused {
         /// Why, as a stable code.
         code: RefusalCode,
         /// What to do about it. A fixed sentence per code.
         remediation: String,
+        /// Bounded broker detail for a channel refusal, when useful.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -293,11 +470,8 @@ pub struct Minted {
     /// For correlation with the audit trail. The gate finds the entry by the
     /// caller's pinned identity, not by a nonce anyone presents to it.
     pub nonce: String,
-    /// When the entry stops being valid, in whole seconds of
-    /// `CLOCK_MONOTONIC` on this host.
-    pub deadline: u64,
-    /// How long that is from when it was minted, in seconds.
-    pub ttl_secs: u64,
+    /// Remaining lifetime, relative to this response.
+    pub expires_in_ms: u64,
     /// The gate to run, by absolute path, through the backend (`sudo` or
     /// `doas`) and with no arguments at all.
     pub gate: String,
@@ -338,11 +512,17 @@ pub enum RefusalCode {
     NonceCollision,
     /// The broker could not complete the request for a reason of its own.
     BrokerUnusable,
+    /// The peer is not trusted for this channel.
+    ChannelUntrusted,
+    /// The requested identifier is unknown.
+    RequestUnknown,
+    /// The requested answer was rejected.
+    AnswerRejected,
 }
 
 impl RefusalCode {
     /// Every code, in numeric order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::RequestTooLarge,
         Self::RequestTimedOut,
         Self::RequestUnreadable,
@@ -357,6 +537,9 @@ impl RefusalCode {
         Self::PolicyUnloadable,
         Self::NonceCollision,
         Self::BrokerUnusable,
+        Self::ChannelUntrusted,
+        Self::RequestUnknown,
+        Self::AnswerRejected,
     ];
 
     /// The stable numeric code. Append-only.
@@ -376,6 +559,9 @@ impl RefusalCode {
             Self::PolicyUnloadable => 12,
             Self::NonceCollision => 13,
             Self::BrokerUnusable => 14,
+            Self::ChannelUntrusted => 15,
+            Self::RequestUnknown => 16,
+            Self::AnswerRejected => 17,
         }
     }
 
@@ -396,6 +582,9 @@ impl RefusalCode {
             Self::PolicyUnloadable => "policy_unloadable",
             Self::NonceCollision => "nonce_collision",
             Self::BrokerUnusable => "broker_unusable",
+            Self::ChannelUntrusted => "channel_untrusted",
+            Self::RequestUnknown => "request_unknown",
+            Self::AnswerRejected => "answer_rejected",
         }
     }
 
@@ -458,6 +647,11 @@ impl RefusalCode {
                 "the broker could not complete the request and failed closed; an administrator \
                  should read the broker's audit record in the journal"
             }
+            Self::ChannelUntrusted => "the peer is not trusted for this broker channel",
+            Self::RequestUnknown => {
+                "the request is unknown or this question is not implemented yet"
+            }
+            Self::AnswerRejected => "the broker rejected this confirmation answer",
         }
     }
 }
@@ -468,10 +662,14 @@ impl RefusalCode {
 /// renders to, which a test asserts, so the fallback is a refusal any
 /// front-end parses, never an empty answer it might read as success.
 pub const FALLBACK_RESPONSE: &str = concat!(
-    r#"{"schema_version":1,"answer":{"refused":{"code":"broker_unusable","remediation":"#,
+    r#"{"schema_version":2,"answer":{"refused":{"code":"broker_unusable","remediation":"#,
     r#""the broker could not complete the request and failed closed; an administrator "#,
     r#"should read the broker's audit record in the journal"}}}"#,
 );
+
+fn check_nonce(id: &str) -> Result<(), String> {
+    check_id(id).map_err(|_| "id must be 64 lowercase hexadecimal characters".to_owned())
+}
 
 /// Why a response could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -533,6 +731,19 @@ impl BrokerResponse {
             answer: Answer::Refused {
                 code,
                 remediation: code.remediation().to_owned(),
+                detail: None,
+            },
+        }
+    }
+
+    /// A refusal with bounded diagnostic detail.
+    pub fn refused_with_detail(code: RefusalCode, detail: String) -> Self {
+        Self {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Refused {
+                code,
+                remediation: code.remediation().to_owned(),
+                detail: Some(detail),
             },
         }
     }
@@ -551,20 +762,87 @@ impl BrokerResponse {
         let text = std::str::from_utf8(bytes).map_err(|error| ResponseError::NotUtf8 {
             offset: error.valid_up_to(),
         })?;
+        let value =
+            parse_json_object(text).map_err(|reason| ResponseError::Malformed { reason })?;
+        if let Some(found) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|number| u32::try_from(number).ok())
+            && found != WIRE_SCHEMA_VERSION
+        {
+            return Err(ResponseError::WrongSchema {
+                found,
+                expected: WIRE_SCHEMA_VERSION,
+            });
+        }
         let response: Self =
             serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
                 reason: error.to_string(),
             })?;
-        if response.schema_version != WIRE_SCHEMA_VERSION {
+        response.check()?;
+        Ok(response)
+    }
+
+    fn check(&self) -> Result<(), ResponseError> {
+        if self.schema_version != WIRE_SCHEMA_VERSION {
             return Err(ResponseError::WrongSchema {
-                found: response.schema_version,
+                found: self.schema_version,
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
+        match &self.answer {
+            Answer::Decided { minted, .. } => {
+                if let Some(minted) = minted {
+                    check_nonce(&minted.nonce)
+                        .map_err(|reason| ResponseError::Malformed { reason })?;
+                    if minted.gate.len() > MAX_PROGRAM_BYTES
+                        || !minted.gate.starts_with('/')
+                        || minted.gate.contains('\0')
+                    {
+                        return Err(ResponseError::Malformed {
+                            reason: "minted gate is invalid or too long".to_owned(),
+                        });
+                    }
+                }
+            }
+            Answer::Pending { id, .. } => {
+                check_nonce(id).map_err(|reason| ResponseError::Malformed { reason })?;
+            }
+            Answer::Watching { prompts, .. } => {
+                if prompts.len() > MAX_PROMPTS || prompts.iter().any(|p| !valid_watch_prompt(p)) {
+                    return Err(ResponseError::Malformed {
+                        reason: "watch prompt list exceeds its bound".to_owned(),
+                    });
+                }
+            }
+            Answer::Refused {
+                remediation,
+                detail,
+                ..
+            } => {
+                if remediation.len() > MAX_PROMPT_BYTES || remediation.contains('\0') {
+                    return Err(ResponseError::Malformed {
+                        reason: "remediation exceeds its bound".to_owned(),
+                    });
+                }
+                if detail
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_PROMPT_BYTES || value.contains('\0'))
+                {
+                    return Err(ResponseError::Malformed {
+                        reason: "refusal detail exceeds its bound".to_owned(),
+                    });
+                }
+            }
+            Answer::Done => {}
+        }
         // A refusal carries no envelope, so it has nothing to disagree about.
-        let envelope = match &response.answer {
+        let envelope = match &self.answer {
             Answer::Decided { decision, .. } => decision.schema_version,
-            Answer::Refused { .. } => ENVELOPE_SCHEMA_VERSION,
+            Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done
+            | Answer::Refused { .. } => ENVELOPE_SCHEMA_VERSION,
         };
         if envelope != ENVELOPE_SCHEMA_VERSION {
             return Err(ResponseError::WrongEnvelope {
@@ -572,7 +850,7 @@ impl BrokerResponse {
                 expected: ENVELOPE_SCHEMA_VERSION,
             });
         }
-        Ok(response)
+        Ok(())
     }
 
     /// Renders the response as JSON.
@@ -583,6 +861,37 @@ impl BrokerResponse {
     pub fn to_json(&self) -> String {
         rendered_or(serde_json::to_string(self), FALLBACK_RESPONSE)
     }
+}
+
+fn parse_json_object(text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("top-level JSON value must be an object".to_owned());
+    }
+    Ok(value)
+}
+
+fn valid_watch_prompt(prompt: &WatchPrompt) -> bool {
+    prompt.id.len() == NONCE_HEX_LEN
+        && prompt
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && prompt.program.starts_with('/')
+        && prompt.program.len() <= MAX_PROGRAM_BYTES
+        && !prompt.program.contains('\0')
+        && !prompt.action.is_empty()
+        && prompt.action.len() <= MAX_PROMPT_BYTES
+        && !prompt.action.contains('\0')
+        && prompt.argv.len() <= MAX_ARGV_COUNT
+        && prompt
+            .argv
+            .iter()
+            .all(|arg| arg.len() <= MAX_ARGUMENT_BYTES && !arg.contains('\0'))
+        && prompt.classification.len() <= MAX_CLASSIFICATION_BYTES
+        && !prompt.classification.contains('\0')
+        && prompt.evidence.len() <= MAX_PROMPT_BYTES
+        && !prompt.evidence.contains('\0')
 }
 
 /// Returns the rendered JSON, or `fallback` if rendering failed.
@@ -614,11 +923,346 @@ mod tests {
 
     fn json_with(key: &str, value: serde_json::Value) -> Vec<u8> {
         let mut object: serde_json::Value = serde_json::from_str(&request().to_json()).unwrap();
-        object
-            .as_object_mut()
-            .unwrap()
-            .insert(key.to_owned(), value);
+        if key == "schema_version" {
+            object
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), value);
+        } else {
+            object["question"]["run"]
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), value);
+        }
         object.to_string().into_bytes()
+    }
+
+    #[test]
+    fn a_question_without_a_schema_version_is_malformed() {
+        let bytes = br#"{"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_array_form_request_is_refused() {
+        let bytes = br#"[2,"watch"]"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn answer_tokens_and_run_hints_are_bounded_and_clean() {
+        let id = "a".repeat(64);
+        let cases = [
+            (
+                Question::Answer {
+                    id: id.clone(),
+                    token: String::new(),
+                    approve: true,
+                },
+                RefusalCode::RequestMalformed,
+            ),
+            (
+                Question::Answer {
+                    id: id.clone(),
+                    token: "bad\0token".to_owned(),
+                    approve: true,
+                },
+                RefusalCode::InteriorNul,
+            ),
+            (
+                Question::Run {
+                    program: "/usr/bin/id".to_owned(),
+                    argv: Vec::new(),
+                    claimed_classification: "x".repeat(MAX_CLASSIFICATION_BYTES + 1),
+                },
+                RefusalCode::RequestMalformed,
+            ),
+            (
+                Question::Run {
+                    program: "/usr/bin/id".to_owned(),
+                    argv: Vec::new(),
+                    claimed_classification: "bad\0hint".to_owned(),
+                },
+                RefusalCode::InteriorNul,
+            ),
+            (
+                Question::Freeze {
+                    reason: "bad\0reason".to_owned(),
+                },
+                RefusalCode::InteriorNul,
+            ),
+        ];
+        for (question, code) in cases {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert_eq!(
+                BrokerRequest::parse(request.to_json().as_bytes())
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn run_fields_are_absent_for_every_non_run_question() {
+        let id = "a".repeat(64);
+        for question in [
+            Question::Status { id: id.clone() },
+            Question::Watch,
+            Question::Pending,
+            Question::Answer {
+                id: id.clone(),
+                token: "token".to_owned(),
+                approve: false,
+            },
+            Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+            Question::Thaw,
+        ] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert_eq!(request.run_fields(), None);
+        }
+    }
+
+    #[test]
+    fn a_schema_1_request_is_refused_wrong_schema() {
+        let bytes = br#"{"schema_version":1,"program":"/usr/bin/id","argv":[],"claimed_classification":"x"}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestWrongSchema
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_request_is_refused() {
+        let repeated_schema =
+            br#"{"schema_version":2,"schema_version":2,"question":{"thaw":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_schema).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+        let repeated_program = br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/true","program":"/usr/bin/false","argv":[],"claimed_classification":"x"}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(repeated_program).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn a_request_with_a_different_schema_is_refused_before_shape_parsing() {
+        let bytes = br#"{"schema_version":3,"question":{"watch":null}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err(),
+            RequestError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn decoded_request_schema_is_rechecked() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            question: Question::Thaw,
+        };
+        assert_eq!(
+            request.check(),
+            Err(RequestError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_question_is_malformed() {
+        let bytes = br#"{"schema_version":2,"question":{"launch":{"program":"/bin/sh"}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_token_is_malformed() {
+        let bytes = format!(
+            r#"{{"schema_version":2,"question":{{"answer":{{"id":"{}","approve":true}}}}}}"#,
+            "a".repeat(64)
+        );
+        assert_eq!(
+            BrokerRequest::parse(bytes.as_bytes()).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn a_status_id_that_is_not_a_nonce_is_malformed() {
+        let bytes = br#"{"schema_version":2,"question":{"status":{"id":"ABC"}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_answer_id_that_is_not_a_nonce_is_malformed() {
+        let bytes = br#"{"schema_version":2,"question":{"answer":{"id":"ABC","token":"token","approve":true}}}"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn new_request_fields_are_bounded_before_they_cross_the_boundary() {
+        let fields = [
+            (
+                Question::Run {
+                    program: format!("/{}", "x".repeat(MAX_PROGRAM_BYTES)),
+                    argv: Vec::new(),
+                    claimed_classification: "x".to_owned(),
+                },
+                "program",
+            ),
+            (
+                Question::Run {
+                    program: "/".to_owned(),
+                    argv: vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)],
+                    claimed_classification: "x".to_owned(),
+                },
+                "argument",
+            ),
+            (
+                Question::Run {
+                    program: "/".to_owned(),
+                    argv: vec!["x".to_owned(); MAX_ARGV_COUNT + 1],
+                    claimed_classification: "x".to_owned(),
+                },
+                "count",
+            ),
+            (
+                Question::Freeze {
+                    reason: "x".repeat(MAX_REASON_BYTES + 1),
+                },
+                "reason",
+            ),
+            (
+                Question::Answer {
+                    id: "a".repeat(64),
+                    token: "x".repeat(MAX_TOKEN_BYTES + 1),
+                    approve: true,
+                },
+                "token",
+            ),
+        ];
+        for (question, field) in fields {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert_eq!(
+                BrokerRequest::parse(request.to_json().as_bytes())
+                    .unwrap_err()
+                    .code(),
+                if field == "token" || field == "reason" {
+                    RefusalCode::RequestMalformed
+                } else {
+                    RefusalCode::RequestTooLarge
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn denies_a_token_nul_with_the_shared_interior_nul_code() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Answer {
+                id: "a".repeat(NONCE_HEX_LEN),
+                token: "secret\0suffix".to_owned(),
+                approve: true,
+            },
+        };
+        assert_eq!(
+            BrokerRequest::parse(request.to_json().as_bytes())
+                .unwrap_err()
+                .code(),
+            RefusalCode::InteriorNul
+        );
+    }
+
+    #[test]
+    fn denies_an_empty_freeze_reason() {
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Freeze {
+                reason: String::new(),
+            },
+        };
+        assert_eq!(
+            BrokerRequest::parse(request.to_json().as_bytes())
+                .unwrap_err()
+                .code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn refuses_an_overlong_or_nul_freeze_reason() {
+        for reason in ["x".repeat(MAX_REASON_BYTES + 1), "bad\0reason".to_owned()] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: Question::Freeze { reason },
+            };
+            assert!(request.check().is_err());
+        }
+    }
+
+    #[test]
+    fn every_question_round_trips() {
+        let id = "a".repeat(64);
+        for question in [
+            Question::Run {
+                program: "/usr/bin/id".to_owned(),
+                argv: vec!["-u".to_owned()],
+                claimed_classification: "unattested".to_owned(),
+            },
+            Question::Status { id: id.clone() },
+            Question::Watch,
+            Question::Pending,
+            Question::Answer {
+                id: id.clone(),
+                token: "one-use".to_owned(),
+                approve: true,
+            },
+            Question::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+            Question::Thaw,
+        ] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert_eq!(
+                BrokerRequest::parse(request.to_json().as_bytes()).unwrap(),
+                request
+            );
+        }
     }
 
     #[test]
@@ -650,7 +1294,7 @@ mod tests {
         // U+FFFD and a rule would then be matched against something nobody
         // typed.
         let mut bytes =
-            br#"{"schema_version":1,"program":"/usr/bin/systemctl","argv":["restart",""#.to_vec();
+            br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/systemctl","argv":["restart",""#.to_vec();
         let offset = bytes.len();
         bytes.extend_from_slice(b"\xffnginx.service\"],\"claimed_classification\":\"x\"}");
         let error = BrokerRequest::parse(&bytes).unwrap_err();
@@ -662,7 +1306,7 @@ mod tests {
     fn denies_a_lone_surrogate_escape_rather_than_decoding_it() {
         // Valid UTF-8 on the wire, but a JSON escape for half a character:
         // the parser refuses it rather than inventing a replacement.
-        let bytes = br#"{"schema_version":1,"program":"/usr/bin/systemctl","argv":["\ud800"],"claimed_classification":"x"}"#;
+        let bytes = br#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/systemctl","argv":["\ud800"],"claimed_classification":"x"}}}"#;
         let error = BrokerRequest::parse(bytes).unwrap_err();
         assert_eq!(error.code(), RefusalCode::RequestMalformed);
     }
@@ -703,7 +1347,7 @@ mod tests {
     #[test]
     fn denies_a_request_missing_a_key() {
         let mut object: serde_json::Value = serde_json::from_str(&request().to_json()).unwrap();
-        object
+        object["question"]["run"]
             .as_object_mut()
             .unwrap()
             .remove("claimed_classification");
@@ -713,12 +1357,12 @@ mod tests {
 
     #[test]
     fn denies_a_schema_this_build_does_not_implement() {
-        let error = BrokerRequest::parse(&json_with("schema_version", serde_json::Value::from(2)))
+        let error = BrokerRequest::parse(&json_with("schema_version", serde_json::Value::from(3)))
             .unwrap_err();
         assert_eq!(
             error,
             RequestError::WrongSchema {
-                found: 2,
+                found: 3,
                 expected: WIRE_SCHEMA_VERSION
             }
         );
@@ -778,6 +1422,10 @@ mod tests {
             RequestError::NotUtf8 { offset: 3 },
             RequestError::Malformed {
                 reason: "trailing comma".to_owned(),
+            },
+            RequestError::FieldTooLarge {
+                field: "program".to_owned(),
+                limit: 1,
             },
             RequestError::WrongSchema {
                 found: 2,
@@ -842,8 +1490,7 @@ mod tests {
     fn minted() -> Minted {
         Minted {
             nonce: "ab".repeat(32),
-            deadline: 1_900,
-            ttl_secs: 900,
+            expires_in_ms: 900_000,
             gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
         }
     }
@@ -855,7 +1502,251 @@ mod tests {
     fn verdict_of(answer: &Answer) -> Option<Verdict> {
         match answer {
             Answer::Decided { decision, .. } => Some(decision.verdict),
-            Answer::Refused { .. } => None,
+            Answer::Refused { .. }
+            | Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::Done => None,
+        }
+    }
+
+    #[test]
+    fn every_answer_round_trips() {
+        let decision = Decision::deny(DenialCode::ArgvRejected, vec!["x".to_owned()], Vec::new());
+        let id = "a".repeat(64);
+        for answer in [
+            Answer::Decided {
+                decision: decision.clone(),
+                minted: None,
+            },
+            Answer::Pending {
+                id: id.clone(),
+                expires_in_ms: 1234,
+            },
+            Answer::Watching {
+                prompts: vec![WatchPrompt {
+                    id: "a".repeat(64),
+                    action: "xudo.pkg.remove".to_owned(),
+                    program: "/usr/bin/apt-get".to_owned(),
+                    argv: vec!["remove".to_owned()],
+                    classification: "unattested".to_owned(),
+                    evidence: "password remains required".to_owned(),
+                    expires_in_ms: 1_000,
+                }],
+                omitted: 0,
+            },
+            Answer::Done,
+            BrokerResponse::refused(RefusalCode::RequestUnknown).answer,
+        ] {
+            let response = BrokerResponse {
+                schema_version: WIRE_SCHEMA_VERSION,
+                answer,
+            };
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn response_nonce_gate_and_remediation_are_checked() {
+        let bad_id = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Pending {
+                id: "ABC".to_owned(),
+                expires_in_ms: 1,
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(bad_id.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "id must be 64 lowercase hexadecimal characters".to_owned()
+            })
+        );
+        let invalid_nonce = BrokerResponse::decided(
+            Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new()),
+            Some(Minted {
+                nonce: "ABC".to_owned(),
+                expires_in_ms: 1,
+                gate: "/bin/id".to_owned(),
+            }),
+        );
+        assert_eq!(
+            BrokerResponse::parse(invalid_nonce.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "id must be 64 lowercase hexadecimal characters".to_owned()
+            })
+        );
+        for gate in [
+            "relative".to_owned(),
+            format!("/{}", "x".repeat(MAX_PROGRAM_BYTES)),
+            "/bin\0evil".to_owned(),
+        ] {
+            let response = BrokerResponse::decided(
+                Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new()),
+                Some(Minted {
+                    nonce: "a".repeat(64),
+                    expires_in_ms: 1,
+                    gate,
+                }),
+            );
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()),
+                Err(ResponseError::Malformed {
+                    reason: "minted gate is invalid or too long".to_owned()
+                })
+            );
+        }
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Refused {
+                code: RefusalCode::RequestUnknown,
+                remediation: "x".repeat(MAX_PROMPT_BYTES + 1),
+                detail: None,
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(response.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "remediation exceeds its bound".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn response_prompt_bounds_are_enforced() {
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Watching {
+                prompts: vec![watch_prompt(); MAX_PROMPTS + 1],
+                omitted: 0,
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(response.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "watch prompt list exceeds its bound".to_owned()
+            })
+        );
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Watching {
+                prompts: vec![WatchPrompt {
+                    action: "x".repeat(MAX_PROMPT_BYTES + 1),
+                    ..watch_prompt()
+                }],
+                omitted: 0,
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(response.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "watch prompt list exceeds its bound".to_owned()
+            })
+        );
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Watching {
+                prompts: vec![WatchPrompt {
+                    program: "/bad\0program".to_owned(),
+                    ..watch_prompt()
+                }],
+                omitted: 0,
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(response.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "watch prompt list exceeds its bound".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn response_refuses_every_malformed_watch_prompt_field() {
+        let mut bad_id = watch_prompt();
+        bad_id.id = "A".repeat(NONCE_HEX_LEN);
+        let mut relative_program = watch_prompt();
+        relative_program.program = "bin/apt-get".to_owned();
+        let mut long_program = watch_prompt();
+        long_program.program = format!("/{}", "x".repeat(MAX_PROGRAM_BYTES));
+        let mut empty_action = watch_prompt();
+        empty_action.action.clear();
+        let mut nul_action = watch_prompt();
+        nul_action.action.push('\0');
+        let mut many_args = watch_prompt();
+        many_args.argv = vec!["x".to_owned(); MAX_ARGV_COUNT + 1];
+        let mut long_arg = watch_prompt();
+        long_arg.argv = vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)];
+        let mut nul_arg = watch_prompt();
+        nul_arg.argv = vec!["bad\0arg".to_owned()];
+        let mut long_class = watch_prompt();
+        long_class.classification = "x".repeat(MAX_CLASSIFICATION_BYTES + 1);
+        let mut nul_class = watch_prompt();
+        nul_class.classification.push('\0');
+        let mut long_evidence = watch_prompt();
+        long_evidence.evidence = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let mut nul_evidence = watch_prompt();
+        nul_evidence.evidence.push('\0');
+
+        for prompt in [
+            bad_id,
+            relative_program,
+            long_program,
+            empty_action,
+            nul_action,
+            many_args,
+            long_arg,
+            nul_arg,
+            long_class,
+            nul_class,
+            long_evidence,
+            nul_evidence,
+        ] {
+            let response = BrokerResponse {
+                schema_version: WIRE_SCHEMA_VERSION,
+                answer: Answer::Watching {
+                    prompts: vec![prompt],
+                    omitted: 0,
+                },
+            };
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()).unwrap_err(),
+                ResponseError::Malformed {
+                    reason: "watch prompt list exceeds its bound".to_owned()
+                }
+            );
+        }
+    }
+
+    fn watch_prompt() -> WatchPrompt {
+        WatchPrompt {
+            id: "a".repeat(64),
+            action: "xudo.pkg.remove".to_owned(),
+            program: "/usr/bin/apt-get".to_owned(),
+            argv: vec!["remove".to_owned()],
+            classification: "unattested".to_owned(),
+            evidence: "password remains required".to_owned(),
+            expires_in_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn refusal_detail_is_optional_but_bounded_and_single_line() {
+        let valid = BrokerResponse::refused_with_detail(
+            RefusalCode::ChannelUntrusted,
+            "watcher already active: pid 77, tty 34816".to_owned(),
+        );
+        assert!(BrokerResponse::parse(valid.to_json().as_bytes()).is_ok());
+        for detail in ["x".repeat(MAX_PROMPT_BYTES + 1), "bad\0detail".to_owned()] {
+            let response =
+                BrokerResponse::refused_with_detail(RefusalCode::ChannelUntrusted, detail);
+            assert_eq!(
+                BrokerResponse::parse(response.to_json().as_bytes()),
+                Err(ResponseError::Malformed {
+                    reason: "refusal detail exceeds its bound".to_owned()
+                })
+            );
         }
     }
 
@@ -877,6 +1768,77 @@ mod tests {
         assert_eq!(
             verdict_of(&BrokerResponse::refused(RefusalCode::SpoolFull).answer),
             None
+        );
+    }
+
+    #[test]
+    fn an_array_form_response_is_refused() {
+        assert_eq!(
+            BrokerResponse::parse(br#"[2,"done"]"#),
+            Err(ResponseError::Malformed {
+                reason: "top-level JSON value must be an object".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_with_a_different_schema_is_refused() {
+        let bytes = br#"{"schema_version":3,"answer":{"done":null}}"#;
+        assert_eq!(
+            BrokerResponse::parse(bytes),
+            Err(ResponseError::WrongSchema {
+                found: 3,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn decoded_response_schema_is_rechecked() {
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION + 1,
+            answer: Answer::Done,
+        };
+        assert_eq!(
+            response.check(),
+            Err(ResponseError::WrongSchema {
+                found: WIRE_SCHEMA_VERSION + 1,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_response_is_refused() {
+        let repeated_schema = br#"{"schema_version":2,"schema_version":2,"answer":"done"}"#;
+        let duplicate_error = serde_json::from_slice::<BrokerResponse>(repeated_schema)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            BrokerResponse::parse(repeated_schema),
+            Err(ResponseError::Malformed {
+                reason: duplicate_error,
+            })
+        );
+
+        let nested_duplicate = format!(
+            "{{\"schema_version\":2,\"answer\":{{\"decided\":{{\"decision\":{},\"minted\":{{\"nonce\":\"{}\",\"nonce\":\"{}\",\"expires_in_ms\":900000,\"gate\":\"/usr/libexec/xudo/xudo-gate-auth\"}}}}}}}}",
+            serde_json::to_string(&Decision::deny(
+                DenialCode::ArgvRejected,
+                vec!["x".to_owned()],
+                Vec::new(),
+            ))
+            .unwrap(),
+            "ab".repeat(32),
+            "cd".repeat(32),
+        );
+        assert_eq!(
+            BrokerResponse::parse(nested_duplicate.as_bytes()).unwrap_err(),
+            ResponseError::Malformed {
+                reason: serde_json::from_str::<BrokerResponse>(&nested_duplicate)
+                    .unwrap_err()
+                    .to_string(),
+            }
         );
     }
 
@@ -918,12 +1880,12 @@ mod tests {
         let mut future: serde_json::Value =
             serde_json::from_str(&BrokerResponse::refused(RefusalCode::SpoolFull).to_json())
                 .unwrap();
-        future["schema_version"] = serde_json::Value::from(2);
+        future["schema_version"] = serde_json::Value::from(3);
         let error = BrokerResponse::parse(future.to_string().as_bytes()).unwrap_err();
         assert_eq!(
             error,
             ResponseError::WrongSchema {
-                found: 2,
+                found: 3,
                 expected: WIRE_SCHEMA_VERSION
             }
         );

@@ -67,6 +67,8 @@ pub enum ProcFile {
     Stat,
     /// `status`: the effective uid the process runs as now.
     Status,
+    /// `uid_map`: the uid namespace mapping.
+    UidMap,
 }
 
 impl ProcFile {
@@ -75,6 +77,7 @@ impl ProcFile {
         match self {
             Self::Stat => "stat",
             Self::Status => "status",
+            Self::UidMap => "uid_map",
         }
     }
 }
@@ -549,6 +552,12 @@ impl PeerCalls for FakePeer {
         let queue = match file {
             ProcFile::Stat => &self.stats,
             ProcFile::Status => &self.statuses,
+            ProcFile::UidMap => {
+                return Err(SysError::read(
+                    format!("{pid}/uid_map"),
+                    "fake: nothing scripted",
+                ));
+            }
         };
         queue.borrow_mut().pop_front().unwrap_or_else(|| {
             Err(SysError::read(
@@ -592,6 +601,14 @@ mod tests {
     fn a_proc_file_names_itself() {
         assert_eq!(ProcFile::Stat.name(), "stat");
         assert_eq!(ProcFile::Status.name(), "status");
+    }
+
+    #[test]
+    fn every_proc_file_names_the_file_the_kernel_uses() {
+        // No cfg: the uid_map arm is otherwise only reached by Linux tests.
+        assert_eq!(ProcFile::Stat.name(), "stat");
+        assert_eq!(ProcFile::Status.name(), "status");
+        assert_eq!(ProcFile::UidMap.name(), "uid_map");
     }
 
     #[test]

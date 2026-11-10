@@ -1,7 +1,7 @@
 Package: xudo
 Version: @VERSION@
 Architecture: @ARCH@
-Maintainer: xudo contributors <noreply@xudo.invalid>
+Maintainer: YaminT <YaminT@users.noreply.github.com>
 Section: admin
 Priority: optional
 Depends: sudo, init-system-helpers (>= 1.54~)

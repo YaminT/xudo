@@ -113,10 +113,14 @@ proc = subprocess.Popen(
 )
 right.close()
 request = {
-    "schema_version": 1,
-    "program": "/usr/bin/id",
-    "argv": ["-u"],
-    "claimed_classification": "telemetry",
+    "schema_version": 2,
+    "question": {
+        "run": {
+            "program": "/usr/bin/id",
+            "argv": ["-u"],
+            "claimed_classification": "unattested",
+        }
+    },
 }
 left.sendall((json.dumps(request) + "\n").encode())
 left.shutdown(socket.SHUT_WR)
@@ -134,8 +138,13 @@ if any(f"{call}(AF_INET" in text for call in ("socketpair", "socket")):
 families = set(re.findall(r'(?:socket|socketpair)\((AF_[A-Z0-9_]+|PF_LOCAL|AF_LOCAL),', text))
 families.update(re.findall(r'connect\([^,]+, \{sa_family=(AF_[A-Z0-9_]+)', text))
 print("telemetry: xudod socket families: %s (exit %d)" % (" ".join(sorted(families)) or "none", proc.returncode))
-if reply:
-    print(reply.decode("utf-8", "replace").strip())
+if not reply:
+    raise SystemExit("FAIL: xudod returned no refusal")
+print(reply.decode("utf-8", "replace").strip())
+response = json.loads(reply)
+refusal = response.get("answer", {}).get("refused", {})
+if refusal.get("code") != "spool_unusable":
+    raise SystemExit("FAIL: expected normal spool refusal, got " + refusal.get("code", "no refusal"))
 PY
 for trace in /work/*.trace; do
     bad=$(grep -E "$bad_filter" "$trace" | grep -Ev "$local_filter" || true)

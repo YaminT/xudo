@@ -10,6 +10,8 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 > **Status, 2026-11-06.** Phase 3 step 2 is implemented: the systemd unit omits `NoNewPrivileges=yes`, and the broker sets it through the hygiene seam before serving. Failure is audited, refused, and exits non-zero. `just systemd-test` checks `NoNewPrivs: 1` and the full password and gate path on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. See `../CONCERNS.md`, 2026-11-06.
 
+> **Status, 2026-11-10. M3 is built and done.** `xudo watch` provides out-of-band confirmation; it is off by default, and every path still requires the password. Gaps: same-uid watcher separation awaits M4 cgroups, freeze does not affect new or human requests before M4, and polling/connect have limits. See `../CONCERNS.md`, 2026-11-10.
+
 > **Status, 2026-11-05.** Phase 3 step 1 is implemented in `packaging/deb/`: the unsigned human-path `.deb`, maintainer scripts, and Ubuntu 24.04/26.04 plus Debian 13 install matrix are wired into CI. Signing, publication, and the remaining phase 3 deliverables await later steps and the owner's explicit release approval.
 
 > **Status, 2026-10-30.** M1, M2a and M2b are done in code and tests (branch `xudo-exec`). `xudo exec` and `xudo install` ask the real broker, the gate runs as root through real `sudo`, and the differential runs through sudo, sudo-rs and OpenDoas. Phase 4 (`ido`) and phase 5 part 1 (`xudo-config`) are done. Gaps are listed in `../CONCERNS.md`, 2026-10-30. Next: phase 3 (beta `.deb`, human path only), then M3. Both open decisions from 2026-10-30 are decided; see the milestone sections.
@@ -40,7 +42,7 @@ Design plan: `../design-plan.md`. Project rules: `../CLAUDE.md`. Enhancement bac
 
 **The gate:** 373 tests, 100% coverage on lines, regions, and functions with **zero line-level waivers**, zero clippy warnings, `cargo deny` clean, miri clean, three fuzz targets clean, a GTFOBins waiver gate, and a pre-commit hook. Nightly and `cargo-fuzz` are installed, so the fuzz and miri lanes have actually run — and fuzzing found a real bug on its first execution (see `../CONCERNS.md`).
 
-**Not done.** The passwordless path (M4): `classify()` returns `Unattested` for every caller, so every request takes the password path. Out-of-band confirmation (M3). Doas is not verified by the doctor or the install probe, and the probe cannot verify on multicall-coreutils distros. Details: `../CONCERNS.md`, 2026-10-30.
+**Not done.** The passwordless path (M4): `classify()` returns `Unattested` for every caller, so every request takes the password path. Doas is not verified by the doctor or the install probe, and the probe cannot verify on multicall-coreutils distros. Details: `../CONCERNS.md`.
 
 ---
 
@@ -54,6 +56,8 @@ The design plan numbers **milestones M1–M7** (technical layers). The user numb
 | `phase-4-ido.md` | `ido` — the buffered human-run command queue, its TUI, `AGENTS.md` integration, and the `willyoumarryme` acceptance test |
 | `phase-5-configuration.md` | Configuration layering and precedence for every binary, plus shipped predefined profiles |
 | `m2b-finish-plan.md` | The exit test for M2b and the step-by-step sequence to reach it (written 2026-10-21) |
+| `m3-plan.md` | M3 design, steps and exit test (done 2026-11-10) |
+| `release-plan.md` | What is left (2026-11-10): owner decisions, release blockers, pre-M4 security criteria, improvements, and plan-document flaws |
 
 Milestones M1(remainder)–M7 are listed below rather than in separate files, because each is already specified in the design plan; what follows is the delta and the ordering.
 
@@ -138,13 +142,13 @@ The verb surface (`xudo pkg|svc|net|hosts|sysctl|time|dir|mount`), dry-run previ
 | 3 | Snippet functionally in effect; dotted-filename regression | Regression done 2026-10-22 (`sudo_ignores_a_snippet_named_with_a_dot`). Probe done 2026-10-29 for sudo; doas and multicall-coreutils distros report NOT VERIFIED |
 | 4 | Hostile direct gate invocation does nothing privileged | Done: `xudo_gate::run` tested step by step and `xudo-gate-bin/tests/binary.rs` through real processes; not repeated as uid 0 |
 | 5 | Nonce is one-use | Partly: one live entry per caller pin; consumed before anything runs, a replay refused as root (`a_consumed_entry_is_not_replayed`). Two real gates racing one entry is not tested |
-| 6–10 | Enrolled agent path, yolo, self-approval, timeout, cgroup spoofing | M3 and M4 |
+| 6–10 | Enrolled agent path, yolo, self-approval, timeout, cgroup spoofing | M3 confirmation, timeout, and tested self-approval cases done; same-uid separation needs M4 cgroups. See `../CONCERNS.md`, 2026-11-10 |
 | 11 | Env scrubbing with real payloads in the child's `/proc/self/environ` | Partly: allowlist tested in `xudo-gate::env`, exec vector asserted in `run`; the child's own `/proc/self/environ` is not asserted |
 | 12 | Symlink and TOCTOU resistance on ruleset, exec target, audit log | Done: ruleset, audit log (gate and broker write through it), and exec target (`open_trusted`, digest, `execveat` on the descriptor) |
 | 13 | Deny-list non-overridable; `check` refuses a rule naming a shell | Done |
 | 14 | Differential compliance | Done 2026-10-30: sudo, sudo-rs and OpenDoas give the same outcomes (`ci/differential/exec.sh`); doas needed `xudo` to stay its parent |
 | 15 | Audit chain verifies and detects truncation | Done (D1): the root lane verifies a broker-and-gate chain and sees it fail when cut; dropping whole trailing records is not detectable from the file |
-| 16 | `freeze` / `thaw` | Engine honours `frozen`; the commands are M3 |
+| 16 | `freeze` / `thaw` | Commands and root lane done; no effect on new or human requests until M4. See `../CONCERNS.md`, 2026-11-10 |
 
 ### M7 — confinement, supply chain, external audit
 
@@ -176,7 +180,7 @@ Strict numerical order is the wrong order. Two changes are worth making delibera
                        only, no NOPASSWD shipped.
                        Ships xudod too: without the nopass hardlink it grants
                        nothing a password did not.
-7. M3                  out-of-band confirmation on the broker from M2b.
+7. M3                  DONE — out-of-band confirmation on the broker from M2b; gaps in `../CONCERNS.md`, 2026-11-10.
 8. M4                  enrollment + the passwordless path.
 9. M5, M6              narrowing, grants, verbs, harness integration.
 10. Phase 5 (part 2)   predefined profiles, config introspection.
