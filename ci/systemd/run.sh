@@ -29,7 +29,7 @@ deb="$root/target/deb/xudo_${deb_ver}_${arch}.deb"
 
 # Debian 13, Ubuntu 24.04, and Ubuntu 26.04. 26.04 stays while it boots the
 # same way; row.sh reports a distro that cannot verify.
-images="debian:13 ubuntu:24.04 ubuntu:26.04"
+images=${XUDO_SYSTEMD_IMAGES:-"debian:13 ubuntu:24.04 ubuntu:26.04"}
 name=
 cleanup() {
     if [ -n "$name" ]; then

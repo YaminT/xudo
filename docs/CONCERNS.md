@@ -44,6 +44,48 @@ supplies cgroup separation.
 The broker sorts by earliest deadline; this is the same as oldest mint time
 while all entries share one lifetime.
 
+## 2026-11-09 — M3 step 9: packaging and end-to-end proof
+
+The shipped `.deb` passed the confirmation acceptance under systemd as PID 1
+on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. On all three images these cases
+passed: `no_watcher_denies_at_once` (exit 18, no entry minted),
+`timeout_zero_returns_pending_and_the_entry_stays_until_ttl` (including the
+pending-entry survival check),
+`approve_then_rerun_then_password_runs_as_root`,
+`deny_runs_nothing_and_exits_18`,
+`a_positive_timeout_returns_pending_or_denied_within_the_bound`,
+`self_approval_from_the_requesters_stdin_fails`,
+`self_approval_through_dev_tty_fails`,
+`watch_started_in_the_requesters_session_is_refused`,
+`freeze_then_human_password_path_runs`,
+`sudo_xudo_thaw_is_refused_for_unprivileged_user`, and
+`sudo_xudo_thaw_works_as_root`.
+
+`watch_in_a_user_namespace_is_refused` could not run its `unshare -U` child:
+the container runtime returned “Operation not permitted” on each image. The
+lane prints this limitation and counts the fixture coverage, including
+`a_diverged_watcher_cannot_approve`; the live unshare path itself was not
+exercisable and this is not a silent pass.
+
+| Systemd image | Watch round-trip | Positive wait (`n = 2`) | Broker starts / average start cost |
+| --- | ---: | ---: | ---: |
+| Debian 13 | 1,012 ms | 2,096 ms | 7 / 299 ms |
+| Ubuntu 24.04 | 993 ms | 2,077 ms | 7 / 296 ms |
+| Ubuntu 26.04 | 1,014 ms | 2,089 ms | 7 / 298 ms |
+
+The positive-wait measurement is from request submission to its exit, before
+watcher cleanup; each is within the configured 2-second timeout plus the
+5-second bound. The separate end-to-end lane took about 4 minutes 20 seconds
+for the three-image matrix. A positive timeout starts one sandboxed broker
+for each status poll: these runs measured about 296–299 ms per start. The
+default timeout remains zero and does not poll.
+
+`just units` accepted every packaged unit; the highest exposure stayed at
+1.2, the existing ceiling. `just root-test` passed all 45 root tests.
+`just verify` finished with `gate: all checks passed`. The step-7 note above
+records the sorting comment correction: earliest deadline is oldest mint time
+while all entries share one lifetime.
+
 ## 2026-11-09 — M3 step 6: bounded `exec` wait
 
 `confirmation_timeout_secs` is a front-end setting, defaults to 0, and is

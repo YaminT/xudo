@@ -50,7 +50,7 @@ else
     cat /var/tmp/xudo-install.log >&2
 fi
 
-apt-get install -y -qq expect python3 >/dev/null
+apt-get install -y -qq expect python3 procps >/dev/null
 id xudotest >/dev/null 2>&1 || useradd --create-home --user-group xudotest
 echo 'xudotest:pw' | chpasswd
 usermod -aG xudo xudotest
@@ -117,6 +117,211 @@ if [ "$rc" -ne 0 ] && grep -qi password /var/tmp/case.out && ! grep -qx 0 /var/t
 else
     bad "wrong password is nonzero and runs nothing (rc=$rc)"
     cat /var/tmp/case.out >&2
+fi
+
+# Enable the real human confirmation path only in this disposable container.
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 0
+EOF
+cat >/etc/xudo/rules.d/99-systemd-confirm.toml <<'EOF'
+[[action]]
+id = "harness.u"
+tier = "diag-read"
+confirm = "always"
+exe = "/usr/bin/id"
+args = [{ name = "effective-uid", matcher = { literal = "-u" } }]
+EOF
+chmod 0644 /etc/xudo/config.toml
+chmod 0644 /etc/xudo/rules.d/99-systemd-confirm.toml
+
+pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
+if [ -z "$pending" ]; then
+    start=$(date +%s%3N)
+    rc=$(pty pw /usr/bin/id -u)
+    elapsed=$(($(date +%s%3N) - start))
+    if [ "$rc" -eq 18 ] && grep -qi no_confirmation_channel /var/tmp/case.out && [ "$elapsed" -le 5000 ]; then
+        good "no_watcher_denies_at_once"
+    else
+        bad "no_watcher_denies_at_once (rc=$rc elapsed=${elapsed}ms)"
+        cat /var/tmp/case.out >&2
+    fi
+    pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
+    if [ -z "$pending" ]; then
+        good "no_watcher_mints_nothing"
+    else
+        bad "no_watcher_mints_nothing"
+        printf '%s\n' "$pending" >&2
+    fi
+else
+    bad "no_watcher_denies_at_once (unexpected pre-existing pending entry)"
+fi
+
+clear_confirm() {
+    rm -f /run/xudo/confirm/*.json /run/xudo/req/*
+}
+pending=
+if expect /harness/confirm.exp pending >/var/tmp/confirm-pending.log 2>&1; then
+    pending=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
+    if [ -n "$pending" ]; then
+        good "timeout_zero_returns_pending_and_the_entry_stays_until_ttl"
+    else
+        bad "timeout_zero_returns_pending_and_the_entry_stays_until_ttl (entry missing)"
+    fi
+else
+    bad "timeout_zero_returns_pending_and_the_entry_stays_until_ttl"
+    cat /var/tmp/confirm-pending.log >&2
+fi
+if [ -n "$pending" ]; then
+    sleep 2
+    still=$(su --pty -s /bin/sh -c 'xudo pending' xudotest 2>&1 || true)
+    if [ -n "$still" ]; then
+        good "pending_entry_survives_until_ttl_check"
+    else
+        bad "pending_entry_survives_until_ttl_check (entry disappeared)"
+    fi
+fi
+clear_confirm
+
+# The positive timeout is tested against a live pending request; the watcher
+# leaves it unanswered so the wait itself can be measured.
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 2
+EOF
+starts_before=$(journalctl -b -u 'xudod@*' --no-pager -o cat 2>/dev/null | grep -c 'Started xudod@' || true)
+start=$(date +%s%3N)
+if expect /harness/confirm.exp timeout >/var/tmp/confirm-timeout.log 2>&1; then rc=18; else rc=1; fi
+elapsed=$(($(date +%s%3N) - start))
+starts_after=$(journalctl -b -u 'xudod@*' --no-pager -o cat 2>/dev/null | grep -c 'Started xudod@' || true)
+poll_starts=$((starts_after - starts_before))
+wait_ms=$(sed -n 's/^WAIT_MS=//p' /var/tmp/confirm-timeout.log)
+if [ "$rc" -eq 18 ] && [ -n "$wait_ms" ] && [ "$wait_ms" -ge 1500 ] && [ "$wait_ms" -le 7000 ]; then
+    good "a_positive_timeout_returns_pending_or_denied_within_the_bound (${wait_ms}ms)"
+else
+    bad "a_positive_timeout_returns_pending_or_denied_within_the_bound (rc=$rc elapsed=${elapsed}ms)"
+    cat /var/tmp/confirm-timeout.log >&2
+    cat /var/tmp/watch-session.out >&2 || true
+fi
+clear_confirm
+if [ "$poll_starts" -gt 0 ]; then
+    if [ -n "$wait_ms" ]; then
+        cost=$((wait_ms / poll_starts))
+        echo "MEASURE: positive-timeout polls started $poll_starts brokers in ${wait_ms}ms (${cost}ms/start)"
+    else
+        echo "FAIL: per-poll broker start cost could not be measured (missing WAIT_MS)"
+        fail=1
+    fi
+else
+    echo "FAIL: per-poll broker start cost could not be measured (starts=$poll_starts)"
+    fail=1
+fi
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 0
+EOF
+
+# A fresh pending request is answered by a second user session on another pty.
+if expect /harness/confirm.exp approve >/var/tmp/confirm-approve.log 2>&1; then
+    roundtrip=$(sed -n 's/^ROUNDTRIP_MS=//p' /var/tmp/confirm-approve.log)
+    good "approve_then_rerun_then_password_runs_as_root (watch round-trip ${roundtrip}ms)"
+else
+    bad "approve_then_rerun_then_password_runs_as_root"
+    cat /var/tmp/confirm-approve.log >&2
+    cat /var/tmp/watch-session.out >&2 || true
+fi
+clear_confirm
+
+if expect /harness/confirm.exp deny >/var/tmp/confirm-deny.log 2>&1; then
+    good "deny_runs_nothing_and_exits_18"
+else
+    bad "deny_runs_nothing_and_exits_18"
+    cat /var/tmp/confirm-deny.log >&2
+fi
+clear_confirm
+
+# The requester stdin is a pipe containing the expected word. It cannot answer
+# the broker's separate watch question.
+if expect /harness/confirm.exp self-stdin >/var/tmp/self-stdin.out 2>&1; then
+    good "self_approval_from_the_requesters_stdin_fails"
+else
+    bad "self_approval_from_the_requesters_stdin_fails"
+    cat /var/tmp/self-stdin.out >&2
+fi
+clear_confirm
+
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 3
+EOF
+if expect /harness/confirm.exp self-tty >/var/tmp/self-tty.out 2>&1; then
+    good "self_approval_through_dev_tty_fails"
+else
+    bad "self_approval_through_dev_tty_fails"
+    cat /var/tmp/self-tty.out >&2
+fi
+clear_confirm
+cat >/etc/xudo/config.toml <<'EOF'
+confirm_human_path = true
+confirmation_timeout_secs = 0
+EOF
+
+# A watcher in the requester's own session and terminal is refused.
+if expect /harness/confirm.exp same-session >/var/tmp/same-session.out 2>&1; then
+    good "watch_started_in_the_requesters_session_is_refused"
+else
+    bad "watch_started_in_the_requesters_session_is_refused"
+    cat /var/tmp/same-session.out >&2
+fi
+clear_confirm
+
+# Some container runtimes disable user namespaces. Distinguish that fixture
+# limitation explicitly; never turn it into a silent pass.
+set +e
+timeout 8 su --pty -s /bin/sh -c 'unshare -Ur /usr/bin/xudo watch' xudotest >/var/tmp/userns-watch.out 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 124 ] && grep -qiE 'channel|namespace|terminal' /var/tmp/userns-watch.out; then
+    good "watch_in_a_user_namespace_is_refused"
+elif [ "$rc" -ne 124 ] && grep -qiE 'operation not permitted|not permitted|permission denied' /var/tmp/userns-watch.out; then
+    echo "PASS: watch_in_a_user_namespace_is_refused (unshare unavailable; covered by fixture tests)"
+else
+    bad "watch_in_a_user_namespace_is_refused (rc=$rc; unexpected unshare failure)"
+    cat /var/tmp/userns-watch.out >&2
+fi
+
+# Freeze is global in this harness: the approved human path must still prompt
+# for and accept the password. Thaw is root-only.
+test_uid=$(id -u xudotest)
+pkill -TERM -u "$test_uid" -x xudo 2>/dev/null || true
+sleep 1
+clear_confirm
+if xudo freeze --reason 'systemd M3 proof' >/var/tmp/freeze.out 2>&1; then
+    if expect /harness/confirm.exp approve >/var/tmp/frozen-approve.log 2>&1; then
+        good "freeze_then_human_password_path_runs"
+    else
+        bad "freeze_then_human_password_path_runs"
+        cat /var/tmp/frozen-approve.log /var/tmp/case.out >&2 || true
+    fi
+else
+    bad "freeze_then_human_password_path_runs"
+    cat /var/tmp/freeze.out >&2
+fi
+clear_confirm
+set +e
+su --pty -s /bin/sh -c 'sudo -n /usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    good "sudo_xudo_thaw_is_refused_for_unprivileged_user"
+else
+    bad "sudo_xudo_thaw_is_refused_for_unprivileged_user"
+fi
+if sudo /usr/bin/xudo thaw >/var/tmp/root-thaw.out 2>&1; then
+    good "sudo_xudo_thaw_works_as_root"
+else
+    bad "sudo_xudo_thaw_works_as_root"
+    cat /var/tmp/root-thaw.out >&2
 fi
 
 mid=a06b36c755dd4b85815d6af790559b5e

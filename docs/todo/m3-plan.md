@@ -451,6 +451,10 @@ Done 2026-11-07: the gate and broker share settings parsing and the gate loads t
   `watch_started_in_the_requesters_session_is_refused`,
   `watch_in_a_user_namespace_is_refused`.
 - **Lane.** `just units`, `just systemd-test`, `just root-test`.
+- **Status (2026-11-09):** done. The packaged `.deb` passed the real-systemd
+  matrix on Debian 13, Ubuntu 24.04, and Ubuntu 26.04. The dated CONCERNS
+  entry records per-image results, timings, and the user-namespace fixture
+  limitation.
 
 ### 10. Closeout
 
