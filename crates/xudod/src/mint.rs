@@ -30,10 +30,11 @@
 //! * **Junk goes.** A temporary file left by a broker that died mid-write —
 //!   no write can be in progress while the lock is held — and any nonce-named
 //!   entry that cannot be read back as a request.
-//! * **Bounded.** At most [`MAX_SPOOL_ENTRIES`] live entries and
-//!   [`MAX_SPOOL_BYTES`] of them, so no member of the `xudo` group can fill
-//!   `/run` by asking; and at most [`MAX_ENTRIES_PER_UID`] whose live caller
-//!   runs as the asking uid, so filling the spool takes eight members, not one.
+//! * **Bounded.** The password path has its own [`MAX_SPOOL_ENTRIES`] entry,
+//!   [`MAX_SPOOL_BYTES`] byte, and [`MAX_ENTRIES_PER_UID`] per-uid limits.
+//!   Watch entries have separate [`MAX_WATCH_ENTRIES`] and
+//!   [`MAX_WATCH_ENTRIES_PER_UID`] limits, so watcher requests cannot consume
+//!   the password path's capacity.
 //!   The entry does not record a uid, so the count reads each live caller's
 //!   real and effective uids from `/proc/<pid>/status` and counts the entry
 //!   against both: a caller that exec'd a set-user-ID program after minting
@@ -87,8 +88,16 @@ pub const MAX_SPOOL_BYTES: usize = 1024 * 1024;
 /// socket lets one uid hold open (`MaxConnectionsPerSource=`).
 pub const MAX_ENTRIES_PER_UID: usize = 8;
 
+/// The most waiting watch entries across all users.
+pub const MAX_WATCH_ENTRIES: usize = 16;
+
+/// The most waiting watch entries belonging to one uid.
+pub const MAX_WATCH_ENTRIES_PER_UID: usize = 2;
+
 // One uid must never be able to take the whole spool.
 const _: () = assert!(MAX_ENTRIES_PER_UID < MAX_SPOOL_ENTRIES);
+const _: () = assert!(MAX_WATCH_ENTRIES_PER_UID < MAX_WATCH_ENTRIES);
+const _: () = assert!(MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES < xudo_gate::run::MAX_SPOOL_NAMES);
 
 /// The largest entry the broker reads back, in bytes.
 ///
@@ -302,26 +311,45 @@ fn prune_and_publish<S: Spool + ?Sized>(
     let mut entries = 0usize;
     let mut bytes = 0usize;
     let mut this_uid = 0usize;
+    let mut watch_entries = 0usize;
+    let mut watch_uid = 0usize;
     for name in spool.names().map_err(MintError::Spool)? {
         match classify(spool, callers, &name, minting) {
-            Existing::Live { size, same_uid } => {
-                entries = entries.saturating_add(1);
-                bytes = bytes.saturating_add(size);
-                this_uid = this_uid.saturating_add(usize::from(same_uid));
+            Existing::Live {
+                size,
+                same_uid,
+                watch,
+            } => {
+                if watch {
+                    watch_entries = watch_entries.saturating_add(1);
+                    watch_uid = watch_uid.saturating_add(usize::from(same_uid));
+                } else {
+                    entries = entries.saturating_add(1);
+                    bytes = bytes.saturating_add(size);
+                    this_uid = this_uid.saturating_add(usize::from(same_uid));
+                }
             }
             Existing::Stale => spool.remove(&name).map_err(MintError::Spool)?,
             Existing::ConfirmationThrottled => return Err(MintError::ConfirmationThrottled),
             Existing::Foreign => {}
         }
     }
-    if entries >= MAX_SPOOL_ENTRIES || bytes.saturating_add(minting.json.len()) > MAX_SPOOL_BYTES {
-        return Err(MintError::Full { entries, bytes });
-    }
-    if this_uid >= MAX_ENTRIES_PER_UID {
-        return Err(MintError::UidFull {
-            uid: minting.uid,
-            entries: this_uid,
-        });
+    if minting.entry().needs_watch {
+        if watch_entries >= MAX_WATCH_ENTRIES || watch_uid >= MAX_WATCH_ENTRIES_PER_UID {
+            return Err(MintError::ConfirmationThrottled);
+        }
+    } else {
+        if entries >= MAX_SPOOL_ENTRIES
+            || bytes.saturating_add(minting.json.len()) > MAX_SPOOL_BYTES
+        {
+            return Err(MintError::Full { entries, bytes });
+        }
+        if this_uid >= MAX_ENTRIES_PER_UID {
+            return Err(MintError::UidFull {
+                uid: minting.uid,
+                entries: this_uid,
+            });
+        }
     }
     match spool.publish(&minting.entry().nonce, minting.json.as_bytes()) {
         Ok(()) => Ok(()),
@@ -341,6 +369,8 @@ enum Existing {
         size: usize,
         /// Whether its caller runs as the asking uid, really or effectively.
         same_uid: bool,
+        /// Whether the entry uses the separate watch quota.
+        watch: bool,
     },
     /// Something to remove: expired, superseded, misnamed, unreadable, a
     /// temporary file, or a non-watch entry whose caller cannot be shown alive.
@@ -414,12 +444,14 @@ fn classify<S: Spool + ?Sized>(
         return Existing::Live {
             size: bytes.len(),
             same_uid: existing.caller_uid == minting.uid,
+            watch: true,
         };
     }
     match live_caller(callers, &existing) {
         Some(uids) => Existing::Live {
             size: bytes.len(),
             same_uid: uids.real == minting.uid || uids.effective == minting.uid,
+            watch: existing.needs_watch,
         },
         None => Existing::Stale,
     }
@@ -452,6 +484,7 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
+    use proptest::prelude::*;
     use xudo_audit::record::{Decision as AuditDecision, Record};
     use xudo_policy::{ActionId, DenialCode, Verdict};
     use xudo_sys::{
@@ -932,6 +965,33 @@ mod tests {
     }
 
     #[test]
+    fn watch_entries_are_throttled_at_their_uid_and_global_limits() {
+        let mut same_uid = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            same_uid = same_uid.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        let next = watch_entry('a', 4242);
+        assert_eq!(
+            publish_as_1000(&same_uid, &FakePeer::new(), &next),
+            Err(MintError::ConfirmationThrottled)
+        );
+
+        let mut global = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES {
+            let mut watched = watch_entry('b', 30_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 2_000 + u32::try_from(index).unwrap();
+            global = global.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        assert_eq!(
+            publish_as_1000(&global, &FakePeer::new(), &next),
+            Err(MintError::ConfirmationThrottled)
+        );
+    }
+
+    #[test]
     fn a_pending_entry_survives_its_requester_exiting() {
         let pending = watch_entry('b', 4243);
         let spool = spool_with(&[&pending]);
@@ -1067,29 +1127,71 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_caller_watch_entry_still_counts_toward_its_uids_quota() {
-        let entries: Vec<PendingRequest> = (0..MAX_ENTRIES_PER_UID)
-            .map(|index| {
-                let mut entry = watch_entry(
-                    char::from(b'b' + u8::try_from(index).unwrap()),
-                    20_000 + u32::try_from(index).unwrap(),
-                );
-                entry.nonce = format!("{:064x}", index + 1);
-                entry
-            })
-            .collect();
-        let refs: Vec<&PendingRequest> = entries.iter().collect();
-        let spool = spool_with(&refs);
+    fn watch_entries_do_not_consume_password_path_uid_slots() {
+        let mut spool = FakeSpool::new();
+        for index in 0..MAX_WATCH_ENTRIES_PER_UID {
+            let mut watched = watch_entry(
+                char::from(b'b' + u8::try_from(index).unwrap()),
+                20_000 + u32::try_from(index).unwrap(),
+            );
+            watched.nonce = format!("{:064x}", index + 1);
+            spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+        }
         let next = entry('a', 4242, 5_000, NOW + 900);
 
-        assert_eq!(
-            publish_as_1000(&spool, &FakePeer::new(), &next),
-            Err(MintError::UidFull {
-                uid: 1000,
-                entries: MAX_ENTRIES_PER_UID,
-            })
-        );
-        assert_eq!(spool.files().len(), MAX_ENTRIES_PER_UID);
+        publish_as_1000(&spool, &FakePeer::new(), &next).unwrap();
+        assert_eq!(spool.files().len(), MAX_WATCH_ENTRIES_PER_UID + 1);
+    }
+
+    #[test]
+    fn watch_entries_cannot_exhaust_the_spool_for_the_password_path() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        for index in 0..MAX_WATCH_ENTRIES {
+            let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+            watched.nonce = format!("{:064x}", index + 1);
+            watched.caller_uid = 4_000 + u32::try_from(index).unwrap();
+            spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+        }
+        for index in 0..MAX_SPOOL_ENTRIES - 1 {
+            let mut password = entry('c', 30_000 + u32::try_from(index).unwrap(), 7, NOW + 100);
+            password.nonce = format!("{:064x}", MAX_WATCH_ENTRIES + index + 1);
+            let uid = 2_000 + u32::try_from(index.div_euclid(MAX_ENTRIES_PER_UID)).unwrap();
+            host = running(host, &password, uid, uid);
+            spool = spool.with_file(password.nonce.clone(), password.to_json());
+        }
+        let next = entry('a', 4242, 5_000, NOW + 900);
+
+        publish_as_1000(&spool, &host, &next).unwrap();
+        assert_eq!(spool.files().len(), MAX_WATCH_ENTRIES + MAX_SPOOL_ENTRIES);
+        assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    proptest! {
+        #[test]
+        fn any_mix_of_watch_entries_never_blocks_a_fresh_password_mint(
+            watch_count in 0..=MAX_WATCH_ENTRIES,
+            password_count in 0..MAX_SPOOL_ENTRIES,
+        ) {
+            let mut spool = FakeSpool::new();
+            let mut host = FakePeer::new();
+            for index in 0..watch_count {
+                let mut watched = watch_entry('b', 20_000 + u32::try_from(index).unwrap());
+                watched.nonce = format!("{:064x}", index + 1);
+                watched.caller_uid = 4_000 + u32::try_from(index).unwrap();
+                spool = spool.with_file(watched.nonce.clone(), watched.to_json());
+            }
+            for index in 0..password_count {
+                let mut password = entry('c', 30_000 + u32::try_from(index).unwrap(), 7, NOW + 100);
+                password.nonce = format!("{:064x}", MAX_WATCH_ENTRIES + index + 1);
+                let uid = 2_000 + u32::try_from(index.div_euclid(MAX_ENTRIES_PER_UID)).unwrap();
+                host = running(host, &password, uid, uid);
+                spool = spool.with_file(password.nonce.clone(), password.to_json());
+            }
+            let next = entry('a', 4242, 5_000, NOW + 900);
+
+            prop_assert!(publish_as_1000(&spool, &host, &next).is_ok());
+        }
     }
 
     #[test]
