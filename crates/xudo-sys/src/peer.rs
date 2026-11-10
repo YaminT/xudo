@@ -604,6 +604,14 @@ mod tests {
     }
 
     #[test]
+    fn every_proc_file_names_the_file_the_kernel_uses() {
+        // No cfg: the uid_map arm is otherwise only reached by Linux tests.
+        assert_eq!(ProcFile::Stat.name(), "stat");
+        assert_eq!(ProcFile::Status.name(), "status");
+        assert_eq!(ProcFile::UidMap.name(), "uid_map");
+    }
+
+    #[test]
     fn the_effective_uid_is_the_second_field_of_the_uid_line() {
         let status =
             b"Name:\tbash\nUmask:\t0022\nUid:\t1000\t0\t1000\t1000\nGid:\t100\t100\t100\t100\n";
