@@ -326,9 +326,8 @@ fn package_removal_always_confirms_even_for_a_human() {
     );
 }
 
-#[test]
-fn the_install_probe_permits_id_dash_u_and_nothing_wider() {
-    assert_eq!(verdict("xudo.probe.id", &["-u"]), Verdict::Allow);
+fn the_install_probe_permits_only_dash_u(action: &str) {
+    assert_eq!(verdict(action, &["-u"]), Verdict::Allow);
     for args in [
         &[][..],
         &["-un"],
@@ -339,11 +338,21 @@ fn the_install_probe_permits_id_dash_u_and_nothing_wider() {
         &["-u", "--", "root"],
     ] {
         assert_eq!(
-            verdict("xudo.probe.id", args),
+            verdict(action, args),
             Verdict::Deny,
-            "{args:?} was permitted"
+            "{action} {args:?} was permitted"
         );
     }
+}
+
+#[test]
+fn the_install_probe_permits_id_dash_u_and_nothing_wider() {
+    the_install_probe_permits_only_dash_u("xudo.probe.id");
+}
+
+#[test]
+fn the_install_probe_permits_gnuid_dash_u_and_nothing_wider() {
+    the_install_probe_permits_only_dash_u("xudo.probe.gnuid");
 }
 
 /// A command each shipped action accepts. Every shipped action must have one:
@@ -362,7 +371,7 @@ fn example(id: &str) -> Vec<&'static str> {
         "xudo.svc.reset-failed" => vec!["--no-pager", "reset-failed", "nginx.service"],
         "xudo.svc.reload-units" => vec!["--no-pager", "daemon-reload"],
         "xudo.dmesg" => vec!["--no-pager", "-k"],
-        "xudo.probe.id" => vec!["-u"],
+        "xudo.probe.id" | "xudo.probe.gnuid" => vec!["-u"],
         "xudo.net.listeners" => vec!["-tulpnH"],
         "xudo.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
         "xudo.pkg.update" => vec!["update"],

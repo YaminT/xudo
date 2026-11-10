@@ -25,6 +25,13 @@ cp /debs/old.deb /debs/new.deb /tmp/ && cd /tmp
 
 # Install: pulls sudo, writes the rule, creates an empty group.
 deb_install ./old.deb
+# Plain Docker does not start the broker, so the probe is unverified here for
+# that reason on every image. A symlink or a missing probe program is a
+# different failure: the package must not have fallen through to it.
+if grep -q 'no probe program is a regular file' /tmp/apt.log; then
+    cat /tmp/apt.log >&2
+    fail "install probe found no regular program"
+fi
 grep -Fq 'every privileged request asks for a password' /tmp/apt.log || fail "first install notice missing"
 grep -Fq 'There is no' /tmp/apt.log || fail "first install notice omitted agent-path status"
 grep -Fq '/usr/share/doc/xudo/SECURITY.md' /tmp/apt.log || fail "first install notice omitted local SECURITY.md path"

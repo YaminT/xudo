@@ -56,21 +56,8 @@ broker() {
     sleep 1
 }
 
-# Finding: the gate refuses a symlinked program, and /usr/bin/id (the install
-# probe's) and expr are symlinks to multicall binaries on Ubuntu 26.04 (uutils)
-# and Alpine (busybox), which also want their own name in argv[0]. Real GNU
-# ones stand in so the rows can run; reported, not fixed.
-for tool in id expr; do
-    # Alpine has no gnu$tool; its coreutils package is one multicall binary.
-    real=/usr/bin/gnu$tool
-    [ -x $real ] || real=/bin/coreutils
-    if [ -L /usr/bin/$tool ] && [ -x $real ]; then
-        rm /usr/bin/$tool
-        cp $real /usr/bin/$tool
-    fi
-done
-
-# `xudo install` for real, with its own probe through the broker. doas asks root
+# `xudo install` for real, against the image as it ships. The probe runs the
+# first of /usr/bin/id and /usr/bin/gnuid that is a regular file. doas asks root
 # for a password, so its probe cannot run: installed, NOT VERIFIED.
 broker
 set +e
@@ -86,6 +73,20 @@ if grep -q '^xudo: no usable backend' "$out/install-real.log"; then
     exit 0
 fi
 [ -e /etc/sudoers.d/xudo ] || [ -e /etc/doas.d/60-xudo.conf ] || { cat "$out/install-real.log" >&2; exit 1; }
+
+# The comparable exec cases name /usr/bin/id and /usr/bin/expr. On Ubuntu 26.04
+# and Alpine those paths are multicall symlinks, which the gate refuses. A
+# regular binary at the shipped xudo.probe.id path keeps every row's exec.txt
+# the same. Install above already ran on the stock image.
+for tool in id expr; do
+    # Alpine has no gnu$tool; its coreutils package is one multicall binary.
+    real=/usr/bin/gnu$tool
+    [ -x $real ] || real=/bin/coreutils
+    if [ -L /usr/bin/$tool ] && [ -x $real ]; then
+        rm /usr/bin/$tool
+        cp $real /usr/bin/$tool
+    fi
+done
 
 # One case: xudo exec as xudotest on a pty, the password typed at the prompt.
 # Records xudo's exit status and what the command printed, minus the prompt
