@@ -2498,22 +2498,118 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(outcome.records.len(), 1);
     }
 
-    #[test]
-    fn an_approved_rerun_runs_after_the_watcher_has_closed() {
+    fn assert_unmatched_approval_does_not_skip_live_channel_check(entry: &PendingRequest) {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
-        let mut approved = shown_entry();
-        approved.state = xudo_gate::request::ConfirmationState::Approved;
-        approved.confirmed = true;
-        let watcher = xudo_gate::request::WatcherPin {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let policy = confirming_policy();
+        let identity = test_identity(PID, START, 0, 0);
+        let caller = classify(&identity);
+        let decision = decide(&policy, &caller, &request);
+        let id = entry.nonce.clone();
+        let bytes = entry.to_json().into_bytes();
+        let spool = FakeSpool::new().with_file(id.as_bytes().to_vec(), bytes.clone());
+        let _ = confirm_run(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            Evaluated {
+                decision,
+                caller,
+                identity,
+                request,
+                policy,
+            },
+        );
+        let response = BrokerResponse::parse(&conn.written()).unwrap();
+        let (decision, minted) = decision_of(&response.answer).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
+        assert!(minted.is_none());
+        assert_eq!(spool.files(), [(id.into_bytes(), bytes)].into());
+    }
+
+    fn approved_entry() -> PendingRequest {
+        let mut entry = shown_entry();
+        let watcher = crate::confirm::WatcherFacts {
             uid: UID,
             pid: 5000,
             starttime: 77,
             tty: 34816,
             sid: 2,
+            diverged: false,
         };
-        approved.confirmed_by = Some(watcher.clone());
-        approved.shown_to = Some(watcher);
+        crate::confirm::answer(
+            &mut entry,
+            watcher,
+            NOW,
+            crate::confirm::Settings::default(),
+            crate::confirm::Answer::Approve(b"remove"),
+        )
+        .unwrap();
+        entry
+    }
+
+    #[test]
+    fn an_expired_approval_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.deadline = BoottimeMillis(NOW);
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn a_consumed_approval_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.state = xudo_gate::request::ConfirmationState::Consumed;
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn an_approval_for_different_argv_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.argv[2] = "make".to_owned();
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn an_approval_for_different_generation_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.generation = entry.generation.saturating_add(1);
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn an_approval_for_different_action_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.action = "xudo.pkg.install".to_owned();
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn an_approval_for_different_uid_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.caller_uid = UID.saturating_add(1);
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn a_pending_entry_cannot_skip_a_missing_live_channel() {
+        let mut entry = approved_entry();
+        entry.state = xudo_gate::request::ConfirmationState::Pending;
+        entry.confirmed = false;
+        entry.confirmed_by = None;
+        assert_unmatched_approval_does_not_skip_live_channel_check(&entry);
+    }
+
+    #[test]
+    fn an_approved_rerun_runs_after_the_watcher_has_closed() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        let approved = approved_entry();
         let spool = FakeSpool::new().with_file(
             approved.nonce.as_bytes().to_vec(),
             approved.to_json().into_bytes(),
@@ -2521,7 +2617,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.confirmations = FakeSpool::new().with_file(
             format!("{UID}.json").into_bytes(),
             serde_json::to_vec(&ConfirmData {
-                heartbeat: None,
+                heartbeat: Some(WatcherHeartbeat {
+                    pid: 5000,
+                    starttime: 77,
+                    tty: 34816,
+                    sid: 2,
+                    at_ms: NOW - HEARTBEAT_FRESH_MS - 1,
+                }),
                 backoff: Vec::new(),
                 outcomes: Vec::new(),
             })
