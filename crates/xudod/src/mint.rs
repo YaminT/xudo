@@ -47,8 +47,10 @@
 use std::fmt::Write as _;
 
 use xudo_audit::Approval;
-use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce};
-use xudo_policy::Decision;
+use xudo_gate::request::{
+    AttestedClass, BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce,
+};
+use xudo_policy::{CallerFacts, Classification, Decision};
 use xudo_sys::{
     Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
     parse_stat, parse_status_uids,
@@ -146,6 +148,9 @@ pub enum MintError {
     /// the gate looks the action up by this name.
     #[error("a permitted decision names no action, so the gate would have nothing to look up")]
     NoAction,
+    /// An agent classification lacks the kernel cgroup id needed to bind it.
+    #[error("the broker classified an agent without an attested cgroup scope id")]
+    NoAttestedScope,
     /// The spool refused an operation.
     #[error(transparent)]
     Spool(SpoolError),
@@ -180,6 +185,12 @@ pub enum MintError {
     /// This process already has a pending or approved watched request.
     #[error("watch confirmation is throttled by a per-process or capacity limit")]
     ConfirmationThrottled,
+}
+
+struct AttestedCaller<'a> {
+    identity: &'a PeerIdentity,
+    facts: &'a CallerFacts,
+    boot_id: Option<&'a str>,
 }
 
 /// The entry as an approval: the command and action its audit record must
@@ -264,11 +275,58 @@ pub fn entry_for(
     deadline: u64,
     nonce: String,
 ) -> Result<PendingRequest, MintError> {
+    let caller = crate::policy::classify(identity);
+    entry_for_classified(
+        decision,
+        &AttestedCaller {
+            identity,
+            facts: &caller,
+            boot_id: None,
+        },
+        request,
+        generation,
+        confirm_human_path,
+        deadline,
+        nonce,
+    )
+}
+
+fn entry_for_classified(
+    decision: &Decision,
+    attested: &AttestedCaller<'_>,
+    request: &BrokerRequest,
+    generation: u64,
+    confirm_human_path: bool,
+    deadline: u64,
+    nonce: String,
+) -> Result<PendingRequest, MintError> {
+    let AttestedCaller {
+        identity,
+        facts: caller,
+        boot_id,
+    } = attested;
     let Some(action) = &decision.action else {
         return Err(MintError::NoAction);
     };
     let Some((program, argv, claimed_classification)) = request.run_fields() else {
         return Err(MintError::NoAction);
+    };
+    let (attested_class, attested_scope_id, boot_id) = match &caller.classification {
+        Classification::Unattested { .. } => (AttestedClass::Unattested, None, None),
+        Classification::Human => (AttestedClass::Human, None, None),
+        Classification::EnrolledAgent { .. } => {
+            let Some(scope_id) = identity.cgroup_id else {
+                return Err(MintError::NoAttestedScope);
+            };
+            let Some(boot_id) = boot_id.filter(|id| !id.is_empty()) else {
+                return Err(MintError::NoAttestedScope);
+            };
+            (
+                AttestedClass::EnrolledAgent { scope_id },
+                Some(scope_id),
+                Some(boot_id.to_owned()),
+            )
+        }
     };
     Ok(PendingRequest {
         schema_version: REQUEST_SCHEMA_VERSION,
@@ -295,6 +353,9 @@ pub fn entry_for(
             &argv.iter().map(String::as_bytes).collect::<Vec<_>>(),
         ),
         claimed_classification: claimed_classification.to_owned(),
+        attested_class,
+        attested_scope_id,
+        boot_id,
     })
 }
 
@@ -560,6 +621,9 @@ mod tests {
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
+            attested_class: AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 
@@ -707,7 +771,179 @@ mod tests {
                     &[b"restart", b"nginx.service"],
                 ),
                 claimed_classification: "enrolled-agent-yolo".to_owned(),
+                attested_class: AttestedClass::Unattested,
+                attested_scope_id: None,
+                boot_id: None,
             }
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn claimed_classification_never_reaches_attested_class(claim in any::<String>()) {
+            let request = BrokerRequest::new(
+                "/usr/bin/systemctl",
+                vec!["restart".to_owned()],
+                &claim,
+            );
+            let minted = entry_for(
+                &permitted(),
+                &identity(4242, 5_000),
+                &request,
+                7,
+                true,
+                1_900,
+                nonce('a'),
+            );
+            prop_assert!(minted.is_ok());
+            if let Ok(entry) = minted {
+                prop_assert_eq!(entry.claimed_classification, claim);
+                prop_assert_eq!(entry.attested_class, AttestedClass::Unattested);
+                prop_assert_eq!(entry.attested_scope_id, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_faked_enrolled_class_is_bound_to_its_kernel_scope_id() {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = Some(77);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "worker".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        let minted = entry_for_classified(
+            &permitted(),
+            &AttestedCaller {
+                identity: &peer,
+                facts: &caller,
+                boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            },
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        );
+        let entry = minted.unwrap();
+        assert_eq!(
+            entry.attested_class,
+            AttestedClass::EnrolledAgent { scope_id: 77 }
+        );
+        assert_eq!(entry.attested_scope_id, Some(77));
+        assert_eq!(
+            entry.boot_id.as_deref(),
+            Some("abcdef01-2345-6789-abcd-ef0123456789")
+        );
+    }
+
+    #[test]
+    fn a_faked_human_class_does_not_inherit_an_agent_claim() {
+        let peer = identity(4242, 5_000);
+        let caller = CallerFacts::new(Classification::Human, peer.uid);
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let entry = entry_for_classified(
+            &permitted(),
+            &AttestedCaller {
+                identity: &peer,
+                facts: &caller,
+                boot_id: None,
+            },
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        )
+        .unwrap();
+        assert_eq!(entry.attested_class, AttestedClass::Human);
+        assert_eq!(entry.attested_scope_id, None);
+        assert_eq!(entry.boot_id, None);
+    }
+
+    #[test]
+    fn an_enrolled_class_without_a_kernel_scope_is_not_minted() {
+        let peer = identity(4242, 5_000);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "worker".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "x");
+        assert_eq!(
+            entry_for_classified(
+                &permitted(),
+                &AttestedCaller {
+                    identity: &peer,
+                    facts: &caller,
+                    boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+                },
+                &request,
+                7,
+                true,
+                1_900,
+                nonce('a'),
+            ),
+            Err(MintError::NoAttestedScope)
+        );
+    }
+
+    #[test]
+    fn an_enrolled_class_without_a_boot_id_is_not_minted() {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = Some(77);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "worker".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "x");
+        assert_eq!(
+            entry_for_classified(
+                &permitted(),
+                &AttestedCaller {
+                    identity: &peer,
+                    facts: &caller,
+                    boot_id: None,
+                },
+                &request,
+                7,
+                true,
+                1_900,
+                nonce('a'),
+            ),
+            Err(MintError::NoAttestedScope)
+        );
+        assert_eq!(
+            entry_for_classified(
+                &permitted(),
+                &AttestedCaller {
+                    identity: &peer,
+                    facts: &caller,
+                    boot_id: Some(""),
+                },
+                &request,
+                7,
+                true,
+                1_900,
+                nonce('a'),
+            ),
+            Err(MintError::NoAttestedScope)
         );
     }
 

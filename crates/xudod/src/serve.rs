@@ -6887,6 +6887,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
+            attested_class: xudo_gate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 

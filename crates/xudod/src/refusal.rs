@@ -91,7 +91,9 @@ impl From<&MintError> for Refusal {
     /// report itself broken by asking often enough.
     fn from(error: &MintError) -> Self {
         match error {
-            MintError::NoAction => Self::broker(RefusalCode::BrokerUnusable, error.to_string()),
+            MintError::NoAction | MintError::NoAttestedScope => {
+                Self::broker(RefusalCode::BrokerUnusable, error.to_string())
+            }
             MintError::Spool(_) => Self::broker(RefusalCode::SpoolUnusable, error.to_string()),
             MintError::Full { .. }
             | MintError::UidFull { .. }
