@@ -266,7 +266,8 @@ pub fn draw_nonce(entropy: &dyn Entropy) -> Result<String, SysError> {
 /// # Errors
 ///
 /// [`MintError::NoAction`] if the decision names no action.
-pub fn entry_for(
+#[cfg(test)]
+pub(crate) fn entry_for(
     decision: &Decision,
     identity: &PeerIdentity,
     request: &BrokerRequest,
@@ -778,85 +779,102 @@ mod tests {
         );
     }
 
+    const GOOD_BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+
+    fn facts_for(kind: u8) -> Classification {
+        match kind {
+            0 => Classification::Unattested {
+                reason: "no cgroup".to_owned(),
+            },
+            1 => Classification::Human,
+            _ => Classification::EnrolledAgent {
+                agent_id: "worker".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+        }
+    }
+
+    fn mint_with(
+        kind: u8,
+        cgroup: Option<u64>,
+        boot: Option<&str>,
+        claim: &str,
+    ) -> Result<PendingRequest, MintError> {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = cgroup;
+        let facts = CallerFacts::new(facts_for(kind), peer.uid);
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], claim);
+        entry_for_classified(
+            &permitted(),
+            &AttestedCaller {
+                identity: &peer,
+                facts: &facts,
+                boot_id: boot,
+            },
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        )
+    }
+
+    fn claim_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            any::<String>(),
+            Just(String::new()),
+            Just("enrolled-agent".to_owned()),
+            Just("enrolled-agent-yolo".to_owned()),
+            Just("enrolled_agent".to_owned()),
+            Just("human".to_owned()),
+            Just("scope_id=77".to_owned()),
+        ]
+    }
+
     proptest! {
         #[test]
         fn claimed_classification_never_reaches_attested_class(
-            claim_a in prop_oneof![
-                any::<String>(),
-                Just("enrolled_agent".to_owned()),
-                Just("human".to_owned()),
-                Just("scope_id=77".to_owned()),
+            kind in 0u8..3,
+            cgroup in prop_oneof![Just(None), Just(Some(77u64))],
+            boot in prop_oneof![
+                Just(None),
+                Just(Some(GOOD_BOOT)),
+                Just(Some("not-a-boot-id")),
             ],
-            claim_b in prop_oneof![
-                any::<String>(),
-                Just("enrolled_agent".to_owned()),
-                Just("human".to_owned()),
-                Just("scope_id=77".to_owned()),
-            ],
+            claim_a in claim_strategy(),
+            claim_b in claim_strategy(),
         ) {
-            let mut peer = identity(4242, 5_000);
-            peer.cgroup_id = Some(77);
-            let facts = CallerFacts::new(
-                Classification::EnrolledAgent {
-                    agent_id: "worker".to_owned(),
-                    session_id: "session".to_owned(),
-                    declared_yolo: false,
-                },
-                peer.uid,
-            );
-            let request = BrokerRequest::new(
-                "/usr/bin/systemctl",
-                vec!["restart".to_owned()],
-                &claim_a,
-            );
-            let attest = AttestedCaller {
-                identity: &peer,
-                facts: &facts,
-                boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            let first = mint_with(kind, cgroup, boot, &claim_a);
+            let second = mint_with(kind, cgroup, boot, &claim_b);
+            let triple = |r: &Result<PendingRequest, MintError>| {
+                r.as_ref()
+                    .map(|e| (e.attested_class.clone(), e.attested_scope_id, e.boot_id.clone()))
+                    .map_err(ToString::to_string)
             };
-            let first = entry_for_classified(
-                &permitted(),
-                &attest,
-                &request,
-                7,
-                true,
-                1_900,
-                nonce('a'),
-            );
-            let second_request = BrokerRequest::new(
-                "/usr/bin/systemctl",
-                vec!["restart".to_owned()],
-                &claim_b,
-            );
-            let second = entry_for_classified(
-                &permitted(),
-                &attest,
-                &second_request,
-                7,
-                true,
-                1_900,
-                nonce('b'),
-            );
-            prop_assert!(first.is_ok());
-            prop_assert!(second.is_ok());
-            if let (Ok(first), Ok(second)) = (first, second) {
-                prop_assert_eq!(first.claimed_classification, claim_a);
-                prop_assert_eq!(second.claimed_classification, claim_b);
+            prop_assert_eq!(triple(&first), triple(&second));
+            if let Ok(entry) = &first {
+                prop_assert_eq!(&entry.claimed_classification, &claim_a);
+                let enrolled = matches!(entry.attested_class, AttestedClass::EnrolledAgent { .. });
                 prop_assert_eq!(
-                    (
-                        &first.attested_class,
-                        first.attested_scope_id,
-                        &first.boot_id,
-                    ),
-                    (
-                        &second.attested_class,
-                        second.attested_scope_id,
-                        &second.boot_id,
-                    ),
+                    enrolled,
+                    kind == 2 && cgroup.is_some() && boot == Some(GOOD_BOOT)
                 );
-                prop_assert_eq!(first.attested_class, AttestedClass::EnrolledAgent { scope_id: 77 });
-                prop_assert_eq!(first.attested_scope_id, Some(77));
-                prop_assert_eq!(first.boot_id.as_deref(), Some("abcdef01-2345-6789-abcd-ef0123456789"));
+            } else {
+                prop_assert_eq!(kind, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn a_claimed_enrolled_agent_cannot_enroll_an_unattested_or_human_caller() {
+        for (kind, expected) in [(0u8, AttestedClass::Unattested), (1, AttestedClass::Human)] {
+            for claim in ["enrolled-agent", "enrolled-agent-yolo"] {
+                let entry = mint_with(kind, Some(77), Some(GOOD_BOOT), claim).unwrap();
+                assert_eq!(entry.attested_class, expected);
+                assert_eq!(entry.attested_scope_id, None);
+                assert_eq!(entry.boot_id, None);
+                assert_eq!(entry.claimed_classification, claim);
             }
         }
     }
