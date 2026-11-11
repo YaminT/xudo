@@ -13,9 +13,10 @@ pub const MAX_FREEZE_BYTES: usize = 2048;
 /// The broker-owned freeze marker.
 pub const FREEZE_FILE: &str = "/var/lib/xudo/frozen";
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct FreezeRecord {
+/// The root-owned freeze marker's data.
+pub struct FreezeRecord {
     reason: String,
     uid: u32,
     time: u64,
@@ -111,14 +112,19 @@ fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
     }
 }
 
-fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
+/// Parses one freeze marker, refusing non-object and duplicate-key forms.
+///
+/// # Errors
+///
+/// Returns the serde error for invalid JSON, an invalid shape, or duplicate keys.
+pub fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     if !value.is_object() {
         return Err(<serde_json::Error as serde::de::Error>::custom(
             "freeze record must be an object",
         ));
     }
-    serde_json::from_value(value)
+    serde_json::from_slice(bytes)
 }
 
 /// Derives engine settings from the bytes shared by the gate and broker.
@@ -244,7 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn a_freeze_file_in_array_form_means_frozen() {
+    fn an_array_form_freeze_file_means_frozen() {
         assert!(freeze_state(Ok(Some(br#"["maintenance",0,1]"#.to_vec()))));
+    }
+
+    #[test]
+    fn duplicate_freeze_record_keys_are_rejected() {
+        assert!(
+            parse_freeze_record(br#"{"reason":"one","reason":"two","uid":0,"time":1}"#).is_err()
+        );
     }
 }

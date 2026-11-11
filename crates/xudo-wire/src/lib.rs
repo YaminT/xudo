@@ -189,7 +189,7 @@ impl BrokerRequest {
         }
         if value
             .get("question")
-            .is_none_or(|question| !(question.is_object() || question.is_string()))
+            .is_none_or(|question| !valid_question_shape(question))
         {
             return Err(RequestError::Malformed {
                 reason: "question must use its object or unit string form".to_owned(),
@@ -783,6 +783,14 @@ impl BrokerResponse {
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
+        if value
+            .get("answer")
+            .is_none_or(|answer| !valid_answer_shape(answer))
+        {
+            return Err(ResponseError::Malformed {
+                reason: "answer must use its object or unit string form".to_owned(),
+            });
+        }
         let response: Self =
             serde_json::from_str(text).map_err(|error| ResponseError::Malformed {
                 reason: error.to_string(),
@@ -869,6 +877,78 @@ impl BrokerResponse {
     pub fn to_json(&self) -> String {
         rendered_or(serde_json::to_string(self), FALLBACK_RESPONSE)
     }
+}
+
+fn valid_question_shape(value: &serde_json::Value) -> bool {
+    if value.is_string() {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 1 {
+        return false;
+    }
+    object.iter().any(|(name, payload)| {
+        let unit = matches!(name.as_str(), "watch" | "pending" | "thaw");
+        let data = matches!(name.as_str(), "run" | "status" | "answer" | "freeze");
+        (unit && payload.is_null()) || (data && payload.is_object())
+    })
+}
+
+#[derive(Clone, Copy)]
+#[cfg(test)]
+enum QuestionShape {
+    Variant(&'static str, bool),
+}
+
+#[cfg(test)]
+fn question_shape(question: &Question) -> QuestionShape {
+    match question {
+        Question::Run { .. } => QuestionShape::Variant("run", false),
+        Question::Status { .. } => QuestionShape::Variant("status", false),
+        Question::Watch => QuestionShape::Variant("watch", true),
+        Question::Pending => QuestionShape::Variant("pending", true),
+        Question::Answer { .. } => QuestionShape::Variant("answer", false),
+        Question::Freeze { .. } => QuestionShape::Variant("freeze", false),
+        Question::Thaw => QuestionShape::Variant("thaw", true),
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(test)]
+enum AnswerShape {
+    Variant(&'static str, bool),
+}
+
+#[cfg(test)]
+fn answer_shape(answer: &Answer) -> AnswerShape {
+    match answer {
+        Answer::Decided { .. } => AnswerShape::Variant("decided", false),
+        Answer::Pending { .. } => AnswerShape::Variant("pending", false),
+        Answer::Watching { .. } => AnswerShape::Variant("watching", false),
+        Answer::Done => AnswerShape::Variant("done", true),
+        Answer::Refused { .. } => AnswerShape::Variant("refused", false),
+    }
+}
+
+fn valid_answer_shape(value: &serde_json::Value) -> bool {
+    if value.is_string() {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 1 {
+        return false;
+    }
+    object.iter().any(|(name, payload)| {
+        matches!(name.as_str(), "done") && payload.is_null()
+            || matches!(
+                name.as_str(),
+                "decided" | "pending" | "watching" | "refused"
+            ) && payload.is_object()
+    })
 }
 
 fn parse_json_object(text: &str) -> Result<serde_json::Value, String> {
@@ -964,12 +1044,130 @@ mod tests {
     }
 
     #[test]
-    fn an_array_form_question_is_refused() {
-        let bytes = br#"{"schema_version":2,"question":["thaw"]}"#;
-        assert_eq!(
-            BrokerRequest::parse(bytes).unwrap_err().code(),
-            RefusalCode::RequestMalformed
-        );
+    fn struct_variant_questions_must_use_the_map_form() {
+        for bytes in [
+            br#"{"schema_version":2,"question":{"run":["/usr/bin/true",[],"x"]}}"#.as_slice(),
+            br#"{"schema_version":2,"question":{"status":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#.as_slice(),
+            br#"{"schema_version":2,"question":{"answer":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tok",true]}}"#.as_slice(),
+            br#"{"schema_version":2,"question":{"freeze":["maintenance"]}}"#.as_slice(),
+        ] {
+            assert_eq!(
+                BrokerRequest::parse(bytes).unwrap_err().code(),
+                RefusalCode::RequestMalformed
+            );
+        }
+    }
+
+    #[test]
+    fn every_question_variant_uses_the_expected_external_shape() {
+        let id = "a".repeat(NONCE_HEX_LEN);
+        let variants = [
+            Question::Run {
+                program: "/x".into(),
+                argv: Vec::new(),
+                claimed_classification: "x".into(),
+            },
+            Question::Status { id: id.clone() },
+            Question::Watch,
+            Question::Pending,
+            Question::Answer {
+                id,
+                token: "x".into(),
+                approve: true,
+            },
+            Question::Freeze { reason: "x".into() },
+            Question::Thaw,
+        ];
+        for question in variants {
+            let serialized = serde_json::to_value(&question).unwrap();
+            let QuestionShape::Variant(name, unit) = question_shape(&question);
+            if unit {
+                assert_eq!(serialized, serde_json::Value::String(name.to_owned()));
+            } else {
+                let object = serialized.as_object().unwrap();
+                assert_eq!(object.len(), 1);
+                assert!(object[name].is_object());
+            }
+            assert!(valid_question_shape(&serialized), "variant {name}");
+            if unit {
+                let mut object = serde_json::Map::new();
+                object.insert(name.to_owned(), serde_json::Value::Null);
+                assert!(valid_question_shape(&serde_json::Value::Object(object)));
+            }
+        }
+    }
+
+    #[test]
+    fn question_shape_rejects_non_variant_objects_and_wrong_payload_shapes() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"watch": null, "pending": null}),
+            serde_json::json!({"run": null}),
+            serde_json::json!({"watch": {}}),
+            serde_json::json!({"unknown": {}}),
+        ] {
+            assert!(!valid_question_shape(&value), "unexpected shape: {value}");
+        }
+    }
+
+    #[test]
+    fn every_answer_variant_uses_the_expected_external_shape() {
+        let id = "a".repeat(NONCE_HEX_LEN);
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let answers = [
+            Answer::Decided {
+                decision,
+                minted: None,
+            },
+            Answer::Pending {
+                id: id.clone(),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+            Answer::Done,
+            Answer::Refused {
+                code: RefusalCode::SpoolFull,
+                remediation: "x".into(),
+                detail: None,
+            },
+        ];
+        for answer in answers {
+            let serialized = serde_json::to_value(&answer).unwrap();
+            let AnswerShape::Variant(name, unit) = answer_shape(&answer);
+            if unit {
+                assert_eq!(serialized, serde_json::Value::String(name.to_owned()));
+            } else {
+                let object = serialized.as_object().unwrap();
+                assert_eq!(object.len(), 1);
+                assert!(object[name].is_object());
+            }
+            assert!(valid_answer_shape(&serialized), "variant {name}");
+            if unit {
+                let mut object = serde_json::Map::new();
+                object.insert(name.to_owned(), serde_json::Value::Null);
+                assert!(valid_answer_shape(&serde_json::Value::Object(object)));
+            }
+        }
+    }
+
+    #[test]
+    fn answer_shape_rejects_non_variant_objects_and_wrong_payload_shapes() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"done": null, "pending": {}}),
+            serde_json::json!({"pending": null}),
+            serde_json::json!({"done": {}}),
+            serde_json::json!({"unknown": {}}),
+        ] {
+            assert!(!valid_answer_shape(&value), "unexpected shape: {value}");
+        }
     }
 
     #[test]
@@ -1052,6 +1250,15 @@ mod tests {
             };
             assert_eq!(request.run_fields(), None);
         }
+    }
+
+    #[test]
+    fn run_fields_return_the_run_question_fields() {
+        let request = BrokerRequest::new("/usr/bin/true", vec!["-v".into()], "unattested");
+        assert_eq!(
+            request.run_fields(),
+            Some(("/usr/bin/true", &["-v".to_owned()][..], "unattested"))
+        );
     }
 
     #[test]
@@ -1796,6 +2003,13 @@ mod tests {
                 reason: "top-level JSON value must be an object".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn struct_variant_answers_must_use_the_map_form() {
+        let id = "a".repeat(NONCE_HEX_LEN);
+        let bytes = format!(r#"{{"schema_version":2,"answer":{{"pending":["{id}",1]}}}}"#);
+        assert!(BrokerResponse::parse(bytes.as_bytes()).is_err());
     }
 
     #[test]
