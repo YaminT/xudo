@@ -150,7 +150,7 @@ is one an agent driving that terminal could type.
 
 ## Other known limits
 
-The install probe reports `installed, but NOT VERIFIED` on doas and on multicall-coreutils systems, including stock Ubuntu 26.04 with uutils `/usr/bin/id` and Alpine. The systemd and differential lanes on Ubuntu 26.04 pass because those lanes install GNU `id`. The audit trail records authorization, not command outcomes. Pasban runs daily as root to verify the chain and compare file records with journald copies by hash. It detects a removed tail, a cut followed by continued writes, and a forged chain journald never saw. It cannot prevent privileged tampering or prove a command completed.
+The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so stock Ubuntu 26.04 verifies. It reports `installed, but NOT VERIFIED` on doas and on a multicall-coreutils system with no regular probe program, such as Alpine. The audit trail records authorization, not command outcomes. Pasban runs daily as root to verify the chain and compare file records with journald copies by hash. It detects a removed tail, a cut followed by continued writes, and a forged chain journald never saw. It cannot prevent privileged tampering or prove a command completed.
 
 ## No telemetry
 
