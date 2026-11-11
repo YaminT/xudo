@@ -316,7 +316,7 @@ fn serve_request(
     if !matches!(request.question, xudo_wire::Question::Run { .. }) {
         return serve_confirmation_question(conn, platform, spool, &identity, &request);
     }
-    let policy = match platform.policy.load() {
+    let mut policy = match platform.policy.load() {
         Ok(policy) => policy,
         Err(error) => {
             return refuse(
@@ -328,6 +328,7 @@ fn serve_request(
             );
         }
     };
+    policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
 
     let caller = classify(&identity);
     let decision = decide(&policy, &caller, &request);
@@ -1370,7 +1371,7 @@ fn serve_confirmation_question(
         xudo_wire::Question::Freeze { reason } => {
             freeze(platform, spool, identity, request, reason)
         }
-        xudo_wire::Question::Thaw => thaw(platform, identity, request),
+        xudo_wire::Question::Thaw => thaw(platform, identity, &classify(identity), request),
         xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
     };
     match result {
@@ -1411,20 +1412,61 @@ fn freeze(
         platform,
         spool,
         identity,
+        &classify(identity),
         request,
         reason,
         &serde_json::to_vec,
     )
 }
 
+/// The most names the state directory is listed to: the audit log, root's
+/// marker, and one marker per non-root freezer. Bounds both the listing a
+/// thaw walks and the markers a group member can make the directory hold.
+const MAX_STATE_NAMES: usize = 128;
+
+/// A freeze or a thaw is a lever over every agent in its scope, so an
+/// attested agent never pulls it: the class is the broker's, from kernel
+/// facts, and an agent that could freeze could stop its owner's other agents.
+fn refuse_attested_agent(caller: &CallerFacts, what: &'static str) -> Result<(), Refusal> {
+    if caller.classification.is_enrolled_agent() {
+        return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
+    }
+    Ok(())
+}
+
+/// Whether `uid`'s own freeze marker stands. Root's global marker is part of
+/// the loaded policy, so root asks nothing more. Storage that cannot be
+/// listed counts as frozen: this only ever withholds an enrolled agent.
+fn user_freeze_stands(platform: &Platform<'_>, uid: u32) -> bool {
+    if uid == 0 {
+        return false;
+    }
+    let Some(state) = platform.freeze_file else {
+        return true;
+    };
+    let Ok(names) = state.names_up_to(MAX_STATE_NAMES + 1) else {
+        return true;
+    };
+    // A listing cut off one past the bound may have cut the marker off too.
+    if names.len() > MAX_STATE_NAMES {
+        return true;
+    }
+    let marker = xudo_gate::policy::freeze_marker_name(uid);
+    names
+        .iter()
+        .any(|name| name.as_slice() == marker.as_bytes())
+}
+
 fn freeze_with(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     identity: &PeerIdentity,
+    caller: &CallerFacts,
     request: &BrokerRequest,
     reason: &str,
     encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
 ) -> Result<BrokerResponse, Refusal> {
+    refuse_attested_agent(caller, "an attested agent cannot freeze")?;
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
     })?;
@@ -1466,7 +1508,11 @@ fn freeze_with(
             )
         })?;
     drop(record);
-    publish_freeze(state, &bytes)?;
+    publish_freeze(
+        state,
+        &xudo_gate::policy::freeze_marker_name(identity.uid),
+        &bytes,
+    )?;
     deny_pending(platform, spool, identity, request)?;
     Ok(done())
 }
@@ -1474,20 +1520,33 @@ fn freeze_with(
 /// A killed broker can leave the temporary name behind, and the publish would
 /// then fail on it for ever. Under the directory lock no other freeze is
 /// mid-publish, so a name found here is stale.
-fn publish_freeze(state: &dyn Spool, bytes: &[u8]) -> Result<(), Refusal> {
+fn publish_freeze(state: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), Refusal> {
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
-    state
-        .remove(&freeze_temp())
+    let names = state
+        .names_up_to(MAX_STATE_NAMES + 1)
         .map_err(|e| Refusal::from(&e))?;
-    match state.publish("frozen", bytes) {
+    // Root's global marker is never refused for room: one slot is held back
+    // for it, so a full directory of user markers cannot disable root's freeze.
+    let is_roots = name == xudo_gate::policy::freeze_marker_name(0);
+    let present = names.iter().any(|n| n.as_slice() == name.as_bytes());
+    if !is_roots && !present && names.len() >= MAX_STATE_NAMES - 1 {
+        return Err(Refusal::client(
+            RefusalCode::SpoolFull,
+            "too many freeze markers",
+        ));
+    }
+    state
+        .remove(&freeze_temp(name))
+        .map_err(|e| Refusal::from(&e))?;
+    match state.publish(name, bytes) {
         Ok(()) | Err(SpoolError::Exists { .. }) => Ok(()),
         Err(error) => Err(Refusal::from(&error)),
     }
 }
 
-/// What `Spool::publish` names its temporary file for `frozen`.
-fn freeze_temp() -> Vec<u8> {
-    format!("{}frozen", xudo_sys::TEMP_PREFIX).into_bytes()
+/// What `Spool::publish` names its temporary file for the marker `name`.
+fn freeze_temp(name: &str) -> Vec<u8> {
+    format!("{}{name}", xudo_sys::TEMP_PREFIX).into_bytes()
 }
 
 fn encode_freeze_record(
@@ -1533,7 +1592,7 @@ fn deny_pending(
         let Ok(mut entry) = parse_entry(&bytes) else {
             continue;
         };
-        if !frozen_agent_entry(&entry) {
+        if !frozen_agent_entry(&entry) || !in_freeze_scope(identity, &entry) {
             continue;
         }
         entry.state = xudo_gate::request::ConfirmationState::Denied;
@@ -1598,21 +1657,26 @@ fn frozen_agent_entry(entry: &xudo_gate::request::PendingRequest) -> bool {
         )
 }
 
+/// A non-root freeze takes back only its own uid's agents; root's takes back
+/// everyone's. The uid is the requester's, stored at mint from kernel facts.
+fn in_freeze_scope(freezer: &PeerIdentity, entry: &xudo_gate::request::PendingRequest) -> bool {
+    freezer.uid == 0 || entry.caller_uid == freezer.uid
+}
+
 /// The fixed claim string a re-decision carries. The decision never reads a
 /// claim; passing a constant makes that structural, not a convention.
 const STORED_CLASS_CLAIM: &str = "stored-class";
 
+/// Thaw lifts the freezer's own scope: a user's marker, or, for root, the
+/// global one and every user's. An agent cannot thaw, and a user cannot lift
+/// root's global marker or another user's.
 fn thaw(
     platform: &mut Platform<'_>,
     identity: &PeerIdentity,
+    caller: &CallerFacts,
     _request: &BrokerRequest,
 ) -> Result<BrokerResponse, Refusal> {
-    if identity.uid != 0 {
-        return Err(Refusal::client(
-            RefusalCode::ChannelUntrusted,
-            "thaw requires uid 0",
-        ));
-    }
+    refuse_attested_agent(caller, "an attested agent cannot thaw")?;
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
     })?;
@@ -1625,13 +1689,38 @@ fn thaw(
                 vec!["xudo thaw".to_owned()],
                 "human",
             )
-            .with_evidence(vec!["broker=xudod".to_owned(), "uid=0".to_owned()])
+            .with_evidence(vec![
+                "broker=xudod".to_owned(),
+                format!("uid={}", identity.uid),
+            ])
             .with_outcome(xudo_audit::record::Outcome::NotExecuted)
         })
         .map_err(|_| {
             Refusal::broker(RefusalCode::BrokerUnusable, "thaw audit record was refused")
         })?;
-    state.remove(b"frozen").map_err(|e| Refusal::from(&e))?;
+    if identity.uid != 0 {
+        let marker = xudo_gate::policy::freeze_marker_name(identity.uid);
+        state
+            .remove(marker.as_bytes())
+            .map_err(|e| Refusal::from(&e))?;
+        return Ok(done());
+    }
+    let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
+    let names = state
+        .names_up_to(MAX_STATE_NAMES + 1)
+        .map_err(|e| Refusal::from(&e))?;
+    if names.len() > MAX_STATE_NAMES {
+        return Err(Refusal::broker(
+            RefusalCode::SpoolFull,
+            "the state directory holds too many names to thaw",
+        ));
+    }
+    for name in names
+        .iter()
+        .filter(|name| xudo_gate::policy::is_freeze_marker_name(name))
+    {
+        state.remove(name).map_err(|e| Refusal::from(&e))?;
+    }
     Ok(done())
 }
 
@@ -2561,6 +2650,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     impl Host {
         fn honest() -> Self {
+            Self::honest_as(UID)
+        }
+
+        /// A peer that identifies honestly as `uid`.
+        fn honest_as(uid: u32) -> Self {
             let record = PidfdInfo::empty()
                 .with_ids(ProcessIds {
                     pid: PID,
@@ -2568,13 +2662,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     ppid: 1,
                 })
                 .with_creds(Creds {
-                    ruid: UID,
+                    ruid: uid,
                     rgid: GID,
-                    euid: UID,
+                    euid: uid,
                     egid: GID,
-                    suid: UID,
+                    suid: uid,
                     sgid: GID,
-                    fsuid: UID,
+                    fsuid: uid,
                     fsgid: GID,
                 });
             Self {
@@ -2585,7 +2679,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 peers: FakePeer::new()
                     .with_cred(Ok(PeerCred {
                         pid: PID,
-                        uid: UID,
+                        uid,
                         gid: GID,
                     }))
                     .with_stat(Ok(stat_line(PID, START)))
@@ -3883,30 +3977,371 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &connection(Ok(thaw.to_json().into_bytes())),
             Ok(&spool),
         );
+        assert_eq!(outcome.answer, Answer::Done);
+    }
+
+    fn thaw_request() -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::Thaw,
+        }
+    }
+
+    /// What a freeze from an attested agent would be classified as. The broker
+    /// classifies everyone `Unattested` until M4, so the agent paths are
+    /// reached only by handing the handler these facts.
+    fn an_attested_agent() -> CallerFacts {
+        CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "scope-44".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        )
+    }
+
+    const MARKER: &[u8] = b"{}";
+
+    #[test]
+    fn a_users_thaw_lifts_only_their_own_marker() {
+        let mut host = Host::honest();
+        for name in ["frozen", "frozen-1000", "frozen-2000", "audit.jsonl"] {
+            host.freeze_file.publish(name, MARKER).unwrap();
+        }
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(thaw_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        let left: Vec<_> = host.freeze_file.files().into_keys().collect();
         assert_eq!(
-            refusal_of(&outcome.answer),
-            Some(RefusalCode::ChannelUntrusted)
+            left,
+            [
+                b"audit.jsonl".to_vec(),
+                b"frozen".to_vec(),
+                b"frozen-2000".to_vec()
+            ]
+        );
+        assert_eq!(host.audit.records().len(), 1);
+    }
+
+    #[test]
+    fn root_thaw_lifts_every_marker_and_nothing_else() {
+        let mut host = Host::honest_as(0);
+        for name in [
+            "frozen",
+            "frozen-1000",
+            "frozen-2000",
+            "frozen-x",
+            "audit.jsonl",
+        ] {
+            host.freeze_file.publish(name, MARKER).unwrap();
+        }
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(thaw_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        let left: Vec<_> = host.freeze_file.files().into_keys().collect();
+        assert_eq!(left, [b"audit.jsonl".to_vec(), b"frozen-x".to_vec()]);
+    }
+
+    #[test]
+    fn root_thaw_refuses_storage_it_cannot_list_or_clear() {
+        let broken = SpoolError::InvalidName {
+            name: "state".to_owned(),
+        };
+        let identity = test_identity(PID, START, 0, 0);
+        let mut root = identity.clone();
+        root.uid = 0;
+        for state in [
+            FakeSpool::new().failing_lock(broken.clone()),
+            FakeSpool::new().failing_names(broken.clone()),
+        ] {
+            let mut host = Host::honest_as(0);
+            host.freeze_file = state;
+            assert!(
+                thaw(
+                    &mut host.platform(),
+                    &root,
+                    &classify(&root),
+                    &thaw_request()
+                )
+                .is_err()
+            );
+        }
+        let mut host = Host::honest_as(0);
+        host.freeze_file = FakeSpool::new()
+            .with_file("frozen-1000", MARKER)
+            .failing_remove(broken);
+        assert!(
+            thaw(
+                &mut host.platform(),
+                &root,
+                &classify(&root),
+                &thaw_request()
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn thaw_from_a_non_root_peer_is_refused() {
-        let mut host = Host::honest();
-        let request = BrokerRequest {
-            schema_version: WIRE_SCHEMA_VERSION,
-            question: xudo_wire::Question::Thaw,
+    fn a_users_freeze_and_thaw_refuse_storage_that_fails() {
+        let broken = SpoolError::InvalidName {
+            name: "state".to_owned(),
         };
+        let identity = test_identity(PID, START, 0, 0);
+        let mut host = Host::honest();
+        host.freeze_file = FakeSpool::new().failing_names(broken.clone());
+        let error = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+
+        let mut host = Host::honest();
+        host.freeze_file = FakeSpool::new()
+            .with_file("frozen-1000", MARKER)
+            .failing_remove(broken);
+        let error = thaw(
+            &mut host.platform(),
+            &identity,
+            &classify(&identity),
+            &thaw_request(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::SpoolUnusable);
+        assert!(
+            host.freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
+    }
+
+    #[test]
+    fn an_attested_agent_cannot_thaw() {
+        for uid in [UID, 0] {
+            let mut identity = test_identity(PID, START, 0, 0);
+            identity.uid = uid;
+            let mut host = Host::honest_as(uid);
+            for name in ["frozen", "frozen-1000"] {
+                host.freeze_file.publish(name, MARKER).unwrap();
+            }
+            let refused = thaw(
+                &mut host.platform(),
+                &identity,
+                &an_attested_agent(),
+                &thaw_request(),
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            assert_eq!(host.freeze_file.files().len(), 2);
+            assert!(host.audit.records().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_attested_agent_cannot_freeze() {
+        for uid in [UID, 0] {
+            let mut identity = test_identity(PID, START, 0, 0);
+            identity.uid = uid;
+            let entry = enrolled_entry(NONCE, UID);
+            let spool = FakeSpool::new().with_file(NONCE, entry.to_json());
+            let mut host = Host::honest_as(uid);
+            let refused = freeze_with(
+                &mut host.platform(),
+                &spool,
+                &identity,
+                &an_attested_agent(),
+                &freeze_request(),
+                "maintenance",
+                &serde_json::to_vec,
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            // Nothing was published, audited, or taken back.
+            assert!(host.freeze_file.files().is_empty());
+            assert!(host.audit.records().is_empty());
+            assert_eq!(
+                spool.files()[NONCE.as_bytes()],
+                entry.to_json().into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn a_users_freeze_does_not_touch_another_users_agents() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let mut kept = Vec::new();
+        for (nonce, uid) in [
+            ("a".repeat(64), UID),
+            ("b".repeat(64), 2000),
+            ("c".repeat(64), 0),
+        ] {
+            let entry = enrolled_entry(&nonce, uid);
+            spool.publish(&nonce, entry.to_json().as_bytes()).unwrap();
+            if uid != UID {
+                kept.push((nonce, entry.to_json().into_bytes()));
+            }
+        }
         let outcome = serve_with(
             &mut host,
-            &connection(Ok(request.to_json().into_bytes())),
-            Ok(&FakeSpool::new()),
+            &connection(Ok(freeze_request().to_json().into_bytes())),
+            Ok(&spool),
         );
-        assert_eq!(
-            refusal_of(&outcome.answer),
-            Some(RefusalCode::ChannelUntrusted)
+        assert_eq!(outcome.answer, Answer::Done);
+        let files = spool.files();
+        assert!(!files.contains_key("a".repeat(64).as_bytes()));
+        for (nonce, bytes) in kept {
+            assert_eq!(files[nonce.as_bytes()], bytes);
+        }
+        // Only the freezer's own marker exists, so it cannot stand for anyone
+        // else: the global one is root's.
+        let markers: Vec<_> = host.freeze_file.files().into_keys().collect();
+        assert_eq!(markers, [b"frozen-1000".to_vec()]);
+        let platform = host.platform();
+        assert!(user_freeze_stands(&platform, UID));
+        assert!(!user_freeze_stands(&platform, 2000));
+    }
+
+    #[test]
+    fn root_freeze_covers_every_users_agents() {
+        let mut host = Host::honest_as(0);
+        let spool = FakeSpool::new();
+        for (nonce, uid) in [
+            ("a".repeat(64), UID),
+            ("b".repeat(64), 2000),
+            ("c".repeat(64), 0),
+        ] {
+            let entry = enrolled_entry(&nonce, uid);
+            spool.publish(&nonce, entry.to_json().as_bytes()).unwrap();
+        }
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(freeze_request().to_json().into_bytes())),
+            Ok(&spool),
         );
-        assert!(host.freeze_file.files().is_empty());
-        assert_eq!(host.audit.records().len(), 1);
+        assert_eq!(outcome.answer, Answer::Done);
+        assert!(spool.files().is_empty());
+        let markers: Vec<_> = host.freeze_file.files().into_keys().collect();
+        assert_eq!(markers, [b"frozen".to_vec()]);
+    }
+
+    #[test]
+    fn a_marker_for_one_user_is_not_a_marker_for_another_and_root_asks_nothing() {
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        host.freeze_file.publish("frozen-10", MARKER).unwrap();
+        let platform = host.platform();
+        assert!(user_freeze_stands(&platform, 1000));
+        assert!(user_freeze_stands(&platform, 10));
+        assert!(!user_freeze_stands(&platform, 100));
+        assert!(!user_freeze_stands(&platform, 0));
+
+        // Storage that is missing or cannot be listed withholds, never grants.
+        let mut host = Host::honest();
+        host.freeze_available = false;
+        assert!(user_freeze_stands(&host.platform(), UID));
+        let mut host = Host::honest();
+        host.freeze_file = FakeSpool::new().failing_names(SpoolError::InvalidName {
+            name: "state".to_owned(),
+        });
+        assert!(user_freeze_stands(&host.platform(), UID));
+    }
+
+    #[test]
+    fn an_overflowing_state_listing_counts_as_frozen_and_blocks_a_thaw_all() {
+        let junk = || {
+            (0..=MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+                state.with_file(format!("junk-{index:04}"), MARKER)
+            })
+        };
+        let mut host = Host::honest();
+        host.freeze_file = junk();
+        assert!(user_freeze_stands(&host.platform(), 2000));
+
+        let mut root = test_identity(PID, START, 0, 0);
+        root.uid = 0;
+        let mut host = Host::honest_as(0);
+        host.freeze_file = junk();
+        let refused = thaw(
+            &mut host.platform(),
+            &root,
+            &classify(&root),
+            &thaw_request(),
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, RefusalCode::SpoolFull);
+    }
+
+    #[test]
+    fn a_full_state_directory_cannot_refuse_roots_freeze() {
+        let mut host = Host::honest_as(0);
+        host.freeze_file = (0..MAX_STATE_NAMES - 1).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        let mut root = test_identity(PID, START, 0, 0);
+        root.uid = 0;
+        freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &root,
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap();
+        assert!(host.freeze_file.files().contains_key(b"frozen".as_slice()));
+    }
+
+    #[test]
+    fn a_group_member_cannot_fill_the_state_directory_with_markers() {
+        let full = || {
+            (0..MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+                state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+            })
+        };
+        let mut host = Host::honest();
+        host.freeze_file = full();
+        let refused = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &test_identity(PID, START, 0, 0),
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, RefusalCode::SpoolFull);
+        assert!(
+            !host
+                .freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
+
+        // A marker already there is not a new name, so it still publishes.
+        let mut host = Host::honest();
+        host.freeze_file = (1..MAX_STATE_NAMES)
+            .fold(FakeSpool::new(), |state, index| {
+                state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+            })
+            .with_file("frozen-1000", MARKER);
+        assert_eq!(host.freeze_file.files().len(), MAX_STATE_NAMES);
+        freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &test_identity(PID, START, 0, 0),
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3949,7 +4384,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let marker = host
             .freeze_file
             .files()
-            .get(b"frozen".as_slice())
+            .get(b"frozen-1000".as_slice())
             .cloned()
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&marker).unwrap();
@@ -4019,6 +4454,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &mut host.platform(),
             &FakeSpool::new(),
             &identity,
+            &classify(&identity),
             &request,
             "x",
             &|_| Err(serde_json::from_str::<()>("invalid").unwrap_err()),
@@ -4156,33 +4592,48 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.freeze_file.publish("frozen", b"marker").unwrap();
         assert_eq!(
-            thaw(&mut host.platform(), &identity, &request)
-                .unwrap()
-                .answer,
+            thaw(
+                &mut host.platform(),
+                &identity,
+                &classify(&identity),
+                &request
+            )
+            .unwrap()
+            .answer,
             Answer::Done
         );
         assert!(host.freeze_file.files().is_empty());
 
         let mut host = Host::honest();
-        host.freeze_file = FakeSpool::new().failing_remove(SpoolError::InvalidName {
-            name: "frozen".to_owned(),
-        });
-        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
-
-        let mut host = Host::honest();
         host.freeze_available = false;
-        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
+        assert!(
+            thaw(
+                &mut host.platform(),
+                &identity,
+                &classify(&identity),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         host.audit = FakeAuditSink::failing("refused");
         host.freeze_file.publish("frozen", b"marker").unwrap();
-        assert!(thaw(&mut host.platform(), &identity, &request).is_err());
+        assert!(
+            thaw(
+                &mut host.platform(),
+                &identity,
+                &classify(&identity),
+                &request
+            )
+            .is_err()
+        );
         assert!(!host.freeze_file.files().is_empty());
     }
 
     #[test]
     fn freeze_denies_pending_agent_entries() {
-        let mut host = Host::honest();
+        let mut host = Host::honest_as(0);
         let spool = FakeSpool::new();
         let mut approved = enrolled_entry(&"b".repeat(64), 2000);
         approved.state = xudo_gate::request::ConfirmationState::Approved;
@@ -4245,7 +4696,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             assert_eq!(kept.state, xudo_gate::request::ConfirmationState::Pending);
         }
         assert!(host.confirmations.files().is_empty());
-        assert!(host.freeze_file.files().contains_key(b"frozen".as_slice()));
+        assert!(
+            host.freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
     }
 
     #[test]
@@ -4271,7 +4726,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn a_stale_freeze_temp_does_not_disable_freeze() {
         let mut host = Host::honest();
-        host.freeze_file.publish(".tmp.frozen", b"half").unwrap();
+        host.freeze_file
+            .publish(".tmp.frozen-1000", b"half")
+            .unwrap();
         let outcome = serve_with(
             &mut host,
             &connection(Ok(freeze_request().to_json().into_bytes())),
@@ -4279,8 +4736,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         assert_eq!(outcome.answer, Answer::Done);
         let files = host.freeze_file.files();
-        assert!(files.contains_key(b"frozen".as_slice()));
-        assert!(!files.contains_key(b".tmp.frozen".as_slice()));
+        assert!(files.contains_key(b"frozen-1000".as_slice()));
+        assert!(!files.contains_key(b".tmp.frozen-1000".as_slice()));
         assert!(host.freeze_file.calls().contains(&SpoolCall::Lock));
 
         let identity = test_identity(PID, START, 0, 0);
@@ -4350,7 +4807,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         .unwrap();
         let record = host.audit.records().last().unwrap();
         assert!(record.evidence.contains(&"reason=line\\nbreak".to_owned()));
-        let marker = host.freeze_file.files()[b"frozen".as_slice()].clone();
+        let marker = host.freeze_file.files()[b"frozen-1000".as_slice()].clone();
         let value: serde_json::Value = serde_json::from_slice(&marker).unwrap();
         assert!(value["time"].as_u64().unwrap() > 1_700_000_000_000);
     }
@@ -8713,7 +9170,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             // re-decision classified the watcher and recorded "unattested".
             proptest::prop_assert_eq!(&by_other.labels, &[label.to_owned()]);
             proptest::prop_assert_eq!(by_baseline, by_other);
-            proptest::prop_assert_eq!(frozen_by(&entry, &baseline), frozen_by(&entry, &other));
+            // A freeze reaches only the freezer's own uid (or all, for root),
+            // so the comparison holds the freezer's uid at the entry's.
+            let mut same_uid = other.clone();
+            same_uid.uid = UID;
+            proptest::prop_assert_eq!(frozen_by(&entry, &baseline), frozen_by(&entry, &same_uid));
         }
 
         #[test]
@@ -8916,6 +9377,60 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             deny_pending(&mut host.platform(), &spool, &watcher, &freeze_request()).unwrap();
             assert_eq!(spool.files()[NONCE.as_bytes()], bytes);
             assert!(host.audit.records().is_empty());
+        }
+    }
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Over a spool of human, unattested and enrolled-agent entries of
+        /// several uids, in every state, a freeze takes back exactly the live
+        /// enrolled-agent entries in its scope (the freezer's own uid, or
+        /// everyone's for root) and leaves every other byte alone.
+        #[test]
+        fn freeze_never_denies_a_human_entry(
+            rows in proptest::collection::vec((0usize..4, 0u8..3, 0u8..3), 1..12),
+            freezer in 0usize..4,
+        ) {
+            use xudo_gate::request::{AttestedClass, ConfirmationState};
+            let uids = [0u32, 1000, 2000, 3000];
+            let freezer_uid = uids[freezer];
+            let spool = FakeSpool::new();
+            let mut expected_taken = Vec::new();
+            let mut before = std::collections::BTreeMap::new();
+            for (index, (uid_at, class, state)) in rows.into_iter().enumerate() {
+                let uid = uids[uid_at];
+                let nonce = format!("{:064x}", index + 1);
+                let mut entry = enrolled_entry(&nonce, uid);
+                match class {
+                    0 => stored_as(&mut entry, AttestedClass::Human),
+                    1 => stored_as(&mut entry, AttestedClass::Unattested),
+                    _ => {}
+                }
+                entry.state = match state {
+                    0 => ConfirmationState::Pending,
+                    1 => ConfirmationState::Approved,
+                    _ => ConfirmationState::Denied,
+                };
+                let live_agent = class == 2 && state < 2;
+                if live_agent && (freezer_uid == 0 || uid == freezer_uid) {
+                    expected_taken.push(nonce.clone());
+                }
+                before.insert(nonce.clone().into_bytes(), entry.to_json().into_bytes());
+                spool.publish(&nonce, entry.to_json().as_bytes()).unwrap();
+            }
+            let mut identity = test_identity(PID, START, 0, 0);
+            identity.uid = freezer_uid;
+            let mut host = Host::honest_as(freezer_uid);
+            deny_pending(&mut host.platform(), &spool, &identity, &freeze_request()).unwrap();
+            let after = spool.files();
+            for (name, bytes) in &before {
+                let nonce = String::from_utf8(name.clone()).unwrap();
+                if expected_taken.contains(&nonce) {
+                    proptest::prop_assert!(!after.contains_key(name));
+                } else {
+                    proptest::prop_assert_eq!(after.get(name), Some(bytes));
+                }
+            }
         }
     }
 }

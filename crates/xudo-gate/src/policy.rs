@@ -12,6 +12,42 @@ pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub const MAX_FREEZE_BYTES: usize = 2048;
 /// The broker-owned freeze marker.
 pub const FREEZE_FILE: &str = "/var/lib/xudo/frozen";
+/// The state directory the freeze markers live in.
+pub const FREEZE_DIR: &str = "/var/lib/xudo";
+
+/// The marker one uid's freeze is published under: root's is the global
+/// `frozen`, anyone else's covers that uid's agents only. The name is built
+/// from a number, never from anything the caller wrote.
+#[must_use]
+pub fn freeze_marker_name(uid: u32) -> String {
+    if uid == 0 {
+        "frozen".to_owned()
+    } else {
+        format!("frozen-{uid}")
+    }
+}
+
+/// Whether `name` is a freeze marker's name: `frozen` or `frozen-<digits>`.
+#[must_use]
+pub fn is_freeze_marker_name(name: &[u8]) -> bool {
+    match name.strip_prefix(b"frozen") {
+        Some(b"") => true,
+        Some(rest) => rest
+            .strip_prefix(b"-")
+            .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)),
+        None => false,
+    }
+}
+
+/// A reader of one trusted file, as the marker check is handed it.
+pub type MarkerRead<'a> = dyn Fn(&Path, usize) -> Result<Option<Vec<u8>>, TrustError> + 'a;
+
+/// Whether `uid`'s own freeze marker stands. Anything but a clean absence
+/// counts as frozen: a marker that is unreadable or malformed freezes.
+pub fn user_frozen(uid: u32, read: &MarkerRead<'_>) -> bool {
+    let path = format!("{FREEZE_DIR}/{}", freeze_marker_name(uid));
+    freeze_state(read(Path::new(&path), MAX_FREEZE_BYTES))
+}
 
 #[cfg(feature = "fuzzing")]
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -264,6 +300,48 @@ mod tests {
         )
         .unwrap();
         assert!(loaded.settings.frozen);
+    }
+
+    #[test]
+    fn marker_names_are_numbers_never_caller_text() {
+        assert_eq!(freeze_marker_name(0), "frozen");
+        assert_eq!(freeze_marker_name(1000), "frozen-1000");
+        for name in [&b"frozen"[..], b"frozen-0", b"frozen-1000"] {
+            assert!(is_freeze_marker_name(name));
+        }
+        for name in [
+            &b"frozen-"[..],
+            b"frozen-1x",
+            b"frozen-../x",
+            b"frozen1",
+            b"audit.jsonl",
+            b"xfrozen",
+            b"",
+        ] {
+            assert!(!is_freeze_marker_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_users_marker_that_is_malformed_or_unreadable_still_freezes_that_user() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let read = |path: &Path, limit: usize| {
+            seen.borrow_mut().push((path.to_path_buf(), limit));
+            Ok(Some(b"garbage".to_vec()))
+        };
+        assert!(user_frozen(1000, &read));
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(
+                Path::new("/var/lib/xudo/frozen-1000").to_path_buf(),
+                MAX_FREEZE_BYTES
+            )]
+        );
+        assert!(!user_frozen(1000, &|_, _| Ok(None)));
+        assert!(user_frozen(1000, &|_, _| Err(TrustError::NotRootOwned {
+            at: "/var/lib/xudo".to_owned(),
+            uid: 1000
+        })));
     }
 
     #[test]

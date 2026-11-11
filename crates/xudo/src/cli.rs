@@ -222,14 +222,14 @@ pub enum Command {
     /// Watch for confirmation requests on this terminal and answer them.
     Watch,
 
-    /// Stop requests on the agent path until thawed by root.
+    /// Stop your own agents' requests until thawed (root: everyone's).
     Freeze {
         /// Why the broker is being frozen.
         #[arg(long, required = true, value_name = "TEXT")]
         reason: String,
     },
 
-    /// Resume the agent path. Requires uid 0.
+    /// Lift your own freeze (root lifts every freeze). Not for agents.
     Thaw,
 
     /// Print the block that tells an agent what it may do.
