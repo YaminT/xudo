@@ -24,6 +24,40 @@ fn stale_telemetry_claim(text: &str) -> bool {
             || lower.contains("planned"))
 }
 
+/// Public prose with markup and line breaks collapsed, so a claim split by
+/// `<code>` or a backtick still matches the words a reader sees.
+fn flatten_claim(text: &str) -> String {
+    let stripped = text
+        .replace("<code>", "")
+        .replace("</code>", "")
+        .replace('`', "");
+    let mut flat = String::new();
+    for word in stripped.split_whitespace() {
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(&word.to_ascii_lowercase());
+    }
+    flat
+}
+
+fn gnu_id_workaround(flat: &str) -> bool {
+    flat.contains("install gnu id") || flat.contains("gnu coreutils")
+}
+
+/// "Near" is the same sentence. The version dot in `26.04` is not a boundary,
+/// so the next sentence may name the release and `NOT VERIFIED` separately.
+fn ubuntu_2604_near_not_verified(flat: &str) -> bool {
+    flat.replace("26.04", "26-04")
+        .split(['.', '!', '?'])
+        .any(|sentence| sentence.contains("26-04") && sentence.contains("not verified"))
+}
+
+fn stale_probe_claim(text: &str) -> bool {
+    let flat = flatten_claim(text);
+    gnu_id_workaround(&flat) || ubuntu_2604_near_not_verified(&flat)
+}
+
 fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
@@ -53,7 +87,10 @@ fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
         .filter_map(|file| {
             let path = root.join(file);
             let text = fs::read_to_string(&path).unwrap();
-            (stale_confirmation_claim(&text) || stale_telemetry_claim(&text)).then(|| file.clone())
+            (stale_confirmation_claim(&text)
+                || stale_telemetry_claim(&text)
+                || stale_probe_claim(&text))
+            .then(|| file.clone())
         })
         .collect();
 
@@ -128,4 +165,53 @@ fn the_check_catches_stale_claims_and_allows_current_status() {
     assert!(!stale_telemetry_claim(
         "just telemetry runs the strace no-telemetry check."
     ));
+}
+
+#[test]
+fn stale_probe_claims_fail_the_old_readme_and_allow_current_wording() {
+    const OLD_README: &str = "The install probe reports `installed, but NOT VERIFIED` on doas and \
+         multicall-coreutils systems. Examples include stock Ubuntu 26.04 and Alpine, where \
+         `/usr/bin/id` is uutils or a multicall applet. The Ubuntu 26.04 systemd and differential \
+         lanes pass because they install GNU `id`.";
+    assert!(stale_probe_claim(OLD_README));
+    assert!(gnu_id_workaround(&flatten_claim(
+        "The lanes pass because they install GNU `id`."
+    )));
+    assert!(gnu_id_workaround(&flatten_claim(
+        "The 26.04 lanes install GNU <code>id</code>."
+    )));
+    assert!(gnu_id_workaround(&flatten_claim(
+        "The disposable lane installs GNU coreutils for the probe."
+    )));
+    assert!(!gnu_id_workaround(&flatten_claim(
+        "Alpine is a multicall-coreutils system with no regular probe program."
+    )));
+    assert!(ubuntu_2604_near_not_verified(&flatten_claim(
+        "Stock Ubuntu 26.04 reports NOT VERIFIED."
+    )));
+    assert!(ubuntu_2604_near_not_verified(&flatten_claim(
+        "Is Ubuntu 26.04 NOT VERIFIED?"
+    )));
+    assert!(!ubuntu_2604_near_not_verified(&flatten_claim(
+        "Ubuntu 26.04 verifies through gnuid."
+    )));
+    assert!(!ubuntu_2604_near_not_verified(&flatten_claim(
+        "The doas install probe remains NOT VERIFIED."
+    )));
+    assert!(!ubuntu_2604_near_not_verified(&flatten_claim(
+        "Ubuntu 26.04! The probe is NOT VERIFIED on doas."
+    )));
+    assert!(!ubuntu_2604_near_not_verified(&flatten_claim(
+        "Nothing about the install probe."
+    )));
+    assert!(stale_probe_claim(
+        "Stock Ubuntu 26.04 reports NOT VERIFIED for the install probe."
+    ));
+    assert!(!stale_probe_claim(
+        "The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so \
+         stock Ubuntu 26.04 verifies. It reports `installed, but NOT VERIFIED` on doas and on a \
+         multicall-coreutils system with no regular probe program, such as Alpine."
+    ));
+    assert_eq!(flatten_claim(""), "");
+    assert_eq!(flatten_claim("GNU"), "gnu");
 }

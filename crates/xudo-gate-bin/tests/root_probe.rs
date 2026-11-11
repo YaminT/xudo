@@ -786,7 +786,7 @@ fn live_test_watcher() -> Pty {
     root_file(
         &format!("{CONFIRM_DIR}/1000.json"),
         format!(
-            "{{\"h\":[{pid},{},{},{},{}],\"b\":[],\"o\":[]}}",
+            "{{\"h\":{{\"p\":{pid},\"s\":{},\"t\":{},\"d\":{},\"a\":{}}},\"b\":[],\"o\":[]}}",
             stat.starttime, stat.tty_nr, stat.session, now
         )
         .as_bytes(),
