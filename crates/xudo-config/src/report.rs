@@ -102,6 +102,21 @@ mod tests {
     }
 
     #[test]
+    fn a_config_file_flag_origin_is_pinned() {
+        let mut settings = Settings::default();
+        apply_file(
+            &mut settings,
+            Layer::ConfigFile,
+            "/tmp/x",
+            "# c\nfrozen = true\n",
+        )
+        .unwrap();
+        insta::assert_snapshot!(get(&settings, Setting::Frozen, true), @"
+        true	--config-file (/tmp/x:2)
+        ");
+    }
+
+    #[test]
     fn compiled_in_values_are_listed_as_compiled_in() {
         let settings = with_file();
         let all = ListOptions {
