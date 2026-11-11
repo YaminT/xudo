@@ -55,6 +55,10 @@
 //! sequence written against those traits and holds no syscall of its own;
 //! `xudo-gate-bin` is five lines that hand it the real host.
 
+#[cfg(feature = "lane-short-ttl")]
+#[used]
+static LANE_SHORT_TTL_MARKER: &[u8] = b"xudo-lane-short-ttl-20-seconds";
+
 pub mod decide;
 pub mod env;
 pub mod policy;

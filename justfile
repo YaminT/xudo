@@ -321,6 +321,8 @@ deb-test: deb
 # trail is checked, and remove stops the socket. Needs Docker.
 # ci/systemd/run.sh says how the container is booted and what is asserted.
 systemd-test: deb
+    CARGO_TARGET_DIR=target/systemd-short-ttl cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --features xudod/lane-short-ttl --target {{musl_triple}}
+    XUDO_BUILD_BIN_DIR=target/systemd-short-ttl/{{musl_triple}}/release packaging/deb/build.sh {{musl_triple}} target/systemd-short-ttl/deb
     ci/systemd/run.sh {{musl_triple}}
 
 # Trace selected shipped release-musl binaries and check their normal dependency graph.

@@ -6,12 +6,9 @@
 #
 #   ci/systemd/run.sh <musl triple>       (or: just systemd-test)
 #
-# Every case must run and pass. The one case that can legitimately be
-# impossible in an image, watch_in_a_user_namespace_is_refused (it needs
-# util-linux >= 2.39 and root able to create a user namespace), prints
-# "SKIP: <case>: <reason>" and fails the lane, unless the operator sets
-#   XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1
-# which turns that one named skip into a printed NOTE. Nothing else is skippable.
+# Every case must run and pass. The user-namespace case needs util-linux >=
+# 2.39 and root able to create a user namespace; if it cannot run, the lane
+# fails. Nothing is skippable.
 set -eu
 
 if [ "$#" -ne 1 ]; then
@@ -32,7 +29,9 @@ raw=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)
 [ -n "$raw" ] || { echo "FAIL: no version in Cargo.toml" >&2; exit 1; }
 deb_ver=$(printf '%s\n' "$raw" | tr '-' '~')
 deb="$root/target/deb/xudo_${deb_ver}_${arch}.deb"
+short_ttl_deb="$root/target/systemd-short-ttl/deb/xudo_${deb_ver}_${arch}.deb"
 [ -f "$deb" ] || { echo "FAIL: built package not at $deb" >&2; exit 1; }
+[ -f "$short_ttl_deb" ] || { echo "FAIL: short-TTL test package not at $short_ttl_deb" >&2; exit 1; }
 
 # Debian 13, Ubuntu 24.04, and Ubuntu 26.04, each as the image ships it.
 # 26.04's /usr/bin/id is a uutils symlink; the install probe uses gnuid.
@@ -112,6 +111,7 @@ boot_once() {
         --tmpfs /run:rw,nosuid,nodev \
         --tmpfs /run/lock:rw,nosuid,nodev,noexec \
         -v "$deb:/opt/xudo.deb:ro" \
+        -v "$short_ttl_deb:/opt/xudo-short-ttl.deb:ro" \
         -v "$root/ci/differential/exec.exp:/opt/exec.exp:ro" \
         -v "$here:/harness:ro" \
         "$image" \
@@ -174,7 +174,7 @@ for image in $images; do
     fi
 
     # Line-buffer: without a tty the row's stdout would arrive in one lump.
-    if ! docker exec -e XUDO_SYSTEMD_ALLOW_USERNS_SKIP="${XUDO_SYSTEMD_ALLOW_USERNS_SKIP:-}" "$name" stdbuf -oL -eL sh /harness/row.sh; then
+    if ! docker exec "$name" stdbuf -oL -eL sh /harness/row.sh; then
         echo "FAIL: row $image" >&2
         fail=1
     fi
