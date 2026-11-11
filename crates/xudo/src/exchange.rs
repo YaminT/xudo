@@ -289,8 +289,12 @@ impl BrokerIo for Live {
         let Some(stream) = self.stream.as_mut() else {
             return Step::Failed("the broker write ran before the connection".to_owned());
         };
-        let set = stream.set_write_timeout(Some(bounded));
-        let (armed, transfer) = after_timeout(set, earlier, || Write::write(stream, bytes));
+        let (armed, transfer) = after_timeout(
+            stream,
+            |stream| stream.set_write_timeout(Some(bounded)),
+            earlier,
+            |stream| Write::write(stream, bytes),
+        );
         self.send_bounded = armed;
         classify_io(transfer)
     }
@@ -303,8 +307,12 @@ impl BrokerIo for Live {
         // `shutdown` does not block on this socket. The deadline was already
         // checked, and the timeout is set so a kernel that does wait cannot
         // outlast it.
-        let set = stream.set_write_timeout(Some(bounded));
-        let (armed, end) = after_timeout(set, earlier, || stream.shutdown(Shutdown::Write));
+        let (armed, end) = after_timeout(
+            stream,
+            |stream| stream.set_write_timeout(Some(bounded)),
+            earlier,
+            |stream| stream.shutdown(Shutdown::Write),
+        );
         self.send_bounded = armed;
         classify_end(end)
     }
@@ -314,8 +322,12 @@ impl BrokerIo for Live {
         let Some(stream) = self.stream.as_mut() else {
             return Step::Failed("the broker read ran before the connection".to_owned());
         };
-        let set = stream.set_read_timeout(Some(bounded));
-        let (armed, transfer) = after_timeout(set, earlier, || Read::read(stream, buf));
+        let (armed, transfer) = after_timeout(
+            stream,
+            |stream| stream.set_read_timeout(Some(bounded)),
+            earlier,
+            |stream| Read::read(stream, buf),
+        );
         self.recv_bounded = armed;
         classify_io(transfer)
     }
@@ -329,13 +341,14 @@ impl BrokerIo for Live {
 /// closed, and dropping that result would discard bytes already queued. The
 /// earlier timeout is what bounds the call.
 fn after_timeout<T>(
-    set: io::Result<()>,
+    stream: &mut UnixStream,
+    set_timeout: impl FnOnce(&UnixStream) -> io::Result<()>,
     earlier: bool,
-    transfer: impl FnOnce() -> io::Result<T>,
+    transfer: impl FnOnce(&mut UnixStream) -> io::Result<T>,
 ) -> (bool, io::Result<T>) {
-    match set {
+    match set_timeout(stream) {
         Err(error) if !earlier => (false, Err(error)),
-        _ => (true, transfer()),
+        _ => (true, transfer(stream)),
     }
 }
 
@@ -1116,33 +1129,37 @@ mod tests {
     }
 
     /// Calling it is the bug: the first refused timeout must not transfer.
-    fn transfer_without_a_timeout() -> io::Result<usize> {
+    fn transfer_without_a_timeout(_: &mut UnixStream) -> io::Result<usize> {
         panic!("the transfer ran with no timeout set");
     }
 
     #[allow(clippy::unnecessary_wraps)] // the callback type is `io::Result`, not the bytes
-    fn queued_bytes() -> io::Result<usize> {
+    fn queued_bytes(_: &mut UnixStream) -> io::Result<usize> {
         Ok(4)
     }
 
     /// Calling it is the bug: shutdown must not run until a send timeout exists.
-    fn shutdown_without_a_timeout() -> io::Result<()> {
+    fn shutdown_without_a_timeout(_: &mut UnixStream) -> io::Result<()> {
         panic!("shutdown ran with no timeout set");
     }
 
     #[allow(clippy::unnecessary_wraps)] // the callback type is `io::Result`, not `()`
-    fn shutdown_finished() -> io::Result<()> {
+    fn shutdown_finished(_: &mut UnixStream) -> io::Result<()> {
         Ok(())
     }
 
     #[test]
     fn a_refused_timeout_is_denied_until_one_setting_has_succeeded() {
+        let mut stream = UnixStream::from(bare_socket());
         // The probe has to run once, or its body is an uncovered region. The
         // assertion below is that `after_timeout` does not run it.
-        let probed = std::panic::catch_unwind(transfer_without_a_timeout);
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transfer_without_a_timeout(&mut stream)
+        }));
         assert!(probed.is_err(), "the transfer probe did not panic");
         let (armed, result) = after_timeout(
-            Err(io::Error::other("refused")),
+            &mut stream,
+            |_| Err(io::Error::other("refused")),
             false,
             transfer_without_a_timeout,
         );
@@ -1150,28 +1167,41 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
 
-        let (armed, result) = after_timeout(Err(io::Error::other("closed")), true, queued_bytes);
+        let (armed, result) = after_timeout(
+            &mut stream,
+            |_| Err(io::Error::other("closed")),
+            true,
+            queued_bytes,
+        );
         assert!(armed);
         assert_eq!(result.unwrap(), 4);
 
-        let (armed, result) = after_timeout(Ok(()), false, queued_bytes);
+        let (armed, result) = after_timeout(&mut stream, |_| Ok(()), false, queued_bytes);
         assert!(armed);
         assert_eq!(result.unwrap(), 4);
 
-        let probed = std::panic::catch_unwind(shutdown_without_a_timeout);
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shutdown_without_a_timeout(&mut stream)
+        }));
         assert!(probed.is_err(), "the shutdown probe did not panic");
         let (armed, end) = after_timeout(
-            Err(io::Error::other("refused")),
+            &mut stream,
+            |_| Err(io::Error::other("refused")),
             false,
             shutdown_without_a_timeout,
         );
         assert!(!armed);
         assert!(end.unwrap_err().to_string().contains("refused"));
 
-        let (armed, end) = after_timeout(Err(io::Error::other("closed")), true, shutdown_finished);
+        let (armed, end) = after_timeout(
+            &mut stream,
+            |_| Err(io::Error::other("closed")),
+            true,
+            shutdown_finished,
+        );
         assert!(armed);
         assert!(end.is_ok());
-        let (armed, end) = after_timeout(Ok(()), false, shutdown_finished);
+        let (armed, end) = after_timeout(&mut stream, |_| Ok(()), false, shutdown_finished);
         assert!(armed);
         assert!(end.is_ok());
     }
@@ -1267,20 +1297,27 @@ mod tests {
 
     #[test]
     fn a_refused_first_timeout_does_not_transfer() {
-        let transfer_probe = std::panic::catch_unwind(transfer_without_a_timeout);
+        let mut refused_stream = UnixStream::from(bare_socket());
+        let transfer_probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transfer_without_a_timeout(&mut refused_stream)
+        }));
         assert!(transfer_probe.is_err(), "the transfer probe did not panic");
         let (armed, write) = after_timeout(
-            Err(io::Error::other("refused")),
+            &mut refused_stream,
+            |_| Err(io::Error::other("refused")),
             false,
             transfer_without_a_timeout,
         );
         assert!(!armed);
         assert_eq!(classify_io(write), Step::Failed("refused".to_owned()));
 
-        let shutdown_probe = std::panic::catch_unwind(shutdown_without_a_timeout);
+        let shutdown_probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shutdown_without_a_timeout(&mut refused_stream)
+        }));
         assert!(shutdown_probe.is_err(), "the shutdown probe did not panic");
         let (armed, shutdown) = after_timeout(
-            Err(io::Error::other("refused")),
+            &mut refused_stream,
+            |_| Err(io::Error::other("refused")),
             false,
             shutdown_without_a_timeout,
         );
@@ -1288,7 +1325,8 @@ mod tests {
         assert_eq!(classify_end(shutdown), Step::Failed("refused".to_owned()));
 
         let (armed, read) = after_timeout(
-            Err(io::Error::other("refused")),
+            &mut refused_stream,
+            |_| Err(io::Error::other("refused")),
             false,
             transfer_without_a_timeout,
         );
