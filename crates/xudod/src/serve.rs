@@ -31,7 +31,7 @@ use crate::mint::{
     AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
     entry_for_classified, publish,
 };
-use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
+use crate::policy::{LoadedPolicy, PolicySource, classify, decide, stored_caller};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
 
@@ -1537,7 +1537,7 @@ fn deny_pending(
             continue;
         }
         entry.state = xudo_gate::request::ConfirmationState::Denied;
-        let caller = classify(identity);
+        let caller = stored_caller(&entry);
         let policy = platform.policy.load().map_err(|_| {
             Refusal::broker(RefusalCode::PolicyUnloadable, "policy cannot be loaded")
         })?;
@@ -1547,7 +1547,7 @@ fn deny_pending(
             &BrokerRequest::new(
                 entry.program.clone(),
                 entry.argv.clone(),
-                entry.claimed_classification.clone(),
+                STORED_CLASS_CLAIM,
             ),
         );
         decision.verdict = xudo_policy::Verdict::Deny;
@@ -1584,16 +1584,23 @@ fn deny_pending(
 }
 
 /// The entries a freeze takes back: an enrolled agent's, pending or approved,
-/// which the gate would refuse while frozen anyway. The claim is a hint and
-/// only ever widens a denial; a human's request keeps its place because the
-/// password path keeps working. The claim is the caller's: M4 must record the
-/// attested class on the entry before a lie here can matter.
+/// which the gate would refuse while frozen anyway. The class is the one the
+/// broker stored at mint from kernel facts; the requester's claim is a hint
+/// and is never read. A human's or unattested request keeps its place because
+/// the password path keeps working.
 fn frozen_agent_entry(entry: &xudo_gate::request::PendingRequest) -> bool {
     use xudo_gate::request::ConfirmationState::{Approved, Pending};
     entry.needs_watch
         && matches!(entry.state, Pending | Approved)
-        && entry.claimed_classification.starts_with("enrolled-agent")
+        && matches!(
+            entry.attested_class,
+            xudo_gate::request::AttestedClass::EnrolledAgent { .. }
+        )
 }
+
+/// The fixed claim string a re-decision carries. The decision never reads a
+/// claim; passing a constant makes that structural, not a convention.
+const STORED_CLASS_CLAIM: &str = "stored-class";
 
 fn thaw(
     platform: &mut Platform<'_>,
@@ -1871,7 +1878,7 @@ fn bounded_prompt(
         action: entry.action.clone(),
         program: entry.program.clone(),
         argv: entry.argv.clone(),
-        classification: entry.claimed_classification.clone(),
+        classification: stored_caller(entry).classification.label().to_owned(),
         evidence: "watch approval is pending; the password remains required".to_owned(),
         expires_in_ms: entry.deadline.0.saturating_sub(now_ms),
     }
@@ -2106,7 +2113,7 @@ fn complete_answer(
     approve: bool,
 ) -> Result<BrokerResponse, Refusal> {
     let AnsweredEntry { id, bytes, entry } = answered;
-    let caller = classify(identity);
+    let caller = stored_caller(&entry);
     let policy = platform
         .policy
         .load()
@@ -2114,7 +2121,7 @@ fn complete_answer(
     let decision_request = BrokerRequest::new(
         entry.program.clone(),
         entry.argv.clone(),
-        entry.claimed_classification.clone(),
+        STORED_CLASS_CLAIM,
     );
     let mut decision = decide(&policy, &caller, &decision_request);
     if approve && decision.verdict != xudo_policy::Verdict::AllowWithConfirmation {
@@ -2213,6 +2220,7 @@ fn parse_entry(bytes: &[u8]) -> Result<xudo_gate::request::PendingRequest, Refus
     std::str::from_utf8(bytes)
         .ok()
         .and_then(|s| xudo_gate::request::PendingRequest::parse(s).ok())
+        .filter(xudo_gate::request::PendingRequest::has_consistent_attested_identity)
         .ok_or_else(|| Refusal::client(RefusalCode::RequestUnknown, "request entry is invalid"))
 }
 
@@ -2489,6 +2497,17 @@ exe = "/usr/bin/apt-get"
 args = [
   { name = "assume-yes", matcher = { literal = "-y" } },
   { name = "verb", matcher = { literal = "remove" } },
+  { name = "pkg", matcher = { one-of = ["gcc"] } },
+]
+
+[[action]]
+id = "xudo.pkg.purge-human"
+tier = "pkg-remove"
+confirm = "always"
+agent-allowed = false
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "purge" } },
   { name = "pkg", matcher = { one-of = ["gcc"] } },
 ]
 
@@ -4197,16 +4216,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn freeze_does_not_deny_another_users_human_request() {
+        use xudo_gate::request::AttestedClass::{Human, Unattested};
         let mut host = Host::honest();
         let spool = FakeSpool::new();
         let mut humans = Vec::new();
-        for (nonce, uid, class) in [
-            (NONCE.to_owned(), UID, "unattested"),
-            ("d".repeat(64), 2000, "human"),
-            ("e".repeat(64), 3000, "yolo-human"),
+        for (nonce, uid, class, stored) in [
+            (NONCE.to_owned(), UID, "unattested", Unattested),
+            ("d".repeat(64), 2000, "human", Human),
+            ("e".repeat(64), 3000, "yolo-human", Human),
         ] {
             let mut entry = enrolled_entry(&nonce, uid);
             class.clone_into(&mut entry.claimed_classification);
+            stored_as(&mut entry, stored);
             spool
                 .publish(&entry.nonce, entry.to_json().as_bytes())
                 .unwrap();
@@ -5682,8 +5703,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), {
             let mut entry = shown_entry();
-            entry.attested_class =
-                xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+            stored_as_agent(&mut entry);
             entry.to_json().into_bytes()
         });
         let ask = |class: Option<&xudo_gate::request::AttestedClass>| {
@@ -7480,9 +7500,24 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn enrolled_entry(nonce: &str, uid: u32) -> PendingRequest {
         let mut entry = shown_entry();
         entry.claimed_classification = "enrolled-agent".to_owned();
+        stored_as_agent(&mut entry);
         entry.nonce = nonce.to_owned();
         entry.caller_uid = uid;
         entry
+    }
+
+    /// What the broker stores at mint for an attested agent.
+    fn stored_as_agent(entry: &mut PendingRequest) {
+        entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+    }
+
+    /// What the broker stores at mint for a human or an unattested caller.
+    fn stored_as(entry: &mut PendingRequest, class: xudo_gate::request::AttestedClass) {
+        entry.attested_class = class;
+        entry.attested_scope_id = None;
+        entry.boot_id = None;
     }
 
     fn freeze_request() -> BrokerRequest {
@@ -8549,5 +8584,338 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(Served::Refused(Fault::Client).exit_status(), 0);
         assert_eq!(Served::Refused(Fault::Broker).exit_status(), UNUSABLE);
         assert_eq!(Served::Undelivered.exit_status(), 0);
+    }
+
+    /// What an answer or a freeze did, with every field that could carry a
+    /// claim or a watcher fact left out.
+    #[derive(Debug, PartialEq)]
+    struct Redecided {
+        refused: Option<RefusalCode>,
+        labels: Vec<String>,
+        verdicts: Vec<xudo_audit::record::Decision>,
+        denials: Vec<Option<String>>,
+        after: Option<xudo_gate::request::ConfirmationState>,
+    }
+
+    fn approved_entry(class: xudo_gate::request::AttestedClass, claim: &str) -> PendingRequest {
+        let mut entry = shown_entry();
+        stored_as(&mut entry, class);
+        claim.clone_into(&mut entry.claimed_classification);
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        entry.confirmed = true;
+        entry.confirmed_by = entry.shown_to.clone();
+        entry
+    }
+
+    fn class_label(class: &xudo_gate::request::AttestedClass) -> &'static str {
+        stored_caller(&PendingRequest {
+            attested_class: class.clone(),
+            ..shown_entry()
+        })
+        .classification
+        .label()
+    }
+
+    fn stored_state(spool: &FakeSpool) -> Option<xudo_gate::request::ConfirmationState> {
+        let files = spool.files();
+        let bytes = files.get(NONCE.as_bytes())?;
+        PendingRequest::parse(std::str::from_utf8(bytes).unwrap())
+            .ok()
+            .map(|entry| entry.state)
+    }
+
+    fn redecided(host: &Host, spool: &FakeSpool, refused: Option<RefusalCode>) -> Redecided {
+        let records = host.audit.records();
+        Redecided {
+            refused,
+            labels: records.iter().map(|r| r.classification.clone()).collect(),
+            verdicts: records.iter().map(|r| r.decision).collect(),
+            denials: records.iter().map(|r| r.denial.clone()).collect(),
+            after: stored_state(spool),
+        }
+    }
+
+    /// The answer path, called at the function level: the entry is already
+    /// marked answered, as `confirm::answer` leaves it.
+    fn answered_by(entry: &PendingRequest, watcher: &PeerIdentity, approve: bool) -> Redecided {
+        let mut answered = entry.clone();
+        answered.state = if approve {
+            xudo_gate::request::ConfirmationState::Approved
+        } else {
+            xudo_gate::request::ConfirmationState::Denied
+        };
+        let mut pending = entry.clone();
+        pending.state = xudo_gate::request::ConfirmationState::Pending;
+        pending.confirmed = false;
+        pending.confirmed_by = None;
+        let bytes = pending.to_json().into_bytes();
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+        let mut host = Host::honest();
+        let result = complete_answer(
+            &mut host.platform(),
+            &spool,
+            watcher,
+            &answer_request(NONCE, "remove", approve),
+            AnsweredEntry {
+                id: NONCE.to_owned(),
+                bytes,
+                entry: answered,
+            },
+            approve,
+        );
+        redecided(&host, &spool, result.err().map(|e| e.code))
+    }
+
+    fn frozen_by(entry: &PendingRequest, freezer: &PeerIdentity) -> Redecided {
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json());
+        let mut host = Host::honest();
+        let result = deny_pending(&mut host.platform(), &spool, freezer, &freeze_request());
+        redecided(&host, &spool, result.err().map(|e| e.code))
+    }
+
+    fn arbitrary_watcher(
+        pid: u32,
+        uid: u32,
+        sid: i64,
+        tty: i64,
+        cgroup: Option<u64>,
+    ) -> PeerIdentity {
+        let mut identity = test_identity(pid, START + 5, sid, tty);
+        identity.uid = uid;
+        identity.cgroup_id = cgroup;
+        identity
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_watchers_classification_never_changes_the_requesters_decision(
+            pid in 1u32..,
+            uid in proptest::prelude::any::<u32>(),
+            sid in proptest::prelude::any::<i64>(),
+            tty in proptest::prelude::any::<i64>(),
+            cgroup in proptest::option::of(proptest::prelude::any::<u64>()),
+            stored in 0u8..3,
+            approve in proptest::prelude::any::<bool>(),
+        ) {
+            use xudo_gate::request::AttestedClass;
+            let class = match stored {
+                0 => AttestedClass::Unattested,
+                1 => AttestedClass::Human,
+                _ => AttestedClass::EnrolledAgent { scope_id: 44 },
+            };
+            let label = class_label(&class);
+            let entry = approved_entry(class, "unattested");
+            let baseline = arbitrary_watcher(5000, UID, 2, 34816, None);
+            let other = arbitrary_watcher(pid, uid, sid, tty, cgroup);
+            let by_baseline = answered_by(&entry, &baseline, approve);
+            let by_other = answered_by(&entry, &other, approve);
+            // The labels are the stored class's, whoever answers. The old
+            // re-decision classified the watcher and recorded "unattested".
+            proptest::prop_assert_eq!(&by_other.labels, &[label.to_owned()]);
+            proptest::prop_assert_eq!(by_baseline, by_other);
+            proptest::prop_assert_eq!(frozen_by(&entry, &baseline), frozen_by(&entry, &other));
+        }
+
+        #[test]
+        fn an_attacker_controlled_claim_never_reaches_the_decision(
+            claim in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "enrolled-agent.*",
+                proptest::prelude::Just("enrolled-agent-yolo".to_string()),
+                proptest::prelude::Just("human".to_string()),
+                proptest::prelude::Just("unattested".to_string()),
+            ],
+            stored in 0u8..3,
+            approve in proptest::prelude::any::<bool>(),
+        ) {
+            use xudo_gate::request::AttestedClass;
+            let class = || match stored {
+                0 => AttestedClass::Unattested,
+                1 => AttestedClass::Human,
+                _ => AttestedClass::EnrolledAgent { scope_id: 44 },
+            };
+            let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+            let plain = approved_entry(class(), "unattested");
+            let claimed = approved_entry(class(), &claim);
+            proptest::prop_assert_eq!(
+                answered_by(&plain, &watcher, approve),
+                answered_by(&claimed, &watcher, approve)
+            );
+            proptest::prop_assert_eq!(frozen_by(&plain, &watcher), frozen_by(&claimed, &watcher));
+        }
+    }
+
+    fn purge_entry(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+        let mut entry = approved_entry(class, "unattested");
+        entry.action = "xudo.pkg.purge-human".to_owned();
+        entry.argv = vec!["purge".to_owned(), "gcc".to_owned()];
+        entry
+    }
+
+    #[test]
+    fn a_watchers_approval_cannot_escalate_an_agent_entry_past_agent_allowed_false() {
+        use xudo_gate::request::{AttestedClass, ConfirmationState};
+        let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+        // Stored as an agent: approve is refused as human-path-only, and the
+        // entry is not turned into an approval. Deny still works.
+        let agent = purge_entry(AttestedClass::EnrolledAgent { scope_id: 44 });
+        let refused = answered_by(&agent, &watcher, true);
+        assert_eq!(refused.refused, Some(RefusalCode::PolicyUnloadable));
+        assert!(refused.labels.is_empty());
+        assert_eq!(refused.after, Some(ConfirmationState::Pending));
+        let denied = answered_by(&agent, &watcher, false);
+        assert_eq!(denied.refused, None);
+        assert_eq!(denied.labels, ["enrolled-agent"]);
+        assert_eq!(denied.denials, [Some("confirmation_refused".to_owned())]);
+        // The same action, stored as unattested, is approved: the old
+        // re-decision as the watcher's class did exactly that for the agent.
+        let human = purge_entry(AttestedClass::Unattested);
+        let approved = answered_by(&human, &watcher, true);
+        assert_eq!(approved.refused, None);
+        assert_eq!(approved.labels, ["unattested"]);
+        assert_eq!(approved.after, Some(ConfirmationState::Approved));
+    }
+
+    #[test]
+    fn the_engine_ignores_the_stored_callers_placeholder_names() {
+        use xudo_policy::Classification;
+        let policy = policy();
+        let entry = enrolled_entry(NONCE, UID);
+        let request = BrokerRequest::new(entry.program.clone(), entry.argv.clone(), "x");
+        let baseline = stored_caller(&entry);
+        let expected = decide(&policy, &baseline, &request);
+        for yolo in [false, true] {
+            for (agent, session) in [("scope-44", "stored"), ("", ""), ("root", "other")] {
+                let mut caller = baseline.clone();
+                caller.classification = Classification::EnrolledAgent {
+                    agent_id: agent.to_owned(),
+                    session_id: session.to_owned(),
+                    declared_yolo: yolo,
+                };
+                let got = decide(&policy, &caller, &request);
+                assert_eq!(got.verdict, expected.verdict);
+                assert_eq!(got.denial, expected.denial);
+            }
+        }
+    }
+
+    #[test]
+    fn a_claimed_class_never_appears_as_the_shown_classification() {
+        use xudo_gate::request::AttestedClass;
+        for claim in ["enrolled-agent-yolo", "human", "unattested", "x"] {
+            for class in [
+                AttestedClass::Unattested,
+                AttestedClass::Human,
+                AttestedClass::EnrolledAgent { scope_id: 44 },
+            ] {
+                let mut entry = shown_entry();
+                stored_as(&mut entry, class.clone());
+                claim.clone_into(&mut entry.claimed_classification);
+                let prompt = bounded_prompt(&entry, NOW);
+                assert_eq!(prompt.classification, class_label(&class));
+            }
+        }
+    }
+
+    #[test]
+    fn a_claimed_agent_class_on_a_human_entry_does_not_make_it_an_agent_entry() {
+        use xudo_gate::request::AttestedClass::Human;
+        let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+        let mut entry = approved_entry(Human, "enrolled-agent-yolo");
+        entry.state = xudo_gate::request::ConfirmationState::Pending;
+        entry.confirmed = false;
+        entry.confirmed_by = None;
+        // Freeze leaves it alone: the password path stays open for a human.
+        let frozen = frozen_by(&entry, &watcher);
+        assert_eq!(
+            frozen.after,
+            Some(xudo_gate::request::ConfirmationState::Pending)
+        );
+        assert!(frozen.labels.is_empty());
+        // Deny re-decides it as a human, whatever it claimed.
+        let denied = answered_by(&entry, &watcher, false);
+        assert_eq!(denied.labels, ["human"]);
+        assert_eq!(denied.refused, None);
+    }
+
+    #[test]
+    fn a_freeze_takes_back_exactly_the_stored_agent_class() {
+        use xudo_gate::request::AttestedClass::{Human, Unattested};
+        let freezer = arbitrary_watcher(5000, UID, 2, 34816, None);
+        let mut agent = enrolled_entry(NONCE, UID);
+        // An agent that claims nothing is still an agent.
+        "human".clone_into(&mut agent.claimed_classification);
+        let frozen = frozen_by(&agent, &freezer);
+        assert_eq!(frozen.after, None);
+        assert_eq!(frozen.labels, ["enrolled-agent"]);
+        // An unattested or human entry claiming to be an agent is kept.
+        for class in [Unattested, Human] {
+            let mut entry = enrolled_entry(NONCE, UID);
+            stored_as(&mut entry, class);
+            let kept = frozen_by(&entry, &freezer);
+            assert_eq!(
+                kept.after,
+                Some(xudo_gate::request::ConfirmationState::Pending)
+            );
+            assert!(kept.labels.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_answer_is_decided_as_the_stored_class_whoever_answers() {
+        use xudo_gate::request::AttestedClass::{EnrolledAgent, Human, Unattested};
+        let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+        for (class, label) in [
+            (Unattested, "unattested"),
+            (Human, "human"),
+            (EnrolledAgent { scope_id: 44 }, "enrolled-agent"),
+        ] {
+            let denied = answered_by(&approved_entry(class, "enrolled-agent"), &watcher, false);
+            assert_eq!(denied.labels, [label]);
+            assert_eq!(denied.after, None);
+        }
+    }
+
+    #[test]
+    fn an_entry_with_an_unparseable_or_missing_stored_class_fails_closed() {
+        let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+        let entry = enrolled_entry(NONCE, UID);
+        let good: serde_json::Value = serde_json::from_str(&entry.to_json()).unwrap();
+        let mangled = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = good.clone();
+            edit(&mut value);
+            serde_json::to_vec(&value).unwrap()
+        };
+        let broken = [
+            mangled(&|v| v["attested_class"] = serde_json::json!("root")),
+            mangled(&|v| {
+                v.as_object_mut().unwrap().remove("attested_class");
+            }),
+            mangled(&|v| {
+                v["attested_class"] = serde_json::json!({"enrolled_agent": {"scope_id": 9}});
+            }),
+            mangled(&|v| v["attested_scope_id"] = serde_json::Value::Null),
+        ];
+        for bytes in broken {
+            // Answering refuses and changes nothing.
+            let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+            let mut host = Host::honest();
+            let refused = answer_confirmation(
+                &mut host.platform(),
+                &spool,
+                &watcher,
+                &answer_request(NONCE, "remove", true),
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::RequestUnknown);
+            assert_eq!(spool.files()[NONCE.as_bytes()], bytes);
+            assert!(host.audit.records().is_empty());
+            // A freeze never acts on it either: nothing is decided or removed.
+            let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+            let mut host = Host::honest();
+            deny_pending(&mut host.platform(), &spool, &watcher, &freeze_request()).unwrap();
+            assert_eq!(spool.files()[NONCE.as_bytes()], bytes);
+            assert!(host.audit.records().is_empty());
+        }
     }
 }
