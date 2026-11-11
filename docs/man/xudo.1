@@ -46,6 +46,17 @@ xudo \- decide whether a privileged command runs as root
 .RB [ \-\-schema ]
 .RB [ options ]
 .br
+.B xudo config get
+.I key
+.RB [ \-\-origin ]
+.br
+.B xudo config list
+.RB [ \-\-origin ]
+.RB [ \-\-effective ]
+.br
+.B xudo config schema
+.RB [ \-\-json ]
+.br
 .B xudo install
 .RB [ \-\-dry\-run ]
 .RB [ \-\-show\-contents ]
@@ -226,6 +237,20 @@ run, and applies nothing.
 Show the effective settings and where each value came from.
 .B \-\-schema
 prints the machine-readable schema instead.
+.B get
+prints one value, and with
+.B \-\-origin
+the file and line that set it, or
+.B <default>
+or
+.BR <compiled-in> .
+.B list
+prints the values a file set, and with
+.B \-\-effective
+the defaults and compiled-in values too.
+.B schema
+is
+.BR \-\-schema .
 Only
 .B \-\-config\-file
 is read, as the system layer.

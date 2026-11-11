@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use xudo_audit::Outcome;
-use xudo_config::XdgPaths;
+use xudo_config::report::{self, ListOptions};
+use xudo_config::{Layer, Setting, Settings, XdgPaths, apply_file_scoped};
 
 use crate::agents_doc::{self, Added};
 use crate::celebrate::{Style, celebrate};
@@ -124,11 +125,29 @@ enum Command {
         #[arg(short = 'n', default_value_t = 20)]
         n: usize,
     },
+    /// Show `ido`'s settings and where each came from.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Play the celebration and print `ido works.`
     Celebrate {
         /// Print the last line only.
         #[arg(long)]
         no_animation: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// List settings. Without `--effective`, only those the user's file set.
+    List {
+        /// Add the origin of each value.
+        #[arg(long)]
+        origin: bool,
+        /// Include defaults and compiled-in values.
+        #[arg(long)]
+        effective: bool,
     },
 }
 
@@ -236,6 +255,7 @@ fn dispatch(cli: Cli, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
         Some(Command::Run(args)) => run(&args, host, io),
         Some(Command::Drop(args)) => drop_command(&args, host, io),
         Some(Command::Log { n }) => log(n, host, io),
+        Some(Command::Config { action }) => config(&action, host, io),
         Some(Command::Celebrate { no_animation }) => Ok(celebrate_command(host, no_animation, io)),
     }
 }
@@ -365,6 +385,46 @@ fn list(json: bool, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
         render::list(&queue, host.now_unix)
     };
     let _ = write!(io.out, "{text}");
+    Ok(0)
+}
+
+/// The settings `ido` owns. Everything else in `xudo-config` belongs to `xudo`,
+/// and a user's file naming one of those is refused rather than ignored.
+const IDO_SETTINGS: [Setting; 1] = [Setting::Color];
+
+/// `ido config list`: the user layer, read from the XDG config file.
+fn config(action: &ConfigAction, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
+    let ConfigAction::List { origin, effective } = action;
+    let home = host.home.as_deref().ok_or(IdoError::NoHome)?;
+    let paths = XdgPaths::resolve(
+        home,
+        host.xdg_config_home.as_deref(),
+        host.xdg_state_home.as_deref(),
+        host.xdg_cache_home.as_deref(),
+        host.xdg_runtime_dir.as_deref(),
+    );
+    let file = paths.config_file();
+    let mut settings = Settings::default();
+    // A missing file is not an error: the defaults are the configuration.
+    if let Ok(contents) = std::fs::read_to_string(&file) {
+        apply_file_scoped(
+            &mut settings,
+            Layer::User,
+            &file.display().to_string(),
+            &contents,
+            &IDO_SETTINGS,
+        )
+        .map_err(|e| IdoError::Refused(e.to_string()))?;
+    }
+    let options = ListOptions {
+        origin: *origin,
+        effective: *effective,
+    };
+    let _ = write!(
+        io.out,
+        "{}",
+        report::list(&settings, &IDO_SETTINGS, options)
+    );
     Ok(0)
 }
 
@@ -1082,6 +1142,57 @@ mod tests {
             "{fourth}"
         );
         assert_eq!(ido(&h, &["log", "-n", "1"]).out.lines().count(), 1);
+    }
+
+    #[test]
+    fn ido_config_list_names_the_users_file_and_line() {
+        let host = host("config-list");
+        let file =
+            XdgPaths::resolve(host.home.as_deref().unwrap(), None, None, None, None).config_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "\ncolor = false\n").unwrap();
+        let out = ido(&host, &["config", "list", "--origin"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert_eq!(
+            out.out,
+            format!(
+                "{:<26} {:<10} user ({}:2)\n",
+                "color",
+                "false",
+                file.display()
+            )
+        );
+    }
+
+    #[test]
+    fn ido_config_list_effective_shows_defaults_and_a_missing_file_is_fine() {
+        let host = host("config-effective");
+        let out = ido(&host, &["config", "list", "--origin"]);
+        assert_eq!((out.code, out.out.as_str()), (0, ""));
+        let out = ido(&host, &["config", "list", "--origin", "--effective"]);
+        assert!(out.out.starts_with("color"), "{}", out.out);
+        assert!(out.out.trim_end().ends_with("<default>"), "{}", out.out);
+        assert_eq!(out.out.lines().count(), 1, "ido owns one setting");
+    }
+
+    #[test]
+    fn ido_config_refuses_a_setting_that_belongs_to_xudo() {
+        let host = host("config-foreign");
+        let file =
+            XdgPaths::resolve(host.home.as_deref().unwrap(), None, None, None, None).config_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "frozen = true\n").unwrap();
+        let out = ido(&host, &["config", "list"]);
+        assert_eq!(out.code, 2);
+        assert!(out.err.contains("frozen is not a setting"), "{}", out.err);
+    }
+
+    #[test]
+    fn ido_config_without_a_home_fails() {
+        let mut host = host("config-nohome");
+        host.home = None;
+        let out = ido(&host, &["config", "list"]);
+        assert_eq!(out.code, 1);
     }
 
     #[test]

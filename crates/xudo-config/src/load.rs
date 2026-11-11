@@ -12,9 +12,11 @@
 //!
 //! # Line numbers are derived, not declared
 //!
-//! A file cannot state its own provenance. The line for each key is found by
-//! scanning the text, so an origin points at the real declaration rather than at
+//! A file cannot state its own provenance. The line for each key is the offset the
+//! TOML parser reported for it, so an origin points at the real declaration rather than at
 //! whatever the file claimed.
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
@@ -76,10 +78,45 @@ pub fn apply_file(
     file: &str,
     contents: &str,
 ) -> Result<(), LoadError> {
+    apply_file_scoped(settings, layer, file, contents, &Setting::ALL)
+}
+
+/// Like [`apply_file`], for a program that owns only some of the settings.
+///
+/// A key that is a setting of another program fails the whole file, exactly as
+/// an unknown key does: `ido` must not accept `frozen = true` and then ignore
+/// it, because a file that does not mean what it says is the failure this
+/// project refuses to paper over.
+///
+/// # Errors
+///
+/// As [`apply_file`], plus [`LoadError::Parse`] for a key outside `owned`.
+pub fn apply_file_scoped(
+    settings: &mut Settings,
+    layer: Layer,
+    file: &str,
+    contents: &str,
+    owned: &[Setting],
+) -> Result<(), LoadError> {
+    let document = toml::de::DeTable::parse(contents).map_err(|e| LoadError::Parse {
+        file: file.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let lines = key_lines(contents, document.get_ref());
     let parsed: File = toml::from_str(contents).map_err(|e| LoadError::Parse {
         file: file.to_owned(),
         reason: e.to_string(),
     })?;
+
+    if let Some(foreign) = lines
+        .keys()
+        .find(|key| !Setting::from_key(key).is_some_and(|s| owned.contains(&s)))
+    {
+        return Err(LoadError::Parse {
+            file: file.to_owned(),
+            reason: format!("{foreign} is not a setting of this program"),
+        });
+    }
 
     if parsed
         .audit_sink
@@ -117,7 +154,7 @@ pub fn apply_file(
         let Some(value) = value else {
             continue;
         };
-        let line = line_of_key(contents, setting.key());
+        let line = lines.get(setting.key()).copied().unwrap_or_default();
         settings
             .apply(setting, value, Origin::file(layer, file, line))
             .map_err(|source| LoadError::Rejected {
@@ -130,24 +167,24 @@ pub fn apply_file(
     Ok(())
 }
 
-/// Finds the 1-based line on which `key` is assigned.
+/// Maps each top-level key to the 1-based line the parser found it on.
 ///
-/// Returns 0 when it cannot be located, which happens only if the key reached
-/// the parser by some route other than this text.
-fn line_of_key(contents: &str, key: &str) -> u32 {
-    contents
-        .lines()
-        .enumerate()
-        .find(|(_, line)| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with(key)
-                && trimmed
-                    .get(key.len()..)
-                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+/// The offset comes from the TOML parse itself, so a quoted key resolves and a
+/// lookalike inside a string does not.
+fn key_lines<'a>(contents: &str, table: &'a toml::de::DeTable<'_>) -> BTreeMap<&'a str, u32> {
+    table
+        .iter()
+        .map(|(key, _)| {
+            let newlines = contents
+                .as_bytes()
+                .iter()
+                .take(key.span().start)
+                .filter(|byte| **byte == b'\n')
+                .count();
+            let line = u32::try_from(newlines.saturating_add(1)).unwrap_or(u32::MAX);
+            (key.get_ref().as_ref(), line)
         })
-        .map_or(0, |(index, _)| {
-            u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX)
-        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -160,6 +197,31 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn a_scoped_file_refuses_another_programs_setting() {
+        // `ido` must not accept `frozen = true` and then ignore it.
+        let mut settings = Settings::default();
+        let err = apply_file_scoped(
+            &mut settings,
+            Layer::User,
+            "config.toml",
+            "color = false\nfrozen = true\n",
+            &[Setting::Color],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("frozen is not a setting"), "{err}");
+        assert_eq!(settings, Settings::default());
+        apply_file_scoped(
+            &mut settings,
+            Layer::User,
+            "config.toml",
+            "color = false\n",
+            &[Setting::Color],
+        )
+        .unwrap();
+        assert_eq!(settings.get(Setting::Color).value, Value::Bool(false));
+    }
 
     #[test]
     fn a_file_sets_what_it_names_and_leaves_the_rest_alone() {
@@ -183,8 +245,43 @@ mod tests {
     }
 
     #[test]
+    fn origin_line_survives_a_quoted_key() {
+        let mut settings = Settings::default();
+        let contents = "# c\n\"frozen\" = true\n'color' = false\n";
+        apply_file(&mut settings, Layer::System, "c.toml", contents).unwrap();
+        assert_eq!(
+            settings.get(Setting::Frozen).origin.to_string(),
+            "system (c.toml:2)"
+        );
+        assert_eq!(
+            settings.get(Setting::Color).origin.to_string(),
+            "system (c.toml:3)"
+        );
+    }
+
+    #[test]
+    fn origin_line_ignores_a_lookalike_inside_a_multiline_string() {
+        let contents = "note = \"\"\"\nfrozen = false\n\"\"\"\nfrozen = true\n";
+        let document = toml::de::DeTable::parse(contents).unwrap();
+        let lines = key_lines(contents, document.get_ref());
+        assert_eq!(lines.get("frozen"), Some(&4));
+        assert_eq!(lines.get("note"), Some(&1));
+    }
+
+    #[test]
+    fn origin_line_for_a_dotted_or_table_key() {
+        // A dotted or table key is not a setting: refused, never mis-pointed.
+        let mut settings = Settings::default();
+        for contents in ["frozen.x = true\n", "[frozen]\nx = 1\n"] {
+            let err = apply_file(&mut settings, Layer::System, "c.toml", contents).unwrap_err();
+            assert!(err.to_string().starts_with("c.toml: "), "{err}");
+        }
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
     fn the_origin_points_at_the_real_line_the_key_is_on() {
-        // Derived by scanning, because a file cannot state its own provenance.
+        // Derived from the parse, because a file cannot state its own provenance.
         let mut settings = Settings::default();
         let contents = "# a comment\n\nfrozen = true\ncolor = false\n";
         apply_file(&mut settings, Layer::System, "config.toml", contents).unwrap();
@@ -395,15 +492,12 @@ mod tests {
     }
 
     #[test]
-    fn a_key_that_cannot_be_located_reports_line_zero_rather_than_guessing() {
-        assert_eq!(line_of_key("other = 1\n", "frozen"), 0);
-        assert_eq!(line_of_key("\nfrozen = true\n", "frozen"), 2);
-        // A key mentioned in a comment is not an assignment.
-        assert_eq!(
-            line_of_key("# frozen is nice\nfrozen = true\n", "frozen"),
-            2
-        );
-        // A longer key that merely starts with the same text is not a match.
-        assert_eq!(line_of_key("frozen_solid = true\n", "frozen"), 0);
+    fn a_comment_or_a_longer_key_is_not_the_setting() {
+        let contents = "# frozen is nice\nfrozen_solid = true\nfrozen = true\n";
+        let document = toml::de::DeTable::parse(contents).unwrap();
+        let lines = key_lines(contents, document.get_ref());
+        assert_eq!(lines.get("frozen"), Some(&3));
+        assert_eq!(lines.get("frozen_solid"), Some(&2));
+        assert_eq!(lines.get("other"), None);
     }
 }
