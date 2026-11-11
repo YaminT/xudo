@@ -98,7 +98,7 @@ mkdir -p /work
 # apt sources; the cargo caches are volumes, these are not.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends sudo passwd >/dev/null
+apt-get install -y -qq --no-install-recommends sudo passwd gcc >/dev/null
 useradd --create-home --shell /bin/bash xudotest
 echo 'xudotest:xudotest-fixed-password' | chpasswd
 

@@ -450,29 +450,52 @@ fn real_injection_payloads_never_reach_the_child_environment() {
         return;
     }
     let _journal = install_everything();
-    let marker = "/var/lib/xudo/environment-payload-ran";
-    let _ = fs::remove_file(marker);
-    let payload = format!("touch {marker}");
+    let marker = format!("{AUDIT_DIR}/environment-payload-ran-{}", std::process::id());
+    let _ = fs::remove_file(&marker);
+    let _marker_guard = FreezeMarkerGuard(marker.clone().into());
+    let (preload_source, preload_library) = compile_environment_payload(&marker);
+    let _source_guard = FreezeMarkerGuard(preload_source.into());
+    let _library_guard = FreezeMarkerGuard(preload_library.clone().into());
+
     let vars = [
-        ("LD_PRELOAD", payload.as_str()),
-        ("BASH_ENV", payload.as_str()),
-        ("NODE_OPTIONS", payload.as_str()),
-        ("http_proxy", payload.as_str()),
-        ("LESSOPEN", payload.as_str()),
-        ("GCONV_PATH", payload.as_str()),
+        ("LD_PRELOAD", preload_library.as_str()),
+        ("BASH_ENV", marker.as_str()),
+        ("NODE_OPTIONS", "--require=/nonexistent-xudo-test-module"),
+        ("http_proxy", "http://xudo-test.invalid/"),
+        ("LESSOPEN", "|/bin/touch /tmp/xudo-test-lessopen"),
+        ("GCONV_PATH", "/nonexistent-xudo-test-gconv"),
     ];
-    let keep = vars
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(" ");
-    root_file(
-        "/etc/sudoers.d/xudo-env-test",
-        format!("Defaults env_keep += \"{keep}\"\n").as_bytes(),
-        0o440,
+    let test_rule = format!("{RULES_DIR}/90-test-environment.toml");
+    let sudoers = "/etc/sudoers.d/xudo-env-test";
+    let _sudoers_guard = FreezeMarkerGuard(sudoers.into());
+    let _rule_guard = FreezeMarkerGuard(test_rule.clone().into());
+
+    // Prove the payload itself works in an ordinary child. LD_PRELOAD is set
+    // only for cat, never for runuser (which is itself running as root here).
+    let payload_control = Command::new("/usr/bin/cat")
+        .arg("/proc/self/environ")
+        .env("LD_PRELOAD", &preload_library)
+        .output()
+        .unwrap();
+    assert!(
+        payload_control.status.success(),
+        "payload control failed: {payload_control:?}"
     );
+    assert!(
+        Path::new(&marker).exists(),
+        "LD_PRELOAD control payload did not run"
+    );
+    fs::remove_file(&marker).unwrap();
+
+    // sudo's setuid loader strips LD_PRELOAD and GCONV_PATH before sudo can
+    // apply env_keep. Prove the other four names reach a plain child through
+    // the same sudo environment path used by the installed gate.
+    assert_sudo_environment_delivery(sudoers, &[vars[1], vars[2], vars[3], vars[4]]);
+
+    // Direct start keeps the complete environment intact until the gate,
+    // including loader variables glibc deliberately removes from setuid sudo.
     root_file(
-        &format!("{RULES_DIR}/90-test-environment.toml"),
+        &test_rule,
         format!(
             "[[action]]\nid = \"{ENV_ACTION}\"\ntier = \"diag-read\"\nexe = \"/usr/bin/cat\"\nargs = [{{ name = \"environment\", matcher = {{ literal = \"/proc/self/environ\" }} }}]\n"
         )
@@ -487,39 +510,84 @@ fn real_injection_payloads_never_reach_the_child_environment() {
         vec!["/proc/self/environ".to_owned()],
     );
 
-    let mut child = Command::new("/usr/sbin/runuser")
-        .args(["-u", USER, "--", "/usr/bin/sudo", "-S", GATE_AUTH])
+    let child = Command::new(GATE_AUTH)
+        .env_clear()
         .envs(vars.iter().copied())
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{PASSWORD}\n").as_bytes())
-        .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    for (name, _) in vars {
-        assert!(
-            !output
-                .stdout
-                .windows(name.len())
-                .any(|part| part == name.as_bytes()),
-            "{name} reached /proc/self/environ: {output:?}"
-        );
-    }
+    let actual = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8(entry.to_vec()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, xudo_gate::child_environment(), "{output:?}");
     assert!(
-        !Path::new(marker).exists(),
+        !Path::new(&marker).exists(),
         "an environment payload created its marker"
     );
     assert!(!entry_exists(&nonce), "the request was not consumed");
-    let _ = fs::remove_file("/etc/sudoers.d/xudo-env-test");
-    let _ = fs::remove_file(format!("{RULES_DIR}/90-test-environment.toml"));
     remove_snippet();
+}
+
+fn compile_environment_payload(marker: &str) -> (String, String) {
+    let payload_source = format!(
+        r#"
+#include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void mark_cat_load(void) {{
+    char executable[4096];
+    ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (length <= 0) return;
+    executable[length] = '\0';
+    if (strcmp(executable, "/usr/bin/cat") != 0) return;
+    int marker = open("{marker}", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (marker >= 0) close(marker);
+}}
+"#
+    );
+    let preload_source = format!("{AUDIT_DIR}/environment-payload-{}.c", std::process::id());
+    let preload_library = format!("{AUDIT_DIR}/environment-payload-{}.so", std::process::id());
+    fs::write(&preload_source, payload_source).unwrap();
+    let compiled = Command::new("cc")
+        .args(["-shared", "-fPIC", "-o", &preload_library, &preload_source])
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "cc failed: {compiled:?}");
+    (preload_source, preload_library)
+}
+
+fn assert_sudo_environment_delivery(sudoers: &str, vars: &[(&str, &str)]) {
+    root_file(
+        sudoers,
+        b"Defaults env_keep += \"BASH_ENV NODE_OPTIONS http_proxy LESSOPEN\"\nxudotest ALL=(root) NOPASSWD: /usr/bin/cat /proc/self/environ\n",
+        0o440,
+    );
+    let mut control_command = Command::new("/usr/sbin/runuser");
+    control_command.args(["-u", USER, "--", "/usr/bin/env"]);
+    control_command.args(vars.iter().map(|(name, value)| format!("{name}={value}")));
+    control_command.args(["/usr/bin/sudo", "-n", "/usr/bin/cat", "/proc/self/environ"]);
+    let control = control_command.output().unwrap();
+    assert!(
+        control.status.success(),
+        "sudo environment control failed: {control:?}"
+    );
+    for (name, value) in vars {
+        let entry = format!("{name}={value}");
+        assert!(
+            control
+                .stdout
+                .split(|byte| *byte == 0)
+                .any(|part| part == entry.as_bytes()),
+            "control did not receive {name}: {control:?}"
+        );
+    }
 }
 
 #[test]
