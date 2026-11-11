@@ -155,32 +155,32 @@ fn confirm_run(
             xudo_policy::DenialCode::NoConfirmationChannel,
         ));
     }
-    if let Some(approved) = take_matching_approval(
-        spool,
-        &request,
-        &identity,
-        decision.action.as_ref().map(xudo_policy::ActionId::as_str),
-        policy.rules.generation.id(),
+    let search = ApprovalSearch {
+        request: &request,
+        identity: &identity,
+        caller: &caller,
+        syscalls: platform.syscalls,
+        action: decision.action.as_ref().map(xudo_policy::ActionId::as_str),
+        generation: policy.rules.generation.id(),
         now,
-    ) {
-        if clear_backoff(
-            platform.confirmations,
-            identity.uid,
-            &approved.fingerprint,
-            now,
-        )
-        .is_err()
-        {
+    };
+    let approved = match take_matching_approval(spool, &search) {
+        Ok(approved) => approved,
+        Err(error) => {
             return ConfirmRun::Served(refuse(
                 conn,
                 platform.audit,
-                &Refusal::broker(
-                    RefusalCode::SpoolUnusable,
-                    "cannot clear confirmation backoff",
-                ),
+                &error,
                 Some(&identity),
                 Some(&request),
             ));
+        }
+    };
+    if let Some(approved) = approved {
+        if let Err(served) =
+            clear_approved_backoff(conn, platform, &identity, &request, &approved, now)
+        {
+            return ConfirmRun::Served(served);
         }
         let evaluated = Evaluated {
             decision,
@@ -607,40 +607,158 @@ fn validated_confirm(bytes: &[u8]) -> Result<ConfirmData, SpoolError> {
     Ok(data)
 }
 
-fn take_matching_approval(
-    spool: &dyn Spool,
-    request: &BrokerRequest,
+fn clear_approved_backoff(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
     identity: &PeerIdentity,
-    action: Option<&str>,
+    request: &BrokerRequest,
+    approved: &xudo_gate::request::PendingRequest,
+    now: u64,
+) -> Result<(), Served> {
+    if clear_backoff(
+        platform.confirmations,
+        identity.uid,
+        &approved.fingerprint,
+        now,
+    )
+    .is_err()
+    {
+        return Err(refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::SpoolUnusable,
+                "cannot clear confirmation backoff",
+            ),
+            Some(identity),
+            Some(request),
+        ));
+    }
+    Ok(())
+}
+
+struct ApprovalSearch<'a> {
+    request: &'a BrokerRequest,
+    identity: &'a PeerIdentity,
+    caller: &'a CallerFacts,
+    syscalls: &'a dyn Syscalls,
+    action: Option<&'a str>,
     generation: u64,
     now: u64,
-) -> Option<xudo_gate::request::PendingRequest> {
-    let (program, argv, _) = request.run_fields()?;
-    let action = action?;
-    let _guard = SpoolGuard::lock(spool).ok()?;
+}
+
+fn take_matching_approval(
+    spool: &dyn Spool,
+    search: &ApprovalSearch<'_>,
+) -> Result<Option<xudo_gate::request::PendingRequest>, Refusal> {
+    let ApprovalSearch {
+        request,
+        identity,
+        caller,
+        syscalls,
+        action,
+        generation,
+        now,
+    } = *search;
+    let Some((program, argv, _)) = request.run_fields() else {
+        return Ok(None);
+    };
+    let Some(action) = action else {
+        return Ok(None);
+    };
+    let _guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
     let names = spool
         .names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)
-        .ok()?;
+        .map_err(|error| Refusal::from(&error))?;
     let argv_bytes = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let (attested_class, scope_id, boot_id) = match &caller.classification {
+        xudo_policy::Classification::Unattested { .. } => {
+            (xudo_gate::request::AttestedClass::Unattested, None, None)
+        }
+        xudo_policy::Classification::Human => {
+            (xudo_gate::request::AttestedClass::Human, None, None)
+        }
+        xudo_policy::Classification::EnrolledAgent { .. } => {
+            let Some(scope_id) = identity.cgroup_id else {
+                return Err(Refusal::client(
+                    RefusalCode::RequestUnknown,
+                    "caller scope is unavailable",
+                ));
+            };
+            let live_boot_id = syscalls.boot_id().ok();
+            let Some(boot_id) = live_boot_id
+                .as_deref()
+                .filter(|id| xudo_gate::request::is_boot_id(id))
+            else {
+                return Err(Refusal::client(
+                    RefusalCode::RequestUnknown,
+                    "live boot id is unavailable",
+                ));
+            };
+            (
+                xudo_gate::request::AttestedClass::EnrolledAgent { scope_id },
+                Some(scope_id),
+                Some(boot_id.to_owned()),
+            )
+        }
+    };
+    let binding = crate::confirm::ApprovalCaller {
+        pid: identity.pid,
+        starttime: identity.starttime,
+        uid: identity.uid,
+        sid: identity.sid,
+        tty: identity.tty,
+        attested_class: &attested_class,
+        scope_id,
+        boot_id: boot_id.as_deref(),
+    };
     for name in names {
-        let bytes = spool.read(&name, crate::mint::MAX_ENTRY_BYTES).ok()?;
+        let bytes = spool
+            .read(&name, crate::mint::MAX_ENTRY_BYTES)
+            .map_err(|error| Refusal::from(&error))?;
         let Ok(entry) = parse_entry(&bytes) else {
             continue;
         };
+        let before = entry.clone();
         let (_, consumed) = crate::confirm::take_approval(
             Some(entry),
-            identity.uid,
             program.as_bytes(),
             &argv_bytes,
             generation,
             action,
             now,
+            &binding,
         );
         if let Some(approved) = consumed {
-            return Some(approved);
+            return Ok(Some(approved));
+        }
+        if same_unconsumable_approval(&before, identity, program, argv, generation, action, now) {
+            return Err(Refusal::client(
+                RefusalCode::RequestUnknown,
+                "approval belongs to another caller",
+            ));
         }
     }
-    None
+    Ok(None)
+}
+
+fn same_unconsumable_approval(
+    entry: &xudo_gate::request::PendingRequest,
+    identity: &PeerIdentity,
+    program: &str,
+    argv: &[String],
+    generation: u64,
+    action: &str,
+    now: u64,
+) -> bool {
+    entry.state == xudo_gate::request::ConfirmationState::Approved
+        && entry.needs_watch
+        && entry.caller_uid == identity.uid
+        && entry.program == program
+        && entry.argv == argv
+        && entry.generation == generation
+        && entry.action == action
+        && now < entry.deadline.0
 }
 
 fn mint_approved(
@@ -681,11 +799,18 @@ fn mint_approved(
             Some(&request),
         );
     }
-    entry.caller_pid = identity.pid;
-    entry.caller_starttime = identity.starttime;
-    entry.caller_uid = identity.uid;
-    entry.caller_sid = identity.sid;
-    entry.caller_tty = identity.tty;
+    if !approval_matches_caller(platform.syscalls, &entry, &caller, &identity) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::client(
+                RefusalCode::RequestUnknown,
+                "approval belongs to another caller",
+            ),
+            Some(&identity),
+            Some(&request),
+        );
+    }
     program.clone_into(&mut entry.program);
     entry.argv = argv.to_vec();
     let json = entry.to_json();
@@ -742,6 +867,46 @@ fn mint_approved(
     )
 }
 
+fn approval_matches_caller(
+    syscalls: &dyn Syscalls,
+    entry: &xudo_gate::request::PendingRequest,
+    caller: &CallerFacts,
+    identity: &PeerIdentity,
+) -> bool {
+    let class_matches =
+        attested_class_for(caller, identity).as_ref() == Some(&entry.attested_class);
+    let boot_matches = if matches!(
+        entry.attested_class,
+        xudo_gate::request::AttestedClass::EnrolledAgent { .. }
+    ) {
+        syscalls.boot_id().ok().as_deref() == entry.boot_id.as_deref()
+    } else {
+        true
+    };
+    entry.caller_pid == identity.pid
+        && entry.caller_starttime == identity.starttime
+        && entry.caller_uid == identity.uid
+        && entry.caller_sid == identity.sid
+        && entry.caller_tty == identity.tty
+        && class_matches
+        && boot_matches
+}
+
+fn attested_class_for(
+    caller: &CallerFacts,
+    identity: &PeerIdentity,
+) -> Option<xudo_gate::request::AttestedClass> {
+    match &caller.classification {
+        xudo_policy::Classification::Unattested { .. } => {
+            Some(xudo_gate::request::AttestedClass::Unattested)
+        }
+        xudo_policy::Classification::Human => Some(xudo_gate::request::AttestedClass::Human),
+        xudo_policy::Classification::EnrolledAgent { .. } => identity
+            .cgroup_id
+            .map(|scope_id| xudo_gate::request::AttestedClass::EnrolledAgent { scope_id }),
+    }
+}
+
 fn publish_consumed_approval(
     spool: &dyn Spool,
     identity: &PeerIdentity,
@@ -759,6 +924,13 @@ fn publish_consumed_approval(
         && current.nonce == entry.nonce
         && current.fingerprint == entry.fingerprint
         && current.caller_uid == identity.uid
+        && current.caller_pid == identity.pid
+        && current.caller_starttime == identity.starttime
+        && current.caller_sid == identity.sid
+        && current.caller_tty == identity.tty
+        && current.attested_class == entry.attested_class
+        && current.attested_scope_id == entry.attested_scope_id
+        && current.boot_id == entry.boot_id
         && current.action == entry.action
         && current.program == entry.program
         && current.argv == entry.argv
@@ -2506,6 +2678,28 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn an_unreadable_approval_spool_is_refused_after_a_live_watcher_is_found() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        host.peers = peer_with_live_watcher();
+        host.confirmations = live_confirmation_store();
+        let spool = FakeSpool::new()
+            .with_file("approval.json", b"malformed but unreadable".to_vec())
+            .failing_read("approval.json");
+        let outcome = serve_with(
+            &mut host,
+            &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            Ok(&spool),
+        );
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::SpoolUnusable)
+        );
+        assert_eq!(outcome.records.len(), 1);
+    }
+
+    #[test]
     fn no_live_watcher_deny_precedes_consuming_an_approval() {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
@@ -2535,6 +2729,26 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(minted.is_none());
         assert_eq!(spool.files().len(), 1);
         assert_eq!(outcome.records.len(), 1);
+    }
+
+    #[test]
+    fn an_approval_search_spool_error_is_a_refusal() {
+        let mut host = Host::honest();
+        turn_on_confirmation(&mut host);
+        host.peers = peer_with_live_watcher();
+        let spool = FakeSpool::new().failing_lock(SpoolError::Gone {
+            name: "approval lock".to_owned(),
+        });
+        let outcome = serve_with(
+            &mut host,
+            &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            Ok(&spool),
+        );
+        assert_eq!(
+            refusal_of(&outcome.answer),
+            Some(RefusalCode::SpoolUnusable)
+        );
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
     }
 
     #[test]
@@ -3965,6 +4179,98 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn consumed_publication_cannot_repin_an_approval_to_another_process() {
+        let original = test_identity(PID, START, 0, 0);
+        let other = test_identity(PID + 1, START + 1, 0, 0);
+        let mut approved = shown_entry();
+        assert_eq!(approved.caller_pid, original.pid);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        approved.confirmed_by = Some(pin.clone());
+        approved.shown_to = Some(pin);
+        let mut consumed = approved.clone();
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        consumed.deadline.0 = NOW + crate::confirm::CONSUMED_TTL_MS;
+        let bytes = approved.to_json();
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone().into_bytes());
+        let error = publish_consumed_approval(&spool, &other, &consumed, &consumed.to_json(), NOW)
+            .unwrap_err();
+        assert_eq!(error.code, RefusalCode::RequestUnknown);
+        assert_eq!(spool.files()[NONCE.as_bytes()], bytes.as_bytes());
+        assert_ne!(original.pid, other.pid);
+    }
+
+    #[test]
+    fn approved_remint_refuses_to_repin_to_a_same_uid_process() {
+        let mut host = Host::honest();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID + 1, START + 1, 0, 0);
+        let policy = confirming_policy();
+        let caller = classify(&identity);
+        let evaluated = Evaluated {
+            decision: decide(&policy, &caller, &request),
+            caller,
+            identity,
+            request,
+            policy,
+        };
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        approved.confirmed_by = Some(pin.clone());
+        approved.shown_to = Some(pin);
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &FakeSpool::new(),
+            evaluated,
+            approved,
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+    }
+
+    #[test]
+    fn an_enrolled_approval_requires_the_live_boot_id_in_the_gate_binding() {
+        let identity = test_identity(PID, START, 0, 0);
+        let caller = xudo_policy::CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "test-agent".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        let mut entry = shown_entry();
+        entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let mut scoped_identity = identity;
+        scoped_identity.cgroup_id = Some(44);
+        let wrong_boot = xudo_sys::FakeSyscalls::new()
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456780".to_owned()));
+        assert!(!approval_matches_caller(
+            &wrong_boot,
+            &entry,
+            &caller,
+            &scoped_identity,
+        ));
+        let unreadable_boot = xudo_sys::FakeSyscalls::new();
+        assert!(!approval_matches_caller(
+            &unreadable_boot,
+            &entry,
+            &caller,
+            &scoped_identity,
+        ));
+    }
+
+    #[test]
     fn consumed_publication_fails_closed_on_lock_read_parse_and_replace_errors() {
         let identity = test_identity(PID, START, 0, 0);
         let mut approved = shown_entry();
@@ -4121,68 +4427,256 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(
             take_matching_approval(
                 &FakeSpool::new(),
-                &BrokerRequest {
-                    schema_version: WIRE_SCHEMA_VERSION,
-                    question: xudo_wire::Question::Status {
-                        id: NONCE.to_owned()
-                    }
-                },
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &BrokerRequest {
+                        schema_version: WIRE_SCHEMA_VERSION,
+                        question: xudo_wire::Question::Status {
+                            id: NONCE.to_owned()
+                        }
+                    },
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_none()
+            .is_ok_and(|approval| approval.is_none())
         );
         assert!(
             take_matching_approval(
                 &FakeSpool::new(),
-                &request,
-                &identity,
-                None,
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: None,
+                    generation,
+                    now: NOW
+                }
             )
-            .is_none()
+            .is_ok_and(|approval| approval.is_none())
         );
         assert!(
             take_matching_approval(
                 &FakeSpool::new().failing_lock(SpoolError::Gone {
                     name: "lock".to_owned()
                 }),
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_none()
+            .is_err()
         );
         assert!(
             take_matching_approval(
                 &FakeSpool::new().failing_names(SpoolError::Gone {
                     name: "names".to_owned()
                 }),
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_none()
+            .is_err()
         );
         assert!(
             take_matching_approval(
                 &FakeSpool::new()
                     .with_file("0bad", b"x".to_vec())
                     .failing_read(b"0bad".to_vec()),
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_none()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_enrolled_retry_with_an_unreadable_live_boot_id_is_denied() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "enrolled-agent",
+        );
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        let caller = xudo_policy::CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "test-agent".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        let mut approved = enrolled_entry(NONCE, UID);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        approved.attested_scope_id = Some(44);
+        approved.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes());
+        assert!(
+            take_matching_approval(
+                &spool,
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &caller,
+                    syscalls: &xudo_sys::FakeSyscalls::new(),
+                    action: Some("xudo.pkg.remove"),
+                    generation: policy().rules.generation.id(),
+                    now: NOW
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_agent_scope_id_from_another_boot_cannot_consume_an_approval() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "enrolled-agent",
+        );
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        let caller = xudo_policy::CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "test-agent".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        let mut approved = enrolled_entry(NONCE, UID);
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        approved.attested_scope_id = Some(44);
+        approved.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes());
+        assert!(
+            take_matching_approval(
+                &spool,
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &caller,
+                    syscalls: &xudo_sys::FakeSyscalls::new()
+                        .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456780".to_owned())),
+                    action: Some("xudo.pkg.remove"),
+                    generation: policy().rules.generation.id(),
+                    now: NOW
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_enrolled_identity_without_a_live_scope_is_denied() {
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "enrolled-agent",
+        );
+        let identity = test_identity(PID, START, 0, 0);
+        let caller = xudo_policy::CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "test-agent".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new(),
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &caller,
+                    syscalls: &xudo_sys::FakeSyscalls::new(),
+                    action: Some("xudo.pkg.remove"),
+                    generation: policy().rules.generation.id(),
+                    now: NOW,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attested_class_conversion_keeps_human_and_live_scope_facts() {
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "human",
+        );
+        let unattested = classify(&identity);
+        assert_eq!(
+            attested_class_for(&unattested, &identity),
+            Some(xudo_gate::request::AttestedClass::Unattested)
+        );
+        let human = xudo_policy::CallerFacts::new(xudo_policy::Classification::Human, UID);
+        assert_eq!(
+            attested_class_for(&human, &identity),
+            Some(xudo_gate::request::AttestedClass::Human)
+        );
+        assert!(
+            take_matching_approval(
+                &FakeSpool::new(),
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &human,
+                    syscalls: &xudo_sys::FakeSyscalls::new(),
+                    action: Some("xudo.pkg.remove"),
+                    generation: policy().rules.generation.id(),
+                    now: NOW,
+                },
+            )
+            .is_ok_and(|approval| approval.is_none())
+        );
+        let agent = xudo_policy::CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "test-agent".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        assert_eq!(attested_class_for(&agent, &identity), None);
+        let mut scoped = identity;
+        scoped.cgroup_id = Some(44);
+        assert_eq!(
+            attested_class_for(&agent, &scoped),
+            Some(xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 })
         );
     }
 
@@ -4217,13 +4711,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(
             take_matching_approval(
                 &approval_spool,
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                policy().rules.generation.id(),
-                NOW,
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation: policy().rules.generation.id(),
+                    now: NOW
+                }
             )
-            .is_some()
+            .is_ok_and(|approval| approval.is_some())
         );
 
         let mut duplicate = shown_entry();
@@ -4336,13 +4834,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(
             take_matching_approval(
                 &malformed_then_valid,
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_some()
+            .is_ok_and(|approval| approval.is_some())
         );
         let consume_error = FakeSpool::new()
             .with_file(NONCE.as_bytes().to_vec(), valid)
@@ -4352,13 +4854,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(
             take_matching_approval(
                 &consume_error,
-                &request,
-                &identity,
-                Some("xudo.pkg.remove"),
-                generation,
-                NOW
+                &ApprovalSearch {
+                    request: &request,
+                    identity: &identity,
+                    caller: &classify(&identity),
+                    syscalls: &xudo_sys::HostSyscalls,
+                    action: Some("xudo.pkg.remove"),
+                    generation,
+                    now: NOW
+                }
             )
-            .is_some()
+            .is_ok_and(|approval| approval.is_some())
         );
     }
 
