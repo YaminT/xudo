@@ -616,6 +616,9 @@ fn caller_for(matched: Option<&Matched>, own: CallerPin) -> GateCaller {
             },
             UNKNOWN_UID,
         ),
+        attested_class: crate::request::AttestedClass::Unattested,
+        attested_scope_id: None,
+        boot_id: None,
     }
 }
 
