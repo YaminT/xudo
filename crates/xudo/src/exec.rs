@@ -1,7 +1,6 @@
 //! `xudo exec`: ask the broker, then let `main` swap this process for the backend.
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -9,7 +8,7 @@ use xudo_backend::Probe;
 use xudo_backend::snippet::GATE_AUTH;
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use xudo_policy::{DenialCode, ExitCode};
-use xudo_wire::{Answer, BrokerRequest, BrokerResponse, MAX_RESPONSE_BYTES, Question};
+use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question};
 
 use crate::cli::{Cli, emit};
 
@@ -413,95 +412,21 @@ fn handle_status_answer(
     })
 }
 
-/// One request, one response, both bounded.
+/// One request and one response, on one deadline.
+///
+/// Connect, the write, and the read share `timeout`. A signal retries the
+/// interrupted call with only the time still left.
+///
+/// # Errors
+///
+/// Returns a connection, deadline, size, or parse error.
 pub(crate) fn ask(
     socket: &Path,
     timeout: Duration,
     request: &BrokerRequest,
 ) -> Result<BrokerResponse, String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .and_then(|()| stream.set_read_timeout(Some(timeout)))
-        .map_err(|e| e.to_string())?;
-    // A failed write shows up as a failed read below, so it isn't checked twice.
-    let _ = stream.write_all(request.to_json().as_bytes());
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    read_response(&mut stream, timeout)
-}
-
-/// One response, bounded by [`MAX_RESPONSE_BYTES`].
-///
-/// The first complete JSON value is the reply.
-fn read_response(stream: &mut UnixStream, timeout: Duration) -> Result<BrokerResponse, String> {
-    use std::cell::RefCell;
-    let stream = RefCell::new(stream);
-    read_response_with(timeout, &mut |remaining, buffer| {
-        tighten_then_read(
-            remaining,
-            &mut |value| stream.borrow().set_read_timeout(value),
-            &mut |buffer| stream.borrow_mut().read(buffer),
-            buffer,
-        )
-    })
-}
-
-fn tighten_then_read(
-    remaining: Duration,
-    set: &mut dyn FnMut(Option<Duration>) -> std::io::Result<()>,
-    read: &mut dyn FnMut(&mut [u8]) -> std::io::Result<usize>,
-    buffer: &mut [u8],
-) -> std::io::Result<usize> {
-    // macOS refuses SO_RCVTIMEO once the peer has closed; the first timeout still bounds the read.
-    let _ = set(Some(remaining));
-    read(buffer)
-}
-
-fn read_response_with(
-    timeout: Duration,
-    read: &mut dyn FnMut(Duration, &mut [u8]) -> std::io::Result<usize>,
-) -> Result<BrokerResponse, String> {
-    let mut bytes = Vec::new();
-    let deadline = Instant::now().checked_add(timeout);
-    // One byte past the limit, so an oversized answer is seen and refused.
-    let limit = MAX_RESPONSE_BYTES.saturating_add(1);
-    loop {
-        if bytes.len() >= limit {
-            return Err("broker response exceeds size limit".to_owned());
-        }
-        if response_candidate(&bytes) {
-            if let Some(done) = response_in(&bytes) {
-                return done;
-            }
-        }
-        let remaining = deadline
-            .and_then(|at| at.checked_duration_since(Instant::now()))
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| "broker response deadline expired".to_owned())?;
-        let mut buf = [0u8; 8192];
-        let want = limit.saturating_sub(bytes.len()).min(buf.len());
-        let (head, _) = buf.split_at_mut(want);
-        match read(remaining, head) {
-            Ok(0) => return reply_from(&bytes),
-            Ok(n) => bytes.extend(head.iter().copied().take(n)),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-fn response_candidate(bytes: &[u8]) -> bool {
-    bytes.iter().rev().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'}')
-}
-
-/// The reply in `bytes`, or why it is not one.
-fn reply_from(bytes: &[u8]) -> Result<BrokerResponse, String> {
-    BrokerResponse::parse(bytes).map_err(|error| error.to_string())
-}
-
-/// `Some` once `bytes` is a whole reply.
-fn response_in(bytes: &[u8]) -> Option<Result<BrokerResponse, String>> {
-    BrokerResponse::parse(bytes).ok().map(Ok)
+    let bytes = crate::exchange::exchange(socket, request.to_json().as_bytes(), timeout)?;
+    BrokerResponse::parse(&bytes).map_err(|error| error.to_string())
 }
 
 /// The argv as a shell line, for a human to read and paste. Display only.
@@ -526,12 +451,13 @@ pub(crate) fn display_quoted(argv: &[String]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+    use std::io::Read;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
     use clap::Parser;
     use xudo_policy::{Decision, Verdict};
-    use xudo_wire::{Minted, RefusalCode};
+    use xudo_wire::{MAX_RESPONSE_BYTES, Minted, RefusalCode};
 
     use super::*;
 
@@ -1594,107 +1520,6 @@ mod tests {
             sent.run_fields().map(|(program, _, _)| program),
             Some(argv()[0].as_str())
         );
-    }
-
-    #[test]
-    fn retries_an_interrupted_broker_read() {
-        let reply = decided(allow(), Some(minted(GATE_AUTH)));
-        let mut interrupted = false;
-        let mut position = 0;
-        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
-            if !interrupted {
-                interrupted = true;
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            let count = buffer.len().min(reply.len().saturating_sub(position));
-            buffer[..count].copy_from_slice(&reply[position..position + count]);
-            position += count;
-            Ok(count)
-        });
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    #[test]
-    fn a_refused_timeout_update_does_not_discard_a_reply() {
-        let reply = decided(allow(), Some(minted(GATE_AUTH)));
-        let mut set_value = None;
-        let mut position = 0;
-        let count = tighten_then_read(
-            Duration::from_millis(250),
-            &mut |value| {
-                set_value = value;
-                Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
-            },
-            &mut |buffer| {
-                let count = buffer.len().min(reply.len().saturating_sub(position));
-                buffer[..count].copy_from_slice(&reply[position..position + count]);
-                position += count;
-                Ok(count)
-            },
-            &mut [0; 4096],
-        )
-        .unwrap();
-        assert_eq!(set_value, Some(Duration::from_millis(250)));
-        assert_eq!(count, reply.len());
-        assert_eq!(&reply[..count], &reply);
-    }
-
-    #[test]
-    fn response_parser_rejects_incomplete_and_oversized_candidates() {
-        assert!(!response_candidate(b"  \n"));
-        assert!(response_candidate(b"{}"));
-        assert!(response_in(&[]).is_none());
-        assert!(response_in(b"{").is_none());
-        assert!(response_in(b"}").is_none());
-        let mut sent_candidate = false;
-        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
-            if sent_candidate {
-                Ok(0)
-            } else {
-                sent_candidate = true;
-                buffer[0] = b'}';
-                Ok(1)
-            }
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn a_malformed_closing_brace_candidate_is_rejected_after_eof() {
-        let mut sent_candidate = false;
-        let result = read_response_with(Duration::from_secs(1), &mut |_, buffer| {
-            if sent_candidate {
-                Ok(0)
-            } else {
-                sent_candidate = true;
-                buffer[0] = b'}';
-                Ok(1)
-            }
-        });
-        assert!(result.is_err(), "malformed broker reply was accepted");
-    }
-
-    #[test]
-    fn an_expired_overall_deadline_stops_a_silent_broker() {
-        let result = read_response_with(Duration::from_millis(1), &mut |_, _| {
-            thread::sleep(Duration::from_millis(5));
-            Err(std::io::ErrorKind::Interrupted.into())
-        });
-        assert_eq!(result, Err("broker response deadline expired".to_owned()));
-    }
-
-    #[test]
-    fn a_zero_socket_read_timeout_is_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("b.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-        });
-        let mut stream = UnixStream::connect(&socket).unwrap();
-        let result = read_response(&mut stream, Duration::ZERO);
-        assert!(result.is_err());
-        broker.join().unwrap();
     }
 
     #[test]
