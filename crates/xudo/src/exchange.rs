@@ -942,9 +942,7 @@ mod tests {
     #[test]
     fn an_oversized_reply_is_refused_at_the_limit() {
         let mut script = primed(vec![]);
-        for _ in 0..40 {
-            script.read.push_back(ReadAct::Fill(b'x'));
-        }
+        script.read.resize_with(40, || ReadAct::Fill(b'x'));
         let err = run(b"{}", Duration::from_secs(30), &zeros(80), &mut script).unwrap_err();
         assert_eq!(err, TOO_BIG);
         assert!(script.reads < 40, "reads {}", script.reads);
@@ -1239,10 +1237,15 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_socket_that_refuses_its_first_timeout_does_not_transfer() {
+        let (mut peer, client) = UnixStream::pair().unwrap();
         let mut live = Live::open(Path::new("/nope"));
-        assert_eq!(live.apply(Settled::Done(bare_socket())), Step::Ready);
+        assert_eq!(
+            live.apply(Settled::Done(OwnedFd::from(client))),
+            Step::Ready
+        );
         let refused = UnixStream::from(bare_socket())
             .set_write_timeout(Some(Duration::ZERO))
             .unwrap_err()
@@ -1255,8 +1258,42 @@ mod tests {
             live.shutdown_write(Duration::ZERO),
             Step::Failed(refused.clone())
         );
+
+        peer.write_all(b"z").unwrap();
         let mut buf = [0u8; 1];
         assert_eq!(live.read(Duration::ZERO, &mut buf), Step::Failed(refused));
+        assert_eq!(buf, [0]);
+    }
+
+    #[test]
+    fn a_refused_first_timeout_does_not_transfer() {
+        let transfer_probe = std::panic::catch_unwind(transfer_without_a_timeout);
+        assert!(transfer_probe.is_err(), "the transfer probe did not panic");
+        let (armed, write) = after_timeout(
+            Err(io::Error::other("refused")),
+            false,
+            transfer_without_a_timeout,
+        );
+        assert!(!armed);
+        assert_eq!(classify_io(write), Step::Failed("refused".to_owned()));
+
+        let shutdown_probe = std::panic::catch_unwind(shutdown_without_a_timeout);
+        assert!(shutdown_probe.is_err(), "the shutdown probe did not panic");
+        let (armed, shutdown) = after_timeout(
+            Err(io::Error::other("refused")),
+            false,
+            shutdown_without_a_timeout,
+        );
+        assert!(!armed);
+        assert_eq!(classify_end(shutdown), Step::Failed("refused".to_owned()));
+
+        let (armed, read) = after_timeout(
+            Err(io::Error::other("refused")),
+            false,
+            transfer_without_a_timeout,
+        );
+        assert!(!armed);
+        assert_eq!(classify_io(read), Step::Failed("refused".to_owned()));
 
         // The accepted timeout still bounds a later refusal, so the bytes move.
         let (mut peer, client) = UnixStream::pair().unwrap();
@@ -1275,15 +1312,17 @@ mod tests {
         assert_eq!(peer.read(&mut got).unwrap(), 3);
         assert_eq!(&got, b"hi!");
         peer.write_all(b"z").unwrap();
-        drop(peer);
         let mut buf = [0u8; 1];
         assert_eq!(
             live.read(Duration::from_secs(1), &mut buf),
             Step::Transferred(1)
         );
         assert_eq!(buf, [b'z']);
-        // The receive timeout is already set, so a later refusal still reads.
-        assert_eq!(live.read(Duration::ZERO, &mut buf), Step::Transferred(0));
+        // Keep the peer open and queue data so this checks the already-armed
+        // timeout path without relying on platform-specific closed-peer behavior.
+        peer.write_all(b"y").unwrap();
+        assert_eq!(live.read(Duration::ZERO, &mut buf), Step::Transferred(1));
+        assert_eq!(buf, [b'y']);
     }
 
     #[test]
@@ -1336,21 +1375,27 @@ mod tests {
     fn a_missing_or_overlong_socket_path_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.sock");
-        for wait in [false, true] {
-            let reason = start_connect(&missing, Duration::from_secs(1), wait);
-            assert!(
-                matches!(reason, Start::Failed(ref text) if text.contains("No such file")),
-                "{reason:?} wait={wait}"
-            );
-        }
+        let nonblocking_missing = start_connect(&missing, Duration::from_secs(1), false);
+        assert!(
+            matches!(nonblocking_missing, Start::Failed(ref text) if text.contains("No such file")),
+            "{nonblocking_missing:?} wait=false"
+        );
+        let blocking_missing = start_connect(&missing, Duration::from_secs(1), true);
+        assert!(
+            matches!(blocking_missing, Start::Failed(ref text) if text.contains("No such file")),
+            "{blocking_missing:?} wait=true"
+        );
         let long = PathBuf::from(format!("/{}", "a".repeat(200)));
-        for wait in [false, true] {
-            let reason = start_connect(&long, Duration::from_millis(50), wait);
-            assert!(
-                matches!(reason, Start::Failed(ref text) if text.contains("long")),
-                "{reason:?} wait={wait}"
-            );
-        }
+        let nonblocking_long = start_connect(&long, Duration::from_millis(50), false);
+        assert!(
+            matches!(nonblocking_long, Start::Failed(ref text) if text.contains("long")),
+            "{nonblocking_long:?} wait=false"
+        );
+        let blocking_long = start_connect(&long, Duration::from_millis(50), true);
+        assert!(
+            matches!(blocking_long, Start::Failed(ref text) if text.contains("long")),
+            "{blocking_long:?} wait=true"
+        );
     }
 
     #[cfg(target_os = "linux")]
