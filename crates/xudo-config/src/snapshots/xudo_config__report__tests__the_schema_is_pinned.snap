@@ -1,0 +1,62 @@
+---
+source: crates/xudo-config/src/report.rs
+expression: "Settings::schema()"
+---
+[
+  {
+    "key": "confirm_agent_actions",
+    "value_type": "boolean",
+    "default": "true",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
+  },
+  {
+    "key": "confirm_human_path",
+    "value_type": "boolean",
+    "default": "false",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
+  },
+  {
+    "key": "confirmation_timeout_secs",
+    "value_type": "integer",
+    "default": "0",
+    "configurable": true,
+    "security_relevant": false,
+    "settable_from_environment": true
+  },
+  {
+    "key": "frozen",
+    "value_type": "boolean",
+    "default": "false",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
+  },
+  {
+    "key": "audit_sink",
+    "value_type": "string",
+    "default": "journald",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
+  },
+  {
+    "key": "color",
+    "value_type": "boolean",
+    "default": "true",
+    "configurable": true,
+    "security_relevant": false,
+    "settable_from_environment": true
+  },
+  {
+    "key": "use_pty",
+    "value_type": "boolean",
+    "default": "true",
+    "configurable": false,
+    "security_relevant": true,
+    "settable_from_environment": false
+  }
+]

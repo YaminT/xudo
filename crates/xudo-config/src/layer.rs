@@ -26,6 +26,11 @@ pub enum Layer {
     BuiltInDefault,
     /// Root-owned system configuration.
     System,
+    /// A file named by `--config-file`, standing in for the system file.
+    ///
+    /// Distinct from [`Self::System`] so scriptable output never claims a
+    /// scratch file is the root-owned one.
+    ConfigFile,
     /// Per-user configuration.
     ///
     /// Exists for `ido` only. `xudo` has no user layer, because a file the user
@@ -44,10 +49,11 @@ pub enum Layer {
 
 impl Layer {
     /// Every layer, lowest precedence first.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Compiled,
         Self::BuiltInDefault,
         Self::System,
+        Self::ConfigFile,
         Self::User,
         Self::Project,
         Self::Environment,
@@ -77,6 +83,7 @@ impl Layer {
             Self::Compiled => "compiled-in",
             Self::BuiltInDefault => "default",
             Self::System => "system",
+            Self::ConfigFile => "--config-file",
             Self::User => "user",
             Self::Project => "project",
             Self::Environment => "environment",
@@ -202,7 +209,8 @@ mod tests {
         // The type carries the ordering, so nobody can implement a comparison
         // backwards.
         assert!(Layer::BuiltInDefault < Layer::System);
-        assert!(Layer::System < Layer::User);
+        assert!(Layer::System < Layer::ConfigFile);
+        assert!(Layer::ConfigFile < Layer::User);
         assert!(Layer::User < Layer::Project);
         assert!(Layer::Project < Layer::Environment);
         assert!(Layer::Environment < Layer::CliFlag);
@@ -241,6 +249,7 @@ mod tests {
         assert_eq!(labels.len(), count);
         assert_eq!(Layer::Compiled.to_string(), "compiled-in");
         assert_eq!(Layer::System.to_string(), "system");
+        assert_eq!(Layer::ConfigFile.to_string(), "--config-file");
     }
 
     #[test]

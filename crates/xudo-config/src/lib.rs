@@ -43,9 +43,10 @@
 pub mod layer;
 pub mod load;
 pub mod paths;
+pub mod report;
 pub mod settings;
 
 pub use layer::{Layer, Origin, Tracked};
-pub use load::{LoadError, apply_file};
+pub use load::{LoadError, apply_file, apply_file_scoped};
 pub use paths::{SystemPaths, XdgPaths};
 pub use settings::{MergeError, SchemaEntry, Setting, Settings, Value};

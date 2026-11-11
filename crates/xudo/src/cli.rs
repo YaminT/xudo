@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use xudo_backend::paths_to_root::HostView;
 use xudo_backend::{BackendKind, InstallPlan, PlanStep, Probe, detect, uninstall_plan};
+use xudo_config::report::{self, ListOptions};
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use xudo_policy::{
     Arg, Argv, CallerFacts, Decision, DenialCode, ExitCode, Request, RuleSet, Verdict,
@@ -82,6 +83,35 @@ pub struct EvalArgs {
     pub argv: Vec<String>,
 }
 
+/// What `xudo config` can do.
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// Print one setting's effective value.
+    Get {
+        /// The setting, as written in the settings file.
+        key: String,
+        /// Also name the file and line (or `<default>`, `<compiled-in>`).
+        #[arg(long)]
+        origin: bool,
+    },
+    /// List settings. Without `--effective`, only those a file set.
+    List {
+        /// Add the origin of each value.
+        #[arg(long)]
+        origin: bool,
+        /// Include defaults and compiled-in values.
+        #[arg(long)]
+        effective: bool,
+    },
+    /// Print the machine-readable schema, so an editor or an agent can validate
+    /// a settings file before it is installed.
+    Schema {
+        /// Accepted for symmetry; the schema is always JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -134,10 +164,17 @@ pub enum Command {
     },
 
     /// Show the effective configuration and where each value came from.
+    ///
+    /// With no subcommand, lists every setting with its origin. `get`, `list`
+    /// and `schema` follow `git config`.
     Config {
         /// Print the machine-readable schema instead of the current values.
         #[arg(long)]
         schema: bool,
+
+        /// What to do; with none, the full report.
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// Integrate xudo with the local sudo or doas backend, or remove it again.
@@ -350,7 +387,7 @@ pub fn run_with_installer_at_socket(
             *fix,
             out,
         ),
-        Command::Config { schema } => config(cli, *schema, out, err),
+        Command::Config { schema, action } => config(cli, *schema, action.as_ref(), out, err),
         Command::Install {
             dry_run,
             show_contents,
@@ -1188,13 +1225,29 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     })
 }
 
+/// The layer a settings file is reported as: only the default path is the
+/// system file.
+fn origin_layer(path: &Path) -> Layer {
+    if path == Path::new(DEFAULT_CONFIG_FILE) {
+        Layer::System
+    } else {
+        Layer::ConfigFile
+    }
+}
+
 /// Reports the effective configuration, or the schema.
 ///
 /// Every value names the file and line that set it, and a compiled-in value says
 /// so rather than being omitted — "why is confirmation off?" must have a
 /// one-command answer, or somebody will answer it by guessing.
-fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    if schema {
+fn config(
+    cli: &Cli,
+    schema: bool,
+    action: Option<&ConfigAction>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if schema || matches!(action, Some(ConfigAction::Schema { .. })) {
         let _ = writeln!(out, "{}", render::json_of(&ConfigSettings::schema()));
         return ExitCode::Delegated;
     }
@@ -1205,7 +1258,10 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
     // defaults are the configuration until somebody writes one.
     if let Ok(contents) = std::fs::read_to_string(&cli.config_file) {
         let name = Path::new(&cli.config_file).display().to_string();
-        if let Err(load_err) = apply_file(&mut settings, Layer::System, &name, &contents) {
+        // A file given on the command line is not the system file, and
+        // scriptable output must not say it is.
+        let layer = origin_layer(&cli.config_file);
+        if let Err(load_err) = apply_file(&mut settings, layer, &name, &contents) {
             // A broken configuration file fails closed: the defaults are safe,
             // but continuing while pretending the file was applied is not.
             let _ = writeln!(err, "xudo: {load_err}");
@@ -1214,6 +1270,29 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         }
     }
 
+    match action {
+        Some(ConfigAction::Get { key, origin }) => {
+            let Some(setting) = Setting::from_key(key) else {
+                let _ = writeln!(err, "xudo: {key} is not a setting; see `xudo config list`");
+                return ExitCode::Unusable;
+            };
+            let _ = write!(out, "{}", report::get(&settings, setting, *origin));
+        }
+        Some(ConfigAction::List { origin, effective }) => {
+            let options = ListOptions {
+                origin: *origin,
+                effective: *effective,
+            };
+            let _ = write!(out, "{}", report::list(&settings, &Setting::ALL, options));
+        }
+        // No subcommand is the legacy report. The schema was answered above.
+        _ => legacy_report(&settings, out),
+    }
+    ExitCode::Delegated
+}
+
+/// The report `xudo config` printed before it had subcommands.
+fn legacy_report(settings: &ConfigSettings, out: &mut dyn Write) {
     for (setting, value, origin) in settings.report() {
         let marker = if setting.is_security_relevant() {
             "*"
@@ -1227,7 +1306,6 @@ fn config(cli: &Cli, schema: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         "\n* security-relevant: never settable from the environment."
     );
     let _ = writeln!(out, "confirm_agent_actions has no effect until M4.");
-    ExitCode::Delegated
 }
 
 /// Classifies the current process, falling back to a password-requiring caller.
@@ -3559,6 +3637,72 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(confirm["default"], "true");
         let color = entries.iter().find(|e| e["key"] == "color").unwrap();
         assert_eq!(color["settable_from_environment"], true);
+    }
+
+    #[test]
+    fn a_config_file_flag_is_never_labelled_system() {
+        assert_eq!(origin_layer(Path::new(DEFAULT_CONFIG_FILE)), Layer::System);
+        assert_eq!(origin_layer(Path::new("/tmp/x")), Layer::ConfigFile);
+    }
+
+    #[test]
+    fn config_get_names_the_real_file_and_line() {
+        let fx = fixture("cli-config-get");
+        let path = fx.config_path();
+        std::fs::write(&path, "# ours\n\nfrozen = true\n").unwrap();
+        let file = path.to_str().unwrap();
+        let (code, out, _) =
+            fx.run(&["--config-file", file, "config", "get", "frozen", "--origin"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, format!("true\t--config-file ({file}:3)\n"));
+        let (_, out, _) = fx.run(&["--config-file", file, "config", "get", "frozen"]);
+        assert_eq!(out, "true\n");
+    }
+
+    #[test]
+    fn config_get_refuses_a_key_that_is_not_a_setting() {
+        let (code, out, err) =
+            fixture("cli-config-get-bad").run(&["config", "get", "confirm_agent_action"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("not a setting"), "{err}");
+    }
+
+    #[test]
+    fn config_list_shows_defaults_and_compiled_in_only_when_effective() {
+        let fx = fixture("cli-config-list");
+        let (code, out, _) = fx.run(&[
+            "--config-file",
+            "/nonexistent/xudo/config.toml",
+            "config",
+            "list",
+            "--origin",
+        ]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.is_empty(), "nothing is set by a file: {out}");
+        let (_, out, _) = fx.run(&[
+            "--config-file",
+            "/nonexistent/xudo/config.toml",
+            "config",
+            "list",
+            "--origin",
+            "--effective",
+        ]);
+        assert_eq!(out.lines().count(), Setting::ALL.len(), "{out}");
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("use_pty") && l.ends_with("<compiled-in>")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn config_schema_subcommand_matches_the_flag() {
+        let fx = fixture("cli-config-schema-sub");
+        let (_, flag, _) = fx.run(&["config", "--schema"]);
+        let (code, sub, _) = fx.run(&["config", "schema", "--json"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(flag, sub);
     }
 
     #[test]
