@@ -96,15 +96,15 @@ pub fn apply_file_scoped(
     contents: &str,
     owned: &[Setting],
 ) -> Result<(), LoadError> {
+    let keys: toml::Table = toml::from_str(contents).map_err(|e| LoadError::Parse {
+        file: file.to_owned(),
+        reason: e.to_string(),
+    })?;
     let parsed: File = toml::from_str(contents).map_err(|e| LoadError::Parse {
         file: file.to_owned(),
         reason: e.to_string(),
     })?;
 
-    let keys: toml::Table = toml::from_str(contents).map_err(|e| LoadError::Parse {
-        file: file.to_owned(),
-        reason: e.to_string(),
-    })?;
     if let Some(foreign) = keys
         .keys()
         .find(|key| !Setting::from_key(key).is_some_and(|s| owned.contains(&s)))
