@@ -90,6 +90,7 @@ const USER: &str = "xudotest";
 /// The lane's account's password. Worth nothing: see `ci/root-test.sh`.
 const PASSWORD: &str = "xudotest-fixed-password";
 const ACTION: &str = "xudo.probe.id";
+const ENV_ACTION: &str = "xudo.test.environment";
 
 /// The rule that ships, so the broker is tested against the file operators get.
 const RULES: &str = include_str!("../../../rules/05-probe.toml");
@@ -345,6 +346,22 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// A request the broker could have minted for `pin`, written where it writes.
 fn write_entry(pin: (u32, u64), generation_offset: u64) -> String {
+    write_entry_for(
+        pin,
+        generation_offset,
+        ACTION,
+        "/usr/bin/id",
+        vec!["-u".to_owned()],
+    )
+}
+
+fn write_entry_for(
+    pin: (u32, u64),
+    generation_offset: u64,
+    action: &str,
+    program: &str,
+    argv: Vec<String>,
+) -> String {
     let nonce = format!(
         "{:064x}",
         (u128::from(std::process::id()) << 64)
@@ -359,9 +376,9 @@ fn write_entry(pin: (u32, u64), generation_offset: u64) -> String {
         nonce: nonce.clone(),
         caller_pid: pin.0,
         caller_starttime: pin.1,
-        action: ACTION.to_owned(),
-        program: "/usr/bin/id".to_owned(),
-        argv: vec!["-u".to_owned()],
+        action: action.to_owned(),
+        program: program.to_owned(),
+        argv,
         generation: generation.saturating_add(generation_offset),
         deadline: BoottimeMillis(HostClock.boottime_millis().saturating_add(120_000)),
         confirmed: false,
@@ -424,6 +441,84 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         journal.text().contains(ACTION),
         "the journal was sent nothing"
     );
+    remove_snippet();
+}
+
+#[test]
+fn real_injection_payloads_never_reach_the_child_environment() {
+    if !begin_root_test("real_injection_payloads_never_reach_the_child_environment") {
+        return;
+    }
+    let _journal = install_everything();
+    let marker = "/var/lib/xudo/environment-payload-ran";
+    let _ = fs::remove_file(marker);
+    let payload = format!("touch {marker}");
+    let vars = [
+        ("LD_PRELOAD", payload.as_str()),
+        ("BASH_ENV", payload.as_str()),
+        ("NODE_OPTIONS", payload.as_str()),
+        ("http_proxy", payload.as_str()),
+        ("LESSOPEN", payload.as_str()),
+        ("GCONV_PATH", payload.as_str()),
+    ];
+    let keep = vars
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    root_file(
+        "/etc/sudoers.d/xudo-env-test",
+        format!("Defaults env_keep += \"{keep}\"\n").as_bytes(),
+        0o440,
+    );
+    root_file(
+        &format!("{RULES_DIR}/90-test-environment.toml"),
+        format!(
+            "[[action]]\nid = \"{ENV_ACTION}\"\ntier = \"diag-read\"\nexe = \"/usr/bin/cat\"\nargs = [{{ name = \"environment\", matcher = {{ literal = \"/proc/self/environ\" }} }}]\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    let nonce = write_entry_for(
+        own_pin(),
+        0,
+        ENV_ACTION,
+        "/usr/bin/cat",
+        vec!["/proc/self/environ".to_owned()],
+    );
+
+    let mut child = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--", "/usr/bin/sudo", "-S", GATE_AUTH])
+        .envs(vars.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{PASSWORD}\n").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    for (name, _) in vars {
+        assert!(
+            !output
+                .stdout
+                .windows(name.len())
+                .any(|part| part == name.as_bytes()),
+            "{name} reached /proc/self/environ: {output:?}"
+        );
+    }
+    assert!(
+        !Path::new(marker).exists(),
+        "an environment payload created its marker"
+    );
+    assert!(!entry_exists(&nonce), "the request was not consumed");
+    let _ = fs::remove_file("/etc/sudoers.d/xudo-env-test");
+    let _ = fs::remove_file(format!("{RULES_DIR}/90-test-environment.toml"));
     remove_snippet();
 }
 
