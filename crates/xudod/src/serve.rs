@@ -515,7 +515,7 @@ fn active_backoff(store: Option<&dyn Spool>, uid: u32, request: &BrokerRequest, 
     store
         .read(name.as_bytes(), CONFIRM_FILE_LIMIT)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<ConfirmData>(&bytes).ok())
+        .and_then(|bytes| parse_confirm_data(&bytes).ok())
         .is_none_or(|data| {
             data.backoff
                 .iter()
@@ -574,7 +574,7 @@ fn read_confirm_data(
         return Ok((None, None));
     }
     let bytes = store.read(name.as_bytes(), CONFIRM_FILE_LIMIT)?;
-    let data = serde_json::from_slice::<ConfirmData>(&bytes).map_err(|error| SpoolError::Io {
+    let data = parse_confirm_data(&bytes).map_err(|error| SpoolError::Io {
         operation: "parse confirmation state".to_owned(),
         at: crate::CONFIRM_DIR.to_owned(),
         code: None,
@@ -808,42 +808,61 @@ struct CompactConfirmData {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CompactHeartbeat(u32, u64, i64, i64, u64);
+#[serde(deny_unknown_fields)]
+struct CompactHeartbeat {
+    p: u32,
+    s: u64,
+    t: i64,
+    d: i64,
+    a: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CompactBackoff(String, u32, u64);
+#[serde(deny_unknown_fields)]
+struct CompactBackoff {
+    f: String,
+    s: u32,
+    u: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CompactOutcome(String, TerminalOutcome, u64, u32, u64);
+#[serde(deny_unknown_fields)]
+struct CompactOutcome {
+    i: String,
+    r: TerminalOutcome,
+    u: u64,
+    p: u32,
+    s: u64,
+}
 
 impl From<CompactConfirmData> for ConfirmData {
     fn from(value: CompactConfirmData) -> Self {
         Self {
             heartbeat: value.h.map(|v| WatcherHeartbeat {
-                pid: v.0,
-                starttime: v.1,
-                tty: v.2,
-                sid: v.3,
-                at_ms: v.4,
+                pid: v.p,
+                starttime: v.s,
+                tty: v.t,
+                sid: v.d,
+                at_ms: v.a,
             }),
             backoff: value
                 .b
                 .into_iter()
                 .map(|v| BackoffEntry {
-                    fingerprint: v.0,
-                    strikes: v.1,
-                    until_ms: v.2,
+                    fingerprint: v.f,
+                    strikes: v.s,
+                    until_ms: v.u,
                 })
                 .collect(),
             outcomes: value
                 .o
                 .into_iter()
                 .map(|v| RecentOutcome {
-                    id: v.0,
-                    outcome: v.1,
-                    until_ms: v.2,
-                    pid: v.3,
-                    starttime: v.4,
+                    id: v.i,
+                    outcome: v.r,
+                    until_ms: v.u,
+                    pid: v.p,
+                    starttime: v.s,
                 })
                 .collect(),
         }
@@ -853,18 +872,32 @@ impl From<CompactConfirmData> for ConfirmData {
 impl From<ConfirmData> for CompactConfirmData {
     fn from(value: ConfirmData) -> Self {
         Self {
-            h: value
-                .heartbeat
-                .map(|v| CompactHeartbeat(v.pid, v.starttime, v.tty, v.sid, v.at_ms)),
+            h: value.heartbeat.map(|v| CompactHeartbeat {
+                p: v.pid,
+                s: v.starttime,
+                t: v.tty,
+                d: v.sid,
+                a: v.at_ms,
+            }),
             b: value
                 .backoff
                 .into_iter()
-                .map(|v| CompactBackoff(v.fingerprint, v.strikes, v.until_ms))
+                .map(|v| CompactBackoff {
+                    f: v.fingerprint,
+                    s: v.strikes,
+                    u: v.until_ms,
+                })
                 .collect(),
             o: value
                 .outcomes
                 .into_iter()
-                .map(|v| CompactOutcome(v.id, v.outcome, v.until_ms, v.pid, v.starttime))
+                .map(|v| CompactOutcome {
+                    i: v.id,
+                    r: v.outcome,
+                    u: v.until_ms,
+                    p: v.pid,
+                    s: v.starttime,
+                })
                 .collect(),
         }
     }
@@ -909,20 +942,39 @@ const MAX_CONFIRM_UIDS: usize = 4_096;
 const MAX_BACKOFF_ENTRIES_PER_UID: usize = 64;
 const MAX_RECENT_OUTCOMES_PER_UID: usize = 64;
 
-const MAX_OUTCOME_BYTES: usize = 2 + 4 + 64 + 7 + 20 + 10 + 20;
-const MAX_BACKOFF_BYTES: usize = 2 + 2 + 64 + 10 + 20;
-const MAX_HEARTBEAT_BYTES: usize = 2 + 4 + 10 + 20 + 20 + 20 + 20;
+const MAX_OUTCOME_BYTES: usize = 155;
+const MAX_BACKOFF_BYTES: usize = 112;
+const MAX_HEARTBEAT_BYTES: usize = 116;
 const MAX_CONFIRM_DATA_BYTES: usize = r#"{"h":null,"b":[],"o":[]}"#.len()
     + MAX_HEARTBEAT_BYTES
     + MAX_BACKOFF_ENTRIES_PER_UID * MAX_BACKOFF_BYTES
     + MAX_RECENT_OUTCOMES_PER_UID * MAX_OUTCOME_BYTES
     + MAX_BACKOFF_ENTRIES_PER_UID
     + MAX_RECENT_OUTCOMES_PER_UID;
+
+fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let valid_rows = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rows| rows.iter().all(serde_json::Value::is_object))
+    };
+    let heartbeat_is_object = value
+        .get("h")
+        .is_some_and(|heartbeat| heartbeat.is_null() || heartbeat.is_object());
+    if !value.is_object() || !heartbeat_is_object || !valid_rows("b") || !valid_rows("o") {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "confirmation records must use object forms",
+        ));
+    }
+    serde_json::from_value(value)
+}
 const _: () = assert!(MAX_CONFIRM_DATA_BYTES <= CONFIRM_FILE_LIMIT);
 
 // A plain struct of strings and integers cannot fail to serialize. The
 // explicit `None` path still refuses to write if serialization ever fails.
-const CONFIRM_FILE_LIMIT: usize = 16 * 1024;
+const CONFIRM_FILE_LIMIT: usize = 20 * 1024;
 
 /// The state as bytes, or `None` when it cannot be serialized or would exceed
 /// what the reader accepts: such a file could never be read back.
@@ -966,10 +1018,10 @@ fn has_live_watcher(
     now: u64,
 ) -> bool {
     let Some(store) = store else { return false };
-    let Ok(bytes) = store.read(format!("{uid}.json").as_bytes(), 16 * 1024) else {
+    let Ok(bytes) = store.read(format!("{uid}.json").as_bytes(), CONFIRM_FILE_LIMIT) else {
         return false;
     };
-    let Ok(data) = serde_json::from_slice::<ConfirmData>(&bytes) else {
+    let Ok(data) = parse_confirm_data(&bytes) else {
         return false;
     };
     let Some(heartbeat) = data.heartbeat else {
@@ -1407,9 +1459,12 @@ fn status_outcome(
         .confirmations
         .ok_or_else(|| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
     let bytes = store
-        .read(format!("{}.json", identity.uid).as_bytes(), 16 * 1024)
+        .read(
+            format!("{}.json", identity.uid).as_bytes(),
+            CONFIRM_FILE_LIMIT,
+        )
         .map_err(|_| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
-    let data: ConfirmData = serde_json::from_slice(&bytes)
+    let data: ConfirmData = parse_confirm_data(&bytes)
         .map_err(|_| Refusal::client(RefusalCode::RequestUnknown, "request does not exist"))?;
     let now = platform.clock.boottime_millis();
     let outcome = data
@@ -3768,6 +3823,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .with_file("1000.json", b"{}".to_vec())
             .failing_read("1000.json");
         assert!(read_confirm_data(&store, "1000.json").is_err());
+    }
+
+    #[test]
+    fn a_confirm_file_with_a_positional_heartbeat_is_refused() {
+        let bytes = br#"{"h":[42,99,34816,41,1],"b":[],"o":[]}"#;
+        assert!(parse_confirm_data(bytes).is_err());
     }
 
     #[test]
