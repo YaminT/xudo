@@ -168,6 +168,9 @@ pub trait GateHost {
     ///
     /// [`PolicyError`] when either trusted input cannot be read or parsed.
     fn load_policy(&self) -> Result<LoadedPolicy, PolicyError>;
+    /// Whether the freeze marker for `uid`'s own agents stands. A marker that
+    /// cannot be read cleanly counts as standing: the gate fails closed.
+    fn user_frozen(&self, uid: u32) -> bool;
     /// Opens the spool through the trust walk.
     ///
     /// # Errors
@@ -223,6 +226,10 @@ impl GateHost for SystemHost {
 
     fn load_policy(&self) -> Result<LoadedPolicy, PolicyError> {
         crate::policy::load(Path::new(RULES_DIR), Path::new(CONFIG_FILE))
+    }
+
+    fn user_frozen(&self, uid: u32) -> bool {
+        crate::policy::user_frozen(uid, &xudo_sys::read_trusted_file)
     }
 
     fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
@@ -507,10 +514,18 @@ fn proceed(
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
+    // The matched entry's uid, which the broker stored at mint from the
+    // kernel's facts, picks whose freeze marker also applies. Root's global
+    // marker is already in the loaded settings. With no entry there is no uid,
+    // and `decide` refuses on the missing entry.
+    let mut settings = loaded.settings;
+    if let Some(found) = &pending {
+        settings.frozen |= host.user_frozen(found.caller_uid);
+    }
     let context = GateContext {
         generation: loaded.rules.generation.id(),
         now: BoottimeMillis(now),
-        settings: loaded.settings,
+        settings,
         password_confirms: entry.password_confirms(),
     };
     let approved = decide(&loaded.rules.rules, &caller, pending.as_ref(), context)?;
@@ -913,6 +928,10 @@ args = [
         audit: FakeAuditSink,
         proc_opened: Cell<bool>,
         spool_opened: Cell<bool>,
+        /// The uids whose own freeze marker stands.
+        user_freezes: Vec<u32>,
+        /// The uids the gate asked about.
+        freeze_asked: std::cell::RefCell<Vec<u32>>,
     }
 
     /// An executable under `target/`, owned by whoever runs the tests, made
@@ -958,6 +977,8 @@ args = [
                 audit: FakeAuditSink::new(),
                 proc_opened: Cell::new(false),
                 spool_opened: Cell::new(false),
+                user_freezes: Vec::new(),
+                freeze_asked: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -980,6 +1001,10 @@ args = [
         }
         fn load_policy(&self) -> Result<LoadedPolicy, PolicyError> {
             self.policy.clone()
+        }
+        fn user_frozen(&self, uid: u32) -> bool {
+            self.freeze_asked.borrow_mut().push(uid);
+            self.user_freezes.contains(&uid)
         }
         fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
             self.spool_opened.set(true);
@@ -1107,6 +1132,21 @@ args = [
     /// Whether some line of evidence begins with `prefix`.
     fn has_line(evidence: &[String], prefix: &str) -> bool {
         evidence.iter().any(|line| line.starts_with(prefix))
+    }
+
+    #[test]
+    fn the_gate_consults_only_the_matched_entrys_own_users_freeze_marker() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.user_freezes = vec![1001];
+        let _ = run(&mut host, &auth());
+        assert_eq!(*host.freeze_asked.borrow(), [1000]);
+
+        // With no entry there is no uid to ask about.
+        let empty = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&empty);
+        let _ = run(&mut host, &auth());
+        assert!(host.freeze_asked.borrow().is_empty());
     }
 
     #[test]
@@ -1991,6 +2031,9 @@ args = [
         assert_eq!(host.clock().boottime_millis(), 0);
         // Nothing here is a ruleset, a spool, or a root-owned program.
         assert!(host.load_policy().is_err());
+        // Whatever this host holds at the marker, the answer is a bool and
+        // never a panic: unreadable counts as frozen.
+        let _ = host.user_frozen(u32::MAX);
         assert!(host.open_spool().is_err());
         assert!(
             host.programs()
