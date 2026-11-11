@@ -42,6 +42,24 @@ pub const SPOOL_DIR: &str = "/run/xudo/req";
 /// The wire version of a spool entry.
 pub const REQUEST_SCHEMA_VERSION: u32 = 3;
 
+/// Classification fixed by the broker from kernel-attested caller facts.
+///
+/// The request's `claimed_classification` is deliberately not representable
+/// here: it is an unauthenticated audit hint, never an identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum AttestedClass {
+    /// No positive identity proof was available; the gate keeps the password path.
+    Unattested,
+    /// An authenticated interactive human.
+    Human,
+    /// An enrolled agent tied to its kernel cgroup id.
+    EnrolledAgent {
+        /// Kernel cgroup id of the enrolled scope.
+        scope_id: u64,
+    },
+}
+
 fn finish_parse(request: PendingRequest) -> Result<PendingRequest, RequestError> {
     if request.schema_version != REQUEST_SCHEMA_VERSION {
         return Err(RequestError::WrongSchema {
@@ -172,6 +190,9 @@ pub enum RequestError {
         /// What this build understands.
         expected: u32,
     },
+    /// The stored classification and scope fields contradict one another.
+    #[error("attested class and scope identity are inconsistent")]
+    InvalidAttestedIdentity,
     /// The nonce is not the shape a minted nonce has.
     #[error(
         "nonce is not {NONCE_HEX_LEN} lowercase hex characters: it names a file, so anything else \
@@ -271,6 +292,7 @@ impl RequestError {
         match self {
             Self::Malformed { .. } => "request_malformed",
             Self::WrongSchema { .. } => "request_wrong_schema",
+            Self::InvalidAttestedIdentity => "request_invalid_attested_identity",
             Self::MalformedNonce => "request_malformed_nonce",
             Self::NoAction => "request_no_action",
             Self::NotAbsoluteProgram { .. } => "request_program_not_absolute",
@@ -356,6 +378,12 @@ pub struct PendingRequest {
     /// agent and it changed nothing" is exactly what an investigator needs to be
     /// able to see.
     pub claimed_classification: String,
+    /// Identity assigned by the broker from kernel-attested facts.
+    pub attested_class: AttestedClass,
+    /// The kernel cgroup id, duplicated for explicit matching by consumers.
+    pub attested_scope_id: Option<u64>,
+    /// Kernel boot identifier associated with the scope, when available.
+    pub boot_id: Option<String>,
 }
 
 impl PendingRequest {
@@ -442,6 +470,18 @@ impl PendingRequest {
                 found: self.schema_version,
                 expected: REQUEST_SCHEMA_VERSION,
             });
+        }
+        let valid_attested_identity = match &self.attested_class {
+            AttestedClass::EnrolledAgent { scope_id } => {
+                self.attested_scope_id == Some(*scope_id)
+                    && self.boot_id.as_ref().is_some_and(|id| is_boot_id(id))
+            }
+            AttestedClass::Unattested | AttestedClass::Human => {
+                self.attested_scope_id.is_none() && self.boot_id.is_none()
+            }
+        };
+        if !valid_attested_identity {
+            return Err(RequestError::InvalidAttestedIdentity);
         }
         if !is_nonce(&self.nonce) {
             return Err(RequestError::MalformedNonce);
@@ -571,6 +611,18 @@ pub fn is_nonce(candidate: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Whether `candidate` is a canonical lowercase UUID boot id.
+fn is_boot_id(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.bytes().enumerate().all(|(offset, byte)| {
+            if matches!(offset, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
 /// Whether a request fingerprint is lowercase SHA-256 hex.
 fn is_fingerprint(candidate: &str) -> bool {
     candidate.len() == 64
@@ -614,6 +666,9 @@ mod tests {
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
+            attested_class: AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 
@@ -645,13 +700,13 @@ mod tests {
     }
 
     #[test]
-    fn a_previous_spool_schema_is_refused() {
+    fn a_schema_2_spool_entry_is_refused() {
         let mut entry = live();
-        entry.schema_version = REQUEST_SCHEMA_VERSION - 1;
+        entry.schema_version = 2;
         assert_eq!(
             entry.validate(pin(), 7, BoottimeMillis(100)),
             Err(RequestError::WrongSchema {
-                found: REQUEST_SCHEMA_VERSION - 1,
+                found: 2,
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
@@ -668,10 +723,50 @@ mod tests {
         assert_eq!(
             finish_parse(entry).map(|_| ()),
             Err(RequestError::WrongSchema {
-                found: REQUEST_SCHEMA_VERSION - 1,
+                found: 2,
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn an_enrolled_entry_needs_a_scope_id() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn an_enrolled_entry_needs_a_boot_id() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn an_enrolled_entry_with_matching_scope_and_boot_id_validates() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Ok(()));
+    }
+
+    #[test]
+    fn a_malformed_boot_id_cannot_bind_an_enrolled_scope() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01x2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn a_scope_id_without_an_enrolled_class_is_refused() {
+        let mut entry = live();
+        entry.attested_scope_id = Some(44);
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
     }
 
     #[test]
@@ -1347,6 +1442,7 @@ mod tests {
                 found: 2,
                 expected: 1,
             },
+            RequestError::InvalidAttestedIdentity,
             RequestError::MalformedNonce,
             RequestError::NoAction,
             RequestError::NotAbsoluteProgram {
