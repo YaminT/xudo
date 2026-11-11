@@ -48,23 +48,65 @@ trap 'exit 130' INT TERM
 
 # Official images ship policy-rc.d that refuses service starts. A machine does
 # not, and this lane is about the package starting its socket.
+#
+# apt-get -qq prints nothing until dpkg starts. A stalled Ubuntu mirror used to
+# sit there for the whole 240s wait, with an empty `docker logs`, and this
+# script reported that systemd had not become running. The acquire timeout
+# makes a stall fail the container instead. Once systemd is PID 1, the units
+# below are oneshots with no start timeout, or a getty restart loop. A
+# container never needs them. logind stays: without it, pam_systemd blocks
+# `su` and `xudo watch` never publishes a heartbeat. Masking is a symlink to
+# /dev/null, which does not need a running systemd.
 boot='
 set -eu
 export DEBIAN_FRONTEND=noninteractive
+cat >/etc/apt/apt.conf.d/99xudo-boot <<EOF
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Acquire::Retries "2";
+EOF
+echo "boot: apt-get update"
 apt-get update -qq
+echo "boot: apt-get install systemd"
 apt-get install -y -qq systemd systemd-sysv
 rm -f /usr/sbin/policy-rc.d
+mkdir -p /etc/systemd/system
+for unit in \
+    systemd-networkd-wait-online.service \
+    apt-daily.timer \
+    apt-daily-upgrade.timer \
+    apt-daily.service \
+    apt-daily-upgrade.service \
+    getty@.service
+do
+    ln -sfn /dev/null "/etc/systemd/system/$unit"
+done
+echo "boot: exec /sbin/init"
 exec /sbin/init
 '
 
-fail=0
-n=0
-for image in $images; do
-    n=$((n + 1))
-    echo "== $image"
-    name=xudo-systemd-$(printf '%s' "$image" | tr ':/' '--')-$$
+# What the container was doing when the boot wait gave up. Printed before the
+# container is removed. Each query is bounded: a wedged bus must not add
+# another 240s.
+dump_boot() {
+    echo "---- $image boot diagnostics ----" >&2
+    hostpid=$(docker inspect -f '{{.State.Pid}}' "$name" 2>/dev/null || echo 0)
+    ps -p "$hostpid" -o args= >&2 || true
+    timeout 20 docker exec "$name" systemctl list-jobs --no-pager >&2 2>&1 || true
+    timeout 20 docker exec "$name" systemctl --failed --no-pager >&2 2>&1 || true
+    timeout 20 docker exec "$name" systemd-analyze blame --no-pager >&2 2>&1 || true
+    timeout 20 docker exec "$name" journalctl -b --no-pager -n 80 >&2 2>&1 || true
+    docker logs "$name" 2>&1 | tail -40 >&2 || true
+}
+
+# One boot. 120 * 2s is the 240s bound. Returns 0 once systemd reports
+# running or degraded. Leaves the container in place so a failure can be
+# diagnosed. Called from `if`, where `set -e` does not apply.
+boot_once() {
+    state=missing
+    got=
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" \
+    if ! docker run -d --name "$name" \
         --privileged \
         --cgroupns=private \
         --tmpfs /run:rw,nosuid,nodev \
@@ -73,37 +115,61 @@ for image in $images; do
         -v "$root/ci/differential/exec.exp:/opt/exec.exp:ro" \
         -v "$here:/harness:ro" \
         "$image" \
-        sh -c "$boot" >/dev/null
-
-    ready=
+        sh -c "$boot" >/dev/null; then
+        echo "boot: $image container did not start" >&2
+        return 1
+    fi
     i=0
     while [ "$i" -lt 120 ]; do
         state=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)
         if [ "$state" != running ]; then
-            echo "FAIL: $image container is $state" >&2
-            docker logs "$name" 2>&1 | tail -40 >&2 || true
-            fail=1
-            break
+            echo "boot: $image container is $state" >&2
+            return 1
         fi
         got=$(docker exec "$name" systemctl is-system-running 2>/dev/null || true)
         case $got in
         running | degraded)
             echo "   systemd is $got"
-            ready=1
-            break
+            return 0
             ;;
         esac
         i=$((i + 1))
         sleep 2
     done
-    if [ -z "$ready" ]; then
-        if [ "$fail" -eq 0 ] || [ "$state" = running ]; then
-            echo "FAIL: $image systemd did not become running or degraded" >&2
-            docker logs "$name" 2>&1 | tail -40 >&2 || true
-            fail=1
+    echo "boot: $image systemd did not become running or degraded (last: ${got:-none})" >&2
+    return 1
+}
+
+fail=0
+n=0
+for image in $images; do
+    n=$((n + 1))
+    echo "== $image"
+    name=xudo-systemd-$(printf '%s' "$image" | tr ':/' '--')-$$
+    booted=
+    try=1
+    while :; do
+        if boot_once; then
+            booted=1
+            break
         fi
+        dump_boot
         docker rm -f "$name" >/dev/null 2>&1 || true
-        name=
+        if [ "$try" -ge 2 ]; then
+            if [ "$state" != running ]; then
+                echo "FAIL: $image container is $state" >&2
+            else
+                echo "FAIL: $image systemd did not become running or degraded" >&2
+            fi
+            fail=1
+            name=
+            break
+        fi
+        # The container, not the test case. A failed row is never run again.
+        echo "retry: booting $image again" >&2
+        try=2
+    done
+    if [ -z "$booted" ]; then
         continue
     fi
 
