@@ -252,7 +252,8 @@ operator-configurable) that
 The security log is the hash-chained audit trail: root-owned, mode 0600,
 append-only in practice and tamper-evident by construction. xudo (broker and
 gate) writes it and can read it; pasban reads and verifies it; nothing else has
-access. "Hard written" is implemented as a hash chain — every record seals the
+access except root, which the chain detects only through the journal copy.
+"Hard written" is implemented as a hash chain — every record seals the
 one before it — plus the journald copy, so a modification cannot be hidden
 even from an attacker who gains the file: the chain stops verifying, and
 pasban's next run reports exactly where.

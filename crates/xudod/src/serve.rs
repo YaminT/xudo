@@ -438,8 +438,8 @@ fn expire_entries(
                     "expiry audit record was refused",
                 )
             })?;
+        record_outcome_locked(store, &entry, TerminalOutcome::Expired, now, true)?;
         spool.remove(&id).map_err(|error| Refusal::from(&error))?;
-        let _ = record_outcome_locked(store, &entry, TerminalOutcome::Expired, now, true);
     }
     Ok(())
 }
@@ -495,7 +495,7 @@ fn record_outcome_locked(
             until_ms,
         });
     }
-    write_confirm(store, &name, old, &data).map_err(|error| Refusal::from(&error))
+    write_confirm(store, &name, old, &data).map_err(|error| refusal_from_confirm_write(&error))
 }
 
 fn request_fingerprint(request: &BrokerRequest, uid: u32) -> Option<String> {
@@ -574,7 +574,16 @@ fn read_confirm_data(
         return Ok((None, None));
     }
     let bytes = store.read(name.as_bytes(), CONFIRM_FILE_LIMIT)?;
-    let data = parse_confirm_data(&bytes).map_err(|error| SpoolError::Io {
+    let data = validated_confirm(&bytes)?;
+    Ok((Some(bytes), Some(data)))
+}
+
+/// One uid file, or why it cannot be treated as confirmation state.
+///
+/// A file that fails here is kept. Deleting bytes we could not validate could
+/// drop a backoff strike the parser did not show us.
+fn validated_confirm(bytes: &[u8]) -> Result<ConfirmData, SpoolError> {
+    let data = parse_confirm_data(bytes).map_err(|error| SpoolError::Io {
         operation: "parse confirmation state".to_owned(),
         at: crate::CONFIRM_DIR.to_owned(),
         code: None,
@@ -592,7 +601,7 @@ fn read_confirm_data(
             reason: "confirmation state exceeds a field or item bound".to_owned(),
         });
     }
-    Ok((Some(bytes), Some(data)))
+    Ok(data)
 }
 
 fn take_matching_approval(
@@ -953,6 +962,10 @@ struct BackoffEntry {
 }
 
 const MAX_CONFIRM_UIDS: usize = 4_096;
+/// How long a heartbeat still counts as a live watcher. The same window the
+/// channel check and the second-watcher refusal use.
+const HEARTBEAT_FRESH_MS: u64 = 3_000;
+const CONFIRM_DIRECTORY_FULL: &str = "confirmation directory is full";
 const MAX_BACKOFF_ENTRIES_PER_UID: usize = 64;
 const MAX_RECENT_OUTCOMES_PER_UID: usize = 64;
 
@@ -1034,7 +1047,33 @@ fn write_confirm(
     })?;
     match old {
         Some(expected) => store.replace(name.as_bytes(), &expected, &bytes),
-        None => store.publish(name, &bytes),
+        None => publish_confirmation(store, name, &bytes),
+    }
+}
+
+/// Publishes a new uid file only while the directory is inside
+/// [`MAX_CONFIRM_UIDS`].
+///
+/// The caller already counted under the confirm lock. This lists again at the
+/// moment of publishing. A second publisher can land a file between those two
+/// counts when the spool lock does not keep them apart, and file 4097 makes
+/// every later read of the directory fail. Asking for exactly the bound is
+/// enough to see that it has been reached.
+fn publish_confirmation(store: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), SpoolError> {
+    let names = store.names_up_to(MAX_CONFIRM_UIDS)?;
+    if names.len() >= MAX_CONFIRM_UIDS {
+        return Err(SpoolError::Full {
+            at: crate::CONFIRM_DIR.to_owned(),
+            limit: MAX_CONFIRM_UIDS,
+        });
+    }
+    store.publish(name, bytes)
+}
+
+fn refusal_from_confirm_write(error: &SpoolError) -> Refusal {
+    match error {
+        SpoolError::Full { .. } => Refusal::broker(RefusalCode::SpoolFull, CONFIRM_DIRECTORY_FULL),
+        other => Refusal::from(other),
     }
 }
 
@@ -1042,6 +1081,20 @@ fn confirmation_denial(mut decision: Decision, code: xudo_policy::DenialCode) ->
     decision.verdict = xudo_policy::Verdict::Deny;
     decision.denial = Some(code);
     decision
+}
+
+/// A heartbeat is live when it is recent, names a real pid, and `/proc` still
+/// shows that pid and start time. A pid of 0 is never live: the kernel reports
+/// it for a peer that is not in this pid namespace.
+fn heartbeat_is_live(peers: &dyn PeerCalls, heartbeat: &WatcherHeartbeat, now: u64) -> bool {
+    if heartbeat.pid == 0 || now.saturating_sub(heartbeat.at_ms) > HEARTBEAT_FRESH_MS {
+        return false;
+    }
+    peers
+        .read_proc(heartbeat.pid, xudo_sys::ProcFile::Stat)
+        .ok()
+        .and_then(|bytes| xudo_sys::parse_stat("watcher", &bytes).ok())
+        .is_some_and(|stat| stat.pid == heartbeat.pid && stat.starttime == heartbeat.starttime)
 }
 
 fn has_live_watcher(
@@ -1061,24 +1114,15 @@ fn has_live_watcher(
     let Some(heartbeat) = data.heartbeat else {
         return false;
     };
-    if now.saturating_sub(heartbeat.at_ms) > 3_000 || heartbeat.pid == 0 {
-        return false;
-    }
-    let live = peers
-        .read_proc(heartbeat.pid, xudo_sys::ProcFile::Stat)
-        .ok()
-        .and_then(|bytes| {
-            xudo_sys::parse_stat(&format!("/proc/{}/stat", heartbeat.pid), &bytes).ok()
-        })
-        .is_some_and(|stat| stat.pid == heartbeat.pid && stat.starttime == heartbeat.starttime);
-    live && xudo_gate::request::WatcherPin {
-        uid,
-        pid: heartbeat.pid,
-        starttime: heartbeat.starttime,
-        tty: heartbeat.tty,
-        sid: heartbeat.sid,
-    }
-    .is_eligible_for(uid, caller.pid, caller.starttime, caller.sid, caller.tty)
+    heartbeat_is_live(peers, &heartbeat, now)
+        && xudo_gate::request::WatcherPin {
+            uid,
+            pid: heartbeat.pid,
+            starttime: heartbeat.starttime,
+            tty: heartbeat.tty,
+            sid: heartbeat.sid,
+        }
+        .is_eligible_for(uid, caller.pid, caller.starttime, caller.sid, caller.tty)
 }
 
 fn serve_confirmation_question(
@@ -1533,7 +1577,7 @@ fn watch(
         ));
     }
     let now = platform.clock.boottime_millis();
-    save_heartbeat(platform, identity, now)?;
+    save_heartbeat(platform, spool, identity, now)?;
     let watcher = crate::confirm::WatcherFacts {
         uid: identity.uid,
         pid: identity.pid,
@@ -1605,8 +1649,103 @@ fn bounded_prompt(
     }
 }
 
+/// Drops uid files that can no longer change a decision, once the directory
+/// is at [`MAX_CONFIRM_UIDS`].
+///
+/// A file is idle when it has no live heartbeat, no backoff strike still
+/// inside its window, and no outcome a status read would still return.
+/// Anything unreadable, malformed, or over a field bound stays: deleting it
+/// could drop a strike the parser did not show us. Live state is never
+/// deleted, so a directory full of live uids still refuses. Below the bound
+/// the files stay, so a failed heartbeat write cannot erase them. The caller
+/// holds the confirm lock.
+fn prune_idle_confirmations(
+    store: &dyn Spool,
+    requests: &dyn Spool,
+    peers: &dyn PeerCalls,
+    own_name: &[u8],
+    now: u64,
+) -> Result<(), SpoolError> {
+    loop {
+        let names = store.names_up_to(MAX_CONFIRM_UIDS + 1)?;
+        if names.len() < MAX_CONFIRM_UIDS
+            || (names.len() == MAX_CONFIRM_UIDS && names.iter().any(|name| name == own_name))
+        {
+            return Ok(());
+        }
+        let _requests_guard = SpoolGuard::lock(requests)?;
+        let request_names = requests.names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)?;
+        let mut live_uids = Vec::new();
+        for id in request_names {
+            let bytes = requests.read(&id, crate::mint::MAX_ENTRY_BYTES)?;
+            let Ok(entry) = parse_entry(&bytes) else {
+                continue;
+            };
+            if request_uid_is_live(&entry) {
+                live_uids.push(entry.caller_uid);
+            }
+        }
+        live_uids.sort_unstable();
+        live_uids.dedup();
+        let mut removed = false;
+        for name in &names {
+            if !uid_file_is_live(name, &live_uids) && confirmation_is_idle(store, peers, name, now)
+            {
+                store.remove(name)?;
+                removed = true;
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+    }
+}
+
+fn request_uid_is_live(entry: &xudo_gate::request::PendingRequest) -> bool {
+    if !entry.needs_watch {
+        return false;
+    }
+    matches!(
+        entry.state,
+        xudo_gate::request::ConfirmationState::Pending
+            | xudo_gate::request::ConfirmationState::Approved
+    )
+}
+
+fn uid_file_is_live(name: &[u8], live_uids: &[u32]) -> bool {
+    let Some(uid) = name
+        .strip_suffix(b".json")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    live_uids.binary_search(&uid).is_ok()
+}
+
+/// `true` only when the file is safe to delete. A read or parse failure is
+/// not idle.
+fn confirmation_is_idle(store: &dyn Spool, peers: &dyn PeerCalls, name: &[u8], now: u64) -> bool {
+    let Ok(bytes) = store.read(name, CONFIRM_FILE_LIMIT) else {
+        return false;
+    };
+    let Ok(data) = validated_confirm(&bytes) else {
+        return false;
+    };
+    if data.backoff.iter().any(|entry| now < entry.until_ms) {
+        return false;
+    }
+    if data.outcomes.iter().any(|entry| now < entry.until_ms) {
+        return false;
+    }
+    data.heartbeat
+        .as_ref()
+        .is_none_or(|heartbeat| !heartbeat_is_live(peers, heartbeat, now))
+}
+
 fn save_heartbeat(
     platform: &mut Platform<'_>,
+    requests: &dyn Spool,
     identity: &PeerIdentity,
     now: u64,
 ) -> Result<(), Refusal> {
@@ -1617,6 +1756,9 @@ fn save_heartbeat(
         )
     })?;
     let _guard = SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?;
+    let name = format!("{}.json", identity.uid);
+    prune_idle_confirmations(store, requests, platform.peers, name.as_bytes(), now)
+        .map_err(|error| Refusal::from(&error))?;
     let heartbeat = WatcherHeartbeat {
         pid: identity.pid,
         starttime: identity.starttime,
@@ -1624,7 +1766,6 @@ fn save_heartbeat(
         sid: identity.sid,
         at_ms: now,
     };
-    let name = format!("{}.json", identity.uid);
     let (old, data) = read_confirm_data(store, &name).map_err(|_| {
         Refusal::broker(
             RefusalCode::SpoolUnusable,
@@ -1633,23 +1774,16 @@ fn save_heartbeat(
     })?;
     if let Some(data) = &data {
         if let Some(first) = &data.heartbeat {
-            if first.pid != identity.pid || first.starttime != identity.starttime {
-                let active = now.saturating_sub(first.at_ms) <= 3_000
-                    && platform
-                        .peers
-                        .read_proc(first.pid, xudo_sys::ProcFile::Stat)
-                        .ok()
-                        .and_then(|b| xudo_sys::parse_stat("watcher", &b).ok())
-                        .is_some_and(|s| s.pid == first.pid && s.starttime == first.starttime);
-                if active {
-                    return Err(Refusal::client(
-                        RefusalCode::ChannelUntrusted,
-                        format!(
-                            "watcher already active: pid {}, tty {}",
-                            first.pid, first.tty
-                        ),
-                    ));
-                }
+            if (first.pid != identity.pid || first.starttime != identity.starttime)
+                && heartbeat_is_live(platform.peers, first, now)
+            {
+                return Err(Refusal::client(
+                    RefusalCode::ChannelUntrusted,
+                    format!(
+                        "watcher already active: pid {}, tty {}",
+                        first.pid, first.tty
+                    ),
+                ));
             }
         }
     }
@@ -1658,21 +1792,11 @@ fn save_heartbeat(
         backoff: Vec::new(),
         outcomes: Vec::new(),
     });
-    if old.is_none()
-        && store
-            .names_up_to(MAX_CONFIRM_UIDS + 1)
-            .map_or(true, |names| names.len() >= MAX_CONFIRM_UIDS)
-    {
-        return Err(Refusal::broker(
-            RefusalCode::SpoolFull,
-            "confirmation directory is full",
-        ));
-    }
     let mut updated = data;
     updated.outcomes.retain(|outcome| outcome.until_ms > now);
     updated.backoff.retain(|entry| entry.until_ms > now);
     updated.heartbeat = Some(heartbeat);
-    write_confirm(store, &name, old, &updated).map_err(|error| Refusal::from(&error))
+    write_confirm(store, &name, old, &updated).map_err(|error| refusal_from_confirm_write(&error))
 }
 
 fn answer_confirmation(
@@ -1822,7 +1946,6 @@ fn complete_answer(
                 )
             })?;
         drop(record);
-        spool.remove(id.as_bytes()).map_err(|e| Refusal::from(&e))?;
         record_outcome_locked(
             platform.confirmations.ok_or_else(|| {
                 Refusal::broker(
@@ -1835,6 +1958,7 @@ fn complete_answer(
             platform.clock.boottime_millis(),
             true,
         )?;
+        spool.remove(id.as_bytes()).map_err(|e| Refusal::from(&e))?;
     }
     Ok(BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -2083,7 +2207,7 @@ mod tests {
         clippy::arithmetic_side_effects
     )]
 
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
 
@@ -2092,7 +2216,7 @@ mod tests {
     use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
     use xudo_sys::{
         Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakeHygiene, FakePeer, FakeSpool,
-        FakeSyscalls, FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure,
+        FakeSyscalls, FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, Spool,
         SpoolCall, SysError,
     };
     use xudo_wire::{Answer, WIRE_SCHEMA_VERSION};
@@ -3691,6 +3815,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             store.with_file(format!("{uid}.json"), b"{}".to_vec())
         });
         assert!(read_confirm_data(&store, "missing.json").is_err());
+        let broken_listing = FakeSpool::new().failing_names(SpoolError::Io {
+            operation: "list confirmation directory".to_owned(),
+            at: crate::CONFIRM_DIR.to_owned(),
+            code: None,
+            reason: "listing failed".to_owned(),
+        });
+        assert!(read_confirm_data(&broken_listing, "missing.json").is_err());
 
         let invalid = ConfirmData {
             heartbeat: None,
@@ -3711,7 +3842,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", b"oversized or malformed".to_vec());
-        let err = save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolUnusable);
         assert!(err.detail.contains("operator repair"));
         assert_eq!(
@@ -3735,7 +3867,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let bytes = serde_json::to_vec(&state).unwrap();
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new().with_file("1000.json", bytes.clone());
-        save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap();
+        save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap();
         let saved: ConfirmData =
             serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
         assert!(saved.backoff.is_empty() && saved.heartbeat.is_some());
@@ -3744,7 +3876,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_replace(SpoolError::Gone {
                 name: "state".to_owned(),
             });
-        let err = save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolUnusable);
         assert_eq!(host.confirmations.files()[b"1000.json".as_slice()], bytes);
     }
@@ -4470,7 +4603,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_expiry_is_not_audited_twice_when_outcome_storage_fails() {
+    fn an_expiry_refuses_and_keeps_the_request_when_outcome_storage_fails() {
         let mut entry = shown_entry();
         entry.deadline = BoottimeMillis(NOW);
         let spool = FakeSpool::new().with_file(
@@ -4478,15 +4611,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             entry.to_json().into_bytes(),
         );
         let mut host = Host::honest();
-        host.confirmations = FakeSpool::new().failing_replace(SpoolError::Gone {
-            name: "confirm".to_owned(),
+        host.confirmations = FakeSpool::new().failing_publish(SpoolError::Io {
+            operation: "publish".to_owned(),
+            at: "confirm".to_owned(),
+            code: None,
+            reason: "full".to_owned(),
         });
         let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
 
-        expire_entries(&mut host.platform(), &spool, &request).unwrap();
-        assert!(spool.files().is_empty());
-        assert_eq!(host.audit.records().len(), 1);
-        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(spool.files().len(), 1);
         assert_eq!(host.audit.records().len(), 1);
     }
 
@@ -4907,7 +5046,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_denied_entry_is_gone_even_if_the_outcome_write_fails() {
+    fn a_denied_entry_stays_available_when_the_outcome_write_fails() {
         let entry = shown_entry();
         let bytes = entry.to_json().into_bytes();
         let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
@@ -4930,13 +5069,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &answer_request(NONCE, "no", false),
             AnsweredEntry {
                 id: NONCE.to_owned(),
-                bytes,
+                bytes: bytes.clone(),
                 entry,
             },
             false,
         );
         assert_eq!(result.unwrap_err().code, RefusalCode::SpoolUnusable);
-        assert!(spool.files().is_empty());
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&bytes));
     }
 
     #[test]
@@ -5287,6 +5426,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.peers = FakePeer::new().with_proc(6000, ProcFile::Stat, stat_line(6000, 88));
         let err = save_heartbeat(
             &mut host.platform(),
+            &FakeSpool::new(),
             &test_identity(5000, 77, 2, 34816),
             NOW,
         )
@@ -5320,17 +5460,470 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_full_confirm_directory_refuses_and_overwrites_nothing() {
+    fn a_full_parseable_live_confirm_directory_refuses_and_preserves_every_file() {
+        let live = backoff_file(NOW + 1);
         let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
-            store.with_file(format!("{uid}.json"), b"{}".to_vec())
+            store.with_file(format!("{uid}.json"), live.clone())
         });
         let mut host = Host::honest();
         host.confirmations = store;
         let before = host.confirmations.files();
         let mut another_uid = test_identity(PID, START, 2, 34816);
         another_uid.uid = 50_000;
-        let err = save_heartbeat(&mut host.platform(), &another_uid, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &another_uid, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolFull);
+        assert_eq!(err.detail, CONFIRM_DIRECTORY_FULL);
+        assert_eq!(host.confirmations.files(), before);
+    }
+
+    #[test]
+    fn a_pending_request_keeps_its_uid_file_live_during_pruning() {
+        let idle = empty_confirm();
+        let mut store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), idle.clone())
+        });
+        let broken_confirm = b"malformed confirmation state".to_vec();
+        store = store
+            .with_file("1000.json", idle)
+            .with_file("not-a-uid.json", broken_confirm.clone());
+        let mut request_entry = shown_entry();
+        request_entry.caller_uid = 1000;
+        let mut password_only = shown_entry();
+        password_only.nonce = format!("{:064x}", 1);
+        password_only.needs_watch = false;
+        password_only.state = xudo_gate::request::ConfirmationState::Pending;
+        password_only.confirmed = false;
+        password_only.confirmed_by = None;
+        password_only.shown_at_ms = None;
+        password_only.shown_to = None;
+        let requests = FakeSpool::new()
+            .with_file(b"unparseable".to_vec(), b"not-json".to_vec())
+            .with_file(
+                password_only.nonce.as_bytes().to_vec(),
+                password_only.to_json().into_bytes(),
+            )
+            .with_file(
+                request_entry.nonce.as_bytes().to_vec(),
+                request_entry.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 80_000;
+        watch(&mut host.platform(), &requests, &watcher).unwrap();
+        let files = host.confirmations.files();
+        assert_eq!(files[b"1000.json".as_slice()], empty_confirm());
+        assert_eq!(files[b"not-a-uid.json".as_slice()], broken_confirm);
+        assert!(files.contains_key(b"80000.json".as_slice()));
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn pending_and_approved_requests_keep_their_uid_files_live() {
+        let mut entry = shown_entry();
+        assert!(request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        assert!(request_uid_is_live(&entry));
+
+        entry.needs_watch = false;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.needs_watch = true;
+        entry.state = xudo_gate::request::ConfirmationState::Consumed;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Denied;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Expired;
+        assert!(!request_uid_is_live(&entry));
+    }
+
+    #[test]
+    fn a_full_bound_with_the_callers_file_skips_the_prune_walk() {
+        let live = backoff_file(NOW + 1);
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), live.clone())
+        });
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let watcher = test_identity(PID, START, 2, 34816);
+        save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap();
+        assert_eq!(
+            host.confirmations
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, SpoolCall::Read(_)))
+                .count(),
+            1,
+            "only the caller's file is read for its heartbeat update"
+        );
+        assert!(
+            !host
+                .confirmations
+                .calls()
+                .iter()
+                .any(|call| matches!(call, SpoolCall::Remove(_)))
+        );
+    }
+
+    #[test]
+    fn pruning_fails_closed_when_the_request_spool_cannot_be_inspected() {
+        let live = backoff_file(NOW + 1);
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), live.clone())
+        });
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 50_000;
+
+        for requests in [
+            FakeSpool::new().failing_lock(gone("request lock")),
+            FakeSpool::new().failing_names(gone("request names")),
+            FakeSpool::new()
+                .with_file(b"request".to_vec(), b"unreadable".to_vec())
+                .failing_read(b"request".to_vec()),
+        ] {
+            let before = host.confirmations.files();
+            let err = save_heartbeat(&mut host.platform(), &requests, &watcher, NOW).unwrap_err();
+            assert_eq!(err.code, RefusalCode::SpoolUnusable);
+            assert_eq!(host.confirmations.files(), before);
+        }
+    }
+
+    fn empty_confirm() -> Vec<u8> {
+        serde_json::to_vec(&ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn confirm_bytes(data: &ConfirmData) -> Vec<u8> {
+        serde_json::to_vec(data).unwrap()
+    }
+
+    fn hb(pid: u32, starttime: u64, at_ms: u64) -> WatcherHeartbeat {
+        WatcherHeartbeat {
+            pid,
+            starttime,
+            tty: 1,
+            sid: 1,
+            at_ms,
+        }
+    }
+
+    fn backoff_file(until_ms: u64) -> Vec<u8> {
+        confirm_bytes(&ConfirmData {
+            heartbeat: None,
+            backoff: vec![BackoffEntry {
+                fingerprint: "b".repeat(64),
+                strikes: 2,
+                until_ms,
+            }],
+            outcomes: Vec::new(),
+        })
+    }
+
+    fn outcome_file(until_ms: u64) -> Vec<u8> {
+        confirm_bytes(&ConfirmData {
+            heartbeat: None,
+            backoff: Vec::new(),
+            outcomes: vec![RecentOutcome {
+                id: "a".repeat(64),
+                outcome: TerminalOutcome::Denied,
+                until_ms,
+                pid: 1,
+                starttime: 1,
+            }],
+        })
+    }
+
+    fn heartbeat_file(pid: u32, starttime: u64, at_ms: u64) -> Vec<u8> {
+        confirm_bytes(&ConfirmData {
+            heartbeat: Some(hb(pid, starttime, at_ms)),
+            backoff: Vec::new(),
+            outcomes: Vec::new(),
+        })
+    }
+
+    /// Another publisher's file appears on the publish-time listing, which asks
+    /// for exactly [`MAX_CONFIRM_UIDS`] names. Earlier listings ask for one past
+    /// the bound and must not see it.
+    enum ListingFault {
+        Insert(Vec<(String, Vec<u8>)>),
+        Fail(SpoolError),
+    }
+
+    struct InterleavedSpool {
+        inner: FakeSpool,
+        at_limit: usize,
+        action: RefCell<Option<ListingFault>>,
+    }
+
+    impl InterleavedSpool {
+        fn inserting(files: Vec<(String, Vec<u8>)>) -> Self {
+            Self {
+                inner: FakeSpool::new(),
+                at_limit: MAX_CONFIRM_UIDS,
+                action: RefCell::new(Some(ListingFault::Insert(files))),
+            }
+        }
+
+        fn failing(error: SpoolError) -> Self {
+            Self {
+                inner: FakeSpool::new(),
+                at_limit: MAX_CONFIRM_UIDS,
+                action: RefCell::new(Some(ListingFault::Fail(error))),
+            }
+        }
+
+        fn failing_interleaved_publish(error: SpoolError) -> Self {
+            Self {
+                inner: FakeSpool::new().failing_publish(error),
+                at_limit: MAX_CONFIRM_UIDS,
+                action: RefCell::new(Some(ListingFault::Insert(vec![(
+                    "raced.json".to_owned(),
+                    b"raced".to_vec(),
+                )]))),
+            }
+        }
+
+        fn files(&self) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+            self.inner.files()
+        }
+    }
+
+    impl Spool for InterleavedSpool {
+        fn lock(&self) -> Result<(), SpoolError> {
+            self.inner.lock()
+        }
+
+        fn unlock(&self) {
+            self.inner.unlock();
+        }
+
+        fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
+            self.inner.names()
+        }
+
+        fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
+            if limit == self.at_limit {
+                let action = self.action.borrow_mut().take();
+                if let Some(action) = action {
+                    match action {
+                        ListingFault::Insert(files) => {
+                            for (name, bytes) in files {
+                                self.inner.publish(&name, &bytes)?;
+                            }
+                        }
+                        ListingFault::Fail(error) => return Err(error),
+                    }
+                }
+            }
+            self.inner.names_up_to(limit)
+        }
+
+        fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
+            self.inner.read(name, limit)
+        }
+
+        fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
+            self.inner.remove(name)
+        }
+
+        fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
+            self.inner.consume(name)
+        }
+
+        fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), SpoolError> {
+            self.inner.publish(name, bytes)
+        }
+
+        fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
+            self.inner.replace(name, expected, bytes)
+        }
+    }
+
+    #[test]
+    fn interleaved_spool_delegates_its_fake_operations() {
+        let spool = InterleavedSpool::inserting(Vec::new());
+        spool.lock().unwrap();
+        spool.publish("1.json", b"old").unwrap();
+        assert_eq!(spool.read(b"1.json", 16).unwrap(), b"old");
+        spool.replace(b"1.json", b"old", b"new").unwrap();
+        assert_eq!(spool.names().unwrap(), vec![b"1.json".to_vec()]);
+        assert_eq!(spool.names_up_to(1).unwrap(), vec![b"1.json".to_vec()]);
+        assert_eq!(spool.names_up_to(MAX_CONFIRM_UIDS).unwrap().len(), 1);
+        assert_eq!(spool.names_up_to(MAX_CONFIRM_UIDS).unwrap().len(), 1);
+        spool.remove(b"1.json").unwrap();
+        spool.publish("2.json", b"used").unwrap();
+        spool.consume(b"2.json").unwrap();
+        assert!(spool.files().is_empty());
+        spool.unlock();
+    }
+
+    #[test]
+    fn four_thousand_and_ninety_seven_idle_uids_do_not_lock_out_watch() {
+        // Every way a uid file can look occupied and still be idle: an empty
+        // record, a heartbeat the channel check would reject, and a strike or
+        // outcome whose window has closed (including exactly at `until_ms`).
+        let idle = empty_confirm();
+        let mut store = FakeSpool::new();
+        for uid in 0..=MAX_CONFIRM_UIDS {
+            store = store.with_file(format!("{uid}.json"), idle.clone());
+        }
+        store = store
+            .with_file("4087.json", outcome_file(NOW))
+            .with_file("4088.json", heartbeat_file(7300, 77, NOW - 3_001))
+            .with_file("4089.json", heartbeat_file(0, 77, NOW))
+            .with_file("4090.json", heartbeat_file(7202, 77, NOW))
+            .with_file("4091.json", heartbeat_file(7200, 77, NOW))
+            .with_file("4092.json", heartbeat_file(7201, 77, NOW))
+            .with_file("4093.json", heartbeat_file(7203, 77, NOW))
+            .with_file("4094.json", backoff_file(NOW - 1))
+            .with_file("4095.json", backoff_file(NOW))
+            .with_file("4096.json", outcome_file(NOW - 1));
+        let mut host = Host::honest();
+        host.peers = std::mem::take(&mut host.peers)
+            .with_proc(7300, ProcFile::Stat, stat_line(7300, 77))
+            .with_proc(0, ProcFile::Stat, stat_line(0, 77))
+            .with_proc(7200, ProcFile::Stat, stat_line(1, 77))
+            .with_proc(7201, ProcFile::Stat, b"not-a-stat".to_vec())
+            .with_proc(7203, ProcFile::Stat, stat_line(7203, 1));
+        host.confirmations = store;
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let response = watch(&mut host.platform(), &FakeSpool::new(), &watcher).unwrap();
+        assert_eq!(
+            response.answer,
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0
+            }
+        );
+        let files = host.confirmations.files();
+        assert_eq!(files.len(), 1, "idle uid files must not keep the bound");
+        let saved: ConfirmData = serde_json::from_slice(&files[b"1000.json".as_slice()]).unwrap();
+        assert_eq!(saved.heartbeat.unwrap().pid, watcher.pid);
+        assert!(saved.backoff.is_empty());
+        assert!(saved.outcomes.is_empty());
+    }
+
+    #[test]
+    fn a_uid_with_live_backoff_is_never_pruned() {
+        let idle = empty_confirm();
+        let mut store = FakeSpool::new();
+        for uid in 0..MAX_CONFIRM_UIDS {
+            store = store.with_file(format!("{uid}.json"), idle.clone());
+        }
+        let live_backoff = backoff_file(NOW + 1);
+        let live_outcome = outcome_file(NOW + 1);
+        let live_heartbeat = heartbeat_file(6100, 91, NOW);
+        let boundary_heartbeat = heartbeat_file(6101, 91, NOW - HEARTBEAT_FRESH_MS);
+        let unreadable = b"do-not-delete".to_vec();
+        store = store
+            .with_file("10.json", live_backoff.clone())
+            .with_file("11.json", live_outcome.clone())
+            .with_file("12.json", live_heartbeat.clone())
+            .with_file("13.json", unreadable.clone())
+            .with_file("14.json", boundary_heartbeat.clone())
+            .failing_read("13.json");
+        let mut host = Host::honest();
+        host.peers = std::mem::take(&mut host.peers)
+            .with_proc(6100, ProcFile::Stat, stat_line(6100, 91))
+            .with_proc(6101, ProcFile::Stat, stat_line(6101, 91));
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 80_000;
+        let response = watch(&mut host.platform(), &FakeSpool::new(), &watcher).unwrap();
+        assert_eq!(
+            response.answer,
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0
+            }
+        );
+        let files = host.confirmations.files();
+        assert_eq!(files[b"10.json".as_slice()], live_backoff);
+        assert_eq!(files[b"11.json".as_slice()], live_outcome);
+        assert_eq!(files[b"12.json".as_slice()], live_heartbeat);
+        assert_eq!(files[b"13.json".as_slice()], unreadable);
+        assert_eq!(files[b"14.json".as_slice()], boundary_heartbeat);
+        assert!(!files.contains_key(b"0.json".as_slice()));
+        assert!(files.contains_key(b"80000.json".as_slice()));
+        assert_eq!(files.len(), 6);
+    }
+
+    #[test]
+    fn the_bound_holds_when_two_publishers_race() {
+        let raced = (0..MAX_CONFIRM_UIDS)
+            .map(|uid| (format!("r{uid}.json"), b"raced".to_vec()))
+            .collect();
+        let store = InterleavedSpool::inserting(raced);
+        let mut host = Host::honest();
+        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut platform = host.platform();
+        platform.confirmations = Some(&store);
+        let err = watch(&mut platform, &FakeSpool::new(), &watcher).unwrap_err();
+        assert_eq!(err.code, RefusalCode::SpoolFull);
+        assert_eq!(store.files().len(), MAX_CONFIRM_UIDS);
+        assert!(!store.files().contains_key(b"1000.json".as_slice()));
+
+        // The publish-time listing itself failing must not then publish.
+        // An I/O error whose reason is not "directory full" stays unusable.
+        let store = InterleavedSpool::failing(SpoolError::Io {
+            operation: "list confirmation directory".to_owned(),
+            at: crate::CONFIRM_DIR.to_owned(),
+            code: None,
+            reason: "listing failed".to_owned(),
+        });
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = Some(&store);
+        let err = watch(&mut platform, &FakeSpool::new(), &watcher).unwrap_err();
+        assert_eq!(err.code, RefusalCode::SpoolUnusable);
+        assert!(store.files().is_empty());
+
+        // A failure while applying the interleaving fault is also a listing
+        // failure and must not be mistaken for a full directory.
+        let store = InterleavedSpool::failing_interleaved_publish(SpoolError::Io {
+            operation: "publish interleaved file".to_owned(),
+            at: crate::CONFIRM_DIR.to_owned(),
+            code: None,
+            reason: "injected failure".to_owned(),
+        });
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.confirmations = Some(&store);
+        let err = watch(&mut platform, &FakeSpool::new(), &watcher).unwrap_err();
+        assert_eq!(err.code, RefusalCode::SpoolUnusable);
+        assert!(store.files().is_empty());
+    }
+
+    #[test]
+    fn a_failed_unlink_cannot_be_skipped_to_publish_past_the_bound() {
+        let idle = empty_confirm();
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), idle.clone())
+        });
+        let store = store.failing_remove(SpoolError::Io {
+            operation: "unlink".to_owned(),
+            at: crate::CONFIRM_DIR.to_owned(),
+            code: None,
+            reason: "busy".to_owned(),
+        });
+        let before = store.files();
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 50_000;
+        let err = watch(&mut host.platform(), &FakeSpool::new(), &watcher).unwrap_err();
+        assert_eq!(err.code, RefusalCode::SpoolUnusable);
+        assert!(err.detail.contains("busy"));
         assert_eq!(host.confirmations.files(), before);
     }
 
@@ -5341,7 +5934,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut platform = host.platform();
         platform.confirmations = None;
         assert_eq!(
-            save_heartbeat(&mut platform, &watcher, NOW)
+            save_heartbeat(&mut platform, &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5352,7 +5945,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             name: "names".to_owned(),
         });
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5366,7 +5959,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&no_heartbeat).unwrap());
-        assert!(save_heartbeat(&mut host.platform(), &watcher, NOW).is_ok());
+        assert!(save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).is_ok());
 
         let oversized = ConfirmData {
             heartbeat: None,
@@ -5383,7 +5976,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&oversized).unwrap());
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5396,7 +5989,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 name: "state".to_owned(),
             });
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5422,7 +6015,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&stale).unwrap());
-        assert!(save_heartbeat(&mut host.platform(), &watcher, NOW).is_ok());
+        assert!(save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).is_ok());
         let saved: ConfirmData =
             serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
         assert!(saved.outcomes.is_empty());
@@ -5653,7 +6246,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn one_users_broken_confirm_file_does_not_block_another_users_run() {
+    fn a_broken_confirm_file_refuses_a_run_when_expiry_cannot_record_its_strike() {
         let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
         let mut expired = shown_entry();
         expired.caller_uid = UID + 1;
@@ -5692,8 +6285,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             )
             .with_file("1001.json", b"broken confirm state".to_vec());
         let outcome = serve_with(&mut host, &request, Ok(&spool));
-        assert_eq!(outcome.served, Served::Minted);
-        assert!(spool.files().contains_key(NONCE.as_bytes()));
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(spool.files().len(), 1);
+        assert!(spool.files().contains_key(expired.nonce.as_bytes()));
         assert_eq!(
             host.confirmations.files()[b"1001.json".as_slice()],
             b"broken confirm state"
