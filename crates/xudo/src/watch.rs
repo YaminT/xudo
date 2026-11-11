@@ -1,9 +1,8 @@
 //! The out-of-band confirmation terminal.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -463,51 +462,15 @@ fn refused_or_unusable(answer: Answer, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// One request and one bounded response over the broker socket.
+/// One request and one response. Connect, the write, and the read share the
+/// heartbeat as one deadline.
 ///
 /// # Errors
 ///
-/// Returns a connection, I/O, or response parsing error.
+/// Returns a connection, deadline, size, or response parsing error.
 pub fn ask_live(socket: &Path, request: &BrokerRequest) -> Result<BrokerResponse, String> {
-    let bytes = ask_live_bytes(socket, request).map_err(display_error)?;
+    let bytes = crate::exchange::exchange(socket, request.to_json().as_bytes(), HEARTBEAT)?;
     BrokerResponse::parse(&bytes).map_err(display_error)
-}
-
-trait BrokerStream: Read + Write {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-    fn shutdown_write(&self) -> io::Result<()>;
-}
-
-impl BrokerStream for UnixStream {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_read_timeout(self, timeout)
-    }
-
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        UnixStream::set_write_timeout(self, timeout)
-    }
-
-    fn shutdown_write(&self) -> io::Result<()> {
-        self.shutdown(std::net::Shutdown::Write)
-    }
-}
-
-fn ask_live_bytes(socket: &Path, request: &BrokerRequest) -> io::Result<Vec<u8>> {
-    let mut stream = UnixStream::connect(socket)?;
-    exchange_stream(&mut stream, request)
-}
-
-fn exchange_stream(stream: &mut dyn BrokerStream, request: &BrokerRequest) -> io::Result<Vec<u8>> {
-    stream.set_read_timeout(Some(HEARTBEAT))?;
-    stream.set_write_timeout(Some(HEARTBEAT))?;
-    stream.write_all(request.to_json().as_bytes())?;
-    stream.shutdown_write()?;
-    let mut bytes = Vec::new();
-    (&mut *stream)
-        .take(u64::try_from(xudo_wire::MAX_RESPONSE_BYTES).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
@@ -525,9 +488,8 @@ mod tests {
         clippy::disallowed_methods
     )]
 
-    use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::io;
+    use std::io::{self, Read};
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -737,82 +699,6 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::other("injected read failure"))
         }
-    }
-
-    struct FailingBrokerStream {
-        fail_at: usize,
-        calls: Cell<usize>,
-        response: io::Cursor<Vec<u8>>,
-    }
-
-    impl FailingBrokerStream {
-        fn step(&self) -> io::Result<()> {
-            let call = self.calls.get();
-            self.calls.set(call.saturating_add(1));
-            if call == self.fail_at {
-                Err(io::Error::other("injected stream failure"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl Read for FailingBrokerStream {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            self.step()?;
-            self.response.read(buffer)
-        }
-    }
-
-    impl Write for FailingBrokerStream {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.step()?;
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl BrokerStream for FailingBrokerStream {
-        fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-            self.step()
-        }
-
-        fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-            self.step()
-        }
-
-        fn shutdown_write(&self) -> io::Result<()> {
-            self.step()
-        }
-    }
-
-    #[test]
-    fn socket_exchange_errors_are_closed_at_each_io_boundary() {
-        let request = BrokerRequest {
-            schema_version: WIRE_SCHEMA_VERSION,
-            question: Question::Pending,
-        };
-        for fail_at in 0..5 {
-            let mut stream = FailingBrokerStream {
-                fail_at,
-                calls: Cell::new(0),
-                response: io::Cursor::new(Vec::new()),
-            };
-            assert!(exchange_stream(&mut stream, &request).is_err());
-        }
-        let mut successful_stream = FailingBrokerStream {
-            fail_at: usize::MAX,
-            calls: Cell::new(0),
-            response: io::Cursor::new(b"reply".to_vec()),
-        };
-        assert_eq!(
-            exchange_stream(&mut successful_stream, &request).unwrap(),
-            b"reply"
-        );
-        successful_stream.flush().unwrap();
     }
 
     #[test]
@@ -1427,6 +1313,26 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
                 omitted: 0,
             }
         );
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn a_garbage_reply_is_not_a_broker_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            stream.write_all(b"not json").unwrap();
+        });
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Pending,
+        };
+        let err = ask_live(&socket, &request).unwrap_err();
+        assert!(err.contains("broker response"), "{err}");
         broker.join().unwrap();
     }
 
