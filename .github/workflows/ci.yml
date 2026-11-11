@@ -24,6 +24,9 @@ jobs:
   gate:
     name: gate (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Green gate (macos-15) runs finish in 2m07s to 3m47s. 30 minutes is
+    # room for a slow runner; a hang fails here, not at the 6-hour default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
