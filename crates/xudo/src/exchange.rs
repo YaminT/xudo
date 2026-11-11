@@ -280,8 +280,8 @@ impl BrokerIo for Live {
         if self.stream.is_some() {
             return Step::Ready;
         }
-        let started = start_connect(&self.path, bounded, self.wait);
-        self.apply(settle(started, self.wait))
+        let settled = connect_attempt(&self.path, bounded, &mut self.wait, start_connect);
+        self.apply(settled)
     }
 
     fn write(&mut self, bounded: Duration, bytes: &[u8]) -> Step {
@@ -408,6 +408,22 @@ fn start_connect(path: &Path, bounded: Duration, wait: bool) -> Start {
     } else {
         nonblocking_connect(path, bounded)
     }
+}
+
+/// Turns a queued nonblocking connect into the one bounded blocking retry.
+/// The starter is injectable so this transition is tested on every platform,
+/// including kernels whose Unix socket queue is difficult to fill reliably.
+fn connect_attempt(
+    path: &Path,
+    bounded: Duration,
+    wait: &mut bool,
+    start: impl FnOnce(&Path, Duration, bool) -> Start,
+) -> Settled {
+    let settled = settle(start(path, bounded, *wait), *wait);
+    if matches!(settled, Settled::NeedWait) {
+        *wait = true;
+    }
+    settled
 }
 
 fn nonblocking_connect(path: &Path, bounded: Duration) -> Start {
@@ -1247,6 +1263,41 @@ mod tests {
         let mut live = Live::open(Path::new("/nope"));
         assert_eq!(live.apply(Settled::Done(bare_socket())), Step::Ready);
         assert_eq!(live.connect(Duration::from_millis(50)), Step::Ready);
+    }
+
+    #[test]
+    fn a_queued_connect_retries_once_with_the_bounded_blocking_mode() {
+        let mut wait = false;
+        let mut attempts = Vec::new();
+        let first = connect_attempt(
+            Path::new("socket"),
+            Duration::from_millis(25),
+            &mut wait,
+            |path, bounded, blocking| {
+                attempts.push((path.to_path_buf(), bounded, blocking));
+                Start::Wait
+            },
+        );
+        assert_eq!(format!("{first:?}"), "NeedWait");
+        assert!(wait);
+
+        let second = connect_attempt(
+            Path::new("socket"),
+            Duration::from_millis(10),
+            &mut wait,
+            |path, bounded, blocking| {
+                attempts.push((path.to_path_buf(), bounded, blocking));
+                Start::Ready(bare_socket())
+            },
+        );
+        assert!(format!("{second:?}").starts_with("Done("));
+        assert_eq!(
+            attempts,
+            [
+                (PathBuf::from("socket"), Duration::from_millis(25), false),
+                (PathBuf::from("socket"), Duration::from_millis(10), true),
+            ]
+        );
     }
 
     #[test]
