@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 pub const SPOOL_DIR: &str = "/run/xudo/req";
 
 /// The wire version of a spool entry.
-pub const REQUEST_SCHEMA_VERSION: u32 = 3;
+pub const REQUEST_SCHEMA_VERSION: u32 = 4;
 
 /// Classification fixed by the broker from kernel-attested caller facts.
 ///
@@ -394,7 +394,10 @@ impl PendingRequest {
     /// [`RequestError::Malformed`] for anything that is not this wire format,
     /// including an unknown key or a missing required key. Optional fields
     /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
-    /// deserialize as `None`, as serde defines for `Option` fields.
+    /// deserialize as `None`, as serde defines for `Option` fields. Attested
+    /// identity fields must use canonical shapes and agree with each other:
+    /// `attested_scope_id` and `boot_id` are both required for an enrolled
+    /// agent and both absent for a human or unattested caller.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
@@ -403,18 +406,6 @@ impl PendingRequest {
         if !value.is_object() {
             return Err(RequestError::Malformed {
                 reason: "top-level JSON value must be an object".to_owned(),
-            });
-        }
-        if value
-            .get("confirmed_by")
-            .is_some_and(|pin| !pin.is_null() && !pin.is_object())
-            || value
-                .get("shown_to")
-                .is_some_and(|pin| !pin.is_null() && !pin.is_object())
-            || value.get("state").is_some_and(|state| !state.is_string())
-        {
-            return Err(RequestError::Malformed {
-                reason: "nested values must use object and string forms".to_owned(),
             });
         }
         if let Some(found) = value
@@ -426,6 +417,28 @@ impl PendingRequest {
             return Err(RequestError::WrongSchema {
                 found,
                 expected: REQUEST_SCHEMA_VERSION,
+            });
+        }
+        let attested_class_has_valid_shape = value.get("attested_class").is_some_and(|class| {
+            class.is_string()
+                || class.as_object().is_some_and(|variants| {
+                    variants.len() == 1
+                        && variants
+                            .get("enrolled_agent")
+                            .is_some_and(serde_json::Value::is_object)
+                })
+        });
+        if !attested_class_has_valid_shape
+            || value
+                .get("confirmed_by")
+                .is_some_and(|pin| !pin.is_null() && !pin.is_object())
+            || value
+                .get("shown_to")
+                .is_some_and(|pin| !pin.is_null() && !pin.is_object())
+            || value.get("state").is_some_and(|state| !state.is_string())
+        {
+            return Err(RequestError::Malformed {
+                reason: "nested values must use object and string forms".to_owned(),
             });
         }
         let request: Self =
@@ -612,7 +625,7 @@ pub fn is_nonce(candidate: &str) -> bool {
 }
 
 /// Whether `candidate` is a canonical lowercase UUID boot id.
-fn is_boot_id(candidate: &str) -> bool {
+pub fn is_boot_id(candidate: &str) -> bool {
     candidate.len() == 36
         && candidate.bytes().enumerate().all(|(offset, byte)| {
             if matches!(offset, 8 | 13 | 18 | 23) {
@@ -700,6 +713,18 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_3_beta_one_spool_entry_is_refused() {
+        let beta_one = r#"{"schema_version":3,"nonce":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","caller_pid":4242,"caller_starttime":998877,"action":"xudo.svc.restart","program":"/usr/bin/systemctl","argv":["restart","nginx.service"],"generation":7,"deadline":200,"confirmed":false,"confirmed_by":null,"state":"pending","caller_uid":1000,"caller_sid":10,"caller_tty":20,"needs_watch":false,"shown_at_ms":null,"shown_to":null,"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","claimed_classification":"enrolled-agent"}"#;
+        assert_eq!(
+            PendingRequest::parse(beta_one),
+            Err(RequestError::WrongSchema {
+                found: 3,
+                expected: REQUEST_SCHEMA_VERSION,
+            })
+        );
+    }
+
+    #[test]
     fn a_schema_2_spool_entry_is_refused() {
         let mut entry = live();
         entry.schema_version = 2;
@@ -727,6 +752,39 @@ mod tests {
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_positional_attested_class_is_refused() {
+        let entry = live().to_json().replace(
+            r#""attested_class":"unattested""#,
+            r#""attested_class":{"enrolled_agent":[44]}"#,
+        );
+        assert_eq!(
+            PendingRequest::parse(&entry).unwrap_err().code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_null_unit_attested_class_is_refused() {
+        let entry = live().to_json().replace(
+            r#""attested_class":"unattested""#,
+            r#""attested_class":{"unattested":null}"#,
+        );
+        assert_eq!(
+            PendingRequest::parse(&entry).unwrap_err().code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_with_an_enrolled_agent_object_is_parsed() {
+        let entry = live().to_json().replace(
+            r#""attested_class":"unattested","attested_scope_id":null,"boot_id":null"#,
+            r#""attested_class":{"enrolled_agent":{"scope_id":44}},"attested_scope_id":44,"boot_id":"abcdef01-2345-6789-abcd-ef0123456789""#,
+        );
+        assert!(PendingRequest::parse(&entry).is_ok());
     }
 
     #[test]
@@ -759,6 +817,23 @@ mod tests {
         entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01x2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn an_enrolled_class_with_a_different_scope_id_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 45 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn a_human_class_with_a_boot_id_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::Human;
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
         assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
     }
 

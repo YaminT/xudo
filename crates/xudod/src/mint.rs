@@ -48,7 +48,7 @@ use std::fmt::Write as _;
 
 use xudo_audit::Approval;
 use xudo_gate::request::{
-    AttestedClass, BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_nonce,
+    AttestedClass, BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_boot_id, is_nonce,
 };
 use xudo_policy::{CallerFacts, Classification, Decision};
 use xudo_sys::{
@@ -149,7 +149,7 @@ pub enum MintError {
     #[error("a permitted decision names no action, so the gate would have nothing to look up")]
     NoAction,
     /// An agent classification lacks the kernel cgroup id needed to bind it.
-    #[error("the broker classified an agent without an attested cgroup scope id")]
+    #[error("the broker could not bind the agent to a valid cgroup scope and boot id")]
     NoAttestedScope,
     /// The spool refused an operation.
     #[error(transparent)]
@@ -187,10 +187,10 @@ pub enum MintError {
     ConfirmationThrottled,
 }
 
-struct AttestedCaller<'a> {
-    identity: &'a PeerIdentity,
-    facts: &'a CallerFacts,
-    boot_id: Option<&'a str>,
+pub(crate) struct AttestedCaller<'a> {
+    pub(crate) identity: &'a PeerIdentity,
+    pub(crate) facts: &'a CallerFacts,
+    pub(crate) boot_id: Option<&'a str>,
 }
 
 /// The entry as an approval: the command and action its audit record must
@@ -291,7 +291,7 @@ pub fn entry_for(
     )
 }
 
-fn entry_for_classified(
+pub(crate) fn entry_for_classified(
     decision: &Decision,
     attested: &AttestedCaller<'_>,
     request: &BrokerRequest,
@@ -318,7 +318,7 @@ fn entry_for_classified(
             let Some(scope_id) = identity.cgroup_id else {
                 return Err(MintError::NoAttestedScope);
             };
-            let Some(boot_id) = boot_id.filter(|id| !id.is_empty()) else {
+            let Some(boot_id) = boot_id.filter(|id| is_boot_id(id)) else {
                 return Err(MintError::NoAttestedScope);
             };
             (
@@ -780,26 +780,83 @@ mod tests {
 
     proptest! {
         #[test]
-        fn claimed_classification_never_reaches_attested_class(claim in any::<String>()) {
+        fn claimed_classification_never_reaches_attested_class(
+            claim_a in prop_oneof![
+                any::<String>(),
+                Just("enrolled_agent".to_owned()),
+                Just("human".to_owned()),
+                Just("scope_id=77".to_owned()),
+            ],
+            claim_b in prop_oneof![
+                any::<String>(),
+                Just("enrolled_agent".to_owned()),
+                Just("human".to_owned()),
+                Just("scope_id=77".to_owned()),
+            ],
+        ) {
+            let mut peer = identity(4242, 5_000);
+            peer.cgroup_id = Some(77);
+            let facts = CallerFacts::new(
+                Classification::EnrolledAgent {
+                    agent_id: "worker".to_owned(),
+                    session_id: "session".to_owned(),
+                    declared_yolo: false,
+                },
+                peer.uid,
+            );
             let request = BrokerRequest::new(
                 "/usr/bin/systemctl",
                 vec!["restart".to_owned()],
-                &claim,
+                &claim_a,
             );
-            let minted = entry_for(
+            let attest = AttestedCaller {
+                identity: &peer,
+                facts: &facts,
+                boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            };
+            let first = entry_for_classified(
                 &permitted(),
-                &identity(4242, 5_000),
+                &attest,
                 &request,
                 7,
                 true,
                 1_900,
                 nonce('a'),
             );
-            prop_assert!(minted.is_ok());
-            if let Ok(entry) = minted {
-                prop_assert_eq!(entry.claimed_classification, claim);
-                prop_assert_eq!(entry.attested_class, AttestedClass::Unattested);
-                prop_assert_eq!(entry.attested_scope_id, None);
+            let second_request = BrokerRequest::new(
+                "/usr/bin/systemctl",
+                vec!["restart".to_owned()],
+                &claim_b,
+            );
+            let second = entry_for_classified(
+                &permitted(),
+                &attest,
+                &second_request,
+                7,
+                true,
+                1_900,
+                nonce('b'),
+            );
+            prop_assert!(first.is_ok());
+            prop_assert!(second.is_ok());
+            if let (Ok(first), Ok(second)) = (first, second) {
+                prop_assert_eq!(first.claimed_classification, claim_a);
+                prop_assert_eq!(second.claimed_classification, claim_b);
+                prop_assert_eq!(
+                    (
+                        &first.attested_class,
+                        first.attested_scope_id,
+                        &first.boot_id,
+                    ),
+                    (
+                        &second.attested_class,
+                        second.attested_scope_id,
+                        &second.boot_id,
+                    ),
+                );
+                prop_assert_eq!(first.attested_class, AttestedClass::EnrolledAgent { scope_id: 77 });
+                prop_assert_eq!(first.attested_scope_id, Some(77));
+                prop_assert_eq!(first.boot_id.as_deref(), Some("abcdef01-2345-6789-abcd-ef0123456789"));
             }
         }
     }
@@ -936,6 +993,37 @@ mod tests {
                     identity: &peer,
                     facts: &caller,
                     boot_id: Some(""),
+                },
+                &request,
+                7,
+                true,
+                1_900,
+                nonce('a'),
+            ),
+            Err(MintError::NoAttestedScope)
+        );
+    }
+
+    #[test]
+    fn an_enrolled_class_with_a_boot_id_newline_is_not_minted() {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = Some(77);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "worker".to_owned(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "x");
+        assert_eq!(
+            entry_for_classified(
+                &permitted(),
+                &AttestedCaller {
+                    identity: &peer,
+                    facts: &caller,
+                    boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789\n"),
                 },
                 &request,
                 7,
