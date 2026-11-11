@@ -30,6 +30,7 @@
 pub mod agentdoc;
 pub mod cli;
 pub mod doctor;
+mod exchange;
 pub mod exec;
 pub mod probe;
 pub mod render;
