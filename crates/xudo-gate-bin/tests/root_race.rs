@@ -1,6 +1,7 @@
 //! Two real sudo invocations racing to consume one real gate entry.
 
 #![cfg(feature = "root-tests")]
+#![cfg(target_os = "linux")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -11,11 +12,11 @@
 )]
 
 use std::fs::{self, File, Permissions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{PermissionsExt, chown};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use xudo_gate::SPOOL_DIR;
@@ -30,6 +31,8 @@ const PASSWORD: &str = "xudotest-fixed-password";
 const RULES: &str = include_str!("../../../rules/05-probe.toml");
 const RULES_DIR: &str = "/etc/xudo/rules.d";
 const ACTION: &str = "xudo.probe.id";
+const AUDIT_LOG: &str = "/var/lib/xudo/audit.jsonl";
+const GONE_DETAIL: &str = "already gone from the spool: another consumer took it first";
 
 fn begin_root_test(test: &str) -> bool {
     root_guard(test)
@@ -104,9 +107,66 @@ fn install_gate() -> Journal {
     let rules = xudo_backend::detect(&xudo_sys::HostProbe).unwrap();
     let plan = xudo_backend::InstallPlan::human_only(&rules).unwrap();
     xudo_sys::execute(&plan, &xudo_sys::HostInstallOps::system(), &NoProbe).unwrap();
+    let _ = xudo_sys::run_capture("/usr/sbin/groupadd", &["--system", "xudo"], None);
+    let added = xudo_sys::run_capture("/usr/sbin/usermod", &["-aG", "xudo", USER], None).unwrap();
+    assert!(
+        added.success,
+        "could not add {USER} to xudo: {}",
+        added.stderr
+    );
     Journal {
         socket: journal,
         reader: Some(reader),
+    }
+}
+
+struct FifoGuard(Vec<String>);
+
+impl Drop for FifoGuard {
+    fn drop(&mut self) {
+        for fifo in &self.0 {
+            let _ = fs::remove_file(fifo);
+        }
+    }
+}
+
+struct PromptedChild {
+    child: Child,
+    stderr: ChildStderr,
+    captured_stderr: Vec<u8>,
+}
+
+impl PromptedChild {
+    fn wait_for_prompt(mut child: Child, prompt: &str) -> Self {
+        let mut stderr = child.stderr.take().unwrap();
+        let mut captured_stderr = Vec::new();
+        let mut buffer = [0_u8; 128];
+        while !captured_stderr
+            .windows(prompt.len())
+            .any(|window| window == prompt.as_bytes())
+        {
+            let count = stderr.read(&mut buffer).unwrap();
+            assert!(count > 0, "sudo exited before prompt {prompt:?}");
+            captured_stderr.extend_from_slice(&buffer[..count]);
+        }
+        Self {
+            child,
+            stderr,
+            captured_stderr,
+        }
+    }
+
+    fn finish(mut self) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+        let status = self.child.wait().unwrap();
+        let mut stdout = Vec::new();
+        self.child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        self.stderr.read_to_end(&mut self.captured_stderr).unwrap();
+        (status, stdout, self.captured_stderr)
     }
 }
 
@@ -162,6 +222,131 @@ fn write_entry(round: u64) -> String {
     nonce
 }
 
+fn make_fifo_pair(round: u64) -> (String, String, FifoGuard) {
+    let base = format!("/run/xudo/race-{round}");
+    let fifo_a = format!("{base}-a");
+    let fifo_b = format!("{base}-b");
+    let guard = FifoGuard(vec![fifo_a.clone(), fifo_b.clone()]);
+    for fifo in [&fifo_a, &fifo_b] {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            fifo.as_str(),
+            rustix::fs::Mode::from_bits_truncate(0o666),
+        )
+        .unwrap();
+        fs::set_permissions(fifo, Permissions::from_mode(0o600)).unwrap();
+    }
+    (fifo_a, fifo_b, guard)
+}
+
+fn spawn_sudo(fifo: &str, round: u64, lane: &str) -> (Child, String) {
+    let prompt = format!("XUDO_RACE_{round}_{lane}:");
+    let child = Command::new("/usr/sbin/runuser")
+        .args([
+            "-u",
+            USER,
+            "--",
+            "/usr/bin/sudo",
+            "-S",
+            "-p",
+            &prompt,
+            GATE_AUTH,
+        ])
+        .stdin(Stdio::from(File::open(fifo).unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, prompt)
+}
+
+fn assert_round_outputs(
+    round: u64,
+    nonce: &str,
+    a: &(ExitStatus, Vec<u8>, Vec<u8>),
+    b: &(ExitStatus, Vec<u8>, Vec<u8>),
+) -> bool {
+    let outputs = [a, b];
+    let successes = outputs
+        .iter()
+        .filter(|(status, stdout, _)| {
+            status.success() && String::from_utf8_lossy(stdout).trim() == "0"
+        })
+        .count();
+    assert_eq!(successes, 1, "round {round}: {a:?} {b:?}");
+    let refusals = outputs
+        .iter()
+        .filter(|(status, _, _)| !status.success())
+        .count();
+    assert_eq!(refusals, 1, "round {round}: {a:?} {b:?}");
+    assert!(
+        !Path::new(&format!("{SPOOL_DIR}/{nonce}")).exists(),
+        "round {round}: entry survived"
+    );
+
+    let audit = fs::read_to_string(AUDIT_LOG).unwrap();
+    outputs
+        .iter()
+        .filter(|(status, _, _)| !status.success())
+        .any(|(_, _, stderr_bytes)| {
+            let stderr = String::from_utf8_lossy(stderr_bytes);
+            assert!(
+                stderr.contains("xudo-gate: refused (gate_failed_spool")
+                    || stderr.contains("xudo-gate: refused (gate_no_pending_request"),
+                "round {round}: loser did not fail closed: {stderr}"
+            );
+            if stderr.contains("xudo-gate: refused (gate_failed_spool") {
+                let audit_line = audit
+                    .lines()
+                    .find(|line| {
+                        line.contains(&format!("nonce={nonce}"))
+                            && line.contains("\"denial\":\"gate_failed_spool\"")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("round {round}: no audit record for {nonce}: {audit}")
+                    });
+                assert!(
+                    audit_line.contains(GONE_DETAIL),
+                    "round {round}: spool failure was not Gone: {audit_line}"
+                );
+                true
+            } else {
+                false
+            }
+        })
+}
+
+fn run_race_round(round: u64) -> bool {
+    let nonce = write_entry(round);
+    let (fifo_a, fifo_b, _fifo_guard) = make_fifo_pair(round);
+    let barrier = Arc::new(Barrier::new(3));
+    let writers: Vec<_> = [fifo_a.clone(), fifo_b.clone()]
+        .into_iter()
+        .map(|fifo| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut writer = File::options().write(true).open(fifo).unwrap();
+                barrier.wait();
+                writer
+                    .write_all(format!("{PASSWORD}\n").as_bytes())
+                    .unwrap();
+            })
+        })
+        .collect();
+
+    let (a_child, a_prompt) = spawn_sudo(&fifo_a, round, "a");
+    let (b_child, b_prompt) = spawn_sudo(&fifo_b, round, "b");
+    let a = PromptedChild::wait_for_prompt(a_child, &a_prompt);
+    let b = PromptedChild::wait_for_prompt(b_child, &b_prompt);
+    barrier.wait();
+    let a = a.finish();
+    let b = b.finish();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert_round_outputs(round, &nonce, &a, &b)
+}
+
 #[test]
 fn two_gates_racing_one_entry_run_it_exactly_once() {
     if !begin_root_test("two_gates_racing_one_entry_run_it_exactly_once") {
@@ -170,91 +355,11 @@ fn two_gates_racing_one_entry_run_it_exactly_once() {
     let _journal = install_gate();
     let mut gone_refusals = 0;
     for round in 0..50_u64 {
-        let nonce = write_entry(round);
-        let base = format!("/run/xudo/race-{round}");
-        let fifo_a = format!("{base}-a");
-        let fifo_b = format!("{base}-b");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            fifo_a.as_str(),
-            rustix::fs::Mode::from_bits_truncate(0o666),
-        )
-        .unwrap();
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            fifo_b.as_str(),
-            rustix::fs::Mode::from_bits_truncate(0o666),
-        )
-        .unwrap();
-        chown(&fifo_a, Some(1000), Some(1000)).unwrap();
-        chown(&fifo_b, Some(1000), Some(1000)).unwrap();
-        fs::set_permissions(&fifo_a, Permissions::from_mode(0o600)).unwrap();
-        fs::set_permissions(&fifo_b, Permissions::from_mode(0o600)).unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let writers: Vec<_> = [fifo_a.clone(), fifo_b.clone()]
-            .into_iter()
-            .map(|fifo| {
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    let mut writer = File::options().write(true).open(fifo).unwrap();
-                    barrier.wait();
-                    writer
-                        .write_all(format!("{PASSWORD}\n").as_bytes())
-                        .unwrap();
-                })
-            })
-            .collect();
-        let child = |fifo: &str| {
-            Command::new("/usr/sbin/runuser")
-                .args(["-u", USER, "--", "/usr/bin/sudo", "-S", GATE_AUTH])
-                .stdin(Stdio::from(File::open(fifo).unwrap()))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap()
-        };
-        let a = child(&fifo_a);
-        let b = child(&fifo_b);
-        barrier.wait();
-        let a = a.wait_with_output().unwrap();
-        let b = b.wait_with_output().unwrap();
-        for writer in writers {
-            writer.join().unwrap();
-        }
-        let successes = [&a, &b]
-            .into_iter()
-            .filter(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0"
-            })
-            .count();
-        assert_eq!(successes, 1, "round {round}: {a:?} {b:?}");
-        let refusals = [&a, &b]
-            .into_iter()
-            .filter(|output| !output.status.success())
-            .count();
-        assert_eq!(refusals, 1, "round {round}: {a:?} {b:?}");
-        assert!(
-            !Path::new(&format!("{SPOOL_DIR}/{nonce}")).exists(),
-            "round {round}: entry survived"
-        );
-        fs::remove_file(fifo_a).unwrap();
-        fs::remove_file(fifo_b).unwrap();
-        for output in [&a, &b] {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    stderr.contains("xudo-gate: refused (gate_failed_spool")
-                        || stderr.contains("xudo-gate: refused (gate_no_pending_request"),
-                    "round {round}: loser did not fail closed on the consumed entry: {output:?}"
-                );
-                if stderr.contains("xudo-gate: refused (gate_failed_spool") {
-                    gone_refusals += 1;
-                }
-            }
-        }
+        gone_refusals += usize::from(run_race_round(round));
     }
     assert!(
         gone_refusals > 0,
         "50 simultaneous releases never exercised Gone at unlink"
     );
+    eprintln!("root_race: {gone_refusals} of 50 rounds produced Gone");
 }
