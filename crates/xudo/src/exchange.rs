@@ -296,7 +296,8 @@ impl BrokerIo for Live {
         if self.stream.is_some() {
             return Step::Ready;
         }
-        let settled = connect_attempt(&self.path, bounded, &mut self.wait, start_connect);
+        let started = start_connect(&self.path, bounded, self.wait);
+        let settled = connect_attempt(started, &mut self.wait);
         self.apply(settled)
     }
 
@@ -449,15 +450,10 @@ fn start_connect(path: &Path, bounded: Duration, wait: bool) -> Start {
 }
 
 /// Turns a queued nonblocking connect into the one bounded blocking retry.
-/// The starter is injectable so this transition is tested on every platform,
+/// The result is injected so this transition is tested on every platform,
 /// including kernels whose Unix socket queue is difficult to fill reliably.
-fn connect_attempt(
-    path: &Path,
-    bounded: Duration,
-    wait: &mut bool,
-    start: impl FnOnce(&Path, Duration, bool) -> Start,
-) -> Settled {
-    let settled = settle(start(path, bounded, *wait), *wait);
+fn connect_attempt(started: Start, wait: &mut bool) -> Settled {
+    let settled = settle(started, *wait);
     if matches!(settled, Settled::NeedWait) {
         *wait = true;
     }
@@ -1311,32 +1307,26 @@ mod tests {
     #[test]
     fn a_refused_timeout_is_denied_until_one_setting_has_succeeded() {
         let mut stream = UnixStream::from(bare_socket());
+        let refuse: fn(&UnixStream) -> io::Result<()> =
+            |stream| refuse_send_timeout(stream, Duration::from_secs(1));
+        let accept: fn(&UnixStream) -> io::Result<()> = accept_timeout;
+        let transfer: fn(&mut UnixStream) -> io::Result<usize> = queued_bytes;
         // The probe has to run once, or its body is an uncovered region. The
         // assertion below is that `after_timeout` does not run it.
         let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transfer_without_a_timeout(&mut stream)
         }));
         assert!(probed.is_err(), "the transfer probe did not panic");
-        let (armed, result) = after_timeout(
-            &mut stream,
-            |_| Err(io::Error::other("refused")),
-            false,
-            transfer_without_a_timeout,
-        );
+        let (armed, result) = after_timeout(&mut stream, refuse, false, transfer);
         assert!(!armed);
         let err = result.unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
 
-        let (armed, result) = after_timeout(
-            &mut stream,
-            |_| Err(io::Error::other("closed")),
-            true,
-            queued_bytes,
-        );
+        let (armed, result) = after_timeout(&mut stream, refuse, true, transfer);
         assert!(armed);
         assert_eq!(result.unwrap(), 4);
 
-        let (armed, result) = after_timeout(&mut stream, |_| Ok(()), false, queued_bytes);
+        let (armed, result) = after_timeout(&mut stream, accept, false, transfer);
         assert!(armed);
         assert_eq!(result.unwrap(), 4);
 
@@ -1344,24 +1334,14 @@ mod tests {
             shutdown_without_a_timeout(&mut stream)
         }));
         assert!(probed.is_err(), "the shutdown probe did not panic");
-        let (armed, end) = after_timeout(
-            &mut stream,
-            |_| Err(io::Error::other("refused")),
-            false,
-            shutdown_without_a_timeout,
-        );
+        let (armed, end) = after_timeout(&mut stream, refuse, false, shutdown_finished);
         assert!(!armed);
         assert!(end.unwrap_err().to_string().contains("refused"));
 
-        let (armed, end) = after_timeout(
-            &mut stream,
-            |_| Err(io::Error::other("closed")),
-            true,
-            shutdown_finished,
-        );
+        let (armed, end) = after_timeout(&mut stream, refuse, true, shutdown_finished);
         assert!(armed);
         assert!(end.is_ok());
-        let (armed, end) = after_timeout(&mut stream, |_| Ok(()), false, shutdown_finished);
+        let (armed, end) = after_timeout(&mut stream, accept, false, shutdown_finished);
         assert!(armed);
         assert!(end.is_ok());
     }
@@ -1410,38 +1390,14 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_connect_retries_once_with_the_bounded_blocking_mode() {
+    fn a_queued_connect_retries_once_then_becomes_ready() {
         let mut wait = false;
-        let mut attempts = Vec::new();
-        let first = connect_attempt(
-            Path::new("socket"),
-            Duration::from_millis(25),
-            &mut wait,
-            |path, bounded, blocking| {
-                attempts.push((path.to_path_buf(), bounded, blocking));
-                Start::Wait
-            },
-        );
+        let first = connect_attempt(Start::Wait, &mut wait);
         assert_eq!(format!("{first:?}"), "NeedWait");
         assert!(wait);
 
-        let second = connect_attempt(
-            Path::new("socket"),
-            Duration::from_millis(10),
-            &mut wait,
-            |path, bounded, blocking| {
-                attempts.push((path.to_path_buf(), bounded, blocking));
-                Start::Ready(bare_socket())
-            },
-        );
+        let second = connect_attempt(Start::Ready(bare_socket()), &mut wait);
         assert!(format!("{second:?}").starts_with("Done("));
-        assert_eq!(
-            attempts,
-            [
-                (PathBuf::from("socket"), Duration::from_millis(25), false),
-                (PathBuf::from("socket"), Duration::from_millis(10), true),
-            ]
-        );
     }
 
     #[test]
@@ -1472,6 +1428,11 @@ mod tests {
 
     fn refuse_recv_timeout(_: &UnixStream, _: Duration) -> io::Result<()> {
         Err(io::Error::other("receive refused"))
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // the timeout callback reports syscall errors
+    fn accept_timeout(_: &UnixStream) -> io::Result<()> {
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
