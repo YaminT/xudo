@@ -193,6 +193,9 @@ pub enum RequestError {
     /// The stored classification and scope fields contradict one another.
     #[error("attested class and scope identity are inconsistent")]
     InvalidAttestedIdentity,
+    /// The consumed entry does not match the caller's live attested identity.
+    #[error("caller attested identity does not match the consumed entry")]
+    WrongAttestedIdentity,
     /// The nonce is not the shape a minted nonce has.
     #[error(
         "nonce is not {NONCE_HEX_LEN} lowercase hex characters: it names a file, so anything else \
@@ -293,6 +296,7 @@ impl RequestError {
             Self::Malformed { .. } => "request_malformed",
             Self::WrongSchema { .. } => "request_wrong_schema",
             Self::InvalidAttestedIdentity => "request_invalid_attested_identity",
+            Self::WrongAttestedIdentity => "request_wrong_attested_identity",
             Self::MalformedNonce => "request_malformed_nonce",
             Self::NoAction => "request_no_action",
             Self::NotAbsoluteProgram { .. } => "request_program_not_absolute",
@@ -577,6 +581,31 @@ impl PendingRequest {
         Ok(())
     }
 
+    /// Whether the gate's live classification, scope, and boot still match
+    /// the attested identity recorded when the broker minted this entry.
+    pub fn live_attested_identity_matches(
+        &self,
+        class: &AttestedClass,
+        scope_id: Option<u64>,
+        boot_id: Option<&str>,
+    ) -> bool {
+        match &self.attested_class {
+            AttestedClass::Unattested => {
+                class == &AttestedClass::Unattested && scope_id.is_none() && boot_id.is_none()
+            }
+            AttestedClass::Human => {
+                class == &AttestedClass::Human && scope_id.is_none() && boot_id.is_none()
+            }
+            AttestedClass::EnrolledAgent { scope_id: saved } => {
+                class == &AttestedClass::EnrolledAgent { scope_id: *saved }
+                    && scope_id == Some(*saved)
+                    && self.attested_scope_id == Some(*saved)
+                    && self.boot_id.as_deref().is_some_and(is_boot_id)
+                    && boot_id == self.boot_id.as_deref()
+            }
+        }
+    }
+
     /// Refuses any NUL byte in a string the kernel would see.
     fn refuse_interior_nul(&self) -> Result<(), RequestError> {
         let named = [("program", self.program.as_str()), ("action", &self.action)];
@@ -809,6 +838,50 @@ mod tests {
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
         assert_eq!(check(&entry), Ok(()));
+    }
+
+    #[test]
+    fn a_consumed_enrolled_identity_matches_only_its_live_scope_and_boot() {
+        let mut request = live();
+        request.state = ConfirmationState::Consumed;
+        request.needs_watch = true;
+        request.confirmed = true;
+        let watcher = WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        };
+        request.confirmed_by = Some(watcher.clone());
+        request.shown_to = Some(watcher);
+        request.shown_at_ms = Some(BoottimeMillis(99));
+        request.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        request.attested_scope_id = Some(44);
+        request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        assert!(request.live_attested_identity_matches(
+            &class,
+            Some(44),
+            Some("abcdef01-2345-6789-abcd-ef0123456789")
+        ));
+        assert!(!request.live_attested_identity_matches(
+            &class,
+            Some(44),
+            Some("abcdef01-2345-6789-abcd-ef0123456780")
+        ));
+        assert!(!request.live_attested_identity_matches(&class, Some(44), None));
+    }
+
+    #[test]
+    fn a_human_entry_matches_only_a_live_human_with_no_scope_or_boot() {
+        let mut request = live();
+        request.attested_class = AttestedClass::Human;
+        let boot = "abcdef01-2345-6789-abcd-ef0123456789";
+        assert!(request.live_attested_identity_matches(&AttestedClass::Human, None, None));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Human, Some(44), None));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Human, None, Some(boot)));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
     }
 
     #[test]
