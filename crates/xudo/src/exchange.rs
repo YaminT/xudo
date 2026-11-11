@@ -73,6 +73,7 @@ enum Step {
 /// The socket operations the exchange loop needs.
 trait BrokerIo {
     fn connect(&mut self, bounded: Duration) -> Step;
+    fn arm_timeouts(&mut self, bounded: Duration) -> Step;
     fn write(&mut self, bounded: Duration, bytes: &[u8]) -> Step;
     fn shutdown_write(&mut self, bounded: Duration) -> Step;
     fn read(&mut self, bounded: Duration, buf: &mut [u8]) -> Step;
@@ -87,6 +88,17 @@ fn exchange_until(
 ) -> Result<Vec<u8>, String> {
     let started = now();
     connect_for(timeout, started, now, io)?;
+    // Arm both directions immediately after connect, while the peer is still
+    // handling the request. Some kernels reject setting a timeout after the
+    // peer has already closed the socket.
+    match io.arm_timeouts(next_budget(started, now, timeout)?) {
+        Step::Ready => {}
+        Step::Failed(reason) => return Err(reason),
+        Step::Interrupted => return Err("arming broker socket timeouts was interrupted".to_owned()),
+        Step::Transferred(_) => {
+            return Err("arming broker socket timeouts reported a byte count".to_owned());
+        }
+    }
     write_for(request, timeout, started, now, io)?;
     shutdown_for(timeout, started, now, io)?;
     read_reply(timeout, started, now, io)
@@ -246,6 +258,8 @@ struct Live {
     send_bounded: bool,
     /// A receive timeout was accepted. A later refusal leaves that bound in place.
     recv_bounded: bool,
+    set_send_timeout: fn(&UnixStream, Duration) -> io::Result<()>,
+    set_recv_timeout: fn(&UnixStream, Duration) -> io::Result<()>,
 }
 
 impl Live {
@@ -256,6 +270,8 @@ impl Live {
             stream: None,
             send_bounded: false,
             recv_bounded: false,
+            set_send_timeout,
+            set_recv_timeout,
         }
     }
 
@@ -282,6 +298,20 @@ impl BrokerIo for Live {
         }
         let settled = connect_attempt(&self.path, bounded, &mut self.wait, start_connect);
         self.apply(settled)
+    }
+
+    fn arm_timeouts(&mut self, bounded: Duration) -> Step {
+        let Some(stream) = self.stream.as_ref() else {
+            return Step::Failed("the broker timeouts ran before the connection".to_owned());
+        };
+        let send = (self.set_send_timeout)(stream, bounded);
+        let recv = (self.set_recv_timeout)(stream, bounded);
+        self.send_bounded = send.is_ok();
+        self.recv_bounded = recv.is_ok();
+        match (send, recv) {
+            (Ok(()), Ok(())) => Step::Ready,
+            (Err(error), _) | (_, Err(error)) => Step::Failed(error.to_string()),
+        }
     }
 
     fn write(&mut self, bounded: Duration, bytes: &[u8]) -> Step {
@@ -331,6 +361,14 @@ impl BrokerIo for Live {
         self.recv_bounded = armed;
         classify_io(transfer)
     }
+}
+
+fn set_send_timeout(stream: &UnixStream, bounded: Duration) -> io::Result<()> {
+    stream.set_write_timeout(Some(bounded))
+}
+
+fn set_recv_timeout(stream: &UnixStream, bounded: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(bounded))
 }
 
 /// Runs `transfer` only when the socket has a timeout.
@@ -621,13 +659,16 @@ mod tests {
 
     struct Script {
         connect: VecDeque<Step>,
+        arm: VecDeque<Step>,
         write: VecDeque<WriteAct>,
         shutdown: VecDeque<Step>,
         read: VecDeque<ReadAct>,
         seen_connect: Vec<Duration>,
+        seen_arm: Vec<Duration>,
         seen_write: Vec<Duration>,
         seen_shutdown: Vec<Duration>,
         seen_read: Vec<Duration>,
+        events: Vec<&'static str>,
         reads: usize,
     }
 
@@ -635,13 +676,16 @@ mod tests {
         fn new() -> Self {
             Self {
                 connect: VecDeque::new(),
+                arm: VecDeque::new(),
                 write: VecDeque::new(),
                 shutdown: VecDeque::new(),
                 read: VecDeque::new(),
                 seen_connect: Vec::new(),
+                seen_arm: Vec::new(),
                 seen_write: Vec::new(),
                 seen_shutdown: Vec::new(),
                 seen_read: Vec::new(),
+                events: Vec::new(),
                 reads: 0,
             }
         }
@@ -649,11 +693,19 @@ mod tests {
 
     impl BrokerIo for Script {
         fn connect(&mut self, bounded: Duration) -> Step {
+            self.events.push("connect");
             self.seen_connect.push(bounded);
             self.connect.pop_front().expect("kept connecting")
         }
 
+        fn arm_timeouts(&mut self, bounded: Duration) -> Step {
+            self.events.push("arm");
+            self.seen_arm.push(bounded);
+            self.arm.pop_front().unwrap_or(Step::Ready)
+        }
+
         fn write(&mut self, bounded: Duration, bytes: &[u8]) -> Step {
+            self.events.push("write");
             self.seen_write.push(bounded);
             match self.write.pop_front().expect("kept writing") {
                 WriteAct::Step(step) => step,
@@ -717,7 +769,7 @@ mod tests {
     fn a_signal_storm_cannot_extend_the_reply_wait() {
         let timeout = Duration::from_secs(1);
         let step = Duration::from_millis(200);
-        // started, connect, write, shutdown, then one clock reading per
+        // started, connect, initial timeouts, write, shutdown, then one clock reading per
         // interrupted read. The reading after the fifth interrupt is the
         // deadline, so the loop must not read again.
         let mut storm = primed(vec![]);
@@ -725,6 +777,7 @@ mod tests {
             storm.read.push_back(ReadAct::Step(Step::Interrupted));
         }
         let offsets = [
+            Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -762,6 +815,7 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
+            Duration::ZERO,
             pause,
             pause * 2u32,
             pause * 3u32,
@@ -789,7 +843,15 @@ mod tests {
         script.connect.clear();
         script.connect.push_back(Step::Interrupted);
         script.connect.push_back(Step::Ready);
-        let offsets = [Duration::ZERO, Duration::ZERO, pause, pause, pause, pause];
+        let offsets = [
+            Duration::ZERO,
+            Duration::ZERO,
+            pause,
+            pause,
+            pause,
+            pause,
+            pause,
+        ];
         assert_eq!(
             run(b"{}", timeout, &offsets, &mut script).unwrap(),
             done_bytes()
@@ -805,6 +867,63 @@ mod tests {
     }
 
     #[test]
+    fn both_socket_timeouts_are_armed_after_connect_and_before_write() {
+        let timeout = Duration::from_secs(1);
+        let pause = Duration::from_millis(40);
+        let mut script = primed(vec![ReadAct::Chunk(done_bytes())]);
+        let offsets = [Duration::ZERO, Duration::ZERO, pause, pause, pause, pause];
+        assert!(run(b"{}", timeout, &offsets, &mut script).is_ok());
+        assert_eq!(
+            script.seen_arm,
+            [kernel_timeout(timeout.checked_sub(pause).unwrap()).unwrap()]
+        );
+        assert_eq!(script.seen_connect.len(), 1);
+        assert_eq!(script.seen_write.len(), 1);
+        assert_eq!(script.events[..3], ["connect", "arm", "write"]);
+    }
+
+    #[test]
+    fn either_initial_timeout_refusal_denies_before_the_request_write() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut live = Live::open(Path::new("socket"));
+        live.stream = Some(stream);
+        live.set_send_timeout = refuse_send_timeout;
+        assert!(matches!(
+            live.arm_timeouts(Duration::from_secs(1)),
+            Step::Failed(reason) if reason.contains("send refused")
+        ));
+        assert!(!live.send_bounded && live.recv_bounded);
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut live = Live::open(Path::new("socket"));
+        live.stream = Some(stream);
+        live.set_recv_timeout = refuse_recv_timeout;
+        assert!(matches!(
+            live.arm_timeouts(Duration::from_secs(1)),
+            Step::Failed(reason) if reason.contains("receive refused")
+        ));
+        assert!(live.send_bounded && !live.recv_bounded);
+
+        for step in [Step::Interrupted, Step::Transferred(1)] {
+            let mut invalid = Script::new();
+            invalid.connect.push_back(Step::Ready);
+            invalid.arm.push_back(step);
+            let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut invalid).unwrap_err();
+            assert!(err.contains("arming broker socket timeouts"), "{err}");
+            assert!(invalid.seen_write.is_empty());
+        }
+
+        let mut script = Script::new();
+        script.connect.push_back(Step::Ready);
+        script
+            .arm
+            .push_back(Step::Failed("timeout refused".to_owned()));
+        let err = run(b"{}", Duration::from_secs(1), &zeros(3), &mut script).unwrap_err();
+        assert_eq!(err, "timeout refused");
+        assert!(script.seen_write.is_empty());
+    }
+
+    #[test]
     fn an_interrupted_write_retries_with_the_time_left() {
         let timeout = Duration::from_secs(1);
         let pause = Duration::from_millis(40);
@@ -813,6 +932,7 @@ mod tests {
         script.write.push_back(WriteAct::Step(Step::Interrupted));
         script.write.push_back(WriteAct::Rest);
         let offsets = [
+            Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -839,6 +959,7 @@ mod tests {
         script.shutdown.push_back(Step::Interrupted);
         script.shutdown.push_back(Step::Ready);
         let offsets = [
+            Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -879,13 +1000,36 @@ mod tests {
     }
 
     #[test]
+    fn a_spent_deadline_stops_write_for_before_its_first_attempt() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(1);
+        let mut script = Script::new();
+        let err = write_for(
+            b"{}",
+            timeout,
+            started,
+            &mut || started + timeout,
+            &mut script,
+        )
+        .unwrap_err();
+        assert_eq!(err, DEADLINE);
+        assert!(script.seen_write.is_empty());
+    }
+
+    #[test]
     fn a_spent_deadline_stops_the_shutdown_before_another_syscall() {
         let timeout = Duration::from_secs(1);
         let mut script = primed(vec![]);
         let err = run(
             b"{}",
             timeout,
-            &[Duration::ZERO, Duration::ZERO, Duration::ZERO, timeout],
+            &[
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                timeout,
+            ],
             &mut script,
         )
         .unwrap_err();
@@ -915,7 +1059,7 @@ mod tests {
         let mut script = primed(vec![ReadAct::Chunk(done_bytes())]);
         script.write.clear();
         assert_eq!(
-            run(b"", Duration::from_secs(1), &zeros(4), &mut script).unwrap(),
+            run(b"", Duration::from_secs(1), &zeros(6), &mut script).unwrap(),
             done_bytes()
         );
     }
@@ -1008,20 +1152,20 @@ mod tests {
     fn an_unexpected_step_or_a_failed_call_is_refused() {
         let mut counted = Script::new();
         counted.connect.push_back(Step::Transferred(1));
-        let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut counted).unwrap_err();
+        let err = run(b"{}", Duration::from_secs(1), &zeros(8), &mut counted).unwrap_err();
         assert!(err.contains("byte count"), "{err}");
 
         let mut failed = Script::new();
         failed
             .connect
             .push_back(Step::Failed("broker down".to_owned()));
-        let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut failed).unwrap_err();
+        let err = run(b"{}", Duration::from_secs(1), &zeros(8), &mut failed).unwrap_err();
         assert!(err.contains("broker down"), "{err}");
 
         let mut write_ready = primed(vec![]);
         write_ready.write.clear();
         write_ready.write.push_back(WriteAct::Step(Step::Ready));
-        let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut write_ready).unwrap_err();
+        let err = run(b"{}", Duration::from_secs(1), &zeros(8), &mut write_ready).unwrap_err();
         assert!(err.contains("no count"), "{err}");
 
         let mut write_failed = primed(vec![]);
@@ -1029,13 +1173,13 @@ mod tests {
         write_failed
             .write
             .push_back(WriteAct::Step(Step::Failed("write failed".to_owned())));
-        let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut write_failed).unwrap_err();
+        let err = run(b"{}", Duration::from_secs(1), &zeros(8), &mut write_failed).unwrap_err();
         assert!(err.contains("write failed"), "{err}");
 
         let mut shutdown_bad = primed(vec![]);
         shutdown_bad.shutdown.clear();
         shutdown_bad.shutdown.push_back(Step::Transferred(1));
-        let err = run(b"{}", Duration::from_secs(1), &zeros(4), &mut shutdown_bad).unwrap_err();
+        let err = run(b"{}", Duration::from_secs(1), &zeros(8), &mut shutdown_bad).unwrap_err();
         assert!(err.contains("byte count"), "{err}");
 
         let mut shutdown_failed = primed(vec![]);
@@ -1046,7 +1190,7 @@ mod tests {
         let err = run(
             b"{}",
             Duration::from_secs(1),
-            &zeros(4),
+            &zeros(8),
             &mut shutdown_failed,
         )
         .unwrap_err();
@@ -1304,6 +1448,10 @@ mod tests {
     fn io_before_connect_fails_closed() {
         let mut live = Live::open(Path::new("/nope"));
         assert_eq!(
+            live.arm_timeouts(Duration::from_secs(1)),
+            Step::Failed("the broker timeouts ran before the connection".to_owned())
+        );
+        assert_eq!(
             live.write(Duration::from_secs(1), b"x"),
             Step::Failed("the broker write ran before the connection".to_owned())
         );
@@ -1316,6 +1464,14 @@ mod tests {
             live.read(Duration::from_secs(1), &mut buf),
             Step::Failed("the broker read ran before the connection".to_owned())
         );
+    }
+
+    fn refuse_send_timeout(_: &UnixStream, _: Duration) -> io::Result<()> {
+        Err(io::Error::other("send refused"))
+    }
+
+    fn refuse_recv_timeout(_: &UnixStream, _: Duration) -> io::Result<()> {
+        Err(io::Error::other("receive refused"))
     }
 
     #[cfg(target_os = "linux")]
@@ -1447,6 +1603,7 @@ mod tests {
         assert_eq!(live.apply(Settled::NeedWait), Step::Interrupted);
         assert!(live.wait);
         assert_eq!(live.connect(Duration::from_secs(1)), Step::Ready);
+        assert_eq!(live.arm_timeouts(Duration::from_millis(200)), Step::Ready);
         assert_eq!(
             live.write(Duration::from_millis(200), b"hi"),
             Step::Transferred(2)
