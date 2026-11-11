@@ -21,6 +21,9 @@ serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 
+[features]
+lane-short-ttl = ["xudo-gate/lane-short-ttl"]
+
 [dev-dependencies]
 insta.workspace = true
 # The in-memory audit sink, for tests only.
