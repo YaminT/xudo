@@ -132,26 +132,6 @@ fn confirm_run(
         }));
     }
     let now = platform.clock.boottime_millis();
-    if !has_live_watcher(
-        platform.confirmations,
-        platform.peers,
-        identity.uid,
-        &identity,
-        now,
-    ) {
-        return ConfirmRun::Served(serve_confirmation_denial(
-            conn,
-            platform,
-            Evaluated {
-                decision,
-                caller,
-                identity,
-                request,
-                policy,
-            },
-            xudo_policy::DenialCode::NoConfirmationChannel,
-        ));
-    }
     if let Some(approved) = take_matching_approval(
         spool,
         &request,
@@ -187,6 +167,26 @@ fn confirm_run(
             policy,
         };
         return ConfirmRun::Served(mint_approved(conn, platform, spool, evaluated, approved));
+    }
+    if !has_live_watcher(
+        platform.confirmations,
+        platform.peers,
+        identity.uid,
+        &identity,
+        now,
+    ) {
+        return ConfirmRun::Served(serve_confirmation_denial(
+            conn,
+            platform,
+            Evaluated {
+                decision,
+                caller,
+                identity,
+                request,
+                policy,
+            },
+            xudo_policy::DenialCode::NoConfirmationChannel,
+        ));
     }
     let code = if active_backoff(platform.confirmations, identity.uid, &request, now)
         || pending_duplicate(spool, &request, identity.uid, now)
@@ -2484,7 +2484,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn no_live_watcher_denies_and_mints_nothing() {
+    fn a_new_request_with_no_watcher_is_still_denied_no_confirmation_channel() {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
         let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
@@ -2499,7 +2499,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn no_live_watcher_deny_precedes_consuming_an_approval() {
+    fn an_approved_rerun_runs_after_the_watcher_has_closed() {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
         let mut approved = shown_entry();
@@ -2518,16 +2518,36 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             approved.nonce.as_bytes().to_vec(),
             approved.to_json().into_bytes(),
         );
+        host.confirmations = FakeSpool::new().with_file(
+            format!("{UID}.json").into_bytes(),
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: None,
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
         let outcome = serve_with(
             &mut host,
             &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
             Ok(&spool),
         );
         let (decision, minted) = decision_of(&outcome.answer).unwrap();
-        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
-        assert!(minted.is_none());
+        assert!(decision.verdict.is_permitted());
+        assert_eq!(
+            minted.as_ref().map(|value| value.nonce.as_str()),
+            Some(approved.nonce.as_str())
+        );
         assert_eq!(spool.files().len(), 1);
-        assert_eq!(outcome.records.len(), 1);
+        let consumed = spool
+            .files()
+            .get(approved.nonce.as_bytes())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|json| PendingRequest::parse(json).ok());
+        assert_eq!(
+            consumed.map(|entry| entry.state),
+            Some(xudo_gate::request::ConfirmationState::Consumed)
+        );
     }
 
     #[test]
