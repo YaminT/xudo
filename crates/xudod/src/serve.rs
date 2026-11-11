@@ -438,8 +438,8 @@ fn expire_entries(
                     "expiry audit record was refused",
                 )
             })?;
+        record_outcome_locked(store, &entry, TerminalOutcome::Expired, now, true)?;
         spool.remove(&id).map_err(|error| Refusal::from(&error))?;
-        let _ = record_outcome_locked(store, &entry, TerminalOutcome::Expired, now, true);
     }
     Ok(())
 }
@@ -976,11 +976,9 @@ fn write_confirm(
 fn publish_confirmation(store: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), SpoolError> {
     let names = store.names_up_to(MAX_CONFIRM_UIDS)?;
     if names.len() >= MAX_CONFIRM_UIDS {
-        return Err(SpoolError::Io {
-            operation: "publish confirmation state".to_owned(),
+        return Err(SpoolError::Full {
             at: crate::CONFIRM_DIR.to_owned(),
-            code: None,
-            reason: CONFIRM_DIRECTORY_FULL.to_owned(),
+            limit: MAX_CONFIRM_UIDS,
         });
     }
     store.publish(name, bytes)
@@ -988,9 +986,7 @@ fn publish_confirmation(store: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(
 
 fn refusal_from_confirm_write(error: &SpoolError) -> Refusal {
     match error {
-        SpoolError::Io { reason, .. } if reason == CONFIRM_DIRECTORY_FULL => {
-            Refusal::broker(RefusalCode::SpoolFull, CONFIRM_DIRECTORY_FULL)
-        }
+        SpoolError::Full { .. } => Refusal::broker(RefusalCode::SpoolFull, CONFIRM_DIRECTORY_FULL),
         other => Refusal::from(other),
     }
 }
@@ -1492,7 +1488,7 @@ fn watch(
         ));
     }
     let now = platform.clock.boottime_millis();
-    save_heartbeat(platform, identity, now)?;
+    save_heartbeat(platform, spool, identity, now)?;
     let watcher = crate::confirm::WatcherFacts {
         uid: identity.uid,
         pid: identity.pid,
@@ -1576,17 +1572,36 @@ fn bounded_prompt(
 /// holds the confirm lock.
 fn prune_idle_confirmations(
     store: &dyn Spool,
+    requests: &dyn Spool,
     peers: &dyn PeerCalls,
+    own_name: &[u8],
     now: u64,
 ) -> Result<(), SpoolError> {
     loop {
         let names = store.names_up_to(MAX_CONFIRM_UIDS + 1)?;
-        if names.len() < MAX_CONFIRM_UIDS {
+        if names.len() < MAX_CONFIRM_UIDS
+            || (names.len() == MAX_CONFIRM_UIDS && names.iter().any(|name| name == own_name))
+        {
             return Ok(());
         }
+        let _requests_guard = SpoolGuard::lock(requests)?;
+        let request_names = requests.names_up_to(crate::mint::MAX_SPOOL_NAMES_TO_WALK)?;
+        let mut live_uids = Vec::new();
+        for id in request_names {
+            let bytes = requests.read(&id, crate::mint::MAX_ENTRY_BYTES)?;
+            let Ok(entry) = parse_entry(&bytes) else {
+                continue;
+            };
+            if request_uid_is_live(&entry) {
+                live_uids.push(entry.caller_uid);
+            }
+        }
+        live_uids.sort_unstable();
+        live_uids.dedup();
         let mut removed = false;
         for name in &names {
-            if confirmation_is_idle(store, peers, name, now) {
+            if !uid_file_is_live(name, &live_uids) && confirmation_is_idle(store, peers, name, now)
+            {
                 store.remove(name)?;
                 removed = true;
             }
@@ -1595,6 +1610,28 @@ fn prune_idle_confirmations(
             return Ok(());
         }
     }
+}
+
+fn request_uid_is_live(entry: &xudo_gate::request::PendingRequest) -> bool {
+    if !entry.needs_watch {
+        return false;
+    }
+    matches!(
+        entry.state,
+        xudo_gate::request::ConfirmationState::Pending
+            | xudo_gate::request::ConfirmationState::Approved
+    )
+}
+
+fn uid_file_is_live(name: &[u8], live_uids: &[u32]) -> bool {
+    let Some(uid) = name
+        .strip_suffix(b".json")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    live_uids.binary_search(&uid).is_ok()
 }
 
 /// `true` only when the file is safe to delete. A read or parse failure is
@@ -1619,6 +1656,7 @@ fn confirmation_is_idle(store: &dyn Spool, peers: &dyn PeerCalls, name: &[u8], n
 
 fn save_heartbeat(
     platform: &mut Platform<'_>,
+    requests: &dyn Spool,
     identity: &PeerIdentity,
     now: u64,
 ) -> Result<(), Refusal> {
@@ -1629,7 +1667,9 @@ fn save_heartbeat(
         )
     })?;
     let _guard = SpoolGuard::lock(store).map_err(|e| Refusal::from(&e))?;
-    prune_idle_confirmations(store, platform.peers, now).map_err(|error| Refusal::from(&error))?;
+    let name = format!("{}.json", identity.uid);
+    prune_idle_confirmations(store, requests, platform.peers, name.as_bytes(), now)
+        .map_err(|error| Refusal::from(&error))?;
     let heartbeat = WatcherHeartbeat {
         pid: identity.pid,
         starttime: identity.starttime,
@@ -1637,7 +1677,6 @@ fn save_heartbeat(
         sid: identity.sid,
         at_ms: now,
     };
-    let name = format!("{}.json", identity.uid);
     let (old, data) = read_confirm_data(store, &name).map_err(|_| {
         Refusal::broker(
             RefusalCode::SpoolUnusable,
@@ -1818,7 +1857,6 @@ fn complete_answer(
                 )
             })?;
         drop(record);
-        spool.remove(id.as_bytes()).map_err(|e| Refusal::from(&e))?;
         record_outcome_locked(
             platform.confirmations.ok_or_else(|| {
                 Refusal::broker(
@@ -1831,6 +1869,7 @@ fn complete_answer(
             platform.clock.boottime_millis(),
             true,
         )?;
+        spool.remove(id.as_bytes()).map_err(|e| Refusal::from(&e))?;
     }
     Ok(BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -3714,7 +3753,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", b"oversized or malformed".to_vec());
-        let err = save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolUnusable);
         assert!(err.detail.contains("operator repair"));
         assert_eq!(
@@ -3738,7 +3778,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let bytes = serde_json::to_vec(&state).unwrap();
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new().with_file("1000.json", bytes.clone());
-        save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap();
+        save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap();
         let saved: ConfirmData =
             serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
         assert!(saved.backoff.is_empty() && saved.heartbeat.is_some());
@@ -3747,7 +3787,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_replace(SpoolError::Gone {
                 name: "state".to_owned(),
             });
-        let err = save_heartbeat(&mut host.platform(), &watcher, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolUnusable);
         assert_eq!(host.confirmations.files()[b"1000.json".as_slice()], bytes);
     }
@@ -4452,7 +4493,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_expiry_is_not_audited_twice_when_outcome_storage_fails() {
+    fn an_expiry_refuses_and_keeps_the_request_when_outcome_storage_fails() {
         let mut entry = shown_entry();
         entry.deadline = BoottimeMillis(NOW);
         let spool = FakeSpool::new().with_file(
@@ -4460,15 +4501,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             entry.to_json().into_bytes(),
         );
         let mut host = Host::honest();
-        host.confirmations = FakeSpool::new().failing_replace(SpoolError::Gone {
-            name: "confirm".to_owned(),
+        host.confirmations = FakeSpool::new().failing_publish(SpoolError::Io {
+            operation: "publish".to_owned(),
+            at: "confirm".to_owned(),
+            code: None,
+            reason: "full".to_owned(),
         });
         let request = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
 
-        expire_entries(&mut host.platform(), &spool, &request).unwrap();
-        assert!(spool.files().is_empty());
-        assert_eq!(host.audit.records().len(), 1);
-        expire_entries(&mut host.platform(), &spool, &request).unwrap();
+        assert_eq!(
+            expire_entries(&mut host.platform(), &spool, &request)
+                .unwrap_err()
+                .code,
+            RefusalCode::SpoolUnusable
+        );
+        assert_eq!(spool.files().len(), 1);
         assert_eq!(host.audit.records().len(), 1);
     }
 
@@ -4889,7 +4936,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_denied_entry_is_gone_even_if_the_outcome_write_fails() {
+    fn a_denied_entry_stays_available_when_the_outcome_write_fails() {
         let entry = shown_entry();
         let bytes = entry.to_json().into_bytes();
         let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
@@ -4912,13 +4959,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &answer_request(NONCE, "no", false),
             AnsweredEntry {
                 id: NONCE.to_owned(),
-                bytes,
+                bytes: bytes.clone(),
                 entry,
             },
             false,
         );
         assert_eq!(result.unwrap_err().code, RefusalCode::SpoolUnusable);
-        assert!(spool.files().is_empty());
+        assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&bytes));
     }
 
     #[test]
@@ -5269,6 +5316,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.peers = FakePeer::new().with_proc(6000, ProcFile::Stat, stat_line(6000, 88));
         let err = save_heartbeat(
             &mut host.platform(),
+            &FakeSpool::new(),
             &test_identity(5000, 77, 2, 34816),
             NOW,
         )
@@ -5302,18 +5350,138 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_full_confirm_directory_refuses_and_overwrites_nothing() {
+    fn a_full_parseable_live_confirm_directory_refuses_and_preserves_every_file() {
+        let live = backoff_file(NOW + 1);
         let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
-            store.with_file(format!("{uid}.json"), b"{}".to_vec())
+            store.with_file(format!("{uid}.json"), live.clone())
         });
         let mut host = Host::honest();
         host.confirmations = store;
         let before = host.confirmations.files();
         let mut another_uid = test_identity(PID, START, 2, 34816);
         another_uid.uid = 50_000;
-        let err = save_heartbeat(&mut host.platform(), &another_uid, NOW).unwrap_err();
+        let err =
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &another_uid, NOW).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolFull);
+        assert_eq!(err.detail, CONFIRM_DIRECTORY_FULL);
         assert_eq!(host.confirmations.files(), before);
+    }
+
+    #[test]
+    fn a_pending_request_keeps_its_uid_file_live_during_pruning() {
+        let idle = empty_confirm();
+        let mut store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), idle.clone())
+        });
+        let broken_confirm = b"malformed confirmation state".to_vec();
+        store = store
+            .with_file("1000.json", idle)
+            .with_file("not-a-uid.json", broken_confirm.clone());
+        let mut request_entry = shown_entry();
+        request_entry.caller_uid = 1000;
+        let mut password_only = shown_entry();
+        password_only.nonce = format!("{:064x}", 1);
+        password_only.needs_watch = false;
+        password_only.state = xudo_gate::request::ConfirmationState::Pending;
+        password_only.confirmed = false;
+        password_only.confirmed_by = None;
+        password_only.shown_at_ms = None;
+        password_only.shown_to = None;
+        let requests = FakeSpool::new()
+            .with_file(b"unparseable".to_vec(), b"not-json".to_vec())
+            .with_file(
+                password_only.nonce.as_bytes().to_vec(),
+                password_only.to_json().into_bytes(),
+            )
+            .with_file(
+                request_entry.nonce.as_bytes().to_vec(),
+                request_entry.to_json().into_bytes(),
+            );
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 80_000;
+        watch(&mut host.platform(), &requests, &watcher).unwrap();
+        let files = host.confirmations.files();
+        assert_eq!(files[b"1000.json".as_slice()], empty_confirm());
+        assert_eq!(files[b"not-a-uid.json".as_slice()], broken_confirm);
+        assert!(files.contains_key(b"80000.json".as_slice()));
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn pending_and_approved_requests_keep_their_uid_files_live() {
+        let mut entry = shown_entry();
+        assert!(request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Approved;
+        assert!(request_uid_is_live(&entry));
+
+        entry.needs_watch = false;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.needs_watch = true;
+        entry.state = xudo_gate::request::ConfirmationState::Consumed;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Denied;
+        assert!(!request_uid_is_live(&entry));
+
+        entry.state = xudo_gate::request::ConfirmationState::Expired;
+        assert!(!request_uid_is_live(&entry));
+    }
+
+    #[test]
+    fn a_full_bound_with_the_callers_file_skips_the_prune_walk() {
+        let live = backoff_file(NOW + 1);
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), live.clone())
+        });
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let watcher = test_identity(PID, START, 2, 34816);
+        save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).unwrap();
+        assert_eq!(
+            host.confirmations
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, SpoolCall::Read(_)))
+                .count(),
+            1,
+            "only the caller's file is read for its heartbeat update"
+        );
+        assert!(
+            !host
+                .confirmations
+                .calls()
+                .iter()
+                .any(|call| matches!(call, SpoolCall::Remove(_)))
+        );
+    }
+
+    #[test]
+    fn pruning_fails_closed_when_the_request_spool_cannot_be_inspected() {
+        let live = backoff_file(NOW + 1);
+        let store = (0..MAX_CONFIRM_UIDS).fold(FakeSpool::new(), |store, uid| {
+            store.with_file(format!("{uid}.json"), live.clone())
+        });
+        let mut host = Host::honest();
+        host.confirmations = store;
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 50_000;
+
+        for requests in [
+            FakeSpool::new().failing_lock(gone("request lock")),
+            FakeSpool::new().failing_names(gone("request names")),
+            FakeSpool::new()
+                .with_file(b"request".to_vec(), b"unreadable".to_vec())
+                .failing_read(b"request".to_vec()),
+        ] {
+            let before = host.confirmations.files();
+            let err = save_heartbeat(&mut host.platform(), &requests, &watcher, NOW).unwrap_err();
+            assert_eq!(err.code, RefusalCode::SpoolUnusable);
+            assert_eq!(host.confirmations.files(), before);
+        }
     }
 
     fn empty_confirm() -> Vec<u8> {
@@ -5641,7 +5809,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let before = store.files();
         let mut host = Host::honest();
         host.confirmations = store;
-        let watcher = test_identity(5000, 77, 2, 34816);
+        let mut watcher = test_identity(5000, 77, 2, 34816);
+        watcher.uid = 50_000;
         let err = watch(&mut host.platform(), &FakeSpool::new(), &watcher).unwrap_err();
         assert_eq!(err.code, RefusalCode::SpoolUnusable);
         assert!(err.detail.contains("busy"));
@@ -5655,7 +5824,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut platform = host.platform();
         platform.confirmations = None;
         assert_eq!(
-            save_heartbeat(&mut platform, &watcher, NOW)
+            save_heartbeat(&mut platform, &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5666,7 +5835,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             name: "names".to_owned(),
         });
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5680,7 +5849,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&no_heartbeat).unwrap());
-        assert!(save_heartbeat(&mut host.platform(), &watcher, NOW).is_ok());
+        assert!(save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).is_ok());
 
         let oversized = ConfirmData {
             heartbeat: None,
@@ -5697,7 +5866,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&oversized).unwrap());
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5710,7 +5879,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 name: "state".to_owned(),
             });
         assert_eq!(
-            save_heartbeat(&mut host.platform(), &watcher, NOW)
+            save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -5736,7 +5905,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         host.confirmations =
             FakeSpool::new().with_file("1000.json", serde_json::to_vec(&stale).unwrap());
-        assert!(save_heartbeat(&mut host.platform(), &watcher, NOW).is_ok());
+        assert!(save_heartbeat(&mut host.platform(), &FakeSpool::new(), &watcher, NOW).is_ok());
         let saved: ConfirmData =
             serde_json::from_slice(&host.confirmations.files()[b"1000.json".as_slice()]).unwrap();
         assert!(saved.outcomes.is_empty());
@@ -5967,7 +6136,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn one_users_broken_confirm_file_does_not_block_another_users_run() {
+    fn a_broken_confirm_file_refuses_a_run_when_expiry_cannot_record_its_strike() {
         let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
         let mut expired = shown_entry();
         expired.caller_uid = UID + 1;
@@ -6006,8 +6175,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             )
             .with_file("1001.json", b"broken confirm state".to_vec());
         let outcome = serve_with(&mut host, &request, Ok(&spool));
-        assert_eq!(outcome.served, Served::Minted);
-        assert!(spool.files().contains_key(NONCE.as_bytes()));
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(spool.files().len(), 1);
+        assert!(spool.files().contains_key(expired.nonce.as_bytes()));
         assert_eq!(
             host.confirmations.files()[b"1001.json".as_slice()],
             b"broken confirm state"
