@@ -66,6 +66,11 @@ impl Setting {
         Self::UsePty,
     ];
 
+    /// The setting a configuration-file key names, if any.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|setting| setting.key() == key)
+    }
+
     /// The key as it appears in a configuration file.
     pub fn key(self) -> &'static str {
         match self {
