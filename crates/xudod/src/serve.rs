@@ -27,7 +27,10 @@ use xudo_sys::{
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
 use crate::identify::{Fault, PeerIdentity, identify};
-use crate::mint::{Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce, entry_for, publish};
+use crate::mint::{
+    AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
+    entry_for_classified, publish,
+};
 use crate::policy::{LoadedPolicy, PolicySource, classify, decide};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
@@ -2024,9 +2027,13 @@ fn mint(
     };
     let now = platform.clock.boottime_millis();
     let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
-    let entry = match entry_for(
+    let entry = match entry_for_classified(
         &decision,
-        &identity,
+        &AttestedCaller {
+            identity: &identity,
+            facts: &caller,
+            boot_id: None,
+        },
         &request,
         policy.rules.generation.id(),
         policy.settings.confirm_human_path,
@@ -2222,7 +2229,7 @@ mod tests {
     use xudo_wire::{Answer, WIRE_SCHEMA_VERSION};
 
     use super::*;
-    use crate::mint::{MAX_SPOOL_ENTRIES, MintError};
+    use crate::mint::{MAX_SPOOL_ENTRIES, MintError, entry_for};
     use crate::policy::PolicyError;
 
     const PID: u32 = 4242;
@@ -6887,6 +6894,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "unattested".to_owned(),
+            attested_class: xudo_gate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 

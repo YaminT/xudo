@@ -831,6 +831,9 @@ args = [
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent".to_owned(),
+            attested_class: crate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 
