@@ -187,6 +187,14 @@ impl BrokerRequest {
                 expected: WIRE_SCHEMA_VERSION,
             });
         }
+        if value
+            .get("question")
+            .is_none_or(|question| !(question.is_object() || question.is_string()))
+        {
+            return Err(RequestError::Malformed {
+                reason: "question must use its object or unit string form".to_owned(),
+            });
+        }
         let request: Self =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
                 reason: error.to_string(),
@@ -949,6 +957,15 @@ mod tests {
     #[test]
     fn an_array_form_request_is_refused() {
         let bytes = br#"[2,"watch"]"#;
+        assert_eq!(
+            BrokerRequest::parse(bytes).unwrap_err().code(),
+            RefusalCode::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_array_form_question_is_refused() {
+        let bytes = br#"{"schema_version":2,"question":["thaw"]}"#;
         assert_eq!(
             BrokerRequest::parse(bytes).unwrap_err().code(),
             RefusalCode::RequestMalformed

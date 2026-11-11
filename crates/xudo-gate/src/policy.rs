@@ -100,7 +100,7 @@ fn load_with(
 fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
     match read {
         Ok(None) => false,
-        Ok(Some(bytes)) => match serde_json::from_slice::<FreezeRecord>(&bytes) {
+        Ok(Some(bytes)) => match parse_freeze_record(&bytes) {
             Ok(record) => {
                 let _ = (record.reason, record.uid, record.time);
                 true
@@ -109,6 +109,16 @@ fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
         },
         Err(_) => true,
     }
+}
+
+fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if !value.is_object() {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "freeze record must be an object",
+        ));
+    }
+    serde_json::from_value(value)
 }
 
 /// Derives engine settings from the bytes shared by the gate and broker.
@@ -231,5 +241,10 @@ mod tests {
         assert!(freeze_state(Ok(Some(
             br#"{"reason":"maintenance","uid":0,"time":1}"#.to_vec()
         ))));
+    }
+
+    #[test]
+    fn a_freeze_file_in_array_form_means_frozen() {
+        assert!(freeze_state(Ok(Some(br#"["maintenance",0,1]"#.to_vec()))));
     }
 }
