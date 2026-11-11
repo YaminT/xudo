@@ -213,8 +213,8 @@ else
     ls -la /run/xudo/req >&2
 fi
 
-# Expiry at the TTL is covered by the broker's unit tests; here the entry is
-# only shown to remain after a timeout-0 request returns.
+# This timeout-zero case proves the request returns immediately and leaves a
+# pending entry for `xudo pending` to display.
 pending=
 name=timeout_zero_returns_pending_and_the_entry_stays
 if expect /harness/confirm.exp pending >/var/tmp/confirm-pending.log 2>&1; then
@@ -343,8 +343,8 @@ clear_confirm same-session none
 # A watcher in a user namespace with a non-identity uid map is not live. Root
 # makes the namespace, so the host's restriction on unprivileged ones (AppArmor)
 # does not apply, and no sysctl is changed. Needs util-linux >= 2.39 for
-# --map-users. Skipping is never silent: it fails the lane unless
-# XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1 (see run.sh).
+# --map-users. A missing prerequisite is a hard failure; the case is never
+# skipped.
 userns=watch_in_a_user_namespace_is_refused
 skip_reason=
 unshare_ver=$(unshare --version 2>/dev/null | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
@@ -365,12 +365,7 @@ if [ -z "$skip_reason" ]; then
     fi
 fi
 if [ -n "$skip_reason" ]; then
-    echo "SKIP: $userns: $skip_reason"
-    if [ "${XUDO_SYSTEMD_ALLOW_USERNS_SKIP:-}" = 1 ]; then
-        echo "NOTE: $userns skipped by XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1"
-    else
-        bad "$userns skipped, and XUDO_SYSTEMD_ALLOW_USERNS_SKIP is not set"
-    fi
+    bad "$userns cannot run: $skip_reason"
 elif expect /harness/confirm.exp userns >/var/tmp/userns.out 2>&1; then
     good "$userns (rc=$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/userns.out))"
 else
@@ -415,6 +410,67 @@ if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ]; then
 else
     bad "xudo_thaw_works_as_root_and_removes_the_frozen_file"
     cat /var/tmp/root-thaw.out >&2
+fi
+
+# Install the short-TTL package only for its expiry proof. Restore the normal
+# package before journal, audit, pasban and remove checks below.
+if ! dpkg -i /opt/xudo-short-ttl.deb >/var/tmp/xudo-short-ttl-install.log 2>&1; then
+    cat /var/tmp/xudo-short-ttl-install.log >&2
+    bad "install short-TTL test package"
+else
+    marker=xudo-lane-short-ttl-20-seconds
+    if grep -aFq "$marker" /usr/libexec/xudo/xudod &&
+        grep -aFq "$marker" /usr/libexec/xudo/xudo-gate-auth; then
+        good "short-TTL marker is present in installed broker and gate"
+    else
+        bad "short-TTL marker is present in installed broker and gate"
+    fi
+    name=short_ttl_expires_a_pending_entry
+    if expect /harness/confirm.exp pending >/var/tmp/confirm-short-ttl.log 2>&1; then
+        pending=$(pending_out)
+        if [ "$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/confirm-short-ttl.log)" = 18 ] &&
+            [ -n "$pending" ] && lists_the_request "$pending"; then
+            sleep 5
+            still=$(pending_out)
+            if lists_the_request "$still"; then
+                good "$name (entry remains before its 20-second expiry)"
+            else
+                bad "$name (entry expired before the 5-second lower bound)"
+                printf '%s\n' "$still" >&2
+            fi
+            sleep 17
+            expired=$(pending_out)
+            if ! lists_the_request "$expired"; then
+                if grep -q 'confirmation_expired' /var/lib/xudo/audit.jsonl; then
+                    good "$name (expired entry removed and audited)"
+                else
+                    bad "$name (expiry audit record missing)"
+                fi
+            else
+                bad "$name (entry remained visible past 20 seconds)"
+                printf '%s\n' "$expired" >&2
+            fi
+        else
+            bad "$name (request was not pending initially)"
+            cat /var/tmp/confirm-short-ttl.log >&2
+        fi
+    else
+        bad "$name"
+        cat /var/tmp/confirm-short-ttl.log >&2
+    fi
+    clear_confirm "$name" none
+
+    if ! dpkg -i /opt/xudo.deb >/var/tmp/xudo-normal-restore.log 2>&1; then
+        cat /var/tmp/xudo-normal-restore.log >&2
+        bad "restore normal package after short-TTL expiry case"
+    else
+        if ! grep -aFq "$marker" /usr/libexec/xudo/xudod &&
+            ! grep -aFq "$marker" /usr/libexec/xudo/xudo-gate-auth; then
+            good "normal package restored without short-TTL marker"
+        else
+            bad "normal package restored without short-TTL marker"
+        fi
+    fi
 fi
 
 mid=a06b36c755dd4b85815d6af790559b5e
