@@ -299,6 +299,9 @@ mod tests {
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "enrolled-agent-yolo".to_owned(),
+            attested_class: xudo_gate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         };
         let record = decided(
             None,

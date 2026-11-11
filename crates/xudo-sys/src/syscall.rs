@@ -34,6 +34,16 @@ use crate::error::SysError;
 
 /// The system calls that need `unsafe`, as a seam.
 pub trait Syscalls {
+    /// Reads the kernel boot id from the fixed procfs interface.
+    ///
+    /// This is used only to scope cgroup ids, which may be reused after a
+    /// reboot. Implementations must not consult the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the boot id cannot be read or is malformed.
+    fn boot_id(&self) -> Result<String, SysError>;
+
     /// Marks every descriptor numbered `first` or above close-on-exec.
     ///
     /// `close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`. It does not close them:
@@ -206,6 +216,10 @@ pub struct HostSyscalls;
 
 #[cfg(target_os = "linux")]
 impl Syscalls for HostSyscalls {
+    fn boot_id(&self) -> Result<String, SysError> {
+        parse_boot_id(std::fs::read("/proc/sys/kernel/random/boot_id"))
+    }
+
     fn mark_cloexec_from(&self, first: u32) -> Result<(), SysError> {
         xudo_sys_raw::sys::mark_cloexec_from(first).map_err(SysError::from)
     }
@@ -230,8 +244,48 @@ impl Syscalls for HostSyscalls {
     }
 }
 
+fn parse_boot_id(read: std::io::Result<Vec<u8>>) -> Result<String, SysError> {
+    let bytes = read.map_err(|error| SysError::Os {
+        operation: "read kernel boot id".to_owned(),
+        code: error.raw_os_error(),
+        reason: "the live boot id could not be read".to_owned(),
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| SysError::Os {
+        operation: "read kernel boot id".to_owned(),
+        code: None,
+        reason: "the live boot id was not UTF-8".to_owned(),
+    })?;
+    let id = text.trim_end_matches('\n');
+    if !valid_boot_id(id) {
+        return Err(SysError::Os {
+            operation: "read kernel boot id".to_owned(),
+            code: None,
+            reason: "the live boot id was malformed".to_owned(),
+        });
+    }
+    Ok(id.to_owned())
+}
+
+fn valid_boot_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 #[cfg(not(target_os = "linux"))]
 impl Syscalls for HostSyscalls {
+    fn boot_id(&self) -> Result<String, SysError> {
+        Err(SysError::unsupported(
+            "kernel boot id on a non-Linux platform",
+        ))
+    }
+
     fn mark_cloexec_from(&self, _first: u32) -> Result<(), SysError> {
         Err(SysError::unsupported("close_range on a non-Linux platform"))
     }
@@ -260,6 +314,8 @@ impl Syscalls for HostSyscalls {
 /// One call a [`FakeSyscalls`] received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FakeCall {
+    /// [`Syscalls::boot_id`].
+    BootId,
     /// [`Syscalls::mark_cloexec_from`] with this lower bound.
     MarkCloexecFrom(u32),
     /// [`Syscalls::peer_pidfd`].
@@ -293,6 +349,7 @@ pub enum FakeCall {
 pub struct FakeSyscalls {
     calls: RefCell<Vec<FakeCall>>,
     cloexec: Result<(), SysError>,
+    boot_id: Result<String, SysError>,
     peer: RefCell<Option<Result<OwnedFd, SysError>>>,
     cred: Result<PeerCred, SysError>,
     info: Result<PidfdInfo, SysError>,
@@ -313,6 +370,7 @@ impl FakeSyscalls {
     pub fn new() -> Self {
         Self {
             calls: RefCell::new(Vec::new()),
+            boot_id: Err(SysError::unsupported("fake: no boot id scripted")),
             cloexec: Err(missing(
                 "close_range",
                 rustix::io::Errno::NOSYS,
@@ -331,6 +389,13 @@ impl FakeSyscalls {
             )),
             exec: SysError::unsupported("fake: exec recorded, nothing replaced"),
         }
+    }
+
+    /// Scripts [`Syscalls::boot_id`].
+    #[must_use]
+    pub fn with_boot_id(mut self, answer: Result<String, SysError>) -> Self {
+        self.boot_id = answer;
+        self
     }
 
     /// Scripts every [`Syscalls::mark_cloexec_from`] answer.
@@ -397,6 +462,17 @@ fn identity(fd: BorrowedFd<'_>) -> Option<(u64, u64)> {
 }
 
 impl Syscalls for FakeSyscalls {
+    fn boot_id(&self) -> Result<String, SysError> {
+        self.record(FakeCall::BootId);
+        self.boot_id.clone().and_then(|id| {
+            if valid_boot_id(&id) {
+                Ok(id)
+            } else {
+                Err(SysError::unsupported("fake: malformed boot id"))
+            }
+        })
+    }
+
     fn mark_cloexec_from(&self, first: u32) -> Result<(), SysError> {
         self.record(FakeCall::MarkCloexecFrom(first));
         self.cloexec.clone()
@@ -466,6 +542,39 @@ mod tests {
         tgid: 412,
         ppid: 1,
     };
+
+    #[test]
+    fn boot_id_read_errors_and_malformed_values_are_refused() {
+        assert!(parse_boot_id(Err(std::io::Error::other("unreadable"))).is_err());
+        assert!(parse_boot_id(Ok(vec![0xff])).is_err());
+        assert!(parse_boot_id(Ok(b"not-a-boot-id\n".to_vec())).is_err());
+        assert!(parse_boot_id(Ok(b"abcdef0x-2345-6789-abcd-ef0123456789\n".to_vec())).is_err());
+        assert_eq!(
+            parse_boot_id(Ok(b"abcdef01-2345-6789-abcd-ef0123456789\n".to_vec())).unwrap(),
+            "abcdef01-2345-6789-abcd-ef0123456789"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_reads_the_live_boot_id_through_the_fixed_kernel_path() {
+        let id = HostSyscalls.boot_id().unwrap();
+        assert!(valid_boot_id(&id));
+    }
+
+    #[test]
+    fn fake_boot_id_is_scripted_through_the_syscall_seam() {
+        let id = "abcdef01-2345-6789-abcd-ef0123456789".to_owned();
+        let fake = FakeSyscalls::new().with_boot_id(Ok(id.clone()));
+        assert_eq!(fake.boot_id(), Ok(id));
+        assert_eq!(fake.calls(), vec![FakeCall::BootId]);
+        assert!(
+            FakeSyscalls::new()
+                .with_boot_id(Ok("bad".to_owned()))
+                .boot_id()
+                .is_err()
+        );
+    }
 
     #[test]
     fn an_unscripted_fake_answers_like_the_oldest_kernel_with_its_errnos() {
