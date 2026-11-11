@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 xudo-backend = { path = "../xudo-backend", version = "0.1.0-beta.1" }

@@ -13,10 +13,21 @@ pub const MAX_FREEZE_BYTES: usize = 2048;
 /// The broker-owned freeze marker.
 pub const FREEZE_FILE: &str = "/var/lib/xudo/frozen";
 
+#[cfg(feature = "fuzzing")]
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// The root-owned freeze marker's data.
 pub struct FreezeRecord {
+    reason: String,
+    uid: u32,
+    time: u64,
+}
+
+#[cfg(not(feature = "fuzzing"))]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// The root-owned freeze marker's data.
+pub(crate) struct FreezeRecord {
     reason: String,
     uid: u32,
     time: u64,
@@ -117,7 +128,7 @@ fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
 /// # Errors
 ///
 /// Returns the serde error for invalid JSON, an invalid shape, or duplicate keys.
-pub fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
+fn parse_freeze_record_inner(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     if !value.is_object() {
         return Err(<serde_json::Error as serde::de::Error>::custom(
@@ -125,6 +136,21 @@ pub fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Err
         ));
     }
     serde_json::from_slice(bytes)
+}
+
+#[cfg(feature = "fuzzing")]
+/// Parses one freeze marker, refusing non-object and duplicate-key forms.
+///
+/// # Errors
+///
+/// Returns the serde error for invalid JSON, an invalid shape, or duplicate keys.
+pub fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
+    parse_freeze_record_inner(bytes)
+}
+
+#[cfg(not(feature = "fuzzing"))]
+pub(crate) fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
+    parse_freeze_record_inner(bytes)
 }
 
 /// Derives engine settings from the bytes shared by the gate and broker.
@@ -241,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_freeze_data_means_frozen_and_absence_does_not() {
+    fn an_existing_freeze_file_fails_closed_and_absence_does_not() {
         assert!(freeze_state(Ok(Some(b"not json".to_vec()))));
         assert!(!freeze_state(Ok(None)));
         assert!(freeze_state(Ok(Some(
@@ -250,12 +276,8 @@ mod tests {
     }
 
     #[test]
-    fn an_array_form_freeze_file_means_frozen() {
-        assert!(freeze_state(Ok(Some(br#"["maintenance",0,1]"#.to_vec()))));
-    }
-
-    #[test]
-    fn duplicate_freeze_record_keys_are_rejected() {
+    fn array_and_duplicate_key_freeze_records_are_rejected() {
+        assert!(parse_freeze_record(br#"["maintenance",0,1]"#).is_err());
         assert!(
             parse_freeze_record(br#"{"reason":"one","reason":"two","uid":0,"time":1}"#).is_err()
         );
