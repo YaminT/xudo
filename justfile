@@ -59,6 +59,7 @@ check-linux:
 # --- tests ------------------------------------------------------------------
 
 test:
+    cargo test -p xudod -p xudo-gate
     cargo test --workspace --all-features
     just no-ignored-passes
 

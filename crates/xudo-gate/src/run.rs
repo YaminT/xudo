@@ -407,6 +407,9 @@ struct Progress {
 /// process, so what comes back is always a refusal, already written to the
 /// audit trail where that was possible.
 pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
+    #[cfg(feature = "lane-short-ttl")]
+    crate::keep_lane_short_ttl_marker_linked();
+
     let mut progress = Progress {
         gate_pid: host.hygiene().pid(),
         ..Progress::default()

@@ -76,7 +76,13 @@ pub const REQUEST_TTL_MILLIS: u64 = REQUEST_TTL_SECS * 1_000;
 
 #[cfg(feature = "lane-short-ttl")]
 #[used]
-static LANE_SHORT_TTL_MARKER: &[u8] = b"xudo-lane-short-ttl-20-seconds";
+static XUDOD_LANE_SHORT_TTL_MARKER: &[u8] = b"xudo-lane-short-ttl-20-seconds";
+
+#[cfg(feature = "lane-short-ttl")]
+#[inline(never)]
+fn keep_lane_short_ttl_marker_linked() {
+    std::hint::black_box(XUDOD_LANE_SHORT_TTL_MARKER);
+}
 
 /// Extra time an expired watch request stays available for the audited expiry
 /// sweep before a mint may prune it when the confirmation store is absent.
@@ -308,6 +314,9 @@ pub fn publish<S: Spool + ?Sized>(
     callers: &dyn PeerCalls,
     minting: &Minting<'_>,
 ) -> Result<(), MintError> {
+    #[cfg(feature = "lane-short-ttl")]
+    keep_lane_short_ttl_marker_linked();
+
     spool.lock().map_err(MintError::Spool)?;
     let published = prune_and_publish(spool, callers, minting);
     spool.unlock();
