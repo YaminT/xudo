@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitflags"
+version = "2.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,6 +104,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -157,6 +173,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,6 +236,19 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rustix"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
 
 [[package]]
 name = "serde"
@@ -307,6 +342,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-sanitize"
+version = "0.1.0-beta.1"
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -376,6 +415,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
 name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -388,13 +442,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
+name = "xudo-audit"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "term-sanitize",
+ "thiserror",
+]
+
+[[package]]
+name = "xudo-backend"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "xudo-config"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "xudo-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
+ "serde_json",
+ "xudo-gate",
  "xudo-policy",
  "xudo-wire",
+ "xudod",
+]
+
+[[package]]
+name = "xudo-gate"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xudo-audit",
+ "xudo-config",
+ "xudo-policy",
+ "xudo-sys",
 ]
 
 [[package]]
@@ -410,6 +508,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "xudo-sys"
+version = "0.1.0-beta.1"
+dependencies = [
+ "bstr",
+ "rustix",
+ "sha2",
+ "thiserror",
+ "xudo-audit",
+ "xudo-backend",
+ "xudo-policy",
+ "xudo-sys-raw",
+]
+
+[[package]]
+name = "xudo-sys-raw"
+version = "0.1.0-beta.1"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "xudo-wire"
 version = "0.1.0-beta.1"
 dependencies = [
@@ -417,6 +536,23 @@ dependencies = [
  "serde_json",
  "thiserror",
  "xudo-policy",
+]
+
+[[package]]
+name = "xudod"
+version = "0.1.0-beta.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "xudo-audit",
+ "xudo-backend",
+ "xudo-config",
+ "xudo-gate",
+ "xudo-policy",
+ "xudo-sys",
+ "xudo-wire",
 ]
 
 [[package]]

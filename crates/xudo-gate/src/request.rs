@@ -751,10 +751,30 @@ mod tests {
     }
 
     #[test]
-    fn a_confirm_file_with_a_positional_watcher_pin_is_refused() {
+    fn a_spool_entry_with_a_map_form_state_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("state".to_owned(), serde_json::json!({"pending": null}));
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_positional_confirmed_by_pin_is_refused() {
         let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
         value.as_object_mut().unwrap().insert(
             "confirmed_by".to_owned(),
+            serde_json::json!([1000, 42, 99, 34816, 41]),
+        );
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_positional_shown_to_pin_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "shown_to".to_owned(),
             serde_json::json!([1000, 42, 99, 34816, 41]),
         );
         assert!(PendingRequest::parse(&value.to_string()).is_err());

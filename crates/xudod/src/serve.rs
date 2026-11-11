@@ -789,10 +789,11 @@ fn pending_duplicate(spool: &dyn Spool, request: &BrokerRequest, uid: u32, now: 
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(from = "CompactConfirmData", into = "CompactConfirmData")]
-struct ConfirmData {
+/// Compact persistent watcher, backoff, and outcome state.
+pub struct ConfirmData {
     heartbeat: Option<WatcherHeartbeat>,
     backoff: Vec<BackoffEntry>,
     #[serde(default)]
@@ -903,7 +904,7 @@ impl From<ConfirmData> for CompactConfirmData {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecentOutcome {
     id: String,
@@ -920,7 +921,7 @@ enum TerminalOutcome {
     Expired,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatcherHeartbeat {
     pid: u32,
@@ -930,7 +931,7 @@ struct WatcherHeartbeat {
     at_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackoffEntry {
     fingerprint: String,
@@ -952,7 +953,12 @@ const MAX_CONFIRM_DATA_BYTES: usize = r#"{"h":null,"b":[],"o":[]}"#.len()
     + MAX_BACKOFF_ENTRIES_PER_UID
     + MAX_RECENT_OUTCOMES_PER_UID;
 
-fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
+/// Parses compact confirmation state while preserving duplicate-key errors.
+///
+/// # Errors
+///
+/// Returns the serde error for invalid JSON, positional fields, or duplicate keys.
+pub fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let valid_rows = |key: &str| {
         value
@@ -968,7 +974,7 @@ fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
             "confirmation records must use object forms",
         ));
     }
-    serde_json::from_value(value)
+    serde_json::from_slice(bytes)
 }
 const _: () = assert!(MAX_CONFIRM_DATA_BYTES <= CONFIRM_FILE_LIMIT);
 
@@ -3608,8 +3614,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             heartbeat: Some(WatcherHeartbeat {
                 pid: u32::MAX,
                 starttime: u64::MAX,
-                tty: i64::MAX,
-                sid: i64::MAX,
+                tty: i64::MIN,
+                sid: i64::MIN,
                 at_ms: u64::MAX,
             }),
             backoff: (0..MAX_BACKOFF_ENTRIES_PER_UID)
@@ -3630,7 +3636,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .collect(),
         };
         let bytes = encode(&data).unwrap();
-        assert!(bytes.len() <= CONFIRM_FILE_LIMIT);
+        assert!(bytes.len() <= MAX_CONFIRM_DATA_BYTES);
     }
 
     #[test]
@@ -3829,6 +3835,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn a_confirm_file_with_a_positional_heartbeat_is_refused() {
         let bytes = br#"{"h":[42,99,34816,41,1],"b":[],"o":[]}"#;
         assert!(parse_confirm_data(bytes).is_err());
+    }
+
+    #[test]
+    fn a_confirm_file_with_positional_backoff_and_outcome_rows_is_refused() {
+        for bytes in [
+            br#"{"h":null,"b":[["fingerprint",1,2]],"o":[]}"#.as_slice(),
+            br#"{"h":null,"b":[],"o":[["nonce","expired",2,3,4]]}"#.as_slice(),
+        ] {
+            assert!(parse_confirm_data(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_in_confirmation_files_are_refused() {
+        assert!(parse_confirm_data(br#"{"h":null,"h":null,"b":[],"o":[]}"#).is_err());
     }
 
     #[test]

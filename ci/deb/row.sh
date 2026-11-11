@@ -90,7 +90,9 @@ doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
+printf '%s\n' '[null,[],[]]' >/run/xudo/confirm/legacy.json
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+gone /run/xudo/confirm/legacy.json
 if grep -Fq 'every privileged request asks for a password' /tmp/apt.log; then
     fail "upgrade printed the first install notice"
 fi
