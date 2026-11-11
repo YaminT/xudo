@@ -73,5 +73,8 @@ if [[ $(run id -u) == 0 ]]; then
 fi
 echo "linux-test: $(uname -sr) $(uname -m), as uid $(run id -u), on the container's own filesystem"
 cd /work
+if [ "$#" -eq 0 ]; then
+    run cargo test -p xudod -p xudo-gate
+fi
 run cargo test --workspace --all-features "$@"
 INNER

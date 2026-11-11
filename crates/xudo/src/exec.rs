@@ -682,6 +682,57 @@ mod tests {
     const SUDO: Has = Has(&["/usr/bin/sudo"]);
 
     #[test]
+    fn exec_with_timeout_zero_returns_pending_at_once_and_leaves_the_entry() {
+        use std::sync::{Arc, Mutex};
+
+        let id = "b".repeat(64);
+        let spool_entry = Arc::new(Mutex::new(Some(id.clone())));
+        let server_spool = Arc::clone(&spool_entry);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_listener = listener.try_clone().unwrap();
+        let response = json(&Answer::Pending {
+            id: id.clone(),
+            expires_in_ms: 20_000,
+        });
+        let entry_id = id.clone();
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = server_listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert!(
+                BrokerRequest::parse(&request)
+                    .unwrap()
+                    .run_fields()
+                    .is_some()
+            );
+            *server_spool.lock().unwrap() = Some(entry_id);
+            stream.write_all(&response).unwrap();
+        });
+        let cli = cli();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_with_confirmation_timeout(
+            &cli,
+            &["/usr/bin/apt-get".to_owned(), "remove".to_owned()],
+            &SUDO,
+            &socket,
+            TIMEOUT,
+            Duration::ZERO,
+            &mut out,
+            &mut err,
+        );
+        broker.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(result, Err(ExitCode::NotConfirmed));
+        assert_eq!(*spool_entry.lock().unwrap(), Some(id));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(dir);
+    }
+
+    #[test]
     fn timeout_zero_renders_pending_output_and_watch_hint() {
         let cli = cli();
         let id = "a".repeat(64);

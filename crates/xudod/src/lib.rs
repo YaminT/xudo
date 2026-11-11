@@ -48,6 +48,12 @@ pub mod record;
 pub mod refusal;
 pub mod serve;
 
+/// Parser entry points exposed only to the separate fuzz crate.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub use crate::serve::{ConfirmData, parse_confirm_data};
+}
+
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::time::Duration;
