@@ -343,8 +343,8 @@ clear_confirm same-session none
 # A watcher in a user namespace with a non-identity uid map is not live. Root
 # makes the namespace, so the host's restriction on unprivileged ones (AppArmor)
 # does not apply, and no sysctl is changed. Needs util-linux >= 2.39 for
-# --map-users. Skipping is never silent: it fails the lane unless
-# XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1 (see run.sh).
+# --map-users. A missing prerequisite is a hard failure; the case is never
+# skipped.
 userns=watch_in_a_user_namespace_is_refused
 skip_reason=
 unshare_ver=$(unshare --version 2>/dev/null | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
@@ -365,12 +365,7 @@ if [ -z "$skip_reason" ]; then
     fi
 fi
 if [ -n "$skip_reason" ]; then
-    echo "SKIP: $userns: $skip_reason"
-    if [ "${XUDO_SYSTEMD_ALLOW_USERNS_SKIP:-}" = 1 ]; then
-        echo "NOTE: $userns skipped by XUDO_SYSTEMD_ALLOW_USERNS_SKIP=1"
-    else
-        bad "$userns skipped, and XUDO_SYSTEMD_ALLOW_USERNS_SKIP is not set"
-    fi
+    bad "$userns cannot run: $skip_reason"
 elif expect /harness/confirm.exp userns >/var/tmp/userns.out 2>&1; then
     good "$userns (rc=$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/userns.out))"
 else
@@ -415,6 +410,37 @@ if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ]; then
 else
     bad "xudo_thaw_works_as_root_and_removes_the_frozen_file"
     cat /var/tmp/root-thaw.out >&2
+fi
+
+# Keep the full acceptance suite on the release package: a password prompt
+# may legitimately take longer than the lane's 20-second TTL. Install the
+# separate test package only for the expiry proof at the end of the row.
+if ! dpkg -i /opt/xudo-short-ttl.deb >/var/tmp/xudo-short-ttl-install.log 2>&1; then
+    cat /var/tmp/xudo-short-ttl-install.log >&2
+    bad "install short-TTL test package"
+else
+    name=short_ttl_expires_a_pending_entry
+    if expect /harness/confirm.exp pending >/var/tmp/confirm-short-ttl.log 2>&1; then
+        pending=$(pending_out)
+        if [ "$(sed -n 's/^REQUESTER_RC=//p' /var/tmp/confirm-short-ttl.log)" = 18 ] &&
+            [ -n "$pending" ] && lists_the_request "$pending"; then
+            sleep 22
+            expired=$(pending_out)
+            if ! lists_the_request "$expired"; then
+                good "$name"
+            else
+                bad "$name (entry remained visible past 20 seconds)"
+                printf '%s\n' "$expired" >&2
+            fi
+        else
+            bad "$name (request was not pending initially)"
+            cat /var/tmp/confirm-short-ttl.log >&2
+        fi
+    else
+        bad "$name"
+        cat /var/tmp/confirm-short-ttl.log >&2
+    fi
+    clear_confirm "$name" none
 fi
 
 mid=a06b36c755dd4b85815d6af790559b5e

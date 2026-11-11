@@ -21,7 +21,7 @@ cargo_version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml
 # A hyphen starts a Debian revision, so 0.1.0-beta.1 would sort above 0.1.0.
 # Tilde stays in the upstream version and sorts before the final release.
 version=$(printf '%s\n' "$cargo_version" | tr '-' '~')
-bin=$root/target/$triple/release
+bin=${XUDO_BUILD_BIN_DIR:-$root/target/$triple/release}
 epoch=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)}
 export SOURCE_DATE_EPOCH=$epoch
 

@@ -42,6 +42,15 @@ dir="$root/target/deb"
 deb="$dir/xudo_${deb_ver}_${arch}.deb"
 [ -f "$deb" ] || { echo "FAIL: built package not at $deb" >&2; exit 1; }
 
+marker=xudo-lane-short-ttl-20-seconds
+for binary in xudo xudod xudo-gate ido; do
+    if strings "$root/target/$triple/release/$binary" | grep -Fq "$marker"; then
+        echo "FAIL: release_binaries_do_not_contain_the_short_ttl_feature ($binary)" >&2
+        exit 1
+    fi
+done
+echo "PASS: release_binaries_do_not_contain_the_short_ttl_feature"
+
 # Two packages from the same binaries: the upgrade is the next patch.
 rm -rf "$root/target/deb-upgrade"
 up=$(VERSION="${numeric%.*}.$((patch + 1))" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-upgrade")
