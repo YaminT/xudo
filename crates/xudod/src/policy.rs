@@ -82,6 +82,26 @@ pub fn classify(identity: &PeerIdentity) -> CallerFacts {
     )
 }
 
+/// The requester's facts as the broker stored them at mint, from kernel
+/// attestation: the class and the requester's uid, nothing the answering
+/// watcher or freezer is, and nothing the requester claimed. The registry
+/// names are placeholders; they never decide anything.
+pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts {
+    use xudo_gate::request::AttestedClass;
+    let classification = match &entry.attested_class {
+        AttestedClass::Unattested => Classification::Unattested {
+            reason: "stored class at mint".to_owned(),
+        },
+        AttestedClass::Human => Classification::Human,
+        AttestedClass::EnrolledAgent { scope_id } => Classification::EnrolledAgent {
+            agent_id: format!("scope-{scope_id}"),
+            session_id: "stored".to_owned(),
+            declared_yolo: false,
+        },
+    };
+    CallerFacts::new(classification, entry.caller_uid)
+}
+
 /// The decision for a request, made exactly as `xudo explain` makes it.
 pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerRequest) -> Decision {
     let Some((program, argv, _)) = request.run_fields() else {
