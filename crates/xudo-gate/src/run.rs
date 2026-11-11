@@ -605,6 +605,12 @@ struct Matched {
 /// there is no caller to name: the gate's own pin stands in, and `decide`
 /// refuses on the missing entry before it looks at the pin. The attestation
 /// is the same either way, because the gate attests no one.
+///
+/// Hard-coded `Unattested`/`None`/`None` on purpose: the gate attests no class
+/// until E6, so an entry minted for any other class (an enrolled agent's scope,
+/// a human) fails `live_attested_identity_matches` and is refused. That is the
+/// fail-closed interim: nothing mints another class before E2, and the gate
+/// must never take a class from the entry it is judging.
 fn caller_for(matched: Option<&Matched>, own: CallerPin) -> GateCaller {
     GateCaller {
         pin: matched.map_or(own, |found| found.caller),
@@ -616,6 +622,9 @@ fn caller_for(matched: Option<&Matched>, own: CallerPin) -> GateCaller {
             },
             UNKNOWN_UID,
         ),
+        attested_class: crate::request::AttestedClass::Unattested,
+        attested_scope_id: None,
+        boot_id: None,
     }
 }
 
@@ -1501,6 +1510,39 @@ args = [
             exit.message
         );
         assert!(host.audit.records().is_empty());
+    }
+
+    /// The gate attests no class, so an entry minted for any other class is
+    /// refused through the real `caller_for`, in the real sequence, and runs
+    /// nothing.
+    fn refused_for_class(mut request: PendingRequest) {
+        request.claimed_classification = "enrolled-agent".to_owned();
+        let spool = Rc::new(holding(&[(NONCE_A, request)]));
+        let mut host = FakeHost::new(&spool);
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 19, "{}", exit.message);
+        assert!(
+            exit.message.contains("request_wrong_attested_identity"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(exec_calls(&host), 0);
+    }
+
+    #[test]
+    fn the_gate_refuses_an_enrolled_entry_until_it_can_attest_a_scope() {
+        let mut request = ours();
+        request.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        request.attested_scope_id = Some(44);
+        request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        refused_for_class(request);
+    }
+
+    #[test]
+    fn the_gate_refuses_a_human_entry_it_cannot_attest_live() {
+        let mut request = ours();
+        request.attested_class = crate::request::AttestedClass::Human;
+        refused_for_class(request);
     }
 
     // ---- exec -------------------------------------------------------------

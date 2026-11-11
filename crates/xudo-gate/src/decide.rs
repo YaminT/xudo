@@ -49,6 +49,12 @@ pub struct GateCaller {
     pub pin: CallerPin,
     /// What the gate attested about it.
     pub facts: CallerFacts,
+    /// The attested class established from the live caller.
+    pub attested_class: crate::request::AttestedClass,
+    /// The caller's live scope id, when enrolled.
+    pub attested_scope_id: Option<u64>,
+    /// The live boot id used to qualify a scope id.
+    pub boot_id: Option<String>,
 }
 
 impl GateCaller {
@@ -66,6 +72,9 @@ impl GateCaller {
                 },
                 UNKNOWN_UID,
             ),
+            attested_class: crate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 }
@@ -379,6 +388,15 @@ pub fn decide(
         });
     };
     pending.validate(caller.pin, context.generation, context.now)?;
+    // Every state, not only `Consumed`: an entry for a class the gate cannot
+    // attest is refused whatever its state, so no path depends on state alone.
+    if !pending.live_attested_identity_matches(
+        &caller.attested_class,
+        caller.attested_scope_id,
+        caller.boot_id.as_deref(),
+    ) {
+        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
+    }
 
     let action_id = ActionId::new(pending.action.clone());
     let request = Request::for_program(
@@ -688,6 +706,9 @@ args = [
                 },
                 1000,
             ),
+            attested_class: crate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 
@@ -695,6 +716,10 @@ args = [
         GateCaller {
             pin: CallerPin::new(pid, 555),
             facts: CallerFacts::new(Classification::Human, 1000),
+            // What the gate attests of anyone until E6, and what these entries carry.
+            attested_class: crate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
     }
 
@@ -919,6 +944,46 @@ args = [
     }
 
     #[test]
+    fn the_gate_refuses_a_consumed_entry_whose_caller_left_the_scope() {
+        let mut pending = status_request(77);
+        pending.confirmed = true;
+        pending.state = crate::request::ConfirmationState::Consumed;
+        pending.needs_watch = true;
+        pending.shown_at_ms = Some(crate::request::BoottimeMillis(99));
+        pending.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 88,
+            starttime: 99,
+            tty: (136 << 8) | 1,
+            sid: 11,
+        });
+        pending.shown_to = pending.confirmed_by.clone();
+        pending.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        pending.attested_scope_id = Some(44);
+        pending.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let caller = GateCaller {
+            pin: CallerPin::new(77, 555),
+            facts: CallerFacts::new(
+                Classification::EnrolledAgent {
+                    agent_id: "claude-code".into(),
+                    session_id: "s-9".into(),
+                    declared_yolo: false,
+                },
+                1000,
+            ),
+            attested_class: crate::request::AttestedClass::EnrolledAgent { scope_id: 45 },
+            attested_scope_id: Some(45),
+            boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned()),
+        };
+        assert_eq!(
+            decide(&rules(), &caller, Some(&pending), context())
+                .unwrap_err()
+                .code(),
+            "request_wrong_attested_identity"
+        );
+    }
+
+    #[test]
     fn the_human_path_runs_while_frozen() {
         let mut ctx = context();
         ctx.settings.frozen = true;
@@ -973,6 +1038,9 @@ args = [
                 },
                 1000,
             ),
+            attested_class: crate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         };
         let human_only = request(77, "xudo.human.only", &["stop", "nginx.service"]);
         assert!(decide(&rules(), &unattested, Some(&human_only), context()).is_ok());
