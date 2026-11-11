@@ -673,7 +673,6 @@ fn take_matching_approval(
     let argv_bytes = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
     let live = live_attestation(syscalls, caller, identity)?;
     let binding = live.binding(identity);
-    let mut belongs_to_another = false;
     for name in names {
         let bytes = spool
             .read(&name, crate::mint::MAX_ENTRY_BYTES)
@@ -681,7 +680,6 @@ fn take_matching_approval(
         let Ok(entry) = parse_entry(&bytes) else {
             continue;
         };
-        let before = entry.clone();
         let (_, consumed) = crate::confirm::take_approval(
             Some(entry),
             program.as_bytes(),
@@ -694,36 +692,8 @@ fn take_matching_approval(
         if let Some(approved) = consumed {
             return Ok(Some(approved));
         }
-        // Remember it and keep looking: the caller's own entry may follow.
-        belongs_to_another |=
-            same_unconsumable_approval(&before, identity, program, argv, generation, action, now);
-    }
-    if belongs_to_another {
-        return Err(Refusal::client(
-            RefusalCode::RequestUnknown,
-            "approval belongs to another caller",
-        ));
     }
     Ok(None)
-}
-
-fn same_unconsumable_approval(
-    entry: &xudo_gate::request::PendingRequest,
-    identity: &PeerIdentity,
-    program: &str,
-    argv: &[String],
-    generation: u64,
-    action: &str,
-    now: u64,
-) -> bool {
-    entry.state == xudo_gate::request::ConfirmationState::Approved
-        && entry.needs_watch
-        && entry.caller_uid == identity.uid
-        && entry.program == program
-        && entry.argv == argv
-        && entry.generation == generation
-        && entry.action == action
-        && now < entry.deadline.0
 }
 
 fn pin_to_consumer(entry: &mut xudo_gate::request::PendingRequest, identity: &PeerIdentity) {
@@ -746,7 +716,7 @@ fn checked_live_identity(
     } else {
         Err(Refusal::client(
             RefusalCode::RequestUnknown,
-            "approval belongs to another caller",
+            "approval no longer matches the caller",
         ))
     }
 }
@@ -801,11 +771,28 @@ fn mint_approved(
             );
         }
     };
-    // Only now, with the identity matched, is the entry the consumer's.
+    // The identity matched, so this copy is re-pinned to the consumer. It is
+    // only a copy: nothing is spent until the compare-and-swap below lands.
     pin_to_consumer(&mut entry, &identity);
     program.clone_into(&mut entry.program);
     entry.argv = argv.to_vec();
     let json = entry.to_json();
+    if let Err(error) = publish_consumed_approval(
+        spool,
+        &live.binding(&identity),
+        &entry,
+        &json,
+        platform.clock.boottime_millis(),
+    ) {
+        return refuse(
+            conn,
+            platform.audit,
+            &error,
+            Some(&identity),
+            Some(&request),
+        );
+    }
+    // Audited after the swap, so a race loser's record never says granted.
     let build = |previous: Option<&Record>, grant: &Grant| {
         decided(
             previous,
@@ -829,21 +816,6 @@ fn mint_approved(
             Some(&request),
         );
     };
-    if let Err(error) = publish_consumed_approval(
-        spool,
-        &live.binding(&identity),
-        &entry,
-        &json,
-        platform.clock.boottime_millis(),
-    ) {
-        return refuse(
-            conn,
-            platform.audit,
-            &error,
-            Some(&identity),
-            Some(&request),
-        );
-    }
     let minted = Minted {
         nonce: authorized.approval().0.nonce.clone(),
         expires_in_ms: remaining_millis(
@@ -3050,19 +3022,32 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_same_uid_process_cannot_spend_someone_elses_approval() {
+    fn an_unattested_rerun_from_another_session_spends_the_approval_behind_the_password() {
         let (spool, id) = approved_for_the_requester();
-        let before = spool.files()[id.as_bytes()].clone();
-        let rerun = || asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
-        for (sid, tty) in [(9, 0), (0, 9), (9, 9)] {
-            let mut host = rerun_host(PID + 1, START + 1, sid, tty);
-            let outcome = serve_with(&mut host, &rerun(), Ok(&spool));
-            assert_eq!(outcome.served, Served::Refused(Fault::Client));
-            assert_eq!(spool.files()[id.as_bytes()], before);
-        }
-        let mut host = rerun_host(PID + 2, START + 2, 0, 0);
-        let outcome = serve_with(&mut host, &rerun(), Ok(&spool));
+        let rerun = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let mut host = rerun_host(PID + 1, START + 1, 9, 9);
+        let outcome = serve_with(&mut host, &rerun, Ok(&spool));
         assert_eq!(outcome.served, Served::Minted);
+        let (_, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(
+            minted.map(|m| m.gate.as_str()),
+            Some(xudo_backend::snippet::GATE_AUTH)
+        );
+        let entry = the_entry(&spool, &id);
+        assert_eq!(entry.state, xudo_gate::request::ConfirmationState::Consumed);
+        assert_eq!(
+            (
+                entry.caller_pid,
+                entry.caller_starttime,
+                entry.caller_sid,
+                entry.caller_tty
+            ),
+            (PID + 1, START + 1, 9, 9)
+        );
+        assert_eq!(
+            entry.attested_class,
+            xudo_gate::request::AttestedClass::Unattested
+        );
     }
 
     #[test]
@@ -3113,8 +3098,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "unattested",
         );
         let syscalls = xudo_sys::FakeSyscalls::new();
-        let first = test_identity(PID + 1, START + 1, 0, 0);
-        let second = test_identity(PID + 2, START + 2, 0, 0);
+        let first = test_identity(PID + 1, START + 1, 8, 0);
+        let second = test_identity(PID + 2, START + 2, 9, 0);
         // Both read the entry as Approved before either has published.
         let mut taken = Vec::new();
         for identity in [&first, &second] {
@@ -3204,7 +3189,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_agent_in_another_scope_cannot_spend_the_approval() {
+    fn an_agent_in_another_scope_opens_its_own_request() {
         let (spool, entry) = agent_approval(44);
         let before = spool.files()[NONCE.as_bytes()].clone();
         let request = BrokerRequest::new(
@@ -3216,13 +3201,34 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         identity.cgroup_id = Some(45);
         let syscalls = xudo_sys::FakeSyscalls::new().with_boot_id(Ok(BOOT_ID.to_owned()));
         let caller = enrolled_caller();
-        let error = take_matching_approval(
+        // No refusal: the caller falls through to its own pending request.
+        let taken = take_matching_approval(
             &spool,
             &search_for(&request, &identity, &caller, &syscalls, &entry.action),
         )
-        .unwrap_err();
-        assert_eq!(error.detail, "approval belongs to another caller");
+        .unwrap();
+        assert!(taken.is_none());
         assert_eq!(spool.files()[NONCE.as_bytes()], before);
+    }
+
+    #[test]
+    fn a_caller_of_another_class_opens_its_own_request_beside_the_approval() {
+        let (spool, id) = approved_for_the_requester();
+        let mut approved = the_entry(&spool, &id);
+        approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        approved.attested_scope_id = Some(44);
+        approved.boot_id = Some(BOOT_ID.to_owned());
+        let spool =
+            FakeSpool::new().with_file(id.as_bytes().to_vec(), approved.to_json().into_bytes());
+        let before = spool.files()[id.as_bytes()].clone();
+        let mut host = rerun_host(PID + 1, START + 1, 9, 9);
+        host.entropy = FakeEntropy::new().with(Ok(vec![0xcd; 32]));
+        let rerun = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let outcome = serve_with(&mut host, &rerun, Ok(&spool));
+        assert_eq!(refusal_of(&outcome.answer), None);
+        assert_eq!(pending_id(&outcome.answer), Some("cd".repeat(32)));
+        assert_eq!(spool.files()[id.as_bytes()], before);
+        assert_eq!(spool.files().len(), 2);
     }
 
     #[test]
@@ -3233,6 +3239,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.boot_id = None;
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let before = spool.files()[NONCE.as_bytes()].clone();
         let request = BrokerRequest::new(
             "/usr/bin/apt-get",
             vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
@@ -3242,13 +3249,32 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         identity.cgroup_id = Some(44);
         let syscalls = xudo_sys::FakeSyscalls::new().with_boot_id(Ok(BOOT_ID.to_owned()));
         let caller = enrolled_caller();
-        assert!(
-            take_matching_approval(
-                &spool,
-                &search_for(&request, &identity, &caller, &syscalls, &entry.action),
-            )
-            .is_err()
+        let taken = take_matching_approval(
+            &spool,
+            &search_for(&request, &identity, &caller, &syscalls, &entry.action),
+        )
+        .unwrap();
+        assert!(taken.is_none());
+        assert_eq!(spool.files()[NONCE.as_bytes()], before);
+    }
+
+    #[test]
+    fn an_approval_for_an_agent_cannot_be_consumed_by_an_unattested_caller_at_the_broker() {
+        let (spool, entry) = agent_approval(44);
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
         );
+        let identity = test_identity(PID, START, 7, 7);
+        let caller = classify(&identity);
+        let syscalls = xudo_sys::FakeSyscalls::new();
+        let taken = take_matching_approval(
+            &spool,
+            &search_for(&request, &identity, &caller, &syscalls, &entry.action),
+        )
+        .unwrap();
+        assert!(taken.is_none());
     }
 
     #[test]
@@ -3405,7 +3431,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let served = mint_approved(
             &connection(Ok(Vec::new())),
             &mut host.platform(),
-            &FakeSpool::new(),
+            &FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes()),
             evaluated,
             entry.clone(),
         );
@@ -4522,7 +4548,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn consumed_publication_cannot_repin_an_approval_to_another_session() {
+    fn consumed_publication_cannot_repin_an_approval_to_another_class() {
         let other = test_identity(PID + 1, START + 1, 9, 9);
         let mut approved = shown_entry();
         approved.state = xudo_gate::request::ConfirmationState::Approved;
@@ -4540,7 +4566,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let bytes = approved.to_json();
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone().into_bytes());
-        let live = unattested_live(&other);
+        let live = LiveAttestation {
+            class: xudo_gate::request::AttestedClass::Human,
+            scope_id: None,
+            boot_id: None,
+        };
         let error = publish_consumed_approval(
             &spool,
             &live.binding(&other),
@@ -4554,8 +4584,36 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn consumed_publication_accepts_a_new_process_of_the_same_identity() {
-        let other = test_identity(PID + 1, START + 1, 0, 0);
+    fn consumed_publication_cannot_repin_an_approval_to_another_scope() {
+        let other = test_identity(PID + 1, START + 1, 9, 9);
+        let (spool, entry) = agent_approval(44);
+        let before = spool.files()[NONCE.as_bytes()].clone();
+        let mut consumed = entry;
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        consumed.caller_pid = other.pid;
+        consumed.caller_starttime = other.starttime;
+        consumed.caller_sid = other.sid;
+        consumed.caller_tty = other.tty;
+        let live = LiveAttestation {
+            class: xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 45 },
+            scope_id: Some(45),
+            boot_id: Some(BOOT_ID.to_owned()),
+        };
+        let error = publish_consumed_approval(
+            &spool,
+            &live.binding(&other),
+            &consumed,
+            &consumed.to_json(),
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::RequestUnknown);
+        assert_eq!(spool.files()[NONCE.as_bytes()], before);
+    }
+
+    #[test]
+    fn consumed_publication_accepts_a_new_session_of_the_same_identity() {
+        let other = test_identity(PID + 1, START + 1, 9, 9);
         let mut approved = shown_entry();
         approved.state = xudo_gate::request::ConfirmationState::Approved;
         approved.confirmed = true;
@@ -4567,6 +4625,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         consumed.deadline.0 = NOW + 1;
         consumed.caller_pid = other.pid;
         consumed.caller_starttime = other.starttime;
+        consumed.caller_sid = other.sid;
+        consumed.caller_tty = other.tty;
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes());
         let live = unattested_live(&other);
@@ -4622,7 +4682,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn approved_remint_refuses_a_same_uid_process_of_another_session() {
+    fn approved_remint_refuses_a_caller_of_another_class() {
         let mut host = Host::honest();
         let request = BrokerRequest::new(
             "/usr/bin/apt-get",
@@ -4645,6 +4705,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
         approved.confirmed_by = Some(pin.clone());
         approved.shown_to = Some(pin);
+        approved.attested_class = xudo_gate::request::AttestedClass::Human;
         let served = mint_approved(
             &connection(Ok(Vec::new())),
             &mut host.platform(),
@@ -4653,6 +4714,93 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             approved,
         );
         assert_eq!(served, Served::Refused(Fault::Client));
+    }
+
+    #[test]
+    fn approved_remint_spends_the_approval_for_a_caller_of_another_session() {
+        let mut host = Host::honest();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID + 1, START + 1, 9, 9);
+        let policy = confirming_policy();
+        let caller = classify(&identity);
+        let evaluated = Evaluated {
+            decision: decide(&policy, &caller, &request),
+            caller,
+            identity,
+            request,
+            policy,
+        };
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        approved.confirmed_by = Some(pin.clone());
+        approved.shown_to = Some(pin);
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes());
+        let mut consumed = approved;
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            consumed,
+        );
+        assert_eq!(served, Served::Minted);
+        let saved = parse_entry(&spool.files()[NONCE.as_bytes()]).unwrap();
+        assert_eq!(saved.state, xudo_gate::request::ConfirmationState::Consumed);
+        assert_eq!((saved.caller_sid, saved.caller_tty), (9, 9));
+    }
+
+    #[test]
+    fn a_race_loser_is_never_audited_as_granted() {
+        let mut host = Host::honest();
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
+            "unattested",
+        );
+        let identity = test_identity(PID + 1, START + 1, 9, 9);
+        let policy = confirming_policy();
+        let caller = classify(&identity);
+        let evaluated = Evaluated {
+            decision: decide(&policy, &caller, &request),
+            caller,
+            identity,
+            request,
+            policy,
+        };
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        approved.confirmed = true;
+        let pin = watcher_pin(&test_identity(5000, 77, 2, 34816));
+        approved.confirmed_by = Some(pin.clone());
+        approved.shown_to = Some(pin);
+        let mut on_disk = approved.clone();
+        on_disk.state = xudo_gate::request::ConfirmationState::Expired;
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), on_disk.to_json().into_bytes());
+        let mut consumed = approved;
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        let served = mint_approved(
+            &connection(Ok(Vec::new())),
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            consumed,
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert!(
+            host.audit
+                .records()
+                .iter()
+                .all(|record| record.decision != xudo_audit::record::Decision::Allowed)
+        );
     }
 
     #[test]
@@ -5021,7 +5169,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     now: NOW
                 }
             )
-            .is_err()
+            .unwrap()
+            .is_none()
         );
     }
 
