@@ -399,9 +399,9 @@ impl PendingRequest {
     /// including an unknown key or a missing required key. Optional fields
     /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
     /// deserialize as `None`, as serde defines for `Option` fields. Attested
-    /// identity fields must use canonical shapes and agree with each other:
-    /// `attested_scope_id` and `boot_id` are both required for an enrolled
-    /// agent and both absent for a human or unattested caller.
+    /// identity fields must use canonical shapes. That they agree with each
+    /// other (`attested_scope_id` and `boot_id` both present for an enrolled
+    /// agent, both absent otherwise) is checked by `validate`, not here.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
@@ -910,6 +910,31 @@ mod tests {
     fn a_round_trip_through_json_changes_nothing() {
         let request = live();
         assert_eq!(PendingRequest::parse(&request.to_json()).unwrap(), request);
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_duplicated_attested_class_is_refused() {
+        let entry = live().to_json().replacen(
+            r#""attested_class":"unattested""#,
+            r#""attested_class":"unattested","attested_class":{"enrolled_agent":{"scope_id":44}}"#,
+            1,
+        );
+        assert_eq!(
+            PendingRequest::parse(&entry).unwrap_err().code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_duplicated_key_inside_enrolled_agent_is_refused() {
+        let entry = live().to_json().replace(
+            r#""attested_class":"unattested","attested_scope_id":null,"boot_id":null"#,
+            r#""attested_class":{"enrolled_agent":{"scope_id":44,"scope_id":45}},"attested_scope_id":44,"boot_id":"abcdef01-2345-6789-abcd-ef0123456789""#,
+        );
+        assert_eq!(
+            PendingRequest::parse(&entry).unwrap_err().code(),
+            "request_malformed"
+        );
     }
 
     #[test]
