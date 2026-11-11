@@ -131,7 +131,13 @@ if {$action eq "userns"} {
 set ready 0
 for {set launch 0} {$launch < 3 && !$ready} {incr launch} {
     file delete -force $heartbeat_file
-    spawn setsid su --pty -s /bin/sh -c {xudo watch} xudotest
+    # No `setsid` here. expect's spawn is already a session leader, so
+    # `setsid` forks and the parent exits at once. That exit closes this
+    # controlling terminal and SIGHUPs the child unless the child has
+    # already called setsid(2). The child loses that race often enough
+    # that `xudo watch` never starts and the heartbeat file never appears.
+    # `su --pty` puts the watcher in its own session, on its own pty.
+    spawn su --pty -s /bin/sh -c {xudo watch} xudotest
     set watcher $spawn_id
     for {set attempt 0} {$attempt < 50} {incr attempt} {
         if {[file exists $heartbeat_file]} { set ready 1; break }
