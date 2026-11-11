@@ -218,14 +218,17 @@ fn time_left(started: Instant, now: Instant, timeout: Duration) -> Option<Durati
 
 /// A socket timeout that cannot outlast `remaining`.
 ///
-/// `SO_SNDTIMEO` and `SO_RCVTIMEO` are timevals. rustix rounds them up to the
-/// next microsecond, and a zero timeval means block forever, so one
-/// microsecond is held back. What cannot spare that microsecond is already
-/// the deadline.
+/// `SO_SNDTIMEO` and `SO_RCVTIMEO` are timevals. rustix 1.1 rounds the
+/// fractional part up to microseconds and does not carry a `1_000_000`
+/// microsecond result into the seconds, so the kernel can reject it
+/// (`EDOM`). Rounding down keeps every timeval inside `remaining`. A
+/// fraction that rounds down to zero would make the kernel wait forever,
+/// so that remainder is already the deadline. A nonzero number of
+/// microseconds stays nonzero.
 fn kernel_timeout(remaining: Duration) -> Option<Duration> {
-    remaining
-        .checked_sub(Duration::from_micros(1))
-        .filter(|adjusted| !adjusted.is_zero())
+    let whole = Duration::from_secs(remaining.as_secs())
+        .saturating_add(Duration::from_micros(u64::from(remaining.subsec_micros())));
+    if whole.is_zero() { None } else { Some(whole) }
 }
 
 fn response_candidate(bytes: &[u8]) -> bool {
@@ -239,6 +242,10 @@ struct Live {
     /// blocks in the kernel for the time still left.
     wait: bool,
     stream: Option<UnixStream>,
+    /// A send timeout was accepted. A later refusal leaves that bound in place.
+    send_bounded: bool,
+    /// A receive timeout was accepted. A later refusal leaves that bound in place.
+    recv_bounded: bool,
 }
 
 impl Live {
@@ -247,6 +254,8 @@ impl Live {
             path: path.to_path_buf(),
             wait: false,
             stream: None,
+            send_bounded: false,
+            recv_bounded: false,
         }
     }
 
@@ -276,15 +285,18 @@ impl BrokerIo for Live {
     }
 
     fn write(&mut self, bounded: Duration, bytes: &[u8]) -> Step {
+        let earlier = self.send_bounded;
         let Some(stream) = self.stream.as_mut() else {
             return Step::Failed("the broker write ran before the connection".to_owned());
         };
         let set = stream.set_write_timeout(Some(bounded));
-        let transfer = Write::write(stream, bytes);
-        classify_io(after_timeout(set, transfer))
+        let (armed, transfer) = after_timeout(set, earlier, || Write::write(stream, bytes));
+        self.send_bounded = armed;
+        classify_io(transfer)
     }
 
     fn shutdown_write(&mut self, bounded: Duration) -> Step {
+        let earlier = self.send_bounded;
         let Some(stream) = self.stream.as_mut() else {
             return Step::Failed("the broker shutdown ran before the connection".to_owned());
         };
@@ -292,29 +304,39 @@ impl BrokerIo for Live {
         // checked, and the timeout is set so a kernel that does wait cannot
         // outlast it.
         let set = stream.set_write_timeout(Some(bounded));
-        let end = stream.shutdown(Shutdown::Write);
-        let _ = set;
+        let (armed, end) = after_timeout(set, earlier, || stream.shutdown(Shutdown::Write));
+        self.send_bounded = armed;
         classify_end(end)
     }
 
     fn read(&mut self, bounded: Duration, buf: &mut [u8]) -> Step {
+        let earlier = self.recv_bounded;
         let Some(stream) = self.stream.as_mut() else {
             return Step::Failed("the broker read ran before the connection".to_owned());
         };
         let set = stream.set_read_timeout(Some(bounded));
-        let transfer = Read::read(stream, buf);
-        classify_io(after_timeout(set, transfer))
+        let (armed, transfer) = after_timeout(set, earlier, || Read::read(stream, buf));
+        self.recv_bounded = armed;
+        classify_io(transfer)
     }
 }
 
-/// A refused timeout update must not drop bytes already queued.
+/// Runs `transfer` only when the socket has a timeout.
 ///
-/// macOS refuses `SO_RCVTIMEO` after the peer has closed. The read result
-/// still stands. A fresh socket accepts the timeout, and that is what bounds
-/// the call.
-fn after_timeout(set: io::Result<()>, transfer: io::Result<usize>) -> io::Result<usize> {
-    drop(set);
-    transfer
+/// The first refusal in a direction is an error: the call would otherwise
+/// wait with no limit. Once a timeout has been accepted, a later refusal
+/// still runs the transfer. macOS rejects `SO_RCVTIMEO` after the peer has
+/// closed, and dropping that result would discard bytes already queued. The
+/// earlier timeout is what bounds the call.
+fn after_timeout<T>(
+    set: io::Result<()>,
+    earlier: bool,
+    transfer: impl FnOnce() -> io::Result<T>,
+) -> (bool, io::Result<T>) {
+    match set {
+        Err(error) if !earlier => (false, Err(error)),
+        _ => (true, transfer()),
+    }
 }
 
 fn classify_io(result: io::Result<usize>) -> Step {
@@ -376,11 +398,41 @@ fn start_connect(path: &Path, bounded: Duration, wait: bool) -> Start {
 }
 
 fn nonblocking_connect(path: &Path, bounded: Duration) -> Start {
+    #[cfg(test)]
+    record_connect(true);
     finish_open(dial(path, true, bounded))
 }
 
 fn blocking_connect(path: &Path, bounded: Duration) -> Start {
+    #[cfg(test)]
+    record_connect(false);
     finish_open(dial(path, false, bounded))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CONNECT_STEPS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_connect(nonblock: bool) {
+    CONNECT_STEPS.with(|steps| {
+        let (nonblock_count, block_count) = steps.get();
+        steps.set(if nonblock {
+            (nonblock_count.saturating_add(1), block_count)
+        } else {
+            (nonblock_count, block_count.saturating_add(1))
+        });
+    });
+}
+
+/// Non-blocking attempts, then blocking attempts, on this thread.
+///
+/// The exchange under test runs on a worker thread. A process-wide counter
+/// would count other tests.
+#[cfg(all(test, target_os = "linux"))]
+fn connect_steps() -> (u32, u32) {
+    CONNECT_STEPS.with(std::cell::Cell::get)
 }
 
 fn dial(path: &Path, nonblock: bool, bounded: Duration) -> Result<OwnedFd, Errno> {
@@ -480,10 +532,8 @@ mod tests {
     use std::time::Duration;
 
     use rustix::io::Errno;
-    use rustix::net::{
-        AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with,
-    };
-    use xudo_wire::{Answer, BrokerRequest, BrokerResponse, WIRE_SCHEMA_VERSION};
+    use rustix::net::{AddressFamily, SocketType, socket_with};
+    use xudo_wire::{Answer, BrokerResponse, WIRE_SCHEMA_VERSION};
 
     use super::*;
 
@@ -637,30 +687,46 @@ mod tests {
     #[test]
     fn a_signal_storm_cannot_extend_the_reply_wait() {
         let timeout = Duration::from_secs(1);
-        let full = kernel_timeout(timeout).unwrap();
-
-        // started, connect, write, shutdown, one read. The next clock reading
-        // is the deadline, so the loop must not read again.
-        let mut storm = primed(vec![ReadAct::Step(Step::Interrupted)]);
+        let step = Duration::from_millis(200);
+        // started, connect, write, shutdown, then one clock reading per
+        // interrupted read. The reading after the fifth interrupt is the
+        // deadline, so the loop must not read again.
+        let mut storm = primed(vec![]);
+        for _ in 0..5 {
+            storm.read.push_back(ReadAct::Step(Step::Interrupted));
+        }
         let offsets = [
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
+            step,
+            step * 2u32,
+            step * 3u32,
+            step * 4u32,
             timeout,
         ];
         let err = run(b"{}", timeout, &offsets, &mut storm).unwrap_err();
         assert_eq!(err, DEADLINE);
-        assert_eq!(storm.seen_read.len(), 1);
-        assert_eq!(storm.seen_read.first().copied(), Some(full));
-        assert!(full < timeout);
+        assert_eq!(storm.seen_read.len(), 5);
+        let mut previous = None;
+        for (i, seen) in storm.seen_read.iter().copied().enumerate() {
+            let elapsed = step * u32::try_from(i).unwrap();
+            let left = kernel_timeout(timeout.checked_sub(elapsed).unwrap()).unwrap();
+            assert_eq!(seen, left, "read {i} restarted the original timeout");
+            assert!(seen <= timeout.checked_sub(elapsed).unwrap());
+            if let Some(before) = previous {
+                assert!(seen < before, "read {i} grew the wait");
+            }
+            previous = Some(seen);
+        }
 
         let pause = Duration::from_millis(40);
-        let mut shrunk = primed(vec![
-            ReadAct::Step(Step::Interrupted),
-            ReadAct::Chunk(done_bytes()),
-        ]);
+        let mut shrunk = primed(vec![ReadAct::Chunk(done_bytes())]);
+        for _ in 0..3 {
+            shrunk.read.push_front(ReadAct::Step(Step::Interrupted));
+        }
         let offsets = [
             Duration::ZERO,
             Duration::ZERO,
@@ -668,17 +734,22 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
             pause,
+            pause * 2u32,
+            pause * 3u32,
         ];
         let got = run(b"{}", timeout, &offsets, &mut shrunk).unwrap();
         assert_eq!(got, done_bytes());
-        assert_eq!(shrunk.seen_read.len(), 2);
-        let first = *shrunk.seen_read.first().unwrap();
-        let second = *shrunk.seen_read.get(1).unwrap();
-        let left = kernel_timeout(timeout.checked_sub(pause).unwrap()).unwrap();
-        assert_eq!(first, full);
-        assert_eq!(second, left);
-        assert!(second < first);
-        assert!(second <= timeout.checked_sub(pause).unwrap());
+        assert_eq!(shrunk.seen_read.len(), 4);
+        let mut previous = None;
+        for (i, seen) in shrunk.seen_read.iter().copied().enumerate() {
+            let elapsed = pause * u32::try_from(i).unwrap();
+            let left = kernel_timeout(timeout.checked_sub(elapsed).unwrap()).unwrap();
+            assert_eq!(seen, left, "read {i}");
+            if let Some(before) = previous {
+                assert!(seen < before, "read {i} grew the wait");
+            }
+            previous = Some(seen);
+        }
     }
 
     #[test]
@@ -974,13 +1045,27 @@ mod tests {
     }
 
     #[test]
-    fn kernel_timeout_holds_back_one_microsecond() {
+    fn kernel_timeout_rounds_down_to_a_whole_microsecond() {
         assert_eq!(kernel_timeout(Duration::ZERO), None);
         assert_eq!(kernel_timeout(Duration::from_nanos(500)), None);
-        assert_eq!(kernel_timeout(Duration::from_micros(1)), None);
+        assert_eq!(kernel_timeout(Duration::from_nanos(999)), None);
+        assert_eq!(
+            kernel_timeout(Duration::from_micros(1)),
+            Some(Duration::from_micros(1))
+        );
         assert_eq!(
             kernel_timeout(Duration::from_micros(2)),
-            Some(Duration::from_micros(1))
+            Some(Duration::from_micros(2))
+        );
+        // Above 999_999_000 ns, rustix's round-up becomes 1_000_000 us and
+        // does not carry into the seconds. The kernel rejects that timeval.
+        assert_eq!(
+            kernel_timeout(Duration::from_nanos(999_999_500)),
+            Some(Duration::from_micros(999_999))
+        );
+        assert_eq!(
+            kernel_timeout(Duration::new(1, 500)),
+            Some(Duration::from_secs(1))
         );
     }
 
@@ -1030,10 +1115,67 @@ mod tests {
             classify_end(Err(io::Error::other("reset"))),
             Step::Failed("reset".to_owned())
         );
-        assert_eq!(
-            after_timeout(Err(io::Error::from(io::ErrorKind::InvalidInput)), Ok(4)).unwrap(),
-            4
+    }
+
+    /// Calling it is the bug: the first refused timeout must not transfer.
+    fn transfer_without_a_timeout() -> io::Result<usize> {
+        panic!("the transfer ran with no timeout set");
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // the callback type is `io::Result`, not the bytes
+    fn queued_bytes() -> io::Result<usize> {
+        Ok(4)
+    }
+
+    /// Calling it is the bug: shutdown must not run until a send timeout exists.
+    fn shutdown_without_a_timeout() -> io::Result<()> {
+        panic!("shutdown ran with no timeout set");
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // the callback type is `io::Result`, not `()`
+    fn shutdown_finished() -> io::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_timeout_is_denied_until_one_setting_has_succeeded() {
+        // The probe has to run once, or its body is an uncovered region. The
+        // assertion below is that `after_timeout` does not run it.
+        let probed = std::panic::catch_unwind(transfer_without_a_timeout);
+        assert!(probed.is_err(), "the transfer probe did not panic");
+        let (armed, result) = after_timeout(
+            Err(io::Error::other("refused")),
+            false,
+            transfer_without_a_timeout,
         );
+        assert!(!armed);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+
+        let (armed, result) = after_timeout(Err(io::Error::other("closed")), true, queued_bytes);
+        assert!(armed);
+        assert_eq!(result.unwrap(), 4);
+
+        let (armed, result) = after_timeout(Ok(()), false, queued_bytes);
+        assert!(armed);
+        assert_eq!(result.unwrap(), 4);
+
+        let probed = std::panic::catch_unwind(shutdown_without_a_timeout);
+        assert!(probed.is_err(), "the shutdown probe did not panic");
+        let (armed, end) = after_timeout(
+            Err(io::Error::other("refused")),
+            false,
+            shutdown_without_a_timeout,
+        );
+        assert!(!armed);
+        assert!(end.unwrap_err().to_string().contains("refused"));
+
+        let (armed, end) = after_timeout(Err(io::Error::other("closed")), true, shutdown_finished);
+        assert!(armed);
+        assert!(end.is_ok());
+        let (armed, end) = after_timeout(Ok(()), false, shutdown_finished);
+        assert!(armed);
+        assert!(end.is_ok());
     }
 
     #[test]
@@ -1095,6 +1237,53 @@ mod tests {
             live.read(Duration::from_secs(1), &mut buf),
             Step::Failed("the broker read ran before the connection".to_owned())
         );
+    }
+
+    #[test]
+    fn a_socket_that_refuses_its_first_timeout_does_not_transfer() {
+        let mut live = Live::open(Path::new("/nope"));
+        assert_eq!(live.apply(Settled::Done(bare_socket())), Step::Ready);
+        let refused = UnixStream::from(bare_socket())
+            .set_write_timeout(Some(Duration::ZERO))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            live.write(Duration::ZERO, b"hi"),
+            Step::Failed(refused.clone())
+        );
+        assert_eq!(
+            live.shutdown_write(Duration::ZERO),
+            Step::Failed(refused.clone())
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(live.read(Duration::ZERO, &mut buf), Step::Failed(refused));
+
+        // The accepted timeout still bounds a later refusal, so the bytes move.
+        let (mut peer, client) = UnixStream::pair().unwrap();
+        let mut live = Live::open(Path::new("/nope"));
+        assert_eq!(
+            live.apply(Settled::Done(OwnedFd::from(client))),
+            Step::Ready
+        );
+        assert_eq!(
+            live.write(Duration::from_secs(1), b"hi"),
+            Step::Transferred(2)
+        );
+        assert_eq!(live.write(Duration::ZERO, b"!"), Step::Transferred(1));
+        assert_eq!(live.shutdown_write(Duration::ZERO), Step::Ready);
+        let mut got = [0u8; 3];
+        assert_eq!(peer.read(&mut got).unwrap(), 3);
+        assert_eq!(&got, b"hi!");
+        peer.write_all(b"z").unwrap();
+        drop(peer);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            live.read(Duration::from_secs(1), &mut buf),
+            Step::Transferred(1)
+        );
+        assert_eq!(buf, [b'z']);
+        // The receive timeout is already set, so a later refusal still reads.
+        assert_eq!(live.read(Duration::ZERO, &mut buf), Step::Transferred(0));
     }
 
     #[test]
@@ -1176,7 +1365,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_broker_socket_that_never_accepts_times_out_within_the_deadline() {
-        use rustix::net::{bind, listen};
+        use rustix::net::{SocketAddrUnix, SocketFlags, bind, connect, listen};
+        use xudo_wire::BrokerRequest;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("full.sock");
@@ -1218,13 +1408,18 @@ mod tests {
 
         let socket = path.clone();
         let started = Instant::now();
-        let result = within(Duration::from_secs(2), move || {
+        let (result, steps) = within(Duration::from_secs(2), move || {
             let request = BrokerRequest::new("/usr/bin/true", Vec::new(), "unattested");
-            crate::exec::ask(&socket, Duration::from_millis(200), &request)
+            let result = crate::exec::ask(&socket, Duration::from_millis(200), &request);
+            (result, connect_steps())
         });
         let elapsed = started.elapsed();
         let err = result.expect_err("a full backlog connected");
         assert!(err.contains("broker response deadline expired"), "{err}");
+        assert!(
+            steps.0 >= 1 && steps.1 >= 1,
+            "connect steps (non-blocking, blocking) were {steps:?}"
+        );
         assert!(
             elapsed >= Duration::from_millis(100),
             "returned immediately: {elapsed:?}"
@@ -1233,13 +1428,18 @@ mod tests {
 
         let socket = path.clone();
         let started = Instant::now();
-        let result = within(Duration::from_secs(4), move || {
+        let (result, steps) = within(Duration::from_secs(4), move || {
             let request = BrokerRequest::new("/usr/bin/true", Vec::new(), "unattested");
-            crate::watch::ask_live(&socket, &request)
+            let result = crate::watch::ask_live(&socket, &request);
+            (result, connect_steps())
         });
         let elapsed = started.elapsed();
         let err = result.expect_err("watch connected through a full backlog");
         assert!(err.contains("broker response deadline expired"), "{err}");
+        assert!(
+            steps.0 >= 1 && steps.1 >= 1,
+            "watch connect steps (non-blocking, blocking) were {steps:?}"
+        );
         assert!(
             elapsed >= Duration::from_millis(500),
             "returned immediately: {elapsed:?}"
