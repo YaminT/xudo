@@ -392,6 +392,9 @@ fn write_entry_for(
         shown_to: None,
         fingerprint: "0".repeat(64),
         claimed_classification: "human".to_owned(),
+        attested_class: xudo_gate::request::AttestedClass::Unattested,
+        attested_scope_id: None,
+        boot_id: None,
     };
     let path = format!("{SPOOL_DIR}/{nonce}");
     root_file(&path, entry.to_json().as_bytes(), 0o600);

@@ -10,7 +10,7 @@
 
 use xudo_audit::journal::{HIGH_SEVERITY, fields};
 use xudo_audit::{Decision, verify};
-use xudo_gate::request::CallerPin;
+use xudo_gate::request::{AttestedClass, CallerPin};
 use xudo_gate::{
     Approved, GateCaller, Refusal, RequestError, Severity, authorization_record, refusal_record,
 };
@@ -20,6 +20,9 @@ fn caller() -> GateCaller {
     GateCaller {
         pin: CallerPin::new(77, 555),
         facts: CallerFacts::new(Classification::Human, 1000),
+        attested_class: AttestedClass::Human,
+        attested_scope_id: None,
+        boot_id: None,
     }
 }
 
