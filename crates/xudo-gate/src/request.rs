@@ -391,6 +391,20 @@ pub struct PendingRequest {
 }
 
 impl PendingRequest {
+    /// Whether the stored class, scope and boot id agree: an enrolled agent
+    /// has its own scope and a valid boot id, anything else has neither.
+    pub fn has_consistent_attested_identity(&self) -> bool {
+        match &self.attested_class {
+            AttestedClass::EnrolledAgent { scope_id } => {
+                self.attested_scope_id == Some(*scope_id)
+                    && self.boot_id.as_ref().is_some_and(|id| is_boot_id(id))
+            }
+            AttestedClass::Unattested | AttestedClass::Human => {
+                self.attested_scope_id.is_none() && self.boot_id.is_none()
+            }
+        }
+    }
+
     /// Parses one spool entry.
     ///
     /// # Errors
@@ -488,16 +502,7 @@ impl PendingRequest {
                 expected: REQUEST_SCHEMA_VERSION,
             });
         }
-        let valid_attested_identity = match &self.attested_class {
-            AttestedClass::EnrolledAgent { scope_id } => {
-                self.attested_scope_id == Some(*scope_id)
-                    && self.boot_id.as_ref().is_some_and(|id| is_boot_id(id))
-            }
-            AttestedClass::Unattested | AttestedClass::Human => {
-                self.attested_scope_id.is_none() && self.boot_id.is_none()
-            }
-        };
-        if !valid_attested_identity {
+        if !self.has_consistent_attested_identity() {
             return Err(RequestError::InvalidAttestedIdentity);
         }
         if !is_nonce(&self.nonce) {
