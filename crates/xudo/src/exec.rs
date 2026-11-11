@@ -691,13 +691,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("broker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let server_listener = listener.try_clone().unwrap();
         let response = json(&Answer::Pending {
             id: id.clone(),
             expires_in_ms: 20_000,
         });
         let entry_id = id.clone();
         let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = server_listener.accept().unwrap();
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
             assert!(
@@ -722,8 +723,12 @@ mod tests {
             &mut err,
         );
         broker.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
         assert_eq!(result, Err(ExitCode::NotConfirmed));
         assert_eq!(*spool_entry.lock().unwrap(), Some(id));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
         drop(dir);
     }
 
