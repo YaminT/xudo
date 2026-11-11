@@ -158,6 +158,11 @@ mod tests {
                 Fault::Broker,
             ),
             (
+                MintError::NoAttestedScope,
+                RefusalCode::BrokerUnusable,
+                Fault::Broker,
+            ),
+            (
                 MintError::Spool(SpoolError::Exists {
                     name: "x".to_owned(),
                 }),
@@ -198,6 +203,14 @@ mod tests {
             assert_eq!(refusal.fault, fault, "{failure:?}");
             assert_eq!(refusal.detail, failure.to_string());
         }
+    }
+
+    #[test]
+    fn no_attested_scope_display_explains_the_missing_identity_binding() {
+        assert_eq!(
+            MintError::NoAttestedScope.to_string(),
+            "the broker could not bind the agent to a valid cgroup scope and boot id"
+        );
     }
 
     #[test]
