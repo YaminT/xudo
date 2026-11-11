@@ -135,26 +135,6 @@ fn confirm_run(
         }));
     }
     let now = platform.clock.boottime_millis();
-    if !has_live_watcher(
-        platform.confirmations,
-        platform.peers,
-        identity.uid,
-        &identity,
-        now,
-    ) {
-        return ConfirmRun::Served(serve_confirmation_denial(
-            conn,
-            platform,
-            Evaluated {
-                decision,
-                caller,
-                identity,
-                request,
-                policy,
-            },
-            xudo_policy::DenialCode::NoConfirmationChannel,
-        ));
-    }
     let search = ApprovalSearch {
         request: &request,
         identity: &identity,
@@ -190,6 +170,26 @@ fn confirm_run(
             policy,
         };
         return ConfirmRun::Served(mint_approved(conn, platform, spool, evaluated, approved));
+    }
+    if !has_live_watcher(
+        platform.confirmations,
+        platform.peers,
+        identity.uid,
+        &identity,
+        now,
+    ) {
+        return ConfirmRun::Served(serve_confirmation_denial(
+            conn,
+            platform,
+            Evaluated {
+                decision,
+                caller,
+                identity,
+                request,
+                policy,
+            },
+            xudo_policy::DenialCode::NoConfirmationChannel,
+        ));
     }
     let code = if active_backoff(platform.confirmations, identity.uid, &request, now)
         || pending_by_identity(spool, &request, &caller, &identity, now)
@@ -2731,11 +2731,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_unreadable_approval_spool_is_refused_after_a_live_watcher_is_found() {
+    fn an_unreadable_approval_spool_is_refused_with_no_live_watcher() {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
-        host.peers = peer_with_live_watcher();
-        host.confirmations = live_confirmation_store();
         let spool = FakeSpool::new()
             .with_file("approval.json", b"malformed but unreadable".to_vec())
             .failing_read("approval.json");
@@ -2752,26 +2750,20 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(outcome.records.len(), 1);
     }
 
-    #[test]
-    fn no_live_watcher_deny_precedes_consuming_an_approval() {
-        let mut host = Host::honest();
-        turn_on_confirmation(&mut host);
-        let mut approved = shown_entry();
-        approved.state = xudo_gate::request::ConfirmationState::Approved;
-        approved.confirmed = true;
-        let watcher = xudo_gate::request::WatcherPin {
-            uid: UID,
-            pid: 5000,
-            starttime: 77,
-            tty: 34816,
-            sid: 2,
-        };
-        approved.confirmed_by = Some(watcher.clone());
-        approved.shown_to = Some(watcher);
-        let spool = FakeSpool::new().with_file(
-            approved.nonce.as_bytes().to_vec(),
-            approved.to_json().into_bytes(),
-        );
+    /// Serves a re-run from `PID + 7` with no live watcher against the
+    /// requester's approval after `damage` has damaged it, and checks that the
+    /// answer is a denial, nothing is minted and the spool is untouched.
+    fn assert_damaged_approval_is_denied_without_a_watcher(
+        damage: fn(&mut PendingRequest),
+    ) -> (FakeSpool, std::collections::BTreeMap<Vec<u8>, Vec<u8>>) {
+        let (spool, id) = approved_for_the_requester();
+        let mut entry = the_entry(&spool, &id);
+        damage(&mut entry);
+        let spool =
+            FakeSpool::new().with_file(id.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let before = spool.files();
+        let mut host = rerun_host(PID + 7, START + 7, 0, 0);
+        host.confirmations = FakeSpool::new();
         let outcome = serve_with(
             &mut host,
             &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
@@ -2780,8 +2772,107 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let (decision, minted) = decision_of(&outcome.answer).unwrap();
         assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
         assert!(minted.is_none());
-        assert_eq!(spool.files().len(), 1);
-        assert_eq!(outcome.records.len(), 1);
+        (spool, before)
+    }
+
+    fn assert_damaged_approval_is_left_alone(damage: fn(&mut PendingRequest)) {
+        let (spool, before) = assert_damaged_approval_is_denied_without_a_watcher(damage);
+        assert_eq!(spool.files(), before);
+    }
+
+    #[test]
+    fn an_expired_approval_cannot_skip_a_missing_live_channel() {
+        // The sweep removes the dead entry; it is never consumed.
+        let (spool, _) = assert_damaged_approval_is_denied_without_a_watcher(|entry| {
+            entry.deadline = BoottimeMillis(NOW);
+        });
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn a_consumed_approval_cannot_skip_a_missing_live_channel() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.state = xudo_gate::request::ConfirmationState::Consumed;
+        });
+    }
+
+    #[test]
+    fn an_approval_for_different_argv_cannot_skip_a_missing_live_channel() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.argv[2] = "make".to_owned();
+        });
+    }
+
+    #[test]
+    fn an_approval_for_different_generation_cannot_skip_a_missing_live_channel() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.generation = entry.generation.saturating_add(1);
+        });
+    }
+
+    #[test]
+    fn an_approval_for_different_action_cannot_skip_a_missing_live_channel() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.action = "xudo.pkg.install".to_owned();
+        });
+    }
+
+    #[test]
+    fn a_different_identity_caller_with_no_watcher_is_denied_not_minted() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.caller_uid = UID.saturating_add(1);
+        });
+    }
+
+    #[test]
+    fn an_approval_of_another_class_with_no_watcher_is_denied_not_minted() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.attested_class = xudo_gate::request::AttestedClass::Human;
+        });
+    }
+
+    #[test]
+    fn a_pending_entry_cannot_skip_a_missing_live_channel() {
+        assert_damaged_approval_is_left_alone(|entry| {
+            entry.state = xudo_gate::request::ConfirmationState::Pending;
+            entry.confirmed = false;
+            entry.confirmed_by = None;
+        });
+    }
+
+    #[test]
+    fn an_approved_rerun_from_a_new_session_runs_after_the_watcher_closed() {
+        let (spool, id) = approved_for_the_requester();
+        let mut host = rerun_host(PID + 7, START + 7, 9, 9);
+        host.confirmations = FakeSpool::new().with_file(
+            format!("{UID}.json").into_bytes(),
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: Some(WatcherHeartbeat {
+                    pid: 5000,
+                    starttime: 77,
+                    tty: 34816,
+                    sid: 2,
+                    at_ms: NOW - HEARTBEAT_FRESH_MS - 1,
+                }),
+                backoff: Vec::new(),
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let outcome = serve_with(
+            &mut host,
+            &asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            Ok(&spool),
+        );
+        assert_eq!(outcome.served, Served::Minted);
+        let (_, minted) = decision_of(&outcome.answer).unwrap();
+        assert_eq!(minted.map(|m| m.nonce.clone()), Some(id.clone()));
+        let entry = the_entry(&spool, &id);
+        assert_eq!(entry.state, xudo_gate::request::ConfirmationState::Consumed);
+        assert_eq!(
+            (entry.caller_pid, entry.caller_sid, entry.caller_tty),
+            (PID + 7, 9, 9)
+        );
     }
 
     #[test]
@@ -3119,7 +3210,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let rerun = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
         let outcome = serve_with(&mut host, &rerun, Ok(&spool));
         let (decision, minted) = decision_of(&outcome.answer).unwrap();
-        assert!(!decision.verdict.is_permitted());
+        // The approval is searched first and found not to match this caller;
+        // the watcher sitting in the caller's own session is no channel.
+        assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
         assert!(minted.is_none());
         assert_eq!(spool.files()[id.as_bytes()], before);
     }
