@@ -182,3 +182,148 @@ fn release_signing_waits_for_the_reusable_ci_workflow() {
     }
     assert!(visited.contains("ci"), "sign ancestors: {visited:?}");
 }
+
+/// `uses:` values that are not a local `./` workflow and not
+/// `action@<40 hex> # vX.Y.Z`.
+fn unpinned_actions(workflow: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in workflow.lines() {
+        let Some(value) = uses_value(line) else {
+            continue;
+        };
+        if value.starts_with("./") || is_sha_pin(value) {
+            continue;
+        }
+        found.push(value.to_owned());
+    }
+    found
+}
+
+/// The value of a step or job `uses:` key, ignoring commented lines.
+fn uses_value(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("- uses:") {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = trimmed.strip_prefix("uses:") {
+        return Some(rest.trim());
+    }
+    None
+}
+
+/// A third-party action pinned the way `release.yml` pins one.
+fn is_sha_pin(value: &str) -> bool {
+    let Some((action, revision)) = value.split_once('@') else {
+        return false;
+    };
+    if action.is_empty() {
+        return false;
+    }
+    let Some((sha, comment)) = revision.split_once(' ') else {
+        return false;
+    };
+    is_commit_sha(sha) && is_version_comment(comment.trim())
+}
+
+fn is_commit_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `# vX.Y.Z`, the trailing comment on every pin in `release.yml`.
+fn is_version_comment(comment: &str) -> bool {
+    let Some(version) = comment.strip_prefix("# v") else {
+        return false;
+    };
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|part| is_numeric(part))
+}
+
+fn is_numeric(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn workflow_files() -> Vec<PathBuf> {
+    let dir = repo().join(".github/workflows");
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        paths.push(entry.unwrap().path());
+    }
+    paths.sort();
+    assert!(!paths.is_empty(), "no workflows under {}", dir.display());
+    paths
+}
+
+#[test]
+fn every_action_in_every_workflow_is_pinned_to_a_sha() {
+    let mut saw_local = false;
+    let mut saw_pin = false;
+    for path in workflow_files() {
+        let text = fs::read_to_string(&path).unwrap();
+        let unpinned = unpinned_actions(&text);
+        assert!(
+            unpinned.is_empty(),
+            "{} uses an action that is not pinned to a 40-hex commit SHA: {}",
+            path.display(),
+            unpinned.join(", ")
+        );
+        for line in text.lines() {
+            let Some(value) = uses_value(line) else {
+                continue;
+            };
+            if value.starts_with("./") {
+                saw_local = true;
+            } else {
+                saw_pin = true;
+            }
+        }
+    }
+    assert!(
+        saw_local,
+        "a local ./ workflow call is exempt and must stay"
+    );
+    assert!(saw_pin, "expected at least one SHA-pinned action");
+}
+
+#[test]
+fn the_pin_check_catches_an_unpinned_uses() {
+    let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
+    let workflow = format!(
+        "\
+# uses: actions/checkout@v4
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@{sha} # v4.2.2
+      - name: Install gate tools
+        uses: taiki-e/install-action@v2
+      - uses: actions/checkout@{sha}
+      - uses: actions/checkout@11bd719 # v4.2.2
+      - uses: actions/checkout@{sha} # v4
+      - uses: actions/checkout@{sha} # release
+      - uses: actions/checkout@{sha} # v4.2.x
+      - uses: actions/checkout@{sha} # v4..2
+      - uses: actions/checkout@gggggggggggggggggggggggggggggggggggggggg # v4.2.2
+      - uses: @{sha} # v4.2.2
+      - uses: not-an-action
+"
+    );
+    assert_eq!(
+        unpinned_actions(&workflow),
+        vec![
+            "actions/checkout@v4".to_owned(),
+            "taiki-e/install-action@v2".to_owned(),
+            format!("actions/checkout@{sha}"),
+            "actions/checkout@11bd719 # v4.2.2".to_owned(),
+            format!("actions/checkout@{sha} # v4"),
+            format!("actions/checkout@{sha} # release"),
+            format!("actions/checkout@{sha} # v4.2.x"),
+            format!("actions/checkout@{sha} # v4..2"),
+            "actions/checkout@gggggggggggggggggggggggggggggggggggggggg # v4.2.2".to_owned(),
+            format!("@{sha} # v4.2.2"),
+            "not-an-action".to_owned(),
+        ]
+    );
+}
