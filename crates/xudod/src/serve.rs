@@ -2717,7 +2717,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             reminted.state,
             xudo_gate::request::ConfirmationState::Consumed
         );
-        assert_eq!(reminted.deadline.0, NOW + crate::confirm::CONSUMED_TTL_MS);
+        assert_eq!(
+            reminted.deadline.0,
+            NOW + REQUEST_TTL_MILLIS.min(crate::confirm::CONSUMED_TTL_MS)
+        );
     }
 
     #[test]

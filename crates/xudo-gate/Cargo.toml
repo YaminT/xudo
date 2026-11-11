@@ -24,6 +24,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+lane-short-ttl = []
+
 [dev-dependencies]
 # `FakeAuditSink`, which exists only where a test build asks for it.
 xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1", features = [

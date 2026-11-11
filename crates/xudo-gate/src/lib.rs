@@ -55,6 +55,16 @@
 //! sequence written against those traits and holds no syscall of its own;
 //! `xudo-gate-bin` is five lines that hand it the real host.
 
+#[cfg(feature = "lane-short-ttl")]
+#[used]
+static XUDO_GATE_LANE_SHORT_TTL_MARKER: &[u8] = b"xudo-lane-short-ttl-20-seconds";
+
+#[cfg(feature = "lane-short-ttl")]
+#[inline(never)]
+pub(crate) fn keep_lane_short_ttl_marker_linked() {
+    std::hint::black_box(XUDO_GATE_LANE_SHORT_TTL_MARKER);
+}
+
 pub mod decide;
 pub mod env;
 pub mod policy;
