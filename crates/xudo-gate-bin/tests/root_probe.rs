@@ -249,6 +249,11 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     let froze = as_user(&["freeze", "--reason", "user scope"]);
     assert!(froze.status.success(), "{froze:?}");
     assert!(theirs.exists());
+    let meta = fs::metadata(&theirs).unwrap();
+    assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o600));
+    assert!(fs::read_to_string(&theirs).unwrap().contains("user scope"));
+    // Root's global marker is byte for byte what root wrote.
+    assert_eq!(fs::read_to_string(&marker).unwrap(), record);
     assert!(frozen_for(uid));
     assert!(!frozen_for(uid + 1));
     assert!(as_user(&["thaw"]).status.success());

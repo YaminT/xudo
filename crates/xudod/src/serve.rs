@@ -1434,6 +1434,16 @@ fn refuse_attested_agent(caller: &CallerFacts, what: &'static str) -> Result<(),
     Ok(())
 }
 
+/// A peer in another user namespace presents uids it chose, so its uid names
+/// no one: it could mint a marker per uid and fill the directory. Refused
+/// like a watch from it.
+fn refuse_diverged(identity: &PeerIdentity, what: &'static str) -> Result<(), Refusal> {
+    if identity.diverged {
+        return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
+    }
+    Ok(())
+}
+
 /// Whether `uid`'s own freeze marker stands. Root's global marker is part of
 /// the loaded policy, so root asks nothing more. Storage that cannot be
 /// listed counts as frozen: this only ever withholds an enrolled agent.
@@ -1466,6 +1476,7 @@ fn freeze_with(
     reason: &str,
     encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
 ) -> Result<BrokerResponse, Refusal> {
+    refuse_diverged(identity, "freeze requires an undiverged peer")?;
     refuse_attested_agent(caller, "an attested agent cannot freeze")?;
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
@@ -1532,7 +1543,7 @@ fn publish_freeze(state: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), Ref
     if !is_roots && !present && names.len() >= MAX_STATE_NAMES - 1 {
         return Err(Refusal::client(
             RefusalCode::SpoolFull,
-            "too many freeze markers",
+            "too many freeze markers; root can free room by removing the extra files in /var/lib/xudo by hand",
         ));
     }
     state
@@ -1676,6 +1687,7 @@ fn thaw(
     caller: &CallerFacts,
     _request: &BrokerRequest,
 ) -> Result<BrokerResponse, Refusal> {
+    refuse_diverged(identity, "thaw requires an undiverged peer")?;
     refuse_attested_agent(caller, "an attested agent cannot thaw")?;
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
@@ -2212,6 +2224,9 @@ fn complete_answer(
         entry.argv.clone(),
         STORED_CLASS_CLAIM,
     );
+    let mut policy = policy;
+    // The entry's owner may have frozen their own agents since it was minted.
+    policy.settings.frozen |= user_freeze_stands(platform, entry.caller_uid);
     let mut decision = decide(&policy, &caller, &decision_request);
     if approve && decision.verdict != xudo_policy::Verdict::AllowWithConfirmation {
         return Err(Refusal::broker(
@@ -2683,6 +2698,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                         gid: GID,
                     }))
                     .with_stat(Ok(stat_line(PID, START)))
+                    .with_proc(
+                        PID,
+                        ProcFile::Status,
+                        format!("NSpid:\t{PID}\n").into_bytes(),
+                    )
+                    .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
                     .with_exit(Ok(false)),
                 clock: FixedClock(NOW),
                 entropy: FakeEntropy::new().with(Ok(vec![0xab; 32])),
@@ -4342,6 +4363,199 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "maintenance",
         )
         .unwrap();
+    }
+
+    const MAX_NAMES_U32: u32 = 128;
+    const _: () = assert!(MAX_STATE_NAMES == MAX_NAMES_U32 as usize);
+
+    fn diverged_as(uid: u32) -> PeerIdentity {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.uid = uid;
+        identity.diverged = true;
+        identity
+    }
+
+    #[test]
+    fn a_diverged_peer_cannot_freeze() {
+        for uid in [UID, 0] {
+            let identity = diverged_as(uid);
+            let mut host = Host::honest_as(uid);
+            let refused = freeze(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &freeze_request(),
+                "maintenance",
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            assert!(host.freeze_file.files().is_empty());
+            assert!(host.audit.records().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_diverged_peer_cannot_thaw() {
+        for uid in [UID, 0] {
+            let identity = diverged_as(uid);
+            let mut host = Host::honest_as(uid);
+            for name in ["frozen", "frozen-1000"] {
+                host.freeze_file.publish(name, MARKER).unwrap();
+            }
+            let refused = thaw(
+                &mut host.platform(),
+                &identity,
+                &classify(&identity),
+                &thaw_request(),
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            assert_eq!(host.freeze_file.files().len(), 2);
+            assert!(host.audit.records().is_empty());
+        }
+    }
+
+    #[test]
+    fn many_diverged_uids_cannot_fill_the_marker_slots() {
+        let mut host = Host::honest();
+        for uid in 1..=2 * MAX_NAMES_U32 {
+            let identity = diverged_as(uid);
+            let refused = freeze(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &freeze_request(),
+                "maintenance",
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+        }
+        assert!(host.freeze_file.files().is_empty());
+        // An honest user is not locked out.
+        freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &test_identity(PID, START, 0, 0),
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap();
+    }
+
+    fn markers_to(count: usize) -> FakeSpool {
+        (0..count).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        })
+    }
+
+    #[test]
+    fn the_user_marker_limit_is_one_short_of_the_directory_bound() {
+        let freeze_as_user = |present: usize| {
+            let mut host = Host::honest();
+            host.freeze_file = markers_to(present);
+            let result = freeze(
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &test_identity(PID, START, 0, 0),
+                &freeze_request(),
+                "maintenance",
+            );
+            (result, host.freeze_file.files().len())
+        };
+        let (allowed, total) = freeze_as_user(MAX_STATE_NAMES - 2);
+        assert!(allowed.is_ok());
+        assert_eq!(total, MAX_STATE_NAMES - 1);
+        let (refused, total) = freeze_as_user(MAX_STATE_NAMES - 1);
+        assert_eq!(refused.unwrap_err().code, RefusalCode::SpoolFull);
+        assert_eq!(total, MAX_STATE_NAMES - 1);
+    }
+
+    #[test]
+    fn roots_reserved_slot_survives_users_filling_the_directory() {
+        let mut host = Host::honest();
+        let spool = FakeSpool::new();
+        let mut refused_at = None;
+        for uid in 1000..1000 + 2 * MAX_NAMES_U32 {
+            let mut identity = test_identity(PID, START, 0, 0);
+            identity.uid = uid;
+            if freeze(
+                &mut host.platform(),
+                &spool,
+                &identity,
+                &freeze_request(),
+                "maintenance",
+            )
+            .is_err()
+            {
+                refused_at = Some(uid);
+                break;
+            }
+        }
+        assert_eq!(refused_at, Some(1000 + MAX_NAMES_U32 - 1));
+        assert_eq!(host.freeze_file.files().len(), MAX_STATE_NAMES - 1);
+
+        let mut root = test_identity(PID, START, 0, 0);
+        root.uid = 0;
+        freeze(
+            &mut host.platform(),
+            &spool,
+            &root,
+            &freeze_request(),
+            "maintenance",
+        )
+        .unwrap();
+        assert!(host.freeze_file.files().contains_key(b"frozen".as_slice()));
+        assert_eq!(host.freeze_file.files().len(), MAX_STATE_NAMES);
+
+        thaw(
+            &mut host.platform(),
+            &root,
+            &classify(&root),
+            &thaw_request(),
+        )
+        .unwrap();
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn a_users_freeze_denies_the_approval_of_their_own_agent_entry() {
+        let approve = |marker: Option<&str>| {
+            let entry = approved_entry(
+                xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 },
+                "unattested",
+            );
+            let mut pending = entry.clone();
+            pending.state = xudo_gate::request::ConfirmationState::Pending;
+            pending.confirmed = false;
+            pending.confirmed_by = None;
+            let bytes = pending.to_json().into_bytes();
+            let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
+            let mut host = Host::honest();
+            if let Some(marker) = marker {
+                host.freeze_file.publish(marker, MARKER).unwrap();
+            }
+            let result = complete_answer(
+                &mut host.platform(),
+                &spool,
+                &arbitrary_watcher(5000, UID, 2, 34816, None),
+                &answer_request(NONCE, "remove", true),
+                AnsweredEntry {
+                    id: NONCE.to_owned(),
+                    bytes,
+                    entry,
+                },
+                true,
+            );
+            (result.err().map(|e| e.code), host.audit.records().len())
+        };
+        assert_eq!(approve(None), (None, 1));
+        // Another user's marker is not the entry owner's.
+        assert_eq!(approve(Some("frozen-2000")), (None, 1));
+        // The entry's owner froze: nothing is granted and nothing is audited.
+        assert_eq!(
+            approve(Some("frozen-1000")),
+            (Some(RefusalCode::PolicyUnloadable), 0)
+        );
     }
 
     #[test]

@@ -477,6 +477,12 @@ fn broker_control_command(
     broker_control(socket, question, out, err, &watch::ask_live)
 }
 
+/// What a thaw reports. The broker answers the same `Done` whoever thawed, and
+/// a user's thaw leaves root's global freeze standing, so the text must not
+/// say the agent path is open again.
+const THAW_DONE: &str =
+    "done: lifted your own freeze. A freeze set by root, if any, is lifted only by root's thaw";
+
 fn broker_control(
     socket: &Path,
     question: xudo_wire::Question,
@@ -490,7 +496,11 @@ fn broker_control(
     };
     match ask(socket, &request) {
         Ok(response) if response.answer == xudo_wire::Answer::Done => {
-            let _ = writeln!(out, "done");
+            let text = match request.question {
+                xudo_wire::Question::Thaw => THAW_DONE,
+                _ => "done",
+            };
+            let _ = writeln!(out, "{text}");
             ExitCode::Delegated
         }
         Ok(response) => {
@@ -1528,7 +1538,22 @@ mod tests {
             ExitCode::Delegated
         );
         assert_eq!(*seen_question.borrow(), Some(xudo_wire::Question::Thaw));
+        assert_eq!(out, format!("{THAW_DONE}\n").into_bytes());
+        out.clear();
+        assert_eq!(
+            broker_control(
+                Path::new("socket"),
+                xudo_wire::Question::Freeze {
+                    reason: "maintenance".to_owned()
+                },
+                &mut out,
+                &mut err,
+                &ask_done
+            ),
+            ExitCode::Delegated
+        );
         assert_eq!(out, b"done\n");
+        out.clear();
 
         let ask_refused = |_: &Path, request: &xudo_wire::BrokerRequest| {
             assert!(
