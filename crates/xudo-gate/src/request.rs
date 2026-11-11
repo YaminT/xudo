@@ -377,6 +377,18 @@ impl PendingRequest {
                 reason: "top-level JSON value must be an object".to_owned(),
             });
         }
+        if value
+            .get("confirmed_by")
+            .is_some_and(|pin| !pin.is_null() && !pin.is_object())
+            || value
+                .get("shown_to")
+                .is_some_and(|pin| !pin.is_null() && !pin.is_object())
+            || value.get("state").is_some_and(|state| !state.is_string())
+        {
+            return Err(RequestError::Malformed {
+                reason: "nested values must use object and string forms".to_owned(),
+            });
+        }
         if let Some(found) = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -726,6 +738,46 @@ mod tests {
                 reason: "top-level JSON value must be an object".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_spool_entry_with_an_array_form_state_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("state".to_owned(), serde_json::json!(["pending"]));
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_map_form_state_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("state".to_owned(), serde_json::json!({"pending": null}));
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_positional_confirmed_by_pin_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "confirmed_by".to_owned(),
+            serde_json::json!([1000, 42, 99, 34816, 41]),
+        );
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_spool_entry_with_a_positional_shown_to_pin_is_refused() {
+        let mut value: serde_json::Value = serde_json::from_str(&live().to_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "shown_to".to_owned(),
+            serde_json::json!([1000, 42, 99, 34816, 41]),
+        );
+        assert!(PendingRequest::parse(&value.to_string()).is_err());
     }
 
     #[test]
