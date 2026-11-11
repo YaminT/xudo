@@ -112,6 +112,14 @@ pub enum SpoolError {
         /// The name.
         name: String,
     },
+    /// The spool has reached a caller-enforced capacity bound.
+    #[error("{at} is full at its limit of {limit} entries")]
+    Full {
+        /// The spool's path.
+        at: String,
+        /// Maximum number of entries.
+        limit: usize,
+    },
     /// The entry to consume is not there: somebody else took it first.
     ///
     /// Only [`Spool::consume`] reports it. The consumer is claiming the right
