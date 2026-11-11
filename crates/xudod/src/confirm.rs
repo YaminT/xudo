@@ -214,8 +214,17 @@ pub fn backoff_ms(strikes: u32) -> u64 {
 }
 
 /// Whether this pending entry has the requested fingerprint.
-pub fn is_duplicate(entry: &PendingRequest, candidate: &str, now_ms: u64) -> bool {
-    entry.state == ConfirmationState::Pending
+///
+/// The same command from another attested class or scope is another request:
+/// it opens its own confirmation rather than being throttled by this one.
+pub fn is_duplicate(
+    entry: &PendingRequest,
+    candidate: &str,
+    class: &xudo_gate::request::AttestedClass,
+    now_ms: u64,
+) -> bool {
+    entry.attested_class == *class
+        && entry.state == ConfirmationState::Pending
         && entry.needs_watch
         && now_ms < entry.deadline.0
         && entry.fingerprint == candidate
@@ -479,6 +488,8 @@ mod tests {
     }
 
     const BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+    const CLASS: xudo_gate::request::AttestedClass = xudo_gate::request::AttestedClass::Unattested;
+
     const AGENT: xudo_gate::request::AttestedClass =
         xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
 
@@ -490,8 +501,8 @@ mod tests {
         caller
     }
 
-    /// A fully approved entry, watched from `watcher()`, with the given class.
-    fn watched(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+    /// A pending entry already shown to `watcher()`, with the given class.
+    fn shown(class: xudo_gate::request::AttestedClass) -> PendingRequest {
         let mut request = entry();
         request.deadline = BoottimeMillis(1_000_000);
         if let xudo_gate::request::AttestedClass::EnrolledAgent { scope_id } = &class {
@@ -500,6 +511,12 @@ mod tests {
         }
         request.attested_class = class;
         assert!(mark_shown(&mut request, watcher(), 1_000));
+        request
+    }
+
+    /// A fully approved entry, watched from `watcher()`, with the given class.
+    fn watched(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+        let mut request = shown(class);
         approve(&mut request, 3_000, b"remove").unwrap();
         request
     }
@@ -732,8 +749,10 @@ mod tests {
                 }
                 (true, 5) => { caller.boot_id = None; ("missing boot id", false) }
                 (false, 2 | 3) => { caller.scope_id = Some(44); ("scope on a non-agent", false) }
-                (_, 4 | 5) => { caller.sid = caller.sid.wrapping_add(100); ("sid", true) }
-                (_, 6 | 7) => { caller.tty = caller.tty.wrapping_add(100); ("tty", true) }
+                // Session, terminal and process are consumer pins for both
+                // classes: varying them must still consume.
+                (false, 4) | (_, 6) => { caller.sid = caller.sid.wrapping_add(100); ("sid", true) }
+                (false, 5) | (_, 7) => { caller.tty = caller.tty.wrapping_add(100); ("tty", true) }
                 _ => {
                     caller.pid = caller.pid.wrapping_add(100);
                     caller.starttime = caller.starttime.wrapping_add(100);
@@ -764,11 +783,13 @@ mod tests {
                 prop_assert_eq!(&consumed.boot_id, &approved.boot_id);
                 prop_assert_eq!(consumed.caller_uid, approved.caller_uid);
             }
-            let mut approved_again = approved.clone();
-            approve(&mut approved_again, 3_500, b"remove").ok();
-            prop_assert_eq!(&approved_again.attested_class, &approved.attested_class);
-            prop_assert_eq!(approved_again.attested_scope_id, approved.attested_scope_id);
-            prop_assert_eq!(&approved_again.boot_id, &approved.boot_id);
+            let pending = shown(class);
+            let mut approved_again = pending.clone();
+            prop_assert!(approve(&mut approved_again, 3_500, b"remove").is_ok());
+            prop_assert_eq!(approved_again.state, ConfirmationState::Approved);
+            prop_assert_eq!(&approved_again.attested_class, &pending.attested_class);
+            prop_assert_eq!(approved_again.attested_scope_id, pending.attested_scope_id);
+            prop_assert_eq!(&approved_again.boot_id, &pending.boot_id);
         }
 
         #[test]
@@ -1195,19 +1216,53 @@ mod tests {
     fn a_duplicate_request_does_not_prompt_twice() {
         let mut request = entry();
         request.fingerprint = fingerprint(1000, b"/usr/bin/pkg", &[b"remove", b"demo"]);
-        assert!(is_duplicate(&request, &request.fingerprint.clone(), 1_000));
-        assert!(!is_duplicate(&request, &"f".repeat(64), 1_000));
+        assert!(is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
+        assert!(!is_duplicate(&request, &"f".repeat(64), &CLASS, 1_000));
         request.needs_watch = false;
-        assert!(!is_duplicate(&request, &request.fingerprint.clone(), 1_000));
+        assert!(!is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
         request.needs_watch = true;
         request.state = ConfirmationState::Approved;
-        assert!(!is_duplicate(&request, &request.fingerprint.clone(), 1_000));
+        assert!(!is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
         request.state = ConfirmationState::Pending;
         assert!(!is_duplicate(
             &request,
             &request.fingerprint.clone(),
+            &CLASS,
             request.deadline.0
         ));
+    }
+
+    #[test]
+    fn a_pending_request_of_another_class_or_scope_is_not_a_duplicate() {
+        use xudo_gate::request::AttestedClass::{EnrolledAgent, Human, Unattested};
+        let mut request = entry();
+        request.fingerprint = fingerprint(1000, b"/usr/bin/pkg", &[b"remove", b"demo"]);
+        request.attested_class = EnrolledAgent { scope_id: 44 };
+        let print = request.fingerprint.clone();
+        assert!(is_duplicate(
+            &request,
+            &print,
+            &EnrolledAgent { scope_id: 44 },
+            1_000
+        ));
+        for other in [Unattested, Human, EnrolledAgent { scope_id: 45 }] {
+            assert!(!is_duplicate(&request, &print, &other, 1_000));
+        }
     }
 
     #[test]
