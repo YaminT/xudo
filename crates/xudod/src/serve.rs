@@ -789,11 +789,24 @@ fn pending_duplicate(spool: &dyn Spool, request: &BrokerRequest, uid: u32, now: 
     })
 }
 
+#[cfg(feature = "fuzzing")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(from = "CompactConfirmData", into = "CompactConfirmData")]
 /// Compact persistent watcher, backoff, and outcome state.
 pub struct ConfirmData {
+    heartbeat: Option<WatcherHeartbeat>,
+    backoff: Vec<BackoffEntry>,
+    #[serde(default)]
+    outcomes: Vec<RecentOutcome>,
+}
+
+#[cfg(not(feature = "fuzzing"))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(from = "CompactConfirmData", into = "CompactConfirmData")]
+/// Compact persistent watcher, backoff, and outcome state.
+pub(crate) struct ConfirmData {
     heartbeat: Option<WatcherHeartbeat>,
     backoff: Vec<BackoffEntry>,
     #[serde(default)]
@@ -958,7 +971,7 @@ const MAX_CONFIRM_DATA_BYTES: usize = r#"{"h":null,"b":[],"o":[]}"#.len()
 /// # Errors
 ///
 /// Returns the serde error for invalid JSON, positional fields, or duplicate keys.
-pub fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
+fn parse_confirm_data_inner(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let valid_rows = |key: &str| {
         value
@@ -975,6 +988,21 @@ pub fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error
         ));
     }
     serde_json::from_slice(bytes)
+}
+
+#[cfg(feature = "fuzzing")]
+/// Parses compact confirmation state while preserving duplicate-key errors.
+///
+/// # Errors
+///
+/// Returns the serde error for invalid JSON, positional fields, or duplicate keys.
+pub fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
+    parse_confirm_data_inner(bytes)
+}
+
+#[cfg(not(feature = "fuzzing"))]
+pub(crate) fn parse_confirm_data(bytes: &[u8]) -> Result<ConfirmData, serde_json::Error> {
+    parse_confirm_data_inner(bytes)
 }
 const _: () = assert!(MAX_CONFIRM_DATA_BYTES <= CONFIRM_FILE_LIMIT);
 

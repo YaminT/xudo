@@ -58,6 +58,12 @@
 pub mod decide;
 pub mod env;
 pub mod policy;
+
+/// Parser entry points exposed only to the separate fuzz crate.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub use crate::policy::{FreezeRecord, parse_freeze_record};
+}
 pub use policy::{MAX_CONFIG_BYTES, PolicyError, SettingsError, settings_from};
 pub mod request;
 pub mod run;
