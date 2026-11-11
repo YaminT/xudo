@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+fuzzing = []
+lane-short-ttl = ["xudo-gate/lane-short-ttl"]
+
 [dependencies]
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 xudo-backend = { path = "../xudo-backend", version = "0.1.0-beta.1" }
@@ -20,9 +24,6 @@ sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
-
-[features]
-lane-short-ttl = ["xudo-gate/lane-short-ttl"]
 
 [dev-dependencies]
 insta.workspace = true
