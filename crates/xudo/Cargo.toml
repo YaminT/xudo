@@ -22,10 +22,14 @@ serde_json.workspace = true
 # a world-writable directory lets anyone choose a file name.
 term-sanitize = { path = "../term-sanitize", version = "0.1.0-beta.1" }
 thiserror.workspace = true
+# `net` is the broker exchange: a non-blocking connect, then `SO_SNDTIMEO` /
+# `SO_RCVTIMEO` shrunk to the time still left. Same crate the terminal already
+# uses; not a new dependency.
 rustix = { version = "1.1", default-features = false, features = [
   "std",
   "termios",
   "event",
+  "net",
 ] }
 
 [dev-dependencies]
