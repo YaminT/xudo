@@ -1225,6 +1225,16 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     })
 }
 
+/// The layer a settings file is reported as: only the default path is the
+/// system file.
+fn origin_layer(path: &Path) -> Layer {
+    if path == Path::new(DEFAULT_CONFIG_FILE) {
+        Layer::System
+    } else {
+        Layer::ConfigFile
+    }
+}
+
 /// Reports the effective configuration, or the schema.
 ///
 /// Every value names the file and line that set it, and a compiled-in value says
@@ -1248,7 +1258,10 @@ fn config(
     // defaults are the configuration until somebody writes one.
     if let Ok(contents) = std::fs::read_to_string(&cli.config_file) {
         let name = Path::new(&cli.config_file).display().to_string();
-        if let Err(load_err) = apply_file(&mut settings, Layer::System, &name, &contents) {
+        // A file given on the command line is not the system file, and
+        // scriptable output must not say it is.
+        let layer = origin_layer(&cli.config_file);
+        if let Err(load_err) = apply_file(&mut settings, layer, &name, &contents) {
             // A broken configuration file fails closed: the defaults are safe,
             // but continuing while pretending the file was applied is not.
             let _ = writeln!(err, "xudo: {load_err}");
@@ -1272,8 +1285,8 @@ fn config(
             };
             let _ = write!(out, "{}", report::list(&settings, &Setting::ALL, options));
         }
-        // The schema was answered above; no subcommand is the legacy report.
-        Some(ConfigAction::Schema { .. }) | None => legacy_report(&settings, out),
+        // No subcommand is the legacy report. The schema was answered above.
+        _ => legacy_report(&settings, out),
     }
     ExitCode::Delegated
 }
@@ -3627,6 +3640,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn a_config_file_flag_is_never_labelled_system() {
+        assert_eq!(origin_layer(Path::new(DEFAULT_CONFIG_FILE)), Layer::System);
+        assert_eq!(origin_layer(Path::new("/tmp/x")), Layer::ConfigFile);
+    }
+
+    #[test]
     fn config_get_names_the_real_file_and_line() {
         let fx = fixture("cli-config-get");
         let path = fx.config_path();
@@ -3635,7 +3654,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let (code, out, _) =
             fx.run(&["--config-file", file, "config", "get", "frozen", "--origin"]);
         assert_eq!(code, ExitCode::Delegated);
-        assert_eq!(out, format!("true\tsystem ({file}:3)\n"));
+        assert_eq!(out, format!("true\t--config-file ({file}:3)\n"));
         let (_, out, _) = fx.run(&["--config-file", file, "config", "get", "frozen"]);
         assert_eq!(out, "true\n");
     }
