@@ -40,9 +40,9 @@ jobs:
             exit 1
           fi
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@d6912b47771be2c443ec90dbb3d28e023987e782 # v2.62.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: just
+          tool: just@1.59.0
       - name: Test package
         run: just deb-test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
