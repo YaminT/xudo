@@ -76,10 +76,44 @@ pub fn apply_file(
     file: &str,
     contents: &str,
 ) -> Result<(), LoadError> {
+    apply_file_scoped(settings, layer, file, contents, &Setting::ALL)
+}
+
+/// Like [`apply_file`], for a program that owns only some of the settings.
+///
+/// A key that is a setting of another program fails the whole file, exactly as
+/// an unknown key does: `ido` must not accept `frozen = true` and then ignore
+/// it, because a file that does not mean what it says is the failure this
+/// project refuses to paper over.
+///
+/// # Errors
+///
+/// As [`apply_file`], plus [`LoadError::Parse`] for a key outside `owned`.
+pub fn apply_file_scoped(
+    settings: &mut Settings,
+    layer: Layer,
+    file: &str,
+    contents: &str,
+    owned: &[Setting],
+) -> Result<(), LoadError> {
     let parsed: File = toml::from_str(contents).map_err(|e| LoadError::Parse {
         file: file.to_owned(),
         reason: e.to_string(),
     })?;
+
+    let keys: toml::Table = toml::from_str(contents).map_err(|e| LoadError::Parse {
+        file: file.to_owned(),
+        reason: e.to_string(),
+    })?;
+    if let Some(foreign) = keys
+        .keys()
+        .find(|key| !Setting::from_key(key).is_some_and(|s| owned.contains(&s)))
+    {
+        return Err(LoadError::Parse {
+            file: file.to_owned(),
+            reason: format!("{foreign} is not a setting of this program"),
+        });
+    }
 
     if parsed
         .audit_sink
@@ -160,6 +194,31 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn a_scoped_file_refuses_another_programs_setting() {
+        // `ido` must not accept `frozen = true` and then ignore it.
+        let mut settings = Settings::default();
+        let err = apply_file_scoped(
+            &mut settings,
+            Layer::User,
+            "config.toml",
+            "color = false\nfrozen = true\n",
+            &[Setting::Color],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("frozen is not a setting"), "{err}");
+        assert_eq!(settings, Settings::default());
+        apply_file_scoped(
+            &mut settings,
+            Layer::User,
+            "config.toml",
+            "color = false\n",
+            &[Setting::Color],
+        )
+        .unwrap();
+        assert_eq!(settings.get(Setting::Color).value, Value::Bool(false));
+    }
 
     #[test]
     fn a_file_sets_what_it_names_and_leaves_the_rest_alone() {

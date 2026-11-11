@@ -48,6 +48,10 @@ ido \- a queue of commands an agent asked you to run
 .RB [ \-n
 .IR count ]
 .br
+.B ido config list
+.RB [ \-\-origin ]
+.RB [ \-\-effective ]
+.br
 .B ido celebrate
 .RB [ \-\-no\-animation ]
 .SH DESCRIPTION
@@ -135,6 +139,25 @@ Dropping an entry satisfies whatever depends on it.
 Shows what was run and how it exited, from a hash-chained log that
 .B xudo audit
 can verify.
+.TP
+.B config
+.B list
+shows the settings
+.B ido
+owns and where each came from.
+.B \-\-origin
+adds the file and line, or
+.B <default>
+or
+.BR <compiled-in> .
+Without
+.B \-\-effective
+only values the user's
+.I config.toml
+set are listed.
+A key that belongs to
+.B xudo
+in that file is refused, not ignored.
 .TP
 .B celebrate
 Plays a short abstract animation and prints
