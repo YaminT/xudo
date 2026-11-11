@@ -57,6 +57,9 @@ use xudo_wire::BrokerRequest;
 
 use crate::identify::PeerIdentity;
 
+/// How long a minted entry lives in the test-only short-TTL build: twenty seconds.
+#[cfg(feature = "lane-short-ttl")]
+pub const REQUEST_TTL_SECS: u64 = 20;
 /// How long a minted entry lives, in seconds: fifteen minutes.
 ///
 /// Long enough for `sudo`'s whole conversation at its defaults —
@@ -66,9 +69,20 @@ use crate::identify::PeerIdentity;
 /// it belonged to by much; and the entry is bound to that process's
 /// `(pid, starttime)` and consumed on use, so its lifetime is not the window
 /// in which it can be abused.
+#[cfg(not(feature = "lane-short-ttl"))]
 pub const REQUEST_TTL_SECS: u64 = 15 * 60;
 /// Request lifetime in the clock's millisecond unit.
 pub const REQUEST_TTL_MILLIS: u64 = REQUEST_TTL_SECS * 1_000;
+
+#[cfg(feature = "lane-short-ttl")]
+#[used]
+static XUDOD_LANE_SHORT_TTL_MARKER: &[u8] = b"xudo-lane-short-ttl-20-seconds";
+
+#[cfg(feature = "lane-short-ttl")]
+#[inline(never)]
+fn keep_lane_short_ttl_marker_linked() {
+    std::hint::black_box(XUDOD_LANE_SHORT_TTL_MARKER);
+}
 
 /// Extra time an expired watch request stays available for the audited expiry
 /// sweep before a mint may prune it when the confirmation store is absent.
@@ -300,6 +314,9 @@ pub fn publish<S: Spool + ?Sized>(
     callers: &dyn PeerCalls,
     minting: &Minting<'_>,
 ) -> Result<(), MintError> {
+    #[cfg(feature = "lane-short-ttl")]
+    keep_lane_short_ttl_marker_linked();
+
     spool.lock().map_err(MintError::Spool)?;
     let published = prune_and_publish(spool, callers, minting);
     spool.unlock();
@@ -1394,6 +1411,9 @@ mod tests {
     #[test]
     fn the_ttl_covers_sudos_default_conversation() {
         // passwd_timeout (5 minutes) times passwd_tries (3).
+        #[cfg(not(feature = "lane-short-ttl"))]
         assert_eq!(REQUEST_TTL_MILLIS, 5 * 60 * 3 * 1_000);
+        #[cfg(feature = "lane-short-ttl")]
+        assert_eq!(REQUEST_TTL_MILLIS, 20 * 1_000);
     }
 }

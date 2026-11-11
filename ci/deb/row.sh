@@ -90,7 +90,19 @@ doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
+printf '%s\n' '{"h":null,"b":[["fingerprint",3,123]],"o":[]}' >/run/xudo/confirm/legacy.json
+printf '%s\n' 'keep target' >/run/xudo/confirm/target-data
+ln -s target-data /run/xudo/confirm/link.json
+printf '%s\n' 'keep non-json' >/run/xudo/confirm/preserve.txt
+mkdir /run/xudo/confirm/nested
+printf '%s\n' 'keep nested' >/run/xudo/confirm/nested/legacy.json
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+gone /run/xudo/confirm/legacy.json
+[ -L /run/xudo/confirm/link.json ] || fail "confirm cleanup removed a symlink"
+[ "$(cat /run/xudo/confirm/target-data)" = 'keep target' ] || fail "confirm cleanup changed a symlink target"
+[ "$(cat /run/xudo/confirm/preserve.txt)" = 'keep non-json' ] || fail "confirm cleanup removed a non-json file"
+[ -d /run/xudo/confirm/nested ] || fail "confirm cleanup removed a subdirectory"
+[ "$(cat /run/xudo/confirm/nested/legacy.json)" = 'keep nested' ] || fail "confirm cleanup changed a nested file"
 if grep -Fq 'every privileged request asks for a password' /tmp/apt.log; then
     fail "upgrade printed the first install notice"
 fi
