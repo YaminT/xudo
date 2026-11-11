@@ -365,7 +365,7 @@ fn the_picker_runs_the_selection_on_a_real_terminal() {
     );
     assert!(wait_for("space select"), "the picker never drew its footer");
     rustix::io::write(&master, b" ").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(wait_for("1 selected"), "space did not select the entry");
     rustix::io::write(&master, b"\r").unwrap();
     let celebrated = wait_for("ido works.");
     if !celebrated {
