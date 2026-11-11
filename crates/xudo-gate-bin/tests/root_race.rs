@@ -213,6 +213,9 @@ fn write_entry(round: u64) -> String {
         shown_to: None,
         fingerprint: "0".repeat(64),
         claimed_classification: "human".to_owned(),
+        attested_class: xudo_gate::request::AttestedClass::Unattested,
+        attested_scope_id: None,
+        boot_id: None,
     };
     root_file(
         &format!("{SPOOL_DIR}/{nonce}"),

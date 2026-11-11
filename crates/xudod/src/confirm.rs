@@ -214,8 +214,17 @@ pub fn backoff_ms(strikes: u32) -> u64 {
 }
 
 /// Whether this pending entry has the requested fingerprint.
-pub fn is_duplicate(entry: &PendingRequest, candidate: &str, now_ms: u64) -> bool {
-    entry.state == ConfirmationState::Pending
+///
+/// The same command from another attested class or scope is another request:
+/// it opens its own confirmation rather than being throttled by this one.
+pub fn is_duplicate(
+    entry: &PendingRequest,
+    candidate: &str,
+    class: &xudo_gate::request::AttestedClass,
+    now_ms: u64,
+) -> bool {
+    entry.attested_class == *class
+        && entry.state == ConfirmationState::Pending
         && entry.needs_watch
         && now_ms < entry.deadline.0
         && entry.fingerprint == candidate
@@ -237,18 +246,75 @@ pub fn expire(entry: &mut PendingRequest, now_ms: u64) -> bool {
     }
 }
 
-/// Takes a matching approval from a collection, returning the remaining entry and consumed entry.
-/// The caller persists `remaining` before proceeding to the password gate.
+/// The live, kernel-attested identity of a caller retrying an approved command.
+///
+/// `pid` and `starttime` say who the consumer is, so the entry can be pinned to
+/// it. They are never compared: a re-run is a new process by construction.
+#[derive(Clone, Debug)]
+pub struct ApprovalCaller<'a> {
+    /// Pid of the caller that is retrying the approved command.
+    pub pid: u32,
+    /// Kernel start time of the retrying caller.
+    pub starttime: u64,
+    /// Effective uid of the caller.
+    pub uid: u32,
+    /// Session id of the caller.
+    pub sid: i64,
+    /// Controlling terminal number of the caller.
+    pub tty: i64,
+    /// Broker-attested class of the caller.
+    pub attested_class: &'a xudo_gate::request::AttestedClass,
+    /// Live cgroup scope id, when the caller is an enrolled agent.
+    pub scope_id: Option<u64>,
+    /// Live kernel boot id, when a scope id is present.
+    pub boot_id: Option<&'a str>,
+}
+
+/// Whether a live caller is the identity an entry was minted for.
+///
+/// An enrolled agent is its scope: any process in the same scope on the same
+/// boot matches, and its session and terminal are not compared. A human or an
+/// unattested caller is its uid and class; the password at `-auth` stands
+/// behind it, and its session and terminal are not compared either. Classes
+/// never cross.
+pub fn identity_matches(entry: &PendingRequest, caller: &ApprovalCaller<'_>) -> bool {
+    use xudo_gate::request::AttestedClass;
+    if entry.caller_uid != caller.uid || entry.attested_class != *caller.attested_class {
+        return false;
+    }
+    match &entry.attested_class {
+        AttestedClass::EnrolledAgent { scope_id } => {
+            entry.attested_scope_id == Some(*scope_id)
+                && caller.scope_id == Some(*scope_id)
+                && entry
+                    .boot_id
+                    .as_deref()
+                    .is_some_and(xudo_gate::request::is_boot_id)
+                && caller.boot_id == entry.boot_id.as_deref()
+        }
+        AttestedClass::Human | AttestedClass::Unattested => {
+            entry.attested_scope_id.is_none() && caller.scope_id.is_none()
+        }
+    }
+}
+
+/// Takes an approved entry only when the caller's identity matches.
+///
+/// Returns the unmatched entry unchanged, or the consumed entry, re-pinned to
+/// the consuming process. The re-pin happens only after the identity matched,
+/// and the watcher is checked again against the consumer: a re-run from the
+/// watcher's own session or terminal consumes nothing. The caller must persist
+/// the transition before proceeding to the password gate.
 pub fn take_approval(
     entry: Option<PendingRequest>,
-    uid: u32,
     program: &[u8],
     argv: &[&[u8]],
     generation: u64,
     action: &str,
     now_ms: u64,
+    caller: &ApprovalCaller<'_>,
 ) -> (Option<PendingRequest>, Option<PendingRequest>) {
-    let Some(mut candidate) = entry else {
+    let Some(candidate) = entry else {
         return (None, None);
     };
     let exact_argv = candidate.program.as_bytes() == program
@@ -258,23 +324,41 @@ pub fn take_approval(
             .iter()
             .zip(argv)
             .all(|(left, right)| left.as_bytes() == *right);
-    if candidate.state == ConfirmationState::Approved
+    if !(candidate.state == ConfirmationState::Approved
         && candidate.needs_watch
-        && candidate.caller_uid == uid
+        && identity_matches(&candidate, caller)
         && candidate.generation == generation
         && candidate.action == action
         && exact_argv
-        && now_ms < candidate.deadline.0
+        && now_ms < candidate.deadline.0)
     {
-        candidate.state = ConfirmationState::Consumed;
-        candidate.deadline.0 = candidate
-            .deadline
-            .0
-            .min(now_ms.saturating_add(CONSUMED_TTL_MS));
-        (None, Some(candidate))
-    } else {
-        (Some(candidate), None)
+        return (Some(candidate), None);
     }
+    let mut consumed = candidate.clone();
+    consumed.caller_pid = caller.pid;
+    consumed.caller_starttime = caller.starttime;
+    consumed.caller_sid = caller.sid;
+    consumed.caller_tty = caller.tty;
+    let eligible = |pin: &Option<xudo_gate::request::WatcherPin>| {
+        pin.as_ref().is_some_and(|watcher| {
+            watcher.is_eligible_for(
+                caller.uid,
+                caller.pid,
+                caller.starttime,
+                caller.sid,
+                caller.tty,
+            )
+        })
+    };
+    if !(eligible(&consumed.confirmed_by) && eligible(&consumed.shown_to)) {
+        return (Some(candidate), None);
+    }
+    consumed.state = ConfirmationState::Consumed;
+    consumed.deadline.0 = consumed
+        .deadline
+        .0
+        .min(now_ms.saturating_add(CONSUMED_TTL_MS));
+    (None, Some(consumed))
 }
 
 #[cfg(test)]
@@ -284,6 +368,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use xudo_gate::request::{BoottimeMillis, REQUEST_SCHEMA_VERSION};
+
+    fn matching_caller() -> ApprovalCaller<'static> {
+        ApprovalCaller {
+            pid: 10,
+            starttime: 20,
+            uid: 1000,
+            sid: 2,
+            tty: 3,
+            attested_class: &xudo_gate::request::AttestedClass::Unattested,
+            scope_id: None,
+            boot_id: None,
+        }
+    }
 
     fn entry() -> PendingRequest {
         PendingRequest {
@@ -307,7 +404,277 @@ mod tests {
             shown_to: None,
             fingerprint: "0".repeat(64),
             claimed_classification: "human".to_owned(),
+            attested_class: xudo_gate::request::AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
         }
+    }
+
+    fn approved_entry() -> PendingRequest {
+        let mut approved = entry();
+        approved.state = ConfirmationState::Approved;
+        approved.confirmed = true;
+        approved
+    }
+
+    #[test]
+    fn an_approval_for_an_agent_scope_cannot_be_consumed_from_another_scope() {
+        let mut approved = approved_entry();
+        approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        approved.attested_scope_id = Some(44);
+        approved.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let live = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 45 };
+        let mut caller = matching_caller();
+        caller.attested_class = &live;
+        caller.scope_id = Some(45);
+        caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789");
+        let (remaining, consumed) = take_approval(
+            Some(approved),
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            2_000,
+            &caller,
+        );
+        assert!(remaining.is_some());
+        assert!(consumed.is_none());
+    }
+
+    #[test]
+    fn an_approval_for_a_human_cannot_be_consumed_by_an_attested_agent() {
+        let mut approved = approved_entry();
+        approved.attested_class = xudo_gate::request::AttestedClass::Human;
+        let live = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        let mut caller = matching_caller();
+        caller.attested_class = &live;
+        caller.scope_id = Some(44);
+        caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789");
+        let (remaining, consumed) = take_approval(
+            Some(approved),
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            2_000,
+            &caller,
+        );
+        assert!(remaining.is_some());
+        assert!(consumed.is_none());
+    }
+
+    #[test]
+    fn an_agent_approval_from_another_boot_cannot_be_consumed() {
+        let mut approved = approved_entry();
+        approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        approved.attested_scope_id = Some(44);
+        approved.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let live = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+        let mut caller = matching_caller();
+        caller.attested_class = &live;
+        caller.scope_id = Some(44);
+        caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456780");
+        let (remaining, consumed) = take_approval(
+            Some(approved),
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            2_000,
+            &caller,
+        );
+        assert!(remaining.is_some());
+        assert!(consumed.is_none());
+    }
+
+    const BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+    const CLASS: xudo_gate::request::AttestedClass = xudo_gate::request::AttestedClass::Unattested;
+
+    const AGENT: xudo_gate::request::AttestedClass =
+        xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
+
+    fn agent_caller(class: &xudo_gate::request::AttestedClass) -> ApprovalCaller<'_> {
+        let mut caller = matching_caller();
+        caller.attested_class = class;
+        caller.scope_id = Some(44);
+        caller.boot_id = Some(BOOT);
+        caller
+    }
+
+    /// A pending entry already shown to `watcher()`, with the given class.
+    fn shown(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+        let mut request = entry();
+        request.deadline = BoottimeMillis(1_000_000);
+        if let xudo_gate::request::AttestedClass::EnrolledAgent { scope_id } = &class {
+            request.attested_scope_id = Some(*scope_id);
+            request.boot_id = Some(BOOT.to_owned());
+        }
+        request.attested_class = class;
+        assert!(mark_shown(&mut request, watcher(), 1_000));
+        request
+    }
+
+    /// A fully approved entry, watched from `watcher()`, with the given class.
+    fn watched(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+        let mut request = shown(class);
+        approve(&mut request, 3_000, b"remove").unwrap();
+        request
+    }
+
+    fn take(request: &PendingRequest, caller: &ApprovalCaller<'_>) -> Option<PendingRequest> {
+        take_approval(
+            Some(request.clone()),
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            4_000,
+            caller,
+        )
+        .1
+    }
+
+    #[test]
+    fn an_unattested_approval_is_spent_from_another_session_and_terminal() {
+        let approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        for (sid, tty) in [(9, 3), (2, 9), (9, 9), (0, 0)] {
+            let mut caller = matching_caller();
+            caller.sid = sid;
+            caller.tty = tty;
+            let consumed = take(&approved, &caller).unwrap();
+            assert_eq!(consumed.state, ConfirmationState::Consumed);
+            assert_eq!((consumed.caller_sid, consumed.caller_tty), (sid, tty));
+        }
+    }
+
+    #[test]
+    fn an_unattested_approval_is_never_spent_by_an_attested_agent() {
+        let approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        assert!(take(&approved, &agent_caller(&AGENT)).is_none());
+    }
+
+    #[test]
+    fn a_human_approval_is_never_spent_by_an_unattested_caller_or_the_reverse() {
+        let human = xudo_gate::request::AttestedClass::Human;
+        let unattested = xudo_gate::request::AttestedClass::Unattested;
+        let mut as_human = matching_caller();
+        as_human.attested_class = &human;
+        assert!(take(&watched(unattested.clone()), &as_human).is_none());
+        assert!(take(&watched(human.clone()), &matching_caller()).is_none());
+        assert!(take(&watched(human.clone()), &as_human).is_some());
+    }
+
+    #[test]
+    fn an_agent_approval_is_never_spent_by_a_human_or_unattested_caller() {
+        let approved = watched(AGENT);
+        for class in [
+            xudo_gate::request::AttestedClass::Human,
+            xudo_gate::request::AttestedClass::Unattested,
+        ] {
+            let mut caller = matching_caller();
+            caller.attested_class = &class;
+            assert!(take(&approved, &caller).is_none());
+        }
+    }
+
+    #[test]
+    fn a_headless_rerun_from_a_new_session_spends_an_unattested_approval() {
+        let mut approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        approved.caller_tty = 0;
+        let mut caller = matching_caller();
+        caller.tty = 0;
+        assert!(take(&approved, &caller).is_some());
+        caller.sid = caller.sid.wrapping_add(1);
+        assert!(take(&approved, &caller).is_some());
+    }
+
+    #[test]
+    fn an_agent_approval_is_consumed_by_a_new_process_in_the_same_scope() {
+        let approved = watched(AGENT);
+        let mut caller = agent_caller(&AGENT);
+        caller.pid = 99;
+        caller.starttime = 98;
+        caller.sid = 77;
+        caller.tty = (136 << 8) | 9;
+        let consumed = take(&approved, &caller).unwrap();
+        assert_eq!(consumed.state, ConfirmationState::Consumed);
+    }
+
+    #[test]
+    fn a_consumed_approval_is_pinned_to_the_consumer() {
+        let approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        let mut caller = matching_caller();
+        caller.pid = 99;
+        caller.starttime = 98;
+        let consumed = take(&approved, &caller).unwrap();
+        assert_eq!((consumed.caller_pid, consumed.caller_starttime), (99, 98));
+        assert_eq!((consumed.caller_sid, consumed.caller_tty), (2, 3));
+    }
+
+    #[test]
+    fn a_rerun_from_the_watchers_session_cannot_consume() {
+        for class in [AGENT, xudo_gate::request::AttestedClass::Unattested] {
+            let approved = watched(class.clone());
+            let mut caller = if class == AGENT {
+                agent_caller(&AGENT)
+            } else {
+                matching_caller()
+            };
+            caller.sid = 5;
+            assert!(take(&approved, &caller).is_none());
+        }
+    }
+
+    #[test]
+    fn a_rerun_on_the_watchers_terminal_cannot_consume() {
+        for class in [AGENT, xudo_gate::request::AttestedClass::Unattested] {
+            let approved = watched(class.clone());
+            let mut caller = if class == AGENT {
+                agent_caller(&AGENT)
+            } else {
+                matching_caller()
+            };
+            caller.tty = (136 << 8) | 1;
+            assert!(take(&approved, &caller).is_none());
+        }
+    }
+
+    #[test]
+    fn an_unwatched_approval_cannot_be_consumed() {
+        let mut approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        approved.shown_to = None;
+        assert!(take(&approved, &matching_caller()).is_none());
+        let mut approved = watched(xudo_gate::request::AttestedClass::Unattested);
+        approved.confirmed_by = None;
+        assert!(take(&approved, &matching_caller()).is_none());
+    }
+
+    #[test]
+    fn an_agent_approval_without_a_valid_stored_boot_id_cannot_be_consumed() {
+        let mut approved = watched(AGENT);
+        approved.boot_id = Some("not-a-boot-id".to_owned());
+        let mut caller = agent_caller(&AGENT);
+        caller.boot_id = Some("not-a-boot-id");
+        assert!(take(&approved, &caller).is_none());
+        approved.boot_id = None;
+        caller.boot_id = None;
+        assert!(take(&approved, &caller).is_none());
+    }
+
+    #[test]
+    fn a_scope_class_with_a_mismatched_stored_scope_cannot_be_consumed() {
+        let mut approved = watched(AGENT);
+        approved.attested_scope_id = Some(45);
+        assert!(take(&approved, &agent_caller(&AGENT)).is_none());
+        let mut approved = watched(xudo_gate::request::AttestedClass::Human);
+        approved.attested_scope_id = Some(44);
+        let human = xudo_gate::request::AttestedClass::Human;
+        let mut caller = matching_caller();
+        caller.attested_class = &human;
+        assert!(take(&approved, &caller).is_none());
+        caller.scope_id = Some(44);
+        approved.attested_scope_id = None;
+        assert!(take(&approved, &caller).is_none());
     }
 
     fn watcher() -> WatcherFacts {
@@ -340,8 +707,89 @@ mod tests {
             request.state = state;
             request.needs_watch = state != ConfirmationState::Approved;
             request.confirmed = state == ConfirmationState::Approved;
-            let (_, consumed) = take_approval(Some(request), 1000, b"/usr/bin/pkg", &[b"remove", b"demo"], 1, "xudo.pkg.remove", 2_000);
+            let (_, consumed) = take_approval(
+            Some(request),
+            b"/usr/bin/pkg",
+            &[b"remove", b"demo"],
+            1,
+            "xudo.pkg.remove",
+            2_000,
+            &matching_caller()
+        );
             prop_assert!(consumed.is_none());
+        }
+
+        #[test]
+        fn no_identity_mismatch_ever_consumes(
+            field in 0usize..9,
+            agent in any::<bool>(),
+        ) {
+            let class = if agent {
+                AGENT
+            } else {
+                xudo_gate::request::AttestedClass::Unattested
+            };
+            let approved = watched(class.clone());
+            let other_class = if agent {
+                xudo_gate::request::AttestedClass::Human
+            } else {
+                xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 }
+            };
+            let wrong_scope = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 45 };
+            let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
+            // Each arm names the field it varies, so a failure says which flipped.
+            let (varied, must_match) = match (agent, field) {
+                (_, 0) => { caller.uid = caller.uid.wrapping_add(1); ("uid", false) }
+                (_, 1) => { caller.attested_class = &other_class; ("class", false) }
+                (true, 2) => { caller.attested_class = &wrong_scope; ("class scope", false) }
+                (true, 3) => { caller.scope_id = Some(45); ("live scope", false) }
+                (true, 4) => {
+                    caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456780");
+                    ("boot id", false)
+                }
+                (true, 5) => { caller.boot_id = None; ("missing boot id", false) }
+                (false, 2 | 3) => { caller.scope_id = Some(44); ("scope on a non-agent", false) }
+                // Session, terminal and process are consumer pins for both
+                // classes: varying them must still consume.
+                (false, 4) | (_, 6) => { caller.sid = caller.sid.wrapping_add(100); ("sid", true) }
+                (false, 5) | (_, 7) => { caller.tty = caller.tty.wrapping_add(100); ("tty", true) }
+                _ => {
+                    caller.pid = caller.pid.wrapping_add(100);
+                    caller.starttime = caller.starttime.wrapping_add(100);
+                    ("pid and start time", true)
+                }
+            };
+            prop_assert_eq!(take(&approved, &caller).is_some(), must_match, "varied {}", varied);
+        }
+
+        #[test]
+        fn no_consumption_changes_the_attested_class_scope_or_boot(
+            agent in any::<bool>(),
+            sid in any::<i64>(),
+            tty in any::<i64>(),
+        ) {
+            let class = if agent {
+                AGENT
+            } else {
+                xudo_gate::request::AttestedClass::Unattested
+            };
+            let approved = watched(class.clone());
+            let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
+            caller.sid = sid;
+            caller.tty = tty;
+            if let Some(consumed) = take(&approved, &caller) {
+                prop_assert_eq!(&consumed.attested_class, &approved.attested_class);
+                prop_assert_eq!(consumed.attested_scope_id, approved.attested_scope_id);
+                prop_assert_eq!(&consumed.boot_id, &approved.boot_id);
+                prop_assert_eq!(consumed.caller_uid, approved.caller_uid);
+            }
+            let pending = shown(class);
+            let mut approved_again = pending.clone();
+            prop_assert!(approve(&mut approved_again, 3_500, b"remove").is_ok());
+            prop_assert_eq!(approved_again.state, ConfirmationState::Approved);
+            prop_assert_eq!(&approved_again.attested_class, &pending.attested_class);
+            prop_assert_eq!(approved_again.attested_scope_id, pending.attested_scope_id);
+            prop_assert_eq!(&approved_again.boot_id, &pending.boot_id);
         }
 
         #[test]
@@ -400,23 +848,23 @@ mod tests {
         approve(&mut approved, 3_000, b"remove").unwrap();
         let (_, consumed) = take_approval(
             Some(approved),
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         let consumed = consumed.unwrap();
         assert_eq!(consumed.state, ConfirmationState::Consumed);
         let (remaining, replay) = take_approval(
             Some(consumed),
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             5_000,
+            &matching_caller(),
         );
         assert!(replay.is_none());
         assert_eq!(remaining.unwrap().state, ConfirmationState::Consumed);
@@ -430,12 +878,12 @@ mod tests {
         approve(&mut approved, 3_000, b"remove").unwrap();
         let (_, consumed) = take_approval(
             Some(approved),
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             5_000,
+            &matching_caller(),
         );
         assert_eq!(consumed.unwrap().deadline.0, 125_000);
     }
@@ -603,45 +1051,47 @@ mod tests {
         let mut request = entry();
         mark_shown(&mut request, watcher(), 1_000);
         approve(&mut request, 3_000, b"remove").unwrap();
+        let mut other_user = matching_caller();
+        other_user.uid = 2000;
         let (different_user, matched_user) = take_approval(
             Some(request.clone()),
-            1001,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &other_user,
         );
         assert!(matched_user.is_none());
         let (different_argv, matched_argv) = take_approval(
             different_user,
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo", b"--force"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(matched_argv.is_none());
         let (remaining, consumed) = take_approval(
             different_argv,
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(remaining.is_none());
         assert!(consumed.is_some());
         let (after_second, consumed_again) = take_approval(
             remaining,
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(after_second.is_none());
         assert!(consumed_again.is_none());
@@ -654,12 +1104,12 @@ mod tests {
         approve(&mut request, 3_000, b"remove").unwrap();
         let (remaining, consumed) = take_approval(
             Some(request),
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             2,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(remaining.is_some());
         assert!(consumed.is_none());
@@ -672,12 +1122,12 @@ mod tests {
         approve(&mut request, 3_000, b"remove").unwrap();
         let (remaining, consumed) = take_approval(
             Some(request),
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.install",
             4_000,
+            &matching_caller(),
         );
         assert!(remaining.is_some());
         assert!(consumed.is_none());
@@ -700,24 +1150,24 @@ mod tests {
         for argv in attacks {
             let (_, consumed) = take_approval(
                 Some(approved()),
-                1000,
                 b"/usr/bin/pkg",
                 argv,
                 1,
                 "xudo.pkg.remove",
                 4_000,
+                &matching_caller(),
             );
             assert!(consumed.is_none(), "accepted argv {argv:?}");
         }
         for now in [10_000, 10_001, u64::MAX] {
             let (_, consumed) = take_approval(
                 Some(approved()),
-                1000,
                 b"/usr/bin/pkg",
                 &[b"remove", b"demo"],
                 1,
                 "xudo.pkg.remove",
                 now,
+                &matching_caller(),
             );
             assert!(consumed.is_none(), "consumed at {now}");
         }
@@ -730,33 +1180,33 @@ mod tests {
         approve(&mut request, 3_000, b"remove").unwrap();
         let (same_entry, wrong_program) = take_approval(
             Some(request),
-            1000,
             b"/usr/bin/other",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(wrong_program.is_none());
         let (expired_entry, expired_match) = take_approval(
             same_entry,
-            1000,
             b"/usr/bin/pkg",
             &[b"remove", b"demo"],
             1,
             "xudo.pkg.remove",
             10_000,
+            &matching_caller(),
         );
         assert!(expired_match.is_none());
         assert!(expired_entry.is_some());
         let (empty, no_match) = take_approval(
             None,
-            1000,
             b"/usr/bin/pkg",
             &[b"remove"],
             1,
             "xudo.pkg.remove",
             4_000,
+            &matching_caller(),
         );
         assert!(empty.is_none());
         assert!(no_match.is_none());
@@ -766,19 +1216,53 @@ mod tests {
     fn a_duplicate_request_does_not_prompt_twice() {
         let mut request = entry();
         request.fingerprint = fingerprint(1000, b"/usr/bin/pkg", &[b"remove", b"demo"]);
-        assert!(is_duplicate(&request, &request.fingerprint.clone(), 1_000));
-        assert!(!is_duplicate(&request, &"f".repeat(64), 1_000));
+        assert!(is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
+        assert!(!is_duplicate(&request, &"f".repeat(64), &CLASS, 1_000));
         request.needs_watch = false;
-        assert!(!is_duplicate(&request, &request.fingerprint.clone(), 1_000));
+        assert!(!is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
         request.needs_watch = true;
         request.state = ConfirmationState::Approved;
-        assert!(!is_duplicate(&request, &request.fingerprint.clone(), 1_000));
+        assert!(!is_duplicate(
+            &request,
+            &request.fingerprint.clone(),
+            &CLASS,
+            1_000
+        ));
         request.state = ConfirmationState::Pending;
         assert!(!is_duplicate(
             &request,
             &request.fingerprint.clone(),
+            &CLASS,
             request.deadline.0
         ));
+    }
+
+    #[test]
+    fn a_pending_request_of_another_class_or_scope_is_not_a_duplicate() {
+        use xudo_gate::request::AttestedClass::{EnrolledAgent, Human, Unattested};
+        let mut request = entry();
+        request.fingerprint = fingerprint(1000, b"/usr/bin/pkg", &[b"remove", b"demo"]);
+        request.attested_class = EnrolledAgent { scope_id: 44 };
+        let print = request.fingerprint.clone();
+        assert!(is_duplicate(
+            &request,
+            &print,
+            &EnrolledAgent { scope_id: 44 },
+            1_000
+        ));
+        for other in [Unattested, Human, EnrolledAgent { scope_id: 45 }] {
+            assert!(!is_duplicate(&request, &print, &other, 1_000));
+        }
     }
 
     #[test]
