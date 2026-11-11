@@ -42,6 +42,25 @@ dir="$root/target/deb"
 deb="$dir/xudo_${deb_ver}_${arch}.deb"
 [ -f "$deb" ] || { echo "FAIL: built package not at $deb" >&2; exit 1; }
 
+marker=xudo-lane-short-ttl-20-seconds
+command -v dpkg-deb >/dev/null || { echo "FAIL: dpkg-deb is required" >&2; exit 1; }
+command -v grep >/dev/null || { echo "FAIL: grep is required" >&2; exit 1; }
+package_root=$(mktemp -d "$root/target/deb-check.XXXXXX")
+trap 'rm -rf "$package_root"' EXIT
+dpkg-deb -x "$deb" "$package_root"
+for binary in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth; do
+    f="$package_root/$binary"
+    if [ ! -f "$f" ]; then
+        echo "FAIL: normal_package_contains_all_binaries (missing $binary)" >&2
+        exit 1
+    fi
+    if grep -aFq "$marker" "$f"; then
+        echo "FAIL: normal_package_uses_the_shipped_ttl ($binary contains the short-TTL marker)" >&2
+        exit 1
+    fi
+done
+echo "PASS: normal_package_does_not_contain_the_short_ttl_feature"
+
 # Two packages from the same binaries: the upgrade is the next patch.
 rm -rf "$root/target/deb-upgrade"
 up=$(VERSION="${numeric%.*}.$((patch + 1))" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-upgrade")

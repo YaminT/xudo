@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+fuzzing = []
+lane-short-ttl = []
+
 [dependencies]
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 xudo-config = { path = "../xudo-config", version = "0.1.0-beta.1" }
