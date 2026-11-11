@@ -244,6 +244,7 @@ impl Syscalls for HostSyscalls {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_boot_id(read: std::io::Result<Vec<u8>>) -> Result<String, SysError> {
     let bytes = read.map_err(|error| SysError::Os {
         operation: "read kernel boot id".to_owned(),
@@ -543,6 +544,7 @@ mod tests {
         ppid: 1,
     };
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn boot_id_read_errors_and_malformed_values_are_refused() {
         assert!(parse_boot_id(Err(std::io::Error::other("unreadable"))).is_err());
@@ -728,6 +730,7 @@ mod tests {
         let (a, _b) = UnixStream::pair().unwrap();
         let host = HostSyscalls;
         let refusals = [
+            host.boot_id().unwrap_err(),
             host.mark_cloexec_from(3).unwrap_err(),
             host.peer_pidfd(a.as_fd()).unwrap_err(),
             host.peer_cred(a.as_fd()).unwrap_err(),
