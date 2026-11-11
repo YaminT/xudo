@@ -10,6 +10,7 @@ authors.workspace = true
 
 [features]
 fuzzing = []
+lane-short-ttl = []
 
 [dependencies]
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
@@ -23,9 +24,6 @@ xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[features]
-lane-short-ttl = []
 
 [dev-dependencies]
 # `FakeAuditSink`, which exists only where a test build asks for it.
