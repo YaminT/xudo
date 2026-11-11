@@ -388,13 +388,13 @@ pub fn decide(
         });
     };
     pending.validate(caller.pin, context.generation, context.now)?;
-    if pending.state == crate::request::ConfirmationState::Consumed
-        && !pending.live_attested_identity_matches(
-            &caller.attested_class,
-            caller.attested_scope_id,
-            caller.boot_id.as_deref(),
-        )
-    {
+    // Every state, not only `Consumed`: an entry for a class the gate cannot
+    // attest is refused whatever its state, so no path depends on state alone.
+    if !pending.live_attested_identity_matches(
+        &caller.attested_class,
+        caller.attested_scope_id,
+        caller.boot_id.as_deref(),
+    ) {
         return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
     }
 
@@ -716,7 +716,8 @@ args = [
         GateCaller {
             pin: CallerPin::new(pid, 555),
             facts: CallerFacts::new(Classification::Human, 1000),
-            attested_class: crate::request::AttestedClass::Human,
+            // What the gate attests of anyone until E6, and what these entries carry.
+            attested_class: crate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
         }
@@ -939,7 +940,6 @@ args = [
             sid: 11,
         });
         pending.shown_to = pending.confirmed_by.clone();
-        pending.attested_class = crate::request::AttestedClass::Human;
         assert!(decide(&rules(), &human(77), Some(&pending), context()).is_ok());
     }
 
@@ -1333,7 +1333,6 @@ args = [
             sid: 11,
         });
         pending.shown_to = pending.confirmed_by.clone();
-        pending.attested_class = crate::request::AttestedClass::Human;
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
 
         // The authorization cites the rule that demanded the approval, not the
@@ -1389,7 +1388,6 @@ args = [
             sid: 11,
         });
         pending.shown_to = pending.confirmed_by.clone();
-        pending.attested_class = crate::request::AttestedClass::Human;
         let approved = decide(&rules, &human(77), Some(&pending), context()).unwrap();
         assert_eq!(approved.action, approved.requested_action);
         let record = authorization_record(
@@ -1479,7 +1477,6 @@ args = [
             sid: 11,
         });
         watched.shown_to = watched.confirmed_by.clone();
-        watched.attested_class = crate::request::AttestedClass::Human;
         assert_eq!(
             decide(&rules, &human(77), Some(&watched), watch_required)
                 .unwrap_err()

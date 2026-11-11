@@ -874,6 +874,17 @@ mod tests {
     }
 
     #[test]
+    fn a_human_entry_matches_only_a_live_human_with_no_scope_or_boot() {
+        let mut request = live();
+        request.attested_class = AttestedClass::Human;
+        let boot = "abcdef01-2345-6789-abcd-ef0123456789";
+        assert!(request.live_attested_identity_matches(&AttestedClass::Human, None, None));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Human, Some(44), None));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Human, None, Some(boot)));
+        assert!(!request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
+    }
+
+    #[test]
     fn a_malformed_boot_id_cannot_bind_an_enrolled_scope() {
         let mut entry = live();
         entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
