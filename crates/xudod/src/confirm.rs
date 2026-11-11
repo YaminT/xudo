@@ -265,8 +265,9 @@ pub struct ApprovalCaller<'a> {
 ///
 /// An enrolled agent is its scope: any process in the same scope on the same
 /// boot matches, and its session and terminal are not compared. A human or an
-/// unattested caller is its session and terminal; a headless caller (tty 0) is
-/// bound to its session. Classes never cross.
+/// unattested caller is its uid and class; the password at `-auth` stands
+/// behind it, and its session and terminal are not compared either. Classes
+/// never cross.
 pub fn identity_matches(entry: &PendingRequest, caller: &ApprovalCaller<'_>) -> bool {
     use xudo_gate::request::AttestedClass;
     if entry.caller_uid != caller.uid || entry.attested_class != *caller.attested_class {
@@ -283,10 +284,7 @@ pub fn identity_matches(entry: &PendingRequest, caller: &ApprovalCaller<'_>) -> 
                 && caller.boot_id == entry.boot_id.as_deref()
         }
         AttestedClass::Human | AttestedClass::Unattested => {
-            entry.attested_scope_id.is_none()
-                && caller.scope_id.is_none()
-                && entry.caller_sid == caller.sid
-                && entry.caller_tty == caller.tty
+            entry.attested_scope_id.is_none() && caller.scope_id.is_none()
         }
     }
 }
@@ -520,30 +518,57 @@ mod tests {
     }
 
     #[test]
-    fn an_unattested_approval_cannot_be_consumed_from_another_session() {
+    fn an_unattested_approval_is_spent_from_another_session_and_terminal() {
         let approved = watched(xudo_gate::request::AttestedClass::Unattested);
-        let mut caller = matching_caller();
-        caller.sid = caller.sid.wrapping_add(1);
-        assert!(take(&approved, &caller).is_none());
+        for (sid, tty) in [(9, 3), (2, 9), (9, 9), (0, 0)] {
+            let mut caller = matching_caller();
+            caller.sid = sid;
+            caller.tty = tty;
+            let consumed = take(&approved, &caller).unwrap();
+            assert_eq!(consumed.state, ConfirmationState::Consumed);
+            assert_eq!((consumed.caller_sid, consumed.caller_tty), (sid, tty));
+        }
     }
 
     #[test]
-    fn an_unattested_approval_cannot_be_consumed_from_another_terminal() {
+    fn an_unattested_approval_is_never_spent_by_an_attested_agent() {
         let approved = watched(xudo_gate::request::AttestedClass::Unattested);
-        let mut caller = matching_caller();
-        caller.tty = caller.tty.wrapping_add(1);
-        assert!(take(&approved, &caller).is_none());
+        assert!(take(&approved, &agent_caller(&AGENT)).is_none());
     }
 
     #[test]
-    fn a_headless_approval_is_bound_to_its_session() {
+    fn a_human_approval_is_never_spent_by_an_unattested_caller_or_the_reverse() {
+        let human = xudo_gate::request::AttestedClass::Human;
+        let unattested = xudo_gate::request::AttestedClass::Unattested;
+        let mut as_human = matching_caller();
+        as_human.attested_class = &human;
+        assert!(take(&watched(unattested.clone()), &as_human).is_none());
+        assert!(take(&watched(human.clone()), &matching_caller()).is_none());
+        assert!(take(&watched(human.clone()), &as_human).is_some());
+    }
+
+    #[test]
+    fn an_agent_approval_is_never_spent_by_a_human_or_unattested_caller() {
+        let approved = watched(AGENT);
+        for class in [
+            xudo_gate::request::AttestedClass::Human,
+            xudo_gate::request::AttestedClass::Unattested,
+        ] {
+            let mut caller = matching_caller();
+            caller.attested_class = &class;
+            assert!(take(&approved, &caller).is_none());
+        }
+    }
+
+    #[test]
+    fn a_headless_rerun_from_a_new_session_spends_an_unattested_approval() {
         let mut approved = watched(xudo_gate::request::AttestedClass::Unattested);
         approved.caller_tty = 0;
         let mut caller = matching_caller();
         caller.tty = 0;
         assert!(take(&approved, &caller).is_some());
         caller.sid = caller.sid.wrapping_add(1);
-        assert!(take(&approved, &caller).is_none());
+        assert!(take(&approved, &caller).is_some());
     }
 
     #[test]
@@ -571,11 +596,28 @@ mod tests {
 
     #[test]
     fn a_rerun_from_the_watchers_session_cannot_consume() {
-        let approved = watched(AGENT);
-        for (sid, tty) in [(5, 3), (2, (136 << 8) | 1)] {
-            let mut caller = agent_caller(&AGENT);
-            caller.sid = sid;
-            caller.tty = tty;
+        for class in [AGENT, xudo_gate::request::AttestedClass::Unattested] {
+            let approved = watched(class.clone());
+            let mut caller = if class == AGENT {
+                agent_caller(&AGENT)
+            } else {
+                matching_caller()
+            };
+            caller.sid = 5;
+            assert!(take(&approved, &caller).is_none());
+        }
+    }
+
+    #[test]
+    fn a_rerun_on_the_watchers_terminal_cannot_consume() {
+        for class in [AGENT, xudo_gate::request::AttestedClass::Unattested] {
+            let approved = watched(class.clone());
+            let mut caller = if class == AGENT {
+                agent_caller(&AGENT)
+            } else {
+                matching_caller()
+            };
+            caller.tty = (136 << 8) | 1;
             assert!(take(&approved, &caller).is_none());
         }
     }
@@ -662,7 +704,7 @@ mod tests {
 
         #[test]
         fn no_identity_mismatch_ever_consumes(
-            field in 0usize..7,
+            field in 0usize..9,
             agent in any::<bool>(),
         ) {
             let class = if agent {
@@ -678,24 +720,55 @@ mod tests {
             };
             let wrong_scope = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 45 };
             let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
-            // Pid and start time are ignored by the binding: the one match.
-            let mut must_match = false;
-            match (agent, field) {
-                (_, 0) => caller.uid = caller.uid.wrapping_add(1),
-                (_, 1) => caller.attested_class = &other_class,
-                (true, 2) => caller.attested_class = &wrong_scope,
-                (true, 3) => caller.scope_id = Some(45),
-                (true, 4) => caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456780"),
-                (true, 5) => caller.boot_id = None,
-                (false, 2 | 4) => caller.sid = caller.sid.wrapping_add(1),
-                (false, 3 | 5) => caller.tty = caller.tty.wrapping_add(1),
+            // Each arm names the field it varies, so a failure says which flipped.
+            let (varied, must_match) = match (agent, field) {
+                (_, 0) => { caller.uid = caller.uid.wrapping_add(1); ("uid", false) }
+                (_, 1) => { caller.attested_class = &other_class; ("class", false) }
+                (true, 2) => { caller.attested_class = &wrong_scope; ("class scope", false) }
+                (true, 3) => { caller.scope_id = Some(45); ("live scope", false) }
+                (true, 4) => {
+                    caller.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456780");
+                    ("boot id", false)
+                }
+                (true, 5) => { caller.boot_id = None; ("missing boot id", false) }
+                (false, 2 | 3) => { caller.scope_id = Some(44); ("scope on a non-agent", false) }
+                (_, 4 | 5) => { caller.sid = caller.sid.wrapping_add(100); ("sid", true) }
+                (_, 6 | 7) => { caller.tty = caller.tty.wrapping_add(100); ("tty", true) }
                 _ => {
                     caller.pid = caller.pid.wrapping_add(100);
                     caller.starttime = caller.starttime.wrapping_add(100);
-                    must_match = true;
+                    ("pid and start time", true)
                 }
+            };
+            prop_assert_eq!(take(&approved, &caller).is_some(), must_match, "varied {}", varied);
+        }
+
+        #[test]
+        fn no_consumption_changes_the_attested_class_scope_or_boot(
+            agent in any::<bool>(),
+            sid in any::<i64>(),
+            tty in any::<i64>(),
+        ) {
+            let class = if agent {
+                AGENT
+            } else {
+                xudo_gate::request::AttestedClass::Unattested
+            };
+            let approved = watched(class.clone());
+            let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
+            caller.sid = sid;
+            caller.tty = tty;
+            if let Some(consumed) = take(&approved, &caller) {
+                prop_assert_eq!(&consumed.attested_class, &approved.attested_class);
+                prop_assert_eq!(consumed.attested_scope_id, approved.attested_scope_id);
+                prop_assert_eq!(&consumed.boot_id, &approved.boot_id);
+                prop_assert_eq!(consumed.caller_uid, approved.caller_uid);
             }
-            prop_assert_eq!(take(&approved, &caller).is_some(), must_match);
+            let mut approved_again = approved.clone();
+            approve(&mut approved_again, 3_500, b"remove").ok();
+            prop_assert_eq!(&approved_again.attested_class, &approved.attested_class);
+            prop_assert_eq!(approved_again.attested_scope_id, approved.attested_scope_id);
+            prop_assert_eq!(&approved_again.boot_id, &approved.boot_id);
         }
 
         #[test]
