@@ -1878,7 +1878,7 @@ fn bounded_prompt(
         action: entry.action.clone(),
         program: entry.program.clone(),
         argv: entry.argv.clone(),
-        classification: entry.claimed_classification.clone(),
+        classification: stored_caller(entry).classification.label().to_owned(),
         evidence: "watch approval is pending; the password remains required".to_owned(),
         expires_in_ms: entry.deadline.0.saturating_sub(now_ms),
     }
@@ -2497,6 +2497,17 @@ exe = "/usr/bin/apt-get"
 args = [
   { name = "assume-yes", matcher = { literal = "-y" } },
   { name = "verb", matcher = { literal = "remove" } },
+  { name = "pkg", matcher = { one-of = ["gcc"] } },
+]
+
+[[action]]
+id = "xudo.pkg.purge-human"
+tier = "pkg-remove"
+confirm = "always"
+agent-allowed = false
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "purge" } },
   { name = "pkg", matcher = { one-of = ["gcc"] } },
 ]
 
@@ -8596,6 +8607,15 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry
     }
 
+    fn class_label(class: &xudo_gate::request::AttestedClass) -> &'static str {
+        stored_caller(&PendingRequest {
+            attested_class: class.clone(),
+            ..shown_entry()
+        })
+        .classification
+        .label()
+    }
+
     fn stored_state(spool: &FakeSpool) -> Option<xudo_gate::request::ConfirmationState> {
         let files = spool.files();
         let bytes = files.get(NONCE.as_bytes())?;
@@ -8683,19 +8703,28 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 1 => AttestedClass::Human,
                 _ => AttestedClass::EnrolledAgent { scope_id: 44 },
             };
+            let label = class_label(&class);
             let entry = approved_entry(class, "unattested");
             let baseline = arbitrary_watcher(5000, UID, 2, 34816, None);
             let other = arbitrary_watcher(pid, uid, sid, tty, cgroup);
-            proptest::prop_assert_eq!(
-                answered_by(&entry, &baseline, approve),
-                answered_by(&entry, &other, approve)
-            );
+            let by_baseline = answered_by(&entry, &baseline, approve);
+            let by_other = answered_by(&entry, &other, approve);
+            // The labels are the stored class's, whoever answers. The old
+            // re-decision classified the watcher and recorded "unattested".
+            proptest::prop_assert_eq!(&by_other.labels, &[label.to_owned()]);
+            proptest::prop_assert_eq!(by_baseline, by_other);
             proptest::prop_assert_eq!(frozen_by(&entry, &baseline), frozen_by(&entry, &other));
         }
 
         #[test]
         fn an_attacker_controlled_claim_never_reaches_the_decision(
-            claim in proptest::prelude::any::<String>(),
+            claim in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "enrolled-agent.*",
+                proptest::prelude::Just("enrolled-agent-yolo".to_string()),
+                proptest::prelude::Just("human".to_string()),
+                proptest::prelude::Just("unattested".to_string()),
+            ],
             stored in 0u8..3,
             approve in proptest::prelude::any::<bool>(),
         ) {
@@ -8713,6 +8742,78 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 answered_by(&claimed, &watcher, approve)
             );
             proptest::prop_assert_eq!(frozen_by(&plain, &watcher), frozen_by(&claimed, &watcher));
+        }
+    }
+
+    fn purge_entry(class: xudo_gate::request::AttestedClass) -> PendingRequest {
+        let mut entry = approved_entry(class, "unattested");
+        entry.action = "xudo.pkg.purge-human".to_owned();
+        entry.argv = vec!["purge".to_owned(), "gcc".to_owned()];
+        entry
+    }
+
+    #[test]
+    fn a_watchers_approval_cannot_escalate_an_agent_entry_past_agent_allowed_false() {
+        use xudo_gate::request::{AttestedClass, ConfirmationState};
+        let watcher = arbitrary_watcher(5000, UID, 2, 34816, None);
+        // Stored as an agent: approve is refused as human-path-only, and the
+        // entry is not turned into an approval. Deny still works.
+        let agent = purge_entry(AttestedClass::EnrolledAgent { scope_id: 44 });
+        let refused = answered_by(&agent, &watcher, true);
+        assert_eq!(refused.refused, Some(RefusalCode::PolicyUnloadable));
+        assert!(refused.labels.is_empty());
+        assert_eq!(refused.after, Some(ConfirmationState::Pending));
+        let denied = answered_by(&agent, &watcher, false);
+        assert_eq!(denied.refused, None);
+        assert_eq!(denied.labels, ["enrolled-agent"]);
+        assert_eq!(denied.denials, [Some("confirmation_refused".to_owned())]);
+        // The same action, stored as unattested, is approved: the old
+        // re-decision as the watcher's class did exactly that for the agent.
+        let human = purge_entry(AttestedClass::Unattested);
+        let approved = answered_by(&human, &watcher, true);
+        assert_eq!(approved.refused, None);
+        assert_eq!(approved.labels, ["unattested"]);
+        assert_eq!(approved.after, Some(ConfirmationState::Approved));
+    }
+
+    #[test]
+    fn the_engine_ignores_the_stored_callers_placeholder_names() {
+        use xudo_policy::Classification;
+        let policy = policy();
+        let entry = enrolled_entry(NONCE, UID);
+        let request = BrokerRequest::new(entry.program.clone(), entry.argv.clone(), "x");
+        let baseline = stored_caller(&entry);
+        let expected = decide(&policy, &baseline, &request);
+        for yolo in [false, true] {
+            for (agent, session) in [("scope-44", "stored"), ("", ""), ("root", "other")] {
+                let mut caller = baseline.clone();
+                caller.classification = Classification::EnrolledAgent {
+                    agent_id: agent.to_owned(),
+                    session_id: session.to_owned(),
+                    declared_yolo: yolo,
+                };
+                let got = decide(&policy, &caller, &request);
+                assert_eq!(got.verdict, expected.verdict);
+                assert_eq!(got.denial, expected.denial);
+            }
+        }
+    }
+
+    #[test]
+    fn a_claimed_class_never_appears_as_the_shown_classification() {
+        use xudo_gate::request::AttestedClass;
+        for claim in ["enrolled-agent-yolo", "human", "unattested", "x"] {
+            for class in [
+                AttestedClass::Unattested,
+                AttestedClass::Human,
+                AttestedClass::EnrolledAgent { scope_id: 44 },
+            ] {
+                let mut entry = shown_entry();
+                stored_as(&mut entry, class.clone());
+                claim.clone_into(&mut entry.claimed_classification);
+                let prompt = bounded_prompt(&entry, NOW);
+                assert_eq!(prompt.classification, class_label(&class));
+            }
         }
     }
 
