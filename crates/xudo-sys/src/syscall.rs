@@ -730,6 +730,7 @@ mod tests {
         let (a, _b) = UnixStream::pair().unwrap();
         let host = HostSyscalls;
         let refusals = [
+            host.boot_id().unwrap_err(),
             host.mark_cloexec_from(3).unwrap_err(),
             host.peer_pidfd(a.as_fd()).unwrap_err(),
             host.peer_cred(a.as_fd()).unwrap_err(),
