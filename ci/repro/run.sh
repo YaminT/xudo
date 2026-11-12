@@ -1,52 +1,60 @@
 #!/usr/bin/env bash
 # two_builds_of_the_same_commit_are_byte_identical
 #
-# Builds the .deb twice from HEAD, each from a clean `git archive` extracted
-# under a different absolute path with its own empty target directory, then
-# compares the .deb and the four binaries byte for byte.
+# Runs `just deb` (the recipe the release signs) twice on HEAD, each in a clean
+# `git archive` checkout under a different absolute path, with a different
+# CARGO_HOME and its own target directory under the checkout, then compares the
+# .deb and the four binaries byte for byte.
 #
-#   ci/repro/run.sh <musl triple>          (or: just repro)
+#   ci/repro/run.sh <musl triple> [file for the .deb sha256]    (or: just repro)
 #
-# What makes the output independent of the machine and the path:
-#   SOURCE_DATE_EPOCH  the commit time; build.sh uses it for every mtime and the changelog date
-#   --remap-path-prefix  the checkout, CARGO_HOME and the rustc sysroot, so no path is embedded
-#   CARGO_INCREMENTAL=0, TZ=UTC, LC_ALL=C, --locked
-# Existing RUSTFLAGS (CI sets -D warnings) are kept and the remaps appended.
+# The determinism (SOURCE_DATE_EPOCH, --remap-path-prefix of the checkout,
+# CARGO_HOME and the sysroot, LC_ALL=C, TZ=UTC, CARGO_INCREMENTAL=0, RUSTFLAGS
+# set outright) is in the `deb` recipe, not here. This script only supplies the
+# commit time, because a git archive has no history.
+#
+# Reference rebuild environment: the GitHub ubuntu-24.04 runner image (amd64 and
+# arm64), its stock dpkg-deb and xz-utils (from the image; `dpkg-deb --version`
+# and `xz --version` are printed below), and the toolchain pinned in
+# rust-toolchain.toml (1.98.0). The release build job compares its own .deb
+# sha256 with the one this script records.
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <musl triple>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "usage: $0 <musl triple> [sha256 output file]" >&2
     exit 2
 fi
 triple=$1
+sha_out=${2:-}
+[[ -z $sha_out ]] || sha_out=$(realpath -m "$sha_out")
 root=$(cd "$(dirname "$0")/../.." && pwd)
-work=$root/target/repro
 epoch=$(git -C "$root" log -1 --format=%ct)
-cargo_home=${CARGO_HOME:-$HOME/.cargo}
-sysroot=$(rustc --print sysroot)
+export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
+home_a=${CARGO_HOME:-$HOME/.cargo}
+home_b=$root/target/repro-b/cargo-home-other
+dpkg-deb --version | head -n 1
+xz --version | head -n 1
 
-build() { # <name> <checkout dir>
-    local name=$1 src=$2
+build() { # <name> <checkout dir> <cargo home>
+    local name=$1 src=$2 chome=$3
     rm -rf "$src"
     mkdir -p "$src"
     git -C "$root" archive HEAD | tar -x -C "$src"
     (
         cd "$src"
-        export SOURCE_DATE_EPOCH=$epoch TZ=UTC LC_ALL=C CARGO_INCREMENTAL=0
-        export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$src=/build --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$sysroot=/rustc"
-        cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin \
-            --release --locked --target "$triple" --target-dir "$work/$name-target"
-        XUDO_BUILD_BIN_DIR=$work/$name-target/$triple/release \
-            packaging/deb/build.sh "$triple" "$work/$name-out" >/dev/null
+        export SOURCE_DATE_EPOCH=$epoch CARGO_HOME=$chome
+        just deb >/dev/null
     )
     # Only the output is compared; free the intermediate build before the next.
-    rm -rf "${work:?}/$name-target"
+    rm -rf "$root/target/repro-$name/out"
+    mv "$src/target/deb" "$root/target/repro-$name/out"
+    rm -rf "$src/target" "$root/target/repro-$name/cargo-home-other"
 }
 
-rm -rf "$work"
-mkdir -p "$work"
-build a "$work/a/xudo-one"
-build b "$work/b/another/xudo-two-longer"
+rm -rf "$root/target/repro-a" "$root/target/repro-b"
+mkdir -p "$root/target/repro-a" "$root/target/repro-b"
+build a "$root/target/repro-a/xudo-one" "$home_a"
+build b "$root/target/repro-b/another/xudo-two-longer" "$home_b"
 
 sums() { # <out dir> : sha256 of the deb and the files it ships
     local out=$1 deb
@@ -54,22 +62,25 @@ sums() { # <out dir> : sha256 of the deb and the files it ships
     sha256sum "$deb" | sed "s|$out/||"
     (cd "$out/stage" && sha256sum usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth)
 }
-sums "$work/a-out" >"$work/a.sums"
-sums "$work/b-out" >"$work/b.sums"
-cat "$work/a.sums"
-if diff "$work/a.sums" "$work/b.sums"; then
+sums "$root/target/repro-a/out" >"$root/target/repro-a/sums"
+sums "$root/target/repro-b/out" >"$root/target/repro-b/sums"
+cat "$root/target/repro-a/sums"
+if diff "$root/target/repro-a/sums" "$root/target/repro-b/sums"; then
     echo "OK: two builds of $(git -C "$root" rev-parse --short HEAD) are byte-identical"
-    rm -rf "$work"
+    [[ -z $sha_out ]] || head -n 1 "$root/target/repro-a/sums" >"$sha_out"
+    rm -rf "$root/target/repro-a" "$root/target/repro-b"
     exit 0
 fi
 echo "FAIL: the two builds differ" >&2
+a=$root/target/repro-a/out
+b=$root/target/repro-b/out
 if command -v diffoscope >/dev/null; then
-    diffoscope "$work"/a-out/xudo_*.deb "$work"/b-out/xudo_*.deb || true
+    diffoscope "$a"/xudo_*.deb "$b"/xudo_*.deb || true
 else
     for f in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth; do
-        n=$(cmp -l "$work/a-out/stage/$f" "$work/b-out/stage/$f" | wc -l || true)
+        n=$(cmp -l "$a/stage/$f" "$b/stage/$f" | wc -l || true)
         echo "$f: $n differing bytes" >&2
     done
-    cmp -l "$work"/a-out/xudo_*.deb "$work"/b-out/xudo_*.deb | wc -l | sed 's/$/ differing bytes in the .deb/' >&2 || true
+    cmp -l "$a"/xudo_*.deb "$b"/xudo_*.deb | wc -l | sed 's/$/ differing bytes in the .deb/' >&2 || true
 fi
 exit 1
