@@ -100,7 +100,9 @@ pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
 pub use source::{DirSource, MapSource, ProcSource};
-pub use spool::{FakeSpool, Spool, SpoolCall, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
+#[cfg(any(test, feature = "fake"))]
+pub use spool::{FakeSpool, SpoolCall};
+pub use spool::{Spool, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,
