@@ -22,6 +22,7 @@ use xudo_sys::{
 };
 
 use crate::agentdoc::{self, DocFormat};
+use crate::check;
 use crate::doctor;
 use crate::exec;
 use crate::probe::BrokerProbe;
@@ -142,8 +143,16 @@ pub enum Command {
         queue: bool,
     },
 
-    /// Lint the ruleset. Exits non-zero if anything is wrong with it.
-    Check,
+    /// Lint the ruleset, then run the `[[test]]` tables in its rule files.
+    ///
+    /// Exits 20 for a lint warning, 21 for a lint error and 22 for a failing
+    /// test; a run with several problems prints them all and exits with the
+    /// most severe.
+    Check {
+        /// Run only the `[[test]]` tables, skipping the lint.
+        #[arg(long)]
+        tests_only: bool,
+    },
 
     /// List the effective policy.
     List {
@@ -434,7 +443,7 @@ pub fn run_with_installer_at_socket(
             .err()
             .unwrap_or(ExitCode::Unusable)
         }
-        Command::Check => with_rules!(|l: &LoadedRules| check(l, out, err)),
+        Command::Check { tests_only } => with_rules!(|l| check::run(cli, l, *tests_only, out, err)),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
@@ -1127,51 +1136,6 @@ fn evaluate_one(
         &Request::for_program(action, program, argv.clone()),
         settings,
     )
-}
-
-/// Lints the ruleset.
-fn check(loaded: &LoadedRules, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let offenders = loaded.rules().self_denying_actions();
-    if !offenders.is_empty() {
-        for (id, classes) in &offenders {
-            let _ = writeln!(
-                err,
-                "xudo: {id} allowlists an executable the deny-list refuses: {classes:?}"
-            );
-        }
-        let _ = writeln!(
-            err,
-            "xudo: a rule that allowlists a shell-capable binary defeats the design"
-        );
-        return ExitCode::Denied;
-    }
-
-    let _ = writeln!(
-        out,
-        "ok: {} action(s) in {} file(s), generation {}",
-        loaded.rules().len(),
-        loaded.files().len(),
-        loaded.generation().get(..12).unwrap_or(loaded.generation())
-    );
-
-    // Reported, not refused: the engine resolves a command more than one
-    // action accepts to the strictest of them, so an overlap is not a hole.
-    // It is still two rules whose interaction nobody wrote down, and the
-    // report never stays silent about a pair it cannot decide.
-    let overlaps = loaded.rules().overlaps();
-    for overlap in &overlaps {
-        let _ = writeln!(out, "{overlap}");
-    }
-    if !overlaps.is_empty() {
-        let _ = writeln!(
-            out,
-            "{} overlapping pair(s): a command more than one action accepts is refused to an \
-             agent if any of them is human-only, and confirmed as strictly as the strictest \
-             demands",
-            overlaps.len()
-        );
-    }
-    ExitCode::Delegated
 }
 
 /// Lists the effective policy.
@@ -2880,8 +2844,9 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
 "#,
             );
         let (code, out, err) = fx.run(&["check"]);
-        // Reported, not refused: the engine resolves an overlap safely.
-        assert_eq!(code, ExitCode::Delegated, "{err}");
+        // Reported, not refused: the engine resolves an overlap safely. It is a
+        // lint warning, which a pipeline can gate on separately.
+        assert_eq!(code, ExitCode::LintWarning, "{err}");
         insta::assert_snapshot!("check_reports_overlaps", out);
     }
 
@@ -2985,10 +2950,207 @@ exe = "/bin/sh"
 args = [{ name = "c", matcher = { literal = "-c" } }]
 "#,
         );
-        let (code, _, err) = fx.run(&["check"]);
-        assert_eq!(code, ExitCode::Denied);
+        let (code, out, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::LintError);
+        assert!(!out.contains("ok:"), "{out}");
         assert!(err.contains("SpawnsShell"), "{err}");
         assert!(err.contains("defeats the design"), "{err}");
+    }
+
+    const FAILING_TEST: &str = r#"
+[[test]]
+argv = ["/usr/bin/systemctl", "restart", "nginx.service"]
+expect = "deny"
+reason = "restart is ours to allow"
+"#;
+
+    const PASSING_TEST: &str = r#"
+[[test]]
+argv = ["/usr/bin/systemctl", "restart", "nginx.service"]
+expect = "allow"
+action = "xudo.svc.restart"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "restart", "nginx"]
+expect = "deny"
+"#;
+
+    const SHELL_RULE: &str = r#"
+[[action]]
+id = "xudo.oops"
+tier = "diag-read"
+exe = "/bin/sh"
+args = [{ name = "c", matcher = { literal = "-c" } }]
+"#;
+
+    #[test]
+    fn a_failing_rule_test_exits_with_the_test_failure_code() {
+        let fx = fixture("cli-check-test-fail").write("20-tests.toml", FAILING_TEST);
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::TestFailure);
+        assert_eq!(code.as_i32(), 22);
+        insta::assert_snapshot!("check_failing_test_human", out);
+        let (_, json, _) = fx.run(&["--output", "json", "check"]);
+        insta::assert_snapshot!("check_failing_test_json", json);
+    }
+
+    #[test]
+    fn passing_rule_tests_exit_zero_and_are_counted() {
+        let fx = fixture("cli-check-test-pass").write("20-tests.toml", PASSING_TEST);
+        let (code, out, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}{err}");
+        assert!(out.contains("tests: 2 passed, 0 failed"), "{out}");
+        let (code, json, _) = fx.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::Delegated);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["tests"]["total"], 2);
+        assert_eq!(parsed["tests"]["results"][0]["outcome"], "pass");
+        assert_eq!(parsed["tests"]["results"][0]["action"], "xudo.svc.restart");
+    }
+
+    #[test]
+    fn a_failing_test_names_the_action_it_pinned() {
+        let fx = fixture("cli-check-test-pinned").write(
+            "20-tests.toml",
+            "[[test]]\nargv = [\"/usr/bin/systemctl\", \"restart\", \"nginx.service\"]\nexpect = \"confirm\"\naction = \"xudo.svc.restart\"\n",
+        );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::TestFailure);
+        assert!(
+            out.contains("FAIL 20-tests.toml:1: expected confirm from xudo.svc.restart, got allow by xudo.svc.restart"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_test_that_names_an_unknown_action_fails() {
+        let fx = fixture("cli-check-test-unknown").write(
+            "20-tests.toml",
+            r#"
+[[test]]
+argv = ["/usr/bin/systemctl", "restart", "nginx.service"]
+expect = "deny"
+action = "xudo.nope"
+
+[[test]]
+argv = []
+expect = "deny"
+"#,
+        );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::TestFailure);
+        assert!(
+            out.contains("ERROR 20-tests.toml:2: unknown action id xudo.nope"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ERROR 20-tests.toml:7: argv is empty"),
+            "{out}"
+        );
+        let (_, json, _) = fx.run(&["--output", "json", "check"]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["tests"]["results"][0]["outcome"], "error");
+        assert_eq!(parsed["tests"]["results"][0]["error"], "unknown-action");
+        assert_eq!(parsed["tests"]["results"][1]["error"], "empty-argv");
+    }
+
+    #[test]
+    fn lint_error_and_test_failure_and_lint_warning_have_distinct_exit_codes() {
+        let warning = fixture("cli-codes-warning")
+            .write("20-a.toml", CONFIRMING)
+            .write("30-b.toml", PERMISSIVE)
+            .run(&["check"])
+            .0;
+        let error = Fixture::new("cli-codes-error")
+            .write("10-oops.toml", SHELL_RULE)
+            .run(&["check"])
+            .0;
+        let failure = fixture("cli-codes-failure")
+            .write("20-tests.toml", FAILING_TEST)
+            .run(&["check"])
+            .0;
+        assert_eq!(warning, ExitCode::LintWarning);
+        assert_eq!(error, ExitCode::LintError);
+        assert_eq!(failure, ExitCode::TestFailure);
+        let numbers = [warning, error, failure].map(ExitCode::as_i32);
+        assert_eq!(numbers, [20, 21, 22]);
+        // None of them is a refusal, an unusable xudo, or a program's own status.
+        for n in numbers {
+            assert!(![0, 1, 2, 17, 18, 19].contains(&n) && n < 128);
+        }
+    }
+
+    #[test]
+    fn the_most_severe_problem_sets_the_exit_code_and_all_are_printed() {
+        let fx = fixture("cli-codes-all")
+            .write("20-a.toml", CONFIRMING)
+            .write("30-b.toml", PERMISSIVE)
+            .write("40-oops.toml", SHELL_RULE)
+            .write("50-tests.toml", FAILING_TEST)
+            .write("60-tests.toml", PASSING_TEST);
+        let (code, out, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::TestFailure);
+        assert!(err.contains("SpawnsShell"), "{err}");
+        assert!(out.contains("overlapping pair(s)"), "{out}");
+        assert!(out.contains("FAIL 50-tests.toml:2"), "{out}");
+        let (_, json, _) = fx.run(&["--output", "json", "check"]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["exit_code"], 22);
+        assert_eq!(parsed["lint"]["errors"][0]["action"], "xudo.oops");
+        assert_eq!(parsed["lint"]["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["tests"]["failed"], 1);
+        assert_eq!(parsed["tests"]["total"], 3);
+
+        // Without the failing test, the lint error is the worst of what is left.
+        let fx = Fixture::new("cli-codes-lint")
+            .write("20-a.toml", CONFIRMING)
+            .write("30-b.toml", PERMISSIVE)
+            .write("40-oops.toml", SHELL_RULE);
+        assert_eq!(fx.run(&["check"]).0, ExitCode::LintError);
+    }
+
+    #[test]
+    fn tests_only_skips_the_lint() {
+        let fx = Fixture::new("cli-tests-only")
+            .write("40-oops.toml", SHELL_RULE)
+            .write(
+                "50-tests.toml",
+                PASSING_TEST
+                    .replace("xudo.svc.restart", "xudo.oops")
+                    .as_str(),
+            );
+        let (code, out, err) = fx.run(&["check", "--tests-only"]);
+        assert_eq!(code, ExitCode::TestFailure, "{out}{err}");
+        assert!(!out.contains("ok:"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        let (code, out, _) = fixture("cli-tests-only-none").run(&["check", "--tests-only"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, "tests: none\n");
+    }
+
+    #[test]
+    fn a_failing_test_cannot_inject_terminal_escapes() {
+        let fx = fixture("cli-check-test-escapes").write(
+            "20-tests.toml",
+            "[[test]]\nargv = [\"/usr/bin/systemctl\", \"\\u001b[2Jrestart\", \"x\"]\nexpect = \"allow\"\nreason = \"\\u001b]0;pwned\\u0007hi\"\n",
+        );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::TestFailure);
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(out.contains("terminal escape sequence"), "{out}");
+    }
+
+    #[test]
+    fn a_test_block_with_an_unknown_key_fails_the_whole_load() {
+        let fx = fixture("cli-check-test-unknown-key").write(
+            "20-tests.toml",
+            "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\nnopasswd = true\n",
+        );
+        let (code, _, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("nopasswd"), "{err}");
     }
 
     #[test]

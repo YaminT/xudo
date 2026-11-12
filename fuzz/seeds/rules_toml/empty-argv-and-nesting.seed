@@ -1,0 +1,12 @@
+[[test]]
+argv = []
+expect = "deny"
+action = "nope"
+
+[[action]]
+id = "x"
+tier = "diag-read"
+exe = "/bin/sh"
+[[action.test]]
+argv = ["/bin/sh"]
+expect = "allow"

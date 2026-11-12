@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agentdoc;
+mod check;
 pub mod cli;
 pub mod doctor;
 mod exchange;

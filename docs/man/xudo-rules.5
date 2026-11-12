@@ -45,11 +45,16 @@ A rule cannot set
 .BR source :
 that key is rejected.
 .SH FILE
-The only top-level key is
+The top-level keys are
 .BR action ,
 written as one
 .B [[action]]
-table per action.
+table per action, and
+.BR test ,
+written as one
+.B [[test]]
+table per test (see
+.BR TESTS ).
 .TP
 .B id
 Stable identifier, for example
@@ -116,6 +121,67 @@ Environment variable names to pass through, by exact name.
 The default is none.
 The child's environment is built from scratch, so a name on no list does not
 exist for the child.
+.SH TESTS
+A rule file may carry
+.B [[test]]
+tables that state what the rules are expected to decide.
+.B xudo check
+runs them, and so does the build for the shipped files.
+.TP
+.B argv
+Array of strings: the program, then its operands, compared byte for byte.
+A program with no operands is a one-element array; an empty array is a test
+error.
+.TP
+.B expect
+.BR allow ,
+.BR deny ,
+or
+.BR confirm .
+.B confirm
+means permitted once a human approves.
+.TP
+.B action
+Optional.
+The action that must decide the command, as
+.B xudo explain \-\-action
+would.
+Without it every action that runs the program takes part.
+An id the ruleset does not define is a test error, not a pass.
+.TP
+.B reason
+Optional text shown when the test fails.
+Displayed with terminal escapes removed.
+.PP
+A test is always decided for a caller classified as a human, with the default
+settings, so the result does not depend on the machine.
+Agent behaviour cannot be expressed in a test:
+.B agent\-allowed = false
+still passes
+.BR "expect = allow" ,
+and a confirmation that only an agent would be asked for is reported as
+.BR allow .
+A test that
+.B expect
+s a
+.B deny
+and names an
+.B action
+is also put to the whole ruleset, as
+.B xudo explain
+would, and fails when that permits the command.
+When
+.B xudo check
+finds a failing test and a lint error in one run, it exits with the test
+failure status, which ranks above the lint error, and the JSON report carries
+both.
+Keys are kebab-case and an unknown key is a hard parse failure, like every
+other table.
+A test can never change a decision: it is parsed beside the ruleset, not into
+it, and it is not part of the ruleset generation, so adding or editing a test
+does not make a request minted under the same rules stale.
+A test cannot set its own provenance; the loader records the file and the line
+of its header.
 .SH MATCHERS
 Matcher keys are kebab-case.
 A position accepts one of them.
