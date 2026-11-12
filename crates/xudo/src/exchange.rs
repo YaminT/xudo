@@ -598,6 +598,9 @@ mod tests {
     use rustix::net::{AddressFamily, SocketType, socket_with};
     use xudo_wire::{Answer, BrokerResponse, WIRE_SCHEMA_VERSION};
 
+    /// A deadline a passing test over a real socket never waits for.
+    const PATIENT: Duration = Duration::from_secs(60);
+
     use super::*;
 
     fn done_bytes() -> Vec<u8> {
@@ -1563,13 +1566,10 @@ mod tests {
         let mut live = Live::open(&path);
         assert_eq!(live.apply(Settled::NeedWait), Step::Interrupted);
         assert!(live.wait);
-        assert_eq!(live.connect(Duration::from_secs(1)), Step::Ready);
-        assert_eq!(live.arm_timeouts(Duration::from_millis(200)), Step::Ready);
-        assert_eq!(
-            live.write(Duration::from_millis(200), b"hi"),
-            Step::Transferred(2)
-        );
-        assert_eq!(live.shutdown_write(Duration::from_millis(200)), Step::Ready);
+        assert_eq!(live.connect(PATIENT), Step::Ready);
+        assert_eq!(live.arm_timeouts(PATIENT), Step::Ready);
+        assert_eq!(live.write(PATIENT, b"hi"), Step::Transferred(2));
+        assert_eq!(live.shutdown_write(PATIENT), Step::Ready);
         let mut buf = [0u8; 4];
         assert_eq!(
             live.read(Duration::from_millis(50), &mut buf),
