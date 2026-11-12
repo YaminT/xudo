@@ -250,21 +250,34 @@ jobs:
   # Beta .deb: build it and install, upgrade, remove, and purge it in Debian and Ubuntu.
   deb:
     name: Debian package (${{ matrix.os }})
+    needs: reproducible-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: just@1.59.0
       - name: Build and test the Debian package in three distributions
         run: just deb-test
+      # Built clean, like the release job, then compared with the other VM's build.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: repro-sha256-${{ matrix.arch }}
+          path: ${{ runner.temp }}/repro
+      - name: Package matches the rebuild on another runner
+        run: ci/repro/compare.sh "$RUNNER_TEMP/repro/repro-sha256.txt" target/deb/xudo_*.deb
 
   # The installed .deb with the broker under systemd as PID 1, in throwaway
   # containers. ci/systemd/run.sh boots systemd; the unit files are not loosened
