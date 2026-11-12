@@ -25,6 +25,7 @@ xudo \- decide whether a privileged command runs as root
 .br
 .B xudo exec
 .RB [ options ]
+.RB [ \-\-queue ]
 .B \-\-
 .I program
 .RI [ arg ...]
@@ -147,6 +148,26 @@ The program is an absolute path, after
 .BR \-\- .
 The command's own status is the process status.
 A policy refusal happens before the command runs.
+.IP
+With
+.BR \-\-queue ,
+a denial that only a person can resolve (human-path-only, or no confirmation
+channel) is also written to the invoking user's
+.BR ido (1)
+queue, exactly as
+.B ido queue
+would, and the id is reported: "queued as #7, run `ido` to execute".
+With
+.B \-\-output json
+the envelope gains
+.BR queued :
+{"id": 7}.
+The exit status is still the denial's: nothing ran, and the verdict is
+unchanged.
+Any other outcome behaves as without the flag and queues nothing.
+If the queue cannot be written, nothing is queued, the failure is reported on
+standard error, and the denial is shown as without the flag.
+.IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
 Set
