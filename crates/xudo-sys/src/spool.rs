@@ -688,6 +688,8 @@ pub struct FakeSpool {
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
     replace_error_after_exchange: Option<SpoolError>,
+    unreadable_after_replace: bool,
+    replaced: std::cell::Cell<bool>,
 }
 
 impl FakeSpool {
@@ -760,6 +762,14 @@ impl FakeSpool {
         self
     }
 
+    /// Makes every [`Spool::read`] fail once [`Spool::replace`] has been
+    /// called, as a read after a half-finished swap can.
+    #[must_use]
+    pub fn failing_read_after_replace(mut self) -> Self {
+        self.unreadable_after_replace = true;
+        self
+    }
+
     /// Every file, by name.
     pub fn files(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.files.borrow().clone()
@@ -809,7 +819,12 @@ impl Spool for FakeSpool {
         self.record(SpoolCall::Read(name.to_vec()));
         let display = name.as_bstr().to_string();
         let found = self.files.borrow().get(name).cloned();
+        let after_replace = self.unreadable_after_replace && self.replaced.get();
         match found {
+            Some(_) if after_replace => Err(SpoolError::Unreadable {
+                name: display,
+                reason: "fake: scripted to fail after a replace".to_owned(),
+            }),
             Some(_) if self.unreadable.contains(name) => Err(SpoolError::Unreadable {
                 name: display,
                 reason: "fake: scripted to fail".to_owned(),
@@ -859,6 +874,7 @@ impl Spool for FakeSpool {
 
     fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
         self.record(SpoolCall::Replace(name.to_vec()));
+        self.replaced.set(true);
         scripted(self.replace_error.as_ref())?;
         let mut files = self.files.borrow_mut();
         match files.get_mut(name) {
@@ -1103,6 +1119,20 @@ mod tests {
         fake.replace(b"request", b"pending", b"approved").unwrap();
         assert_eq!(kind(fake.replace(b"request", b"pending", b"x")), "Gone");
         fake.unlock();
+        assert_eq!(
+            fake.files().get(b"request".as_slice()).unwrap(),
+            b"approved"
+        );
+    }
+
+    #[test]
+    fn fake_reads_can_fail_once_a_replace_was_attempted() {
+        let fake = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_read_after_replace();
+        assert_eq!(fake.read(b"request", 64).unwrap(), b"pending");
+        fake.replace(b"request", b"pending", b"approved").unwrap();
+        assert_eq!(kind(fake.read(b"request", 64).map(drop)), "Unreadable");
         assert_eq!(
             fake.files().get(b"request".as_slice()).unwrap(),
             b"approved"

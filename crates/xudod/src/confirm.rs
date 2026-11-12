@@ -775,10 +775,11 @@ mod tests {
             };
             let approved = watched(class.clone());
             let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
+            // A caller in the watcher's session or on its terminal never
+            // consumes; every other draw does, so the unwrap below is exact.
+            prop_assume!(sid != watcher().sid && tty != watcher().tty);
             caller.sid = sid;
             caller.tty = tty;
-            // Not vacuous: the same user and live attestation always consume.
-            // A matching caller must consume: the draw is never vacuous.
             let consumed = take(&approved, &caller).unwrap();
             prop_assert_eq!(&consumed.attested_class, &approved.attested_class);
             prop_assert_eq!(consumed.attested_scope_id, approved.attested_scope_id);
