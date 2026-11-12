@@ -173,6 +173,9 @@ fuzz seconds:
 supply-chain:
     cargo deny check
     cargo audit --deny warnings
+    # Offline: --frozen reads the pinned imports.lock instead of fetching the
+    # imported audit sets. Refresh with `cargo vet regenerate imports`.
+    cargo vet --locked --frozen
 
 # --- GTFOBins gate ----------------------------------------------------------
 
