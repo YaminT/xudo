@@ -1,0 +1,5 @@
+[[action]]
+id = "x.ex"
+tier = "diag-read"
+exe = "/usr/bin/ex"
+args = [{ name = "u", matcher = { literal = "-u" } }]

@@ -189,7 +189,8 @@ args = [{ name = "x", matcher = { pattern = '(?-u:\xff\xfe)' } }]
         found.escaped().ends_with(r#""\xff\xfe""#),
         "{}",
         found.escaped()
-    );
+    ); // An overlap the report lists, here only as possible, silences the finding.
+    assert!(fuzz(&rules, &rules.overlaps(), small(budget())).clean());
 }
 
 #[test]
@@ -339,5 +340,36 @@ proptest! {
                 );
             }
         }
+    }
+}
+
+/// The loader does not reject a rule that allowlists a deny-listed program:
+/// `self_denying_actions` reports it, and the compiled-in deny-list refuses
+/// every command the rule accepts, so it can never produce an allow. The seed
+/// `fuzz/seeds/rules_toml/self-denying-ex.seed` is this ruleset.
+#[test]
+fn a_self_denying_rule_loads_and_can_never_produce_an_allow() {
+    let rules = RuleSet::from_toml(
+        "x.toml",
+        include_str!("../../../fuzz/seeds/rules_toml/self-denying-ex.seed"),
+    )
+    .unwrap();
+    let offenders = rules.self_denying_actions();
+    assert_eq!(offenders.len(), 1);
+    let action = rules.actions().first().unwrap();
+    assert_eq!(action.exe, "/usr/bin/ex");
+    let found = witnesses(&rules, action, 1, 4);
+    assert!(!found.is_empty(), "no witness for the self-denying rule");
+    let human = CallerFacts::new(Classification::Human, 1000);
+    for argv in found {
+        let decision = evaluate_command(
+            &rules,
+            &human,
+            &Arg::from(action.exe.as_str()),
+            &argv,
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.denial, Some(DenialCode::DenyListed));
     }
 }

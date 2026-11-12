@@ -703,6 +703,13 @@ fn check_fuzz_finds_nothing_in_the_shipped_rules() {
         report.accepted_by_one > 0,
         "the fuzz never reached an accepting action: {report:?}"
     );
+    for action in rules.actions() {
+        assert!(
+            !xudo_policy::fuzz_check::witnesses(&rules, action, 1, 4).is_empty(),
+            "no witness for shipped action {}",
+            action.id
+        );
+    }
     let found: Vec<String> = report
         .findings
         .iter()
