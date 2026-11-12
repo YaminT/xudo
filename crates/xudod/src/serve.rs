@@ -157,11 +157,6 @@ fn confirm_run(
         }
     };
     if let Some(approved) = approved {
-        if let Err(served) =
-            clear_approved_backoff(conn, platform, &identity, &request, &approved, now)
-        {
-            return ConfirmRun::Served(served);
-        }
         let evaluated = Evaluated {
             decision,
             caller,
@@ -613,23 +608,16 @@ fn clear_approved_backoff(
     platform: &mut Platform<'_>,
     identity: &PeerIdentity,
     request: &BrokerRequest,
-    approved: &xudo_gate::request::PendingRequest,
+    fingerprint: &str,
     now: u64,
 ) -> Result<(), Served> {
-    if clear_backoff(
-        platform.confirmations,
-        identity.uid,
-        &approved.fingerprint,
-        now,
-    )
-    .is_err()
-    {
+    if clear_backoff(platform.confirmations, identity.uid, fingerprint, now).is_err() {
         return Err(refuse(
             conn,
             platform.audit,
             &Refusal::broker(
                 RefusalCode::SpoolUnusable,
-                "cannot clear confirmation backoff",
+                "cannot clear confirmation backoff after the approval was consumed",
             ),
             Some(identity),
             Some(request),
@@ -807,7 +795,8 @@ fn mint_approved(
         &authorized,
         platform.clock.boottime_millis(),
     ) {
-        // This record supersedes the grant: the log never ends in a lost one.
+        // Best effort: `refuse` ignores a failed append, and a crash between
+        // authorize and swap leaves a grant with no denial after it.
         return refuse(
             conn,
             platform.audit,
@@ -816,6 +805,26 @@ fn mint_approved(
             Some(&request),
         );
     }
+    // Only a real consume clears the backoff.
+    if let Err(served) = clear_approved_backoff(
+        conn,
+        platform,
+        &identity,
+        &request,
+        &authorized.approval().0.fingerprint,
+        platform.clock.boottime_millis(),
+    ) {
+        return served;
+    }
+    answer_minted(conn, platform, decision, &authorized)
+}
+
+fn answer_minted(
+    conn: &dyn Connection,
+    platform: &Platform<'_>,
+    decision: xudo_policy::Decision,
+    authorized: &xudo_sys::Authorized<Grant>,
+) -> Served {
     let minted = Minted {
         nonce: authorized.approval().0.nonce.clone(),
         expires_in_ms: remaining_millis(
@@ -913,9 +922,20 @@ fn publish_consumed_approval(
     now: u64,
 ) -> Result<(), Refusal> {
     swap_to_consumed(spool, live, authorized, now).map_err(|mut error| {
-        // Names the grant that the refusal's record supersedes.
+        // The swap can fail after the exchange put the consumed bytes in
+        // place (the last unlink, a failed swap back): then the entry on disk
+        // is spendable and the record must not claim the grant is gone.
+        let landed = matches!(
+            spool.read(authorized.approval().0.nonce.as_bytes(), crate::mint::MAX_ENTRY_BYTES),
+            Ok(bytes) if bytes == authorized.approval().0.to_json().as_bytes()
+        );
+        let note = if landed {
+            "consume outcome unknown; the consumed entry is on disk"
+        } else {
+            "supersedes the grant"
+        };
         error.detail = format!(
-            "{} (supersedes the grant for nonce={})",
+            "{} ({note} for nonce={})",
             error.detail,
             authorized.approval().0.nonce
         );
@@ -938,6 +958,7 @@ fn swap_to_consumed(
         .map_err(|error| Refusal::from(&error))?;
     let current = parse_entry(&old)?;
     let matches = current.state == xudo_gate::request::ConfirmationState::Approved
+        && entry.state == xudo_gate::request::ConfirmationState::Consumed
         && crate::confirm::identity_matches(&current, live)
         && entry.caller_pid == live.pid
         && entry.caller_starttime == live.starttime
@@ -2850,7 +2871,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn no_live_watcher_denies_and_mints_nothing() {
+    fn a_new_request_with_no_watcher_is_still_denied_no_confirmation_channel() {
         let mut host = Host::honest();
         turn_on_confirmation(&mut host);
         let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
@@ -2861,7 +2882,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(decision.denial, Some(DenialCode::NoConfirmationChannel));
         assert!(minted.is_none());
         assert!(spool.files().is_empty());
+        // One record, a denial: no grant record is written without a watcher.
         assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.records[0].decision, xudo_audit::Decision::Denied);
     }
 
     #[test]
@@ -2975,7 +2998,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_approved_rerun_from_a_new_session_runs_after_the_watcher_closed() {
+    fn an_approved_rerun_runs_after_the_watcher_has_closed() {
         let (spool, id) = approved_for_the_requester();
         let mut host = rerun_host(PID + 7, START + 7, 9, 9);
         host.confirmations = FakeSpool::new().with_file(
@@ -3001,6 +3024,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(outcome.served, Served::Minted);
         let (_, minted) = decision_of(&outcome.answer).unwrap();
         assert_eq!(minted.map(|m| m.nonce.clone()), Some(id.clone()));
+        assert_eq!(
+            minted.map(|m| m.gate.as_str()),
+            Some(xudo_backend::snippet::GATE_AUTH)
+        );
         let entry = the_entry(&spool, &id);
         assert_eq!(entry.state, xudo_gate::request::ConfirmationState::Consumed);
         assert_eq!(
@@ -3587,7 +3614,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn approval_store_clear_failure_refuses_before_consuming_the_match() {
+    fn approval_store_clear_failure_refuses_after_the_consume_is_swapped() {
         let request = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
         let parsed = BrokerRequest::new(
             "/usr/bin/apt-get",
@@ -3705,18 +3732,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = make_evaluated(&host, request);
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let mut consumed = entry.clone();
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
         let served = mint_approved(
             &connection(Ok(Vec::new())),
             &mut host.platform(),
             &spool,
             evaluated,
-            entry.clone(),
+            consumed,
         );
         assert_eq!(served, Served::Refused(Fault::Broker));
-        // Audit comes first, so its failure swaps nothing.
+        // Audit comes first, so its failure swaps nothing: the bytes on disk
+        // are the approved ones, which a swap-before-audit would have replaced.
         assert_eq!(
-            the_entry(&spool, NONCE).state,
-            xudo_gate::request::ConfirmationState::Approved
+            spool.files()[NONCE.as_bytes()],
+            entry.to_json().into_bytes()
         );
 
         let mut host = Host::honest();
@@ -5566,6 +5596,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn approved_remint_spends_the_approval_for_a_caller_of_another_session() {
         let mut host = Host::honest();
+        host.confirmations = live_confirmation_store();
         let request = BrokerRequest::new(
             "/usr/bin/apt-get",
             vec!["-y".to_owned(), "remove".to_owned(), "gcc".to_owned()],
@@ -5743,6 +5774,120 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn swapping_in_an_entry_that_is_not_consumed_is_refused() {
+        let identity = test_identity(PID, START, 0, 0);
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        let json = approved.to_json().into_bytes();
+        let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), json.clone());
+        let live = unattested_live(&identity);
+        // A grant proves some record exists, not that it is a consume record.
+        let error =
+            publish_consumed_approval(&spool, &live.binding(&identity), &grant(&approved), NOW)
+                .unwrap_err();
+        assert_eq!(error.code, RefusalCode::RequestUnknown);
+        assert_eq!(spool.files()[NONCE.as_bytes()], json);
+        assert!(
+            !spool
+                .calls()
+                .contains(&xudo_sys::SpoolCall::Replace(NONCE.as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_swap_that_errors_after_the_exchange_is_not_logged_as_a_lost_grant() {
+        let identity = test_identity(PID, START, 0, 0);
+        let mut approved = shown_entry();
+        approved.state = xudo_gate::request::ConfirmationState::Approved;
+        let mut consumed = approved.clone();
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        let live = unattested_live(&identity);
+        let after = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
+            .failing_replace_after_exchange(SpoolError::Gone {
+                name: "unlink".to_owned(),
+            });
+        let error =
+            publish_consumed_approval(&after, &live.binding(&identity), &grant(&consumed), NOW)
+                .unwrap_err();
+        assert!(error.detail.contains("consume outcome unknown"));
+        assert!(!error.detail.contains("supersedes the grant"));
+        // The consumed bytes really are on disk.
+        assert_eq!(
+            the_entry(&after, NONCE).state,
+            xudo_gate::request::ConfirmationState::Consumed
+        );
+        // A swap that failed before the exchange still supersedes the grant.
+        let before = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
+            .failing_replace(SpoolError::Gone {
+                name: "exchange".to_owned(),
+            });
+        let error =
+            publish_consumed_approval(&before, &live.binding(&identity), &grant(&consumed), NOW)
+                .unwrap_err();
+        assert!(error.detail.contains("supersedes the grant"));
+        assert!(!error.detail.contains("consume outcome unknown"));
+    }
+
+    fn backoff_store(fingerprint: &str) -> FakeSpool {
+        FakeSpool::new().with_file(
+            "1000.json",
+            serde_json::to_vec(&ConfirmData {
+                heartbeat: None,
+                backoff: vec![BackoffEntry {
+                    fingerprint: fingerprint.to_owned(),
+                    strikes: 1,
+                    until_ms: NOW + 60_000,
+                }],
+                outcomes: Vec::new(),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn backoff_left(host: &Host) -> usize {
+        serde_json::from_slice::<ConfirmData>(&host.confirmations.files()[b"1000.json".as_slice()])
+            .unwrap()
+            .backoff
+            .len()
+    }
+
+    #[test]
+    fn a_lost_consume_leaves_the_backoff_in_place() {
+        let (approved, id) = approved_for_the_requester();
+        let fingerprint = the_entry(&approved, &id).fingerprint;
+        let rerun = || asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        // The swap is refused.
+        let lost = FakeSpool::new()
+            .with_file(
+                id.as_bytes().to_vec(),
+                approved.files()[id.as_bytes()].clone(),
+            )
+            .failing_replace(SpoolError::Gone {
+                name: "replace".to_owned(),
+            });
+        let mut host = rerun_host(PID + 7, START + 7, 0, 0);
+        host.confirmations = backoff_store(&fingerprint);
+        let outcome = serve_with(&mut host, &rerun(), Ok(&lost));
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(backoff_left(&host), 1);
+        // The audit record is refused: nothing is swapped, nothing cleared.
+        let mut host = rerun_host(PID + 7, START + 7, 0, 0);
+        host.confirmations = backoff_store(&fingerprint);
+        host.audit = FakeAuditSink::failing("audit down");
+        let outcome = serve_with(&mut host, &rerun(), Ok(&approved));
+        assert_eq!(outcome.served, Served::Refused(Fault::Broker));
+        assert_eq!(backoff_left(&host), 1);
+        // A real consume clears it.
+        let mut host = rerun_host(PID + 7, START + 7, 0, 0);
+        host.confirmations = backoff_store(&fingerprint);
+        let outcome = serve_with(&mut host, &rerun(), Ok(&approved));
+        assert_eq!(outcome.served, Served::Minted);
+        assert_eq!(backoff_left(&host), 0);
+    }
+
+    #[test]
     fn consumed_publication_fails_closed_on_lock_read_parse_and_replace_errors() {
         let identity = test_identity(PID, START, 0, 0);
         let mut approved = shown_entry();
@@ -5756,9 +5901,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let id = NONCE.as_bytes().to_vec();
         let json = approved.to_json().into_bytes();
         let with = || FakeSpool::new().with_file(id.clone(), json.clone());
+        let mut consumed = approved.clone();
+        consumed.state = xudo_gate::request::ConfirmationState::Consumed;
         let live = unattested_live(&identity);
         let publish = |spool: &FakeSpool| {
-            publish_consumed_approval(spool, &live.binding(&identity), &grant(&approved), NOW)
+            publish_consumed_approval(spool, &live.binding(&identity), &grant(&consumed), NOW)
                 .unwrap_err()
         };
         assert_eq!(
@@ -5768,7 +5915,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(publish(&FakeSpool::new()).code, RefusalCode::SpoolUnusable);
         let garbage = FakeSpool::new().with_file(id.clone(), b"not json".to_vec());
         assert!(
-            publish_consumed_approval(&garbage, &live.binding(&identity), &grant(&approved), NOW)
+            publish_consumed_approval(&garbage, &live.binding(&identity), &grant(&consumed), NOW)
                 .is_err()
         );
         assert_eq!(garbage.files()[&id], b"not json");

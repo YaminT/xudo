@@ -621,16 +621,17 @@ impl SpoolDir {
                 if !matches!(displaced, Ok(inode) if inode == current_inode) {
                     // The exchange requires the destination to exist, so a gate
                     // that consumed it cannot be undone by this replacement.
-                    let _ = renameat_with(
+                    let restored = renameat_with(
                         &self.dir,
                         temp.as_str(),
                         &self.dir,
                         component,
                         RenameFlags::EXCHANGE,
                     );
-                    return Err(std::io::Error::other(
-                        "entry inode changed during replacement",
-                    ));
+                    // A failed swap back leaves the new bytes in place; say so.
+                    return Err(std::io::Error::other(format!(
+                        "entry inode changed during replacement (swap back: {restored:?})"
+                    )));
                 }
                 unlinkat(&self.dir, temp.as_str(), AtFlags::empty()).map_err(std::io::Error::from)
             });
@@ -686,6 +687,7 @@ pub struct FakeSpool {
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
+    replace_error_after_exchange: Option<SpoolError>,
 }
 
 impl FakeSpool {
@@ -747,6 +749,14 @@ impl FakeSpool {
     #[must_use]
     pub fn failing_replace(mut self, error: SpoolError) -> Self {
         self.replace_error = Some(error);
+        self
+    }
+
+    /// Makes [`Spool::replace`] fail after the new bytes are in place, as the
+    /// real spool can when its last unlink or its swap back fails.
+    #[must_use]
+    pub fn failing_replace_after_exchange(mut self, error: SpoolError) -> Self {
+        self.replace_error_after_exchange = Some(error);
         self
     }
 
@@ -854,7 +864,7 @@ impl Spool for FakeSpool {
         match files.get_mut(name) {
             Some(current) if current.as_slice() == expected => {
                 *current = bytes.to_vec();
-                Ok(())
+                scripted(self.replace_error_after_exchange.as_ref())
             }
             _ => Err(SpoolError::Gone {
                 name: name.as_bstr().to_string(),
@@ -1189,6 +1199,10 @@ mod tests {
             std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o600)).unwrap();
             std::fs::rename(&changed, dir.join("request")).unwrap();
         });
+        assert!(
+            format!("{:?}", result.as_ref().unwrap_err()).contains("swap back: Ok(())"),
+            "the swap-back result is part of the error: {result:?}"
+        );
         assert_eq!(kind(result), "Io");
         assert_eq!(spool.read(b"request", 64).unwrap(), b"pending");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
