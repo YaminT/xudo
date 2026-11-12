@@ -33,7 +33,9 @@
 //! [`SpoolDir::open`] always demands root, and the tests point the descriptor
 //! half at a directory they created, with their own uid.
 
+#[cfg(any(test, feature = "fake"))]
 use std::cell::RefCell;
+#[cfg(any(test, feature = "fake"))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
@@ -646,6 +648,7 @@ impl SpoolDir {
 }
 
 /// One call a [`FakeSpool`] received.
+#[cfg(any(test, feature = "fake"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpoolCall {
     /// [`Spool::lock`].
@@ -676,6 +679,7 @@ pub enum SpoolCall {
 /// [`SpoolError::TooLarge`] — and can be told to fail
 /// any operation, so every refusal a broker makes on a spool error is
 /// reachable without a broken filesystem. Every call is recorded in order.
+#[cfg(any(test, feature = "fake"))]
 #[derive(Debug, Default)]
 pub struct FakeSpool {
     files: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
@@ -692,6 +696,7 @@ pub struct FakeSpool {
     replaced: std::cell::Cell<bool>,
 }
 
+#[cfg(any(test, feature = "fake"))]
 impl FakeSpool {
     /// An empty spool that fails nothing.
     pub fn new() -> Self {
@@ -785,6 +790,7 @@ impl FakeSpool {
     }
 }
 
+#[cfg(any(test, feature = "fake"))]
 /// `Ok(())`, or the scripted failure.
 fn scripted(error: Option<&SpoolError>) -> Result<(), SpoolError> {
     match error {
@@ -793,6 +799,7 @@ fn scripted(error: Option<&SpoolError>) -> Result<(), SpoolError> {
     }
 }
 
+#[cfg(any(test, feature = "fake"))]
 impl Spool for FakeSpool {
     fn lock(&self) -> Result<(), SpoolError> {
         self.record(SpoolCall::Lock);
