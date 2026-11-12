@@ -608,16 +608,26 @@ fn clear_approved_backoff(
     platform: &mut Platform<'_>,
     identity: &PeerIdentity,
     request: &BrokerRequest,
-    fingerprint: &str,
+    consumed: &xudo_gate::request::PendingRequest,
     now: u64,
 ) -> Result<(), Served> {
-    if clear_backoff(platform.confirmations, identity.uid, fingerprint, now).is_err() {
+    if clear_backoff(
+        platform.confirmations,
+        identity.uid,
+        &consumed.fingerprint,
+        now,
+    )
+    .is_err()
+    {
         return Err(refuse(
             conn,
             platform.audit,
             &Refusal::broker(
                 RefusalCode::SpoolUnusable,
-                "cannot clear confirmation backoff after the approval was consumed",
+                format!(
+                    "cannot clear confirmation backoff after the approval was consumed (nonce={})",
+                    consumed.nonce
+                ),
             ),
             Some(identity),
             Some(request),
@@ -811,7 +821,7 @@ fn mint_approved(
         platform,
         &identity,
         &request,
-        &authorized.approval().0.fingerprint,
+        &authorized.approval().0,
         platform.clock.boottime_millis(),
     ) {
         return served;
@@ -915,50 +925,43 @@ fn live_attestation(
 /// identity, not against the in-memory copy, which was read from the same
 /// place and would agree with itself. The consumed copy may differ from the
 /// disk only in state, deadline and the consumer's pin.
+///
+/// Every refusal names the nonce. One that comes from `replace` is re-read
+/// while the lock is still held: only bytes that differ from the consumed copy
+/// show the grant is gone, anything else leaves the outcome unknown, because
+/// the exchange may have landed before the error.
 fn publish_consumed_approval(
     spool: &dyn Spool,
     live: &crate::confirm::ApprovalCaller<'_>,
     authorized: &xudo_sys::Authorized<Grant>,
     now: u64,
 ) -> Result<(), Refusal> {
-    swap_to_consumed(spool, live, authorized, now).map_err(|mut error| {
-        // The swap can fail after the exchange put the consumed bytes in
-        // place (the last unlink, a failed swap back): then the entry on disk
-        // is spendable and the record must not claim the grant is gone.
-        let landed = matches!(
-            spool.read(authorized.approval().0.nonce.as_bytes(), crate::mint::MAX_ENTRY_BYTES),
-            Ok(bytes) if bytes == authorized.approval().0.to_json().as_bytes()
-        );
-        let note = if landed {
-            "consume outcome unknown; the consumed entry is on disk"
-        } else {
-            "supersedes the grant"
-        };
-        error.detail = format!(
-            "{} ({note} for nonce={})",
-            error.detail,
-            authorized.approval().0.nonce
-        );
-        error
-    })
-}
-
-fn swap_to_consumed(
-    spool: &dyn Spool,
-    live: &crate::confirm::ApprovalCaller<'_>,
-    authorized: &xudo_sys::Authorized<Grant>,
-    now: u64,
-) -> Result<(), Refusal> {
+    const SUPERSEDES: &str = "supersedes the grant";
+    const UNKNOWN: &str = "consume outcome unknown; the consumed entry may be on disk";
     let entry = &authorized.approval().0;
+    let note = |mut error: Refusal, note: &str| {
+        error.detail = format!("{} ({note} for nonce={})", error.detail, entry.nonce);
+        error
+    };
+    if entry.state != xudo_gate::request::ConfirmationState::Consumed {
+        // A grant proves some record exists, not that it is a consume record.
+        return Err(note(
+            Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "the entry to swap in is not a consumed one",
+            ),
+            SUPERSEDES,
+        ));
+    }
     let json = entry.to_json();
-    let _guard = SpoolGuard::lock(spool).map_err(|error| Refusal::from(&error))?;
+    let _guard =
+        SpoolGuard::lock(spool).map_err(|error| note(Refusal::from(&error), SUPERSEDES))?;
     let id = entry.nonce.as_bytes();
     let old = spool
         .read(id, crate::mint::MAX_ENTRY_BYTES)
-        .map_err(|error| Refusal::from(&error))?;
-    let current = parse_entry(&old)?;
+        .map_err(|error| note(Refusal::from(&error), SUPERSEDES))?;
+    let current = parse_entry(&old).map_err(|error| note(error, SUPERSEDES))?;
     let matches = current.state == xudo_gate::request::ConfirmationState::Approved
-        && entry.state == xudo_gate::request::ConfirmationState::Consumed
         && crate::confirm::identity_matches(&current, live)
         && entry.caller_pid == live.pid
         && entry.caller_starttime == live.starttime
@@ -977,14 +980,24 @@ fn swap_to_consumed(
         && current.deadline.0 > now
         && entry.deadline.0 <= current.deadline.0;
     if !matches {
-        return Err(Refusal::client(
-            RefusalCode::RequestUnknown,
-            "approval changed before it was consumed",
+        return Err(note(
+            Refusal::client(
+                RefusalCode::RequestUnknown,
+                "approval changed before it was consumed",
+            ),
+            SUPERSEDES,
         ));
     }
-    spool
-        .replace(id, &old, json.as_bytes())
-        .map_err(|error| Refusal::from(&error))
+    spool.replace(id, &old, json.as_bytes()).map_err(|error| {
+        let differs = matches!(
+            spool.read(id, crate::mint::MAX_ENTRY_BYTES),
+            Ok(bytes) if bytes != json.as_bytes()
+        );
+        note(
+            Refusal::from(&error),
+            if differs { SUPERSEDES } else { UNKNOWN },
+        )
+    })
 }
 
 /// The class a pending entry of this caller would be minted with. An agent
@@ -3658,7 +3671,31 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             refusal_of(&outcome.answer),
             Some(RefusalCode::SpoolUnusable)
         );
+        // The consume landed before the clear failed: the entry is spent and
+        // pinned to the re-run consumer, not left approved.
         assert_eq!(spool.files().len(), 1);
+        let on_disk = the_entry(&spool, NONCE);
+        assert_eq!(
+            on_disk.state,
+            xudo_gate::request::ConfirmationState::Consumed
+        );
+        assert_eq!((on_disk.caller_pid, on_disk.caller_starttime), (PID, START));
+        // The log holds the grant, then the refusal that names its nonce.
+        let records = host.audit.records();
+        let decisions: Vec<_> = records.iter().map(|record| record.decision).collect();
+        assert_eq!(
+            decisions,
+            [
+                xudo_audit::record::Decision::AwaitingConfirmation,
+                xudo_audit::record::Decision::Denied
+            ]
+        );
+        assert!(
+            records[1]
+                .evidence
+                .iter()
+                .any(|line| line.contains(&format!("nonce={NONCE}")))
+        );
     }
 
     #[test]
@@ -5785,49 +5822,99 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error =
             publish_consumed_approval(&spool, &live.binding(&identity), &grant(&approved), NOW)
                 .unwrap_err();
-        assert_eq!(error.code, RefusalCode::RequestUnknown);
+        assert_eq!(error.code, RefusalCode::BrokerUnusable);
+        assert_eq!(error.fault, Fault::Broker);
         assert_eq!(spool.files()[NONCE.as_bytes()], json);
-        assert!(
-            !spool
-                .calls()
-                .contains(&xudo_sys::SpoolCall::Replace(NONCE.as_bytes().to_vec()))
-        );
+        assert!(spool.calls().is_empty());
     }
 
-    #[test]
-    fn a_swap_that_errors_after_the_exchange_is_not_logged_as_a_lost_grant() {
-        let identity = test_identity(PID, START, 0, 0);
+    fn swap_entries() -> (PendingRequest, PendingRequest) {
         let mut approved = shown_entry();
         approved.state = xudo_gate::request::ConfirmationState::Approved;
         let mut consumed = approved.clone();
         consumed.state = xudo_gate::request::ConfirmationState::Consumed;
+        (approved, consumed)
+    }
+
+    fn swap_detail(spool: &dyn Spool, consumed: &PendingRequest) -> String {
+        let identity = test_identity(PID, START, 0, 0);
         let live = unattested_live(&identity);
+        publish_consumed_approval(spool, &live.binding(&identity), &grant(consumed), NOW)
+            .unwrap_err()
+            .detail
+    }
+
+    #[test]
+    fn a_swap_that_errors_after_the_exchange_is_not_logged_as_a_lost_grant() {
+        let (approved, consumed) = swap_entries();
         let after = FakeSpool::new()
             .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
-            .failing_replace_after_exchange(SpoolError::Gone {
-                name: "unlink".to_owned(),
-            });
-        let error =
-            publish_consumed_approval(&after, &live.binding(&identity), &grant(&consumed), NOW)
-                .unwrap_err();
-        assert!(error.detail.contains("consume outcome unknown"));
-        assert!(!error.detail.contains("supersedes the grant"));
+            .failing_replace_after_exchange(gone("unlink"));
+        let detail = swap_detail(&after, &consumed);
+        assert!(detail.contains("consume outcome unknown"));
+        assert!(!detail.contains("supersedes the grant"));
+        assert!(detail.contains(&format!("nonce={NONCE}")));
         // The consumed bytes really are on disk.
         assert_eq!(
             the_entry(&after, NONCE).state,
             xudo_gate::request::ConfirmationState::Consumed
         );
-        // A swap that failed before the exchange still supersedes the grant.
+    }
+
+    #[test]
+    fn a_swap_that_errors_after_the_exchange_and_cannot_be_reread_is_unknown() {
+        let (approved, consumed) = swap_entries();
+        let after = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
+            .failing_replace_after_exchange(gone("unlink"))
+            .failing_read_after_replace();
+        // A spendable consumed entry is on disk; the log must not say it is gone.
+        let detail = swap_detail(&after, &consumed);
+        assert!(detail.contains("consume outcome unknown"));
+        assert!(!detail.contains("supersedes the grant"));
+    }
+
+    #[test]
+    fn a_swap_that_fails_before_the_exchange_supersedes_the_grant() {
+        let (approved, consumed) = swap_entries();
         let before = FakeSpool::new()
             .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
-            .failing_replace(SpoolError::Gone {
-                name: "exchange".to_owned(),
-            });
-        let error =
-            publish_consumed_approval(&before, &live.binding(&identity), &grant(&consumed), NOW)
-                .unwrap_err();
-        assert!(error.detail.contains("supersedes the grant"));
-        assert!(!error.detail.contains("consume outcome unknown"));
+            .failing_replace(gone("exchange"));
+        let detail = swap_detail(&before, &consumed);
+        assert!(detail.contains("supersedes the grant"));
+        assert!(!detail.contains("consume outcome unknown"));
+        assert!(detail.contains(&format!("nonce={NONCE}")));
+    }
+
+    #[test]
+    fn a_swap_refused_before_replace_never_rereads_the_entry() {
+        let (approved, consumed) = swap_entries();
+        let read = || xudo_sys::SpoolCall::Read(NONCE.as_bytes().to_vec());
+        // The lock fails: nothing is read at all.
+        let locked = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
+            .failing_lock(gone("lock"));
+        assert!(swap_detail(&locked, &consumed).contains("supersedes the grant"));
+        assert!(!locked.calls().contains(&read()));
+        // The entry cannot be read: the one failed read is the only read.
+        let unreadable = FakeSpool::new()
+            .with_file(NONCE.as_bytes().to_vec(), approved.to_json().into_bytes())
+            .failing_read(NONCE.as_bytes());
+        assert!(swap_detail(&unreadable, &consumed).contains("supersedes the grant"));
+        // The entry does not parse, or no longer matches: one read, no replace.
+        let mut changed = approved.clone();
+        changed.argv.push("extra".to_owned());
+        for bytes in [b"{".to_vec(), changed.to_json().into_bytes()] {
+            let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes);
+            assert!(swap_detail(&spool, &consumed).contains("supersedes the grant"));
+            let calls = spool.calls();
+            assert_eq!(calls.iter().filter(|call| **call == read()).count(), 1);
+            assert!(
+                !calls
+                    .iter()
+                    .any(|call| matches!(call, xudo_sys::SpoolCall::Replace(_)))
+            );
+        }
     }
 
     fn backoff_store(fingerprint: &str) -> FakeSpool {

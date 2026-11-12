@@ -105,8 +105,20 @@ fn exercise_real_pty(input: &str, approve: bool, expected_token: &str, pre_input
         // the watch, so the refusal that stops the watcher waits for the answer.
         let mut answered = false;
         let mut finished = false;
+        // A watcher that stops answering must fail the test, not hang it.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "the watcher stopped asking");
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
             let mut bytes = Vec::new();
             stream.read_to_end(&mut bytes).unwrap();
             let request = BrokerRequest::parse(&bytes).unwrap();
