@@ -48,6 +48,7 @@ fn queue_host() -> ido::Host {
         queued_by: Some("xudo".to_owned()),
         lock_wait: std::time::Duration::from_secs(2),
         frame_delay: std::time::Duration::ZERO,
+        xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
     }
 }
 

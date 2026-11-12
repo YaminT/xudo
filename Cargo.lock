@@ -251,6 +251,7 @@ name = "ido"
 version = "0.1.0-beta.1"
 dependencies = [
  "clap",
+ "insta",
  "serde",
  "serde_json",
  "term-sanitize",

@@ -65,7 +65,13 @@ pub struct Host {
     pub lock_wait: Duration,
     /// Delay between celebration frames.
     pub frame_delay: Duration,
+    /// Absolute path of the `xudo` front-end that runs a root-marked entry.
+    /// Never searched for on `PATH`; the binary passes [`XUDO_FRONT_END`].
+    pub xudo_front_end: PathBuf,
 }
+
+/// Where the `xudo` front-end is installed.
+pub const XUDO_FRONT_END: &str = "/usr/bin/xudo";
 
 /// Opens the raw terminal for the picker.
 pub type OpenTerminal<'a> = dyn FnMut() -> std::io::Result<Box<dyn Terminal>> + 'a;
@@ -172,6 +178,10 @@ struct QueueArgs {
     /// time and never run automatically. Repeat for each token.
     #[arg(long = "dry-run-of", value_name = "ARG", allow_hyphen_values = true)]
     dry_run_of: Vec<OsString>,
+    /// The command needs root: running it means `xudo exec -- <command>`, with
+    /// policy, the deny-list, an audit record, and the human's password.
+    #[arg(long)]
+    root: bool,
     /// The command, as separate arguments after `--`. Never a shell string.
     #[arg(last = true, required = true, value_name = "ARGV")]
     argv: Vec<OsString>,
@@ -334,7 +344,9 @@ pub struct Enqueued {
 /// validation, duplicate check and entry format. Runs nothing.
 ///
 /// `argv` is stored exactly as given; `reason` is untrusted display text.
-/// The directory is the host's current one.
+/// The directory is the host's current one. The entry is marked `via_xudo`:
+/// the only caller is `xudo exec --queue`, so what it queues is exactly what
+/// `xudo` was asked to run.
 ///
 /// # Errors
 ///
@@ -346,8 +358,17 @@ pub fn enqueue(
     reason: Option<String>,
 ) -> Result<Enqueued, IdoError> {
     let cwd = resolve_cwd(None, host)?;
-    let (entry, already) =
-        enqueue_entry(host, argv, cwd, reason, None, None, Vec::new(), Vec::new())?;
+    let (entry, already) = enqueue_entry(
+        host,
+        argv,
+        cwd,
+        reason,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        true,
+    )?;
     Ok(Enqueued {
         id: entry.id,
         already,
@@ -364,17 +385,21 @@ fn enqueue_entry(
     step: Option<u32>,
     needs: Vec<u64>,
     dry_run_of: Vec<String>,
+    via_xudo: bool,
 ) -> Result<(Entry, bool), IdoError> {
     let store = store(host)?;
     let _lock = store.lock_waiting(host.lock_wait)?;
     let existing = store.load()?;
-    if let Some(same) = existing
-        .iter()
-        .find(|e| e.argv == command && e.cwd == cwd && e.group == group && e.step == step)
-    {
+    if let Some(same) = existing.iter().find(|e| {
+        e.argv == command
+            && e.cwd == cwd
+            && e.group == group
+            && e.step == step
+            && e.via_xudo == via_xudo
+    }) {
         return Ok((same.clone(), true));
     }
-    let entry = Entry::build(
+    let mut entry = Entry::build(
         &existing,
         command,
         reason,
@@ -386,6 +411,7 @@ fn enqueue_entry(
         host.now_unix,
         host.queued_by.clone(),
     )?;
+    entry.via_xudo = via_xudo;
     store.append(&entry)?;
     Ok((entry, false))
 }
@@ -403,6 +429,7 @@ fn queue(args: QueueArgs, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError>
         args.step,
         args.needs,
         dry_run_of,
+        args.root,
     )?;
     if already {
         let _ = writeln!(
@@ -536,6 +563,7 @@ fn run_selected(
         now_unix: host.now_unix,
         child_env,
         lock_wait: host.lock_wait,
+        xudo_front_end: &host.xudo_front_end,
     };
     let report = run_ids(store, ids, &ctx, io.out)?;
     let _ = write!(io.out, "{}", report.summary());
@@ -561,6 +589,20 @@ fn run(args: &RunArgs, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
     if ids.is_empty() {
         let _ = writeln!(io.out, "ido: nothing to run");
         return Ok(0);
+    }
+    if args.yes {
+        let rooted: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| queue.iter().any(|e| e.id == *id && e.via_xudo))
+            .collect();
+        if !rooted.is_empty() {
+            return Err(IdoError::Refused(format!(
+                "{} runs through `xudo exec` as root, and --yes skips the confirmation; \
+                 nothing ran. Use the picker or run from a terminal and type run",
+                ids_text(&rooted)
+            )));
+        }
     }
     if !args.yes && !confirmed(&ids, &queue, host, io)? {
         let _ = writeln!(io.out, "ido: not confirmed; nothing ran");
@@ -778,6 +820,7 @@ mod tests {
             queued_by: Some("claude-code".into()),
             lock_wait: Duration::from_millis(20),
             frame_delay: Duration::ZERO,
+            xudo_front_end: PathBuf::from(XUDO_FRONT_END),
         }
     }
 
@@ -965,6 +1008,138 @@ mod tests {
         let again = ido(&h, &["queue", "--", "make", "install"]);
         assert_eq!(again.code, 0);
         assert!(again.out.contains("already queued as #1"), "{}", again.out);
+        assert_eq!(queue_ids(&h), vec![1]);
+    }
+
+    #[test]
+    fn queue_root_marks_the_entry_and_the_run_goes_through_xudo() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut h = host("queue-root");
+        let fake = h.cwd.clone().unwrap().join("xudo");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        h.xudo_front_end = fake.clone();
+
+        let q = ido(
+            &h,
+            &["queue", "--root", "--", "systemctl", "restart", "nginx"],
+        );
+        assert_eq!(q.code, 0, "{}", q.err);
+        let entry = store(&h).unwrap().load().unwrap().remove(0);
+        assert!(entry.via_xudo);
+        assert_eq!(entry.argv, ["systemctl", "restart", "nginx"]);
+        let list = ido(&h, &["list"]);
+        assert!(
+            list.out.contains("runs through `xudo exec`"),
+            "{}",
+            list.out
+        );
+        // The same argv without the marker is a different entry.
+        let plain = ido(&h, &["queue", "--", "systemctl", "restart", "nginx"]);
+        assert!(plain.out.contains("queued #2"), "{}", plain.out);
+        let again = ido(
+            &h,
+            &["queue", "--root", "--", "systemctl", "restart", "nginx"],
+        );
+        assert!(again.out.contains("already queued as #1"), "{}", again.out);
+
+        let h = tty(h);
+        let run = ido_with(&h, &["run", "1"], "run\n", Vec::new());
+        assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+        let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
+        assert_eq!(args, "exec\n--\nsystemctl\nrestart\nnginx\n");
+        assert_eq!(queue_ids(&h), vec![2]);
+    }
+
+    /// A fake `xudo` that records its argv, so a test can see whether it ran.
+    fn fake_xudo(h: &mut Host) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = h.cwd.clone().unwrap().join("xudo");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'ran\\n' >> \"$0.log\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        h.xudo_front_end = fake.clone();
+        fake
+    }
+
+    fn ran(fake: &std::path::Path) -> bool {
+        std::path::Path::new(&format!("{}.log", fake.display())).exists()
+    }
+
+    #[test]
+    fn yes_never_runs_a_root_marked_entry() {
+        let mut h = host("yes-root");
+        let fake = fake_xudo(&mut h);
+        ido(
+            &h,
+            &["queue", "--root", "--", "systemctl", "restart", "nginx"],
+        );
+        let out = ido(&h, &["run", "--yes", "1"]);
+        assert_eq!(out.code, 2);
+        assert!(out.err.contains("#1"), "{}", out.err);
+        assert!(out.err.contains("--yes"), "{}", out.err);
+        assert!(!ran(&fake));
+        assert_eq!(queue_ids(&h), vec![1]);
+    }
+
+    #[test]
+    fn yes_all_refuses_when_any_entry_is_root_marked() {
+        let mut h = host("yes-all-root");
+        let fake = fake_xudo(&mut h);
+        ido(&h, &["queue", "--", "true"]);
+        ido(&h, &["queue", "--root", "--", "systemctl", "stop", "x"]);
+        for args in [
+            &["run", "--all", "--yes"][..],
+            &["run", "--yes", "1", "2"][..],
+        ] {
+            let out = ido(&h, args);
+            assert_eq!(out.code, 2, "{}", out.err);
+            assert!(out.err.contains("#2"), "{}", out.err);
+            assert!(!out.err.contains("#1 "), "{}", out.err);
+            assert!(!ran(&fake));
+            assert_eq!(queue_ids(&h), vec![1, 2]);
+        }
+        ido(
+            &h,
+            &[
+                "queue",
+                "--group",
+                "g",
+                "--root",
+                "--",
+                "systemctl",
+                "stop",
+                "y",
+            ],
+        );
+        let group = ido(&h, &["run", "--group", "g", "--yes"]);
+        assert_eq!(group.code, 2);
+        assert!(!ran(&fake));
+        assert_eq!(queue_ids(&h), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_plain_entry_still_runs_with_yes() {
+        let mut h = host("yes-plain");
+        let fake = fake_xudo(&mut h);
+        ido(&h, &["queue", "--", "true"]);
+        let out = ido(&h, &["run", "--yes", "1"]);
+        assert_eq!(out.code, 0, "{}{}", out.out, out.err);
+        assert!(!ran(&fake), "a plain entry must not go through xudo");
+        assert!(queue_ids(&h).is_empty());
+    }
+
+    #[test]
+    fn an_agent_queued_root_entry_still_needs_the_typed_word_to_run() {
+        let h = tty(host("root-typed"));
+        ido(&h, &["queue", "--root", "--", "true"]);
+        let refused = ido_with(&h, &["run", "1"], "no\n", Vec::new());
+        assert_eq!(refused.code, 1);
+        assert!(refused.out.contains("not confirmed"), "{}", refused.out);
+        assert!(
+            refused.out.contains("runs through `xudo exec`"),
+            "{}",
+            refused.out
+        );
         assert_eq!(queue_ids(&h), vec![1]);
     }
 

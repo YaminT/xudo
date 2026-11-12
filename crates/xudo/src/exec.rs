@@ -1769,6 +1769,7 @@ mod tests {
             queued_by: Some("xudo".to_owned()),
             lock_wait: Duration::from_secs(1),
             frame_delay: Duration::ZERO,
+            xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
         }
     }
 
@@ -1823,6 +1824,7 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].argv, args);
             assert_eq!(entries[0].queued_by.as_deref(), Some("xudo"));
+            assert!(entries[0].via_xudo, "a denied command is xudo-bound");
             let reason = entries[0].reason.as_deref().unwrap();
             assert!(reason.contains(&format!("{code:?}")), "{reason}");
             // The same command again is the same entry, not a second.

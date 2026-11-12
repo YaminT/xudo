@@ -1646,6 +1646,17 @@ mod tests {
     }
 
     #[test]
+    fn an_option_looking_exec_argv_is_data_after_the_separator() {
+        for first in ["--queue", "--config-file"] {
+            let cli = Cli::try_parse_from(["xudo", "exec", "--", first, "x"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Exec { ref argv, queue: false } if argv == &[first, "x"]
+            ));
+        }
+    }
+
+    #[test]
     fn doctor_names_the_attestation_rung_not_just_the_kernel_version() {
         // "Why did this agent get a password prompt" is answered by the rung and
         // by nothing else in the output.

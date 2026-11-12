@@ -29,7 +29,10 @@ A line this version cannot parse refuses the whole file; unknown keys are an
 error, never ignored.
 .TP
 .B schema_version
-Always 1 in this version.
+2 in this version.
+A line with version 1 has no
+.B via_xudo
+and is read as an entry that runs as you.
 .TP
 .B id
 Monotonic, unique within the file's history.
@@ -47,6 +50,22 @@ Unix seconds.
 .TP
 .B queued_by
 Who queued it, by the caller's own claim; shown as unverified.
+.TP
+.B via_xudo
+Optional boolean, written only when true.
+The queuer's explicit mark that the entry needs root: running it means
+.B xudo exec \-\- argv...
+instead of running
+.B argv
+directly.
+Never inferred from the command.
+It grants nothing: the entry still has to be selected and confirmed by the
+user, and
+.B xudo
+still applies its policy and asks for the user's password.
+A version 1
+.B ido
+that meets this key refuses the file.
 .TP
 .BR attempts ", " last_exit
 Set when a run fails.

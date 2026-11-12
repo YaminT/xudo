@@ -16,6 +16,7 @@
 
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -94,6 +95,8 @@ pub struct RunContext<'a> {
     pub child_env: &'a [(String, String)],
     /// How long to wait for the queue lock.
     pub lock_wait: Duration,
+    /// Absolute path of the `xudo` front-end that runs a root-marked entry.
+    pub xudo_front_end: &'a Path,
 }
 
 /// Runs `ids`, in order, stopping on the first failure.
@@ -136,10 +139,29 @@ pub fn run_ids(
             entry
         };
 
+        if entry.via_xudo && !xudo_installed(ctx.xudo_front_end) {
+            // Nothing ran and nothing is recorded as an attempt: the entry
+            // stays queued exactly as it was.
+            report.skipped.push((
+                *id,
+                format!(
+                    "needs root, and the `xudo` front-end is not installed at {}; \
+                     it stays queued",
+                    ctx.xudo_front_end.display()
+                ),
+            ));
+            continue;
+        }
+
         let shown = render::argv_line(&entry.argv, render::FIELD_COLS);
-        let _ = writeln!(out, "ido: running #{id}: {}", shown.text);
+        let via = if entry.via_xudo {
+            " through xudo exec"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "ido: running #{id}{via}: {}", shown.text);
         let _ = out.flush();
-        let outcome = spawn_and_wait(&entry, ctx.child_env);
+        let outcome = spawn_and_wait(&entry, ctx);
         let exit = exit_code_of(&outcome);
         {
             let _lock = store.lock_waiting(ctx.lock_wait)?;
@@ -167,8 +189,21 @@ pub fn run_ids(
     Ok(report)
 }
 
+/// Whether `path` is an absolute path to an executable regular file.
+fn xudo_installed(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_absolute()
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 /// Spawns the entry's argv and waits, mapping every fate to an [`Outcome`].
-fn spawn_and_wait(entry: &Entry, child_env: &[(String, String)]) -> Outcome {
+///
+/// A root-marked entry runs as `<xudo> exec -- <argv>`: the argv follows a
+/// literal `--`, as separate arguments, so nothing in it can be read as an
+/// option to `xudo` and no shell is involved. The child inherits the human's
+/// terminal, so the password prompt happens there.
+fn spawn_and_wait(entry: &Entry, ctx: &RunContext<'_>) -> Outcome {
+    let child_env = ctx.child_env;
     // `Command::new` performs a PATH search, which the workspace lint bans
     // because in a *privileged* exec path, PATH is attacker leverage. Here it
     // is the point: ido runs the command with the human's own shell
@@ -176,8 +211,16 @@ fn spawn_and_wait(entry: &Entry, child_env: &[(String, String)]) -> Outcome {
     // privilege to leak. The argv executed is byte-identical to what was
     // stored and displayed.
     #[allow(clippy::disallowed_methods)]
-    let mut command = std::process::Command::new(entry.argv.first().map_or("", String::as_str));
-    command.args(entry.argv.get(1..).unwrap_or_default());
+    let mut command = if entry.via_xudo {
+        // Absolute and checked by the caller: no `PATH` search for this one.
+        let mut command = std::process::Command::new(ctx.xudo_front_end);
+        command.arg("exec").arg("--").args(&entry.argv);
+        command
+    } else {
+        let mut command = std::process::Command::new(entry.argv.first().map_or("", String::as_str));
+        command.args(entry.argv.get(1..).unwrap_or_default());
+        command
+    };
     if let Some(cwd) = &entry.cwd {
         command.current_dir(cwd);
     }
@@ -233,6 +276,9 @@ fn record_run(
 ) -> Result<(), IdoError> {
     let chain = store.read_log()?;
     let mut evidence = vec![format!("entry={}", entry.id), format!("ran_at={now_unix}")];
+    if entry.via_xudo {
+        evidence.push("runner=xudo-exec".to_owned());
+    }
     if let Some(reason) = &entry.reason {
         evidence.push(format!("reason={reason}"));
     }
@@ -287,14 +333,18 @@ mod tests {
             queued_by: None,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         }
     }
 
-    const CTX: RunContext<'static> = RunContext {
-        now_unix: 100,
-        child_env: &[],
-        lock_wait: Duration::from_millis(50),
-    };
+    fn ctx() -> RunContext<'static> {
+        RunContext {
+            now_unix: 100,
+            child_env: &[],
+            lock_wait: Duration::from_millis(50),
+            xudo_front_end: Path::new("/nonexistent/xudo"),
+        }
+    }
 
     #[test]
     fn a_failure_stops_the_run_and_is_recorded() {
@@ -307,7 +357,7 @@ mod tests {
             ])
             .unwrap();
         let mut out = Vec::new();
-        let report = run_ids(&store, &[1, 2, 3], &CTX, &mut out).unwrap();
+        let report = run_ids(&store, &[1, 2, 3], &ctx(), &mut out).unwrap();
         assert_eq!(report.succeeded, vec![1]);
         assert_eq!(report.failed, Some((2, 3)));
         assert_eq!(report.not_reached, vec![3]);
@@ -341,7 +391,7 @@ mod tests {
         step2.step = Some(2);
         store.replace(&[step1, step2]).unwrap();
         let mut out = Vec::new();
-        let report = run_ids(&store, &[9, 2], &CTX, &mut out).unwrap();
+        let report = run_ids(&store, &[9, 2], &ctx(), &mut out).unwrap();
         assert!(report.succeeded.is_empty());
         assert_eq!(
             report.skipped,
@@ -375,7 +425,7 @@ mod tests {
         ];
         let ctx = RunContext {
             child_env: &env,
-            ..CTX
+            ..ctx()
         };
         let report = run_ids(&store, &[1], &ctx, &mut Vec::new()).unwrap();
         assert_eq!(report.succeeded, vec![1], "{report:?}");
@@ -388,12 +438,217 @@ mod tests {
         let mut missing_dir = entry(2, &["true"]);
         missing_dir.cwd = Some("/definitely/not/a/dir".into());
         store.replace(&[entry(1, &[]), missing_dir]).unwrap();
-        let report = run_ids(&store, &[1], &CTX, &mut Vec::new()).unwrap();
+        let report = run_ids(&store, &[1], &ctx(), &mut Vec::new()).unwrap();
         assert_eq!(report.failed, Some((1, SPAWN_FAILURE_EXIT)));
-        let report = run_ids(&store, &[2], &CTX, &mut Vec::new()).unwrap();
+        let report = run_ids(&store, &[2], &ctx(), &mut Vec::new()).unwrap();
         assert_eq!(report.failed, Some((2, SPAWN_FAILURE_EXIT)));
         let log = store.read_log().unwrap();
         assert!(!log.records()[0].outcome.executed());
+    }
+
+    /// Installs a fake `xudo` that records its argv (NUL-separated) next to
+    /// itself and exits with the code stored beside it.
+    fn fake_xudo(dir: &Path, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("xudo");
+        let script = "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$0.args\"\nexit CODE\n"
+            .replace("CODE", &code.to_string());
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn recorded_args(xudo: &Path) -> Option<Vec<String>> {
+        let raw = std::fs::read(format!("{}.args", xudo.display())).ok()?;
+        let text = String::from_utf8(raw).unwrap();
+        Some(
+            text.strip_suffix('\0')
+                .unwrap_or(&text)
+                .split('\0')
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    fn marked(id: u64, argv: &[&str]) -> Entry {
+        let mut e = entry(id, argv);
+        e.via_xudo = true;
+        e
+    }
+
+    #[test]
+    fn ido_runs_a_privileged_entry_through_xudo_exec() {
+        let (dir, store) = store("via-xudo");
+        let xudo = fake_xudo(&dir, 0);
+        store
+            .replace(&[marked(1, &["systemctl", "restart", "nginx"])])
+            .unwrap();
+        let ctx = RunContext {
+            xudo_front_end: &xudo,
+            ..ctx()
+        };
+        let mut out = Vec::new();
+        let report = run_ids(&store, &[1], &ctx, &mut out).unwrap();
+        assert_eq!(report.succeeded, vec![1], "{report:?}");
+        assert_eq!(
+            recorded_args(&xudo).unwrap(),
+            ["exec", "--", "systemctl", "restart", "nginx"]
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("ido: running #1 through xudo exec: systemctl restart nginx"),
+            "{text}"
+        );
+        assert!(store.load().unwrap().is_empty());
+        let log = store.read_log().unwrap();
+        assert!(
+            log.records()[0]
+                .evidence
+                .contains(&"runner=xudo-exec".to_owned())
+        );
+        assert_eq!(log.records()[0].argv, ["systemctl", "restart", "nginx"]);
+    }
+
+    #[test]
+    fn an_entry_without_the_root_marker_runs_as_before() {
+        let (dir, store) = store("no-marker");
+        let xudo = fake_xudo(&dir, 0);
+        store.replace(&[entry(1, &["true"])]).unwrap();
+        let ctx = RunContext {
+            xudo_front_end: &xudo,
+            ..ctx()
+        };
+        let mut out = Vec::new();
+        let report = run_ids(&store, &[1], &ctx, &mut out).unwrap();
+        assert_eq!(report.succeeded, vec![1]);
+        assert!(recorded_args(&xudo).is_none(), "xudo must not be involved");
+        assert!(!String::from_utf8(out).unwrap().contains("xudo"));
+        let log = store.read_log().unwrap();
+        assert!(
+            log.records()[0]
+                .evidence
+                .iter()
+                .all(|e| !e.contains("xudo"))
+        );
+    }
+
+    #[test]
+    fn the_xudo_runner_never_goes_through_a_shell() {
+        let (dir, store) = store("no-shell");
+        let xudo = fake_xudo(&dir, 0);
+        let pwned = dir.join("pwned");
+        let hostile = [
+            "echo",
+            "$(touch pwned)",
+            "; touch pwned",
+            "`touch pwned`",
+            "a b",
+            "*",
+            "",
+            "it's",
+        ];
+        let mut e = marked(1, &hostile);
+        e.cwd = Some(dir.to_str().unwrap().to_owned());
+        store.replace(&[e]).unwrap();
+        let ctx = RunContext {
+            xudo_front_end: &xudo,
+            ..ctx()
+        };
+        let report = run_ids(&store, &[1], &ctx, &mut Vec::new()).unwrap();
+        assert_eq!(report.succeeded, vec![1]);
+        let mut want = vec!["exec".to_owned(), "--".to_owned()];
+        want.extend(hostile.iter().map(|s| (*s).to_owned()));
+        assert_eq!(recorded_args(&xudo).unwrap(), want);
+        assert!(!pwned.exists());
+    }
+
+    #[test]
+    fn a_literal_double_dash_or_option_first_element_stays_after_the_separator() {
+        // The queuer is untrusted: whatever its argv starts with, it lands
+        // after `exec --`, so it can never be read as an option to `xudo`.
+        for argv in [
+            vec!["--", "systemctl"],
+            vec!["--output", "json", "true"],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["exec", "--", "true"],
+        ] {
+            let (dir, store) = store("dashes");
+            let xudo = fake_xudo(&dir, 0);
+            store.replace(&[marked(1, &argv)]).unwrap();
+            let ctx = RunContext {
+                xudo_front_end: &xudo,
+                ..ctx()
+            };
+            run_ids(&store, &[1], &ctx, &mut Vec::new()).unwrap();
+            let mut want = vec!["exec".to_owned(), "--".to_owned()];
+            want.extend(argv.iter().map(|s| (*s).to_owned()));
+            assert_eq!(recorded_args(&xudo).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn a_missing_xudo_front_end_refuses_and_keeps_the_entry_queued() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store("no-xudo");
+        let not_executable = dir.join("plain");
+        std::fs::write(&not_executable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for absent in [
+            PathBuf::from("/nonexistent/xudo"),
+            PathBuf::from("xudo"),
+            dir.clone(),
+            not_executable,
+        ] {
+            store
+                .replace(&[
+                    marked(1, &["systemctl", "restart", "nginx"]),
+                    entry(2, &["true"]),
+                ])
+                .unwrap();
+            let ctx = RunContext {
+                xudo_front_end: &absent,
+                ..ctx()
+            };
+            let mut out = Vec::new();
+            let report = run_ids(&store, &[1, 2], &ctx, &mut out).unwrap();
+            assert_eq!(report.succeeded, vec![2], "the rest still runs");
+            assert_eq!(report.failed, None);
+            assert_eq!(report.skipped.len(), 1, "{report:?}");
+            assert_eq!(report.skipped[0].0, 1);
+            assert!(report.skipped[0].1.contains("not installed"), "{report:?}");
+            assert_eq!(report.exit_code(), 1);
+            let left = store.load().unwrap();
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].id, 1);
+            assert_eq!(left[0].attempts, 0);
+            assert_eq!(left[0].last_exit, None);
+            assert!(!String::from_utf8(out).unwrap().contains("running #1"));
+        }
+        assert_eq!(store.read_log().unwrap().len(), 4, "only the plain runs");
+    }
+
+    #[test]
+    fn the_exit_status_of_xudo_exec_is_propagated() {
+        let (dir, store) = store("xudo-exit");
+        let xudo = fake_xudo(&dir, 7);
+        store
+            .replace(&[
+                marked(1, &["systemctl", "restart", "nginx"]),
+                entry(2, &["true"]),
+            ])
+            .unwrap();
+        let ctx = RunContext {
+            xudo_front_end: &xudo,
+            ..ctx()
+        };
+        let report = run_ids(&store, &[1, 2], &ctx, &mut Vec::new()).unwrap();
+        assert_eq!(report.failed, Some((1, 7)));
+        assert_eq!(report.not_reached, vec![2]);
+        let left = store.load().unwrap();
+        assert_eq!(left[0].last_exit, Some(7));
+        assert_eq!(left[0].attempts, 1);
+        assert!(left[0].via_xudo, "the marker survives a failed attempt");
     }
 
     #[test]
@@ -401,7 +656,7 @@ mod tests {
         let (_, store) = store("locked");
         store.replace(&[entry(1, &["true"])]).unwrap();
         let _held = store.lock().unwrap();
-        let err = run_ids(&store, &[1], &CTX, &mut Vec::new()).unwrap_err();
+        let err = run_ids(&store, &[1], &ctx(), &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("another ido process"), "{err}");
     }
 
@@ -430,7 +685,7 @@ mod tests {
         ];
         let ctx = RunContext {
             child_env: &env,
-            ..CTX
+            ..ctx()
         };
         run_ids(&store, &[1], &ctx, &mut Vec::new())
             .unwrap_err()
@@ -456,7 +711,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .unwrap();
-        let err = run_ids(&store, &[1], &CTX, &mut Vec::new()).unwrap_err();
+        let err = run_ids(&store, &[1], &ctx(), &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("cannot be parsed"), "{err}");
         assert!(store.read_log().unwrap().is_empty(), "nothing ran");
     }

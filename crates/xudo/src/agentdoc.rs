@@ -25,7 +25,7 @@ pub enum DocFormat {
 }
 
 /// The sentinel that opens a generated block.
-pub const BEGIN: &str = "<!-- xudo:begin v1 -->";
+pub const BEGIN: &str = "<!-- xudo:begin v2 -->";
 /// The sentinel that closes a generated block.
 pub const END: &str = "<!-- xudo:end -->";
 
@@ -41,7 +41,7 @@ pub fn render(rules: &RuleSet, generation: &str, format: DocFormat) -> String {
 
     if rules.is_empty() {
         out.push_str(
-            "No privileged action is allowed. Do not use sudo. Do not use xudo.\nAsk the user to run privileged commands.\n",
+            "No privileged action is allowed. Do not use sudo. Do not use xudo.\nAsk the user to run privileged commands.\n\nNever run `ido run` or `ido drop`. Only the user runs or drops queued commands.\n",
         );
         push_footer(&mut out, generation, format);
         return out;
@@ -71,6 +71,7 @@ pub fn render(rules: &RuleSet, generation: &str, format: DocFormat) -> String {
          - If xudo denies a command, read the `remediation` field. Do it.\n\
          - Do not retry a command that was denied as `deny_listed`. It will never work.\n\
          - Do not look for another way to run a denied command.\n\
+         - Never run `ido run` or `ido drop`. Only the user runs or drops queued commands.\n\
          \n\
          Check a command before you run it:\n\
          \n\
@@ -155,6 +156,17 @@ args = [{ name = "t", matcher = { literal = "/mnt" } }]
         let text = render(&rules(), "abcdef0123456789", DocFormat::Agents);
         assert!(text.starts_with(BEGIN));
         assert!(text.trim_end().ends_with(END));
+    }
+
+    #[test]
+    fn the_block_forbids_running_the_queue_with_or_without_rules() {
+        for text in [
+            render(&rules(), "abcdef0123456789", DocFormat::Agents),
+            render(&RuleSet::default(), "abcdef0123456789", DocFormat::Agents),
+        ] {
+            assert!(text.contains("Never run `ido run` or `ido drop`"), "{text}");
+            assert!(text.starts_with("<!-- xudo:begin v2 -->"));
+        }
     }
 
     #[test]
