@@ -64,7 +64,13 @@ fn load_all_with_tests() -> (RuleSet, Vec<xudo_policy::RuleTest>) {
 #[test]
 fn shipped_rule_tests_pass() {
     let (rules, tests) = load_all_with_tests();
-    assert!(tests.len() >= 25, "the shipped files lost their tests");
+    // Pinned exactly: adding or removing a shipped test is edited here, on
+    // purpose, so a file that silently lost its tests cannot pass.
+    assert_eq!(
+        tests.len(),
+        28,
+        "the shipped test count changed: update this"
+    );
     let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
     let failures: Vec<String> = results
         .iter()

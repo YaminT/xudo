@@ -148,7 +148,7 @@ fn human_report(
         // It is still two rules whose interaction nobody wrote down, and the
         // report never stays silent about a pair it cannot decide.
         for warning in &report.warnings {
-            let _ = writeln!(out, "{warning}");
+            let _ = writeln!(out, "{}", safe(warning));
         }
         if !report.warnings.is_empty() {
             let _ = writeln!(
