@@ -150,6 +150,11 @@ skips that and is refused on a terminal.
 Without a terminal,
 .B \-\-yes
 is required.
+.B \-\-yes
+never runs an entry marked as root (queued with
+.BR "\-\-root" ):
+a run that names one is refused whole, with nothing run, and
+only the typed word on a terminal, or the picker, runs it.
 .B \-\-all
 leaves failed entries for an explicit retry by id.
 .TP

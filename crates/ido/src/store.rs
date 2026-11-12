@@ -155,6 +155,10 @@ impl Store {
                     line: i.saturating_add(1),
                     source,
                 })?;
+            entry.check_schema().map_err(|why| IdoError::QueueParse {
+                line: i.saturating_add(1),
+                source: <serde_json::Error as serde::de::Error>::custom(why),
+            })?;
             entries.push(entry);
         }
         Ok(entries)
@@ -451,6 +455,30 @@ mod tests {
         std::fs::write(store.queue_path(), text).unwrap();
         let err = store.load().unwrap_err();
         assert!(err.to_string().starts_with("queue line 3"), "{err}");
+    }
+
+    fn private(store: &Store) {
+        std::fs::set_permissions(store.queue_path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_newer_schema_or_a_v1_line_with_the_marker_refuses_the_queue() {
+        let (_, store) = open("schema-refusals");
+        let lines = [
+            r#"{"schema_version":3,"id":1,"argv":["x"],"queued_at":0}"#,
+            r#"{"schema_version":1,"id":1,"argv":["x"],"queued_at":0,"via_xudo":true}"#,
+        ];
+        for line in lines {
+            std::fs::write(store.queue_path(), format!("{line}\n")).unwrap();
+            private(&store);
+            let err = store.load().unwrap_err();
+            assert!(err.to_string().starts_with("queue line 1"), "{err}");
+        }
+        let v1 = r#"{"schema_version":1,"id":1,"argv":["x"],"queued_at":0}"#;
+        std::fs::write(store.queue_path(), format!("{v1}\n")).unwrap();
+        private(&store);
+        assert_eq!(store.load().unwrap().len(), 1);
     }
 
     #[test]
