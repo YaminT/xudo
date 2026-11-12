@@ -379,3 +379,18 @@ fn a_pending_confirmation_envelope_is_pinned_in_both_renderers() {
         render::pending_json(&id, 12_345)
     );
 }
+
+#[test]
+fn a_denial_with_a_queue_entry_is_pinned_in_both_renderers() {
+    let decision = denial(DenialCode::HumanPathOnly);
+    insta::assert_snapshot!(
+        "json__deny_human_path_only_queued",
+        render::json_queued(&decision, Some(7))
+    );
+    assert_eq!(
+        render::json_queued(&decision, None),
+        render::json(&decision)
+    );
+    insta::assert_snapshot!("human__queued", render::queued_human(7, false));
+    insta::assert_snapshot!("human__already_queued", render::queued_human(7, true));
+}
