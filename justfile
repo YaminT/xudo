@@ -273,6 +273,9 @@ units:
 
 # --- differential compliance ------------------------------------------------
 
+# Pinned in the workflows too; crates/xudo-tests/tests/sbom_lane.rs holds them equal.
+auditable_version := "0.7.7"
+
 # The static Linux binary the matrix drives: musl, for whichever architecture
 # Docker on this host runs natively. Linked with rustc's bundled rust-lld (see
 # .cargo/config.toml) so the same build works from a Mac and from the runner.
@@ -310,11 +313,13 @@ install-root:
 
 # Writes the CycloneDX SBOM of the four shipped binaries: ci/sbom/generate.sh.
 sbom out='target/sbom/xudo.cdx.json':
-    ci/sbom/generate.sh {{musl_triple}} {{quote(out)}}
+    ci/sbom/generate.sh {{quote(out)}}
 
 # Builds the four binaries with `cargo auditable`, then checks that each embeds
 # a non-empty dependency list and that the SBOM lists every crate in it and in
-# `cargo tree -e normal`, with the Cargo.lock version. No network.
+# `cargo tree`, per binary and in both directions, then proves the check fails
+# on a binary with no audit data and on an SBOM missing a crate. Reads the
+# binaries inside the .deb. Needs the crates already fetched.
 sbom-check: deb
     ci/sbom/check.sh {{musl_triple}}
 
@@ -331,10 +336,20 @@ sbom-check: deb
 # the shipped bytes (warnings stay denied in the lint lanes). `cargo auditable`
 # embeds each binary's dependency list (from Cargo.lock, no timestamps, so
 # the bytes stay reproducible); `just sbom-check` reads it back. A rebuilder needs
-# the pinned toolchain; any path, locale, time zone and CARGO_HOME will do.
+# the pinned toolchain and cargo-auditable {{auditable_version}} (the recipe fails without it, or on a `cargo install`ed other version);
+# any path, locale, time zone and CARGO_HOME will do.
 deb:
     #!/usr/bin/env bash
     set -euo pipefail
+    # cargo-auditable has no --version flag. `cargo install --list` knows it when
+    # it came from `cargo install`; a prebuilt binary (CI) is pinned by the workflows.
+    command -v cargo-auditable >/dev/null \
+        || { echo "need cargo-auditable {{auditable_version}}: cargo install --locked cargo-auditable@{{auditable_version}}" >&2; exit 1; }
+    installed=$(cargo install --list | sed -n 's/^cargo-auditable v\([^ :]*\).*/\1/p')
+    if [[ -n $installed && $installed != {{auditable_version}} ]]; then
+        echo "need cargo-auditable {{auditable_version}}, found $installed" >&2; exit 1
+    fi
+    echo "cargo-auditable: ${installed:-version not recorded (prebuilt)}, pinned {{auditable_version}}"
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
     export LC_ALL=C TZ=UTC CARGO_INCREMENTAL=0
     export RUSTFLAGS="--remap-path-prefix={{justfile_directory()}}=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rustc"

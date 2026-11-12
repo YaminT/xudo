@@ -14,13 +14,13 @@ cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle --certificate-id
 sudo apt install ./xudo_<ver>_<arch>.deb
 ```
 
-Each release also carries a CycloneDX SBOM, `xudo-<version>.cdx.json` (`<version>` is Cargo's spelling, for example `0.1.0-beta.1`), listing every crate in the shipped binaries with its `Cargo.lock` version and checksum. It is signed like the package; verify it with the same identity:
+Each release also carries a CycloneDX SBOM, `xudo-<version>.cdx.json` (`<version>` is Cargo's spelling, for example `0.1.0-beta.1`), listing every crate the shipped binaries link, as resolved for the two musl targets, with its `Cargo.lock` version and checksum. It is signed like the package; verify it with the same identity:
 
 ```sh
 cosign verify-blob --bundle xudo-<version>.cdx.json.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo-<version>.cdx.json
 ```
 
-The four binaries also embed that dependency list (`cargo-auditable`). Read it from an installed binary with `cargo audit bin /usr/bin/xudo`.
+The four binaries also embed that dependency list (`cargo-auditable`). Read it from an installed binary with `cargo audit bin /usr/bin/xudo`. That embedded list may name a crate the binary does not link (`errno`); the SBOM does not. Building the package (`just deb`) needs `cargo-auditable` 0.7.7.
 
 xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 

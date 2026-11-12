@@ -193,6 +193,7 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: just@1.59.0,cargo-auditable@0.7.7
+          fallback: none
       - name: two_builds_of_the_same_commit_are_byte_identical
         run: just repro "$RUNNER_TEMP/repro-sha256.txt"
       # The release build job downloads this and fails if its own .deb differs.
@@ -269,6 +270,7 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: just@1.59.0,cargo-auditable@0.7.7
+          fallback: none
       - name: Build and test the Debian package in three distributions
         run: just deb-test
       # The four binaries embed their dependency lists and the SBOM lists them all.
@@ -301,5 +303,6 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: just@1.59.0,cargo-auditable@0.7.7
+          fallback: none
       - name: Installed package under systemd as PID 1
         run: just systemd-test
