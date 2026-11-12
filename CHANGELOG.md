@@ -5,6 +5,30 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Executable `[[test]]` tables in rule files, run by `xudo check` and by the
+  build. A test never changes a decision and is not part of the ruleset
+  generation.
+
+### Changed
+
+- **Breaking:** `xudo check` exit codes. Overlapping actions now exit 20 (was
+  0), the shell-allowlist lint exits 21 (was 17), and a failing rule test exits
+  22. A failing test ranks above a lint error when one run finds both.
+- The ruleset generation is hashed from a canonical encoding of each action
+  (framing v2), and a rule file with no actions is no longer part of it. Every
+  approval in flight when xudo is upgraded is invalidated once; retry the
+  request.
+- A rule file may carry at most 4096 `[[test]]` tables, and a ruleset at most
+  16384 in all; more fails to load.
+
+### Compatibility
+
+- The shipped rules carry `[[test]]` tables, which a 0.1.0-beta.1 binary
+  rejects as an unknown key. Downgrading xudo below this version while keeping
+  the new rules denies everything until the rules are downgraded with it.
+
 ## 0.1.0-beta.1 - 2026-11-10
 
 ### Added

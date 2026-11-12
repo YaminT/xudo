@@ -114,4 +114,4 @@ argv = [
   "ripgrep",
 ]
 expect = "deny"
-reason = "deny-list class: -o names a program to run as root"
+reason = "no rule accepts -o, which names a program to run as root"

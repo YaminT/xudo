@@ -138,8 +138,9 @@ What makes it safe:
   runs it is refused — and by pasban, which removes expired grants and reports
   any grant it finds that should not exist.
 - **A grant never outlives the rules it named.** Each grant records the policy
-  generation it was minted under; installing new rules bumps the generation
-  and invalidates every outstanding grant.
+  generation it was minted under; a policy change bumps the generation
+  and invalidates every outstanding grant (comments, positions and tests
+  do not).
 - **Visible and recorded.** Granting, every use under a grant, expiry, and
   revocation each write an audit record, and while any grant is live, xudo
   shows a banner naming it.

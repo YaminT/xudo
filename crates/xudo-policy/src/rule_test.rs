@@ -179,12 +179,29 @@ fn run_one(
         evaluate(
             rules,
             caller,
-            &Request::for_program(action.clone(), program.as_str(), argv),
+            &Request::for_program(action.clone(), program.as_str(), argv.clone()),
             settings,
         )
     } else {
         evaluate_command(rules, caller, &Arg::from(program.as_str()), &argv, settings)
     };
+    // A named action pins the evaluation to that one action, which refuses an
+    // argv it rejects even when another action accepts it. A test that expects
+    // a refusal is therefore also put to the engine `xudo explain` asks, so it
+    // cannot pass while the real command is permitted.
+    if test.expect == Expectation::Deny
+        && test.action.is_some()
+        && decision.verdict == Verdict::Deny
+    {
+        let real = evaluate_command(rules, caller, &Arg::from(program.as_str()), &argv, settings);
+        if real.verdict != Verdict::Deny {
+            return TestOutcome::Fail {
+                actual: Expectation::of(real.verdict),
+                denial: real.denial,
+                decided_by: real.action,
+            };
+        }
+    }
     let actual = Expectation::of(decision.verdict);
     // `action` is the action that must decide the command. A refusal cites no
     // action, so it is judged on the verdict alone; a permitted command must be
@@ -203,18 +220,6 @@ fn run_one(
             decided_by: decision.action,
         }
     }
-}
-
-/// Finds the 1-based line of the `index`th `[[test]]` header, or 0.
-pub(crate) fn line_of_test(contents: &str, index: usize) -> u32 {
-    contents
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.trim_start().starts_with("[[test]]"))
-        .nth(index)
-        .map_or(0, |(line, _)| {
-            u32::try_from(line.saturating_add(1)).unwrap_or(u32::MAX)
-        })
 }
 
 #[cfg(test)]
@@ -279,8 +284,17 @@ args = [{ name = "verb", matcher = { literal = "purge" } }]
             let err =
                 RuleSet::from_toml_with_tests("t.toml", &format!("[[test]]\n{body}")).unwrap_err();
             assert!(err.to_string().contains("t.toml"));
-            // `from_toml` refuses it too: the gate and the broker load through it.
-            assert!(RuleSet::from_toml("t.toml", &format!("[[test]]\n{body}")).is_err());
+            // The gate and the broker load through `load_rule_files`, which
+            // refuses it too.
+            let text = format!("[[test]]\n{body}");
+            assert!(RuleSet::from_toml("t.toml", &text).is_err());
+            assert!(
+                crate::files::load_rule_files(vec![crate::files::RuleFile {
+                    name: b"t.toml".to_vec(),
+                    bytes: text.into_bytes(),
+                }])
+                .is_err()
+            );
         }
     }
 
@@ -391,13 +405,58 @@ action = "xudo.pkg.purge"
     }
 
     #[test]
-    fn a_named_action_decides_even_when_another_would_accept() {
-        // Pinned to the action that does not accept the argv: a refusal about
-        // that action, as `xudo explain --action` gives.
+    fn a_deny_test_naming_a_rejecting_action_fails_when_the_engine_allows_the_command() {
+        // Pinned to the action that does not accept the argv the pinned
+        // evaluation refuses, but `xudo explain` (no pin) confirms `purge`
+        // under the other action: the test would pass while the command runs.
         let outcomes = run(
             "[[test]]\nargv = [\"/usr/bin/apt-get\", \"purge\"]\nexpect = \"deny\"\naction = \"xudo.pkg.update\"\n",
         );
+        assert_eq!(
+            outcomes,
+            [TestOutcome::Fail {
+                actual: Expectation::Confirm,
+                denial: None,
+                decided_by: Some(ActionId::new("xudo.pkg.purge")),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_deny_test_naming_an_action_passes_when_the_engine_denies_too() {
+        let outcomes = run(
+            "[[test]]\nargv = [\"/usr/bin/apt-get\", \"install\"]\nexpect = \"deny\"\naction = \"xudo.pkg.update\"\n",
+        );
         assert_eq!(outcomes, [TestOutcome::Pass]);
+    }
+
+    #[test]
+    fn a_test_is_located_by_the_parsers_span_not_by_scanning_for_text() {
+        let text = "[[ test ]]\nargv = [\"/x\"]\nexpect = \"deny\"\nreason = \"\"\"\n[[test]]\n\"\"\"\n\n[[test]]\nargv = [\"/y\"]\nexpect = \"deny\"\n";
+        let (_, tests) = RuleSet::from_toml_with_tests("t.toml", text).unwrap();
+        let lines: Vec<u32> = tests.iter().map(|t| t.source.line).collect();
+        assert_eq!(lines, [1, 8]);
+    }
+
+    #[test]
+    fn a_file_over_the_test_bound_is_refused_and_one_at_it_loads() {
+        use crate::rule::MAX_TESTS_PER_FILE;
+        let one = "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\n";
+        let (_, tests) =
+            RuleSet::from_toml_with_tests("t.toml", &one.repeat(MAX_TESTS_PER_FILE)).unwrap();
+        assert_eq!(tests.len(), MAX_TESTS_PER_FILE);
+        let err = RuleSet::from_toml_with_tests("t.toml", &one.repeat(MAX_TESTS_PER_FILE + 1))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            crate::rule::RuleSetError::TooManyTests {
+                file: "t.toml".into(),
+                limit: MAX_TESTS_PER_FILE
+            }
+        );
+        // `from_toml` agrees, so `xudo check` and the broker refuse alike.
+        assert!(RuleSet::from_toml("t.toml", &one.repeat(MAX_TESTS_PER_FILE + 1)).is_err());
+        assert!(err.to_string().contains("4096"), "{err}");
     }
 
     #[test]
@@ -442,13 +501,5 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             }
         );
         assert_eq!(run("xudo.b"), TestOutcome::Pass);
-    }
-
-    #[test]
-    fn the_test_header_is_located_by_order() {
-        let text = "x\n[[test]]\n  [[test]]\n";
-        assert_eq!(line_of_test(text, 0), 2);
-        assert_eq!(line_of_test(text, 1), 3);
-        assert_eq!(line_of_test(text, 2), 0);
     }
 }

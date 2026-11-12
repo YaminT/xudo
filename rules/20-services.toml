@@ -95,4 +95,4 @@ argv = [
   "nginx.service",
 ]
 expect = "deny"
-reason = "deny-list class: enable changes a unit definition"
+reason = "no rule accepts enable, which changes a unit definition"

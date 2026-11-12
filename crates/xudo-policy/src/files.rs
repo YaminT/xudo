@@ -31,6 +31,12 @@ pub const RULE_FILE_SUFFIX: &[u8] = b".toml";
 /// names the framing version so a later change cannot collide with this one.
 const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v2\0";
 
+/// The most `[[test]]` tables one ruleset may carry across all its files.
+///
+/// Every reader parses every test on every load, so the whole is bounded as
+/// well as each file (see [`crate::rule::MAX_TESTS_PER_FILE`]).
+pub const MAX_TESTS: usize = 16 * 1024;
+
 /// Whether a directory entry is a rule file.
 ///
 /// A name ending in `.toml` with something before it. A file named exactly
@@ -144,6 +150,12 @@ pub enum RuleFilesError {
         /// The file.
         file: String,
     },
+    /// More `[[test]]` tables across all files than one ruleset may carry.
+    #[error("more than {limit} [[test]] tables across the rule files")]
+    TooManyTests {
+        /// The bound.
+        limit: usize,
+    },
     /// The policy engine refused a file, or the files together.
     ///
     /// Transparent, because every [`RuleSetError`] already names the file and
@@ -201,6 +213,9 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
 
         actions.extend(parsed.actions().iter().cloned());
         tests.extend(file_tests);
+        if tests.len() > MAX_TESTS {
+            return Err(RuleFilesError::TooManyTests { limit: MAX_TESTS });
+        }
     }
 
     Ok(LoadedRuleSet {
@@ -896,5 +911,20 @@ args = [
                 prop_assert_eq!(policy_form(&moved), policy_form(&base));
             }
         }
+    }
+
+    #[test]
+    fn a_ruleset_over_the_test_bound_is_refused_whatever_the_file_split() {
+        let one = "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\n";
+        let full = one.repeat(crate::rule::MAX_TESTS_PER_FILE);
+        let files = |n: usize| -> Vec<RuleFile> {
+            (0..n).map(|i| file(&format!("{i}.toml"), &full)).collect()
+        };
+        let fit = 4;
+        assert_eq!(fit * crate::rule::MAX_TESTS_PER_FILE, MAX_TESTS);
+        assert_eq!(load_rule_files(files(fit)).unwrap().tests.len(), MAX_TESTS);
+        let err = load_rule_files(files(fit + 1)).unwrap_err();
+        assert_eq!(err, RuleFilesError::TooManyTests { limit: MAX_TESTS });
+        assert!(err.to_string().contains("16384"), "{err}");
     }
 }

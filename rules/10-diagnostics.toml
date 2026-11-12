@@ -130,4 +130,4 @@ reason = "only the listed properties"
 [[test]]
 argv = ["/usr/bin/systemctl", "--no-pager", "--full", "edit", "nginx.service"]
 expect = "deny"
-reason = "deny-list class: edit rewrites a unit definition"
+reason = "no rule accepts edit, which rewrites a unit definition"

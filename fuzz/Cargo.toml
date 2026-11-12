@@ -21,6 +21,11 @@ xudo-gate = { path = "../crates/xudo-gate", features = ["fuzzing"] }
 xudod = { path = "../crates/xudod", features = ["fuzzing"] }
 arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = { version = "0.9", default-features = false, features = [
+  "parse",
+  "display",
+  "serde",
+] }
 
 [[bin]]
 name = "rules_toml"

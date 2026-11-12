@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::deny::evaluate_deny_list;
 use crate::matcher::ArgSpec;
-use crate::rule_test::{RuleTest, line_of_test};
+use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -206,7 +206,26 @@ struct RuleFile {
     /// Executable tests. Kept apart from `action` on purpose: a test is not
     /// policy and never reaches the compiled ruleset.
     #[serde(default)]
-    test: Vec<RuleTest>,
+    test: Vec<toml::Spanned<RuleTest>>,
+}
+
+/// The most `[[test]]` tables one rule file may carry.
+///
+/// The broker and the gate parse every test of every file on every request, so
+/// a generated suite must not become a per-request cost. A file over the bound
+/// fails to load, for every reader alike.
+pub const MAX_TESTS_PER_FILE: usize = 4096;
+
+/// The byte offset at which each line of `text` begins.
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at.saturating_add(1)))
+        .collect()
+}
+
+/// The 1-based line holding byte offset `at`.
+fn line_at(starts: &[usize], at: usize) -> u32 {
+    u32::try_from(starts.partition_point(|start| *start <= at)).unwrap_or(u32::MAX)
 }
 
 fn default_true() -> bool {
@@ -281,6 +300,14 @@ pub enum RuleSetError {
         file: String,
         /// The parser's account of why.
         reason: String,
+    },
+    /// A rule file carries more `[[test]]` tables than the bound allows.
+    #[error("rule file {file}: more than {limit} [[test]] tables")]
+    TooManyTests {
+        /// The file that failed.
+        file: String,
+        /// The bound.
+        limit: usize,
     },
     /// A critical-tier action declares that it never confirms.
     #[error("action {id} at {at}: a critical-tier action cannot set confirm = \"never\"")]
@@ -406,12 +433,23 @@ impl RuleSet {
                 action
             })
             .collect();
+        if parsed.test.len() > MAX_TESTS_PER_FILE {
+            return Err(RuleSetError::TooManyTests {
+                file: file.to_owned(),
+                limit: MAX_TESTS_PER_FILE,
+            });
+        }
+        // The parser's own span for each table, turned into a line with one
+        // pass over the file: no second reading of the text, and `[[ test ]]`
+        // or a header-looking line inside a string cannot mislead it.
+        let line_starts = line_starts(contents);
         let tests = parsed
             .test
             .into_iter()
-            .enumerate()
-            .map(|(index, mut test)| {
-                test.source = Source::new(file, line_of_test(contents, index));
+            .map(|spanned| {
+                let at = spanned.span().start;
+                let mut test = spanned.into_inner();
+                test.source = Source::new(file, line_at(&line_starts, at));
                 test
             })
             .collect();

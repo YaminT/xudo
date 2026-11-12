@@ -7,7 +7,9 @@
 
 #![no_main]
 
-use xudo_policy::{CallerFacts, Classification, RuleSet, engine::Settings, run_tests};
+use xudo_policy::{
+    CallerFacts, Classification, RuleFile, RuleSet, engine::Settings, load_rule_files, run_tests,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -20,10 +22,24 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    // `from_toml` is what the gate and the broker call; a test block must not
-    // make the two disagree about whether the file loads, or about its actions.
-    let plain = RuleSet::from_toml("fuzz.toml", text).expect("from_toml refused what the tests loader took");
-    assert_eq!(plain, set, "a [[test]] block changed the compiled ruleset");
+    // The gate and the broker load through `load_rule_files`. A `[[test]]`
+    // table must change neither whether a file loads nor the generation: strip
+    // the tables the way the parser sees them and compare.
+    if let Ok(mut table) = text.parse::<toml::Table>() {
+        table.remove("test");
+        if let Ok(stripped) = toml::to_string(&table) {
+            let file = |bytes: &[u8]| RuleFile {
+                name: b"fuzz.toml".to_vec(),
+                bytes: bytes.to_vec(),
+            };
+            let with = load_rule_files(vec![file(text.as_bytes())]);
+            let without = load_rule_files(vec![file(stripped.as_bytes())]);
+            if let Ok(with) = with {
+                let without = without.expect("stripping the tests made a loadable file unloadable");
+                assert_eq!(with.generation, without.generation, "a [[test]] table moved the generation");
+            }
+        }
+    }
 
     // Running whatever tests loaded must never panic, and a test cannot set
     // its own provenance.
