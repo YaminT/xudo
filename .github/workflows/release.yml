@@ -45,6 +45,15 @@ jobs:
           tool: just@1.59.0
       - name: Test package
         run: just deb-test
+      # The reproducible-build job built this commit on another runner VM. The
+      # package about to be signed must be those exact bytes. This catches drift
+      # between runners; it does not defend against a compromised build system.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: repro-sha256-${{ matrix.arch }}
+          path: ${{ runner.temp }}/repro
+      - name: Shipped .deb matches the rebuild on another runner
+        run: ci/repro/compare.sh "$RUNNER_TEMP/repro/repro-sha256.txt" target/deb/xudo_*.deb
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xudo-deb-${{ matrix.arch }}
