@@ -819,6 +819,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "xudo",
+ "xudo-policy",
  "xudo-tests",
 ]
 
