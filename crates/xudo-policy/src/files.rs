@@ -58,8 +58,8 @@ pub struct RuleFile {
 
 /// Which policy a set of rule files is.
 ///
-/// A SHA-256 over every rule file's name and the actions it defines, in name
-/// order, each field length-prefixed. The prefixes matter: hashing names and
+/// A SHA-256 over the name of every rule file that defines actions, and those
+/// actions, in name order, each field length-prefixed. The prefixes matter: hashing names and
 /// contents back to back would give `1.toml` holding `#a2.toml#b` the same
 /// generation as `1.toml` holding `#a` beside `2.toml` holding `#b`, two
 /// different rulesets that a stale request could not tell apart.
@@ -67,8 +67,12 @@ pub struct RuleFile {
 /// The actions are hashed as parsed, not the file's bytes, so that what is not
 /// policy is not in the digest: a `[[test]]` table (see [`crate::rule_test`]),
 /// a comment, and the line an action sits on can all change without
-/// invalidating a request minted under the same rules. Anything that can
-/// change a decision is a field of [`Action`], and is hashed.
+/// invalidating a request minted under the same rules. Every field of
+/// [`Action`] that can change a decision is hashed. Two things that also bear
+/// on a decision are outside the generation: the settings, and the compiled
+/// engine (the deny-list), which no rule file can change. The generation only
+/// tells a stale request from a fresh one; the gate re-decides from root-owned
+/// state, so it never trusts a generation to vouch for either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Generation([u8; 32]);
 
@@ -332,7 +336,7 @@ fn put_matcher(out: &mut Vec<u8>, matcher: &Matcher) {
         }
         Matcher::Pattern(pattern) => {
             put(out, b"pattern");
-            put(out, pattern.source().as_bytes());
+            put(out, pattern.canonical_form());
         }
     }
 }
@@ -462,8 +466,9 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "10-a.toml",
             &ONE_ACTION.replace("restart", "reload"),
         )]);
-        // Moving a rule between files changes the file:line a decision cites,
-        // so it is a different policy even when the rules are identical.
+        // The name of a file that defines actions is hashed with them, so
+        // moving a rule to another file is a different generation even when
+        // the rules are identical.
         assert_ne!(base, renamed);
         assert_ne!(base, edited);
     }
@@ -716,6 +721,16 @@ args = [
   { name = "e", matcher = { name = "hostname" } },
   { name = "f", matcher = { name = "sysctl-key" } },
 ]
+
+[[action]]
+id = "a.three"
+tier = "diag-read"
+exe = "/usr/bin/id"
+confirm = "never"
+agent-allowed = true
+args = [
+  { name = "n", matcher = { literal = "-u" } },
+]
 "#,
         )
         .unwrap()
@@ -732,6 +747,7 @@ args = [
             [
                 "b324748da0c3bfb72a2ff3ca4d054df8a837b80f9bf5a0f5f3c4b80bfa74238a",
                 "80bd4e20b000d9556b4ccd33b702d8fe36eb8637c6f1461ccbd1ed9ca671b7f9",
+                "336bd13449dcfa10179cf3319d090841485898e4ff33c136104b13f4f6395095",
             ]
         );
     }
@@ -754,18 +770,52 @@ args = [
         use super::*;
         use crate::matcher::AnchoredPattern;
 
+        /// Every `NameKind`, as a fixed-size array so that adding a kind to the
+        /// enum without listing it here is caught by the pin below.
+        const ALL_NAME_KINDS: [NameKind; 7] = [
+            NameKind::DebName,
+            NameKind::RpmName,
+            NameKind::ArchName,
+            NameKind::ApkName,
+            NameKind::UnitName,
+            NameKind::Hostname,
+            NameKind::SysctlKey,
+        ];
+
+        /// How many of the shared-payload texts to try; compiling each pattern
+        /// is slow under miri, which runs this module.
+        const SAME_TEXTS: usize = if cfg!(miri) { 1 } else { 5 };
+
+        /// Whether to try a pattern too: compiling one is slow under miri.
+        const PATTERNS: usize = if cfg!(miri) { 0 } else { 1 };
+
+        /// How many fixed actions to mutate; every pattern mutation compiles a
+        /// regex, and miri has the property test for the same mutations.
+        const FIXED_BASES: usize = if cfg!(miri) { 0 } else { usize::MAX };
+
+        const ALL_CONFIRMS: [ConfirmPolicy; 3] = [
+            ConfirmPolicy::Default,
+            ConfirmPolicy::Always,
+            ConfirmPolicy::Never,
+        ];
+
+        const ALL_TIERS: [Tier; 7] = [
+            Tier::DiagRead,
+            Tier::SvcControl,
+            Tier::PkgInstall,
+            Tier::PkgRemove,
+            Tier::SysTunable,
+            Tier::NetFilter,
+            Tier::Critical,
+        ];
+
         fn matcher() -> impl Strategy<Value = Matcher> {
             prop_oneof![
-                "[a-z]{0,4}".prop_map(Matcher::Literal),
+                "[a-z/]{0,4}".prop_map(Matcher::Literal),
                 proptest::collection::vec("[a-z]{0,3}", 0..3).prop_map(Matcher::OneOf),
                 (-3i64..3, 0i64..6).prop_map(|(lo, hi)| Matcher::IntRange { lo, hi }),
-                "/[a-z]{0,4}".prop_map(|prefix| Matcher::PathUnder { prefix }),
-                prop_oneof![
-                    Just(NameKind::DebName),
-                    Just(NameKind::UnitName),
-                    Just(NameKind::Hostname),
-                ]
-                .prop_map(Matcher::Name),
+                "[a-z/]{0,4}".prop_map(|prefix| Matcher::PathUnder { prefix }),
+                proptest::sample::select(ALL_NAME_KINDS.to_vec()).prop_map(Matcher::Name),
                 "[a-z]{1,3}[+*]?".prop_map(|s| Matcher::Pattern(AnchoredPattern::new(&s).unwrap())),
             ]
         }
@@ -787,23 +837,11 @@ args = [
         }
 
         fn tier() -> impl Strategy<Value = Tier> {
-            prop_oneof![
-                Just(Tier::DiagRead),
-                Just(Tier::SvcControl),
-                Just(Tier::PkgInstall),
-                Just(Tier::PkgRemove),
-                Just(Tier::SysTunable),
-                Just(Tier::NetFilter),
-                Just(Tier::Critical),
-            ]
+            proptest::sample::select(ALL_TIERS.to_vec())
         }
 
         fn confirm() -> impl Strategy<Value = ConfirmPolicy> {
-            prop_oneof![
-                Just(ConfirmPolicy::Default),
-                Just(ConfirmPolicy::Always),
-                Just(ConfirmPolicy::Never),
-            ]
+            proptest::sample::select(ALL_CONFIRMS.to_vec())
         }
 
         fn action() -> impl Strategy<Value = Action> {
@@ -841,8 +879,14 @@ args = [
             };
             with(&|a| a.id = ActionId::new(format!("{}x", a.id)));
             with(&|a| a.tier = other.tier);
+            for tier in ALL_TIERS {
+                with(&|a| a.tier = tier);
+            }
             with(&|a| a.exe.push('x'));
             with(&|a| a.confirm = other.confirm);
+            for confirm in ALL_CONFIRMS {
+                with(&|a| a.confirm = confirm);
+            }
             with(&|a| a.agent_allowed = !a.agent_allowed);
             with(&|a| a.env_allow.push("NEW".into()));
             with(&|a| a.env_allow.reverse());
@@ -884,8 +928,115 @@ args = [
                         *p = AnchoredPattern::new(&format!("{}z", p.source())).unwrap();
                     }
                 });
+                // One field at a time, each directly, so that none depends on
+                // the other action happening to differ in it.
+                with(&|a| {
+                    if let Matcher::IntRange { hi, .. } = &mut a.args[index].matcher {
+                        *hi = hi.saturating_add(1);
+                    }
+                });
+                with(&|a| {
+                    if let Repeat::Between { min, .. } = &mut a.args[index].repeat {
+                        *min = min.saturating_add(1);
+                    }
+                });
+                with(&|a| {
+                    if let Repeat::Between { max, .. } = &mut a.args[index].repeat {
+                        *max = max.saturating_add(1);
+                    }
+                });
+                for kind in ALL_NAME_KINDS {
+                    with(&|a| {
+                        if matches!(a.args[index].matcher, Matcher::Name(_)) {
+                            a.args[index].matcher = Matcher::Name(kind);
+                        }
+                    });
+                }
             }
             out
+        }
+
+        fn lone(matcher: Matcher) -> Action {
+            Action {
+                id: ActionId::new("lone.one"),
+                tier: Tier::DiagRead,
+                exe: "/usr/bin/true".to_owned(),
+                args: vec![ArgSpec::one("a", matcher)],
+                confirm: ConfirmPolicy::Default,
+                agent_allowed: false,
+                env_allow: Vec::new(),
+                source: Source::new("p.toml", 1),
+            }
+        }
+
+        #[test]
+        fn the_same_bytes_under_different_matchers_are_different_policy() {
+            let kind_words = ["deb-name", "hostname", "unit-name"];
+            let texts = ["a", "", "/etc", "/", "a/b"];
+            let texts = texts.into_iter().take(SAME_TEXTS);
+            for text in texts.chain(kind_words) {
+                let mut forms = vec![
+                    Matcher::Literal(text.into()),
+                    Matcher::PathUnder {
+                        prefix: text.into(),
+                    },
+                    Matcher::OneOf(vec![text.into()]),
+                ];
+                forms.extend(
+                    [text]
+                        .into_iter()
+                        .take(PATTERNS)
+                        .map(|t| Matcher::Pattern(AnchoredPattern::new(t).unwrap())),
+                );
+                let forms: Vec<_> = forms.into_iter().map(|m| policy_form(&lone(m))).collect();
+                for (i, a) in forms.iter().enumerate() {
+                    for b in &forms[i + 1..] {
+                        assert_ne!(a, b, "{text:?}");
+                    }
+                }
+            }
+            // A name kind is not the literal spelled like it.
+            assert_ne!(
+                policy_form(&lone(Matcher::Name(NameKind::Hostname))),
+                policy_form(&lone(Matcher::Literal("hostname".into())))
+            );
+        }
+
+        #[test]
+        fn every_name_kind_and_every_confirm_policy_is_its_own_form() {
+            let kinds: Vec<_> = ALL_NAME_KINDS
+                .iter()
+                .map(|k| policy_form(&lone(Matcher::Name(*k))))
+                .collect();
+            let confirms: Vec<_> = ALL_CONFIRMS
+                .iter()
+                .map(|c| {
+                    let mut a = lone(Matcher::Literal("x".into()));
+                    a.confirm = *c;
+                    policy_form(&a)
+                })
+                .collect();
+            for set in [kinds, confirms] {
+                for (i, a) in set.iter().enumerate() {
+                    for b in &set[i + 1..] {
+                        assert_ne!(a, b);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn every_one_field_change_of_the_fixed_actions_changes_the_form() {
+            let all = fixed_actions();
+            for base in all.iter().take(FIXED_BASES) {
+                for other in &all {
+                    for mutated in mutations(base, other) {
+                        if &mutated != base {
+                            assert_ne!(policy_form(&mutated), policy_form(base));
+                        }
+                    }
+                }
+            }
         }
 
         // Miri runs the interpreter a thousand times slower: a handful of
