@@ -7,10 +7,11 @@
 
 #![no_main]
 
-use xudo_policy::{
-    CallerFacts, Classification, RuleFile, RuleSet, engine::Settings, load_rule_files, run_tests,
-};
 use libfuzzer_sys::fuzz_target;
+use xudo_policy::{
+    engine::Settings, evaluate_command, fuzz_check::witnesses, load_rule_files, run_tests, Arg,
+    CallerFacts, Classification, DenialCode, RuleFile, RuleSet, Verdict,
+};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -36,7 +37,10 @@ fuzz_target!(|data: &[u8]| {
             let without = load_rule_files(vec![file(stripped.as_bytes())]);
             if let Ok(with) = with {
                 let without = without.expect("stripping the tests made a loadable file unloadable");
-                assert_eq!(with.generation, without.generation, "a [[test]] table moved the generation");
+                assert_eq!(
+                    with.generation, without.generation,
+                    "a [[test]] table moved the generation"
+                );
             }
         }
     }
@@ -47,7 +51,10 @@ fuzz_target!(|data: &[u8]| {
     let results = run_tests(&set, &tests, &human, Settings::default());
     assert_eq!(results.len(), tests.len());
     for test in &tests {
-        assert_eq!(test.source.file, "fuzz.toml", "a test set its own provenance");
+        assert_eq!(
+            test.source.file, "fuzz.toml",
+            "a test set its own provenance"
+        );
     }
 
     // Anything that loaded must satisfy every invariant the validator claims.
@@ -58,7 +65,11 @@ fuzz_target!(|data: &[u8]| {
             action.exe
         );
         assert!(
-            !action.exe.split('/').skip(1).any(|c| c.is_empty() || c == "." || c == ".."),
+            !action
+                .exe
+                .split('/')
+                .skip(1)
+                .any(|c| c.is_empty() || c == "." || c == ".."),
             "loaded an unclean exe: {:?}",
             action.exe
         );
@@ -68,9 +79,24 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // A loaded ruleset must never allowlist a deny-listed executable.
-    assert!(
-        set.self_denying_actions().is_empty(),
-        "loaded a ruleset that allowlists a deny-listed executable"
-    );
+    // The loader does not reject a rule that allowlists a deny-listed
+    // executable: `self_denying_actions` is a lint (`xudo check`, exit 21) and a
+    // check on the shipped rules. The invariant is that such a rule can never
+    // produce an allow, because the compiled-in deny-list refuses at decision
+    // time and no file can override it. Prove it with a witness per offender.
+    for (id, _) in set.self_denying_actions() {
+        let Some(action) = set.actions().iter().find(|a| &a.id == id) else {
+            continue;
+        };
+        for argv in witnesses(&set, action, 1, 4) {
+            let program = Arg::from(action.exe.as_str());
+            let decision = evaluate_command(&set, &human, &program, &argv, Settings::default());
+            assert_eq!(
+                decision.verdict,
+                Verdict::Deny,
+                "a self-denying rule produced an allow"
+            );
+            assert_eq!(decision.denial, Some(DenialCode::DenyListed));
+        }
+    }
 });

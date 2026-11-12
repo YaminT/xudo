@@ -10,6 +10,9 @@ All notable changes to xudo are documented here. This project follows
 - Executable `[[test]]` tables in rule files, run by `xudo check` and by the
   build. A test never changes a decision and is not part of the ruleset
   generation.
+- `xudo check --fuzz [--fuzz-budget N] [--fuzz-seed S]`: a bounded,
+  deterministic differential fuzz of the loaded ruleset that cross-checks the
+  overlap report and the standing invariants; a finding is a lint error (21).
 
 ### Changed
 

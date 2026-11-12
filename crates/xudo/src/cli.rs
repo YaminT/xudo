@@ -113,6 +113,40 @@ pub enum ConfigAction {
     },
 }
 
+/// What `xudo check` is asked to do.
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Run only the `[[test]]` tables, skipping the lint.
+    #[arg(long, conflicts_with = "fuzz")]
+    pub(crate) tests_only: bool,
+
+    /// Also run a bounded, deterministic fuzz of the ruleset: candidate
+    /// commands derived from its own rules, put to the engine, to
+    /// cross-check the overlap report and the standing invariants. Any
+    /// finding is a lint error. Runs nothing.
+    #[arg(long)]
+    pub(crate) fuzz: bool,
+
+    /// How many candidate commands the fuzz tries, 1 to 1000000.
+    #[arg(
+        long,
+        requires = "fuzz",
+        value_name = "N",
+        default_value_t = xudo_policy::fuzz_check::DEFAULT_BUDGET as u32,
+        value_parser = clap::value_parser!(u32).range(1..=1_000_000)
+    )]
+    pub(crate) fuzz_budget: u32,
+
+    /// The fuzz seed. The same ruleset and seed give the same report.
+    #[arg(
+        long,
+        requires = "fuzz",
+        value_name = "S",
+        default_value_t = xudo_policy::fuzz_check::DEFAULT_SEED
+    )]
+    pub(crate) fuzz_seed: u64,
+}
+
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -148,11 +182,7 @@ pub enum Command {
     /// Exits 20 for a lint warning, 21 for a lint error and 22 for a failing
     /// test; a run with several problems prints them all and exits with the
     /// most severe.
-    Check {
-        /// Run only the `[[test]]` tables, skipping the lint.
-        #[arg(long)]
-        tests_only: bool,
-    },
+    Check(CheckArgs),
 
     /// List the effective policy.
     List {
@@ -443,7 +473,7 @@ pub fn run_with_installer_at_socket(
             .err()
             .unwrap_or(ExitCode::Unusable)
         }
-        Command::Check { tests_only } => with_rules!(|l| check::run(cli, l, *tests_only, out, err)),
+        Command::Check(args) => with_rules!(|l| check::run(cli, l, args, out, err)),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
@@ -3128,6 +3158,65 @@ expect = "deny"
         let (code, out, _) = fixture("cli-tests-only-none").run(&["check", "--tests-only"]);
         assert_eq!(code, ExitCode::Delegated);
         assert_eq!(out, "tests: none\n");
+    }
+
+    #[test]
+    fn check_fuzz_reports_counts_and_keeps_the_exit_status() {
+        let fx = fixture("cli-check-fuzz")
+            .write("20-a.toml", CONFIRMING)
+            .write("30-b.toml", PERMISSIVE);
+        let (code, out, err) = fx.run(&["check", "--fuzz", "--fuzz-budget", "300"]);
+        // Only the overlap warning: the fuzz found nothing, so nothing new.
+        assert_eq!(code, ExitCode::LintWarning, "{out}{err}");
+        assert!(out.contains("fuzz: seed "), "{out}");
+        assert!(out.contains("300 candidate(s)"), "{out}");
+        assert!(out.contains("0 finding(s)"), "{out}");
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(fx.run(&["check", "--fuzz", "--fuzz-budget", "300"]).1, out);
+
+        let (_, json, _) = fx.run(&[
+            "--output",
+            "json",
+            "check",
+            "--fuzz",
+            "--fuzz-seed",
+            "5",
+            "--fuzz-budget",
+            "50",
+        ]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["fuzz"]["seed"], 5);
+        assert_eq!(parsed["fuzz"]["candidates"], 50);
+        assert_eq!(parsed["fuzz"]["findings"].as_array().unwrap().len(), 0);
+
+        // Without the flag, the envelope is what it was.
+        let (_, plain, _) = fx.run(&["--output", "json", "check"]);
+        let parsed: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert!(parsed.get("fuzz").is_none(), "{plain}");
+        assert!(!fx.run(&["check"]).1.contains("fuzz:"));
+    }
+
+    #[test]
+    fn check_fuzz_bounds_are_validated() {
+        let parse = |args: &[&str]| {
+            let mut full = vec!["xudo", "check"];
+            full.extend_from_slice(args);
+            Cli::try_parse_from(full)
+        };
+        assert!(parse(&["--fuzz", "--fuzz-budget", "1"]).is_ok());
+        assert!(parse(&["--fuzz", "--fuzz-budget", "1000000"]).is_ok());
+        assert!(parse(&["--fuzz", "--fuzz-seed", "18446744073709551615"]).is_ok());
+        for bad in [
+            &["--fuzz", "--fuzz-budget", "0"][..],
+            &["--fuzz", "--fuzz-budget", "1000001"],
+            &["--fuzz", "--fuzz-budget", "-1"],
+            &["--fuzz", "--fuzz-seed", "18446744073709551616"],
+            &["--fuzz-budget", "5"],
+            &["--fuzz-seed", "5"],
+            &["--fuzz", "--tests-only"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
