@@ -566,6 +566,10 @@ mod tests {
 
     use super::*;
 
+    /// A deadline a passing test over a real socket never waits for, so a
+    /// loaded runner cannot expire it.
+    const PATIENT: Duration = Duration::from_secs(60);
+
     struct Has(&'static [&'static str]);
 
     impl Probe for Has {
@@ -650,7 +654,7 @@ mod tests {
             argv,
             probe,
             &socket,
-            TIMEOUT,
+            PATIENT,
             Duration::ZERO,
             queue,
             &mut out,
@@ -769,7 +773,7 @@ mod tests {
             &["/usr/bin/apt-get".to_owned(), "remove".to_owned()],
             &SUDO,
             &socket,
-            TIMEOUT,
+            PATIENT,
             Duration::ZERO,
             None,
             &mut out,
@@ -808,7 +812,7 @@ mod tests {
             &["/usr/bin/apt-get".to_owned(), "remove".to_owned()],
             &SUDO,
             &socket,
-            TIMEOUT,
+            PATIENT,
             Duration::from_millis(1),
             None,
             &mut out,
@@ -1556,7 +1560,7 @@ mod tests {
             &argv(),
             &SUDO,
             &socket,
-            TIMEOUT,
+            PATIENT,
             Duration::from_secs(1),
             Some(&mut Pace {
                 elapsed: &mut elapsed,
@@ -1668,15 +1672,7 @@ mod tests {
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let started = std::time::Instant::now();
-        let result = plan(
-            &cli(),
-            &argv(),
-            &SUDO,
-            &socket,
-            Duration::from_secs(5),
-            &mut out,
-            &mut err,
-        );
+        let result = plan(&cli(), &argv(), &SUDO, &socket, PATIENT, &mut out, &mut err);
         let elapsed = started.elapsed();
         let _ = release.send(());
         let err = String::from_utf8(err).unwrap();

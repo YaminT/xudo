@@ -469,7 +469,17 @@ fn refused_or_unusable(answer: Answer, err: &mut dyn Write) -> ExitCode {
 ///
 /// Returns a connection, deadline, size, or response parsing error.
 pub fn ask_live(socket: &Path, request: &BrokerRequest) -> Result<BrokerResponse, String> {
-    let bytes = crate::exchange::exchange(socket, request.to_json().as_bytes(), HEARTBEAT)?;
+    ask_within(socket, request, HEARTBEAT)
+}
+
+/// [`ask_live`] with the deadline given, so a test over a real socket can
+/// allow far longer than a loaded machine needs and never depend on the clock.
+fn ask_within(
+    socket: &Path,
+    request: &BrokerRequest,
+    deadline: Duration,
+) -> Result<BrokerResponse, String> {
+    let bytes = crate::exchange::exchange(socket, request.to_json().as_bytes(), deadline)?;
     BrokerResponse::parse(&bytes).map_err(display_error)
 }
 
@@ -1287,6 +1297,10 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
         "###);
     }
 
+    /// A deadline a passing test never waits for, so a loaded runner cannot
+    /// expire it.
+    const PATIENT: Duration = Duration::from_secs(60);
+
     #[test]
     fn live_broker_exchange_round_trips_one_question_and_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1305,7 +1319,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Pending,
         };
-        let response = ask_live(&socket, &request).unwrap();
+        let response = ask_within(&socket, &request, PATIENT).unwrap();
         assert_eq!(
             response.answer,
             Answer::Watching {
@@ -1331,7 +1345,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Pending,
         };
-        let err = ask_live(&socket, &request).unwrap_err();
+        let err = ask_within(&socket, &request, PATIENT).unwrap_err();
         assert!(err.contains("broker response"), "{err}");
         broker.join().unwrap();
     }
@@ -1342,7 +1356,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Pending,
         };
-        assert!(ask_live(Path::new("/dev/null/xudo-watch.sock"), &request).is_err());
+        assert!(ask_within(Path::new("/dev/null/xudo-watch.sock"), &request, PATIENT).is_err());
     }
 
     #[test]

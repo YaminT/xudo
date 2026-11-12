@@ -205,6 +205,10 @@ mod tests {
 
     use super::*;
 
+    /// A deadline a passing test never waits for, so a loaded runner cannot
+    /// expire it.
+    const PATIENT: Duration = Duration::from_secs(60);
+
     /// A gate that answers `Ok(out)` or fails, and records what it was asked to run.
     struct Gate(Result<Output, ()>, RefCell<Vec<String>>);
 
@@ -299,7 +303,7 @@ mod tests {
         });
         let probe = BrokerProbe {
             socket: &socket,
-            timeout: TIMEOUT,
+            timeout: PATIENT,
             runner: gate,
             files,
         };
@@ -378,7 +382,7 @@ mod tests {
         let files = id_is_regular();
         let probe = BrokerProbe {
             socket: &dir.path().join("none.sock"),
-            timeout: TIMEOUT,
+            timeout: PATIENT,
             runner: &gate,
             files: &files,
         };
@@ -456,7 +460,7 @@ mod tests {
         let probe = BrokerProbe {
             // Nothing listens: asking the broker would say "unreachable".
             socket: &dir.path().join("none.sock"),
-            timeout: TIMEOUT,
+            timeout: PATIENT,
             runner: &gate,
             files: &files,
         };
@@ -493,7 +497,7 @@ mod tests {
         let files = KnownFiles::only(&[]);
         let probe = BrokerProbe {
             socket: &dir.path().join("none.sock"),
-            timeout: TIMEOUT,
+            timeout: PATIENT,
             runner: &gate,
             files: &files,
         };

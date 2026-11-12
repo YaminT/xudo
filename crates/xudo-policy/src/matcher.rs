@@ -210,6 +210,19 @@ impl AnchoredPattern {
         })
     }
 
+    /// The bytes that identify this pattern in a canonical encoding.
+    ///
+    /// Destructures exhaustively, so a field added to the pattern (a flag, a
+    /// size bound) stops this compiling until it is either encoded or named as
+    /// derived. `compiled` is built from `source` alone by [`Self::new`].
+    pub(crate) fn canonical_form(&self) -> &[u8] {
+        let Self {
+            source,
+            compiled: _,
+        } = self;
+        source.as_bytes()
+    }
+
     /// Returns the pattern as written by the rule author, without anchors.
     pub fn source(&self) -> &str {
         &self.source
