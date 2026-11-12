@@ -378,6 +378,7 @@ mod tests {
             queued_by: None,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         }
     }
 

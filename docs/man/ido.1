@@ -17,6 +17,7 @@ ido \- a queue of commands an agent asked you to run
 .IR dir ]
 .RB [ \-\-dry\-run\-of
 .IR arg ]...
+.RB [ \-\-root ]
 .B \-\-
 .I command
 .RI [ arg ...]
@@ -93,6 +94,27 @@ again.
 A
 .B \-\-needs
 id must already be queued, so a dependency cycle cannot be written.
+.B \-\-root
+marks the entry as needing root: when you run it,
+.B ido
+executes
+.B /usr/bin/xudo exec \-\-
+.I command
+.RI [ arg ...]
+instead of the command itself, so it still gets
+.BR xudo 's
+policy matching, deny\-list and audit record, and asks for your password on
+your terminal.
+The marker grants nothing: you still select and confirm the entry, and the
+command is passed after
+.B \-\-
+as separate arguments, never through a shell.
+If
+.B xudo
+is not installed at that path the entry is not run and stays queued.
+Entries queued by
+.B xudo exec \-\-queue
+carry the marker.
 .TP
 .B add
 Writes the agent instructions between

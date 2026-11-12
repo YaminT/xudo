@@ -46,7 +46,9 @@ pub mod run;
 pub mod status;
 pub mod store;
 
-pub use cli::{CELEBRATION_NAME, Enqueued, Host, Io, OpenTerminal, enqueue, run_with};
+pub use cli::{
+    CELEBRATION_NAME, Enqueued, Host, Io, OpenTerminal, XUDO_FRONT_END, enqueue, run_with,
+};
 pub use entry::{Entry, QUEUE_SCHEMA_VERSION};
 pub use error::IdoError;
 pub use picker::Terminal;

@@ -121,7 +121,11 @@ pub fn row(entry: &Entry, queue: &[Entry], now_unix: u64) -> Row {
     let consequence = assess(&entry.argv);
 
     let mut meta: Vec<String> = Vec::new();
-    meta.push(if consequence.elevates {
+    meta.push(if entry.via_xudo {
+        // Fixed text, no agent bytes: what running this entry will do.
+        "needs root: runs through `xudo exec` (policy, deny-list, audit; asks your password)"
+            .to_owned()
+    } else if consequence.elevates {
         "needs root".to_owned()
     } else {
         "no root".to_owned()
@@ -164,7 +168,7 @@ pub fn row(entry: &Entry, queue: &[Entry], now_unix: u64) -> Row {
             .map(|f| format!("\u{26A0} {f}"))
             .collect(),
         status: status_of(entry, queue, now_unix),
-        high: consequence.is_high(),
+        high: entry.via_xudo || consequence.is_high(),
     }
 }
 
@@ -293,6 +297,7 @@ mod tests {
             queued_by: None,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         }
     }
 
