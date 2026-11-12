@@ -374,9 +374,9 @@ else
 fi
 clear_confirm userns none
 
-# Freeze is global in this harness: the approved human path must still prompt
-# for and accept the password. Thaw is root-only, and refused by the broker
-# (not by sudo) for anyone else.
+# Root's freeze is global; the approved human path must still prompt for and
+# accept the password. A user's freeze and thaw reach only that user's own
+# marker, so a user's thaw cannot lift root's freeze.
 frozen=/var/lib/xudo/frozen
 test_uid=$(id -u xudotest)
 pkill -TERM -u "$test_uid" -x xudo 2>/dev/null || true
@@ -399,16 +399,38 @@ set +e
 su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
 rc=$?
 set -e
-if [ "$rc" -ne 0 ] && grep -q 'thaw requires uid 0' /var/tmp/nonroot-thaw.out && [ -f "$frozen" ]; then
-    good "xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user (rc=$rc)"
+if [ "$rc" -eq 0 ] && [ -f "$frozen" ]; then
+    good "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc)"
 else
-    bad "xudo_thaw_is_refused_by_the_broker_for_an_unprivileged_user (rc=$rc, frozen file: $([ -f "$frozen" ] && echo present || echo gone))"
+    bad "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc, frozen file: $([ -f "$frozen" ] && echo present || echo gone))"
     cat /var/tmp/nonroot-thaw.out >&2
 fi
-if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ]; then
-    good "xudo_thaw_works_as_root_and_removes_the_frozen_file"
+user_frozen=/var/lib/xudo/frozen-$test_uid
+set +e
+su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/var/tmp/user-freeze.out 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -f "$user_frozen" ]; then
+    good "a_users_freeze_writes_only_their_own_marker"
 else
-    bad "xudo_thaw_works_as_root_and_removes_the_frozen_file"
+    bad "a_users_freeze_writes_only_their_own_marker (rc=$rc)"
+    cat /var/tmp/user-freeze.out >&2
+fi
+set +e
+su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/user-thaw.out 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ ! -e "$user_frozen" ] && [ -f "$frozen" ]; then
+    good "a_users_thaw_removes_only_their_own_marker"
+else
+    bad "a_users_thaw_removes_only_their_own_marker (rc=$rc)"
+    cat /var/tmp/user-thaw.out >&2
+fi
+su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/dev/null 2>&1 || true
+if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ] && [ ! -e "$user_frozen" ]; then
+    good "xudo_thaw_works_as_root_and_removes_every_freeze_marker"
+else
+    bad "xudo_thaw_works_as_root_and_removes_every_freeze_marker"
     cat /var/tmp/root-thaw.out >&2
 fi
 

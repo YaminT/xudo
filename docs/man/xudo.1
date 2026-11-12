@@ -179,16 +179,25 @@ This command does not require a terminal.
 .B freeze
 Requires
 .BR \-\-reason \fITEXT\fR .
-Freeze the agent path with an operator supplied reason. Until agent
+Freeze the agent path with an operator supplied reason. The scope is the
+caller's. A user's freeze stops only that user's own agents: it writes a
+marker named by the user's uid, and root's global freeze is untouched.
+Root's freeze is global and stops every user's agents. An attested agent
+cannot freeze, and neither can a peer in another user namespace. Until agent
 enrollment ships (M4) this sets the flag but changes nothing for new requests
 or for human requests: every caller is unattested, and the human password path
-stays available. Pending or approved requests of an enrolled agent are denied
-and audited, without a backoff strike; a human's pending request is left alone.
+stays available. Pending or approved requests of an enrolled agent in the
+freezer's scope (every user's, for root) are denied and audited, without a
+backoff strike; a human's pending request is left alone.
 .TP
 .B thaw
-Remove the freeze marker and resume the agent path. Accepted only from uid 0;
-run it as
-.BR "sudo xudo thaw" .
+Lift the caller's own freeze and resume that scope. A user's thaw removes only
+the marker for their own uid: root's global freeze stays in force, and so does
+every other user's, until root lifts it. Root's thaw lifts the global freeze
+and every user's marker. An attested agent cannot thaw, and neither can a peer
+in another user namespace. Run it as the user who froze; do not run it as
+.B sudo
+to clear a user's freeze unless root's global freeze should go as well.
 .TP
 .B check
 Lint the loaded ruleset.

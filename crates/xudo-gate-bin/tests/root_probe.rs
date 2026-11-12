@@ -215,22 +215,61 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(output.stdout.trim(), "0");
     assert!(!entry_exists(&nonce));
 
-    // An ordinary user cannot thaw, and is told it is a matter of trust.
-    let refused = Command::new("/usr/sbin/runuser")
-        .args(["-u", USER, "--"])
-        .arg(xudo_binary())
-        .args(["--output", "json", "thaw"])
-        .output()
-        .unwrap();
-    assert!(!refused.status.success(), "{refused:?}");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("ChannelUntrusted"),
-        "{refused:?}"
-    );
+    // An ordinary user's thaw lifts only their own marker: root's global
+    // freeze stands, and the broker says done all the same.
+    let as_user = |args: &[&str]| {
+        Command::new("/usr/sbin/runuser")
+            .args(["-u", USER, "--"])
+            .arg(xudo_binary())
+            .args(["--output", "json"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let thawed = as_user(&["thaw"]);
+    assert!(thawed.status.success(), "{thawed:?}");
+    assert!(marker.exists(), "a user's thaw lifted root's freeze");
+
+    // A user's own freeze writes their own marker, which the gate reads for
+    // that uid alone, and root's global marker is untouched.
+    let uid: u32 = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .args(["-u", USER])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let theirs = dir.join(format!("frozen-{uid}"));
+    let frozen_for = |who: u32| xudo_gate::policy::user_frozen(who, &xudo_sys::read_trusted_file);
+    assert!(!frozen_for(uid));
+    let froze = as_user(&["freeze", "--reason", "user scope"]);
+    assert!(froze.status.success(), "{froze:?}");
+    assert!(theirs.exists());
+    let meta = fs::metadata(&theirs).unwrap();
+    assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o600));
+    assert!(fs::read_to_string(&theirs).unwrap().contains("user scope"));
+    // Root's global marker is byte for byte what root wrote.
+    assert_eq!(fs::read_to_string(&marker).unwrap(), record);
+    assert!(frozen_for(uid));
+    assert!(!frozen_for(uid + 1));
+    assert!(as_user(&["thaw"]).status.success());
+    assert!(!theirs.exists());
     assert!(marker.exists());
+    // Root's thaw clears every marker, a user's included.
+    assert!(
+        as_user(&["freeze", "--reason", "user scope"])
+            .status
+            .success()
+    );
+    assert!(theirs.exists());
 
     assert_eq!(ask_broker(xudo_wire::Question::Thaw).answer, Answer::Done);
     assert!(!marker.exists());
+    assert!(!theirs.exists());
     assert!(!load().settings.frozen);
     remove_snippet();
 }
