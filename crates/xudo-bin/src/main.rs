@@ -19,6 +19,38 @@ fn caller_path() -> Option<std::ffi::OsString> {
     std::env::var_os("PATH")
 }
 
+/// One variable as text, for the queue location only.
+#[allow(clippy::disallowed_methods)]
+fn var(name: &str) -> Option<String> {
+    std::env::var_os(name).and_then(|v| v.into_string().ok())
+}
+
+/// Where `xudo exec --queue` writes: the invoking user's own `ido` queue, found
+/// the way `ido` finds it. Read here, once, and handed to the library as data.
+/// It places a file and decides nothing: the queue is the caller's own, written
+/// only after the broker has already denied the command.
+fn queue_host() -> ido::Host {
+    ido::Host {
+        home: std::env::home_dir(),
+        xdg_config_home: var("XDG_CONFIG_HOME"),
+        xdg_state_home: var("XDG_STATE_HOME"),
+        xdg_cache_home: var("XDG_CACHE_HOME"),
+        xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
+        cwd: std::env::current_dir().ok(),
+        uid: rustix::process::getuid().as_raw(),
+        now_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        stdin_tty: false,
+        stdout_tty: false,
+        no_color: true,
+        no_animation: true,
+        queued_by: Some("xudo".to_owned()),
+        lock_wait: std::time::Duration::from_secs(2),
+        frame_delay: std::time::Duration::ZERO,
+    }
+}
+
 /// `xudo exec`: if the broker said yes, become the backend running the gate.
 ///
 /// Same pid and start time, so the gate finds the entry pinned to us, and the
@@ -26,11 +58,13 @@ fn caller_path() -> Option<std::ffi::OsString> {
 fn exec(
     cli: &xudo::Cli,
     argv: &[String],
+    queue: bool,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> std::process::ExitCode {
     use std::os::unix::process::CommandExt;
-    let plan = match xudo::exec::plan_live(cli, argv, out, err) {
+    let host = queue.then(queue_host);
+    let plan = match xudo::exec::plan_live(cli, argv, host.as_ref(), out, err) {
         Ok(plan) => plan,
         Err(status) => return exit_status(status.as_i32()),
     };
@@ -73,8 +107,8 @@ fn main() -> std::process::ExitCode {
     };
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
-    if let xudo::Command::Exec { argv } = &cli.command {
-        return exec(&cli, argv, &mut out, &mut err);
+    if let xudo::Command::Exec { argv, queue } = &cli.command {
+        return exec(&cli, argv, *queue, &mut out, &mut err);
     }
     let status = xudo::run(&cli, &invocation, &mut out, &mut err);
     exit_status(status.as_i32())

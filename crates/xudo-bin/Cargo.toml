@@ -17,7 +17,13 @@ path = "src/main.rs"
 
 [dependencies]
 xudo = { path = "../xudo", version = "0.1.0-beta.1" }
+# Only to build the `ido::Host` that `--queue` hands the library.
+ido = { path = "../ido", version = "0.1.0-beta.1" }
 clap.workspace = true
+rustix = { version = "1.1", default-features = false, features = [
+  "std",
+  "process",
+] }
 
 # `tests/binary.rs` runs the binary as a process. It lives in this package, not
 # in `xudo-tests`, because Cargo builds a binary for — and sets
@@ -31,6 +37,8 @@ xudo-tests = { path = "../xudo-tests", version = "0.1.0-beta.1" }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
+# The denial the fake broker in `tests/root_queue.rs` sends.
+xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 rustix = { version = "1.1", default-features = false, features = [
   "std",
   "termios",
@@ -48,6 +56,10 @@ root-tests = []
 # ("requires the features") rather than running an empty binary and passing.
 [[test]]
 name = "root_install"
+required-features = ["root-tests"]
+
+[[test]]
+name = "root_queue"
 required-features = ["root-tests"]
 
 [[test]]

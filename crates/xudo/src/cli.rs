@@ -134,6 +134,12 @@ pub enum Command {
         /// The command and its arguments, after `--`. The program is an absolute path.
         #[arg(trailing_var_arg = true, required = true, value_name = "ARGV")]
         argv: Vec<String>,
+
+        /// If the denial is one only a human can resolve (`human-path-only` or
+        /// `no-confirmation-channel`), queue the command for `ido` and report
+        /// its id. Never runs anything and never changes the verdict.
+        #[arg(long)]
+        queue: bool,
     },
 
     /// Lint the ruleset. Exits non-zero if anything is wrong with it.
@@ -410,7 +416,7 @@ pub fn run_with_installer_at_socket(
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
         // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
-        Command::Exec { argv } => {
+        Command::Exec { argv, .. } => {
             let Some(wait) = exec::configured_timeout(cli, err) else {
                 return ExitCode::Unusable;
             };
@@ -421,6 +427,7 @@ pub fn run_with_installer_at_socket(
                 Path::new(xudo_wire::BROKER_SOCKET),
                 exec::TIMEOUT,
                 wait,
+                None,
                 out,
                 err,
             )
@@ -1341,12 +1348,22 @@ fn classify(ops: &dyn PrivilegedOps, err: &mut dyn Write) -> CallerFacts {
 
 /// Renders a decision in the requested format and maps it to an exit status.
 pub(crate) fn emit(cli: &Cli, decision: &Decision, out: &mut dyn Write) -> ExitCode {
+    emit_queued(cli, decision, None, out)
+}
+
+/// [`emit`], with the id of the queue entry `--queue` made for this denial.
+pub(crate) fn emit_queued(
+    cli: &Cli,
+    decision: &Decision,
+    queued: Option<u64>,
+    out: &mut dyn Write,
+) -> ExitCode {
     match cli.output {
         Format::Human => {
             let _ = write!(out, "{}", render::human(decision));
         }
         Format::Json => {
-            let _ = writeln!(out, "{}", render::json(decision));
+            let _ = writeln!(out, "{}", render::json_queued(decision, queued));
         }
     }
     // `explain` reports; it does not execute. A refusal still exits non-zero so

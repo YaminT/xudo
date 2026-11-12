@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The queue write `xudo exec --queue` shares with `ido queue`: same store, lock
+# and entry format. `ido` has no terminal dependency and none on `xudo`.
+ido = { path = "../ido", version = "0.1.0-beta.1" }
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 xudo-backend = { path = "../xudo-backend", version = "0.1.0-beta.1" }
 xudo-config = { path = "../xudo-config", version = "0.1.0-beta.1" }

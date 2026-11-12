@@ -135,6 +135,36 @@ pub fn json(decision: &Decision) -> String {
     to_pretty(decision)
 }
 
+/// The envelope with `queued: {id}` beside the decision, when `--queue` made an
+/// entry for it. With no entry it is exactly [`json`].
+pub fn json_queued(decision: &Decision, queued: Option<u64>) -> String {
+    #[derive(serde::Serialize)]
+    struct Id {
+        id: u64,
+    }
+    #[derive(serde::Serialize)]
+    struct Queued<'a> {
+        #[serde(flatten)]
+        decision: &'a Decision,
+        queued: Id,
+    }
+    queued.map_or_else(
+        || json(decision),
+        |id| {
+            to_pretty(&Queued {
+                decision,
+                queued: Id { id },
+            })
+        },
+    )
+}
+
+/// The line that tells the agent where the command went.
+pub fn queued_human(id: u64, already: bool) -> String {
+    let when = if already { "already queued" } else { "queued" };
+    format!("xudo: {when} as #{id}, run `ido` to execute\n")
+}
+
 /// Renders any serializable value, degrading the same way [`json`] does.
 ///
 /// Used for the configuration schema, which is plain data for the same reason a

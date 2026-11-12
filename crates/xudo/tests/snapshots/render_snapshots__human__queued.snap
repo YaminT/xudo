@@ -1,0 +1,5 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::queued_human(7, false)"
+---
+xudo: queued as #7, run `ido` to execute
