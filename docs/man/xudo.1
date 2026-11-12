@@ -261,8 +261,8 @@ an empty, a very long or a non\-UTF\-8 argument), and each is put to the engine,
 never run.
 It cross\-checks the overlap report (two actions accept a command it does not
 list), canonicalization (the decision changes when the argv is canonicalized
-first) and appending (a refusal that a trailing argument turns into a
-permission).
+first) and appending (a deny\-list refusal that a trailing argument turns into a
+permission; the agent path is not covered).
 Any finding is a lint error, printed as the command both sanitized and as
 hexadecimal bytes.
 .B \-\-fuzz\-budget

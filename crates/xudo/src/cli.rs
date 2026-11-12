@@ -132,7 +132,7 @@ pub struct CheckArgs {
         long,
         requires = "fuzz",
         value_name = "N",
-        default_value_t = 20_000,
+        default_value_t = xudo_policy::fuzz_check::DEFAULT_BUDGET as u32,
         value_parser = clap::value_parser!(u32).range(1..=1_000_000)
     )]
     pub(crate) fuzz_budget: u32,

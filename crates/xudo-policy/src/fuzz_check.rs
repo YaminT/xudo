@@ -15,8 +15,11 @@
 //!   disjoint, so this is a soundness hole in the analysis, never a rule problem.
 //! * **Canonicalization stability.** Deciding the canonical form of the argv
 //!   must give the same decision as deciding the argv.
-//! * **Appending never widens.** A candidate refused for a reason other than its
-//!   argument shape stays refused when an argument is appended.
+//! * **Appending never widens a deny-list refusal.** A candidate the compiled-in
+//!   deny-list refuses stays refused when an argument is appended. The agent
+//!   path is not covered: a human-only refusal can become a permission when the
+//!   human-only rule stops matching the longer argv (the overlap lint already
+//!   warns about that).
 //!
 //! Candidates accepted by one action, by several actions the report predicts,
 //! or by none are only counted.
@@ -541,7 +544,7 @@ pub fn fuzz_with(
         .collect();
     let mut report = FuzzReport {
         seed: config.seed,
-        budget: config.budget,
+        budget: config.budget.min(MAX_BUDGET),
         candidates: 0,
         accepted_by_one: 0,
         accepted_by_several: 0,
@@ -551,13 +554,12 @@ pub fn fuzz_with(
     };
     let mut seen = BTreeSet::new();
     let mut record = |report: &mut FuzzReport, finding: Finding| {
-        if !seen.insert(finding.key()) {
-            return;
-        }
-        if report.findings.len() < MAX_FINDINGS {
-            report.findings.push(finding);
-        } else {
+        // Past the cap the keys (multi-KB each) are no longer kept: every
+        // further finding is counted as omitted, repeats included.
+        if report.findings.len() >= MAX_FINDINGS {
             report.omitted = report.omitted.saturating_add(1);
+        } else if seen.insert(finding.key()) {
+            report.findings.push(finding);
         }
     };
 
@@ -595,8 +597,7 @@ pub fn fuzz_with(
             record(&mut report, Finding { kind, exe, argv });
         }
 
-        let shape = matches!(decision.denial, Some(DenialCode::ArgvRejected));
-        if decision.verdict == Verdict::Deny && !shape {
+        if decision.denial == Some(DenialCode::DenyListed) {
             let mut longer = argv.as_slice().to_vec();
             longer.push(extra.clone());
             if decide(&exe, &Argv::new(longer)).verdict != Verdict::Deny {
@@ -620,15 +621,18 @@ mod tests {
 
     #[test]
     fn every_mutation_kind_changes_an_argv_without_panicking() {
+        const SEEDS: u64 = if cfg!(miri) { 1 } else { 4 };
         let dictionary = bare();
-        for kind in 0..KINDS.saturating_mul(2) {
-            for start in [
-                Vec::new(),
-                vec![Arg::from("a")],
-                vec![Arg::from("a"), Arg::from("b"), Arg::from("c")],
-                vec![Arg::from("a"); MAX_ARGV_LEN],
-            ] {
-                for seed in 0..4 {
+        let starts = [
+            Vec::new(),
+            vec![Arg::from("a")],
+            vec![Arg::from("a"), Arg::from("b"), Arg::from("c")],
+            vec![Arg::from("a"); MAX_ARGV_LEN],
+        ];
+        // One kind past the last proves the modulo.
+        for kind in 0..=KINDS {
+            for start in &starts {
+                for seed in 0..SEEDS {
                     let mut args = start.clone();
                     mutate(&mut args, kind, &mut Rng(seed), &dictionary);
                     assert!(

@@ -83,6 +83,11 @@ pub(crate) fn run(
         budget: usize::try_from(args.fuzz_budget).unwrap_or(usize::MAX),
         seed: args.fuzz_seed,
     });
+    let overlaps = if tests_only && !args.fuzz {
+        Vec::new()
+    } else {
+        loaded.rules().overlaps()
+    };
     let (errors, warnings) = if tests_only {
         (Vec::new(), Vec::new())
     } else {
@@ -98,12 +103,7 @@ pub(crate) fn run(
                     )
                 })
                 .collect(),
-            loaded
-                .rules()
-                .overlaps()
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            overlaps.iter().map(ToString::to_string).collect(),
         )
     };
     let human = CallerFacts::new(Classification::Human, 1000);
@@ -111,7 +111,7 @@ pub(crate) fn run(
         errors,
         warnings,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
-        fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &loaded.rules().overlaps(), config)),
+        fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
     let status = report.status();
     match cli.output {
@@ -420,6 +420,27 @@ mod tests {
         assert!(!err.contains('\u{1b}'), "{err:?}");
         insta::assert_snapshot!("fuzz_stdout", out);
         insta::assert_snapshot!("fuzz_stderr", err);
+    }
+
+    #[test]
+    fn a_hostile_action_id_in_a_fuzz_finding_is_not_printed_raw() {
+        let mut hostile = report();
+        hostile.findings = vec![Finding {
+            kind: FindingKind::MissedOverlap {
+                first: ActionId::new("a\u{1b}[31mred\nxudo: forged\u{202e}"),
+                second: ActionId::new("a.two"),
+            },
+            exe: Arg::from("/usr/bin/x"),
+            argv: Argv::new([Arg::from("a")]),
+        }];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        fuzz_lines(&hostile, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        assert!(!err.contains('\u{202e}'), "{err:?}");
+        let finding_lines = err.lines().filter(|l| l.starts_with("xudo: fuzz:")).count();
+        assert_eq!(finding_lines, 2, "the id forged a line: {err:?}");
+        assert!(!err.contains("\nxudo: forged"), "{err:?}");
     }
 
     #[test]
