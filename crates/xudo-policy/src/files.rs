@@ -35,7 +35,7 @@ const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v2\0";
 ///
 /// Every reader parses every test on every load, so the whole is bounded as
 /// well as each file (see [`crate::rule::MAX_TESTS_PER_FILE`]).
-pub const MAX_TESTS: usize = 16 * 1024;
+pub const MAX_TESTS: usize = 4 * crate::rule::MAX_TESTS_PER_FILE;
 
 /// Whether a directory entry is a rule file.
 ///
@@ -888,7 +888,21 @@ args = [
             out
         }
 
+        // Miri runs the interpreter a thousand times slower: a handful of
+        // cases there still draws every strategy, and the normal run keeps
+        // proptest's 256.
         proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: if cfg!(miri) { 4 } else { 256 },
+                // Miri's isolation refuses the regression file's I/O.
+                failure_persistence: if cfg!(miri) {
+                    None
+                } else {
+                    ProptestConfig::default().failure_persistence
+                },
+                ..ProptestConfig::default()
+            })]
+
             #[test]
             fn any_decision_relevant_difference_changes_the_canonical_form(
                 base in action(),
@@ -925,6 +939,6 @@ args = [
         assert_eq!(load_rule_files(files(fit)).unwrap().tests.len(), MAX_TESTS);
         let err = load_rule_files(files(fit + 1)).unwrap_err();
         assert_eq!(err, RuleFilesError::TooManyTests { limit: MAX_TESTS });
-        assert!(err.to_string().contains("16384"), "{err}");
+        assert!(err.to_string().contains(&MAX_TESTS.to_string()), "{err}");
     }
 }

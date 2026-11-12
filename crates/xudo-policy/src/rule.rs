@@ -214,7 +214,11 @@ struct RuleFile {
 /// The broker and the gate parse every test of every file on every request, so
 /// a generated suite must not become a per-request cost. A file over the bound
 /// fails to load, for every reader alike.
-pub const MAX_TESTS_PER_FILE: usize = 4096;
+///
+/// Miri interprets the parser some thousand times slower, so under it the bound
+/// is small: the check it guards is the same comparison, and the tests state
+/// the bound through this constant, never as a literal.
+pub const MAX_TESTS_PER_FILE: usize = if cfg!(miri) { 8 } else { 4096 };
 
 /// The byte offset at which each line of `text` begins.
 fn line_starts(text: &str) -> Vec<usize> {
