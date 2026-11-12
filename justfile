@@ -308,7 +308,19 @@ install-root:
 # Builds target/deb/xudo_<version>_<arch>.deb from the static musl binaries,
 # for the architecture Docker on this host runs. No cargo-deb: the layout and
 # the maintainer scripts are in packaging/deb/.
+#
+# This one recipe builds the package the release signs and the one
+# `just repro` compares, so the settings that make it byte-reproducible live
+# here and nowhere else. RUSTFLAGS is set outright, never appended to the
+# caller's, so CI's `-D warnings` and the release's empty value cannot change
+# the shipped bytes (warnings stay denied in the lint lanes). A rebuilder needs
+# the pinned toolchain; any path, locale, time zone and CARGO_HOME will do.
 deb:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+    export LC_ALL=C TZ=UTC CARGO_INCREMENTAL=0
+    export RUSTFLAGS="--remap-path-prefix={{justfile_directory()}}=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rustc"
     cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
     packaging/deb/build.sh {{musl_triple}}
 
@@ -326,10 +338,11 @@ systemd-test: deb
     XUDO_BUILD_BIN_DIR=target/systemd-short-ttl/{{musl_triple}}/release packaging/deb/build.sh {{musl_triple}} target/systemd-short-ttl/deb
     ci/systemd/run.sh {{musl_triple}}
 
-# Two builds of HEAD from different paths, byte-compared (.deb and the four
-# binaries). ci/repro/run.sh says what is pinned.
-repro:
-    ci/repro/run.sh {{musl_triple}}
+# Two builds of HEAD with `just deb`, from different paths and CARGO_HOMEs,
+# byte-compared (.deb and the four binaries). ci/repro/run.sh has the details.
+# An optional file receives the .deb sha256.
+repro sha_out='':
+    ci/repro/run.sh {{musl_triple}} {{sha_out}}
 
 # Trace selected shipped release-musl binaries and check their normal dependency graph.
 telemetry:

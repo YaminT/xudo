@@ -7,6 +7,8 @@
 # Run `cargo build --release --target <triple>` for the four binaries first.
 set -eu
 umask 022
+# conffiles and md5sums are sorted: the order must not depend on the locale.
+export LC_ALL=C
 triple=$1
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out=${2:-$root/target/deb}
