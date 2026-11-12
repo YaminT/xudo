@@ -42,7 +42,8 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: just@1.59.0
+          tool: just@1.59.0,cargo-auditable@0.7.7
+          fallback: none
       - name: Test package
         run: just deb-test
       # The reproducible-build job built this commit on another runner VM. The
@@ -60,9 +61,34 @@ jobs:
           path: target/deb/xudo_*.deb
           if-no-files-found: error
 
+  # One CycloneDX SBOM per release, from Cargo.lock. Its own job, so the build
+  # matrix keeps no conditional steps; the sign job signs the file.
+  sbom:
+    name: SBOM
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: just@1.59.0
+      - name: Generate the SBOM
+        run: |
+          workspace_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          just sbom "target/sbom/xudo-${workspace_version}.cdx.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xudo-sbom
+          path: target/sbom/xudo-*.cdx.json
+          if-no-files-found: error
+
   sign:
     name: Sign release artifacts
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -73,13 +99,16 @@ jobs:
         with:
           pattern: xudo-deb-*
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: xudo-sbom
       - uses: sigstore/cosign-installer@fb28c2b6339dcd94da6e4cbcbc5e888961f6f8c3 # v3.9.0
         with:
           cosign-release: 'v2.4.1'
       - name: Create checksums and sign artifacts
         run: |
-          sha256sum -- *.deb > SHA256SUMS
-          for file in *.deb SHA256SUMS; do
+          sha256sum -- *.deb *.cdx.json > SHA256SUMS
+          for file in *.deb *.cdx.json SHA256SUMS; do
             cosign sign-blob --yes --bundle "$file.cosign.bundle" "$file"
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -87,6 +116,7 @@ jobs:
           name: xudo-release-artifacts
           path: |
             *.deb
+            *.cdx.json
             *.cosign.bundle
             SHA256SUMS
           if-no-files-found: error
@@ -107,4 +137,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --verify-tag --draft --prerelease --title "$TAG" ./*.deb ./SHA256SUMS ./*.cosign.bundle
+        run: gh release create "$TAG" --verify-tag --draft --prerelease --title "$TAG" ./*.deb ./*.cdx.json ./SHA256SUMS ./*.cosign.bundle

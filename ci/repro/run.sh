@@ -16,7 +16,8 @@
 # Reference rebuild environment: the GitHub ubuntu-24.04 runner image (amd64 and
 # arm64), its stock dpkg-deb and xz-utils (from the image; `dpkg-deb --version`
 # and `xz --version` are printed below), and the toolchain pinned in
-# rust-toolchain.toml (1.98.0). The release build job compares its own .deb
+# rust-toolchain.toml (1.98.0), plus cargo-auditable 0.7.7 (the `deb` recipe
+# checks it). The release build job compares its own .deb
 # sha256 with the one this script records.
 set -euo pipefail
 
