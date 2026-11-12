@@ -272,7 +272,7 @@ impl Picker {
         let high = ids
             .iter()
             .filter_map(|id| self.entry(*id))
-            .any(|e| crate::consequence::assess(&e.argv).is_high());
+            .any(|e| e.via_xudo || crate::consequence::assess(&e.argv).is_high());
         if ids.len() > 1 || high {
             self.mode = Mode::ConfirmRun {
                 ids,
@@ -574,6 +574,7 @@ mod tests {
             queued_by: None,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         }
     }
 
@@ -627,6 +628,17 @@ mod tests {
         sequence.extend([Key::Backspace, Key::Char('n'), Key::Unknown]);
         keys(&mut p, &sequence);
         assert_eq!(p.handle(Key::Enter), Action::Run(vec![1]));
+    }
+
+    #[test]
+    fn the_picker_shows_that_an_entry_runs_through_xudo() {
+        let mut e = entry(1, &["systemctl", "restart", "nginx"]);
+        e.via_xudo = true;
+        let mut p = Picker::new(vec![e, entry(2, &["true"])], 1000, false);
+        insta::assert_snapshot!(p.frame(120, 24));
+        // It is high consequence: a keypress is not enough to run it.
+        assert_eq!(keys(&mut p, &[Key::Space, Key::Enter]), Action::Continue);
+        assert!(p.frame(120, 24).contains("type run"));
     }
 
     #[test]

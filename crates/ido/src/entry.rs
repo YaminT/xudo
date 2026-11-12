@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::IdoError;
 
 /// Version of the queue-line schema. Bump on any change to the shape.
-pub const QUEUE_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added `via_xudo`. A version 1 line has no such key and still
+/// parses, as an entry that runs as the human. A version 1 `ido` reading a
+/// line with the key refuses the whole file (`deny_unknown_fields`), which
+/// fails closed.
+pub const QUEUE_SCHEMA_VERSION: u32 = 2;
 
 /// After this many seconds an unrun entry is shown greyed as stale.
 ///
@@ -60,6 +65,13 @@ pub struct Entry {
     /// entry instead, so `Some(0)` never occurs.
     #[serde(default)]
     pub last_exit: Option<i32>,
+    /// Set by the queuer: running this entry means `xudo exec -- <argv>`, so
+    /// it needs root and goes through policy, the deny-list and the audit
+    /// record. An explicit marker, never guessed from the argv. Setting it
+    /// grants nothing: the human still selects the entry, and `xudo exec`
+    /// still asks for their password.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_xudo: bool,
 }
 
 impl Entry {
@@ -134,7 +146,30 @@ impl Entry {
             queued_by,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         })
+    }
+
+    /// Checks the schema version a line declares against what it carries.
+    ///
+    /// A version above this build's is a newer writer: refuse rather than
+    /// guess what its fields mean. A version 1 line cannot carry `via_xudo`,
+    /// which did not exist then, so one that does was not written by `ido`.
+    ///
+    /// # Errors
+    ///
+    /// The reason, as text, when the line is refused.
+    pub fn check_schema(&self) -> Result<(), String> {
+        if self.schema_version > QUEUE_SCHEMA_VERSION {
+            return Err(format!(
+                "schema_version {} is newer than this ido understands ({QUEUE_SCHEMA_VERSION})",
+                self.schema_version
+            ));
+        }
+        if self.schema_version < 2 && self.via_xudo {
+            return Err("a schema_version 1 line cannot carry via_xudo".to_owned());
+        }
+        Ok(())
     }
 
     /// One JSONL line, newline included.
@@ -184,6 +219,7 @@ mod tests {
             queued_by: None,
             attempts: 0,
             last_exit: None,
+            via_xudo: false,
         }
     }
 
@@ -321,6 +357,33 @@ mod tests {
         assert!(line.ends_with('\n'));
         let back: Entry = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn the_marker_round_trips_and_is_absent_when_unset() {
+        let plain = minimal(1, None, None);
+        assert!(!plain.to_jsonl().contains("via_xudo"));
+        let mut marked = plain.clone();
+        marked.via_xudo = true;
+        let line = marked.to_jsonl();
+        assert!(line.contains("\"via_xudo\":true"), "{line}");
+        let back: Entry = serde_json::from_str(line.trim_end()).unwrap();
+        assert!(back.via_xudo);
+        let v1 = r#"{"schema_version":1,"id":1,"argv":["x"],"queued_at":0}"#;
+        assert!(!serde_json::from_str::<Entry>(v1).unwrap().via_xudo);
+    }
+
+    #[test]
+    fn a_newer_schema_or_a_v1_line_with_the_marker_is_refused() {
+        let mut e = minimal(1, None, None);
+        assert!(e.check_schema().is_ok());
+        e.schema_version = QUEUE_SCHEMA_VERSION + 1;
+        assert!(e.check_schema().unwrap_err().contains("newer"));
+        e.schema_version = 1;
+        e.via_xudo = true;
+        assert!(e.check_schema().unwrap_err().contains("via_xudo"));
+        e.via_xudo = false;
+        assert!(e.check_schema().is_ok());
     }
 
     #[test]

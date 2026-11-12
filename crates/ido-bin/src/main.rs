@@ -122,6 +122,7 @@ fn main() -> std::process::ExitCode {
         queued_by: queued_by(),
         lock_wait: Duration::from_secs(2),
         frame_delay: Duration::from_millis(120),
+        xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
     };
 
     let mut out = std::io::stdout().lock();
