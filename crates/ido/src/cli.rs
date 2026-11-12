@@ -590,6 +590,20 @@ fn run(args: &RunArgs, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
         let _ = writeln!(io.out, "ido: nothing to run");
         return Ok(0);
     }
+    if args.yes {
+        let rooted: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| queue.iter().any(|e| e.id == *id && e.via_xudo))
+            .collect();
+        if !rooted.is_empty() {
+            return Err(IdoError::Refused(format!(
+                "{} runs through `xudo exec` as root, and --yes skips the confirmation; \
+                 nothing ran. Use the picker or run from a terminal and type run",
+                ids_text(&rooted)
+            )));
+        }
+    }
     if !args.yes && !confirmed(&ids, &queue, host, io)? {
         let _ = writeln!(io.out, "ido: not confirmed; nothing ran");
         return Ok(1);
@@ -1029,11 +1043,89 @@ mod tests {
         );
         assert!(again.out.contains("already queued as #1"), "{}", again.out);
 
-        let run = ido(&h, &["run", "--yes", "1"]);
+        let h = tty(h);
+        let run = ido_with(&h, &["run", "1"], "run\n", Vec::new());
         assert_eq!(run.code, 0, "{}{}", run.out, run.err);
         let args = std::fs::read_to_string(format!("{}.args", fake.display())).unwrap();
         assert_eq!(args, "exec\n--\nsystemctl\nrestart\nnginx\n");
         assert_eq!(queue_ids(&h), vec![2]);
+    }
+
+    /// A fake `xudo` that records its argv, so a test can see whether it ran.
+    fn fake_xudo(h: &mut Host) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = h.cwd.clone().unwrap().join("xudo");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'ran\\n' >> \"$0.log\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        h.xudo_front_end = fake.clone();
+        fake
+    }
+
+    fn ran(fake: &std::path::Path) -> bool {
+        std::path::Path::new(&format!("{}.log", fake.display())).exists()
+    }
+
+    #[test]
+    fn yes_never_runs_a_root_marked_entry() {
+        let mut h = host("yes-root");
+        let fake = fake_xudo(&mut h);
+        ido(
+            &h,
+            &["queue", "--root", "--", "systemctl", "restart", "nginx"],
+        );
+        let out = ido(&h, &["run", "--yes", "1"]);
+        assert_eq!(out.code, 2);
+        assert!(out.err.contains("#1"), "{}", out.err);
+        assert!(out.err.contains("--yes"), "{}", out.err);
+        assert!(!ran(&fake));
+        assert_eq!(queue_ids(&h), vec![1]);
+    }
+
+    #[test]
+    fn yes_all_refuses_when_any_entry_is_root_marked() {
+        let mut h = host("yes-all-root");
+        let fake = fake_xudo(&mut h);
+        ido(&h, &["queue", "--", "true"]);
+        ido(&h, &["queue", "--root", "--", "systemctl", "stop", "x"]);
+        for args in [
+            &["run", "--all", "--yes"][..],
+            &["run", "--yes", "1", "2"][..],
+        ] {
+            let out = ido(&h, args);
+            assert_eq!(out.code, 2, "{}", out.err);
+            assert!(out.err.contains("#2"), "{}", out.err);
+            assert!(!out.err.contains("#1 "), "{}", out.err);
+            assert!(!ran(&fake));
+            assert_eq!(queue_ids(&h), vec![1, 2]);
+        }
+        ido(
+            &h,
+            &[
+                "queue",
+                "--group",
+                "g",
+                "--root",
+                "--",
+                "systemctl",
+                "stop",
+                "y",
+            ],
+        );
+        let group = ido(&h, &["run", "--group", "g", "--yes"]);
+        assert_eq!(group.code, 2);
+        assert!(!ran(&fake));
+        assert_eq!(queue_ids(&h), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_plain_entry_still_runs_with_yes() {
+        let mut h = host("yes-plain");
+        let fake = fake_xudo(&mut h);
+        ido(&h, &["queue", "--", "true"]);
+        let out = ido(&h, &["run", "--yes", "1"]);
+        assert_eq!(out.code, 0, "{}{}", out.out, out.err);
+        assert!(!ran(&fake), "a plain entry must not go through xudo");
+        assert!(queue_ids(&h).is_empty());
     }
 
     #[test]

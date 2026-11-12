@@ -150,6 +150,28 @@ impl Entry {
         })
     }
 
+    /// Checks the schema version a line declares against what it carries.
+    ///
+    /// A version above this build's is a newer writer: refuse rather than
+    /// guess what its fields mean. A version 1 line cannot carry `via_xudo`,
+    /// which did not exist then, so one that does was not written by `ido`.
+    ///
+    /// # Errors
+    ///
+    /// The reason, as text, when the line is refused.
+    pub fn check_schema(&self) -> Result<(), String> {
+        if self.schema_version > QUEUE_SCHEMA_VERSION {
+            return Err(format!(
+                "schema_version {} is newer than this ido understands ({QUEUE_SCHEMA_VERSION})",
+                self.schema_version
+            ));
+        }
+        if self.schema_version < 2 && self.via_xudo {
+            return Err("a schema_version 1 line cannot carry via_xudo".to_owned());
+        }
+        Ok(())
+    }
+
     /// One JSONL line, newline included.
     ///
     /// Infallible by construction — every field is plain data — and degrading
@@ -349,6 +371,19 @@ mod tests {
         assert!(back.via_xudo);
         let v1 = r#"{"schema_version":1,"id":1,"argv":["x"],"queued_at":0}"#;
         assert!(!serde_json::from_str::<Entry>(v1).unwrap().via_xudo);
+    }
+
+    #[test]
+    fn a_newer_schema_or_a_v1_line_with_the_marker_is_refused() {
+        let mut e = minimal(1, None, None);
+        assert!(e.check_schema().is_ok());
+        e.schema_version = QUEUE_SCHEMA_VERSION + 1;
+        assert!(e.check_schema().unwrap_err().contains("newer"));
+        e.schema_version = 1;
+        e.via_xudo = true;
+        assert!(e.check_schema().unwrap_err().contains("via_xudo"));
+        e.via_xudo = false;
+        assert!(e.check_schema().is_ok());
     }
 
     #[test]
