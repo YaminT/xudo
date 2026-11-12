@@ -327,3 +327,174 @@ jobs:
         ]
     );
 }
+
+/// A file's text without its comment lines, so a needle must be in the code.
+fn uncommented(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The lines of the recipe body (indented lines after its header).
+fn recipe_body(justfile: &str, recipe: &str) -> String {
+    let mut lines = justfile.lines();
+    lines
+        .by_ref()
+        .find(|l| l.starts_with(&format!("{recipe}:")))
+        .unwrap();
+    let body: Vec<&str> = lines
+        .take_while(|l| l.is_empty() || l.starts_with(' '))
+        .collect();
+    uncommented(&body.join("\n"))
+}
+
+/// The text of the job `key` in a workflow: from its key to the next job key
+/// or the comment block before it, with comments removed.
+fn job(workflow: &str, key: &str) -> String {
+    let header = format!("  {key}:");
+    let mut lines = workflow.lines().skip_while(|l| *l != header);
+    let mut out: Vec<&str> = lines.by_ref().take(1).collect();
+    out.extend(lines.take_while(|l| l.is_empty() || l.starts_with("   ")));
+    let text = out.join("\n");
+    uncommented(&text)
+        .lines()
+        .map(|l| match l.find(" #") {
+            Some(i) => l[..i].trim_end(),
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_ci_job_builds_the_deb_twice_and_compares_the_bytes() {
+    let workflow = fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let justfile = fs::read_to_string(repo().join("justfile")).unwrap();
+    let script = fs::read_to_string(repo().join("ci/repro/run.sh")).unwrap();
+    let code = uncommented(&script);
+    assert!(recipes_run(&workflow).contains("repro"));
+    assert!(
+        justfile
+            .lines()
+            .any(|l| l.starts_with("repro:") || l.starts_with("repro "))
+    );
+    assert!(reached(&justfile).contains("repro"));
+    // The recipe is tied to the job, which is a hard gate.
+    let repro = job(&workflow, "reproducible-build");
+    assert!(repro.contains("name: reproducible build"));
+    assert!(repro.contains("run: just repro "), "{repro}");
+    assert!(!repro.contains("continue-on-error"), "{repro}");
+    assert!(!repro.contains("\n    if:"), "{repro}");
+    assert!(!repro.contains("rust-cache"), "{repro}");
+    assert!(repro.contains("ubuntu-24.04-arm"), "{repro}");
+    assert!(repro.contains("persist-credentials: false"), "{repro}");
+    assert!(
+        !repro
+            .lines()
+            .any(|l| l.trim_start().starts_with("if:") || l.trim_start().starts_with("- if:")),
+        "{repro}"
+    );
+    // The release reaches the job through its call to this workflow.
+    assert!(workflow.lines().any(|l| l.trim() == "workflow_call:"));
+    // The script runs the very recipe the release signs, in each checkout.
+    assert!(code.contains("just deb"), "run.sh must call `just deb`");
+    assert!(code.contains("archive HEAD"));
+    assert!(code.contains("sha256sum"));
+    assert!(code.contains("CARGO_HOME"));
+    assert!(
+        !code.contains("cargo build"),
+        "run.sh must not build itself"
+    );
+    // The shipped bytes are decided in the recipe, whatever the caller sets.
+    let deb = recipe_body(&justfile, "deb");
+    for needle in [
+        "--remap-path-prefix={{justfile_directory()}}",
+        "CARGO_HOME",
+        "rustc --print sysroot",
+        "SOURCE_DATE_EPOCH",
+        "LC_ALL=C",
+        "TZ=UTC",
+        "CARGO_INCREMENTAL=0",
+        "export RUSTFLAGS=\"--remap",
+    ] {
+        assert!(deb.contains(needle), "the deb recipe lacks {needle}");
+    }
+    assert_eq!(
+        deb.matches("RUSTFLAGS=").count(),
+        1,
+        "RUSTFLAGS must be assigned exactly once"
+    );
+    assert!(
+        !deb.contains("RUSTFLAGS:-"),
+        "RUSTFLAGS must be set outright"
+    );
+    assert!(
+        !deb.contains("$RUSTFLAGS"),
+        "RUSTFLAGS must be set outright"
+    );
+    let build = uncommented(&fs::read_to_string(repo().join("packaging/deb/build.sh")).unwrap());
+    assert!(build.contains("export LC_ALL=C"));
+    assert!(unpinned_actions(&workflow).is_empty());
+}
+
+#[test]
+fn the_release_build_fails_if_its_deb_differs_from_the_independent_rebuild() {
+    let release = fs::read_to_string(repo().join(".github/workflows/release.yml")).unwrap();
+    let build = job(&release, "build");
+    assert!(build.contains("repro-sha256-${{ matrix.arch }}"), "{build}");
+    assert!(build.contains("ci/repro/compare.sh"), "{build}");
+    assert!(
+        build.contains("just deb-test") || build.contains("just deb\n"),
+        "{build}"
+    );
+    assert!(!build.contains("rust-cache"), "{build}");
+    assert!(!build.contains("continue-on-error"), "{build}");
+    assert!(
+        !build
+            .lines()
+            .any(|l| l.trim_start().starts_with("- if:") || l.trim_start().starts_with("if:")),
+        "{build}"
+    );
+    // The comparison gates the upload, so a differing package is never signed.
+    let compare = build.find("ci/repro/compare.sh").unwrap();
+    let upload = build.find("actions/upload-artifact").unwrap();
+    assert!(compare < upload, "{build}");
+    assert!(release.contains("uses: ./.github/workflows/ci.yml"));
+    assert!(build.contains("needs: ci"));
+}
+
+#[test]
+fn the_ci_deb_job_proves_cross_vm_equality_on_every_pull_request() {
+    let workflow = fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let deb = job(&workflow, "deb");
+    assert!(deb.contains("needs: reproducible-build"), "{deb}");
+    assert!(
+        deb.contains("arch: amd64") && deb.contains("arch: arm64"),
+        "{deb}"
+    );
+    assert!(deb.contains("repro-sha256-${{ matrix.arch }}"), "{deb}");
+    assert!(deb.contains("ci/repro/compare.sh"), "{deb}");
+    assert!(deb.contains("just deb-test"), "{deb}");
+    assert!(!deb.contains("rust-cache"), "{deb}");
+    assert!(!deb.contains("continue-on-error"), "{deb}");
+    assert!(deb.contains("persist-credentials: false"), "{deb}");
+    assert!(
+        !deb.lines()
+            .any(|l| l.trim_start().starts_with("- if:") || l.trim_start().starts_with("if:")),
+        "{deb}"
+    );
+    assert!(unpinned_actions(&workflow).is_empty());
+}
+
+#[test]
+fn the_compare_script_fails_closed_and_is_not_an_and_list() {
+    let script = fs::read_to_string(repo().join("ci/repro/compare.sh")).unwrap();
+    let code = uncommented(&script);
+    // bash -e ignores a failing `&&` list, so no line may end one or hold one.
+    assert!(!code.contains("&&"), "{code}");
+    assert!(!code.contains("||"), "{code}");
+    assert!(code.matches("exit 1").count() >= 4, "{code}");
+    assert!(code.contains("sha256sum"));
+    assert!(code.contains("[ \"$expected\" != \"$actual\" ]"), "{code}");
+}
