@@ -327,3 +327,25 @@ jobs:
         ]
     );
 }
+
+#[test]
+fn a_ci_job_builds_the_deb_twice_and_compares_the_bytes() {
+    let workflow = fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
+    let justfile = fs::read_to_string(repo().join("justfile")).unwrap();
+    let script = fs::read_to_string(repo().join("ci/repro/run.sh")).unwrap();
+    assert!(recipes_run(&workflow).contains("repro"));
+    assert!(justfile.lines().any(|l| l == "repro:"));
+    assert!(reached(&justfile).contains("repro"));
+    assert!(workflow.contains("name: reproducible build"));
+    // The release workflow reaches the job through its call to this one.
+    assert!(workflow.lines().any(|l| l.trim() == "workflow_call:"));
+    for needle in [
+        "SOURCE_DATE_EPOCH",
+        "--remap-path-prefix",
+        "archive HEAD",
+        "sha256sum",
+    ] {
+        assert!(script.contains(needle), "ci/repro/run.sh lacks {needle}");
+    }
+    assert!(unpinned_actions(&workflow).is_empty());
+}

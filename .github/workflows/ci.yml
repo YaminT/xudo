@@ -168,6 +168,22 @@ jobs:
       - name: Root tests, as uid 0, on a copy of the checkout
         run: just root-test
 
+  # The beta .deb built twice from one commit, from different checkout paths and
+  # clean target directories, must match byte for byte. ci/repro/run.sh says what
+  # is pinned and compares the package and the four binaries.
+  reproducible-build:
+    name: reproducible build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: just@1.59.0
+      - name: two_builds_of_the_same_commit_are_byte_identical
+        run: just repro
+
   # The differential compliance matrix: the static binary and the shipped
   # ruleset driven inside real distributions against real sudo, sudo-rs,
   # OpenDoas, and no escalator at all. ci/differential/run.sh pins what each
