@@ -306,6 +306,18 @@ install-root:
     cargo build -p xudo-bin --release --target {{musl_triple}}
     ci/install/run.sh target/{{musl_triple}}/release/xudo
 
+# --- SBOM --------------------------------------------------------------------
+
+# Writes the CycloneDX SBOM of the four shipped binaries: ci/sbom/generate.sh.
+sbom out='target/sbom/xudo.cdx.json':
+    ci/sbom/generate.sh {{musl_triple}} {{quote(out)}}
+
+# Builds the four binaries with `cargo auditable`, then checks that each embeds
+# a non-empty dependency list and that the SBOM lists every crate in it and in
+# `cargo tree -e normal`, with the Cargo.lock version. No network.
+sbom-check: deb
+    ci/sbom/check.sh {{musl_triple}}
+
 # --- the beta .deb -----------------------------------------------------------
 
 # Builds target/deb/xudo_<version>_<arch>.deb from the static musl binaries,
@@ -316,7 +328,9 @@ install-root:
 # `just repro` compares, so the settings that make it byte-reproducible live
 # here and nowhere else. RUSTFLAGS is set outright, never appended to the
 # caller's, so CI's `-D warnings` and the release's empty value cannot change
-# the shipped bytes (warnings stay denied in the lint lanes). A rebuilder needs
+# the shipped bytes (warnings stay denied in the lint lanes). `cargo auditable`
+# embeds each binary's dependency list (from Cargo.lock, no timestamps, so
+# the bytes stay reproducible); `just sbom-check` reads it back. A rebuilder needs
 # the pinned toolchain; any path, locale, time zone and CARGO_HOME will do.
 deb:
     #!/usr/bin/env bash
@@ -324,7 +338,7 @@ deb:
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
     export LC_ALL=C TZ=UTC CARGO_INCREMENTAL=0
     export RUSTFLAGS="--remap-path-prefix={{justfile_directory()}}=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rustc"
-    cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
+    cargo auditable build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
     packaging/deb/build.sh {{musl_triple}}
 
 # Install, upgrade, remove, and purge the .deb in Ubuntu 24.04, Ubuntu 26.04
@@ -373,7 +387,7 @@ setup: install-hooks
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
 # fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
-ci: verify check-linux miri units differential root-test install-root deb-test systemd-test telemetry repro
+ci: verify check-linux miri units differential root-test install-root deb-test sbom-check systemd-test telemetry repro
 
 clean:
     cargo clean
