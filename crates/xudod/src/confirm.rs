@@ -775,14 +775,16 @@ mod tests {
             };
             let approved = watched(class.clone());
             let mut caller = if agent { agent_caller(&class) } else { matching_caller() };
+            // A caller in the watcher's session or on its terminal never
+            // consumes; every other draw does, so the unwrap below is exact.
+            prop_assume!(sid != watcher().sid && tty != watcher().tty);
             caller.sid = sid;
             caller.tty = tty;
-            if let Some(consumed) = take(&approved, &caller) {
-                prop_assert_eq!(&consumed.attested_class, &approved.attested_class);
-                prop_assert_eq!(consumed.attested_scope_id, approved.attested_scope_id);
-                prop_assert_eq!(&consumed.boot_id, &approved.boot_id);
-                prop_assert_eq!(consumed.caller_uid, approved.caller_uid);
-            }
+            let consumed = take(&approved, &caller).unwrap();
+            prop_assert_eq!(&consumed.attested_class, &approved.attested_class);
+            prop_assert_eq!(consumed.attested_scope_id, approved.attested_scope_id);
+            prop_assert_eq!(&consumed.boot_id, &approved.boot_id);
+            prop_assert_eq!(consumed.caller_uid, approved.caller_uid);
             let pending = shown(class);
             let mut approved_again = pending.clone();
             prop_assert!(approve(&mut approved_again, 3_500, b"remove").is_ok());

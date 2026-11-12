@@ -107,6 +107,32 @@ pub fn plan_with_confirmation_timeout(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
+    plan_paced(cli, argv, probe, socket, timeout, wait, None, out, err)
+}
+
+/// The clock and the sleep behind the approval wait.
+///
+/// The wall clock and a real sleep make the wait depend on machine load, so a
+/// test substitutes a virtual pair and the wait becomes deterministic.
+struct Pace<'a> {
+    elapsed: &'a mut dyn FnMut() -> Duration,
+    sleep: &'a mut dyn FnMut(Duration),
+}
+
+/// [`plan_with_confirmation_timeout`] with the wait paced by `pace`, or by the
+/// real clock when it is `None`.
+#[allow(clippy::too_many_arguments)]
+fn plan_paced(
+    cli: &Cli,
+    argv: &[String],
+    probe: &dyn Probe,
+    socket: &Path,
+    timeout: Duration,
+    wait: Duration,
+    mut pace: Option<&mut Pace<'_>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
     let Some((program, operands)) = argv.split_first() else {
         let _ = writeln!(err, "xudo: nothing to run; pass a command after `--`");
         return Err(ExitCode::Unusable);
@@ -143,7 +169,6 @@ pub fn plan_with_confirmation_timeout(
             out,
             err,
             &mut |wait, status_request| {
-                let started = Instant::now();
                 let mut status = |remaining| {
                     ask(
                         socket,
@@ -151,6 +176,10 @@ pub fn plan_with_confirmation_timeout(
                         status_request,
                     )
                 };
+                if let Some(pace) = pace.as_deref_mut() {
+                    return poll_status_with(&id, wait, &mut status, pace.elapsed, pace.sleep);
+                }
+                let started = Instant::now();
                 let mut elapsed = || started.elapsed();
                 let mut sleep = std::thread::sleep;
                 poll_status_with(&id, wait, &mut status, &mut elapsed, &mut sleep)
@@ -656,6 +685,38 @@ mod tests {
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
         drop(dir);
+    }
+
+    #[test]
+    fn a_wait_on_the_real_clock_that_is_over_before_polling_leaves_it_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let response = json(&Answer::Pending {
+            id: "c".repeat(64),
+            expires_in_ms: 20_000,
+        });
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        // The first sleep lasts the whole window, so no status is asked: the
+        // outcome does not depend on how fast the machine is.
+        let result = plan_with_confirmation_timeout(
+            &cli(),
+            &["/usr/bin/apt-get".to_owned(), "remove".to_owned()],
+            &SUDO,
+            &socket,
+            TIMEOUT,
+            Duration::from_millis(1),
+            &mut out,
+            &mut err,
+        );
+        broker.join().unwrap();
+        assert_eq!(result, Err(ExitCode::NotConfirmed));
     }
 
     #[test]
@@ -1386,13 +1447,22 @@ mod tests {
         let mut cli = cli();
         cli.output = crate::cli::Format::Json;
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = plan_with_confirmation_timeout(
+        // A virtual clock that the sleep advances: the wait cannot overrun its
+        // window however loaded the machine is.
+        let virtual_now = std::cell::Cell::new(Duration::ZERO);
+        let mut elapsed = || virtual_now.get();
+        let mut sleep = |slept: Duration| virtual_now.set(virtual_now.get() + slept);
+        let result = plan_paced(
             &cli,
             &argv(),
             &SUDO,
             &socket,
             TIMEOUT,
             Duration::from_secs(1),
+            Some(&mut Pace {
+                elapsed: &mut elapsed,
+                sleep: &mut sleep,
+            }),
             &mut out,
             &mut err,
         );

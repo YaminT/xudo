@@ -621,16 +621,17 @@ impl SpoolDir {
                 if !matches!(displaced, Ok(inode) if inode == current_inode) {
                     // The exchange requires the destination to exist, so a gate
                     // that consumed it cannot be undone by this replacement.
-                    let _ = renameat_with(
+                    let restored = renameat_with(
                         &self.dir,
                         temp.as_str(),
                         &self.dir,
                         component,
                         RenameFlags::EXCHANGE,
                     );
-                    return Err(std::io::Error::other(
-                        "entry inode changed during replacement",
-                    ));
+                    // A failed swap back leaves the new bytes in place; say so.
+                    return Err(std::io::Error::other(format!(
+                        "entry inode changed during replacement (swap back: {restored:?})"
+                    )));
                 }
                 unlinkat(&self.dir, temp.as_str(), AtFlags::empty()).map_err(std::io::Error::from)
             });
@@ -686,6 +687,9 @@ pub struct FakeSpool {
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
+    replace_error_after_exchange: Option<SpoolError>,
+    unreadable_after_replace: bool,
+    replaced: std::cell::Cell<bool>,
 }
 
 impl FakeSpool {
@@ -750,6 +754,22 @@ impl FakeSpool {
         self
     }
 
+    /// Makes [`Spool::replace`] fail after the new bytes are in place, as the
+    /// real spool can when its last unlink or its swap back fails.
+    #[must_use]
+    pub fn failing_replace_after_exchange(mut self, error: SpoolError) -> Self {
+        self.replace_error_after_exchange = Some(error);
+        self
+    }
+
+    /// Makes every [`Spool::read`] fail once [`Spool::replace`] has been
+    /// called, as a read after a half-finished swap can.
+    #[must_use]
+    pub fn failing_read_after_replace(mut self) -> Self {
+        self.unreadable_after_replace = true;
+        self
+    }
+
     /// Every file, by name.
     pub fn files(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.files.borrow().clone()
@@ -799,7 +819,12 @@ impl Spool for FakeSpool {
         self.record(SpoolCall::Read(name.to_vec()));
         let display = name.as_bstr().to_string();
         let found = self.files.borrow().get(name).cloned();
+        let after_replace = self.unreadable_after_replace && self.replaced.get();
         match found {
+            Some(_) if after_replace => Err(SpoolError::Unreadable {
+                name: display,
+                reason: "fake: scripted to fail after a replace".to_owned(),
+            }),
             Some(_) if self.unreadable.contains(name) => Err(SpoolError::Unreadable {
                 name: display,
                 reason: "fake: scripted to fail".to_owned(),
@@ -849,12 +874,13 @@ impl Spool for FakeSpool {
 
     fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
         self.record(SpoolCall::Replace(name.to_vec()));
+        self.replaced.set(true);
         scripted(self.replace_error.as_ref())?;
         let mut files = self.files.borrow_mut();
         match files.get_mut(name) {
             Some(current) if current.as_slice() == expected => {
                 *current = bytes.to_vec();
-                Ok(())
+                scripted(self.replace_error_after_exchange.as_ref())
             }
             _ => Err(SpoolError::Gone {
                 name: name.as_bstr().to_string(),
@@ -1100,6 +1126,20 @@ mod tests {
     }
 
     #[test]
+    fn fake_reads_can_fail_once_a_replace_was_attempted() {
+        let fake = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_read_after_replace();
+        assert_eq!(fake.read(b"request", 64).unwrap(), b"pending");
+        fake.replace(b"request", b"pending", b"approved").unwrap();
+        assert_eq!(kind(fake.read(b"request", 64).map(drop)), "Unreadable");
+        assert_eq!(
+            fake.files().get(b"request".as_slice()).unwrap(),
+            b"approved"
+        );
+    }
+
+    #[test]
     fn fake_replace_can_fail_without_changing_the_entry() {
         let fake = FakeSpool::new()
             .with_file("request", b"pending".to_vec())
@@ -1189,6 +1229,10 @@ mod tests {
             std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o600)).unwrap();
             std::fs::rename(&changed, dir.join("request")).unwrap();
         });
+        assert!(
+            format!("{:?}", result.as_ref().unwrap_err()).contains("swap back: Ok(())"),
+            "the swap-back result is part of the error: {result:?}"
+        );
         assert_eq!(kind(result), "Io");
         assert_eq!(spool.read(b"request", 64).unwrap(), b"pending");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
