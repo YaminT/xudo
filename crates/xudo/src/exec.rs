@@ -1868,7 +1868,11 @@ mod tests {
                 &queueing_cli("human"),
                 Some(&host),
             );
-            assert!(result.is_err(), "{result:?}");
+            // No plan was produced: the denial's own status, and one entry.
+            let (plain, _, _) = against(denied(code), &SUDO, &argv());
+            assert!(plain.is_err(), "{plain:?}");
+            assert_eq!(result, plain);
+            assert_eq!(queued_entries(&host).len(), 1);
         }
         // An allowed command is planned as without the flag, and queues nothing.
         let dir = tempfile::tempdir().unwrap();
@@ -1920,11 +1924,12 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_argv_is_queued_byte_for_byte() {
+    fn a_non_utf8_argument_is_refused_by_the_parser_and_nothing_is_queued() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        // Bytes that are not UTF-8 never reach the queue altered: the command
-        // line parser refuses them, so nothing lossy can be written.
+        // `ido`'s `Entry.argv` is `Vec<String>`, so non-UTF-8 bytes cannot be
+        // queued byte for byte: the command line parser refuses them first,
+        // and nothing lossy ever reaches the queue.
         let bad = OsString::from_vec(b"/usr/bin/tool\xff\xfe".to_vec());
         let parsed = Cli::try_parse_from([
             OsString::from("xudo"),
@@ -1934,7 +1939,14 @@ mod tests {
             bad,
         ]);
         assert!(parsed.is_err());
-        // And text with every byte `ido` must not reinterpret is stored exactly.
+        // The refusal happens before any queue is opened.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir.path().join("home").exists());
+    }
+
+    #[test]
+    fn control_characters_in_argv_are_queued_exactly() {
+        // Text with every byte `ido` must not reinterpret is stored as given.
         let dir = tempfile::tempdir().unwrap();
         let host = queue_host(dir.path());
         let args: Vec<String> = [
