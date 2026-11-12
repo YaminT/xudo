@@ -686,3 +686,27 @@ fn dropping_a_pinned_flag_is_refused() {
         Some(DenialCode::ArgvRejected)
     );
 }
+
+/// The differential fuzz, run against the rules that ship: the overlap analysis
+/// misses nothing, no decision depends on canonicalizing first, and appending an
+/// argument never turns a refusal into a permission.
+#[test]
+fn check_fuzz_finds_nothing_in_the_shipped_rules() {
+    let rules = load_all();
+    let config = xudo_policy::fuzz_check::FuzzConfig {
+        budget: 3000,
+        ..Default::default()
+    };
+    let report = xudo_policy::fuzz_check::fuzz(&rules, &rules.overlaps(), config);
+    assert_eq!(report.candidates, 3000);
+    assert!(
+        report.accepted_by_one > 0,
+        "the fuzz never reached an accepting action: {report:?}"
+    );
+    let found: Vec<String> = report
+        .findings
+        .iter()
+        .map(|f| format!("{}: {}", f.summary(), f.escaped()))
+        .collect();
+    assert!(report.clean(), "the fuzz found:\n{}", found.join("\n"));
+}

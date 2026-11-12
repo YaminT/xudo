@@ -1,0 +1,5 @@
+---
+source: crates/xudo/src/check.rs
+expression: out
+---
+fuzz: seed 9, 100 candidate(s): 60 accepted by one action, 10 by several, 30 by none; 5 finding(s)

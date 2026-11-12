@@ -16,10 +16,12 @@ use serde_json::{Value, json};
 use term_sanitize::{Clean, Limits};
 use xudo_policy::{
     CallerFacts, Classification, DenialCode, ExitCode, TestError, TestOutcome, TestResult,
-    engine::Settings, run_tests,
+    engine::Settings,
+    fuzz_check::{Finding, FindingKind, FuzzConfig, FuzzReport, fuzz},
+    run_tests,
 };
 
-use crate::cli::{Cli, Format};
+use crate::cli::{CheckArgs, Cli, Format};
 use crate::rules::LoadedRules;
 
 /// The envelope's schema version.
@@ -38,6 +40,8 @@ struct Report {
     /// One rendered overlap each.
     warnings: Vec<String>,
     results: Vec<TestResult>,
+    /// What the fuzz found, when it ran.
+    fuzz: Option<FuzzReport>,
 }
 
 impl Report {
@@ -52,7 +56,8 @@ impl Report {
     fn status(&self) -> ExitCode {
         [
             (self.failed() > 0).then_some(ExitCode::TestFailure),
-            (!self.errors.is_empty()).then_some(ExitCode::LintError),
+            (!self.errors.is_empty() || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
+                .then_some(ExitCode::LintError),
             (!self.warnings.is_empty()).then_some(ExitCode::LintWarning),
         ]
         .into_iter()
@@ -64,14 +69,20 @@ impl Report {
 
 /// Lints and tests `loaded`, writes the report, and returns the exit status.
 ///
-/// `tests_only` skips the lint.
+/// `--tests-only` skips the lint. `--fuzz` also runs the differential fuzz, whose
+/// findings are lint errors.
 pub(crate) fn run(
     cli: &Cli,
     loaded: &LoadedRules,
-    tests_only: bool,
+    args: &CheckArgs,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let tests_only = args.tests_only;
+    let fuzz_config = args.fuzz.then(|| FuzzConfig {
+        budget: usize::try_from(args.fuzz_budget).unwrap_or(usize::MAX),
+        seed: args.fuzz_seed,
+    });
     let (errors, warnings) = if tests_only {
         (Vec::new(), Vec::new())
     } else {
@@ -100,6 +111,7 @@ pub(crate) fn run(
         errors,
         warnings,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
+        fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &loaded.rules().overlaps(), config)),
     };
     let status = report.status();
     match cli.output {
@@ -160,6 +172,9 @@ fn human_report(
             );
         }
     }
+    if let Some(fuzz) = &report.fuzz {
+        fuzz_lines(fuzz, out, err);
+    }
 
     if report.results.is_empty() {
         if tests_only {
@@ -176,6 +191,66 @@ fn human_report(
     for result in &report.results {
         failure(result, out);
     }
+}
+
+/// The fuzz summary on `out`, its findings on `err`. Every command is shown
+/// twice, sanitized for the terminal and as hexadecimal bytes, because the
+/// sanitized form cannot say which bytes were removed.
+fn fuzz_lines(fuzz: &FuzzReport, out: &mut dyn Write, err: &mut dyn Write) {
+    for finding in &fuzz.findings {
+        let _ = writeln!(err, "xudo: fuzz: {}", safe(&finding.summary()));
+        let _ = writeln!(err, "  command: {}", safe(&finding.escaped()));
+        let _ = writeln!(err, "  bytes:   {}", finding.hex());
+    }
+    if fuzz.omitted > 0 {
+        let _ = writeln!(
+            err,
+            "xudo: fuzz: {} more finding(s) not listed",
+            fuzz.omitted
+        );
+    }
+    let _ = writeln!(
+        out,
+        "fuzz: seed {}, {} candidate(s): {} accepted by one action, {} by several, {} by none; \
+         {} finding(s)",
+        fuzz.seed,
+        fuzz.candidates,
+        fuzz.accepted_by_one,
+        fuzz.accepted_by_several,
+        fuzz.accepted_by_none,
+        fuzz.findings.len().saturating_add(fuzz.omitted)
+    );
+}
+
+fn finding_json(finding: &Finding) -> Value {
+    let (kind, actions) = match &finding.kind {
+        FindingKind::MissedOverlap { first, second } => (
+            "missed-overlap",
+            vec![first.to_string(), second.to_string()],
+        ),
+        FindingKind::CanonicalizationUnstable => ("canonicalization-unstable", Vec::new()),
+        FindingKind::AppendingWidens { .. } => ("appending-widens", Vec::new()),
+    };
+    json!({
+        "kind": kind,
+        "summary": finding.summary(),
+        "actions": actions,
+        "command_escaped": finding.escaped(),
+        "command_hex": finding.hex(),
+    })
+}
+
+fn fuzz_json(fuzz: &FuzzReport) -> Value {
+    json!({
+        "seed": fuzz.seed,
+        "budget": fuzz.budget,
+        "candidates": fuzz.candidates,
+        "accepted_by_one": fuzz.accepted_by_one,
+        "accepted_by_several": fuzz.accepted_by_several,
+        "accepted_by_none": fuzz.accepted_by_none,
+        "omitted": fuzz.omitted,
+        "findings": fuzz.findings.iter().map(finding_json).collect::<Vec<_>>(),
+    })
 }
 
 /// One failing test: what was expected, what happened, and what it ran. A
@@ -221,7 +296,7 @@ fn failure(result: &TestResult, out: &mut dyn Write) {
 /// consumer is a program, and it gets the bytes the rule file holds.
 fn envelope(report: &Report, status: ExitCode) -> Value {
     let results: Vec<Value> = report.results.iter().map(result_json).collect();
-    json!({
+    let mut envelope = json!({
         "schema_version": SCHEMA_VERSION,
         "exit_code": status.as_i32(),
         "lint": {
@@ -237,7 +312,13 @@ fn envelope(report: &Report, status: ExitCode) -> Value {
             "failed": report.failed(),
             "results": results,
         },
-    })
+    });
+    // Only when asked for, so a run without `--fuzz` is byte for byte what it
+    // was.
+    if let (Some(fuzz), Some(fields)) = (&report.fuzz, envelope.as_object_mut()) {
+        fields.insert("fuzz".to_owned(), fuzz_json(fuzz));
+    }
+    envelope
 }
 
 fn result_json(result: &TestResult) -> Value {
@@ -291,4 +372,76 @@ fn safe(text: &str) -> String {
     }
     let what: Vec<String> = findings.iter().map(ToString::to_string).collect();
     format!("{text} [{}]", what.join("; "))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use xudo_policy::{ActionId, Arg, Argv};
+
+    use super::*;
+
+    fn report() -> FuzzReport {
+        let finding = |kind| Finding {
+            kind,
+            exe: Arg::from("/usr/bin/x"),
+            argv: Argv::new([Arg::new(b"a\x1b[2J\xff".to_vec())]),
+        };
+        FuzzReport {
+            seed: 9,
+            budget: 100,
+            candidates: 100,
+            accepted_by_one: 60,
+            accepted_by_several: 10,
+            accepted_by_none: 30,
+            findings: vec![
+                finding(FindingKind::MissedOverlap {
+                    first: ActionId::new("a.one"),
+                    second: ActionId::new("a.two"),
+                }),
+                finding(FindingKind::CanonicalizationUnstable),
+                finding(FindingKind::AppendingWidens {
+                    appended: Arg::from("x"),
+                }),
+            ],
+            omitted: 2,
+        }
+    }
+
+    #[test]
+    fn a_fuzz_finding_is_shown_sanitized_and_as_bytes() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        fuzz_lines(&report(), &mut out, &mut err);
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        insta::assert_snapshot!("fuzz_stdout", out);
+        insta::assert_snapshot!("fuzz_stderr", err);
+    }
+
+    #[test]
+    fn a_fuzz_finding_sets_the_lint_error_status_and_the_envelope_lists_it() {
+        let mut found = Report {
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            results: Vec::new(),
+            fuzz: Some(report()),
+        };
+        assert_eq!(found.status(), ExitCode::LintError);
+        let json = envelope(&found, found.status());
+        insta::assert_snapshot!(
+            "fuzz_envelope",
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+
+        found.fuzz = found.fuzz.map(|mut f| {
+            f.findings.clear();
+            f.omitted = 0;
+            f
+        });
+        assert_eq!(found.status(), ExitCode::Delegated);
+    }
 }

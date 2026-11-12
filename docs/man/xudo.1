@@ -31,7 +31,11 @@ xudo \- decide whether a privileged command runs as root
 .RI [ arg ...]
 .br
 .B xudo check
-.RB [ \-\-tests\-only ]
+.RB [ \-\-tests\-only "\||\|" \-\-fuzz
+.RB [ \-\-fuzz\-budget
+.IR n ]
+.RB [ \-\-fuzz\-seed
+.IR s ]]
 .RB [ options ]
 .br
 .B xudo list
@@ -239,13 +243,33 @@ for a lint error,
 .B 22
 for a failing test.
 .B \-\-tests\-only
-skips the lint.
+skips the lint, and cannot be combined with
+.BR \-\-fuzz .
 With
 .B \-\-output json
 the report is one envelope, with a result for each test.
 A ruleset that will not load, an unknown key in a test table included, is
 .BR 19 ,
 before any of this runs.
+.IP
+.B \-\-fuzz
+also runs a bounded, deterministic fuzz of the ruleset: candidate commands are
+derived from its own rules, byte for byte, with mutations (an argument
+appended, dropped, swapped or duplicated, one byte changed, a
+.BR \-\- ,
+an empty, a very long or a non\-UTF\-8 argument), and each is put to the engine,
+never run.
+It cross\-checks the overlap report (two actions accept a command it does not
+list), canonicalization (the decision changes when the argv is canonicalized
+first) and appending (a refusal that a trailing argument turns into a
+permission).
+Any finding is a lint error, printed as the command both sanitized and as
+hexadecimal bytes.
+.B \-\-fuzz\-budget
+sets how many candidates to try, 1 to 1000000 (default 20000);
+.B \-\-fuzz\-seed
+sets the seed, any unsigned 64\-bit number.
+The same ruleset and seed give the same report.
 .TP
 .B list
 List each action's id, tier, executable, and the file and line it came from.
