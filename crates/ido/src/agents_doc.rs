@@ -20,7 +20,7 @@ use crate::error::IdoError;
 
 /// Opening marker. The version lets a later `ido` recognise and replace an
 /// older block.
-pub const BEGIN: &str = "<!-- ido:begin v1 -->";
+pub const BEGIN: &str = "<!-- ido:begin v2 -->";
 
 /// Prefix shared by every version's opening marker.
 const BEGIN_PREFIX: &str = "<!-- ido:begin";
@@ -30,7 +30,7 @@ pub const END: &str = "<!-- ido:end -->";
 
 /// The instructions, in short imperative sentences: this text is parsed by a
 /// model, and hedging produces exactly the ambiguity that gets misread.
-pub const BLOCK: &str = "<!-- ido:begin v1 -->
+pub const BLOCK: &str = "<!-- ido:begin v2 -->
 ## Privileged and high-consequence commands
 
 Do not run commands that need sudo. Do not run cloud CLI commands that write.
@@ -55,6 +55,8 @@ Rules:
 - Queue one command per call.
 - Write a real argument list after `--`. Do not write a shell string.
 - Do not queue the same command twice.
+- If the command needs root, add `--root`. The user's `ido` runs it as `xudo exec`.
+- Never run `ido run` or `ido drop`. Only the user runs or drops queued commands.
 - Say what you queued. Then say: \"Run `ido` to execute it.\"
 <!-- ido:end -->
 ";
@@ -297,6 +299,39 @@ mod tests {
         assert!(new.ends_with(after), "{new}");
         assert!(new.contains(BLOCK));
         assert!(!new.contains("old text"));
+    }
+
+    /// The block this crate shipped before v2, verbatim in the parts that
+    /// matter: its opening marker and its closing marker.
+    const V1_BLOCK: &str = "<!-- ido:begin v1 -->\n## Privileged and high-consequence \
+commands\n\nQueue them with `ido queue`.\n<!-- ido:end -->\n";
+
+    #[test]
+    fn agents_block_v2_replaces_v1_idempotently() {
+        let before = "# Project\n\nIntro.\n\n";
+        let after = "\n## Later\n\nOutro\n";
+        let old = format!("{before}{V1_BLOCK}{after}");
+        let new = splice(&old).unwrap();
+        assert_eq!(new, format!("{before}{BLOCK}{after}"));
+        assert_eq!(new.matches("<!-- ido:begin").count(), 1);
+        assert!(!new.contains("ido:begin v1"));
+        assert!(new.contains("ido:begin v2"));
+        assert!(new.contains("Never run `ido run` or `ido drop`"));
+        assert_eq!(
+            splice(&new).unwrap(),
+            new,
+            "a second splice changes nothing"
+        );
+
+        // Through `add`: one backup of the v1 file, then nothing more to do.
+        let file = scratch("v1-to-v2").join("AGENTS.md");
+        std::fs::write(&file, &old).unwrap();
+        assert_eq!(add(&file).unwrap(), Added::Updated(file.clone()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+        let backup = file.with_file_name("AGENTS.md.ido-backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+        assert_eq!(add(&file).unwrap(), Added::Unchanged(file.clone()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
     }
 
     #[test]
