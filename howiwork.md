@@ -56,7 +56,7 @@ A permission answers: *may requester Z perform action X in situation Y?*
   Actions cover what the invoking user cannot already do: installing packages,
   restarting services, writing under `/var/www`, running `certbot` as root.
 - **Situation Y** — the context the decision is made in: the project the
-  request is scoped to, global settings (frozen, agent confirmation), whether
+  request is scoped to, global settings (frozen, agent confirmation; a freeze is global when root sets it and covers only the caller's own agents when a user does), whether
   a rule demands human confirmation, rate and novelty limits, and conflicts
   the doctor can see (for the nginx example: Apache already holding port 80 is
   reported, not silently fought). Context can only *narrow* what an action
