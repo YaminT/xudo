@@ -82,3 +82,10 @@ path = "fuzz_targets/freeze_file.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "check_fuzz"
+path = "fuzz_targets/check_fuzz.rs"
+test = false
+doc = false
+bench = false

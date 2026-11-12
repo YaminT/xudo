@@ -1,0 +1,14 @@
+---
+source: crates/xudo/src/check.rs
+expression: err
+---
+xudo: fuzz: overlap analysis missed an overlap: a.one and a.two both accept it
+  command: "/usr/bin/x" "a\x1b[2J\xff"
+  bytes:   0x2f7573722f62696e2f78 0x611b5b324aff
+xudo: fuzz: the decision changes when the argv is canonicalized first
+  command: "/usr/bin/x" "a\x1b[2J\xff"
+  bytes:   0x2f7573722f62696e2f78 0x611b5b324aff
+xudo: fuzz: appending x turns a refusal into a permission
+  command: "/usr/bin/x" "a\x1b[2J\xff"
+  bytes:   0x2f7573722f62696e2f78 0x611b5b324aff
+xudo: fuzz: 2 more finding(s) not listed
