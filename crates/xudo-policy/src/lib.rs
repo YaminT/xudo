@@ -57,6 +57,7 @@ pub mod decision;
 pub mod deny;
 pub mod engine;
 pub mod files;
+pub mod fuzz_check;
 pub mod matcher;
 pub mod overlap;
 pub mod rule;

@@ -1,0 +1,52 @@
+---
+source: crates/xudo/src/check.rs
+expression: "serde_json::to_string_pretty(&json).unwrap()"
+---
+{
+  "exit_code": 21,
+  "fuzz": {
+    "accepted_by_none": 30,
+    "accepted_by_one": 60,
+    "accepted_by_several": 10,
+    "budget": 100,
+    "candidates": 100,
+    "findings": [
+      {
+        "actions": [
+          "a.one",
+          "a.two"
+        ],
+        "command_escaped": "\"/usr/bin/x\" \"a\\x1b[2J\\xff\"",
+        "command_hex": "0x2f7573722f62696e2f78 0x611b5b324aff",
+        "kind": "missed-overlap",
+        "summary": "overlap analysis missed an overlap: a.one and a.two both accept it"
+      },
+      {
+        "actions": [],
+        "command_escaped": "\"/usr/bin/x\" \"a\\x1b[2J\\xff\"",
+        "command_hex": "0x2f7573722f62696e2f78 0x611b5b324aff",
+        "kind": "canonicalization-unstable",
+        "summary": "the decision changes when the argv is canonicalized first"
+      },
+      {
+        "actions": [],
+        "command_escaped": "\"/usr/bin/x\" \"a\\x1b[2J\\xff\"",
+        "command_hex": "0x2f7573722f62696e2f78 0x611b5b324aff",
+        "kind": "appending-widens",
+        "summary": "appending x turns a refusal into a permission"
+      }
+    ],
+    "omitted": 2,
+    "seed": 9
+  },
+  "lint": {
+    "errors": [],
+    "warnings": []
+  },
+  "schema_version": 1,
+  "tests": {
+    "failed": 0,
+    "results": [],
+    "total": 0
+  }
+}
