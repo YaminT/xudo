@@ -10,7 +10,7 @@ use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigVal
 use xudo_policy::{DenialCode, ExitCode};
 use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question};
 
-use crate::cli::{Cli, emit};
+use crate::cli::{Cli, emit, emit_queued};
 
 type StatusPoll<'a> =
     dyn FnMut(Duration, &BrokerRequest) -> Result<Option<BrokerResponse>, ExitCode> + 'a;
@@ -54,6 +54,7 @@ pub struct ExecPlan {
 pub fn plan_live(
     cli: &Cli,
     argv: &[String],
+    queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
@@ -68,6 +69,7 @@ pub fn plan_live(
         socket,
         TIMEOUT,
         timeout,
+        queue,
         out,
         err,
     )
@@ -87,7 +89,17 @@ pub fn plan(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
-    plan_with_confirmation_timeout(cli, argv, probe, socket, timeout, Duration::ZERO, out, err)
+    plan_with_confirmation_timeout(
+        cli,
+        argv,
+        probe,
+        socket,
+        timeout,
+        Duration::ZERO,
+        None,
+        out,
+        err,
+    )
 }
 
 /// Asks the broker and waits for an out-of-band approval for at most `wait`.
@@ -104,10 +116,13 @@ pub fn plan_with_confirmation_timeout(
     socket: &Path,
     timeout: Duration,
     wait: Duration,
+    queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
-    plan_paced(cli, argv, probe, socket, timeout, wait, None, out, err)
+    plan_paced(
+        cli, argv, probe, socket, timeout, wait, None, queue, out, err,
+    )
 }
 
 /// The clock and the sleep behind the approval wait.
@@ -130,6 +145,7 @@ fn plan_paced(
     timeout: Duration,
     wait: Duration,
     mut pace: Option<&mut Pace<'_>>,
+    queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
@@ -200,15 +216,7 @@ fn plan_paced(
         }
         Answer::Decided { decision, minted } => {
             if !decision.verdict.is_permitted() {
-                let status = emit(cli, &decision, out);
-                if decision.denial == Some(DenialCode::HumanPathOnly) {
-                    let _ = writeln!(
-                        err,
-                        "xudo: a human must run this; queue it with:\n  ido queue -- {}",
-                        display_quoted(argv)
-                    );
-                }
-                return Err(status);
+                return Err(report_denial(cli, &decision, argv, queue, out, err));
             }
             // Permitted but nothing minted means the gate has nothing to find.
             let Some(minted) = minted else {
@@ -458,6 +466,74 @@ pub(crate) fn ask(
     BrokerResponse::parse(&bytes).map_err(|error| error.to_string())
 }
 
+/// Shows a denial, queueing it first when `--queue` asks and a person can
+/// resolve it. The verdict and the exit status are the denial's either way.
+fn report_denial(
+    cli: &Cli,
+    decision: &xudo_policy::Decision,
+    argv: &[String],
+    queue: Option<&ido::Host>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let human_only = matches!(
+        decision.denial,
+        Some(DenialCode::HumanPathOnly | DenialCode::NoConfirmationChannel)
+    );
+    let queued = match (human_only, queue) {
+        (true, Some(host)) => queue_denied(host, argv, decision, err),
+        _ => None,
+    };
+    let status = emit_queued(cli, decision, queued.map(|q| q.id), out);
+    match queued {
+        Some(q) => {
+            let _ = write!(err, "{}", crate::render::queued_human(q.id, q.already));
+        }
+        None if human_only => {
+            let _ = writeln!(
+                err,
+                "xudo: a human must run this; queue it with:\n  ido queue -- {}",
+                display_quoted(argv)
+            );
+        }
+        None => {}
+    }
+    status
+}
+
+/// Writes the denied command to the caller's `ido` queue, as `ido queue` would.
+///
+/// `None` on any failure, after saying why: the caller then prints the plain
+/// denial, so a failed write is never read as queued. The command is stored as
+/// the vector it arrived as; the denial code is display-only provenance in the
+/// entry's reason, which `ido` sanitizes wherever it shows it.
+fn queue_denied(
+    host: &ido::Host,
+    argv: &[String],
+    decision: &xudo_policy::Decision,
+    err: &mut dyn Write,
+) -> Option<ido::Enqueued> {
+    let code = decision
+        .denial
+        .map_or_else(String::new, |code| format!("{code:?}"));
+    let reason = format!("xudo denied this ({code}); a human must run it");
+    match ido::enqueue(host, argv.to_vec(), Some(reason)) {
+        Ok(queued) => Some(queued),
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "xudo: could not queue the command ({}); nothing was queued",
+                term_sanitize::display_str(
+                    &error.to_string(),
+                    term_sanitize::Limits::single_line(200)
+                )
+                .text
+            );
+            None
+        }
+    }
+}
+
 /// The argv as a shell line, for a human to read and paste. Display only.
 pub(crate) fn display_quoted(argv: &[String]) -> String {
     argv.iter()
@@ -547,6 +623,17 @@ mod tests {
         probe: &dyn Probe,
         argv: &[String],
     ) -> (Result<ExecPlan, ExitCode>, String, String) {
+        against_queueing(reply, probe, argv, &cli(), None)
+    }
+
+    /// [`against`], with `--queue` pointed at `queue` and the given flags.
+    fn against_queueing(
+        reply: Vec<u8>,
+        probe: &dyn Probe,
+        argv: &[String],
+        cli: &Cli,
+        queue: Option<&ido::Host>,
+    ) -> (Result<ExecPlan, ExitCode>, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -558,7 +645,17 @@ mod tests {
             request
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = plan(&cli(), argv, probe, &socket, TIMEOUT, &mut out, &mut err);
+        let result = plan_with_confirmation_timeout(
+            cli,
+            argv,
+            probe,
+            &socket,
+            TIMEOUT,
+            Duration::ZERO,
+            queue,
+            &mut out,
+            &mut err,
+        );
         let request = broker.join().unwrap();
         // What the broker received is exactly what the caller typed.
         let sent = BrokerRequest::parse(&request).unwrap();
@@ -674,6 +771,7 @@ mod tests {
             &socket,
             TIMEOUT,
             Duration::ZERO,
+            None,
             &mut out,
             &mut err,
         );
@@ -712,6 +810,7 @@ mod tests {
             &socket,
             TIMEOUT,
             Duration::from_millis(1),
+            None,
             &mut out,
             &mut err,
         );
@@ -1463,6 +1562,7 @@ mod tests {
                 elapsed: &mut elapsed,
                 sleep: &mut sleep,
             }),
+            None,
             &mut out,
             &mut err,
         );
@@ -1650,6 +1750,240 @@ mod tests {
         assert!(!err.contains("ido queue"), "{err}");
     }
 
+    /// A queue under a fresh temporary home, as `ido` would find it.
+    fn queue_host(dir: &Path) -> ido::Host {
+        use std::os::unix::fs::MetadataExt;
+        ido::Host {
+            home: Some(dir.join("home")),
+            xdg_config_home: None,
+            xdg_state_home: None,
+            xdg_cache_home: None,
+            xdg_runtime_dir: Some(dir.join("run").to_str().unwrap().to_owned()),
+            cwd: Some(dir.to_path_buf()),
+            uid: std::fs::metadata(dir).unwrap().uid(),
+            now_unix: 1_000_000,
+            stdin_tty: false,
+            stdout_tty: false,
+            no_color: true,
+            no_animation: true,
+            queued_by: Some("xudo".to_owned()),
+            lock_wait: Duration::from_secs(1),
+            frame_delay: Duration::ZERO,
+        }
+    }
+
+    /// What is in the queue, read back through `ido`'s own store.
+    fn queued_entries(host: &ido::Host) -> Vec<ido::Entry> {
+        let paths = xudo_config::XdgPaths::resolve(
+            host.home.as_deref().unwrap(),
+            None,
+            None,
+            None,
+            host.xdg_runtime_dir.as_deref(),
+        );
+        ido::store::Store::open(&paths.state, &paths.runtime, host.uid)
+            .unwrap()
+            .load()
+            .unwrap()
+    }
+
+    fn queueing_cli(output: &str) -> Cli {
+        Cli::parse_from(["xudo", "--output", output, "exec", "--queue", "--", "x"])
+    }
+
+    fn denied(code: DenialCode) -> Vec<u8> {
+        decided(
+            Decision::deny(code, Vec::new(), Vec::new()),
+            Some(minted(GATE_AUTH)),
+        )
+    }
+
+    #[test]
+    fn a_denial_with_queue_writes_one_entry_with_exact_argv() {
+        for code in [DenialCode::HumanPathOnly, DenialCode::NoConfirmationChannel] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = queue_host(dir.path());
+            let mut args = argv();
+            args.extend(["it's here".into(), String::new(), "a b\n$(c)".into()]);
+            let (plain, _, _) = against(denied(code), &SUDO, &args);
+            let (result, out, err) = against_queueing(
+                denied(code),
+                &SUDO,
+                &args,
+                &queueing_cli("human"),
+                Some(&host),
+            );
+            // The denial's own exit status; the action did not run.
+            assert_eq!(result, plain);
+            assert!(result.is_err());
+            assert!(!out.is_empty());
+            assert!(err.contains("queued as #1, run `ido` to execute"), "{err}");
+            assert!(!err.contains("ido queue --"), "{err}");
+            let entries = queued_entries(&host);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].argv, args);
+            assert_eq!(entries[0].queued_by.as_deref(), Some("xudo"));
+            let reason = entries[0].reason.as_deref().unwrap();
+            assert!(reason.contains(&format!("{code:?}")), "{reason}");
+            // The same command again is the same entry, not a second.
+            let (_, _, err) = against_queueing(
+                denied(code),
+                &SUDO,
+                &args,
+                &queueing_cli("human"),
+                Some(&host),
+            );
+            assert!(err.contains("already queued as #1"), "{err}");
+            assert_eq!(queued_entries(&host).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_json_denial_with_queue_carries_the_entry_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = queue_host(dir.path());
+        let (result, out, _) = against_queueing(
+            denied(DenialCode::HumanPathOnly),
+            &SUDO,
+            &argv(),
+            &queueing_cli("json"),
+            Some(&host),
+        );
+        assert_eq!(result, Err(ExitCode::Denied));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["queued"]["id"], 1);
+        assert_eq!(parsed["verdict"], "deny");
+    }
+
+    #[test]
+    fn queue_never_runs_anything() {
+        // A minted entry rides beside the denial; nothing may be planned from it.
+        for code in [DenialCode::HumanPathOnly, DenialCode::NoConfirmationChannel] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = queue_host(dir.path());
+            let (result, _, _) = against_queueing(
+                denied(code),
+                &SUDO,
+                &argv(),
+                &queueing_cli("human"),
+                Some(&host),
+            );
+            assert!(result.is_err(), "{result:?}");
+        }
+        // An allowed command is planned as without the flag, and queues nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let host = queue_host(dir.path());
+        let reply = decided(allow(), Some(minted(GATE_AUTH)));
+        let (result, out, err) = against_queueing(
+            reply.clone(),
+            &SUDO,
+            &argv(),
+            &queueing_cli("human"),
+            Some(&host),
+        );
+        let (plain, plain_out, plain_err) = against(reply, &SUDO, &argv());
+        assert_eq!((&result, &out, &err), (&plain, &plain_out, &plain_err));
+        assert!(result.is_ok());
+        assert!(!dir.path().join("home").exists());
+    }
+
+    #[test]
+    fn queue_ignores_denials_that_are_not_human_path() {
+        for code in [
+            DenialCode::UnknownAction,
+            DenialCode::ArgvRejected,
+            DenialCode::DenyListed,
+            DenialCode::PolicyUnloadable,
+            DenialCode::Frozen,
+            DenialCode::ExeMismatch,
+            DenialCode::ConfirmationRefused,
+            DenialCode::ConfirmationExpired,
+            DenialCode::ConfirmationThrottled,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = queue_host(dir.path());
+            let (plain, plain_out, plain_err) = against(denied(code), &SUDO, &argv());
+            let (result, out, err) = against_queueing(
+                denied(code),
+                &SUDO,
+                &argv(),
+                &queueing_cli("human"),
+                Some(&host),
+            );
+            assert_eq!((&result, &out, &err), (&plain, &plain_out, &plain_err));
+            assert!(!err.contains("queued"), "{err}");
+            assert!(
+                !dir.path().join("home").exists(),
+                "{code:?} touched the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_argv_is_queued_byte_for_byte() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        // Bytes that are not UTF-8 never reach the queue altered: the command
+        // line parser refuses them, so nothing lossy can be written.
+        let bad = OsString::from_vec(b"/usr/bin/tool\xff\xfe".to_vec());
+        let parsed = Cli::try_parse_from([
+            OsString::from("xudo"),
+            "exec".into(),
+            "--queue".into(),
+            "--".into(),
+            bad,
+        ]);
+        assert!(parsed.is_err());
+        // And text with every byte `ido` must not reinterpret is stored exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let host = queue_host(dir.path());
+        let args: Vec<String> = [
+            "/bin/x",
+            "\u{1b}[31m",
+            "a\nb",
+            "\u{202e}",
+            "\\x00",
+            "$(id)",
+            "--",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (result, _, _) = against_queueing(
+            denied(DenialCode::HumanPathOnly),
+            &SUDO,
+            &args,
+            &queueing_cli("human"),
+            Some(&host),
+        );
+        assert_eq!(result, Err(ExitCode::Denied));
+        let entries = queued_entries(&host);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].argv, args);
+    }
+
+    #[test]
+    fn a_failed_queue_write_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = queue_host(dir.path());
+        host.home = None;
+        for format in ["human", "json"] {
+            let (result, out, err) = against_queueing(
+                denied(DenialCode::HumanPathOnly),
+                &SUDO,
+                &argv(),
+                &queueing_cli(format),
+                Some(&host),
+            );
+            assert_eq!(result, Err(ExitCode::Denied));
+            assert!(err.contains("could not queue the command"), "{err}");
+            assert!(err.contains("nothing was queued"), "{err}");
+            assert!(!err.contains("queued as"), "{err}");
+            // The denial still tells the agent how to hand it over by hand.
+            assert!(err.contains("ido queue --"), "{err}");
+            assert!(!out.contains("\"queued\""), "{out}");
+        }
+    }
+
     #[test]
     fn a_human_only_denial_prints_the_ido_line() {
         let deny = Decision::deny(DenialCode::HumanPathOnly, Vec::new(), Vec::new());
@@ -1786,7 +2120,7 @@ mod tests {
     fn plan_live_stops_on_an_empty_command_before_touching_anything() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
-            plan_live(&cli(), &[], &mut out, &mut err),
+            plan_live(&cli(), &[], None, &mut out, &mut err),
             Err(ExitCode::Unusable)
         );
     }
@@ -1798,7 +2132,7 @@ mod tests {
         cli.config_file = dir.path().to_path_buf();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
-            plan_live(&cli, &argv(), &mut out, &mut err),
+            plan_live(&cli, &argv(), None, &mut out, &mut err),
             Err(ExitCode::Unusable)
         );
         assert!(

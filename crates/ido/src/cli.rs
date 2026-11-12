@@ -321,37 +321,97 @@ fn resolve_cwd(given: Option<&Path>, host: &Host) -> Result<Option<String>, IdoE
     Ok(Some(dir))
 }
 
-fn queue(args: QueueArgs, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
-    let command = utf8_all(args.argv, "the command")?;
-    let dry_run_of = utf8_all(args.dry_run_of, "--dry-run-of")?;
-    let cwd = resolve_cwd(args.cwd.as_deref(), host)?;
+/// What queueing one command did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Enqueued {
+    /// The entry's id, new or existing.
+    pub id: u64,
+    /// The same command was already queued, so nothing was written.
+    pub already: bool,
+}
+
+/// Queues one command the way `ido queue` does: the same store, lock,
+/// validation, duplicate check and entry format. Runs nothing.
+///
+/// `argv` is stored exactly as given; `reason` is untrusted display text.
+/// The directory is the host's current one.
+///
+/// # Errors
+///
+/// Any failure to resolve the directory or the queue, take the lock, validate
+/// the entry, or write it. Nothing is queued on error.
+pub fn enqueue(
+    host: &Host,
+    argv: Vec<String>,
+    reason: Option<String>,
+) -> Result<Enqueued, IdoError> {
+    let cwd = resolve_cwd(None, host)?;
+    let (entry, already) =
+        enqueue_entry(host, argv, cwd, reason, None, None, Vec::new(), Vec::new())?;
+    Ok(Enqueued {
+        id: entry.id,
+        already,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_entry(
+    host: &Host,
+    command: Vec<String>,
+    cwd: Option<String>,
+    reason: Option<String>,
+    group: Option<String>,
+    step: Option<u32>,
+    needs: Vec<u64>,
+    dry_run_of: Vec<String>,
+) -> Result<(Entry, bool), IdoError> {
     let store = store(host)?;
     let _lock = store.lock_waiting(host.lock_wait)?;
     let existing = store.load()?;
     if let Some(same) = existing
         .iter()
-        .find(|e| e.argv == command && e.cwd == cwd && e.group == args.group && e.step == args.step)
+        .find(|e| e.argv == command && e.cwd == cwd && e.group == group && e.step == step)
     {
-        let _ = writeln!(
-            io.out,
-            "ido: already queued as #{}; not queued again",
-            same.id
-        );
-        return Ok(0);
+        return Ok((same.clone(), true));
     }
     let entry = Entry::build(
         &existing,
         command,
-        args.reason,
-        args.group,
-        args.step,
-        args.needs,
+        reason,
+        group,
+        step,
+        needs,
         cwd,
         dry_run_of,
         host.now_unix,
         host.queued_by.clone(),
     )?;
     store.append(&entry)?;
+    Ok((entry, false))
+}
+
+fn queue(args: QueueArgs, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
+    let command = utf8_all(args.argv, "the command")?;
+    let dry_run_of = utf8_all(args.dry_run_of, "--dry-run-of")?;
+    let cwd = resolve_cwd(args.cwd.as_deref(), host)?;
+    let (entry, already) = enqueue_entry(
+        host,
+        command,
+        cwd,
+        args.reason,
+        args.group,
+        args.step,
+        args.needs,
+        dry_run_of,
+    )?;
+    if already {
+        let _ = writeln!(
+            io.out,
+            "ido: already queued as #{}; not queued again",
+            entry.id
+        );
+        return Ok(0);
+    }
     let shown = render::argv_line(&entry.argv, FIELD_COLS);
     let _ = writeln!(io.out, "ido: queued #{}: {}", entry.id, shown.text);
     let _ = writeln!(io.out, "Run `ido` to execute it.");
@@ -719,6 +779,42 @@ mod tests {
             lock_wait: Duration::from_millis(20),
             frame_delay: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn enqueue_writes_once_and_reports_the_same_entry_again() {
+        let host = host("enqueue-once");
+        let argv = vec!["/bin/echo".to_owned(), "a b".to_owned()];
+        let first = enqueue(&host, argv.clone(), Some("why".into())).unwrap();
+        assert_eq!(
+            first,
+            Enqueued {
+                id: 1,
+                already: false
+            }
+        );
+        let again = enqueue(&host, argv.clone(), None).unwrap();
+        assert_eq!(
+            again,
+            Enqueued {
+                id: 1,
+                already: true
+            }
+        );
+        let queue = store(&host).unwrap().load().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].argv, argv);
+        assert_eq!(queue[0].reason.as_deref(), Some("why"));
+    }
+
+    #[test]
+    fn enqueue_refuses_without_a_directory_or_a_command_and_writes_nothing() {
+        let mut host = host("enqueue-refuses");
+        assert!(enqueue(&host, Vec::new(), None).is_err());
+        host.cwd = Some(host.cwd.clone().unwrap().join("missing"));
+        assert!(enqueue(&host, vec!["/bin/true".into()], None).is_err());
+        host.cwd = None;
+        assert!(enqueue(&host, vec!["/bin/true".into()], None).is_ok());
     }
 
     /// A terminal that replays scripted reads.

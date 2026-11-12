@@ -771,6 +771,7 @@ name = "xudo"
 version = "0.1.0-beta.1"
 dependencies = [
  "clap",
+ "ido",
  "insta",
  "rustix",
  "serde",
@@ -813,6 +814,7 @@ version = "0.1.0-beta.1"
 dependencies = [
  "assert_cmd",
  "clap",
+ "ido",
  "predicates",
  "rustix",
  "serde_json",
