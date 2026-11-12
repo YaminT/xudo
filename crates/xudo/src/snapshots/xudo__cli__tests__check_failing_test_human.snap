@@ -2,7 +2,7 @@
 source: crates/xudo/src/cli.rs
 expression: out
 ---
-ok: 2 action(s) in 2 file(s), generation f5f3d9f898f2
+ok: 2 action(s) in 2 file(s), generation 73e262c49e50
 tests: 0 passed, 1 failed
 FAIL 20-tests.toml:2: expected deny, got allow by xudo.svc.restart
   argv: /usr/bin/systemctl restart nginx.service

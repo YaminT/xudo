@@ -20,7 +20,8 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::rule::{Action, RuleSet, RuleSetError, Source};
+use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
+use crate::rule::{Action, ConfirmPolicy, RuleSet, RuleSetError, Tier};
 use crate::rule_test::RuleTest;
 
 /// The suffix that makes a directory entry a rule file.
@@ -186,13 +187,17 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
 
         let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
 
-        framed(&mut hasher, &file.name);
-        for action in parsed.actions() {
-            framed(&mut hasher, &policy_form(action));
+        // A file with no actions is not policy, so it is not hashed: a file
+        // of tests alone, added or removed, must not move the generation.
+        if !parsed.actions().is_empty() {
+            framed(&mut hasher, &file.name);
+            for action in parsed.actions() {
+                framed(&mut hasher, &policy_form(action));
+            }
+            // Closes the file, so the last action of one cannot be read as the
+            // first of the next.
+            framed(&mut hasher, b"");
         }
-        // Closes the file, so the last action of one cannot be read as the
-        // first of the next.
-        framed(&mut hasher, b"");
 
         actions.extend(parsed.actions().iter().cloned());
         tests.extend(file_tests);
@@ -207,15 +212,124 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
 
 /// Everything about an action that can change a decision, as bytes.
 ///
-/// The derived `Debug` of the action with its line zeroed: every field is in it,
-/// so a field added to [`Action`] is in the digest without anyone remembering to
-/// add it, and the pinned digest in this module's tests fails to say so. The
-/// line is zeroed because where an action sits in its file is provenance, not
-/// policy.
+/// A canonical encoding written out by hand, not the action's `Debug` output:
+/// `Debug` is documented as unstable, and this feeds a wire value, so an impl
+/// that dropped a field would let a real policy change keep its generation.
+/// Every field is length-framed or a fixed tag, in struct order, and every
+/// destructuring below is exhaustive with no `..`, so a field or variant added
+/// to a policy type stops this module compiling until it is encoded. The
+/// action's `source` is left out: where an action sits in its file is
+/// provenance, not policy.
 fn policy_form(action: &Action) -> Vec<u8> {
-    let mut action = action.clone();
-    action.source = Source::new(action.source.file, 0);
-    format!("{action:?}").into_bytes()
+    let Action {
+        id,
+        tier,
+        exe,
+        args,
+        confirm,
+        agent_allowed,
+        env_allow,
+        source: _,
+    } = action;
+    let mut out = Vec::new();
+    put(&mut out, id.as_str().as_bytes());
+    put(&mut out, tier_word(*tier).as_bytes());
+    put(&mut out, exe.as_bytes());
+    put_len(&mut out, args.len());
+    for spec in args {
+        let ArgSpec {
+            name,
+            matcher,
+            repeat,
+        } = spec;
+        put(&mut out, name.as_bytes());
+        put_matcher(&mut out, matcher);
+        match repeat {
+            Repeat::One => put(&mut out, b"one"),
+            Repeat::Optional => put(&mut out, b"optional"),
+            Repeat::Between { min, max } => {
+                put(&mut out, b"between");
+                put_len(&mut out, *min);
+                put_len(&mut out, *max);
+            }
+        }
+    }
+    let confirm = match confirm {
+        ConfirmPolicy::Default => "default",
+        ConfirmPolicy::Always => "always",
+        ConfirmPolicy::Never => "never",
+    };
+    put(&mut out, confirm.as_bytes());
+    out.push(u8::from(*agent_allowed));
+    put_len(&mut out, env_allow.len());
+    for name in env_allow {
+        put(&mut out, name.as_bytes());
+    }
+    out
+}
+
+fn tier_word(tier: Tier) -> &'static str {
+    match tier {
+        Tier::DiagRead => "diag-read",
+        Tier::SvcControl => "svc-control",
+        Tier::PkgInstall => "pkg-install",
+        Tier::PkgRemove => "pkg-remove",
+        Tier::SysTunable => "sys-tunable",
+        Tier::NetFilter => "net-filter",
+        Tier::Critical => "critical",
+    }
+}
+
+fn put_matcher(out: &mut Vec<u8>, matcher: &Matcher) {
+    match matcher {
+        Matcher::Literal(want) => {
+            put(out, b"literal");
+            put(out, want.as_bytes());
+        }
+        Matcher::OneOf(options) => {
+            put(out, b"one-of");
+            put_len(out, options.len());
+            for option in options {
+                put(out, option.as_bytes());
+            }
+        }
+        Matcher::IntRange { lo, hi } => {
+            put(out, b"int-range");
+            put(out, &lo.to_be_bytes());
+            put(out, &hi.to_be_bytes());
+        }
+        Matcher::PathUnder { prefix } => {
+            put(out, b"path-under");
+            put(out, prefix.as_bytes());
+        }
+        Matcher::Name(kind) => {
+            put(out, b"name");
+            let word = match kind {
+                NameKind::DebName => "deb-name",
+                NameKind::RpmName => "rpm-name",
+                NameKind::ArchName => "arch-name",
+                NameKind::ApkName => "apk-name",
+                NameKind::UnitName => "unit-name",
+                NameKind::Hostname => "hostname",
+                NameKind::SysctlKey => "sysctl-key",
+            };
+            put(out, word.as_bytes());
+        }
+        Matcher::Pattern(pattern) => {
+            put(out, b"pattern");
+            put(out, pattern.source().as_bytes());
+        }
+    }
+}
+
+/// Appends one field preceded by its length, as [`framed`] does for the hash.
+fn put(out: &mut Vec<u8>, field: &[u8]) {
+    put_len(out, field.len());
+    out.extend_from_slice(field);
+}
+
+fn put_len(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&(len as u64).to_be_bytes());
 }
 
 /// Feeds one field to the hash, preceded by its length as eight big-endian
@@ -245,6 +359,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::rule::{ActionId, Source};
 
     const ONE_ACTION: &str = r#"
 [[action]]
@@ -363,7 +478,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         ]);
         assert_eq!(
             pinned.hex(),
-            "82afb2b3a3764f8d324ce81d8245ffd8f6580383e91f11a87a96262af61f3230"
+            "aa1f8736c26f54a0bcfb00cd90243f6991fffd6e010c83044cbbc85120784cf8"
         );
         assert_eq!(
             generation(Vec::new()).hex(),
@@ -393,7 +508,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         assert!(loaded.rules.is_empty());
         assert_ne!(
             loaded.generation,
-            generation(vec![file("10-a.toml", "# nothing")])
+            generation(vec![file("10-a.toml", ONE_ACTION)])
         );
     }
 
@@ -523,5 +638,263 @@ expect = "deny"
         .unwrap();
         let places: Vec<String> = loaded.tests.iter().map(|t| t.source.to_string()).collect();
         assert_eq!(places, ["10-a.toml:3", "10-a.toml:14", "20-b.toml:1"]);
+    }
+
+    #[test]
+    fn a_file_holding_only_tests_never_changes_the_generation() {
+        // `xudo-rules(5)` promises that adding a test never bumps the
+        // generation, and a file of tests alone has no actions to hash.
+        let plain = generation(vec![file("10-a.toml", ONE_ACTION)]);
+        let tests_only = "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\n";
+        assert_eq!(
+            generation(vec![
+                file("10-a.toml", ONE_ACTION),
+                file("20-tests.toml", tests_only)
+            ]),
+            plain
+        );
+        assert_eq!(
+            generation(vec![file("00-t.toml", tests_only)]),
+            generation(Vec::new())
+        );
+        assert_eq!(
+            generation(vec![file("00-t.toml", "# nothing")]),
+            generation(Vec::new())
+        );
+    }
+
+    fn digest(action: &Action) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(policy_form(action));
+        Generation(hasher.finalize().into()).hex()
+    }
+
+    fn fixed_actions() -> Vec<Action> {
+        RuleSet::from_toml(
+            "f.toml",
+            r#"
+[[action]]
+id = "a.one"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+confirm = "always"
+agent-allowed = false
+env-allow = ["LANG", "TERM"]
+args = [
+  { name = "verb", matcher = { one-of = ["start", "stop"] } },
+  { name = "unit", matcher = { name = "unit-name" }, repeat = { between = { min = 1, max = 3 } } },
+  { name = "n", matcher = { int-range = { lo = -5, hi = 9 } }, repeat = "optional" },
+  { name = "p", matcher = { path-under = { prefix = "/etc" } } },
+  { name = "r", matcher = { pattern = "a+b" } },
+  { name = "l", matcher = { literal = "x" } },
+]
+
+[[action]]
+id = "a.two"
+tier = "critical"
+exe = "/usr/bin/true"
+args = [
+  { name = "a", matcher = { name = "deb-name" } },
+  { name = "b", matcher = { name = "rpm-name" } },
+  { name = "c", matcher = { name = "arch-name" } },
+  { name = "d", matcher = { name = "apk-name" } },
+  { name = "e", matcher = { name = "hostname" } },
+  { name = "f", matcher = { name = "sysctl-key" } },
+]
+"#,
+        )
+        .unwrap()
+        .actions()
+        .to_vec()
+    }
+
+    #[test]
+    fn the_canonical_form_of_fixed_actions_is_pinned() {
+        // The form is a wire value: a change to it must be deliberate.
+        let digests: Vec<String> = fixed_actions().iter().map(digest).collect();
+        assert_eq!(
+            digests,
+            [
+                "b324748da0c3bfb72a2ff3ca4d054df8a837b80f9bf5a0f5f3c4b80bfa74238a",
+                "80bd4e20b000d9556b4ccd33b702d8fe36eb8637c6f1461ccbd1ed9ca671b7f9",
+            ]
+        );
+    }
+
+    #[test]
+    fn where_an_action_sits_is_not_in_its_canonical_form() {
+        let mut moved = fixed_actions();
+        for action in &mut moved {
+            action.source = Source::new("elsewhere.toml", 999);
+        }
+        assert_eq!(
+            moved.iter().map(policy_form).collect::<Vec<_>>(),
+            fixed_actions().iter().map(policy_form).collect::<Vec<_>>()
+        );
+    }
+
+    mod canonical {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::matcher::AnchoredPattern;
+
+        fn matcher() -> impl Strategy<Value = Matcher> {
+            prop_oneof![
+                "[a-z]{0,4}".prop_map(Matcher::Literal),
+                proptest::collection::vec("[a-z]{0,3}", 0..3).prop_map(Matcher::OneOf),
+                (-3i64..3, 0i64..6).prop_map(|(lo, hi)| Matcher::IntRange { lo, hi }),
+                "/[a-z]{0,4}".prop_map(|prefix| Matcher::PathUnder { prefix }),
+                prop_oneof![
+                    Just(NameKind::DebName),
+                    Just(NameKind::UnitName),
+                    Just(NameKind::Hostname),
+                ]
+                .prop_map(Matcher::Name),
+                "[a-z]{1,3}[+*]?".prop_map(|s| Matcher::Pattern(AnchoredPattern::new(&s).unwrap())),
+            ]
+        }
+
+        fn repeat() -> impl Strategy<Value = Repeat> {
+            prop_oneof![
+                Just(Repeat::One),
+                Just(Repeat::Optional),
+                (0usize..3, 0usize..5).prop_map(|(min, max)| Repeat::Between { min, max }),
+            ]
+        }
+
+        fn spec() -> impl Strategy<Value = ArgSpec> {
+            ("[a-z]{1,3}", matcher(), repeat()).prop_map(|(name, matcher, repeat)| ArgSpec {
+                name,
+                matcher,
+                repeat,
+            })
+        }
+
+        fn tier() -> impl Strategy<Value = Tier> {
+            prop_oneof![
+                Just(Tier::DiagRead),
+                Just(Tier::SvcControl),
+                Just(Tier::PkgInstall),
+                Just(Tier::PkgRemove),
+                Just(Tier::SysTunable),
+                Just(Tier::NetFilter),
+                Just(Tier::Critical),
+            ]
+        }
+
+        fn confirm() -> impl Strategy<Value = ConfirmPolicy> {
+            prop_oneof![
+                Just(ConfirmPolicy::Default),
+                Just(ConfirmPolicy::Always),
+                Just(ConfirmPolicy::Never),
+            ]
+        }
+
+        fn action() -> impl Strategy<Value = Action> {
+            (
+                "[a-z.]{1,6}",
+                tier(),
+                "/[a-z/]{1,6}",
+                proptest::collection::vec(spec(), 0..4),
+                confirm(),
+                any::<bool>(),
+                proptest::collection::vec("[A-Z]{1,3}", 0..3),
+                1u32..500,
+            )
+                .prop_map(
+                    |(id, tier, exe, args, confirm, agent_allowed, env_allow, line)| Action {
+                        id: ActionId::new(id),
+                        tier,
+                        exe,
+                        args,
+                        confirm,
+                        agent_allowed,
+                        env_allow,
+                        source: Source::new("p.toml", line),
+                    },
+                )
+        }
+
+        /// Every way to change one decision-relevant field of an action.
+        fn mutations(base: &Action, other: &Action) -> Vec<Action> {
+            let mut out = Vec::new();
+            let mut with = |f: &dyn Fn(&mut Action)| {
+                let mut a = base.clone();
+                f(&mut a);
+                out.push(a);
+            };
+            with(&|a| a.id = ActionId::new(format!("{}x", a.id)));
+            with(&|a| a.tier = other.tier);
+            with(&|a| a.exe.push('x'));
+            with(&|a| a.confirm = other.confirm);
+            with(&|a| a.agent_allowed = !a.agent_allowed);
+            with(&|a| a.env_allow.push("NEW".into()));
+            with(&|a| a.env_allow.reverse());
+            with(&|a| {
+                if let Some(first) = a.env_allow.first_mut() {
+                    first.push('x');
+                }
+            });
+            with(&|a| {
+                a.args
+                    .push(ArgSpec::one("extra", Matcher::Literal("e".into())));
+            });
+            with(&|a| a.args.reverse());
+            with(&|a| {
+                a.args.pop();
+            });
+            if let Some(spec) = other.args.first() {
+                with(&|a| a.args.push(spec.clone()));
+                with(&|a| a.args.insert(0, spec.clone()));
+            }
+            for index in 0..base.args.len() {
+                with(&|a| a.args[index].name.push('x'));
+                with(&|a| {
+                    if let Some(spec) = other.args.first() {
+                        a.args[index].matcher = spec.matcher.clone();
+                    }
+                });
+                with(&|a| {
+                    if let Some(spec) = other.args.first() {
+                        a.args[index].repeat = spec.repeat;
+                    }
+                });
+                with(&|a| match &mut a.args[index].matcher {
+                    Matcher::Literal(s) | Matcher::PathUnder { prefix: s } => s.push('x'),
+                    Matcher::OneOf(v) => v.push("x".into()),
+                    Matcher::IntRange { lo, .. } => *lo = lo.saturating_sub(1),
+                    Matcher::Name(_) => a.args[index].matcher = Matcher::Literal("n".into()),
+                    Matcher::Pattern(p) => {
+                        *p = AnchoredPattern::new(&format!("{}z", p.source())).unwrap();
+                    }
+                });
+            }
+            out
+        }
+
+        proptest! {
+            #[test]
+            fn any_decision_relevant_difference_changes_the_canonical_form(
+                base in action(),
+                other in action(),
+            ) {
+                for mutated in mutations(&base, &other) {
+                    if mutated != base {
+                        prop_assert_ne!(policy_form(&mutated), policy_form(&base), "{:?} vs {:?}", mutated, base);
+                    }
+                }
+            }
+
+            #[test]
+            fn equal_policy_gives_equal_form_whatever_the_provenance(
+                base in action(),
+                line in 1u32..9999,
+            ) {
+                let mut moved = base.clone();
+                moved.source = Source::new("q.toml", line);
+                prop_assert_eq!(policy_form(&moved), policy_form(&base));
+            }
+        }
     }
 }
