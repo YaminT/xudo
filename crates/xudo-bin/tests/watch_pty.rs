@@ -100,34 +100,36 @@ fn exercise_real_pty(input: &str, approve: bool, expected_token: &str, pre_input
     let response_token = Arc::new(Mutex::new(None));
     let response_seen = Arc::clone(&response_token);
     let server = std::thread::spawn(move || {
-        let mut watches = 0;
+        // The prompt stays on offer until the answer arrives, however long
+        // the machine takes to deliver it: a heartbeat in between must not end
+        // the watch, so the refusal that stops the watcher waits for the answer.
+        let mut answered = false;
+        let mut finished = false;
         loop {
             let (mut stream, _) = listener.accept().unwrap();
             let mut bytes = Vec::new();
             stream.read_to_end(&mut bytes).unwrap();
             let request = BrokerRequest::parse(&bytes).unwrap();
             let answer = match request.question {
-                Question::Watch => {
-                    watches += 1;
-                    if watches == 1 {
-                        Answer::Watching {
-                            prompts: vec![watch_prompt()],
-                            omitted: 0,
-                        }
-                    } else {
-                        Answer::Refused {
-                            code: RefusalCode::ChannelUntrusted,
-                            remediation: "stop test watcher".to_owned(),
-                            detail: Some("pty test finished".to_owned()),
-                        }
+                Question::Watch if answered => {
+                    finished = true;
+                    Answer::Refused {
+                        code: RefusalCode::ChannelUntrusted,
+                        remediation: "stop test watcher".to_owned(),
+                        detail: Some("pty test finished".to_owned()),
                     }
                 }
+                Question::Watch => Answer::Watching {
+                    prompts: vec![watch_prompt()],
+                    omitted: 0,
+                },
                 Question::Answer {
                     approve: got_approve,
                     token,
                     ..
                 } => {
                     *response_seen.lock().unwrap() = Some((got_approve, token));
+                    answered = true;
                     Answer::Done
                 }
                 _ => panic!("unexpected broker question"),
@@ -137,7 +139,7 @@ fn exercise_real_pty(input: &str, approve: bool, expected_token: &str, pre_input
                 answer,
             };
             stream.write_all(reply.to_json().as_bytes()).unwrap();
-            if watches > 1 {
+            if finished {
                 break;
             }
         }
