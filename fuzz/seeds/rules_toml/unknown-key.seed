@@ -1,0 +1,4 @@
+[[test]]
+argv = ["/usr/bin/id"]
+expect = "allow"
+nopasswd = true

@@ -1,0 +1,11 @@
+---
+source: crates/xudo-policy/tests/contract_snapshots.rs
+expression: table
+---
+ 0  Delegated
+17  Denied
+18  NotConfirmed
+19  Unusable
+20  LintWarning
+21  LintError
+22  TestFailure

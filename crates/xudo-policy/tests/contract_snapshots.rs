@@ -16,8 +16,8 @@
 
 use std::fmt::Write as _;
 
-use xudo_policy::DenialCode;
 use xudo_policy::decision::ConfirmReason;
+use xudo_policy::{DenialCode, ExitCode};
 
 /// Every denial code. [`lists_every_denial_code`] stops compiling when a
 /// variant is added, and the build error lands here, where this array needs
@@ -95,4 +95,53 @@ fn every_confirmation_prompt_string_is_pinned() {
         let _ = writeln!(prompts, "    {}", reason.explain());
     }
     insta::assert_snapshot!("confirmation_prompt_strings", prompts);
+}
+
+/// Every process exit status `xudo` itself reports, with the same
+/// exhaustiveness arrangement as [`ALL_CODES`].
+const ALL_EXIT_CODES: [ExitCode; 7] = [
+    ExitCode::Delegated,
+    ExitCode::Denied,
+    ExitCode::NotConfirmed,
+    ExitCode::Unusable,
+    ExitCode::LintWarning,
+    ExitCode::LintError,
+    ExitCode::TestFailure,
+];
+
+/// Compile-time exhaustiveness for [`ALL_EXIT_CODES`].
+fn lists_every_exit_code(code: ExitCode) {
+    match code {
+        ExitCode::Delegated
+        | ExitCode::Denied
+        | ExitCode::NotConfirmed
+        | ExitCode::Unusable
+        | ExitCode::LintWarning
+        | ExitCode::LintError
+        | ExitCode::TestFailure => {}
+    }
+}
+
+#[test]
+fn the_exit_status_contract_is_pinned() {
+    // A pipeline gates on these numbers, so a renumbering is a breaking change.
+    let mut table = String::new();
+    for code in ALL_EXIT_CODES {
+        lists_every_exit_code(code);
+        let _ = writeln!(table, "{:>2}  {code:?}", code.as_i32());
+    }
+    insta::assert_snapshot!("exit_status_contract", table);
+}
+
+#[test]
+fn the_check_codes_rank_by_severity_and_never_collide_with_a_refusal() {
+    use ExitCode::{Denied, LintError, LintWarning, NotConfirmed, TestFailure, Unusable};
+    assert!(LintWarning.as_i32() < LintError.as_i32());
+    assert!(LintError.as_i32() < TestFailure.as_i32());
+    for check in [LintWarning, LintError, TestFailure] {
+        for other in [Denied, NotConfirmed, Unusable] {
+            assert_ne!(check.as_i32(), other.as_i32());
+        }
+        assert!(check.as_i32() < 128, "{check:?} could read as a signal");
+    }
 }

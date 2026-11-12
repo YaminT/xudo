@@ -39,6 +39,38 @@ tier = "sys-tunable"
 exe = "/usr/bin/timedatectl"
 args = [
   { name = "verb", matcher = { literal = "set-ntp" } },
-  # "false" is the precondition for clock manipulation, so it is confirmed.
-  { name = "value", matcher = { one-of = ["true", "false"] } },
+  # "false" is the precondition for clock manipulation: a reviewer should treat
+  # it as the sensitive value. (Whether it is confirmed depends on the caller and
+  # settings, so no rule test can assert it.)
+  { name = "value", matcher = { one-of = [
+    "true",
+    "false",
+  ] } },
 ]
+
+# Tests run by `xudo check` and by the build.
+
+[[test]]
+argv = ["/usr/sbin/sysctl", "-q", "-w", "vm.max_map_count", "262144"]
+expect = "allow"
+action = "xudo.sysctl.max-map-count"
+
+[[test]]
+argv = ["/usr/sbin/sysctl", "-q", "-w", "fs.inotify.max_user_watches", "524288"]
+expect = "allow"
+action = "xudo.sysctl.inotify-watches"
+
+[[test]]
+argv = ["/usr/bin/timedatectl", "set-ntp", "true"]
+expect = "allow"
+action = "xudo.time.set-ntp"
+
+[[test]]
+argv = ["/usr/sbin/sysctl", "-q", "-w", "vm.max_map_count", "100"]
+expect = "deny"
+reason = "near miss: below the range the rule allows"
+
+[[test]]
+argv = ["/usr/sbin/sysctl", "-q", "-w", "kernel.core_pattern", "|/tmp/x"]
+expect = "deny"
+reason = "no rule accepts core_pattern, which is a program specification"

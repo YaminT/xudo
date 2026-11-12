@@ -101,7 +101,7 @@ fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
 }
 
 #[test]
-fn changelog_puts_an_empty_unreleased_above_the_shipped_version() {
+fn changelog_puts_unreleased_above_the_shipped_version() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -131,12 +131,24 @@ fn changelog_puts_an_empty_unreleased_above_the_shipped_version() {
             .is_some_and(|heading| heading.starts_with(&format!("## {version}"))),
         "shipped section is not {version}: {headings:?}"
     );
-    let unreleased = changelog.split("## Unreleased").nth(1).unwrap();
-    let body = unreleased.split("\n## ").next().unwrap();
+    // The shipped section stays as it was released: its own heading, followed
+    // by what it shipped, below an Unreleased that carries what comes next.
+    let shipped = changelog.split("\n## ").nth(2).unwrap();
     assert!(
-        body.trim().is_empty(),
-        "Unreleased should stay empty until the next release: {body}"
+        shipped.starts_with(&version) && shipped.contains("M3 out-of-band confirmation"),
+        "the shipped section changed: {shipped}"
     );
+    let unreleased = changelog.split("\n## ").nth(1).unwrap();
+    assert!(unreleased.starts_with("Unreleased"), "{unreleased}");
+}
+
+#[test]
+fn the_changelog_check_catches_a_rewritten_shipped_section() {
+    // Canary: the same split applied to a changelog whose shipped section was
+    // emptied must not satisfy the assertion above.
+    let rewritten = "# C\n\n## Unreleased\n\n- x\n\n## 0.1.0-beta.1 - 2026-11-10\n\n- other\n";
+    let shipped = rewritten.split("\n## ").nth(2).unwrap();
+    assert!(!shipped.contains("M3 out-of-band confirmation"));
 }
 
 #[test]

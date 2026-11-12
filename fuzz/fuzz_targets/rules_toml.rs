@@ -7,7 +7,9 @@
 
 #![no_main]
 
-use xudo_policy::RuleSet;
+use xudo_policy::{
+    CallerFacts, Classification, RuleFile, RuleSet, engine::Settings, load_rule_files, run_tests,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -16,9 +18,37 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Must not panic on any input, valid or not.
-    let Ok(set) = RuleSet::from_toml("fuzz.toml", text) else {
+    let Ok((set, tests)) = RuleSet::from_toml_with_tests("fuzz.toml", text) else {
         return;
     };
+
+    // The gate and the broker load through `load_rule_files`. A `[[test]]`
+    // table must change neither whether a file loads nor the generation: strip
+    // the tables the way the parser sees them and compare.
+    if let Ok(mut table) = text.parse::<toml::Table>() {
+        table.remove("test");
+        if let Ok(stripped) = toml::to_string(&table) {
+            let file = |bytes: &[u8]| RuleFile {
+                name: b"fuzz.toml".to_vec(),
+                bytes: bytes.to_vec(),
+            };
+            let with = load_rule_files(vec![file(text.as_bytes())]);
+            let without = load_rule_files(vec![file(stripped.as_bytes())]);
+            if let Ok(with) = with {
+                let without = without.expect("stripping the tests made a loadable file unloadable");
+                assert_eq!(with.generation, without.generation, "a [[test]] table moved the generation");
+            }
+        }
+    }
+
+    // Running whatever tests loaded must never panic, and a test cannot set
+    // its own provenance.
+    let human = CallerFacts::new(Classification::Human, 1000);
+    let results = run_tests(&set, &tests, &human, Settings::default());
+    assert_eq!(results.len(), tests.len());
+    for test in &tests {
+        assert_eq!(test.source.file, "fuzz.toml", "a test set its own provenance");
+    }
 
     // Anything that loaded must satisfy every invariant the validator claims.
     for action in set.actions() {

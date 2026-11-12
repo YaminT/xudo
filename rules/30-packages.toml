@@ -59,3 +59,59 @@ args = [
   { name = "separator", matcher = { literal = "--" } },
   { name = "pkg", matcher = { name = "deb-name" }, repeat = { between = { min = 1, max = 20 } } },
 ]
+
+# Tests run by `xudo check` and by the build.
+
+[[test]]
+argv = [
+  "/usr/bin/apt-get",
+  "-y",
+  "--no-install-recommends",
+  "install",
+  "--",
+  "ripgrep",
+]
+expect = "allow"
+action = "xudo.pkg.install"
+
+[[test]]
+argv = ["/usr/bin/apt-get", "update"]
+expect = "allow"
+action = "xudo.pkg.update"
+
+[[test]]
+argv = ["/usr/bin/apt-get", "-y", "remove", "--", "ripgrep"]
+expect = "confirm"
+action = "xudo.pkg.remove"
+reason = "removal always asks a human"
+
+[[test]]
+argv = ["/usr/bin/apt-get", "-s", "install", "--", "ripgrep"]
+expect = "allow"
+action = "xudo.pkg.dry-run-install"
+
+[[test]]
+argv = [
+  "/usr/bin/apt-get",
+  "-y",
+  "--no-install-recommends",
+  "install",
+  "--",
+  "./local.deb",
+]
+expect = "deny"
+reason = "near miss: a local file is not a package name"
+
+[[test]]
+argv = [
+  "/usr/bin/apt-get",
+  "-o",
+  "DPkg::Pre-Invoke::=/bin/sh",
+  "-y",
+  "--no-install-recommends",
+  "install",
+  "--",
+  "ripgrep",
+]
+expect = "deny"
+reason = "no rule accepts -o, which names a program to run as root"
