@@ -5854,6 +5854,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert!(detail.contains("consume outcome unknown"));
         assert!(!detail.contains("supersedes the grant"));
         assert!(detail.contains(&format!("nonce={NONCE}")));
+        // The lock is held across the re-read, and released only after it.
+        assert_eq!(
+            after.calls(),
+            [
+                xudo_sys::SpoolCall::Lock,
+                xudo_sys::SpoolCall::Read(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Replace(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Read(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Unlock,
+            ]
+        );
         // The consumed bytes really are on disk.
         assert_eq!(
             the_entry(&after, NONCE).state,
@@ -5872,6 +5883,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let detail = swap_detail(&after, &consumed);
         assert!(detail.contains("consume outcome unknown"));
         assert!(!detail.contains("supersedes the grant"));
+        // The lock is held across the re-read, and released only after it.
+        assert_eq!(
+            after.calls(),
+            [
+                xudo_sys::SpoolCall::Lock,
+                xudo_sys::SpoolCall::Read(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Replace(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Read(NONCE.as_bytes().to_vec()),
+                xudo_sys::SpoolCall::Unlock,
+            ]
+        );
     }
 
     #[test]
