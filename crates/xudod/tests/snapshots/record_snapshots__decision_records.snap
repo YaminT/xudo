@@ -28,11 +28,11 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b",
+    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94",
     "nonce=abababababababababababababababababababababababababababababababab",
     "deadline_ms=1900"
   ],
-  "hash": "4a9c43adce6586ecb5ad243ba489b7b782bbbd36860c7c9049f9542f54fcfe86",
+  "hash": "8b081b3819cc369d8c9f45f0309479e491cae9d60a09d142f1ee158ce9c910bf",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -66,9 +66,9 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b"
+    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
   ],
-  "hash": "9c4ec9f9f42d98fe0a889fc2242c8a3e53f9cebec3fdcacc686c35ec4feacdcc",
+  "hash": "ef6484ce27e7f7762d44153b2f1633d53106b0c0dbe03493cd712ee617e9a089",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -100,9 +100,9 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b"
+    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
   ],
-  "hash": "a29903de09eac645c6d25e4cff1259b2d496b84485307070edb0bcb59b3cf5b4",
+  "hash": "6e78ba51d8bfaac9f02a3a5c7799a89309fa1bbc728103810e1921e0393a034f",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": null,

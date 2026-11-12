@@ -20,14 +20,15 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::rule::{Action, RuleSet, RuleSetError};
+use crate::rule::{Action, RuleSet, RuleSetError, Source};
+use crate::rule_test::RuleTest;
 
 /// The suffix that makes a directory entry a rule file.
 pub const RULE_FILE_SUFFIX: &[u8] = b".toml";
 
 /// Separates this hash from every other SHA-256 the project computes, and
 /// names the framing version so a later change cannot collide with this one.
-const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v1\0";
+const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v2\0";
 
 /// Whether a directory entry is a rule file.
 ///
@@ -50,11 +51,17 @@ pub struct RuleFile {
 
 /// Which policy a set of rule files is.
 ///
-/// A SHA-256 over every rule file's name and contents, in name order, each
-/// field length-prefixed. The prefixes matter: hashing names and contents
-/// back to back would give `1.toml` holding `#a2.toml#b` the same generation
-/// as `1.toml` holding `#a` beside `2.toml` holding `#b`, two different
-/// rulesets that a stale request could not tell apart.
+/// A SHA-256 over every rule file's name and the actions it defines, in name
+/// order, each field length-prefixed. The prefixes matter: hashing names and
+/// contents back to back would give `1.toml` holding `#a2.toml#b` the same
+/// generation as `1.toml` holding `#a` beside `2.toml` holding `#b`, two
+/// different rulesets that a stale request could not tell apart.
+///
+/// The actions are hashed as parsed, not the file's bytes, so that what is not
+/// policy is not in the digest: a `[[test]]` table (see [`crate::rule_test`]),
+/// a comment, and the line an action sits on can all change without
+/// invalidating a request minted under the same rules. Anything that can
+/// change a decision is a field of [`Action`], and is hashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Generation([u8; 32]);
 
@@ -98,6 +105,10 @@ pub struct LoadedRuleSet {
     pub rules: RuleSet,
     /// Which policy it is.
     pub generation: Generation,
+    /// The `[[test]]` tables of every file, in load order.
+    ///
+    /// Beside the ruleset and outside the generation: a test is not policy.
+    pub tests: Vec<RuleTest>,
 }
 
 /// Why a set of rule files could not become a ruleset. Every variant fails
@@ -158,6 +169,7 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
     let mut hasher = Sha256::new();
     hasher.update(GENERATION_DOMAIN);
     let mut actions: Vec<Action> = Vec::new();
+    let mut tests: Vec<RuleTest> = Vec::new();
 
     for file in &files {
         if !is_rule_file_name(&file.name) {
@@ -172,16 +184,38 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
             file: name.to_owned(),
         })?;
 
-        framed(&mut hasher, &file.name);
-        framed(&mut hasher, &file.bytes);
+        let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
 
-        actions.extend(RuleSet::from_toml(name, text)?.actions().iter().cloned());
+        framed(&mut hasher, &file.name);
+        for action in parsed.actions() {
+            framed(&mut hasher, &policy_form(action));
+        }
+        // Closes the file, so the last action of one cannot be read as the
+        // first of the next.
+        framed(&mut hasher, b"");
+
+        actions.extend(parsed.actions().iter().cloned());
+        tests.extend(file_tests);
     }
 
     Ok(LoadedRuleSet {
         rules: RuleSet::load(actions)?,
         generation: Generation(hasher.finalize().into()),
+        tests,
     })
+}
+
+/// Everything about an action that can change a decision, as bytes.
+///
+/// The derived `Debug` of the action with its line zeroed: every field is in it,
+/// so a field added to [`Action`] is in the digest without anyone remembering to
+/// add it, and the pinned digest in this module's tests fails to say so. The
+/// line is zeroed because where an action sits in its file is provenance, not
+/// policy.
+fn policy_form(action: &Action) -> Vec<u8> {
+    let mut action = action.clone();
+    action.source = Source::new(action.source.file, 0);
+    format!("{action:?}").into_bytes()
 }
 
 /// Feeds one field to the hash, preceded by its length as eight big-endian
@@ -291,7 +325,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
-    fn the_generation_changes_with_a_name_or_a_byte_of_content() {
+    fn the_generation_changes_with_a_name_or_a_change_of_policy() {
         let base = generation(vec![file("10-a.toml", ONE_ACTION)]);
         let renamed = generation(vec![file("99-z.toml", ONE_ACTION)]);
         let edited = generation(vec![file(
@@ -306,11 +340,15 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     #[test]
     fn two_rulesets_that_concatenate_alike_have_different_generations() {
-        // Back to back, these are both the bytes `1.toml#a2.toml#b`. Without
-        // length prefixes they would be one generation, and a request minted
-        // under either would stay valid under the other.
-        let one_file = generation(vec![file("1.toml", "#a2.toml#b")]);
-        let two_files = generation(vec![file("1.toml", "#a"), file("2.toml", "#b")]);
+        // Back to back, the actions of `1.toml` holding both and of `1.toml`
+        // and `2.toml` holding one each are the same bytes. Without the length
+        // prefixes and the file boundary they would be one generation, and a
+        // request minted under either would stay valid under the other.
+        let one_file = generation(vec![file("1.toml", &format!("{ONE_ACTION}{OTHER_ACTION}"))]);
+        let two_files = generation(vec![
+            file("1.toml", ONE_ACTION),
+            file("2.toml", OTHER_ACTION),
+        ]);
         assert_ne!(one_file, two_files);
     }
 
@@ -319,14 +357,17 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         // The generation is a wire value: the broker writes it, the gate
         // compares it, generated docs carry it. A change to the framing must
         // be deliberate, so the exact digest is asserted.
-        let pinned = generation(vec![file("10-a.toml", "#a"), file("20-b.toml", "#b")]);
+        let pinned = generation(vec![
+            file("10-a.toml", OTHER_ACTION),
+            file("20-b.toml", ONE_ACTION),
+        ]);
         assert_eq!(
             pinned.hex(),
-            "66a7de1e758dbc5b76f74259cec3dc42f83fa3303d4a8d2c97504f01ae655928"
+            "82afb2b3a3764f8d324ce81d8245ffd8f6580383e91f11a87a96262af61f3230"
         );
         assert_eq!(
             generation(Vec::new()).hex(),
-            "e7c2d0362f304183f2bc5044cc4868e05c3bf3fff860be7339d255fc7ce6e52b"
+            "8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
         );
     }
 
@@ -419,5 +460,68 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         .unwrap_err();
         assert!(err.to_string().contains("duplicate action id"), "{err}");
         assert!(format!("{err:?}").contains("DuplicateId"));
+    }
+
+    const WITH_TESTS: &str = r#"
+# a comment that is not policy
+[[test]]
+argv = ["/usr/bin/apt-get", "update"]
+expect = "allow"
+reason = "the refresh"
+
+[[action]]
+id = "xudo.pkg.update"
+tier = "pkg-install"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "update" } }]
+
+[[test]]
+argv = ["/usr/bin/apt-get", "install"]
+expect = "deny"
+"#;
+
+    #[test]
+    fn editing_adding_or_removing_a_test_never_changes_the_generation() {
+        // A test is not policy: a request minted under these rules must not
+        // go stale because someone added a case, and the line an action sits
+        // on moved when they did.
+        let plain = generation(vec![file("10-a.toml", OTHER_ACTION)]);
+        let tested = load_rule_files(vec![file("10-a.toml", WITH_TESTS)]).unwrap();
+        assert_eq!(tested.generation, plain);
+        assert_eq!(tested.tests.len(), 2);
+        let edited = WITH_TESTS.replace("\"deny\"", "\"allow\"");
+        assert_eq!(generation(vec![file("10-a.toml", &edited)]), plain);
+        assert_eq!(
+            generation(vec![file("10-a.toml", &format!("# top\n{OTHER_ACTION}"))]),
+            plain
+        );
+    }
+
+    #[test]
+    fn a_policy_change_still_changes_the_generation_beside_tests() {
+        let base = generation(vec![file("10-a.toml", WITH_TESTS)]);
+        let widened = WITH_TESTS.replace("\"update\" }", "\"upgrade\" }");
+        assert_ne!(generation(vec![file("10-a.toml", &widened)]), base);
+    }
+
+    #[test]
+    fn tests_are_collected_across_files_in_load_order_with_their_provenance() {
+        let loaded = load_rule_files(vec![
+            file("20-b.toml", WITH_TESTS),
+            file("10-a.toml", WITH_TESTS),
+        ])
+        .unwrap_err();
+        // Both files define the same action id, which the combined load refuses.
+        assert!(loaded.to_string().contains("duplicate"), "{loaded}");
+        let loaded = load_rule_files(vec![
+            file(
+                "20-b.toml",
+                "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\n",
+            ),
+            file("10-a.toml", WITH_TESTS),
+        ])
+        .unwrap();
+        let places: Vec<String> = loaded.tests.iter().map(|t| t.source.to_string()).collect();
+        assert_eq!(places, ["10-a.toml:3", "10-a.toml:14", "20-b.toml:1"]);
     }
 }

@@ -23,7 +23,9 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use xudo_policy::{RuleFile, RuleFilesError, RuleSet, is_rule_file_name, load_rule_files};
+use xudo_policy::{
+    RuleFile, RuleFilesError, RuleSet, RuleTest, is_rule_file_name, load_rule_files,
+};
 
 /// The default location of the root-owned rule files.
 pub const DEFAULT_RULES_DIR: &str = "/etc/xudo/rules.d";
@@ -34,6 +36,7 @@ pub struct LoadedRules {
     rules: RuleSet,
     files: Vec<PathBuf>,
     generation: String,
+    tests: Vec<RuleTest>,
 }
 
 impl LoadedRules {
@@ -56,6 +59,12 @@ impl LoadedRules {
     /// the generation they will compare against.
     pub fn generation(&self) -> &str {
         &self.generation
+    }
+
+    /// The `[[test]]` tables of every rule file, in load order. Not policy: the
+    /// ruleset and its generation are the same with or without them.
+    pub fn tests(&self) -> &[RuleTest] {
+        &self.tests
     }
 
     /// Loads every rule file under `dir`.
@@ -106,6 +115,7 @@ impl LoadedRules {
             rules: loaded.rules,
             files: entries.into_iter().map(|(path, _)| path).collect(),
             generation: loaded.generation.hex(),
+            tests: loaded.tests,
         })
     }
 }

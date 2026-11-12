@@ -31,6 +31,7 @@ xudo \- decide whether a privileged command runs as root
 .RI [ arg ...]
 .br
 .B xudo check
+.RB [ \-\-tests\-only ]
 .RB [ options ]
 .br
 .B xudo list
@@ -221,16 +222,30 @@ in another user namespace. Run it as the user who froze; do not run it as
 to clear a user's freeze unless root's global freeze should go as well.
 .TP
 .B check
-Lint the loaded ruleset.
-Exits
-.B 17
-when an action allowlists an executable the compiled-in deny-list refuses.
-Overlapping actions are reported and are not themselves a failure: a command
-more than one action accepts is refused to an agent if any of them is
-human-only, and confirmed as strictly as the strictest demands.
-A ruleset that will not load is
+Lint the loaded ruleset, then run the
+.B [[test]]
+tables in its rule files (see
+.BR xudo\-rules (5)).
+Overlapping actions are a lint warning, not a refusal: a command more than one
+action accepts is refused to an agent if any of them is human-only, and
+confirmed as strictly as the strictest demands.
+An action that allowlists an executable the compiled-in deny-list refuses is a
+lint error.
+Everything found is printed, and the exit status is the most severe problem:
+.B 20
+for a lint warning,
+.B 21
+for a lint error,
+.B 22
+for a failing test.
+.B \-\-tests\-only
+skips the lint.
+With
+.B \-\-output json
+the report is one envelope, with a result for each test.
+A ruleset that will not load, an unknown key in a test table included, is
 .BR 19 ,
-before this lint runs.
+before any of this runs.
 .TP
 .B list
 List each action's id, tier, executable, and the file and line it came from.
@@ -392,11 +407,22 @@ An approval request still pending at the configured timeout also exits 18.
 could not operate and failed closed: the ruleset or the settings file would
 not load, no usable backend, an install that is not verified, an audit log
 that could not be read, or a status that does not fit in a byte.
+.TP
+.B 20
+.B check
+found a lint warning, and nothing worse.
+.TP
+.B 21
+.B check
+found a lint error: an action allowlists an executable the deny-list refuses.
+.TP
+.B 22
+.B check
+ran the rule files' tests and at least one did not hold, or could not run.
 .PP
-.BR 17 ,
-.BR 18 ,
-and
-.B 19
+.B 17
+through
+.B 22
 sit above the
 .BR 0 / 1 / 2
 band a program uses for its own failures and below

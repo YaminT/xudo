@@ -163,7 +163,14 @@ fuzz seconds:
     host=$(rustc +nightly -vV | sed -n 's/^host: //p')
     for target in $(cargo +nightly fuzz list); do
         echo "fuzzing $target"
-        cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time={{seconds}}
+        # Committed seeds (`fuzz/seeds/<target>`) ride along with the untracked
+        # corpus, so a grammar the corpus has not met yet is still exercised.
+        seeds=()
+        if [ -d "fuzz/seeds/$target" ]; then
+            mkdir -p "fuzz/corpus/$target"
+            seeds=("fuzz/corpus/$target" "fuzz/seeds/$target")
+        fi
+        cargo +nightly fuzz run --target "$host" "$target" ${seeds[@]+"${seeds[@]}"} -- -max_total_time={{seconds}}
     done
 
 # --- supply chain -----------------------------------------------------------

@@ -242,12 +242,19 @@ pub enum ExitCode {
     NotConfirmed,
     /// xudo itself could not operate and failed closed.
     Unusable,
+    /// `xudo check` found something worth a look: a lint warning, and nothing
+    /// worse.
+    LintWarning,
+    /// `xudo check` found something wrong with the ruleset itself.
+    LintError,
+    /// `xudo check` ran the rule files' `[[test]]` tables and one did not hold.
+    TestFailure,
 }
 
 impl ExitCode {
     /// The numeric exit status.
     ///
-    /// `17`, `18` and `19` are reserved values chosen to collide with nothing a
+    /// `17` through `22` are reserved values chosen to collide with nothing a
     /// caller already reads: above the `0`/`1`/`2` band a program uses for its
     /// own failures, and below `128`, where the shell convention for a killed
     /// child (`128 + signal`, so `129`–`192`) begins. A refusal by `xudo` is
@@ -259,6 +266,11 @@ impl ExitCode {
             Self::Denied => 17,
             Self::NotConfirmed => 18,
             Self::Unusable => 19,
+            // `xudo check` only. Numbered in order of severity, so the most
+            // severe problem in one run is the largest of these.
+            Self::LintWarning => 20,
+            Self::LintError => 21,
+            Self::TestFailure => 22,
         }
     }
 }
@@ -467,7 +479,14 @@ mod tests {
     #[test]
     fn a_refusal_cannot_be_read_as_a_child_that_ran_or_was_killed() {
         assert_eq!(ExitCode::Delegated.as_i32(), 0);
-        for code in [ExitCode::Denied, ExitCode::NotConfirmed, ExitCode::Unusable] {
+        for code in [
+            ExitCode::Denied,
+            ExitCode::NotConfirmed,
+            ExitCode::Unusable,
+            ExitCode::LintWarning,
+            ExitCode::LintError,
+            ExitCode::TestFailure,
+        ] {
             let status = code.as_i32();
             assert!(status > 2, "{code:?} reads as a program's own failure");
             // 128 + signal is the shell convention for a killed child, so the

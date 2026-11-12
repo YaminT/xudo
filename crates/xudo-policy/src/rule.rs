@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::deny::evaluate_deny_list;
 use crate::matcher::ArgSpec;
+use crate::rule_test::{RuleTest, line_of_test};
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -202,6 +203,10 @@ pub struct Action {
 struct RuleFile {
     #[serde(default)]
     action: Vec<Action>,
+    /// Executable tests. Kept apart from `action` on purpose: a test is not
+    /// policy and never reaches the compiled ruleset.
+    #[serde(default)]
+    test: Vec<RuleTest>,
 }
 
 fn default_true() -> bool {
@@ -372,6 +377,23 @@ impl RuleSet {
     /// Returns [`RuleSetError::Parse`] when the TOML is invalid or contains an
     /// unrecognised key, and any validation error from [`RuleSet::load`].
     pub fn from_toml(file: &str, contents: &str) -> Result<Self, RuleSetError> {
+        Self::from_toml_with_tests(file, contents).map(|(rules, _)| rules)
+    }
+
+    /// [`Self::from_toml`], and the file's `[[test]]` tables beside the ruleset.
+    ///
+    /// The tests are validated like everything else in the file (an unknown key
+    /// is a hard failure) and returned separately: a test can never become part
+    /// of the ruleset the engine reads. Each carries the file and line it was
+    /// declared on, assigned here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_toml`].
+    pub fn from_toml_with_tests(
+        file: &str,
+        contents: &str,
+    ) -> Result<(Self, Vec<RuleTest>), RuleSetError> {
         let parsed: RuleFile = toml::from_str(contents).map_err(|e| RuleSetError::Parse {
             file: file.to_owned(),
             reason: e.to_string(),
@@ -384,7 +406,16 @@ impl RuleSet {
                 action
             })
             .collect();
-        Self::load(actions)
+        let tests = parsed
+            .test
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut test)| {
+                test.source = Source::new(file, line_of_test(contents, index));
+                test
+            })
+            .collect();
+        Ok((Self::load(actions)?, tests))
     }
 
     /// Looks up an action by id.

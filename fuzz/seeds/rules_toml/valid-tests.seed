@@ -1,0 +1,15 @@
+[[action]]
+id = "x.a"
+tier = "diag-read"
+exe = "/usr/bin/id"
+args = [{ name = "u", matcher = { literal = "-u" } }]
+
+[[test]]
+argv = ["/usr/bin/id", "-u"]
+expect = "allow"
+action = "x.a"
+reason = "ok"
+
+[[test]]
+argv = ["/usr/bin/id", "-un"]
+expect = "deny"
