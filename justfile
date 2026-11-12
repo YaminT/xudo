@@ -326,6 +326,11 @@ systemd-test: deb
     XUDO_BUILD_BIN_DIR=target/systemd-short-ttl/{{musl_triple}}/release packaging/deb/build.sh {{musl_triple}} target/systemd-short-ttl/deb
     ci/systemd/run.sh {{musl_triple}}
 
+# Two builds of HEAD from different paths, byte-compared (.deb and the four
+# binaries). ci/repro/run.sh says what is pinned.
+repro:
+    ci/repro/run.sh {{musl_triple}}
+
 # Trace selected shipped release-musl binaries and check their normal dependency graph.
 telemetry:
     ci/telemetry/run.sh {{musl_triple}}
@@ -352,7 +357,7 @@ setup: install-hooks
 # a job in .github/workflows/ci.yml runs is here or in `verify`, except the two
 # fuzz recipes, which need nightly; `crates/xudo-tests/tests/ci_lanes.rs` fails
 # the build when one is missing.
-ci: verify check-linux miri units differential root-test install-root deb-test systemd-test telemetry
+ci: verify check-linux miri units differential root-test install-root deb-test systemd-test telemetry repro
 
 clean:
     cargo clean
