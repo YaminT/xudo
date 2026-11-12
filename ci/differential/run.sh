@@ -60,10 +60,17 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
-# Under target/, never /tmp. The container writes here as root.
+# Under target/, never /tmp. The container writes here as root; see give_back.
 mkdir -p "$root/target"
 out=$(mktemp -d "$root/target/differential.XXXXXX")
 echo "differential: transcripts in $out"
+
+# The containers write here as root. Hand the files back to the invoking user
+# from inside a container, so no sudo is needed on the host, even on failure.
+give_back() {
+    docker run --rm -v "$out:/o" alpine:3.22 chown -R "$(id -u):$(id -g)" /o >/dev/null 2>&1 || true
+}
+trap give_back EXIT
 
 fail=0
 for spec in "${rows[@]}"; do
