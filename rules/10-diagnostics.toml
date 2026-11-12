@@ -77,3 +77,57 @@ tier = "diag-read"
 # Fixed argv, no caller input reaches it at all — the safest shape a rule has.
 exe = "/usr/bin/ss"
 args = [{ name = "flags", matcher = { literal = "-tulpnH" } }]
+
+# Tests run by `xudo check` and by the build.
+
+[[test]]
+argv = ["/usr/bin/journalctl", "--no-pager", "-u", "nginx.service", "-n", "100"]
+expect = "allow"
+action = "xudo.svc.logs"
+
+[[test]]
+argv = ["/usr/bin/journalctl", "--no-pager", "-k", "-b"]
+expect = "allow"
+action = "xudo.dmesg"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "--full", "status", "nginx.service"]
+expect = "allow"
+action = "xudo.svc.status"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "show",
+  "nginx.service",
+  "--property=ActiveState",
+]
+expect = "allow"
+action = "xudo.svc.show"
+
+[[test]]
+argv = ["/usr/bin/ss", "-tulpnH"]
+expect = "allow"
+action = "xudo.net.listeners"
+
+[[test]]
+argv = ["/usr/bin/journalctl", "-u", "nginx.service"]
+expect = "deny"
+reason = "near miss: without --no-pager the pager would run as root"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "show",
+  "nginx.service",
+  "--property=MainPID",
+]
+expect = "deny"
+reason = "only the listed properties"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "--full", "edit", "nginx.service"]
+expect = "deny"
+reason = "deny-list class: edit rewrites a unit definition"

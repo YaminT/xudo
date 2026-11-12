@@ -51,3 +51,48 @@ args = [
   { name = "no-pager", matcher = { literal = "--no-pager" } },
   { name = "verb", matcher = { literal = "daemon-reload" } },
 ]
+
+# Tests run by `xudo check` and by the build.
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "nginx.service",
+]
+expect = "allow"
+action = "xudo.svc.lifecycle"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "reset-failed", "nginx.service"]
+expect = "allow"
+action = "xudo.svc.reset-failed"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "daemon-reload"]
+expect = "allow"
+action = "xudo.svc.reload-units"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "nginx",
+]
+expect = "deny"
+reason = "near miss: a unit name needs its suffix"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "enable",
+  "nginx.service",
+]
+expect = "deny"
+reason = "deny-list class: enable changes a unit definition"

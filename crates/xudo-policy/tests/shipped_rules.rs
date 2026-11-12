@@ -49,6 +49,50 @@ fn load_all() -> RuleSet {
     RuleSet::load(actions).unwrap_or_else(|e| panic!("shipped rules do not combine: {e}"))
 }
 
+/// Every shipped file's `[[test]]` tables, and the ruleset they run against.
+fn load_all_with_tests() -> (RuleSet, Vec<xudo_policy::RuleTest>) {
+    let mut tests = Vec::new();
+    for (name, contents) in SHIPPED {
+        let (_, file_tests) = RuleSet::from_toml_with_tests(name, contents).unwrap();
+        tests.extend(file_tests);
+    }
+    (load_all(), tests)
+}
+
+/// The tests the rule files carry hold, and every action is exercised by one
+/// that names it. A failing shipped test fails the build.
+#[test]
+fn shipped_rule_tests_pass() {
+    let (rules, tests) = load_all_with_tests();
+    assert!(tests.len() >= 25, "the shipped files lost their tests");
+    let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|r| !r.outcome.passed())
+        .map(|r| format!("{}: {:?} {:?}", r.test.source, r.test.argv, r.outcome))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "shipped rule tests fail:\n{}",
+        failures.join("\n")
+    );
+
+    for (name, _) in SHIPPED {
+        assert!(
+            tests.iter().any(|t| &t.source.file == name),
+            "{name} carries no tests"
+        );
+    }
+
+    for action in rules.actions() {
+        assert!(
+            tests.iter().any(|t| t.action.as_ref() == Some(&action.id)),
+            "{} has no test naming it",
+            action.id
+        );
+    }
+}
+
 fn human() -> CallerFacts {
     CallerFacts::new(Classification::Human, 1000)
 }

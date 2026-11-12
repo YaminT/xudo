@@ -14,6 +14,8 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::fmt::Write as _;
+
 use proptest::prelude::*;
 use xudo_policy::{
     Action, ActionId, Arg, Argv, CallerFacts, Classification, Confirm, Decision, DenialCode, Hint,
@@ -992,4 +994,141 @@ fn arb_parametric_matcher() -> impl Strategy<Value = Matcher> {
         1 => Just(Matcher::Name(NameKind::UnitName)),
         1 => Just(Matcher::Name(NameKind::SysctlKey)),
     ]
+}
+
+// --- executable rule tests are not policy -------------------------------------
+
+/// A `[[test]]` table as rule-file text. Operands come from a printable
+/// alphabet so the TOML escaping here stays trivial; the reason is escaped.
+fn arb_test_block() -> impl Strategy<Value = String> {
+    (
+        prop::collection::vec(
+            prop_oneof![
+                prop::sample::select(TOKENS).prop_map(str::to_owned),
+                arb_shared_exe(),
+            ],
+            0..5,
+        ),
+        prop::sample::select(&["allow", "deny", "confirm"][..]),
+        prop::option::of(prop::sample::select(&["r.0", "r.1", "r.9", "nope"][..])),
+        prop::option::of("[ -~]{0,20}"),
+    )
+        .prop_map(|(argv, expect, action, reason)| {
+            let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+            let argv: Vec<String> = argv.iter().map(|a| quote(a)).collect();
+            let mut block = format!(
+                "[[test]]\nargv = [{}]\nexpect = \"{expect}\"\n",
+                argv.join(", ")
+            );
+            if let Some(action) = action {
+                let _ = writeln!(block, "action = \"{action}\"");
+            }
+            if let Some(reason) = reason {
+                let _ = writeln!(block, "reason = {}", quote(&reason));
+            }
+            block
+        })
+}
+
+/// Action tables to draw rulesets from: overlapping, confirming, critical,
+/// human-only, and one the deny-list refuses.
+const ACTION_TEXTS: &[&str] = &[
+    "[[action]]\nid = \"r.0\"\ntier = \"svc-control\"\nexe = \"/usr/bin/systemctl\"\nargs = [{ name = \"verb\", matcher = { literal = \"restart\" } }, { name = \"unit\", matcher = { name = \"unit-name\" } }]\n",
+    "[[action]]\nid = \"r.1\"\ntier = \"pkg-install\"\nexe = \"/usr/bin/apt-get\"\nconfirm = \"always\"\nargs = [{ name = \"verb\", matcher = { literal = \"install\" } }, { name = \"pkg\", matcher = { name = \"deb-name\" }, repeat = { between = { min = 1, max = 4 } } }]\n",
+    "[[action]]\nid = \"r.2\"\ntier = \"critical\"\nexe = \"/usr/bin/systemctl\"\nargs = [{ name = \"verb\", matcher = { literal = \"restart\" } }, { name = \"unit\", matcher = { pattern = \"[a-z.]+\" } }]\n",
+    "[[action]]\nid = \"r.3\"\ntier = \"diag-read\"\nexe = \"/usr/bin/journalctl\"\nagent-allowed = false\nargs = [{ name = \"flag\", matcher = { one-of = [\"-k\", \"-b\"] }, repeat = \"optional\" }]\n",
+    "[[action]]\nid = \"r.4\"\ntier = \"svc-control\"\nexe = \"/bin/sh\"\n",
+];
+
+/// A ruleset drawn from [`ACTION_TEXTS`], as its action tables in declaration
+/// order.
+fn arb_rules_text() -> impl Strategy<Value = Vec<&'static str>> {
+    prop::collection::vec(any::<bool>(), ACTION_TEXTS.len()).prop_map(|keep| {
+        ACTION_TEXTS
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(text, _)| *text)
+            .collect()
+    })
+}
+
+fn both_callers() -> [CallerFacts; 2] {
+    [caller(false, Vec::new()), caller(true, Vec::new())]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A `[[test]]` block can never change a decision.
+    ///
+    /// Must never be deleted. Tests are added, edited and removed around an
+    /// arbitrary ruleset, at the end and at the top of the file, and every
+    /// request is decided the same: the compiled ruleset is equal, the
+    /// generation is equal, and `evaluate_command` returns the same decision
+    /// for a human and for an agent. Appended, the whole decision is equal;
+    /// placed above the actions, only the line a decision cites differs, and
+    /// that is provenance, not policy.
+    #[test]
+    fn test_blocks_never_affect_evaluation(
+        pieces in arb_rules_text(),
+        at in any::<usize>(),
+        middle in prop::collection::vec(arb_test_block(), 0..4),
+        tests in prop::collection::vec(arb_test_block(), 0..4),
+        edited in prop::collection::vec(arb_test_block(), 0..4),
+        requests in prop::collection::vec((arb_shared_exe(), arb_tokens()), 1..6),
+    ) {
+        let join = |blocks: &[String]| blocks.join("\n");
+        let base = pieces.join("\n");
+        let appended = format!("{base}\n{}", join(&tests));
+        let prepended = format!("{}\n{base}", join(&edited));
+        // Between two action tables, where the parse boundary is and where an
+        // operator would put one.
+        let cut = at % (pieces.len() + 1);
+        let interleaved = format!(
+            "{}\n{}\n{}",
+            pieces[..cut].join("\n"),
+            join(&middle),
+            pieces[cut..].join("\n")
+        );
+
+        let plain = load_rule_files(vec![RuleFile {
+            name: b"10-r.toml".to_vec(),
+            bytes: base.clone().into_bytes(),
+        }]).unwrap();
+        for variant in [&appended, &prepended, &interleaved] {
+            let with = load_rule_files(vec![RuleFile {
+                name: b"10-r.toml".to_vec(),
+                bytes: variant.clone().into_bytes(),
+            }]).unwrap();
+            prop_assert_eq!(with.generation, plain.generation);
+            prop_assert_eq!(with.rules.actions().len(), plain.rules.actions().len());
+            for (a, b) in with.rules.actions().iter().zip(plain.rules.actions()) {
+                prop_assert_eq!(&a.id, &b.id);
+                prop_assert_eq!(&a.exe, &b.exe);
+                prop_assert_eq!(&a.args, &b.args);
+                prop_assert_eq!((a.tier, a.confirm, a.agent_allowed), (b.tier, b.confirm, b.agent_allowed));
+            }
+            for (program, argv) in &requests {
+                for who in both_callers() {
+                    let want = evaluate_command(&plain.rules, &who, &Arg::from(program.as_str()), argv, Settings::default());
+                    let got = evaluate_command(&with.rules, &who, &Arg::from(program.as_str()), argv, Settings::default());
+                    prop_assert_eq!(got.verdict, want.verdict);
+                    prop_assert_eq!(got.denial, want.denial);
+                    prop_assert_eq!(&got.action, &want.action);
+                    prop_assert_eq!(&got.confirm, &want.confirm);
+                    prop_assert_eq!(&got.resolved_argv, &want.resolved_argv);
+                    if variant == &appended {
+                        prop_assert_eq!(got, want);
+                    }
+                }
+            }
+        }
+        // And the tests it carries are the ones written, in order.
+        let loaded = load_rule_files(vec![RuleFile {
+            name: b"10-r.toml".to_vec(),
+            bytes: appended.into_bytes(),
+        }]).unwrap();
+        prop_assert_eq!(loaded.tests.len(), tests.len());
+    }
 }

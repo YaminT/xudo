@@ -18,3 +18,27 @@ id = "xudo.probe.gnuid"
 tier = "diag-read"
 exe = "/usr/bin/gnuid"
 args = [{ name = "effective-uid", matcher = { literal = "-u" } }]
+
+# Tests run by `xudo check` and by the build. A test is not policy: it can only
+# say what the rules above are expected to decide.
+
+[[test]]
+argv = ["/usr/bin/id", "-u"]
+expect = "allow"
+action = "xudo.probe.id"
+reason = "the probe `xudo install` runs"
+
+[[test]]
+argv = ["/usr/bin/gnuid", "-u"]
+expect = "allow"
+action = "xudo.probe.gnuid"
+
+[[test]]
+argv = ["/usr/bin/id", "-un"]
+expect = "deny"
+reason = "near miss: -un prints a name, and the rule matches one literal"
+
+[[test]]
+argv = ["/usr/bin/id", "-u", "root"]
+expect = "deny"
+reason = "a username would read another account"

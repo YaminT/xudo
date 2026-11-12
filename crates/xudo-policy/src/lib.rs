@@ -60,6 +60,7 @@ pub mod files;
 pub mod matcher;
 pub mod overlap;
 pub mod rule;
+pub mod rule_test;
 
 pub use argv::{Arg, Argv};
 pub use caller::{CallerFacts, Classification, Hint, HintSource};
@@ -73,3 +74,4 @@ pub use files::{
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use overlap::Overlap;
 pub use rule::{Action, ActionId, RuleSet, RuleSetError, Source, Tier};
+pub use rule_test::{Expectation, RuleTest, TestError, TestOutcome, TestResult, run_tests};
