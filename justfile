@@ -342,7 +342,7 @@ systemd-test: deb
 # byte-compared (.deb and the four binaries). ci/repro/run.sh has the details.
 # An optional file receives the .deb sha256.
 repro sha_out='':
-    ci/repro/run.sh {{musl_triple}} {{sha_out}}
+    ci/repro/run.sh {{musl_triple}} {{quote(sha_out)}}
 
 # Trace selected shipped release-musl binaries and check their normal dependency graph.
 telemetry:

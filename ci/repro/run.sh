@@ -32,6 +32,7 @@ epoch=$(git -C "$root" log -1 --format=%ct)
 export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
 home_a=${CARGO_HOME:-$HOME/.cargo}
 home_b=$root/target/repro-b/cargo-home-other
+echo "runner: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
 dpkg-deb --version | head -n 1
 xz --version | head -n 1
 
