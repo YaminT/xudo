@@ -456,7 +456,10 @@ action = "xudo.pkg.purge"
         );
         // `from_toml` agrees, so `xudo check` and the broker refuse alike.
         assert!(RuleSet::from_toml("t.toml", &one.repeat(MAX_TESTS_PER_FILE + 1)).is_err());
-        assert!(err.to_string().contains("4096"), "{err}");
+        assert!(
+            err.to_string().contains(&MAX_TESTS_PER_FILE.to_string()),
+            "{err}"
+        );
     }
 
     #[test]
