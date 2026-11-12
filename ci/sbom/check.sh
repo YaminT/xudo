@@ -16,8 +16,11 @@ command -v objcopy >/dev/null || { echo "FAIL: objcopy (binutils) is required" >
 # cargo-auditable's data lists a crate that is not linked: it reads
 # `cargo metadata --filter-platform`, which keeps rustix's linux-only optional
 # `libc_errno` edge without checking that the feature is on. `cargo tree` applies
-# the features and leaves `errno` out. Named here so every other difference fails.
-ALLOW_AUDIT_ONLY=errno
+# the features and leaves `errno` out. `errno` depends on `libc`, so `libc` is
+# audit-only too wherever no other path in the tree reaches it (x86_64 `ido`;
+# aarch64 happens to reach it). Named here so every other difference fails; the
+# SBOM still follows cargo tree, and the selftest pins this list to exactly these.
+ALLOW_AUDIT_ONLY=errno,libc
 
 shopt -s nullglob
 debs=(target/deb/*.deb)
@@ -44,7 +47,8 @@ verify() { # <sbom> <binary>...
     python3 -I ci/sbom/sbom.py check Cargo.lock "$sbom" "$tmp/both.txt" "$ALLOW_AUDIT_ONLY" "${pairs[@]}"
 }
 
-verify "$tmp/sbom.json" "${bins[@]}"
+verify "$tmp/sbom.json" "${bins[@]}" | tee "$tmp/verify.out"
+grep -qx "ALLOWLIST USED: .*" "$tmp/verify.out"
 # The same file twice must be the same bytes.
 ci/sbom/generate.sh "$tmp/again.json" >/dev/null
 cmp "$tmp/sbom.json" "$tmp/again.json"
@@ -67,3 +71,8 @@ if out=$(verify "$tmp/short.json" "${bins[@]}" 2>&1); then
 fi
 grep -q "serde .* is missing from the SBOM" <<<"$out" || { echo "SELFTEST FAIL: wrong reason: $out" >&2; exit 1; }
 echo "SELFTEST PASS: an SBOM missing a crate is rejected"
+
+# Self-test (c): the allowlist is exactly these two names, and its arithmetic is
+# tight (fixtures: libc audit-only passes with it, fails without; anything else fails).
+[[ $ALLOW_AUDIT_ONLY == "errno,libc" ]] || { echo "SELFTEST FAIL: the allowlist grew: $ALLOW_AUDIT_ONLY" >&2; exit 1; }
+python3 -I ci/sbom/sbom.py selftest

@@ -179,5 +179,5 @@ fn the_sbom_check_runs_its_adversarial_self_tests() {
     assert!(check.contains("objcopy --remove-section .dep-v0"));
     assert!(check.contains("sbom.py drop"));
     assert!(check.contains("SELFTEST PASS"));
-    assert!(check.contains("ALLOW_AUDIT_ONLY=errno"));
+    assert!(check.contains("ALLOW_AUDIT_ONLY=errno,libc\n"));
 }
