@@ -5,6 +5,12 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Security
+
+- v0.1.0-beta.1 ships a service-lifecycle rule that accepted power, reboot,
+  rescue, kernel-module, device and broker-socket units for any caller who
+  could pass the password gate. Fixed here: those units are refused.
+
 ### Added
 
 - Executable `[[test]]` tables in rule files, run by `xudo check` and by the

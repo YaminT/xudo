@@ -15,6 +15,13 @@ path still requires the password. Session and terminal checks do not prove a
 human: a same-uid agent can run `script -qc 'xudo watch'`. M4's cgroup scope is
 needed to separate the agent from the human.
 
+The published `v0.1.0-beta.1` package ships `xudo.svc.lifecycle` accepting
+`systemctl` start, stop, and restart of power, reboot, rescue, kernel-module,
+device, and broker-socket units for any caller who passes the password gate.
+This tree refuses those units. The lifecycle and `reset-failed` rules accept
+only a plain `.service` name, and the compiled-in deny-list refuses the same
+units on `systemctl` for every verb.
+
 ## Reporting
 
 Open a private security advisory on the GitHub repository. Please do not open a
