@@ -43,9 +43,14 @@
 //!    ([`xudo_audit::continuation`]); the caller's record is built after it,
 //!    checked to follow it and to pass the caller's own check, and refused if
 //!    it is longer than [`xudo_audit::MAX_RECORD_BYTES`].
-//! 6. One `write` of the whole line, then `fdatasync` — and, for a log's first
-//!    record, `fsync` of the directory too, since `fdatasync` makes the data
-//!    durable but not the name the file was just created under.
+//! 6. One `write` of the whole line. A short count is a failure, so the
+//!    cut-back below runs while this process is still alive: looping into a
+//!    second `write` is how `RLIMIT_FSIZE` delivers `SIGXFSZ` and kills the
+//!    writer before a torn tail can be repaired. `EINTR` means that call wrote
+//!    nothing, so it is tried once more; a second interrupt is a failure too.
+//!    Then `fdatasync` — and, for a log's first record, `fsync` of the
+//!    directory too, since `fdatasync` makes the data durable but not the name
+//!    the file was just created under.
 //! 7. The record goes to the trail's mirrors (journald), the lock still held.
 //!
 //! Any failure from the write on — the write itself, `fdatasync`, the
@@ -70,7 +75,7 @@
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -441,8 +446,36 @@ trait LogFile {
     fn size(&mut self) -> io::Result<u64>;
     /// Fills `buf` from `offset`.
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()>;
-    /// Appends all of `bytes` at the end.
-    fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// One `write` of `bytes`. Returns how many bytes that call wrote.
+    ///
+    /// # Errors
+    ///
+    /// The `write` error. `EINTR` is returned as [`io::ErrorKind::Interrupted`]
+    /// and means nothing was written.
+    fn write_once(&mut self, bytes: &[u8]) -> io::Result<usize>;
+    /// Writes `bytes` with one `write`. A short count is an error, so the
+    /// caller can cut the log back. `EINTR` is tried once more, because that
+    /// call wrote nothing; a second interrupt is an error.
+    ///
+    /// # Errors
+    ///
+    /// A short count, a second `EINTR`, or any other `write` error.
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let first = self.write_once(bytes);
+        let attempt = if first
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted)
+        {
+            self.write_once(bytes)
+        } else {
+            first
+        };
+        match attempt {
+            Ok(written) if written == bytes.len() => Ok(()),
+            Ok(_) => Err(io::Error::other("short write of an audit record")),
+            Err(error) => Err(error),
+        }
+    }
     /// Cuts the log back to `len` bytes.
     fn truncate(&mut self, len: u64) -> io::Result<()>;
     /// `fdatasync`: the data is on disk when this returns.
@@ -470,8 +503,8 @@ impl LogFile for HostLogFile<'_> {
         FileExt::read_exact_at(&self.file, buf, offset)
     }
 
-    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+    fn write_once(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.file, bytes)
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -572,7 +605,7 @@ mod tests {
 
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    use xudo_audit::{Chain, Decision, MAX_RECORD_BYTES, Outcome, Sequence, verify};
+    use xudo_audit::{Chain, Decision, MAX_RECORD_BYTES, Outcome, Sequence, verify, verify_log};
 
     use super::*;
     use crate::audit::{AuditSink, FakeAuditSink};
@@ -598,6 +631,11 @@ mod tests {
         failing: Vec<Op>,
         /// How much of a failing append reaches the file first.
         partial: usize,
+        /// `write` calls that return `EINTR` and write nothing, before a real
+        /// attempt. One is retried; a second refuses.
+        interrupts: usize,
+        /// When set, the real `write` returns this many bytes and stops.
+        short: Option<usize>,
     }
 
     impl FakeLogFile {
@@ -640,12 +678,25 @@ mod tests {
             Ok(())
         }
 
-        fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-            if self.failing.contains(&Op::Append) {
-                self.bytes.extend_from_slice(&bytes[..self.partial]);
+        fn write_once(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.interrupts > 0 {
+                self.interrupts = self.interrupts.saturating_sub(1);
+                self.calls.push((Op::Append, 0));
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
             }
-            self.step(Op::Append, bytes.len() as u64)
-                .map(|()| self.bytes.extend_from_slice(bytes))
+            if let Some(short) = self.short {
+                let n = short.min(bytes.len());
+                self.bytes.extend_from_slice(&bytes[..n]);
+                self.calls.push((Op::Append, n as u64));
+                return Ok(n);
+            }
+            if self.failing.contains(&Op::Append) {
+                let n = self.partial.min(bytes.len());
+                self.bytes.extend_from_slice(&bytes[..n]);
+            }
+            self.step(Op::Append, bytes.len() as u64)?;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
         }
 
         fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -839,6 +890,73 @@ mod tests {
                 (Op::Sync, 0)
             ]
         );
+    }
+
+    #[test]
+    fn a_short_audit_write_is_cut_back() {
+        // `write` returned fewer bytes than the record and no error. That is
+        // how `RLIMIT_FSIZE` truncates the first call. The fragment must not
+        // stay: the count is a failure, and the cut-back runs.
+        let before = log_of(2);
+        let mut file = FakeLogFile {
+            short: Some(4),
+            ..FakeLogFile::holding(&before)
+        };
+        let err = write(&mut file).unwrap_err();
+        assert!(err.to_string().contains("short write"), "{err}");
+        assert_eq!(file.bytes, before);
+        assert!(verify_log(&file.bytes).is_ok());
+        assert_eq!(
+            file.calls[2..],
+            [
+                (Op::Append, 4),
+                (Op::Truncate, before.len() as u64),
+                (Op::Sync, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_audit_write_is_retried_or_refused() {
+        // `EINTR` wrote nothing, so the same record is tried once more. A
+        // second interrupt is a refusal and the log is unchanged. A short
+        // count on the retry is the same failure as a short first write.
+        let before = log_of(1);
+        let mut once = FakeLogFile {
+            interrupts: 1,
+            ..FakeLogFile::holding(&before)
+        };
+        let record = write(&mut once).unwrap();
+        assert_eq!(record.seq.get(), 2);
+        assert!(verify_log(&once.bytes).is_ok());
+        assert_eq!(append_calls(&once), 2);
+
+        let mut twice = FakeLogFile {
+            interrupts: 2,
+            ..FakeLogFile::holding(&before)
+        };
+        let err = write(&mut twice).unwrap_err();
+        assert!(err.to_string().starts_with("cannot write"), "{err}");
+        assert_eq!(twice.bytes, before);
+        assert!(verify_log(&twice.bytes).is_ok());
+        assert_eq!(append_calls(&twice), 2);
+
+        let mut then_short = FakeLogFile {
+            interrupts: 1,
+            short: Some(3),
+            ..FakeLogFile::holding(&before)
+        };
+        let err = write(&mut then_short).unwrap_err();
+        assert!(err.to_string().contains("short write"), "{err}");
+        assert_eq!(then_short.bytes, before);
+        assert!(verify_log(&then_short.bytes).is_ok());
+    }
+
+    fn append_calls(file: &FakeLogFile) -> usize {
+        file.calls
+            .iter()
+            .filter(|(op, _)| *op == Op::Append)
+            .count()
     }
 
     #[test]
