@@ -374,6 +374,45 @@ fn command_verdict(args: &[&str]) -> Verdict {
 }
 
 #[test]
+fn denies_every_systemctl_power_subcommand() {
+    const VERBS: &[&str] = &[
+        "poweroff",
+        "reboot",
+        "halt",
+        "kexec",
+        "suspend",
+        "hibernate",
+        "hybrid-sleep",
+        "suspend-then-hibernate",
+        "soft-reboot",
+        "rescue",
+        "emergency",
+        "default",
+        "exit",
+    ];
+    for verb in VERBS {
+        let findings = xudo_policy::evaluate_deny_list(
+            b"/usr/bin/systemctl",
+            &Argv::new(vec![verb, "--no-wall"]),
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.class == xudo_policy::CapabilityClass::PowerState),
+            "{verb} {findings:?}"
+        );
+    }
+    let ordinary = xudo_policy::evaluate_deny_list(
+        b"/usr/bin/systemctl",
+        &Argv::new(vec!["start", "multi-user.target"]),
+    );
+    assert!(
+        ordinary.is_empty(),
+        "start of an ordinary target is not a power subcommand: {ordinary:?}"
+    );
+}
+
+#[test]
 fn denies_poweroff_via_systemctl_start_poweroff_target() {
     let args = [
         "/usr/bin/systemctl",

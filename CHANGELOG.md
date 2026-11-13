@@ -23,6 +23,11 @@ All notable changes to xudo are documented here. This project follows
   units. `xudo check` exits 21 for that rule, and `xudo doctor` prints the
   same sentence. The package upgrade prints it when the kept file still
   contains `xudo.svc.lifecycle`.
+- `systemctl poweroff`, `reboot`, `halt`, `kexec`, `suspend`, `hibernate`,
+  `hybrid-sleep`, `suspend-then-hibernate`, `soft-reboot`, `rescue`,
+  `emergency`, `default`, and `exit` are refused with any arguments.
+  `isolate` is refused for every target. `systemd-exit.service` is refused
+  with the other power services: its unit file sets `SuccessAction=exit-force`.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now

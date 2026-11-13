@@ -525,6 +525,8 @@ const POWER_SERVICES: &[&[u8]] = &[
     b"systemd-hibernate",
     b"systemd-hybrid-sleep",
     b"systemd-suspend-then-hibernate",
+    // SuccessAction=exit-force. Starting it reboots the host.
+    b"systemd-exit",
 ];
 
 /// `debug-shell.service` is an unauthenticated root shell on tty9.
@@ -556,6 +558,40 @@ const UNIT_MUTATING_VERBS: &[&[u8]] = &[
     b"set-default",
     b"switch-root",
 ];
+
+/// `systemctl` subcommands that power off, reboot, sleep, or change the boot
+/// target. Refused with no unit argument. `isolate` is one of them for every
+/// target, including a target this list does not name.
+const POWER_SUBCOMMANDS: &[&[u8]] = &[
+    b"poweroff",
+    b"reboot",
+    b"halt",
+    b"kexec",
+    b"suspend",
+    b"hibernate",
+    b"hybrid-sleep",
+    b"suspend-then-hibernate",
+    b"soft-reboot",
+    b"rescue",
+    b"emergency",
+    b"default",
+    b"exit",
+    b"isolate",
+];
+
+/// The first `systemctl` argument that is not a flag, when it is a power or
+/// boot subcommand.
+fn systemctl_power_subcommand(argv: &Argv) -> Option<&[u8]> {
+    let verb = argv.as_slice().iter().find_map(|arg| {
+        let bytes = arg.as_bytes();
+        if bytes.first() == Some(&b'-') {
+            None
+        } else {
+            Some(bytes)
+        }
+    })?;
+    POWER_SUBCOMMANDS.contains(&verb).then_some(verb)
+}
 
 /// One hexadecimal digit, or `None` when `byte` is not one.
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -931,6 +967,17 @@ fn deny_by_executable(name: &[u8]) -> Vec<DenyFinding> {
 /// receives it: `-p` is fatal to `sysctl` and harmless to `systemctl`.
 fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let mut findings: Vec<DenyFinding> = Vec::new();
+    // `systemctl poweroff` has no unit. `systemctl isolate multi-user.target`
+    // names a target this list does not otherwise refuse. The subcommand is
+    // enough.
+    if name == b"systemctl"
+        && let Some(verb) = systemctl_power_subcommand(argv)
+    {
+        findings.push(DenyFinding::new(
+            CapabilityClass::PowerState,
+            format!("systemctl {} changes power or boot state", verb.as_bstr()),
+        ));
+    }
     for (index, arg) in argv.as_slice().iter().enumerate() {
         let bytes = arg.as_bytes();
 
@@ -1505,6 +1552,25 @@ mod tests {
     }
 
     #[test]
+    fn denies_systemctl_poweroff_subcommand() {
+        assert!(
+            classes("/usr/bin/systemctl", &["--no-wall", "poweroff"])
+                .contains(&CapabilityClass::PowerState)
+        );
+        assert!(systemctl_power_subcommand(&Argv::default()).is_none());
+        assert!(systemctl_power_subcommand(&Argv::new(vec!["--no-pager"])).is_none());
+        assert!(systemctl_power_subcommand(&Argv::new(vec!["start"])).is_none());
+    }
+
+    #[test]
+    fn denies_isolate_of_any_target() {
+        assert!(
+            classes("/usr/bin/systemctl", &["isolate", "multi-user.target"])
+                .contains(&CapabilityClass::PowerState)
+        );
+    }
+
+    #[test]
     fn denies_kernel_module_load_via_modprobe_template_unit() {
         assert!(
             classes("/usr/bin/systemctl", &["start", "modprobe@dummy.service"])
@@ -1547,6 +1613,7 @@ mod tests {
             "systemd-hibernate.service",
             "systemd-hybrid-sleep.service",
             "systemd-suspend-then-hibernate.service",
+            "systemd-exit.service",
             "runlevel0.target",
             "runlevel1.target",
             "runlevel6.target",
