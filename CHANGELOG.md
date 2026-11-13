@@ -17,6 +17,15 @@ All notable changes to xudo are documented here. This project follows
   still refuses the units above, plus the systemd power and sleep services,
   `debug-shell`, runlevel aliases, firewall and time-sync units, and the
   journal units, including when an operator's rule names one of them.
+- The install rule accepted a package name ending in `-` (`apparmor-`),
+  which `apt-get install` reads as a request to remove that package, skipping
+  the confirmation the remove rule demands. `deb-name` and `apk-name` now
+  reject a trailing `-`. The install rule also requires `--no-remove`, so an
+  install that would remove a conflicting package is refused; the operator
+  removes that package with the remove rule. A trailing `+` stays accepted:
+  `g++` and `libstdc++6` are real names, `pkg+` on `apt-get install` is
+  harmless, and on `remove` it merely installs (the remove rule already
+  confirms).
 
 ### Added
 

@@ -27,6 +27,16 @@ deny-list refuses the units above, the systemd power and sleep services,
 journal units, on `systemctl` for every verb, including a unit an operator
 listed by mistake.
 
+The published `v0.1.0-beta.1` install rule accepted a package name ending in
+`-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped
+the confirmation `xudo.pkg.remove` demands and could remove a security
+package or xudo itself. `deb-name` and `apk-name` now reject a trailing `-`.
+The install rule also requires `--no-remove`: an install that would remove a
+conflicting package is refused, and the operator removes that package with
+the remove rule. A trailing `+` stays accepted. `g++` is a real package name,
+`pkg+` on `apt-get install` asks apt to install the package, and on `remove`
+it merely installs.
+
 ## Reporting
 
 Open a private security advisory on the GitHub repository. Please do not open a

@@ -11,9 +11,10 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+use proptest::prelude::*;
 use xudo_policy::{
-    Argv, CallerFacts, CapabilityClass, Classification, DenialCode, Request, RuleSet, Verdict,
-    engine::Settings,
+    Arg, Argv, CallerFacts, CapabilityClass, Classification, DenialCode, Matcher, NameKind,
+    Request, RuleSet, Verdict, engine::Settings, evaluate_command,
 };
 
 /// Each shipped file, paired with the name it has on disk.
@@ -105,7 +106,7 @@ fn shipped_rule_tests_pass() {
     // purpose, so a file that silently lost its tests cannot pass.
     assert_eq!(
         tests.len(),
-        30,
+        31,
         "the shipped test count changed: update this"
     );
     let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
@@ -171,6 +172,24 @@ fn denial(action: &str, args: &[&str]) -> Option<DenialCode> {
         Settings::default(),
     )
     .denial
+}
+
+/// The shipped install argv, without the package names.
+///
+/// `--no-remove` sits with the other apt options, before the verb. Apt reads
+/// options before the command, and a token after `--` would be a package name.
+const INSTALL_PREFIX: &[&str] = &[
+    "-y",
+    "--no-install-recommends",
+    "--no-remove",
+    "install",
+    "--",
+];
+
+fn install_argv<'a>(packages: &[&'a str]) -> Vec<&'a str> {
+    let mut args = INSTALL_PREFIX.to_vec();
+    args.extend_from_slice(packages);
+    args
 }
 
 #[test]
@@ -833,17 +852,7 @@ fn no_lifecycle_verb_reaches_a_listed_unit() {
 #[test]
 fn package_install_permits_names_and_refuses_every_other_source() {
     assert_eq!(
-        verdict(
-            "xudo.pkg.install",
-            &[
-                "-y",
-                "--no-install-recommends",
-                "install",
-                "--",
-                "ripgrep",
-                "fd-find"
-            ]
-        ),
+        verdict("xudo.pkg.install", &install_argv(&["ripgrep", "fd-find"])),
         Verdict::Allow
     );
 
@@ -856,11 +865,79 @@ fn package_install_permits_names_and_refuses_every_other_source() {
         "-y",
         "../../etc/passwd",
     ] {
-        let d = denial(
-            "xudo.pkg.install",
-            &["-y", "--no-install-recommends", "install", "--", bad],
-        );
+        let d = denial("xudo.pkg.install", &install_argv(&[bad]));
         assert!(d.is_some(), "{bad} was permitted");
+    }
+}
+
+#[test]
+fn denies_package_removal_via_install_trailing_hyphen() {
+    // `apt-get install apparmor-` removes apparmor. The install rule must not
+    // be that removal: pkg.remove is the removal, and it confirms always.
+    for name in ["apparmor-", "auditd-", "xudo-", "sudo-"] {
+        let args = install_argv(&[name]);
+        assert_eq!(
+            denial("xudo.pkg.install", &args),
+            Some(DenialCode::ArgvRejected),
+            "{name} was not an argument refusal"
+        );
+        let decision = evaluate_command(
+            &load_all(),
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(args),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{name} was accepted");
+        assert_eq!(decision.denial, Some(DenialCode::ArgvRejected));
+    }
+}
+
+#[test]
+fn install_without_no_remove_is_not_accepted() {
+    // The flag is part of the rule, not a default apt adds. Without it an
+    // install that must remove a conflicting package would proceed.
+    let args = ["-y", "--no-install-recommends", "install", "--", "ripgrep"];
+    assert_eq!(
+        denial("xudo.pkg.install", &args),
+        Some(DenialCode::ArgvRejected)
+    );
+    let decision = evaluate_command(
+        &load_all(),
+        &human(),
+        &Arg::from("/usr/bin/apt-get"),
+        &Argv::new(args.to_vec()),
+        Settings::default(),
+    );
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert_eq!(
+        verdict("xudo.pkg.install", &install_argv(&["ripgrep"])),
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn legitimate_package_names_with_plus_dot_and_hyphen_are_accepted() {
+    // Real names. A trailing `+` stays: `g++` is a package, and `pkg+` on
+    // install asks apt to install. An internal `-` or `.` is not a removal.
+    for name in [
+        "libstdc++6",
+        "g++",
+        "python3.12",
+        "libpng16-16",
+        "x11-utils",
+    ] {
+        for kind in [NameKind::DebName, NameKind::ApkName] {
+            assert!(
+                Matcher::Name(kind).accepts(&Arg::from(name)),
+                "{kind:?} rejected {name}"
+            );
+        }
+        assert_eq!(
+            verdict("xudo.pkg.install", &install_argv(&[name])),
+            Verdict::Allow,
+            "{name} was not an install"
+        );
     }
 }
 
@@ -874,6 +951,7 @@ fn package_install_refuses_a_configuration_redirect() {
         &[
             "-y",
             "--no-install-recommends",
+            "--no-remove",
             "install",
             "-o",
             "DPkg::Pre-Invoke::=sh -c id",
@@ -886,13 +964,65 @@ fn package_install_refuses_a_configuration_redirect() {
 
 #[test]
 fn package_install_caps_the_number_of_names() {
-    let mut args = vec!["-y", "--no-install-recommends", "install", "--"];
+    let mut args = INSTALL_PREFIX.to_vec();
     let many = vec!["ripgrep"; 21];
     args.extend(many.iter().copied());
     assert_eq!(
         denial("xudo.pkg.install", &args),
         Some(DenialCode::ArgvRejected)
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+    /// A deb-name ending in `-` is a removal. No shipped action accepts one,
+    /// in a package slot or through the install, remove, or dry-run shape.
+    #[test]
+    fn no_deb_name_ending_in_a_hyphen_is_accepted_by_any_shipped_action(
+        body in "[a-z0-9+._]{0,48}"
+    ) {
+        let name = format!("{body}-");
+        let arg = Arg::from(name.as_str());
+        prop_assert!(!Matcher::Name(NameKind::DebName).accepts(&arg));
+        prop_assert!(!Matcher::Name(NameKind::ApkName).accepts(&arg));
+
+        let rules = load_all();
+        for action in rules.actions() {
+            for spec in &action.args {
+                if matches!(
+                    spec.matcher,
+                    Matcher::Name(NameKind::DebName | NameKind::ApkName)
+                ) {
+                    let id = action.id.as_str();
+                    prop_assert!(!spec.matcher.accepts(&arg), "{id} accepts {name}", id = id, name = name);
+                }
+            }
+        }
+
+        let shapes: &[(&str, &[&str])] = &[
+            ("/usr/bin/apt-get", INSTALL_PREFIX),
+            ("/usr/bin/apt-get", &["-y", "remove", "--"]),
+            ("/usr/bin/apt-get", &["-s", "install", "--"]),
+        ];
+        for (program, prefix) in shapes {
+            let mut argv = prefix.to_vec();
+            argv.push(name.as_str());
+            let decision = evaluate_command(
+                &rules,
+                &human(),
+                &Arg::from(*program),
+                &Argv::new(argv),
+                Settings::default(),
+            );
+            prop_assert_eq!(
+                decision.verdict,
+                Verdict::Deny,
+                "{program} accepted {name}",
+                program = program,
+                name = name
+            );
+        }
+    }
 }
 
 #[test]
@@ -946,7 +1076,7 @@ fn example(id: &str) -> Vec<&'static str> {
         "xudo.dmesg" => vec!["--no-pager", "-k"],
         "xudo.probe.id" | "xudo.probe.gnuid" => vec!["-u"],
         "xudo.net.listeners" => vec!["-tulpnH"],
-        "xudo.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
+        "xudo.pkg.install" => install_argv(&["ripgrep"]),
         "xudo.pkg.update" => vec!["update"],
         "xudo.pkg.remove" => vec!["-y", "remove", "--", "ripgrep"],
         "xudo.pkg.dry-run-install" => vec!["-s", "install", "--", "ripgrep"],

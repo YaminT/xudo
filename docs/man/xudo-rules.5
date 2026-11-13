@@ -234,6 +234,37 @@ or any occurrence of
 or
 .B ..
 anywhere in the value is rejected.
+.B deb\-name
+and
+.B apk\-name
+also reject a trailing
+.BR \- .
+.B apt\-get install pkg\-
+removes
+.BR pkg ,
+so that name is a removal, not an install.
+A trailing
+.B +
+is accepted.
+.B g++
+and
+.B libstdc++6
+are real package names, and
+.B pkg+
+on
+.B apt\-get install
+asks apt to install
+.BR pkg .
+On
+.B remove
+the same suffix merely installs, and the remove action already asks for
+confirmation every time.
+The shipped install action requires the literal option
+.B \-\-no\-remove
+with its other options, before the verb.
+An install that would remove a conflicting package is refused.
+The operator removes that package with the remove action, which always
+asks for confirmation.
 .B unit\-name
 must end in
 .BR .service ,
