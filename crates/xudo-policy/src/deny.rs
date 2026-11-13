@@ -1491,7 +1491,13 @@ mod tests {
 
     #[test]
     fn denies_poweroff_via_systemd_poweroff_service() {
-        for unit in [
+        // One service and one runlevel alias under miri: each extra
+        // `evaluate_deny_list` is most of a second there, and the integration
+        // property already names every listed unit.
+        #[cfg(miri)]
+        let units: &[&str] = &["systemd-poweroff.service", "runlevel0.target"];
+        #[cfg(not(miri))]
+        let units: &[&str] = &[
             "systemd-poweroff.service",
             "systemd-reboot.service",
             "systemd-halt.service",
@@ -1505,7 +1511,8 @@ mod tests {
             "runlevel1.target",
             "runlevel6.target",
             "systemd-poweroff",
-        ] {
+        ];
+        for unit in units {
             assert!(
                 classes("/usr/bin/systemctl", &["start", unit])
                     .contains(&CapabilityClass::PowerState),
@@ -1529,7 +1536,12 @@ mod tests {
 
     #[test]
     fn firewall_time_sync_and_journal_units_are_denied() {
-        for unit in [
+        // Same split as the power-service test: miri sees one witness per
+        // class, including the two stems that are not prefixes of each other.
+        #[cfg(miri)]
+        let security: &[&str] = &["nftables.service", "chronyd.service"];
+        #[cfg(not(miri))]
+        let security: &[&str] = &[
             "nftables.service",
             "ufw.service",
             "netfilter-persistent.service",
@@ -1537,19 +1549,27 @@ mod tests {
             "systemd-timesyncd.service",
             "chrony.service",
             "chronyd.service",
-        ] {
+        ];
+        for unit in security {
             assert!(
                 classes("/usr/bin/systemctl", &["stop", unit])
                     .contains(&CapabilityClass::SecuritySubsystem),
                 "{unit}"
             );
         }
-        for unit in [
+        #[cfg(miri)]
+        let journal: &[&str] = &[
+            "systemd-journald.service",
+            "systemd-journald-dev-log.socket",
+        ];
+        #[cfg(not(miri))]
+        let journal: &[&str] = &[
             "systemd-journald.service",
             "systemd-journald.socket",
             "systemd-journald-dev-log.socket",
             "rsyslog.service",
-        ] {
+        ];
+        for unit in journal {
             assert!(
                 classes("/usr/bin/systemctl", &["stop", unit])
                     .contains(&CapabilityClass::SelfModification),
@@ -1558,15 +1578,18 @@ mod tests {
         }
         // `chronyd` is not the `chrony` stem, and the dev-log socket is not
         // the journald stem. Both are listed on their own, and a neighbour
-        // is not pulled in with them.
-        assert_eq!(
-            classes("/usr/bin/systemctl", &["stop", "chronyd.service"]).len(),
-            1
-        );
-        assert!(!denies(
-            "/usr/bin/systemctl",
-            &["stop", "systemd-journald-extra.service"]
-        ));
+        // is not pulled in with them. Miri already classified those two stems.
+        #[cfg(not(miri))]
+        {
+            assert_eq!(
+                classes("/usr/bin/systemctl", &["stop", "chronyd.service"]).len(),
+                1
+            );
+            assert!(!denies(
+                "/usr/bin/systemctl",
+                &["stop", "systemd-journald-extra.service"]
+            ));
+        }
     }
 
     #[test]
@@ -1577,19 +1600,23 @@ mod tests {
                 "{arg}"
             );
         }
-        assert!(
-            classes("/usr/bin/dnf", &["--config-file=/tmp/evil.repo"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
-        // A different long option, and systemctl's own `-c`, are not this flag.
-        assert!(
-            !classes("/usr/bin/apt-get", &["--config=/tmp/evil.conf"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
-        assert!(
-            !classes("/usr/bin/systemctl", &["-c/tmp/evil.conf"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
+        // The near misses are the same check. Miri already ran the two
+        // spellings above; the rest of the suite runs these.
+        #[cfg(not(miri))]
+        {
+            assert!(
+                classes("/usr/bin/dnf", &["--config-file=/tmp/evil.repo"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/apt-get", &["--config=/tmp/evil.conf"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/systemctl", &["-c/tmp/evil.conf"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+        }
     }
 
     #[test]
@@ -1600,28 +1627,34 @@ mod tests {
                 "{arg}"
             );
         }
-        assert!(
-            classes("/usr/bin/apt-get", &["-o", "Dir::Cache=/tmp/a0"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
         // Not a joined option: an empty argument, a lone dash, a bare flag
         // (the joined form needs a value), and a long option that only
-        // shares a prefix.
+        // shares a prefix. The direct helper checks are cheap under miri;
+        // the full argv checks are not, and coverage runs them.
         assert!(!joined_short_option(b"-o", b'o'));
         assert!(!joined_short_option(b"-c", b'c'));
         assert!(!joined_short_option(b"-p", b'p'));
-        assert!(!classes("/usr/bin/apt-get", &[""]).contains(&CapabilityClass::ConfigNamedProgram));
-        assert!(
-            !classes("/usr/bin/apt-get", &["-"]).contains(&CapabilityClass::ConfigNamedProgram)
-        );
-        assert!(
-            !classes("/usr/bin/apt-get", &["--option-extra"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
-        assert!(
-            !classes("/usr/bin/apt-get", &["--opt=Dir::Cache=/tmp"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
+        #[cfg(not(miri))]
+        {
+            assert!(
+                classes("/usr/bin/apt-get", &["-o", "Dir::Cache=/tmp/a0"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/apt-get", &[""]).contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/apt-get", &["-"]).contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/apt-get", &["--option-extra"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/usr/bin/apt-get", &["--opt=Dir::Cache=/tmp"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+        }
     }
 
     #[test]
@@ -1637,13 +1670,16 @@ mod tests {
             );
         }
         // `-p` on systemctl is a property flag, not a file load.
-        assert!(
-            !classes("/usr/bin/systemctl", &["-p/ActiveState"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
-        assert!(
-            !classes("/sbin/sysctl", &["--load-extra"])
-                .contains(&CapabilityClass::ConfigNamedProgram)
-        );
+        #[cfg(not(miri))]
+        {
+            assert!(
+                !classes("/usr/bin/systemctl", &["-p/ActiveState"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+            assert!(
+                !classes("/sbin/sysctl", &["--load-extra"])
+                    .contains(&CapabilityClass::ConfigNamedProgram)
+            );
+        }
     }
 }
