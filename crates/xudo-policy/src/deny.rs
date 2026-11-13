@@ -895,54 +895,128 @@ fn matches_name(name: &[u8], set: &[&[u8]]) -> bool {
     })
 }
 
-/// `bytes` is `-{letter}{value}` with a non-empty value.
+/// ASCII case fold for apt, which compares long options with `stringcasecmp`.
+fn ascii_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+/// Whether a short-option cluster contains one of `letters`.
 ///
-/// apt reads `-oFoo=bar` and `-c/path` this way, and sysctl reads `-p/path`
-/// the same way. `--option` does not match: its second byte is `-`, not the
-/// letter.
-fn joined_short_option(bytes: &[u8], letter: u8) -> bool {
-    let Some((dash, rest)) = bytes.split_first() else {
+/// The cluster is the leading ASCII letters after a single `-`. `-yc/tmp`
+/// clusters `y` and `c`; the value starts at the first non-letter. `--option`
+/// is a long option and is not a cluster. A path byte is not a cluster letter,
+/// so `-y/tmp/cache` does not match `c`.
+fn short_cluster_has(bytes: &[u8], letters: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(b"-") else {
         return false;
     };
-    if *dash != b'-' {
+    if rest.is_empty() || rest.starts_with(b"-") {
         return false;
     }
-    let Some((flag, value)) = rest.split_first() else {
+    for byte in rest {
+        if !byte.is_ascii_alphabetic() {
+            return false;
+        }
+        if letters.contains(byte) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The name of a long option, without a joined `=value`.
+fn long_option_name(bytes: &[u8]) -> Option<&[u8]> {
+    let rest = bytes.strip_prefix(b"--")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(match rest.split_once_str(b"=") {
+        Some((name, _)) => name,
+        None => rest,
+    })
+}
+
+/// `bytes` names `option` exactly. Apt compares that name without regard to case.
+fn long_option_is(bytes: &[u8], option: &[u8], ignore_case: bool) -> bool {
+    let Some(name) = long_option_name(bytes) else {
         return false;
     };
-    *flag == letter && !value.is_empty()
+    if ignore_case {
+        ascii_eq_ignore_case(name, option)
+    } else {
+        name == option
+    }
 }
 
-/// `bytes` is `{name}={value}`, with `name` including its leading dashes.
-fn joined_long_option(bytes: &[u8], name: &[u8]) -> bool {
-    bytes
-        .strip_prefix(name)
-        .is_some_and(|rest| rest.starts_with(b"="))
+/// `bytes` is a non-empty abbreviation of `option`, or the option itself.
+///
+/// `--load-extra` is not an abbreviation of `--load`: the name is longer than
+/// the option. `getopt_long` accepts a unique prefix; `load` and `system` do
+/// not share one.
+fn long_option_prefix(bytes: &[u8], option: &[u8]) -> bool {
+    let Some(name) = long_option_name(bytes) else {
+        return false;
+    };
+    !name.is_empty() && name.len() <= option.len() && option.starts_with(name)
 }
 
-/// Whether `name` is a package manager whose `-o` and `-c` redirect config.
-fn is_package_manager(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"apt" | b"apt-get" | b"dpkg" | b"dnf" | b"yum" | b"zypper" | b"pacman"
-    )
+/// apt and apt-get. Long names are case-insensitive. `-c` and `-o` match
+/// inside a short cluster.
+fn apt_redirects_config(bytes: &[u8]) -> bool {
+    short_cluster_has(bytes, b"co")
+        || long_option_is(bytes, b"option", true)
+        || long_option_is(bytes, b"config-file", true)
 }
 
-/// An exact or joined spelling of `-o`, `--option`, `-c`, or `--config-file`.
-fn redirects_package_config(bytes: &[u8]) -> bool {
-    matches!(bytes, b"-o" | b"--option" | b"-c" | b"--config-file")
-        || joined_short_option(bytes, b'o')
-        || joined_short_option(bytes, b'c')
-        || joined_long_option(bytes, b"--option")
-        || joined_long_option(bytes, b"--config-file")
+/// dnf and yum: `--config` and `--setopt`, not apt's `--config-file`.
+fn dnf_redirects_config(bytes: &[u8]) -> bool {
+    long_option_is(bytes, b"config", false) || long_option_is(bytes, b"setopt", false)
 }
 
-/// An exact or joined spelling of sysctl's file-driven flags.
+/// zypper: `-c` and `--config`.
+fn zypper_redirects_config(bytes: &[u8]) -> bool {
+    short_cluster_has(bytes, b"c") || long_option_is(bytes, b"config", false)
+}
+
+/// pacman: `--config`, `-c`, and `--hookdir`.
+fn pacman_redirects_config(bytes: &[u8]) -> bool {
+    short_cluster_has(bytes, b"c")
+        || long_option_is(bytes, b"config", false)
+        || long_option_is(bytes, b"hookdir", false)
+}
+
+/// dpkg's own redirects. Apt's `-o` and `--config-file` are not dpkg options.
+fn dpkg_redirects_config(bytes: &[u8]) -> bool {
+    long_option_is(bytes, b"admindir", false)
+        || long_option_is(bytes, b"instdir", false)
+        || long_option_is(bytes, b"root", false)
+        || long_option_is(bytes, b"pre-invoke", false)
+        || long_option_is(bytes, b"post-invoke", false)
+}
+
+/// A package-manager argument that points config, hooks, or the root elsewhere.
+fn redirects_package_config(tool: &[u8], bytes: &[u8]) -> bool {
+    match tool {
+        b"apt" | b"apt-get" => apt_redirects_config(bytes),
+        b"dnf" | b"yum" => dnf_redirects_config(bytes),
+        b"zypper" => zypper_redirects_config(bytes),
+        b"pacman" => pacman_redirects_config(bytes),
+        b"dpkg" => dpkg_redirects_config(bytes),
+        _ => false,
+    }
+}
+
+/// sysctl's file-driven flags, including `-f` (an alias of `-p`), a short
+/// cluster that contains `p` or `f`, and a unique prefix of `--load` or
+/// `--system`.
 fn applies_sysctl_file(bytes: &[u8]) -> bool {
-    matches!(bytes, b"-p" | b"--load" | b"--system")
-        || joined_short_option(bytes, b'p')
-        || joined_long_option(bytes, b"--load")
-        || joined_long_option(bytes, b"--system")
+    short_cluster_has(bytes, b"pf")
+        || long_option_prefix(bytes, b"load")
+        || long_option_prefix(bytes, b"system")
 }
 
 /// Returns `true` when `path` is at or beneath any protected prefix.
@@ -1141,11 +1215,9 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
         }
 
         // An option that redirects a package manager's configuration, hooks, or
-        // root, independent of which manager it is. apt reads `-oFoo=bar` and
-        // `-c/path` as the joined spellings of `-o` and `-c`; `--option=` and
-        // `--config-file=` are the long forms. The value never becomes its
-        // own argument, so an exact-token check misses it.
-        if is_package_manager(name) && redirects_package_config(bytes) {
+        // root. Each tool has its own spellings. apt folds long-option case
+        // and clusters short options; the others do not use apt's names.
+        if redirects_package_config(name, bytes) {
             findings.push(DenyFinding::new(
                 CapabilityClass::ConfigNamedProgram,
                 format!("argument {index} redirects package-manager configuration"),
@@ -1340,12 +1412,18 @@ mod tests {
                 .contains(&CapabilityClass::ConfigNamedProgram)
         );
         assert!(
-            classes("/usr/bin/dnf", &["--config-file", "/tmp/evil.repo"])
+            classes("/usr/bin/dnf", &["--config", "/tmp/evil.repo"])
                 .contains(&CapabilityClass::ConfigNamedProgram)
         );
         // The same flag on an unrelated program is not this class.
         assert!(
             !classes("/usr/bin/systemctl", &["-o"]).contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        // `--config-file` is apt's spelling. dnf's flag is `--config`.
+        #[cfg(not(miri))]
+        assert!(
+            !classes("/usr/bin/dnf", &["--config-file", "/tmp/evil.repo"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
         );
     }
 
@@ -1779,7 +1857,12 @@ mod tests {
         #[cfg(not(miri))]
         {
             assert!(
-                classes("/usr/bin/dnf", &["--config-file=/tmp/evil.repo"])
+                !classes("/usr/bin/dnf", &["--config-file=/tmp/evil.repo"])
+                    .contains(&CapabilityClass::ConfigNamedProgram),
+                "dnf has no --config-file; that spelling is apt's"
+            );
+            assert!(
+                classes("/usr/bin/dnf", &["--config=/tmp/evil.repo"])
                     .contains(&CapabilityClass::ConfigNamedProgram)
             );
             assert!(
@@ -1801,13 +1884,29 @@ mod tests {
                 "{arg}"
             );
         }
-        // Not a joined option: an empty argument, a lone dash, a bare flag
-        // (the joined form needs a value), and a long option that only
-        // shares a prefix. The direct helper checks are cheap under miri;
-        // the full argv checks are not, and coverage runs them.
-        assert!(!joined_short_option(b"-o", b'o'));
-        assert!(!joined_short_option(b"-c", b'c'));
-        assert!(!joined_short_option(b"-p", b'p'));
+        // Cluster and prefix checks are cheap under miri. A full argv check
+        // is not, and coverage runs those below.
+        assert!(short_cluster_has(b"-o", b"co"));
+        assert!(short_cluster_has(b"-c", b"co"));
+        assert!(!short_cluster_has(b"-y", b"co"));
+        assert!(!short_cluster_has(b"-y/tmp/cache", b"co"));
+        assert!(!short_cluster_has(b"--option", b"co"));
+        assert!(!short_cluster_has(b"-", b"co"));
+        assert!(!short_cluster_has(b"", b"co"));
+        assert!(!short_cluster_has(b"-q", b"pf"));
+        assert!(short_cluster_has(b"-f", b"pf"));
+        assert!(long_option_is(b"--Config-File=/x", b"config-file", true));
+        assert!(!long_option_is(b"--opt=x", b"option", true));
+        assert!(!long_option_is(b"--Config", b"config", false));
+        assert!(!long_option_prefix(b"--load-extra", b"load"));
+        assert!(long_option_prefix(b"--loa=/x", b"load"));
+        assert!(!long_option_prefix(b"--", b"load"));
+        assert!(!long_option_prefix(b"--=x", b"load"));
+        assert!(!long_option_is(b"-c", b"config", false));
+        assert!(!long_option_prefix(b"load", b"load"));
+        assert!(!ascii_eq_ignore_case(b"ab", b"a"));
+        assert!(ascii_eq_ignore_case(b"Ab", b"aB"));
+        assert!(!ascii_eq_ignore_case(b"Ab", b"ac"));
         #[cfg(not(miri))]
         {
             assert!(
@@ -1855,5 +1954,86 @@ mod tests {
                     .contains(&CapabilityClass::ConfigNamedProgram)
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_apt_config_file_case_variant() {
+        for arg in ["--Config-File=/x", "--OPTION=Dir::Cache=/tmp", "--Option"] {
+            assert!(
+                classes("/usr/bin/apt-get", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        assert!(
+            classes("/usr/bin/apt", &["--config-FILE=/x"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_apt_clustered_short_option() {
+        for arg in ["-yc/tmp/x", "-soDir::Etc=/x"] {
+            assert!(
+                classes("/usr/bin/apt-get", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        assert!(
+            !classes("/usr/bin/apt-get", &["-y"]).contains(&CapabilityClass::ConfigNamedProgram)
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_sysctl_f_alias() {
+        for arg in ["-f", "-f/x", "-qp/x"] {
+            assert!(
+                classes("/sbin/sysctl", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        assert!(!classes("/sbin/sysctl", &["-q"]).contains(&CapabilityClass::ConfigNamedProgram));
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_sysctl_abbreviated_load() {
+        for arg in ["--l=/x", "--loa=/x", "--s", "--sys"] {
+            assert!(
+                classes("/sbin/sysctl", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_each_package_managers_own_config_options() {
+        let rows = [
+            ("/usr/bin/dnf", "--setopt=tsflags=nodocs"),
+            ("/usr/bin/yum", "--config=/tmp/yum.conf"),
+            ("/usr/bin/zypper", "--config=/tmp/zypp.conf"),
+            ("/usr/bin/zypper", "-c/tmp/zypp.conf"),
+            ("/usr/bin/pacman", "--hookdir=/tmp/hooks"),
+            ("/usr/bin/pacman", "--config=/tmp/pacman.conf"),
+            ("/usr/bin/pacman", "-c/tmp/pacman.conf"),
+            ("/usr/bin/dpkg", "--admindir=/tmp/adm"),
+            ("/usr/bin/dpkg", "--instdir=/tmp/root"),
+            ("/usr/bin/dpkg", "--root=/tmp/root"),
+            ("/usr/bin/dpkg", "--pre-invoke=id"),
+            ("/usr/bin/dpkg", "--post-invoke=id"),
+        ];
+        for (exe, arg) in rows {
+            assert!(
+                classes(exe, &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{exe} {arg}"
+            );
+        }
+        assert!(
+            !classes("/usr/bin/dpkg", &["-oDir::Etc=/x"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
     }
 }
