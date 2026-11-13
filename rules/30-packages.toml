@@ -6,9 +6,14 @@
 # scripts run as root by design.
 #
 # What the rules can still do is make every *other* route unreachable. The
-# deb-name matcher rejects "/", "=", ":", a leading "-", and "..", so
-# `apt-get install ./local.deb`, a version-pinned downgrade, an architecture
-# qualifier, and a URL install are all unrepresentable. The compiled-in
+# deb-name matcher rejects "/", "=", ":", a leading "-", a trailing "-", and
+# "..", so `apt-get install ./local.deb`, a version-pinned downgrade, an
+# architecture qualifier, a URL install, and `apt-get install pkg-` (which
+# removes pkg) are all unrepresentable. A trailing "+" stays: g++ is a real
+# name, and pkg+ asks apt to install. The install action also requires the
+# literal --no-remove, in the option group before the verb, so an install
+# that would remove a conflicting package is refused. The operator removes
+# that package with xudo.pkg.remove, which always confirms. The compiled-in
 # deny-list independently refuses `-o`/`--option`/`--config-file`, because
 # `apt-get -o DPkg::Pre-Invoke::='...'` is a /bin/sh-as-root injection through a
 # rule that only meant to install a package.
@@ -24,6 +29,7 @@ exe = "/usr/bin/apt-get"
 args = [
   { name = "assume-yes", matcher = { literal = "-y" } },
   { name = "no-recommends", matcher = { literal = "--no-install-recommends" } },
+  { name = "no-remove", matcher = { literal = "--no-remove" } },
   { name = "verb", matcher = { literal = "install" } },
   { name = "separator", matcher = { literal = "--" } },
   { name = "pkg", matcher = { name = "deb-name" }, repeat = { between = { min = 1, max = 20 } } },
@@ -67,6 +73,7 @@ argv = [
   "/usr/bin/apt-get",
   "-y",
   "--no-install-recommends",
+  "--no-remove",
   "install",
   "--",
   "ripgrep",
@@ -95,6 +102,7 @@ argv = [
   "/usr/bin/apt-get",
   "-y",
   "--no-install-recommends",
+  "--no-remove",
   "install",
   "--",
   "./local.deb",
@@ -105,10 +113,24 @@ reason = "near miss: a local file is not a package name"
 [[test]]
 argv = [
   "/usr/bin/apt-get",
+  "-y",
+  "--no-install-recommends",
+  "--no-remove",
+  "install",
+  "--",
+  "apparmor-",
+]
+expect = "deny"
+reason = "a trailing hyphen removes the package through install"
+
+[[test]]
+argv = [
+  "/usr/bin/apt-get",
   "-o",
   "DPkg::Pre-Invoke::=/bin/sh",
   "-y",
   "--no-install-recommends",
+  "--no-remove",
   "install",
   "--",
   "ripgrep",

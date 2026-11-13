@@ -83,17 +83,28 @@ impl Repeat {
 /// tidy. The package-name kinds, for instance, all reject `/`, `=`, and `:`,
 /// which is what makes `apt-get install ./local.deb`, a version-pinned
 /// downgrade, and a URL install unrepresentable in a rule that only meant to
-/// name a package from a configured repository.
+/// name a package from a configured repository. `deb-name` and `apk-name`
+/// also reject a trailing `-`: `apt-get install pkg-` removes `pkg`. A
+/// trailing `+` stays, because `g++` is a real package name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum NameKind {
     /// A Debian binary package name.
+    ///
+    /// A trailing `-` is rejected. `apt-get install name-` removes `name`,
+    /// so the install rule would skip the confirmation a removal demands.
+    /// A trailing `+` is kept: `g++` and `libstdc++6` are real names, and
+    /// `name+` asks apt to install `name`.
     DebName,
     /// An RPM package name.
     RpmName,
     /// An Arch package name.
     ArchName,
     /// An Alpine package name.
+    ///
+    /// The same bytes as [`Self::DebName`], including the refusal of a
+    /// trailing `-`. One check, so a name apt would remove is not an Alpine
+    /// name either.
     ApkName,
     /// A systemd unit name with an explicit unit suffix.
     ///
@@ -136,11 +147,16 @@ impl NameKind {
         }
 
         match self {
-            Self::DebName | Self::ApkName => bytes.iter().all(|b| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || matches!(b, b'+' | b'.' | b'-' | b'_')
-            }),
+            // A trailing `-` is how `apt-get install pkg-` removes `pkg`.
+            // A trailing `+` is a real name (`g++`) and asks apt to install.
+            Self::DebName | Self::ApkName => {
+                bytes.last() != Some(&b'-')
+                    && bytes.iter().all(|b| {
+                        b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || matches!(b, b'+' | b'.' | b'-' | b'_')
+                    })
+            }
             Self::RpmName | Self::ArchName => bytes.iter().all(|b| {
                 b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'@')
             }),
@@ -878,6 +894,12 @@ mod tests {
             "..",
             "UPPER",
             "",
+            // `apt-get install` treats a trailing hyphen as removal.
+            "apparmor-",
+            "auditd-",
+            "xudo-",
+            "sudo-",
+            "a-",
         ] {
             assert!(!m.accepts(&Arg::from(bad)), "accepted {bad:?}");
         }
@@ -903,10 +925,18 @@ mod tests {
         for kind in [NameKind::DebName, NameKind::ApkName] {
             let m = Matcher::Name(kind);
             assert!(m.accepts(&Arg::from("libstdc++6")));
+            assert!(m.accepts(&Arg::from("g++")));
             assert!(m.accepts(&Arg::from("python3.11-dev")));
+            assert!(m.accepts(&Arg::from("python3.12")));
+            assert!(m.accepts(&Arg::from("libpng16-16")));
+            assert!(m.accepts(&Arg::from("x11-utils")));
             assert!(m.accepts(&Arg::from("linux_headers")));
+            // A trailing `+` stays. `pkg+` installs; it does not remove.
+            assert!(m.accepts(&Arg::from("libfoo+")));
             assert!(!m.accepts(&Arg::from("libStdc++6")));
             assert!(!m.accepts(&Arg::from("pkg name")));
+            assert!(!m.accepts(&Arg::from("libpng16-")));
+            assert!(!m.accepts(&Arg::from("x11-utils-")));
         }
     }
 
@@ -914,7 +944,9 @@ mod tests {
     fn apk_names_behave_like_deb_names() {
         let m = Matcher::Name(NameKind::ApkName);
         assert!(m.accepts(&Arg::from("busybox-extras")));
+        assert!(m.accepts(&Arg::from("g++")));
         assert!(!m.accepts(&Arg::from("Busybox")));
+        assert!(!m.accepts(&Arg::from("busybox-extras-")));
     }
 
     #[test]

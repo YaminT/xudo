@@ -19,10 +19,13 @@
 /usr/bin/ss -tulpnH
 
 # pkg-install / pkg-remove: a package name, a local file, a hook injection,
+# a removal disguised as an install, the install argv without --no-remove,
 # and a removal that must demand confirmation.
+/usr/bin/apt-get -y --no-install-recommends --no-remove install -- curl
+/usr/bin/apt-get -y --no-install-recommends --no-remove install -- ./evil.deb
+/usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends --no-remove install -- curl
+/usr/bin/apt-get -y --no-install-recommends --no-remove install -- apparmor-
 /usr/bin/apt-get -y --no-install-recommends install -- curl
-/usr/bin/apt-get -y --no-install-recommends install -- ./evil.deb
-/usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends install -- curl
 /usr/bin/apt-get -y remove -- build-essential
 
 # sys-tunable: an enumerated key in range, a code-execution key, a file-driven form.
