@@ -479,7 +479,8 @@ fn denies_stopping_the_broker_socket() {
 #[test]
 fn no_lifecycle_verb_reaches_a_special_target() {
     // Every lifecycle verb, plus verbs the deny entry covers even though no
-    // shipped rule lists them (`isolate`, `reset-failed`, `status`).
+    // shipped rule lists them (`isolate`, `reset-failed`, `kill`). `status`
+    // and `show` are read-only and are not in this list.
     const VERBS: &[&str] = &[
         "start",
         "stop",
@@ -491,8 +492,6 @@ fn no_lifecycle_verb_reaches_a_special_target() {
         "isolate",
         "kill",
         "reset-failed",
-        "status",
-        "show",
     ];
     const TARGETS: &[&str] = &[
         "poweroff.target",
@@ -534,6 +533,72 @@ fn no_lifecycle_verb_reaches_a_special_target() {
                 "{verb} {target}"
             );
         }
+    }
+}
+
+#[test]
+fn status_of_a_tripwire_unit_is_allowed() {
+    // The shipped read-only rules. The deny-list must not turn them into a refusal.
+    const UNITS: &[&str] = &[
+        "xudod.socket",
+        "systemd-journald.service",
+        "chronyd.service",
+        "nftables.service",
+        "apparmor.service",
+        "auditd.service",
+    ];
+    for unit in UNITS {
+        assert_eq!(
+            command_verdict(&["/usr/bin/systemctl", "--no-pager", "--full", "status", unit]),
+            Verdict::Allow,
+            "status {unit}"
+        );
+        assert_eq!(
+            command_verdict(&[
+                "/usr/bin/systemctl",
+                "--no-pager",
+                "show",
+                unit,
+                "--property=ActiveState",
+            ]),
+            Verdict::Allow,
+            "show {unit}"
+        );
+        let findings = xudo_policy::evaluate_deny_list(
+            b"/usr/bin/systemctl",
+            &Argv::new(vec!["status", unit]),
+        );
+        assert!(
+            findings.is_empty(),
+            "status {unit} is a diagnostic: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn stop_of_a_tripwire_unit_is_refused() {
+    for unit in [
+        "xudod.socket",
+        "systemd-journald.service",
+        "chronyd.service",
+    ] {
+        assert_eq!(
+            command_verdict(&[
+                "/usr/bin/systemctl",
+                "--no-pager",
+                "--no-ask-password",
+                "stop",
+                unit,
+            ]),
+            Verdict::Deny,
+            "stop {unit}"
+        );
+        assert!(
+            unit_classes("stop", unit).contains(&xudo_policy::CapabilityClass::SelfModification)
+                || unit_classes("stop", unit)
+                    .contains(&xudo_policy::CapabilityClass::SecuritySubsystem),
+            "stop {unit}"
+        );
     }
 }
 

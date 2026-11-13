@@ -30,6 +30,12 @@ All notable changes to xudo are documented here. This project follows
   with the other power services: its unit file sets `SuccessAction=exit-force`.
 - `systemd-journald` followed by `-`, `.`, or `@` is the journal for any
   continuation. `systemd-journald-audit.socket` was not refused.
+- Read-only `systemctl` verbs (`status`, `show`, `is-active`, `is-failed`,
+  `is-enabled`, `cat`, and the `list-*` queries) are not refused just
+  because the unit is on the tripwire. Nothing changed for diagnostics:
+  `xudo.svc.status` and `xudo.svc.show` of `xudod`, the journal, chrony,
+  nftables, apparmor, and auditd still run. A verb that starts, stops, or
+  signals the unit is still refused, and a power subcommand is still refused.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now
