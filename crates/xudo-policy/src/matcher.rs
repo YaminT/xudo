@@ -96,6 +96,15 @@ pub enum NameKind {
     /// A trailing `+` is kept: `g++` and `libstdc++6` are real names, and
     /// `name+` asks apt to install `name`.
     DebName,
+    /// A Debian package name with no `.` and no `+` anywhere.
+    ///
+    /// [`Self::DebName`], plus those two refusals. `apt-get` reads a name
+    /// containing either, when it is not an exact cache hit, as an unanchored
+    /// regular expression. The remove rule uses this kind so one confirmed
+    /// token cannot select many packages, and so `name+` cannot install.
+    /// A real name that contains `.` or `+` (`python3.12`, `g++`,
+    /// `libstdc++6`) is not removable through xudo.
+    DebNameLiteral,
     /// An RPM package name.
     RpmName,
     /// An Arch package name.
@@ -156,6 +165,12 @@ impl NameKind {
                             || b.is_ascii_digit()
                             || matches!(b, b'+' | b'.' | b'-' | b'_')
                     })
+            }
+            // `.` and `+` are how apt-get turns a name that is not an exact
+            // cache hit into an unanchored regular expression. Removal uses
+            // this kind so one confirmed token cannot select many packages.
+            Self::DebNameLiteral => {
+                !bytes.contains(&b'.') && !bytes.contains(&b'+') && Self::DebName.accepts(bytes)
             }
             Self::RpmName | Self::ArchName => bytes.iter().all(|b| {
                 b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'@')
@@ -941,6 +956,39 @@ mod tests {
     }
 
     #[test]
+    fn deb_name_literal_refuses_a_dot_or_a_plus_anywhere() {
+        // Removal uses this kind. A `.` or `+` that is not an exact apt cache
+        // hit is an unanchored regular expression, and `name+` on remove
+        // installs. A plain name, including an internal `-`, still matches.
+        let m = Matcher::Name(NameKind::DebNameLiteral);
+        assert!(m.accepts(&Arg::from("ripgrep")));
+        assert!(m.accepts(&Arg::from("build-essential")));
+        assert!(m.accepts(&Arg::from("libpng16-16")));
+        assert!(m.accepts(&Arg::from("a")));
+        assert!(m.accepts(&Arg::from("0")));
+        for bad in [
+            "lib.",
+            "ba.h",
+            "g++",
+            "libstdc++6",
+            "python3.12",
+            "libfoo+",
+            "pkg-",
+        ] {
+            assert!(!m.accepts(&Arg::from(bad)), "accepted {bad}");
+        }
+        assert_eq!(m.describe(), "DebNameLiteral");
+        let spec: ArgSpec = toml::from_str(
+            r#"
+            name = "pkg"
+            matcher = { name = "deb-name-literal" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.matcher, Matcher::Name(NameKind::DebNameLiteral));
+    }
+
+    #[test]
     fn apk_names_behave_like_deb_names() {
         let m = Matcher::Name(NameKind::ApkName);
         assert!(m.accepts(&Arg::from("busybox-extras")));
@@ -1335,6 +1383,7 @@ mod tests {
         // wrong `true` there is an overlap `xudo check` stays silent about.
         let kinds = [
             NameKind::DebName,
+            NameKind::DebNameLiteral,
             NameKind::RpmName,
             NameKind::ArchName,
             NameKind::ApkName,

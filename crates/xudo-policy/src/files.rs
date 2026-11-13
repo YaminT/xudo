@@ -325,6 +325,7 @@ fn put_matcher(out: &mut Vec<u8>, matcher: &Matcher) {
             put(out, b"name");
             let word = match kind {
                 NameKind::DebName => "deb-name",
+                NameKind::DebNameLiteral => "deb-name-literal",
                 NameKind::RpmName => "rpm-name",
                 NameKind::ArchName => "arch-name",
                 NameKind::ApkName => "apk-name",
@@ -777,8 +778,9 @@ args = [
 
         /// Every `NameKind`, as a fixed-size array so that adding a kind to the
         /// enum without listing it here is caught by the pin below.
-        const ALL_NAME_KINDS: [NameKind; 8] = [
+        const ALL_NAME_KINDS: [NameKind; 9] = [
             NameKind::DebName,
+            NameKind::DebNameLiteral,
             NameKind::RpmName,
             NameKind::ArchName,
             NameKind::ApkName,

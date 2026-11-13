@@ -64,10 +64,20 @@ All notable changes to xudo are documented here. This project follows
   the confirmation the remove rule demands. `deb-name` and `apk-name` now
   reject a trailing `-`. The install rule also requires `--no-remove`, so an
   install that would remove a conflicting package is refused; the operator
-  removes that package with the remove rule. A trailing `+` stays accepted:
-  `g++` and `libstdc++6` are real names, `pkg+` on `apt-get install` is
-  harmless, and on `remove` it merely installs (the remove rule already
-  confirms).
+  removes that package with the remove rule. A trailing `+` stays accepted
+  by `deb-name`: `g++` and `libstdc++6` are real names, and `pkg+` on
+  `apt-get install` is harmless.
+- apt-get reads a package name containing `.` or `+` that is not an exact
+  cache hit as an unanchored regular expression. On install that can select
+  many packages and cannot remove one, because the install rule requires
+  `--no-remove`, so `deb-name` is unchanged there. On remove one confirmed
+  token such as `lib.` could remove hundreds of packages, and a trailing
+  `+` installs. The remove rule now uses `deb-name-literal` (`deb-name`, and
+  no `.` and no `+` anywhere). A package whose name contains either
+  (`python3.12`, `g++`, `libstdc++6`) can no longer be removed through xudo.
+  Remove it with the host's own tools, or add an operator rule that lists
+  that name with `one-of`. The ruleset generation changes, so an approval
+  already minted is no longer valid.
 - The audit appender wrote a record with `write_all`. A caller who set
   `RLIMIT_FSIZE` just past the log made the first `write` return a short
   count and the next one raise `SIGXFSZ`, which killed the gate before the
