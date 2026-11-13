@@ -28,6 +28,8 @@ All notable changes to xudo are documented here. This project follows
   `emergency`, `default`, and `exit` are refused with any arguments.
   `isolate` is refused for every target. `systemd-exit.service` is refused
   with the other power services: its unit file sets `SuccessAction=exit-force`.
+- `systemd-journald` followed by `-`, `.`, or `@` is the journal for any
+  continuation. `systemd-journald-audit.socket` was not refused.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now

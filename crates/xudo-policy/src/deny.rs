@@ -691,12 +691,29 @@ fn has_unit_stem(unit: &[u8], stem: &[u8]) -> bool {
 /// Stems of xudo's own units, and of the log path its audit mirror uses.
 ///
 /// Stopping the broker socket removes the policy that allowed the command.
-/// `systemd-journald` is where that decision is mirrored; once it is stopped,
-/// every later decision fails closed. `systemd-journald-dev-log.socket` is
-/// not the `systemd-journald` stem (`-dev-log` is not a suffix separator).
-/// `rsyslog` is the same log path on a host that forwards the journal.
-const AUDIT_MIRROR_UNITS: &[&[u8]] =
-    &[b"systemd-journald", b"systemd-journald-dev-log", b"rsyslog"];
+/// The journal itself is [`is_journal_unit`]: `systemd-journald` followed by
+/// `-`, `.`, or `@` is that journal for any continuation, including
+/// `-audit` and `-dev-log`. `rsyslog` is the same log path on a host that
+/// forwards the journal.
+const AUDIT_MIRROR_UNITS: &[&[u8]] = &[b"rsyslog"];
+
+/// `systemd-journald`, and any continuation after `-`, `.`, or `@`.
+///
+/// `-audit` and `-dev-log` are the same daemon. A neighbour that does not
+/// continue the stem (`systemd-journaldctl`) is not.
+fn is_journal_unit(unit: &[u8]) -> bool {
+    match unit.strip_prefix(b"systemd-journald") {
+        Some(rest)
+            if rest.is_empty()
+                || rest.starts_with(b"-")
+                || rest.starts_with(b".")
+                || rest.starts_with(b"@") =>
+        {
+            true
+        }
+        Some(_) | None => false,
+    }
+}
 
 /// Firewall and time-sync stems, plus `AppArmor` and auditd.
 ///
@@ -722,7 +739,10 @@ const SECURITY_UNITS: &[&[u8]] = &[
 /// removes the policy that allowed the command. The journal stems are the
 /// audit mirror; see [`AUDIT_MIRROR_UNITS`].
 fn is_self_unit(unit: &[u8]) -> bool {
-    has_unit_stem(unit, b"xudod") || unit.starts_with(b"xudo-") || stem_in(unit, AUDIT_MIRROR_UNITS)
+    has_unit_stem(unit, b"xudod")
+        || unit.starts_with(b"xudo-")
+        || is_journal_unit(unit)
+        || stem_in(unit, AUDIT_MIRROR_UNITS)
 }
 
 /// A firewall, time-sync, `AppArmor`, or audit unit.
@@ -1683,18 +1703,32 @@ mod tests {
                 "{unit}"
             );
         }
-        // `chronyd` is not the `chrony` stem, and the dev-log socket is not
-        // the journald stem. Both are listed on their own, and a neighbour
-        // is not pulled in with them. Miri already classified those two stems.
+        // `chronyd` is its own stem. Any continuation of `systemd-journald`
+        // is the journal, including `-extra` and `-audit`. A name that does
+        // not continue the stem is not. Miri already classified the service
+        // and the dev-log socket.
         #[cfg(not(miri))]
         {
             assert_eq!(
                 classes("/usr/bin/systemctl", &["stop", "chronyd.service"]).len(),
                 1
             );
+            for unit in [
+                "systemd-journald",
+                "systemd-journald-audit.socket",
+                "systemd-journald-dev-log.socket",
+                "systemd-journald@x.service",
+                "systemd-journald-extra.service",
+            ] {
+                assert!(
+                    classes("/usr/bin/systemctl", &["stop", unit])
+                        .contains(&CapabilityClass::SelfModification),
+                    "{unit}"
+                );
+            }
             assert!(!denies(
                 "/usr/bin/systemctl",
-                &["stop", "systemd-journald-extra.service"]
+                &["stop", "systemd-journaldctl.service"]
             ));
         }
     }
