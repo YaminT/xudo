@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-07" "xudo 0.1.0-beta.1" "File Formats"
+.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.1" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -221,6 +221,7 @@ An identifier class:
 .BR arch\-name ,
 .BR apk\-name ,
 .BR unit\-name ,
+.BR service\-unit\-name ,
 .BR hostname ,
 .BR sysctl\-key .
 Every class rejects an empty value and a value longer than 255 bytes.
@@ -241,13 +242,29 @@ must end in
 .BR .target ,
 .BR .path ,
 or
-.BR .mount .
+.BR .mount ,
+and may contain
+.B @
+and a backslash.
 A suffix-less name would match more units than it appears to, because
 .B systemctl restart foo
 resolves
 .B foo
 to
 .BR foo.service .
+The journal rules use this kind: reading any unit's log is the point.
+.B service\-unit\-name
+accepts only a name ending in
+.BR .service ,
+with no
+.B @
+and no backslash.
+.BR poweroff.target ,
+.BR modprobe@dummy.service ,
+and an escaped name are not a service restart.
+The shipped lifecycle and reset\-failed rules use this kind.
+.B unit\-name
+itself is not tightened.
 .TP
 .B pattern
 A regular expression.
@@ -299,10 +316,28 @@ It is enumerated by capability class (a shell, an interpreter, an arbitrary
 read or write, a unit-definition change, and the rest of that list), not by
 binary name.
 A copy, a hardlink, or a multicall applet does not escape a class.
+On
+.B systemctl
+the list also refuses the unit, whatever the verb: a power or boot target,
+a
+.B modprobe@
+template, an fsck, growfs, makefs, or
+.B mdadm@
+template, an
+.B xudod
+or
+.B xudo\-
+unit, and
+.B apparmor
+or
+.BR auditd .
+A rule that still uses
+.B unit\-name
+cannot start those.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .
-The verb is an enumeration, and the unit must carry a suffix.
+The verb is an enumeration, and the unit is a plain service name.
 .PP
 .EX
 [[action]]
@@ -312,7 +347,7 @@ exe = "/usr/bin/systemctl"
 args = [
   { name = "no\-pager", matcher = { literal = "\-\-no\-pager" } },
   { name = "verb", matcher = { literal = "reset\-failed" } },
-  { name = "unit", matcher = { name = "unit\-name" } },
+  { name = "unit", matcher = { name = "service\-unit\-name" } },
 ]
 .EE
 .SH SEE ALSO

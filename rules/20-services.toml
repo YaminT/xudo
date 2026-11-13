@@ -6,10 +6,16 @@
 # deny-list, because a tier boundary that depends on one list being complete is
 # not a boundary.
 #
-# Unit names are validated for shape here and should be narrowed to an
-# enumeration per host: `systemctl restart foo` resolves `foo` to `foo.service`,
-# so a rule matching a suffix-less name matches more units than it appears to,
-# which is why unit-name requires an explicit suffix.
+# Lifecycle and reset-failed take service-unit-name: a `.service` with no `@`
+# and no backslash. The generic unit-name kind still accepts `.target`,
+# `.mount`, templates, and escapes, because the journal rules use it to name
+# any unit whose log is being read. A suffix-less name is still refused:
+# `systemctl restart foo` resolves `foo` to `foo.service`.
+#
+# The compiled-in deny-list also refuses, on any verb, a power or boot target,
+# `modprobe@`, the fsck/growfs/makefs and `mdadm*@` templates, `xudod` and
+# `xudo-*` units, and `apparmor` / `auditd`. A later rule that goes back to
+# unit-name cannot reopen those.
 
 [[action]]
 id = "xudo.svc.lifecycle"
@@ -27,7 +33,7 @@ args = [
     "reload-or-restart",
     "try-reload-or-restart",
   ] } },
-  { name = "unit", matcher = { name = "unit-name" } },
+  { name = "unit", matcher = { name = "service-unit-name" } },
 ]
 
 [[action]]
@@ -37,7 +43,7 @@ exe = "/usr/bin/systemctl"
 args = [
   { name = "no-pager", matcher = { literal = "--no-pager" } },
   { name = "verb", matcher = { literal = "reset-failed" } },
-  { name = "unit", matcher = { name = "unit-name" } },
+  { name = "unit", matcher = { name = "service-unit-name" } },
 ]
 
 [[action]]
@@ -96,3 +102,25 @@ argv = [
 ]
 expect = "deny"
 reason = "no rule accepts enable, which changes a unit definition"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "start",
+  "poweroff.target",
+]
+expect = "deny"
+reason = "near miss: a power target is not a service"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "start",
+  "modprobe@dummy.service",
+]
+expect = "deny"
+reason = "near miss: a template unit can load a kernel module"

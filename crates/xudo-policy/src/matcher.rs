@@ -96,7 +96,21 @@ pub enum NameKind {
     /// An Alpine package name.
     ApkName,
     /// A systemd unit name with an explicit unit suffix.
+    ///
+    /// Accepts `.service`, `.socket`, `.timer`, `.target`, `.path`, and
+    /// `.mount`, including template instances (`@`) and systemd escapes
+    /// (`\`). The journal rules use this kind, because reading any unit's
+    /// log is the point. Lifecycle rules must not: a `.target` or a template
+    /// is a different act from restarting a service. Those use
+    /// [`Self::ServiceUnitName`].
     UnitName,
+    /// A plain systemd service name.
+    ///
+    /// The same shape rules as [`Self::UnitName`], except the name must end
+    /// in `.service` and must not contain `@` or `\`. `poweroff.target`,
+    /// `modprobe@dummy.service`, and `a\x2db.service` are not a service
+    /// restart.
+    ServiceUnitName,
     /// A DNS hostname label sequence.
     Hostname,
     /// A dotted `sysctl` key.
@@ -131,6 +145,7 @@ impl NameKind {
                 b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'@')
             }),
             Self::UnitName => Self::accepts_unit(bytes),
+            Self::ServiceUnitName => Self::accepts_service_unit(bytes),
             Self::Hostname => {
                 bytes
                     .iter()
@@ -166,6 +181,21 @@ impl NameKind {
         bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@' | b'\\'))
+    }
+
+    /// A service the operator named, not a target, a socket, or a template.
+    ///
+    /// `@` starts a template instance (`modprobe@dummy.service` loads a
+    /// kernel module). `\` is a systemd escape, which can hide either of
+    /// those. Both are rejected here. [`Self::accepts_unit`] still allows
+    /// them, on purpose.
+    fn accepts_service_unit(bytes: &[u8]) -> bool {
+        if !bytes.ends_with(b".service") {
+            return false;
+        }
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
     }
 }
 
@@ -388,9 +418,9 @@ pub(crate) fn meet(a: &Matcher, b: &Matcher) -> Meet {
 /// Each arm is an argument about what the two accept, and the probes are
 /// chosen to make it hold. The name-kind arms rest on three facts about
 /// [`NameKind::accepts`] — no kind accepts a leading `-`, no kind accepts a
-/// `/`, and every kind but unit-name accepts a bare decimal — which
-/// `name_kinds_hold_what_overlap_detection_relies_on` pins, so a change to a
-/// kind fails a test before it can make this lie.
+/// `/`, and every kind but unit-name and service-unit-name accepts a bare
+/// decimal — which `name_kinds_hold_what_overlap_detection_relies_on` pins,
+/// so a change to a kind fails a test before it can make this lie.
 fn exhausts(a: &Matcher, b: &Matcher) -> bool {
     use Matcher::{IntRange, Literal, Name, OneOf, PathUnder, Pattern};
 
@@ -401,7 +431,8 @@ fn exhausts(a: &Matcher, b: &Matcher) -> bool {
         // Ranges: both probe their floor, and the larger floor lies in both
         // whenever they intersect. Against a name kind: names never start
         // with `-`, so only a value of zero or more can be shared, and the
-        // smallest such value is probed; unit-name accepts no decimal at all.
+        // smallest such value is probed; unit-name and service-unit-name
+        // accept no decimal at all.
         // Against a path: a path starts with `/`, an integer never does.
         | (IntRange { .. }, IntRange { .. } | Name(_) | PathUnder { .. })
         | (Name(_) | PathUnder { .. }, IntRange { .. })
@@ -913,6 +944,41 @@ mod tests {
             assert!(m.accepts(&Arg::from(unit)), "rejected {unit}");
         }
         assert!(!m.accepts(&Arg::from("a.swap")));
+        // Escapes stay valid for this kind. The journal rules use it to name
+        // any unit, and tightening it would hide a target's log.
+        assert!(m.accepts(&Arg::from("a\\x2db.service")));
+        assert!(m.accepts(&Arg::from("getty@tty1.service")));
+    }
+
+    #[test]
+    fn service_unit_names_accept_only_a_plain_service() {
+        let m = Matcher::Name(NameKind::ServiceUnitName);
+        assert!(m.accepts(&Arg::from("nginx.service")));
+        assert!(m.accepts(&Arg::from("ssh.service")));
+        assert!(m.accepts(&Arg::from("a.b-c_d.service")));
+        for bad in [
+            "a@b.service",
+            "a.target",
+            "a.mount",
+            "a\\x2db.service",
+            "-a.service",
+            "../a.service",
+            "",
+        ] {
+            assert!(!m.accepts(&Arg::from(bad)), "accepted {bad:?}");
+        }
+        assert!(!m.accepts(&Arg::new(b"a\0.service".to_vec())));
+        assert!(!m.accepts(&Arg::new(vec![
+            b'a', 0xff, b'.', b's', b'e', b'r', b'v', b'i', b'c', b'e',
+        ])));
+        let spec: ArgSpec = toml::from_str(
+            r#"
+            name = "unit"
+            matcher = { name = "service-unit-name" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.matcher, Matcher::Name(NameKind::ServiceUnitName));
     }
 
     #[test]
@@ -1241,6 +1307,7 @@ mod tests {
             NameKind::ArchName,
             NameKind::ApkName,
             NameKind::UnitName,
+            NameKind::ServiceUnitName,
             NameKind::Hostname,
             NameKind::SysctlKey,
         ];
@@ -1248,10 +1315,11 @@ mod tests {
             for refused in ["-1", "-0", "/a", "a/b", "/"] {
                 assert!(!kind.accepts(refused.as_bytes()), "{kind:?} {refused}");
             }
+            let refuses_decimal = matches!(kind, NameKind::UnitName | NameKind::ServiceUnitName);
             for decimal in ["0", "7", "10", "65535", "9223372036854775807"] {
                 assert_eq!(
                     kind.accepts(decimal.as_bytes()),
-                    kind != NameKind::UnitName,
+                    !refuses_decimal,
                     "{kind:?} {decimal}"
                 );
             }

@@ -33,6 +33,12 @@
 //! adding cases to [`CapabilityClass`], never by loosening a matcher. Nothing
 //! about the list is silently capped: [`deny_list_version`] changes whenever it
 //! does, and the version is written into every audit record.
+//!
+//! Arguments to `systemctl` are classified by the unit name as well as by the
+//! verb. A power or boot target, a `modprobe@` template, a filesystem
+//! template, this broker's own units, and the `AppArmor` and audit units are
+//! refused whatever the verb is. A rule that matches the generic unit-name
+//! kind cannot reopen them.
 
 use bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
@@ -44,7 +50,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    1
+    2
 }
 
 /// A class of capability that is never permitted as root.
@@ -470,6 +476,39 @@ const FATAL_SYSCTL_KEYS: &[&[u8]] = &[
     b"fs.suid_dumpable",
 ];
 
+/// Power and boot targets. `systemctl start` of one of these changes whether
+/// the machine is up, or which mode it comes up in. Matched case-sensitively,
+/// as systemd matches unit names.
+///
+/// `hybrid-sleep`, `suspend-then-hibernate`, `sleep`, and `shutdown` are the
+/// same power act as `suspend` and `poweroff`. `sysinit` is the early-boot
+/// target. Ordinary dependency targets (`multi-user`, `network`) are not in
+/// this list.
+const POWER_OR_BOOT_TARGETS: &[&[u8]] = &[
+    b"poweroff.target",
+    b"reboot.target",
+    b"halt.target",
+    b"kexec.target",
+    b"soft-reboot.target",
+    b"ctrl-alt-del.target",
+    b"suspend.target",
+    b"hibernate.target",
+    b"hybrid-sleep.target",
+    b"suspend-then-hibernate.target",
+    b"sleep.target",
+    b"shutdown.target",
+    b"rescue.target",
+    b"emergency.target",
+    b"exit.target",
+    b"sysinit.target",
+];
+
+/// Template prefixes whose instance is a kernel module name.
+const KERNEL_MODULE_TEMPLATES: &[&[u8]] = &[b"modprobe"];
+
+/// Template prefixes that check, grow, or create a filesystem.
+const DEVICE_TEMPLATES: &[&[u8]] = &[b"systemd-fsck", b"systemd-growfs", b"systemd-makefs"];
+
 /// `systemctl` verbs that write or reinterpret a unit definition.
 const UNIT_MUTATING_VERBS: &[&[u8]] = &[
     b"enable",
@@ -490,6 +529,159 @@ const UNIT_MUTATING_VERBS: &[&[u8]] = &[
     b"set-default",
     b"switch-root",
 ];
+
+/// One hexadecimal digit, or `None` when `byte` is not one.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte.saturating_sub(b'0')),
+        b'a'..=b'f' => Some(byte.saturating_sub(b'a').saturating_add(10)),
+        b'A'..=b'F' => Some(byte.saturating_sub(b'A').saturating_add(10)),
+        _ => None,
+    }
+}
+
+/// A complete `\xHH` at the start of `bytes`, and what follows it.
+fn take_hex_byte(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let (hi, rest) = bytes.split_first()?;
+    let (lo, rest) = rest.split_first()?;
+    let hi = hex_nibble(*hi)?;
+    let lo = hex_nibble(*lo)?;
+    // Each nibble is 0..=15, so the byte they form fits in `u8`.
+    Some((hi.saturating_mul(16).saturating_add(lo), rest))
+}
+
+/// Decodes systemd `\xHH` escapes in a unit name.
+///
+/// A backslash that is not a complete `\xHH` is ambiguous. `drop_escaped`
+/// drops both the backslash and the byte after it, so `mod\.probe` joins
+/// into `modprobe`. Otherwise only the backslash is dropped, so
+/// `poweroff\.target` is `poweroff.target`. Either reading is enough to
+/// deny: an escape that can spell a refused unit is refused.
+///
+/// A trailing backslash has no byte after it and is dropped.
+fn decode_unit(bytes: &[u8], drop_escaped: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some((&head, tail)) = rest.split_first() {
+        if head != b'\\' {
+            out.push(head);
+            rest = tail;
+            continue;
+        }
+        // A match, not `let … else`: the diverging `else` is a region
+        // llvm-cov does not mark covered even when a trailing `\` hits it.
+        match tail.split_first() {
+            None => break,
+            Some((&marker, after)) => {
+                if marker == b'x'
+                    && let Some((byte, after_byte)) = take_hex_byte(after)
+                {
+                    out.push(byte);
+                    rest = after_byte;
+                    continue;
+                }
+                if !drop_escaped {
+                    out.push(marker);
+                }
+                rest = after;
+            }
+        }
+    }
+    out
+}
+
+/// The template name before the first `@`, when there is one.
+fn template_prefix(unit: &[u8]) -> Option<&[u8]> {
+    match unit.split_once_str(b"@") {
+        Some((prefix, _)) if !prefix.is_empty() => Some(prefix),
+        Some(_) | None => None,
+    }
+}
+
+/// The capability a template unit exercises, from its prefix alone.
+///
+/// The instance is not consulted. `modprobe@` loads whatever module the
+/// instance names, and an instance that contains `\` is the same template
+/// with a name this list will not try to decode before refusing it.
+fn template_class(unit: &[u8]) -> Option<CapabilityClass> {
+    let prefix = template_prefix(unit)?;
+    if KERNEL_MODULE_TEMPLATES.contains(&prefix) {
+        Some(CapabilityClass::KernelModule)
+    } else if DEVICE_TEMPLATES.contains(&prefix) || prefix.starts_with(b"mdadm") {
+        Some(CapabilityClass::DeviceOrFilesystem)
+    } else {
+        None
+    }
+}
+
+/// `stem`, `stem.something`, or `stem@instance`.
+///
+/// systemd resolves a suffix-less name to `stem.service`, so the bare stem
+/// is the same unit as `stem.service`.
+fn has_unit_stem(unit: &[u8], stem: &[u8]) -> bool {
+    match unit.strip_prefix(stem) {
+        Some(rest) if rest.is_empty() || rest.starts_with(b".") || rest.starts_with(b"@") => true,
+        Some(_) | None => false,
+    }
+}
+
+/// xudo's own units. Stopping the broker socket, or an `xudo-*` service,
+/// removes the policy that allowed the command.
+fn is_self_unit(unit: &[u8]) -> bool {
+    has_unit_stem(unit, b"xudod") || unit.starts_with(b"xudo-")
+}
+
+/// `AppArmor` and auditd. Stopping either removes the backstop the class exists
+/// for.
+fn is_security_unit(unit: &[u8]) -> bool {
+    has_unit_stem(unit, b"apparmor") || has_unit_stem(unit, b"auditd")
+}
+
+/// The capability class of one unit name, after escapes have been decoded.
+fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
+    // Every entry ends in `.target`. Skipping the list for any other
+    // suffix keeps the common service-name path to a couple of compares.
+    if unit.ends_with(b".target") && POWER_OR_BOOT_TARGETS.contains(&unit) {
+        return Some(CapabilityClass::PowerState);
+    }
+    if let Some(class) = template_class(unit) {
+        return Some(class);
+    }
+    if is_self_unit(unit) {
+        return Some(CapabilityClass::SelfModification);
+    }
+    if is_security_unit(unit) {
+        return Some(CapabilityClass::SecuritySubsystem);
+    }
+    None
+}
+
+/// The class of one `systemctl` argument, when it names a unit this list
+/// refuses.
+///
+/// Flags are not units. The raw bytes are tried first, which already refuses
+/// a template whose instance contains `\`. A name that still contains `\` is
+/// then read both ways [`decode_unit`] documents, and refused when either
+/// reading is a unit this list refuses. The comparison is case-sensitive.
+fn classify_systemctl_unit(raw: &[u8]) -> Option<CapabilityClass> {
+    if raw.first() == Some(&b'-') {
+        return None;
+    }
+    if let Some(class) = class_of_unit(raw) {
+        return Some(class);
+    }
+    if !raw.contains(&b'\\') {
+        return None;
+    }
+    for drop_escaped in [false, true] {
+        // `\` is always consumed, so this is a different name from `raw`,
+        // which `class_of_unit` has already refused to classify.
+        if let Some(class) = class_of_unit(&decode_unit(raw, drop_escaped)) {
+            return Some(class);
+        }
+    }
+    None
+}
 
 /// Extracts the final path component of an executable path.
 fn basename(path: &[u8]) -> &[u8] {
@@ -669,6 +861,21 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
             ));
         }
 
+        // A unit `systemctl` would act on, whatever the verb in front of it.
+        // The lifecycle rule refuses these by shape. This is what still
+        // refuses them when a later rule matches the generic unit-name kind.
+        if name == b"systemctl"
+            && let Some(class) = classify_systemctl_unit(bytes)
+        {
+            findings.push(DenyFinding::new(
+                class,
+                format!(
+                    "argument {index} names the restricted unit {}",
+                    bytes.as_bstr()
+                ),
+            ));
+        }
+
         // An option that redirects a package manager's configuration, hooks, or
         // root, independent of which manager it is.
         if matches!(bytes, b"-o" | b"--option" | b"-c" | b"--config-file")
@@ -706,7 +913,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 1);
+        assert_eq!(deny_list_version(), 2);
     }
 
     #[test]
@@ -1116,5 +1323,47 @@ mod tests {
         assert!(!matches_name(b"nodejs-doc", INTERPRETERS));
         assert!(!matches_name(b"sedate", ARBITRARY_WRITERS));
         assert!(matches_name(b"node", INTERPRETERS));
+    }
+
+    #[test]
+    fn denies_poweroff_via_systemctl_start_poweroff_target() {
+        let found = classes(
+            "/usr/bin/systemctl",
+            &[
+                "--no-pager",
+                "--no-ask-password",
+                "start",
+                "poweroff.target",
+            ],
+        );
+        assert!(found.contains(&CapabilityClass::PowerState), "{found:?}");
+        assert!(!found.contains(&CapabilityClass::UnitDefinitionMutation));
+        // A different case is a different unit. systemd does not fold it.
+        assert!(!denies("/usr/bin/systemctl", &["start", "Poweroff.target"]));
+    }
+
+    #[test]
+    fn denies_kernel_module_load_via_modprobe_template_unit() {
+        assert!(
+            classes("/usr/bin/systemctl", &["start", "modprobe@dummy.service"])
+                .contains(&CapabilityClass::KernelModule)
+        );
+        // `\x40` is `@`. One escaped spelling here keeps the decoder on the
+        // miri path; the rest of the matrix lives in the integration tests.
+        assert!(
+            classes(
+                "/usr/bin/systemctl",
+                &["start", "modprobe\\x40dummy.service"]
+            )
+            .contains(&CapabilityClass::KernelModule)
+        );
+    }
+
+    #[test]
+    fn denies_stopping_the_broker_socket() {
+        assert!(
+            classes("/usr/bin/systemctl", &["stop", "xudod.socket"])
+                .contains(&CapabilityClass::SelfModification)
+        );
     }
 }

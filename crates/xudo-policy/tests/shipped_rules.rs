@@ -12,7 +12,8 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use xudo_policy::{
-    Argv, CallerFacts, Classification, DenialCode, Request, RuleSet, Verdict, engine::Settings,
+    Argv, CallerFacts, CapabilityClass, Classification, DenialCode, Request, RuleSet, Verdict,
+    engine::Settings,
 };
 
 /// Each shipped file, paired with the name it has on disk.
@@ -68,7 +69,7 @@ fn shipped_rule_tests_pass() {
     // purpose, so a file that silently lost its tests cannot pass.
     assert_eq!(
         tests.len(),
-        28,
+        30,
         "the shipped test count changed: update this"
     );
     let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
@@ -257,6 +258,278 @@ fn service_lifecycle_permits_the_verbs_it_lists() {
             ),
             Verdict::Allow,
             "{verb} was not permitted"
+        );
+    }
+}
+
+#[test]
+fn shipped_lifecycle_still_accepts_a_plain_service() {
+    for unit in ["nginx.service", "ssh.service"] {
+        assert_eq!(
+            verdict(
+                "xudo.svc.lifecycle",
+                &["--no-pager", "--no-ask-password", "restart", unit]
+            ),
+            Verdict::Allow,
+            "{unit}"
+        );
+    }
+    assert_eq!(
+        verdict(
+            "xudo.svc.reset-failed",
+            &["--no-pager", "reset-failed", "ssh.service"]
+        ),
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn journal_rules_still_accept_a_target_and_a_template_unit() {
+    // Reading a unit's log is the point of the generic unit-name kind.
+    // Narrowing it would hide the log of the unit the lifecycle rule refuses.
+    for unit in ["poweroff.target", "getty@tty1.service", "a\\x2db.service"] {
+        assert_eq!(
+            verdict("xudo.svc.logs", &["--no-pager", "-u", unit]),
+            Verdict::Allow,
+            "{unit}"
+        );
+    }
+}
+
+fn command_verdict(args: &[&str]) -> Verdict {
+    let rules = load_all();
+    let (program, operands) = args.split_first().unwrap();
+    xudo_policy::evaluate_command(
+        &rules,
+        &human(),
+        &xudo_policy::Arg::from(*program),
+        &Argv::new(operands.to_vec()),
+        Settings::default(),
+    )
+    .verdict
+}
+
+#[test]
+fn denies_poweroff_via_systemctl_start_poweroff_target() {
+    let args = [
+        "/usr/bin/systemctl",
+        "--no-pager",
+        "--no-ask-password",
+        "start",
+        "poweroff.target",
+    ];
+    assert_eq!(command_verdict(&args), Verdict::Deny);
+    assert_eq!(
+        denial(
+            "xudo.svc.reset-failed",
+            &["--no-pager", "reset-failed", "poweroff.target"]
+        ),
+        Some(DenialCode::ArgvRejected)
+    );
+}
+
+#[test]
+fn denies_kernel_module_load_via_modprobe_template_unit() {
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "modprobe@dummy.service",
+        ]),
+        Verdict::Deny
+    );
+}
+
+#[test]
+fn denies_stopping_the_broker_socket() {
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--no-ask-password",
+            "stop",
+            "xudod.socket",
+        ]),
+        Verdict::Deny
+    );
+    // A plain service name matches the lifecycle rule, and the deny-list
+    // still refuses the broker's own service.
+    assert_eq!(
+        denial(
+            "xudo.svc.lifecycle",
+            &["--no-pager", "--no-ask-password", "stop", "xudod.service"]
+        ),
+        Some(DenialCode::DenyListed)
+    );
+}
+
+#[test]
+fn no_lifecycle_verb_reaches_a_special_target() {
+    // Every verb the shipped rule lists, plus the verbs the deny entry covers
+    // even though that rule does not (`isolate`, `reset-failed`, `status`).
+    const VERBS: &[&str] = &[
+        "start",
+        "stop",
+        "restart",
+        "try-restart",
+        "reload",
+        "reload-or-restart",
+        "try-reload-or-restart",
+        "isolate",
+        "kill",
+        "reset-failed",
+        "status",
+        "show",
+    ];
+    const TARGETS: &[&str] = &[
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "soft-reboot.target",
+        "ctrl-alt-del.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+        "sleep.target",
+        "shutdown.target",
+        "rescue.target",
+        "emergency.target",
+        "exit.target",
+        "sysinit.target",
+    ];
+    for verb in VERBS {
+        for target in TARGETS {
+            let argv = Argv::new(vec!["--no-pager", "--no-ask-password", verb, target]);
+            let findings = xudo_policy::evaluate_deny_list(b"/usr/bin/systemctl", &argv);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.class == xudo_policy::CapabilityClass::PowerState),
+                "{verb} {target} was not a power state: {findings:?}"
+            );
+            assert_eq!(
+                command_verdict(&[
+                    "/usr/bin/systemctl",
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    target,
+                ]),
+                Verdict::Deny,
+                "{verb} {target}"
+            );
+        }
+    }
+}
+
+fn unit_classes(verb: &str, unit: &str) -> Vec<CapabilityClass> {
+    let argv = Argv::new(vec![verb, unit]);
+    xudo_policy::evaluate_deny_list(b"/usr/bin/systemctl", &argv)
+        .into_iter()
+        .map(|finding| finding.class)
+        .collect()
+}
+
+#[test]
+fn unit_keyed_deny_entries_cover_templates_security_and_escapes() {
+    // The cartesian power-target check is `no_lifecycle_verb_reaches_a_special_target`.
+    // This one is the rest of the unit-keyed list, including spellings that
+    // only decode to a refused unit. It lives here so miri, which runs the
+    // library tests only, does not pay for the matrix.
+    for unit in ["modprobe@foo\\x2dbar.service", "mod\\.probe@x.service"] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::KernelModule),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "systemd-fsck@dev-sda1.service",
+        "systemd-growfs@dev-sda1.service",
+        "systemd-makefs@dev-sda1.service",
+        "mdadm-last-resort@dev-sda1.service",
+        "mdadm-grow-continue@dev-md0.service",
+        "mdadm@dev-md0.service",
+    ] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::DeviceOrFilesystem),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "xudod.service",
+        "xudod",
+        "xudod@1.service",
+        "xudo-pasban.service",
+    ] {
+        assert!(
+            unit_classes("stop", unit).contains(&CapabilityClass::SelfModification),
+            "{unit}"
+        );
+    }
+    assert!(
+        !unit_classes("stop", "xudod-extra.service").contains(&CapabilityClass::SelfModification)
+    );
+    for unit in [
+        "apparmor.service",
+        "apparmor",
+        "apparmor@profile.service",
+        "auditd.service",
+        "auditd.socket",
+    ] {
+        assert!(
+            unit_classes("stop", unit).contains(&CapabilityClass::SecuritySubsystem),
+            "{unit}"
+        );
+    }
+    assert!(unit_classes("stop", "apparmor-helper.service").is_empty());
+    for unit in [
+        "ctrl\\x2dalt\\x2ddel.target",
+        "ctrl\\x2Dalt\\x2ddel.target",
+        "reboot\\x2etarget",
+        "poweroff\\.target",
+        "poweroff.target\\",
+    ] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::PowerState),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "getty@tty\\x2d1.service",
+        "getty\\.service",
+        "nginx.service",
+        "@foo.service",
+        "reboot\\x",
+        "poweroff\\x2",
+        "poweroff\\xz.target",
+        "poweroff\\x2g.target",
+        "Poweroff.target",
+    ] {
+        assert!(unit_classes("start", unit).is_empty(), "{unit} was denied");
+    }
+    let journal = Argv::new(vec!["--no-pager", "-u", "poweroff.target"]);
+    assert!(xudo_policy::evaluate_deny_list(b"/usr/bin/journalctl", &journal).is_empty());
+    let both = unit_classes("enable", "poweroff.target");
+    assert!(both.contains(&CapabilityClass::UnitDefinitionMutation));
+    assert!(both.contains(&CapabilityClass::PowerState));
+}
+
+#[test]
+fn shipped_lifecycle_refuses_apparmor_and_auditd_by_the_deny_list() {
+    // These are plain `.service` names, so the matcher accepts them. The
+    // deny-list is what refuses them.
+    for unit in ["apparmor.service", "auditd.service"] {
+        assert_eq!(
+            denial(
+                "xudo.svc.lifecycle",
+                &["--no-pager", "--no-ask-password", "stop", unit]
+            ),
+            Some(DenialCode::DenyListed),
+            "{unit}"
         );
     }
 }
