@@ -77,6 +77,18 @@ fn hole_lifecycle() -> RuleSet {
         .unwrap_or_else(|e| panic!("hole lifecycle rule does not load: {e}"))
 }
 
+/// The open `unit-name` lifecycle rule, which is the beta.1 hole. A refusal
+/// here is the deny-list, because the rule itself matches.
+fn hole_denial(args: &[&str]) -> Option<DenialCode> {
+    xudo_policy::evaluate(
+        &hole_lifecycle(),
+        &human(),
+        &Request::new("xudo.svc.lifecycle", Argv::new(args.to_vec())),
+        Settings::default(),
+    )
+    .denial
+}
+
 fn load_all() -> RuleSet {
     let mut actions = Vec::new();
     for (name, contents) in SHIPPED {
@@ -455,6 +467,17 @@ fn denies_poweroff_via_systemctl_start_poweroff_target() {
         ),
         Some(DenialCode::ArgvRejected)
     );
+    // The shipped set denies this because no rule matches. The open
+    // unit-name rule matches, and the deny-list still refuses the target.
+    assert_eq!(
+        hole_denial(&[
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "poweroff.target",
+        ]),
+        Some(DenialCode::DenyListed)
+    );
 }
 
 #[test]
@@ -469,6 +492,15 @@ fn denies_kernel_module_load_via_modprobe_template_unit() {
         ]),
         Verdict::Deny
     );
+    assert_eq!(
+        hole_denial(&[
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "modprobe@dummy.service",
+        ]),
+        Some(DenialCode::DenyListed)
+    );
 }
 
 #[test]
@@ -482,6 +514,11 @@ fn denies_stopping_the_broker_socket() {
             "xudod.socket",
         ]),
         Verdict::Deny
+    );
+    // The open unit-name rule matches the socket. The deny-list still refuses it.
+    assert_eq!(
+        hole_denial(&["--no-pager", "--no-ask-password", "stop", "xudod.socket",]),
+        Some(DenialCode::DenyListed)
     );
     // A unit-name lifecycle rule would accept this plain service name. The
     // deny-list still refuses the broker's own service.
