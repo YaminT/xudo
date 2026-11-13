@@ -36,6 +36,12 @@ All notable changes to xudo are documented here. This project follows
   `xudo.svc.status` and `xudo.svc.show` of `xudod`, the journal, chrony,
   nftables, apparmor, and auditd still run. A verb that starts, stops, or
   signals the unit is still refused, and a power subcommand is still refused.
+- Package-manager config redirects are matched per tool. apt long options
+  are case-insensitive and a short cluster is scanned for `c` or `o`.
+  sysctl also refuses `-f` and a prefix of `--load` or `--system`. dnf,
+  yum, zypper, pacman, and dpkg use their own option names. This is defence
+  in depth: the shipped rules still only name apt-get, and their positions
+  are literals.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now
