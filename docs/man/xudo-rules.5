@@ -262,7 +262,21 @@ and no backslash.
 .BR poweroff.target ,
 .BR modprobe@dummy.service ,
 and an escaped name are not a service restart.
-The shipped lifecycle and reset\-failed rules use this kind.
+The shipped
+.B reset\-failed
+rule uses this kind.
+There is no shipped service-lifecycle rule.
+The example at
+.B /usr/share/doc/xudo/examples/20\-services\-lifecycle.toml
+is a
+.B one\-of
+list of placeholder service names; copy it into
+.B rules.d
+and replace those names.
+The compiled-in deny-list still refuses a power or sleep unit, a runlevel
+alias,
+.BR debug\-shell ,
+a firewall or time-sync unit, and a journal unit, even when a rule lists it.
 .B unit\-name
 itself is not tightened.
 .TP

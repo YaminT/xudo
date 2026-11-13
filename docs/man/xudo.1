@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-07" "xudo 0.1.0-beta.1" "User Commands"
+.TH XUDO 1 "2026-11-13" "xudo 0.1.0-beta.1" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -251,6 +251,14 @@ the report is one envelope, with a result for each test.
 A ruleset that will not load, an unknown key in a test table included, is
 .BR 19 ,
 before any of this runs.
+When the loaded ruleset has no action
+.BR xudo.svc.lifecycle ,
+.B check
+prints one note and does not change the exit status:
+.B no service lifecycle rule: copy /usr/share/doc/xudo/examples/20\-services\-lifecycle.toml to /etc/xudo/rules.d/ and list your units
+The JSON envelope carries the same sentence in
+.B note
+only when the rule is absent.
 .IP
 .B \-\-fuzz
 also runs a bounded, deterministic fuzz of the ruleset: candidate commands are
@@ -301,6 +309,16 @@ prints the versioned machine-readable envelope, the same as
 .B \-\-fix
 proposes a fix for each path to root, including the command a human would
 run, and applies nothing.
+When the rules loaded and none of them is
+.BR xudo.svc.lifecycle ,
+.B doctor
+prints the same one-line note as
+.BR check .
+That note is not a fault, and
+.B \-\-json
+includes it as
+.B lifecycle_note
+only then.
 .TP
 .B config
 Show the effective settings and where each value came from.

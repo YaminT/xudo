@@ -44,6 +44,12 @@ install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-auth"
 install -m 0644 "$root"/packaging/systemd/* "$stage/usr/lib/systemd/system/"
 install -m 0644 "$root/packaging/tmpfiles.d/xudo.conf" "$stage/usr/lib/tmpfiles.d/"
 install -m 0644 "$root"/rules/*.toml "$stage/etc/xudo/rules.d/"
+# The lifecycle example is documentation. `rules/*.toml` does not match
+# `rules/examples/*.toml.example`, and this name is what an operator copies
+# into rules.d. It is not a conffile.
+mkdir -p "$stage/usr/share/doc/xudo/examples"
+install -m 0644 "$root/rules/examples/20-services-lifecycle.toml.example" \
+    "$stage/usr/share/doc/xudo/examples/20-services-lifecycle.toml"
 mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \

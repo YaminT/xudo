@@ -43,6 +43,9 @@ grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted sy
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
+[ -f /usr/share/doc/xudo/examples/20-services-lifecycle.toml ] || fail "lifecycle example not installed"
+[ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
+printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/doc/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
 matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
 [ "$matching_count" -eq "$rules_count" ] || fail "doctor did not report every shipped rule as matches shipped"

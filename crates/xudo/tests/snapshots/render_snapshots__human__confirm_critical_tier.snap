@@ -11,5 +11,5 @@ ALLOW, after a human confirms
   trace
     canonicalized: unchanged (dist-upgrade)
     matched xudo.pkg.dist-upgrade at snapshot-fixture.toml:23
-    deny-list v2: no capability class matched
+    deny-list v3: no capability class matched
     confirmation required: the matched rule is in a critical tier

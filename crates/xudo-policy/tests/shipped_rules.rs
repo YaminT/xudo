@@ -40,6 +40,42 @@ const SHIPPED: &[(&str, &str)] = &[
     ),
 ];
 
+/// The lifecycle example is not a shipped rule. The loader only reads names
+/// ending in `.toml`, and this file is `*.toml.example`, so `include_str!`
+/// is how the build attacks it.
+const LIFECYCLE_EXAMPLE: &str =
+    include_str!("../../../rules/examples/20-services-lifecycle.toml.example");
+
+/// The hole the tripwires close: a lifecycle rule whose unit position is the
+/// generic `unit-name` kind. The shipped rules do not contain this. A test
+/// that only calls `evaluate_deny_list` would pass even if matching an action
+/// stopped the deny-list from running.
+const HOLE_LIFECYCLE: &str = r#"
+[[action]]
+id = "xudo.svc.lifecycle"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = [
+    "start", "stop", "restart", "try-restart", "reload",
+    "reload-or-restart", "try-reload-or-restart",
+  ] } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+fn example_lifecycle() -> RuleSet {
+    RuleSet::from_toml("20-services-lifecycle.toml", LIFECYCLE_EXAMPLE)
+        .unwrap_or_else(|e| panic!("lifecycle example does not load: {e}"))
+}
+
+fn hole_lifecycle() -> RuleSet {
+    RuleSet::from_toml("hole.toml", HOLE_LIFECYCLE)
+        .unwrap_or_else(|e| panic!("hole lifecycle rule does not load: {e}"))
+}
+
 fn load_all() -> RuleSet {
     let mut actions = Vec::new();
     for (name, contents) in SHIPPED {
@@ -240,40 +276,49 @@ fn an_empty_rule_file_is_valid_and_permits_nothing() {
 
 // --- what the shipped rules actually permit ---------------------------------
 
+/// Verbs the example lists, and the verbs a lifecycle rule is for.
+const LIFECYCLE_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+];
+
 #[test]
 fn service_lifecycle_permits_the_verbs_it_lists() {
-    for verb in [
-        "start",
-        "stop",
-        "restart",
-        "try-restart",
-        "reload",
-        "reload-or-restart",
-        "try-reload-or-restart",
-    ] {
-        assert_eq!(
-            verdict(
+    // The example, not the shipped rules. The shipped set has no lifecycle
+    // action; this is what an operator gets after copying the example and
+    // before replacing the placeholder names.
+    let rules = example_lifecycle();
+    for verb in LIFECYCLE_VERBS {
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
                 "xudo.svc.lifecycle",
-                &["--no-pager", "--no-ask-password", verb, "nginx.service"]
+                Argv::new(vec![
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    "example.service",
+                ]),
             ),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.verdict,
             Verdict::Allow,
-            "{verb} was not permitted"
+            "{verb} was not permitted: {:?}",
+            decision.denial
         );
     }
 }
 
 #[test]
-fn shipped_lifecycle_still_accepts_a_plain_service() {
-    for unit in ["nginx.service", "ssh.service"] {
-        assert_eq!(
-            verdict(
-                "xudo.svc.lifecycle",
-                &["--no-pager", "--no-ask-password", "restart", unit]
-            ),
-            Verdict::Allow,
-            "{unit}"
-        );
-    }
+fn reset_failed_still_accepts_a_plain_service() {
     assert_eq!(
         verdict(
             "xudo.svc.reset-failed",
@@ -354,21 +399,29 @@ fn denies_stopping_the_broker_socket() {
         ]),
         Verdict::Deny
     );
-    // A plain service name matches the lifecycle rule, and the deny-list
-    // still refuses the broker's own service.
-    assert_eq!(
-        denial(
+    // A unit-name lifecycle rule would accept this plain service name. The
+    // deny-list still refuses the broker's own service.
+    let decision = xudo_policy::evaluate(
+        &hole_lifecycle(),
+        &human(),
+        &Request::new(
             "xudo.svc.lifecycle",
-            &["--no-pager", "--no-ask-password", "stop", "xudod.service"]
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "stop",
+                "xudod.service",
+            ]),
         ),
-        Some(DenialCode::DenyListed)
+        Settings::default(),
     );
+    assert_eq!(decision.denial, Some(DenialCode::DenyListed));
 }
 
 #[test]
 fn no_lifecycle_verb_reaches_a_special_target() {
-    // Every verb the shipped rule lists, plus the verbs the deny entry covers
-    // even though that rule does not (`isolate`, `reset-failed`, `status`).
+    // Every lifecycle verb, plus verbs the deny entry covers even though no
+    // shipped rule lists them (`isolate`, `reset-failed`, `status`).
     const VERBS: &[&str] = &[
         "start",
         "stop",
@@ -519,26 +572,10 @@ fn unit_keyed_deny_entries_cover_templates_security_and_escapes() {
 }
 
 #[test]
-fn shipped_lifecycle_refuses_apparmor_and_auditd_by_the_deny_list() {
-    // These are plain `.service` names, so the matcher accepts them. The
-    // deny-list is what refuses them.
-    for unit in ["apparmor.service", "auditd.service"] {
-        assert_eq!(
-            denial(
-                "xudo.svc.lifecycle",
-                &["--no-pager", "--no-ask-password", "stop", unit]
-            ),
-            Some(DenialCode::DenyListed),
-            "{unit}"
-        );
-    }
-}
-
-#[test]
 fn service_lifecycle_refuses_every_unit_mutating_verb() {
-    // Refused twice over: the verb is not in the enum, and the deny-list
-    // classifies it independently. Either alone would be enough; both is the
-    // point.
+    // The example's verb enum is the lifecycle verbs only. `enable` changes
+    // a unit definition and is not in that list.
+    let rules = example_lifecycle();
     for verb in [
         "enable",
         "disable",
@@ -550,28 +587,247 @@ fn service_lifecycle_refuses_every_unit_mutating_verb() {
         "set-property",
         "switch-root",
     ] {
-        let d = denial(
-            "xudo.svc.lifecycle",
-            &["--no-pager", "--no-ask-password", verb, "nginx.service"],
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
+                "xudo.svc.lifecycle",
+                Argv::new(vec![
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    "example.service",
+                ]),
+            ),
+            Settings::default(),
         );
-        assert!(
-            d == Some(DenialCode::ArgvRejected) || d == Some(DenialCode::DenyListed),
-            "{verb} gave {d:?}"
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::ArgvRejected),
+            "{verb} gave {:?}",
+            decision.denial
         );
     }
 }
 
 #[test]
 fn a_suffixless_unit_name_is_refused() {
-    // `systemctl restart nginx` resolves to nginx.service, so accepting a bare
-    // name would silently widen the rule.
-    assert_eq!(
-        denial(
+    // `systemctl restart example` resolves to example.service, so accepting a
+    // bare name would silently widen the operator's list.
+    let rules = example_lifecycle();
+    let decision = xudo_policy::evaluate(
+        &rules,
+        &human(),
+        &Request::new(
             "xudo.svc.lifecycle",
-            &["--no-pager", "--no-ask-password", "restart", "nginx"]
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "example",
+            ]),
         ),
-        Some(DenialCode::ArgvRejected)
+        Settings::default(),
     );
+    assert_eq!(decision.denial, Some(DenialCode::ArgvRejected));
+}
+
+#[test]
+fn the_shipped_rules_have_no_lifecycle_rule() {
+    let rules = load_all();
+    assert!(
+        rules
+            .actions()
+            .iter()
+            .all(|action| action.id.as_str() != "xudo.svc.lifecycle"),
+        "xudo.svc.lifecycle is an example, not a shipped action"
+    );
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--no-ask-password",
+            "restart",
+            "nginx.service",
+        ]),
+        Verdict::Deny
+    );
+}
+
+#[test]
+fn the_lifecycle_example_parses_and_its_tests_pass() {
+    let (rules, tests) =
+        RuleSet::from_toml_with_tests("20-services-lifecycle.toml", LIFECYCLE_EXAMPLE)
+            .unwrap_or_else(|e| panic!("lifecycle example does not load: {e}"));
+    assert_eq!(rules.actions().len(), 1);
+    assert!(
+        rules
+            .actions()
+            .iter()
+            .any(|action| action.id.as_str() == "xudo.svc.lifecycle")
+    );
+    assert!(
+        tests.len() >= 7,
+        "the example's [[test]] tables were dropped: {}",
+        tests.len()
+    );
+    let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|result| !result.outcome.passed())
+        .map(|result| format!("{:?} {:?}", result.test.argv, result.outcome))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "example tests fail:\n{}",
+        failures.join("\n")
+    );
+
+    // Near misses the [[test]] tables also pin, asserted here so deleting a
+    // table cannot make an unlisted unit look allowed.
+    for unit in [
+        "nginx.service",
+        "systemd-poweroff.service",
+        "poweroff.target",
+        "example",
+        "example.service.extra",
+    ] {
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
+                "xudo.svc.lifecycle",
+                Argv::new(vec!["--no-pager", "--no-ask-password", "restart", unit]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{unit} was permitted");
+    }
+}
+
+/// Every unit the deny-list keys, with the class that entry uses.
+///
+/// The cartesian check below is the proof that a `unit-name` lifecycle rule
+/// (the hole) still cannot reach one. The class is pinned so a tripwire that
+/// moved to the wrong class fails here.
+fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
+    let mut units = Vec::new();
+    let power = [
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "soft-reboot.target",
+        "ctrl-alt-del.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+        "sleep.target",
+        "shutdown.target",
+        "rescue.target",
+        "emergency.target",
+        "exit.target",
+        "sysinit.target",
+        "runlevel0.target",
+        "runlevel1.target",
+        "runlevel6.target",
+        "systemd-poweroff.service",
+        "systemd-reboot.service",
+        "systemd-halt.service",
+        "systemd-kexec.service",
+        "systemd-soft-reboot.service",
+        "systemd-suspend.service",
+        "systemd-hibernate.service",
+        "systemd-hybrid-sleep.service",
+        "systemd-suspend-then-hibernate.service",
+    ];
+    for unit in power {
+        units.push((unit, CapabilityClass::PowerState));
+    }
+    units.push(("debug-shell.service", CapabilityClass::SpawnsShell));
+    units.push(("modprobe@dummy.service", CapabilityClass::KernelModule));
+    for unit in [
+        "systemd-fsck@dev-sda1.service",
+        "systemd-growfs@dev-sda1.service",
+        "systemd-makefs@dev-sda1.service",
+        "mdadm@dev-md0.service",
+    ] {
+        units.push((unit, CapabilityClass::DeviceOrFilesystem));
+    }
+    for unit in [
+        "xudod.service",
+        "xudod.socket",
+        "xudo-pasban.service",
+        "systemd-journald.service",
+        "systemd-journald.socket",
+        "systemd-journald-dev-log.socket",
+        "rsyslog.service",
+    ] {
+        units.push((unit, CapabilityClass::SelfModification));
+    }
+    for unit in [
+        "apparmor.service",
+        "auditd.service",
+        "nftables.service",
+        "ufw.service",
+        "netfilter-persistent.service",
+        "firewalld.service",
+        "systemd-timesyncd.service",
+        "chrony.service",
+        "chronyd.service",
+    ] {
+        units.push((unit, CapabilityClass::SecuritySubsystem));
+    }
+    units
+}
+
+#[test]
+fn no_lifecycle_verb_reaches_a_listed_unit() {
+    let rules = hole_lifecycle();
+    // The fixture really is a hole for an ordinary service. If this failed,
+    // a later DenyListed would only mean "the rule did not match".
+    let ordinary = xudo_policy::evaluate(
+        &rules,
+        &human(),
+        &Request::new(
+            "xudo.svc.lifecycle",
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "nginx.service",
+            ]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(ordinary.verdict, Verdict::Allow, "{:?}", ordinary.denial);
+
+    for verb in LIFECYCLE_VERBS {
+        for (unit, class) in listed_units() {
+            let decision = xudo_policy::evaluate(
+                &rules,
+                &human(),
+                &Request::new(
+                    "xudo.svc.lifecycle",
+                    Argv::new(vec!["--no-pager", "--no-ask-password", verb, unit]),
+                ),
+                Settings::default(),
+            );
+            assert_eq!(
+                decision.denial,
+                Some(DenialCode::DenyListed),
+                "{verb} {unit} gave {:?} {:?}",
+                decision.verdict,
+                decision.denial
+            );
+            let classes = unit_classes(verb, unit);
+            assert!(
+                classes.contains(&class),
+                "{verb} {unit} was {classes:?}, expected {class:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -682,12 +938,6 @@ fn the_install_probe_permits_gnuid_dash_u_and_nothing_wider() {
 /// an action with no example here fails the tests that walk the ruleset.
 fn example(id: &str) -> Vec<&'static str> {
     match id {
-        "xudo.svc.lifecycle" => vec![
-            "--no-pager",
-            "--no-ask-password",
-            "restart",
-            "nginx.service",
-        ],
         "xudo.svc.status" => vec!["--no-pager", "--full", "status", "nginx.service"],
         "xudo.svc.show" => vec!["--no-pager", "show", "nginx.service"],
         "xudo.svc.logs" => vec!["--no-pager", "-u", "nginx.service"],

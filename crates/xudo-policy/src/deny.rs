@@ -50,7 +50,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    2
+    3
 }
 
 /// A class of capability that is never permitted as root.
@@ -483,7 +483,8 @@ const FATAL_SYSCTL_KEYS: &[&[u8]] = &[
 /// `hybrid-sleep`, `suspend-then-hibernate`, `sleep`, and `shutdown` are the
 /// same power act as `suspend` and `poweroff`. `sysinit` is the early-boot
 /// target. Ordinary dependency targets (`multi-user`, `network`) are not in
-/// this list.
+/// this list. Runlevel aliases are [`RUNLEVELS`]: `runlevel0` is poweroff,
+/// `runlevel6` is reboot, and `runlevel1` is rescue.
 const POWER_OR_BOOT_TARGETS: &[&[u8]] = &[
     b"poweroff.target",
     b"reboot.target",
@@ -502,6 +503,32 @@ const POWER_OR_BOOT_TARGETS: &[&[u8]] = &[
     b"exit.target",
     b"sysinit.target",
 ];
+
+/// `runlevel0` (poweroff), `runlevel1` (rescue), `runlevel6` (reboot).
+///
+/// These are aliases of the special targets. A name match on
+/// `poweroff.target` alone misses `runlevel0.target`.
+const RUNLEVELS: &[&[u8]] = &[b"runlevel0", b"runlevel1", b"runlevel6"];
+
+/// Services that implement a power or sleep target.
+///
+/// `systemd-poweroff.service` is a different unit from `poweroff.target`, and
+/// a `.service`-only rule still accepts it. The stem is matched, so the bare
+/// name systemd resolves to `stem.service` is the same unit.
+const POWER_SERVICES: &[&[u8]] = &[
+    b"systemd-poweroff",
+    b"systemd-reboot",
+    b"systemd-halt",
+    b"systemd-kexec",
+    b"systemd-soft-reboot",
+    b"systemd-suspend",
+    b"systemd-hibernate",
+    b"systemd-hybrid-sleep",
+    b"systemd-suspend-then-hibernate",
+];
+
+/// `debug-shell.service` is an unauthenticated root shell on tty9.
+const SHELL_UNITS: &[&[u8]] = &[b"debug-shell"];
 
 /// Template prefixes whose instance is a kernel module name.
 const KERNEL_MODULE_TEMPLATES: &[&[u8]] = &[b"modprobe"];
@@ -625,27 +652,69 @@ fn has_unit_stem(unit: &[u8], stem: &[u8]) -> bool {
     }
 }
 
+/// Stems of xudo's own units, and of the log path its audit mirror uses.
+///
+/// Stopping the broker socket removes the policy that allowed the command.
+/// `systemd-journald` is where that decision is mirrored; once it is stopped,
+/// every later decision fails closed. `systemd-journald-dev-log.socket` is
+/// not the `systemd-journald` stem (`-dev-log` is not a suffix separator).
+/// `rsyslog` is the same log path on a host that forwards the journal.
+const AUDIT_MIRROR_UNITS: &[&[u8]] =
+    &[b"systemd-journald", b"systemd-journald-dev-log", b"rsyslog"];
+
+/// Firewall and time-sync stems, plus `AppArmor` and auditd.
+///
+/// Stopping a firewall unit removes a host security control, which is what
+/// [`CapabilityClass::SecuritySubsystem`] is for. Stopping a time-sync unit
+/// is the same act as `set-ntp false`. There is no time-sync class; this one
+/// is the class for disabling a host control, and
+/// [`CapabilityClass::SelfModification`] stays the class for xudo's own
+/// policy and audit path.
+const SECURITY_UNITS: &[&[u8]] = &[
+    b"apparmor",
+    b"auditd",
+    b"nftables",
+    b"ufw",
+    b"netfilter-persistent",
+    b"firewalld",
+    b"systemd-timesyncd",
+    b"chrony",
+    b"chronyd",
+];
+
 /// xudo's own units. Stopping the broker socket, or an `xudo-*` service,
-/// removes the policy that allowed the command.
+/// removes the policy that allowed the command. The journal stems are the
+/// audit mirror; see [`AUDIT_MIRROR_UNITS`].
 fn is_self_unit(unit: &[u8]) -> bool {
-    has_unit_stem(unit, b"xudod") || unit.starts_with(b"xudo-")
+    has_unit_stem(unit, b"xudod") || unit.starts_with(b"xudo-") || stem_in(unit, AUDIT_MIRROR_UNITS)
 }
 
-/// `AppArmor` and auditd. Stopping either removes the backstop the class exists
-/// for.
+/// A firewall, time-sync, `AppArmor`, or audit unit.
 fn is_security_unit(unit: &[u8]) -> bool {
-    has_unit_stem(unit, b"apparmor") || has_unit_stem(unit, b"auditd")
+    stem_in(unit, SECURITY_UNITS)
+}
+
+/// Whether `unit` is `stem`, `stem.something`, or `stem@instance`.
+fn stem_in(unit: &[u8], stems: &[&[u8]]) -> bool {
+    stems.iter().any(|stem| has_unit_stem(unit, stem))
 }
 
 /// The capability class of one unit name, after escapes have been decoded.
 fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
-    // Every entry ends in `.target`. Skipping the list for any other
-    // suffix keeps the common service-name path to a couple of compares.
+    // Every power-target entry ends in `.target`. Skipping that list for any
+    // other suffix keeps the common service-name path to a couple of compares.
+    // Runlevels are stems: `runlevel0.target` and the bare name both match.
     if unit.ends_with(b".target") && POWER_OR_BOOT_TARGETS.contains(&unit) {
+        return Some(CapabilityClass::PowerState);
+    }
+    if stem_in(unit, RUNLEVELS) || stem_in(unit, POWER_SERVICES) {
         return Some(CapabilityClass::PowerState);
     }
     if let Some(class) = template_class(unit) {
         return Some(class);
+    }
+    if stem_in(unit, SHELL_UNITS) {
+        return Some(CapabilityClass::SpawnsShell);
     }
     if is_self_unit(unit) {
         return Some(CapabilityClass::SelfModification);
@@ -703,6 +772,56 @@ fn matches_name(name: &[u8], set: &[&[u8]]) -> bool {
     })
 }
 
+/// `bytes` is `-{letter}{value}` with a non-empty value.
+///
+/// apt reads `-oFoo=bar` and `-c/path` this way, and sysctl reads `-p/path`
+/// the same way. `--option` does not match: its second byte is `-`, not the
+/// letter.
+fn joined_short_option(bytes: &[u8], letter: u8) -> bool {
+    let Some((dash, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if *dash != b'-' {
+        return false;
+    }
+    let Some((flag, value)) = rest.split_first() else {
+        return false;
+    };
+    *flag == letter && !value.is_empty()
+}
+
+/// `bytes` is `{name}={value}`, with `name` including its leading dashes.
+fn joined_long_option(bytes: &[u8], name: &[u8]) -> bool {
+    bytes
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with(b"="))
+}
+
+/// Whether `name` is a package manager whose `-o` and `-c` redirect config.
+fn is_package_manager(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"apt" | b"apt-get" | b"dpkg" | b"dnf" | b"yum" | b"zypper" | b"pacman"
+    )
+}
+
+/// An exact or joined spelling of `-o`, `--option`, `-c`, or `--config-file`.
+fn redirects_package_config(bytes: &[u8]) -> bool {
+    matches!(bytes, b"-o" | b"--option" | b"-c" | b"--config-file")
+        || joined_short_option(bytes, b'o')
+        || joined_short_option(bytes, b'c')
+        || joined_long_option(bytes, b"--option")
+        || joined_long_option(bytes, b"--config-file")
+}
+
+/// An exact or joined spelling of sysctl's file-driven flags.
+fn applies_sysctl_file(bytes: &[u8]) -> bool {
+    matches!(bytes, b"-p" | b"--load" | b"--system")
+        || joined_short_option(bytes, b'p')
+        || joined_long_option(bytes, b"--load")
+        || joined_long_option(bytes, b"--system")
+}
+
 /// Returns `true` when `path` is at or beneath any protected prefix.
 fn touches_protected_path(path: &[u8]) -> bool {
     if !path.starts_with(b"/") {
@@ -720,8 +839,10 @@ fn touches_protected_path(path: &[u8]) -> bool {
 /// canonical argv.
 ///
 /// `exe` must already be the absolute, resolved path; this crate cannot resolve
-/// it. `argv` must already be canonicalized, so `--key=value` has been split
-/// and a flag cannot hide its payload behind an `=`.
+/// it. `argv` must already be canonicalized. Canonicalization does **not**
+/// split `--key=value` (see [`crate::argv::Argv::canonicalize`]): a joined
+/// flag is one argument, so a flag this list refuses is matched both as an
+/// exact token and as the joined prefix `--flag=` or `-xVALUE`.
 ///
 /// Returns every class that matched, sorted and deduplicated, so an audit
 /// record names all of them rather than whichever happened to be checked first.
@@ -842,8 +963,11 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
         }
 
         // File-driven sysctl application: the values come from a file this
-        // argv does not name, so argv matching cannot see them.
-        if name == b"sysctl" && matches!(bytes, b"-p" | b"--load" | b"--system") {
+        // argv does not name, so argv matching cannot see them. `-p/path` and
+        // `--load=/path` are the joined spellings of the same flags.
+        // `--system=` is refused with them: it is the joined form of a flag
+        // this list already refuses, and a value there is still a file.
+        if name == b"sysctl" && applies_sysctl_file(bytes) {
             findings.push(DenyFinding::new(
                 CapabilityClass::ConfigNamedProgram,
                 format!("argument {index} applies sysctl values from a file"),
@@ -862,8 +986,8 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
         }
 
         // A unit `systemctl` would act on, whatever the verb in front of it.
-        // The lifecycle rule refuses these by shape. This is what still
-        // refuses them when a later rule matches the generic unit-name kind.
+        // The shipped rules do not start or stop a unit. This is what still
+        // refuses a listed unit when an operator's rule names it.
         if name == b"systemctl"
             && let Some(class) = classify_systemctl_unit(bytes)
         {
@@ -877,13 +1001,11 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
         }
 
         // An option that redirects a package manager's configuration, hooks, or
-        // root, independent of which manager it is.
-        if matches!(bytes, b"-o" | b"--option" | b"-c" | b"--config-file")
-            && matches!(
-                name,
-                b"apt" | b"apt-get" | b"dpkg" | b"dnf" | b"yum" | b"zypper" | b"pacman"
-            )
-        {
+        // root, independent of which manager it is. apt reads `-oFoo=bar` and
+        // `-c/path` as the joined spellings of `-o` and `-c`; `--option=` and
+        // `--config-file=` are the long forms. The value never becomes its
+        // own argument, so an exact-token check misses it.
+        if is_package_manager(name) && redirects_package_config(bytes) {
             findings.push(DenyFinding::new(
                 CapabilityClass::ConfigNamedProgram,
                 format!("argument {index} redirects package-manager configuration"),
@@ -913,7 +1035,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 2);
+        assert_eq!(deny_list_version(), 3);
     }
 
     #[test]
@@ -1364,6 +1486,164 @@ mod tests {
         assert!(
             classes("/usr/bin/systemctl", &["stop", "xudod.socket"])
                 .contains(&CapabilityClass::SelfModification)
+        );
+    }
+
+    #[test]
+    fn denies_poweroff_via_systemd_poweroff_service() {
+        for unit in [
+            "systemd-poweroff.service",
+            "systemd-reboot.service",
+            "systemd-halt.service",
+            "systemd-kexec.service",
+            "systemd-soft-reboot.service",
+            "systemd-suspend.service",
+            "systemd-hibernate.service",
+            "systemd-hybrid-sleep.service",
+            "systemd-suspend-then-hibernate.service",
+            "runlevel0.target",
+            "runlevel1.target",
+            "runlevel6.target",
+            "systemd-poweroff",
+        ] {
+            assert!(
+                classes("/usr/bin/systemctl", &["start", unit])
+                    .contains(&CapabilityClass::PowerState),
+                "{unit}"
+            );
+        }
+        assert!(!denies("/usr/bin/systemctl", &["start", "nginx.service"]));
+    }
+
+    #[test]
+    fn denies_debug_shell_service() {
+        assert!(
+            classes("/usr/bin/systemctl", &["start", "debug-shell.service"])
+                .contains(&CapabilityClass::SpawnsShell)
+        );
+        assert!(
+            classes("/usr/bin/systemctl", &["start", "debug-shell"])
+                .contains(&CapabilityClass::SpawnsShell)
+        );
+    }
+
+    #[test]
+    fn firewall_time_sync_and_journal_units_are_denied() {
+        for unit in [
+            "nftables.service",
+            "ufw.service",
+            "netfilter-persistent.service",
+            "firewalld.service",
+            "systemd-timesyncd.service",
+            "chrony.service",
+            "chronyd.service",
+        ] {
+            assert!(
+                classes("/usr/bin/systemctl", &["stop", unit])
+                    .contains(&CapabilityClass::SecuritySubsystem),
+                "{unit}"
+            );
+        }
+        for unit in [
+            "systemd-journald.service",
+            "systemd-journald.socket",
+            "systemd-journald-dev-log.socket",
+            "rsyslog.service",
+        ] {
+            assert!(
+                classes("/usr/bin/systemctl", &["stop", unit])
+                    .contains(&CapabilityClass::SelfModification),
+                "{unit}"
+            );
+        }
+        // `chronyd` is not the `chrony` stem, and the dev-log socket is not
+        // the journald stem. Both are listed on their own, and a neighbour
+        // is not pulled in with them.
+        assert_eq!(
+            classes("/usr/bin/systemctl", &["stop", "chronyd.service"]).len(),
+            1
+        );
+        assert!(!denies(
+            "/usr/bin/systemctl",
+            &["stop", "systemd-journald-extra.service"]
+        ));
+    }
+
+    #[test]
+    fn denies_joined_config_file_option() {
+        for arg in ["--config-file=/tmp/evil.conf", "-c/tmp/evil.conf"] {
+            assert!(
+                classes("/usr/bin/apt-get", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        assert!(
+            classes("/usr/bin/dnf", &["--config-file=/tmp/evil.repo"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        // A different long option, and systemctl's own `-c`, are not this flag.
+        assert!(
+            !classes("/usr/bin/apt-get", &["--config=/tmp/evil.conf"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            !classes("/usr/bin/systemctl", &["-c/tmp/evil.conf"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+    }
+
+    #[test]
+    fn denies_joined_package_option() {
+        for arg in ["-oDir::Cache=/tmp/a0", "--option=Dir::Cache=/tmp/a0"] {
+            assert!(
+                classes("/usr/bin/apt-get", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        assert!(
+            classes("/usr/bin/apt-get", &["-o", "Dir::Cache=/tmp/a0"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        // Not a joined option: an empty argument, a lone dash, a bare flag
+        // (the joined form needs a value), and a long option that only
+        // shares a prefix.
+        assert!(!joined_short_option(b"-o", b'o'));
+        assert!(!joined_short_option(b"-c", b'c'));
+        assert!(!joined_short_option(b"-p", b'p'));
+        assert!(!classes("/usr/bin/apt-get", &[""]).contains(&CapabilityClass::ConfigNamedProgram));
+        assert!(
+            !classes("/usr/bin/apt-get", &["-"]).contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            !classes("/usr/bin/apt-get", &["--option-extra"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            !classes("/usr/bin/apt-get", &["--opt=Dir::Cache=/tmp"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+    }
+
+    #[test]
+    fn denies_joined_sysctl_load() {
+        for arg in [
+            "-p/tmp/evil.conf",
+            "--load=/tmp/evil.conf",
+            "--system=/tmp/evil.conf",
+        ] {
+            assert!(
+                classes("/sbin/sysctl", &[arg]).contains(&CapabilityClass::ConfigNamedProgram),
+                "{arg}"
+            );
+        }
+        // `-p` on systemctl is a property flag, not a file load.
+        assert!(
+            !classes("/usr/bin/systemctl", &["-p/ActiveState"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            !classes("/sbin/sysctl", &["--load-extra"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
         );
     }
 }
