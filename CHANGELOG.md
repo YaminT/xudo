@@ -72,10 +72,17 @@ All notable changes to xudo are documented here. This project follows
   `RLIMIT_FSIZE` just past the log made the first `write` return a short
   count and the next one raise `SIGXFSZ`, which killed the gate before the
   torn tail could be cut back. The broker and every later gate then refused
-  the damaged log. An append is now one `write`. A short count is a failure
-  and the existing cut-back runs, so the request is denied and the log stays
-  intact. `EINTR` (which writes nothing) is tried once more; a second
-  interrupt is a failure too.
+  the damaged log. An append is now one `write`. On this `RLIMIT_FSIZE`
+  route a short count is a failure and the existing cut-back runs, so the
+  request is denied and the log stays intact. `EINTR` (which writes nothing)
+  is tried once more; a second interrupt is a failure too. This holds for
+  `RLIMIT_FSIZE` only. `SIGXFSZ` and `SIGXCPU` are core-dump signals and are
+  not delivered between the pages of one `write`, so they do not tear a
+  record. `SIGTERM`, `SIGHUP` and `SIGINT` still can, when the record crosses
+  a page boundary; the caller can steer that length through argv, and sudo
+  relaying a signal (or the pty hanging up) can deliver it. That route
+  predates this fix. xudo stays down until an operator moves the log aside.
+  Blocking signals around the write is a later change.
 
 ### Added
 
