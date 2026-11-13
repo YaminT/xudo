@@ -12,7 +12,7 @@
 
 use std::io::Write;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use term_sanitize::{Clean, Limits};
 use xudo_policy::{
     CallerFacts, Classification, DenialCode, ExitCode, TestError, TestOutcome, TestResult,
@@ -114,10 +114,12 @@ pub(crate) fn run(
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
     let status = report.status();
+    let note =
+        crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT);
     match cli.output {
-        Format::Human => human_report(loaded, &report, tests_only, out, err),
+        Format::Human => human_report(loaded, &report, tests_only, note, out, err),
         Format::Json => {
-            let _ = writeln!(out, "{}", envelope(&report, status));
+            let _ = writeln!(out, "{}", envelope(&report, status, note));
         }
     }
     status
@@ -127,6 +129,7 @@ fn human_report(
     loaded: &LoadedRules,
     report: &Report,
     tests_only: bool,
+    note: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) {
@@ -155,6 +158,10 @@ fn human_report(
                 loaded.generation().get(..12).unwrap_or(loaded.generation())
             );
         }
+        // A note, not a finding: the exit status above does not count it.
+        if let Some(note) = note {
+            let _ = writeln!(out, "{note}");
+        }
         // Reported, not refused: the engine resolves a command more than one
         // action accepts to the strictest of them, so an overlap is not a hole.
         // It is still two rules whose interaction nobody wrote down, and the
@@ -171,6 +178,8 @@ fn human_report(
                 report.warnings.len()
             );
         }
+    } else if let Some(note) = note {
+        let _ = writeln!(out, "{note}");
     }
     if let Some(fuzz) = &report.fuzz {
         fuzz_lines(fuzz, out, err);
@@ -294,31 +303,41 @@ fn failure(result: &TestResult, out: &mut dyn Write) {
 
 /// The machine-readable report. Strings are JSON-escaped, not sanitized: the
 /// consumer is a program, and it gets the bytes the rule file holds.
-fn envelope(report: &Report, status: ExitCode) -> Value {
+fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
     let results: Vec<Value> = report.results.iter().map(result_json).collect();
-    let mut envelope = json!({
-        "schema_version": SCHEMA_VERSION,
-        "exit_code": status.as_i32(),
-        "lint": {
+    // A map, not `json!` then `as_object_mut`: that `if let` has a `None` arm
+    // `json!` can never take, and coverage has nothing to mark it with.
+    let mut fields = Map::new();
+    fields.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
+    fields.insert("exit_code".to_owned(), json!(status.as_i32()));
+    fields.insert(
+        "lint".to_owned(),
+        json!({
             "errors": report
                 .errors
                 .iter()
                 .map(|(id, classes)| json!({ "action": id, "classes": classes }))
                 .collect::<Vec<_>>(),
             "warnings": report.warnings,
-        },
-        "tests": {
+        }),
+    );
+    fields.insert(
+        "tests".to_owned(),
+        json!({
             "total": report.results.len(),
             "failed": report.failed(),
             "results": results,
-        },
-    });
+        }),
+    );
     // Only when asked for, so a run without `--fuzz` is byte for byte what it
-    // was.
-    if let (Some(fuzz), Some(fields)) = (&report.fuzz, envelope.as_object_mut()) {
+    // was. The lifecycle note is the same: absent when the rule is loaded.
+    if let Some(fuzz) = &report.fuzz {
         fields.insert("fuzz".to_owned(), fuzz_json(fuzz));
     }
-    envelope
+    if let Some(note) = note {
+        fields.insert("note".to_owned(), json!(note));
+    }
+    Value::Object(fields)
 }
 
 fn result_json(result: &TestResult) -> Value {
@@ -452,7 +471,7 @@ mod tests {
             fuzz: Some(report()),
         };
         assert_eq!(found.status(), ExitCode::LintError);
-        let json = envelope(&found, found.status());
+        let json = envelope(&found, found.status(), None);
         insta::assert_snapshot!(
             "fuzz_envelope",
             serde_json::to_string_pretty(&json).unwrap()

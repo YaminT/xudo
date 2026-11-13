@@ -4,7 +4,8 @@
 # row of the matrix must produce byte-identical answers for all of them; the
 # backend underneath is not a policy input.
 
-# svc-control: the shipped lifecycle rule, then the ways it must refuse.
+# svc-control: no shipped rule restarts a service. The first row used to match
+# the lifecycle rule; it must now be refused with the other near misses.
 /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
 /usr/bin/systemctl restart nginx.service
 /usr/bin/systemctl --no-pager --no-ask-password restart nginx

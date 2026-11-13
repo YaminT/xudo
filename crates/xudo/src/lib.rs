@@ -33,6 +33,7 @@ pub mod cli;
 pub mod doctor;
 mod exchange;
 pub mod exec;
+mod lifecycle_note;
 pub mod probe;
 pub mod render;
 pub mod rules;

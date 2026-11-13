@@ -6,35 +6,26 @@
 # deny-list, because a tier boundary that depends on one list being complete is
 # not a boundary.
 #
-# Lifecycle and reset-failed take service-unit-name: a `.service` with no `@`
-# and no backslash. The generic unit-name kind still accepts `.target`,
-# `.mount`, templates, and escapes, because the journal rules use it to name
-# any unit whose log is being read. A suffix-less name is still refused:
-# `systemctl restart foo` resolves `foo` to `foo.service`.
+# There is no shipped service-lifecycle rule. Restarting a service is an
+# enumeration the operator writes per host: copy
+# /usr/share/doc/xudo/examples/20-services-lifecycle.toml into this directory
+# and replace the placeholder units. The source of that example is
+# rules/examples/20-services-lifecycle.toml.example, which the loader cannot
+# read (the name does not end in `.toml`).
 #
-# The compiled-in deny-list also refuses, on any verb, a power or boot target,
-# `modprobe@`, the fsck/growfs/makefs and `mdadm*@` templates, `xudod` and
-# `xudo-*` units, and `apparmor` / `auditd`. A later rule that goes back to
-# unit-name cannot reopen those.
-
-[[action]]
-id = "xudo.svc.lifecycle"
-tier = "svc-control"
-exe = "/usr/bin/systemctl"
-args = [
-  { name = "no-pager", matcher = { literal = "--no-pager" } },
-  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
-  { name = "verb", matcher = { one-of = [
-    "start",
-    "stop",
-    "restart",
-    "try-restart",
-    "reload",
-    "reload-or-restart",
-    "try-reload-or-restart",
-  ] } },
-  { name = "unit", matcher = { name = "service-unit-name" } },
-]
+# reset-failed takes service-unit-name: a `.service` with no `@` and no
+# backslash. It does not start or stop the unit. The generic unit-name kind
+# still accepts `.target`, `.mount`, templates, and escapes, because the
+# journal rules use it to name any unit whose log is being read. A suffix-less
+# name is still refused: `systemctl restart foo` resolves `foo` to
+# `foo.service`.
+#
+# The compiled-in deny-list also refuses, on any verb, a power or boot target
+# (including runlevel0, runlevel1, and runlevel6), the systemd power services,
+# `debug-shell`, `modprobe@`, the fsck/growfs/makefs and `mdadm*@` templates,
+# `xudod` and `xudo-*` units, the journal and rsyslog units, the firewall
+# units, the time-sync units, and `apparmor` / `auditd`. A later rule that
+# lists one of those units cannot reopen it.
 
 [[action]]
 id = "xudo.svc.reset-failed"
@@ -68,8 +59,8 @@ argv = [
   "restart",
   "nginx.service",
 ]
-expect = "allow"
-action = "xudo.svc.lifecycle"
+expect = "deny"
+reason = "no shipped rule restarts a service; copy the lifecycle example and list the unit"
 
 [[test]]
 argv = ["/usr/bin/systemctl", "--no-pager", "reset-failed", "nginx.service"]

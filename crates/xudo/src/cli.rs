@@ -2895,6 +2895,34 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         assert_eq!(code, ExitCode::Delegated);
         assert!(out.starts_with("ok: "), "{out}");
         assert!(!out.contains("overlap"), "{out}");
+        assert!(
+            out.contains(crate::lifecycle_note::TEXT),
+            "shipped rules have no lifecycle action, so check must say so: {out}"
+        );
+    }
+
+    #[test]
+    fn check_is_silent_about_lifecycle_when_the_operator_listed_one() {
+        let with_lifecycle = RULES.replacen("xudo.svc.restart", "xudo.svc.lifecycle", 1);
+        let fx = Fixture::new("cli-check-lifecycle").write("10-rules.toml", &with_lifecycle);
+        let (code, out, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}{err}");
+        assert!(out.starts_with("ok: "), "{out}");
+        assert!(
+            !out.contains("no service lifecycle rule:"),
+            "a loaded lifecycle action is not a missing one: {out}"
+        );
+        let (code, json, _) = fx.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::Delegated);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("note").is_none(), "{json}");
+        assert_eq!(parsed["exit_code"], 0);
+        // `--tests-only` skips the ok line. The note is still absent, because
+        // the rule is loaded. This is the other arm of that print.
+        let (code, out, err) = fx.run(&["check", "--tests-only"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}{err}");
+        assert_eq!(out, "tests: none\n", "{out}");
+        assert!(err.is_empty(), "{err}");
     }
 
     #[test]
@@ -3157,7 +3185,11 @@ expect = "deny"
 
         let (code, out, _) = fixture("cli-tests-only-none").run(&["check", "--tests-only"]);
         assert_eq!(code, ExitCode::Delegated);
-        assert_eq!(out, "tests: none\n");
+        assert_eq!(
+            out,
+            format!("{}\ntests: none\n", crate::lifecycle_note::TEXT),
+            "{out}"
+        );
     }
 
     #[test]

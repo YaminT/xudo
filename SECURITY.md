@@ -18,9 +18,14 @@ needed to separate the agent from the human.
 The published `v0.1.0-beta.1` package ships `xudo.svc.lifecycle` accepting
 `systemctl` start, stop, and restart of power, reboot, rescue, kernel-module,
 device, and broker-socket units for any caller who passes the password gate.
-This tree refuses those units. The lifecycle and `reset-failed` rules accept
-only a plain `.service` name, and the compiled-in deny-list refuses the same
-units on `systemctl` for every verb.
+The shipped rule set no longer contains a service lifecycle rule. Copy
+`/usr/share/doc/xudo/examples/20-services-lifecycle.toml` to
+`/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
+still ships, and accepts only a plain `.service` name. The compiled-in
+deny-list refuses the units above, the systemd power and sleep services,
+`debug-shell`, the runlevel aliases, firewall and time-sync units, and the
+journal units, on `systemctl` for every verb, including a unit an operator
+listed by mistake.
 
 ## Reporting
 

@@ -153,6 +153,12 @@ pub struct RulesetReport {
     pub trust: TrustReport,
     /// Whether each loaded rule matches dpkg's shipped conffile checksum.
     pub package_drift: RuleDriftReport,
+    /// Set when the rules loaded and none of them is `xudo.svc.lifecycle`.
+    ///
+    /// A note, not a fault: doctor still exits 0. Absent when the rules did
+    /// not load, and when the operator has copied the example.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_note: Option<&'static str>,
 }
 
 /// How a loaded rule relates to dpkg's original conffile record.
@@ -408,6 +414,9 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         load_error: loaded.err().map(ToString::to_string),
         trust,
         package_drift,
+        lifecycle_note: loaded.ok().and_then(|loaded| {
+            crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT)
+        }),
     }
 }
 
@@ -845,6 +854,9 @@ pub(crate) fn human(report: &Report) -> String {
     }
     backend_lines(&report.backend, &mut line);
     line("exec path", &report.exec_path);
+    // `line` mutably borrows `out` until this last call. The note is one bare
+    // sentence between the ruleset row and the trust row.
+    insert_lifecycle_note(&mut out, report.ruleset.lifecycle_note);
     let _ = write!(out, "{}", paths_section(&report.paths_to_root));
     if let Some(proposals) = &report.proposals {
         let prefixed = report.backend.exe.is_some() && !report.paths_to_root.subject.is_root;
@@ -859,6 +871,26 @@ pub(crate) fn human(report: &Report) -> String {
         "security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+/// Puts `note` on its own line immediately before the rules-trust row.
+///
+/// `human` cannot write it there directly: the row closure borrows the
+/// buffer until the last row. No anchor means the ruleset section was not
+/// rendered, and the note is omitted rather than appended somewhere else.
+fn insert_lifecycle_note(out: &mut String, note: Option<&str>) {
+    let Some(note) = note else {
+        return;
+    };
+    let Some(pos) = out.find("\nrules trust") else {
+        return;
+    };
+    let mut sentence = String::with_capacity(note.len().saturating_add(1));
+    sentence.push_str(note);
+    sentence.push('\n');
+    // One past the newline that opens the trust row. Display layout only.
+    let at = pos.saturating_add(1);
+    out.insert_str(at, &sentence);
 }
 
 fn drift_label(status: RuleDriftStatus) -> &'static str {
@@ -2005,6 +2037,22 @@ mod tests {
     }
 
     #[test]
+    fn the_lifecycle_note_sits_between_the_ruleset_and_trust_rows() {
+        let mut out = "ruleset      1 action(s)\nrules trust  ok\n".to_owned();
+        insert_lifecycle_note(&mut out, Some("note line"));
+        assert_eq!(
+            out,
+            "ruleset      1 action(s)\nnote line\nrules trust  ok\n"
+        );
+        let mut untouched = out.clone();
+        insert_lifecycle_note(&mut untouched, None);
+        assert_eq!(untouched, out);
+        let mut no_anchor = "ruleset only\n".to_owned();
+        insert_lifecycle_note(&mut no_anchor, Some("note line"));
+        assert_eq!(no_anchor, "ruleset only\n");
+    }
+
+    #[test]
     fn the_envelope_of_a_clean_machine_is_pinned() {
         let loaded = fixture_rules("1");
         let report = gathered(
@@ -2035,6 +2083,15 @@ mod tests {
 
     #[test]
     fn the_envelope_of_a_machine_with_every_other_path_to_root_is_pinned() {
+        let hostile = hostile_report(true);
+        assert!(
+            hostile.ruleset.lifecycle_note.is_none(),
+            "a ruleset that did not load has no lifecycle note"
+        );
+        assert!(
+            !human(&hostile).contains("no service lifecycle rule:"),
+            "an unloaded ruleset must not ask for a lifecycle file"
+        );
         insta::assert_snapshot!("json_every_path", render::json_of(&hostile_report(true)));
         insta::assert_snapshot!("human_every_path", human(&hostile_report(true)));
     }

@@ -1,0 +1,115 @@
+# EXAMPLE. Not a shipped rule.
+#
+# The loader reads only names ending in `.toml` in the rules directory, and the
+# package installs this file under /usr/share/doc, so it is never loaded by
+# accident. To let an operator restart a service:
+#
+#   cp /usr/share/doc/xudo/examples/20-services-lifecycle.toml /etc/xudo/rules.d/
+#
+# Then replace the placeholder names below with the units this host should
+# expose. Leave a name out and the command is refused. The compiled-in
+# deny-list still refuses a power service, debug-shell, the firewall, time
+# sync, the journal, and the other tripwire units even if you list one here
+# by mistake. Do not add those.
+
+[[action]]
+id = "xudo.svc.lifecycle"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = [
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+  ] } },
+  { name = "unit", matcher = { one-of = [
+    "example.service",
+    "example-other.service",
+  ] } },
+]
+
+# Tests run by `xudo check` once this file is copied into rules.d, and by the
+# build against this file on its own.
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "example.service",
+]
+expect = "allow"
+action = "xudo.svc.lifecycle"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "stop",
+  "example-other.service",
+]
+expect = "allow"
+action = "xudo.svc.lifecycle"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "nginx.service",
+]
+expect = "deny"
+reason = "near miss: nginx.service is not in the operator's list"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "start",
+  "systemd-poweroff.service",
+]
+expect = "deny"
+reason = "near miss: a power service is not in the placeholder list"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "start",
+  "poweroff.target",
+]
+expect = "deny"
+reason = "near miss: a power target is not a listed service"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "example",
+]
+expect = "deny"
+reason = "near miss: a unit name needs its suffix, and the bare name is not listed"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "enable",
+  "example.service",
+]
+expect = "deny"
+reason = "no rule accepts enable, which changes a unit definition"

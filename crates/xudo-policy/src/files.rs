@@ -424,6 +424,9 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "a.toml.bak",
             "a.toml.dpkg-old",
             "a.TOML",
+            // The packaged example lives beside the rules in the repo and must
+            // not be loaded if a directory walk ever sees it.
+            "20-services-lifecycle.toml.example",
         ] {
             assert!(!is_rule_file_name(name.as_bytes()), "{name}");
         }

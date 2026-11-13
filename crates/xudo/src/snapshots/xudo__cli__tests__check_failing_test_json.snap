@@ -2,4 +2,4 @@
 source: crates/xudo/src/cli.rs
 expression: json
 ---
-{"exit_code":22,"lint":{"errors":[],"warnings":[]},"schema_version":1,"tests":{"failed":1,"results":[{"action":null,"actual":"allow","argv":["/usr/bin/systemctl","restart","nginx.service"],"decided_by":"xudo.svc.restart","denial":null,"expect":"deny","file":"20-tests.toml","line":2,"outcome":"fail","reason":"restart is ours to allow"}],"total":1}}
+{"exit_code":22,"lint":{"errors":[],"warnings":[]},"note":"no service lifecycle rule: copy /usr/share/doc/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units","schema_version":1,"tests":{"failed":1,"results":[{"action":null,"actual":"allow","argv":["/usr/bin/systemctl","restart","nginx.service"],"decided_by":"xudo.svc.restart","denial":null,"expect":"deny","file":"20-tests.toml","line":2,"outcome":"fail","reason":"restart is ours to allow"}],"total":1}}

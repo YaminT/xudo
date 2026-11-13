@@ -11,5 +11,5 @@ ALLOW, after a human confirms
   trace
     canonicalized: unchanged (restart nginx.service)
     matched xudo.svc.restart at snapshot-fixture.toml:3
-    deny-list v2: no capability class matched
+    deny-list v3: no capability class matched
     confirmation required: an enrolled agent requested a privileged action and confirm_agent_actions is on
