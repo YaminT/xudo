@@ -306,6 +306,32 @@ const LIFECYCLE_VERBS: &[&str] = &[
     "try-reload-or-restart",
 ];
 
+/// Lifecycle verbs plus the power and boot subcommands. No shipped action
+/// may accept one of these on an ordinary service name.
+const LIFECYCLE_OR_POWER_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+    "isolate",
+    "poweroff",
+    "reboot",
+    "halt",
+    "kexec",
+    "suspend",
+    "hibernate",
+    "hybrid-sleep",
+    "suspend-then-hibernate",
+    "soft-reboot",
+    "rescue",
+    "emergency",
+    "default",
+    "exit",
+];
+
 #[test]
 fn service_lifecycle_permits_the_verbs_it_lists() {
     // The example, not the shipped rules. The shipped set has no lifecycle
@@ -757,23 +783,39 @@ fn a_suffixless_unit_name_is_refused() {
 
 #[test]
 fn the_shipped_rules_have_no_lifecycle_rule() {
+    // The engine, not the action id: no shipped systemctl action accepts a
+    // lifecycle or power verb on an ordinary service name. `status` still
+    // reads one.
     let rules = load_all();
-    assert!(
-        rules
-            .actions()
-            .iter()
-            .all(|action| action.id.as_str() != "xudo.svc.lifecycle"),
-        "xudo.svc.lifecycle is an example, not a shipped action"
-    );
+    for verb in LIFECYCLE_OR_POWER_VERBS {
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                *verb,
+                "nginx.service",
+            ]),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.verdict,
+            Verdict::Deny,
+            "{verb} of nginx.service was accepted: {:?}",
+            decision.denial
+        );
+    }
     assert_eq!(
         command_verdict(&[
             "/usr/bin/systemctl",
             "--no-pager",
-            "--no-ask-password",
-            "restart",
+            "--full",
+            "status",
             "nginx.service",
         ]),
-        Verdict::Deny
+        Verdict::Allow
     );
 }
 
