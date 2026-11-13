@@ -38,7 +38,7 @@ expression: "render::json_of(&report)"
       ],
       "unavailable": "test fixture has no dpkg record"
     },
-    "lifecycle_note": "no service lifecycle rule: copy /usr/share/doc/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units"
+    "lifecycle_note": "no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units"
   },
   "sudoers_snippet": {
     "installed_rule": null,

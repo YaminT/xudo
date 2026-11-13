@@ -1,10 +1,10 @@
 # EXAMPLE. Not a shipped rule.
 #
 # The loader reads only names ending in `.toml` in the rules directory, and the
-# package installs this file under /usr/share/doc, so it is never loaded by
-# accident. To let an operator restart a service:
+# package installs this file under /usr/share/xudo/examples, so it is never
+# loaded by accident. To let an operator restart a service:
 #
-#   cp /usr/share/doc/xudo/examples/20-services-lifecycle.toml /etc/xudo/rules.d/
+#   cp /usr/share/xudo/examples/20-services-lifecycle.toml /etc/xudo/rules.d/
 #
 # Then replace the placeholder names below with the units this host should
 # expose. Leave a name out and the command is refused. The compiled-in
