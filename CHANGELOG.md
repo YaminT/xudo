@@ -26,6 +26,14 @@ All notable changes to xudo are documented here. This project follows
   `g++` and `libstdc++6` are real names, `pkg+` on `apt-get install` is
   harmless, and on `remove` it merely installs (the remove rule already
   confirms).
+- The audit appender wrote a record with `write_all`. A caller who set
+  `RLIMIT_FSIZE` just past the log made the first `write` return a short
+  count and the next one raise `SIGXFSZ`, which killed the gate before the
+  torn tail could be cut back. The broker and every later gate then refused
+  the damaged log. An append is now one `write`. A short count is a failure
+  and the existing cut-back runs, so the request is denied and the log stays
+  intact. `EINTR` (which writes nothing) is tried once more; a second
+  interrupt is a failure too.
 
 ### Added
 

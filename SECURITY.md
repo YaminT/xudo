@@ -37,6 +37,17 @@ the remove rule. A trailing `+` stays accepted. `g++` is a real package name,
 `pkg+` on `apt-get install` asks apt to install the package, and on `remove`
 it merely installs.
 
+The published `v0.1.0-beta.1` audit appender wrote each record with
+`write_all`. A caller who set `RLIMIT_FSIZE` to the log's size plus a few
+bytes made the first `write` return a short count and the next one raise
+`SIGXFSZ`, killing the `-auth` gate before it could cut the torn line back.
+The broker and every later gate then refused the damaged tail, so xudo stayed
+down until an operator moved the log aside. An append is now one `write` of
+the whole record. A short count is a failure and the cut-back runs, denying
+the request and leaving the log as it was. `EINTR` wrote nothing, so it is
+tried once; a second interrupt fails the same way. This does not reset the
+caller's resource limits. That stays a later change.
+
 ## Reporting
 
 Open a private security advisory on the GitHub repository. Please do not open a
