@@ -43,7 +43,17 @@ grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted sy
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
-[ -f /usr/share/doc/xudo/examples/20-services-lifecycle.toml ] || fail "lifecycle example not installed"
+# Ubuntu's official images set path-exclude=/usr/share/doc/*, so dpkg never
+# unpacks the example there. Debian 13 does not, and the file is present.
+# ci/deb/run.sh is what checks the .deb itself contains the example.
+example=/usr/share/doc/xudo/examples/20-services-lifecycle.toml
+if [ ! -f "$example" ]; then
+    if [ ! -d /etc/dpkg/dpkg.cfg.d ] \
+        || ! grep -Rqs '^path-exclude=/usr/share/doc/\*' /etc/dpkg/dpkg.cfg.d
+    then
+        fail "lifecycle example not installed"
+    fi
+fi
 [ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
 printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/doc/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
