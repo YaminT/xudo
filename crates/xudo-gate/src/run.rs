@@ -16,23 +16,28 @@
 //! 2. **`/dev/null` for closed 0 to 2.** Before the first `open`, which would
 //!    otherwise take a closed descriptor's number and make the audit log the
 //!    gate's standard error.
-//! 3. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
+//! 3. **Umask `022` and working directory `/`.** Before anything is opened or
+//!    written. A caller umask of `000` would make a file an apt hook or a
+//!    maintainer script creates world-writable. The directory is an `O_PATH`
+//!    descriptor of `/`. Either failure refuses. The caller's resource limits
+//!    stay a later change.
+//! 4. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
-//! 4. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
+//! 5. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
 //!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
-//! 5. **`/proc` verified as procfs**, on the descriptor it is read through.
-//! 6. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
+//! 6. **`/proc` verified as procfs**, on the descriptor it is read through.
+//! 7. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
 //!    by `(pid, starttime)`, bounded at [`LINEAGE_PROCESSES`] processes. The
 //!    names the walk reads are hints and go in the audit record; nothing
 //!    branches on them. What the walk yields is a set of pins, and the next
 //!    step matches an entry to one of them.
-//! 7. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
+//! 8. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
 //!    generation is [`xudo_policy::Generation::id`] of what was loaded, the
 //!    value the broker minted against.
-//! 8. **The spool and the clock.** The broker's spool, opened through the trust
+//! 9. **The spool and the clock.** The broker's spool, opened through the trust
 //!    walk and seen through [`RequestSpool`], which can list, read and consume
 //!    and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked, and the
 //!    listing is cut off one name past that, so a crowded spool is refused
@@ -42,18 +47,18 @@
 //!    more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
 //!    one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!    reading of zero is refused as no reading.
-//! 9. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
-//!    through the verified directory descriptor before anything executes, and
-//!    a failed unlink — `ENOENT` included, which means a second gate took it
-//!    first ([`xudo_sys::SpoolError::Gone`]) — is a refusal. An entry is
-//!    therefore used at most once. This is the one place the broker's own
-//!    `remove`, for which a missing name is success, must not be used.
-//! 10. **The program**, opened through the trust walk and judged and hashed on
+//! 10. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
+//!     through the verified directory descriptor before anything executes, and
+//!     a failed unlink — `ENOENT` included, which means a second gate took it
+//!     first ([`xudo_sys::SpoolError::Gone`]) — is a refusal. An entry is
+//!     therefore used at most once. This is the one place the broker's own
+//!     `remove`, for which a missing name is success, must not be used.
+//! 11. **The program**, opened through the trust walk and judged and hashed on
 //!     that descriptor. A `#!` script is refused as a script.
-//! 11. **The audit record**, through [`xudo_sys::authorize`], before the exec.
+//! 12. **The audit record**, through [`xudo_sys::authorize`], before the exec.
 //!     A gate that cannot write its record refuses, and the exec takes the
 //!     [`Authorized`] that only a written record makes.
-//! 12. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
+//! 13. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
 //!     from the canonical argv *bytes* and the environment from
 //!     [`crate::child_environment`].
 //!
@@ -471,6 +476,8 @@ fn proceed(
         host.syscalls().mark_cloexec_from(FIRST_INHERITED_FD),
     )?;
     stage(Stage::Streams, host.hygiene().ensure_std_streams())?;
+    stage(Stage::CallerState, host.hygiene().reset_umask())?;
+    stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
     let entry = accept_invocation(args)?;
     progress
@@ -1078,6 +1085,8 @@ args = [
             host.hygiene.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetUmask,
+                HygieneCall::ResetCwd,
                 HygieneCall::ForbidNewPrivileges
             ]
         );
@@ -1692,8 +1701,51 @@ args = [
         );
         assert_eq!(
             seen,
-            ["proc=false", "spool=false", "hygiene=2", "programs=0"]
+            ["proc=false", "spool=false", "hygiene=4", "programs=0"]
         );
+    }
+
+    #[test]
+    fn the_gate_resets_cwd_and_umask() {
+        // Both calls happen after the streams are filled and before anything
+        // is opened. A failure of either refuses, and the later one is not
+        // attempted when the earlier one failed.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut umask_host = FakeHost::new(&spool);
+        umask_host.hygiene =
+            FakeHygiene::new(GATE_PID).with_umask_error(SysError::unsupported("umask"));
+        let umask_exit = run(&mut umask_host, &auth());
+        assert!(
+            umask_exit.message.contains("gate_failed_caller_state"),
+            "{}",
+            umask_exit.message
+        );
+        assert_eq!(
+            umask_host.hygiene.calls(),
+            [HygieneCall::EnsureStdStreams, HygieneCall::ResetUmask]
+        );
+        assert!(!umask_host.proc_opened.get());
+        assert!(umask_host.programs.opened().is_empty());
+
+        let mut cwd_host = FakeHost::new(&spool);
+        cwd_host.hygiene = FakeHygiene::new(GATE_PID).with_cwd_error(SysError::unsupported("cwd"));
+        let cwd_exit = run(&mut cwd_host, &auth());
+        assert!(
+            cwd_exit.message.contains("gate_failed_caller_state"),
+            "{}",
+            cwd_exit.message
+        );
+        assert_eq!(
+            cwd_host.hygiene.calls(),
+            [
+                HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetUmask,
+                HygieneCall::ResetCwd
+            ]
+        );
+        assert!(!cwd_host.proc_opened.get());
+        assert!(cwd_host.programs.opened().is_empty());
+        assert_eq!(exec_calls(&cwd_host), 0);
     }
 
     #[test]
