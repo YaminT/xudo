@@ -56,10 +56,20 @@ bytes made the first `write` return a short count and the next one raise
 `SIGXFSZ`, killing the `-auth` gate before it could cut the torn line back.
 The broker and every later gate then refused the damaged tail, so xudo stayed
 down until an operator moved the log aside. An append is now one `write` of
-the whole record. A short count is a failure and the cut-back runs, denying
-the request and leaving the log as it was. `EINTR` wrote nothing, so it is
-tried once; a second interrupt fails the same way. This does not reset the
-caller's resource limits. That stays a later change.
+the whole record. On this `RLIMIT_FSIZE` route a short count is a failure
+and the cut-back runs, denying the request and leaving the log as it was.
+`EINTR` wrote nothing, so it is tried once; a second interrupt fails the same
+way. A core-dump signal (`SIGXFSZ`, `SIGXCPU`) is not turned into a pending
+group-exit between the pages of one `write`, so it does not tear a record
+this way. A fatal signal that is not a core-dump signal (`SIGTERM`,
+`SIGHUP`, `SIGINT`) still can: the kernel marks the kill and checks for it
+between page-sized chunks, so a record that crosses a page boundary can be
+left half-written. The caller can steer that length through argv. A signal
+sudo relays, or the pty hanging up when the user kills sudo, is enough to
+deliver it. That route predates this fix. The impact is availability: xudo
+stays down until an operator moves the log aside. Blocking signals around
+the write and the cut-back is a later change. This change does not reset
+the caller's resource limits.
 
 ## Reporting
 
