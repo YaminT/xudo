@@ -4,6 +4,7 @@ expression: snapshot
 ---
 Descriptors gate_failed_descriptors
 Streams gate_failed_streams
+CallerState gate_failed_caller_state
 Privileges gate_failed_privileges
 Invocation gate_failed_invocation
 Procfs gate_failed_procfs

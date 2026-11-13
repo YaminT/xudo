@@ -8,6 +8,7 @@ fn lists_every_stage(stage: Stage) {
     match stage {
         Stage::Descriptors
         | Stage::Streams
+        | Stage::CallerState
         | Stage::Privileges
         | Stage::Invocation
         | Stage::Procfs
@@ -26,23 +27,25 @@ fn position(stage: Stage) -> usize {
     match stage {
         Stage::Descriptors => 0,
         Stage::Streams => 1,
-        Stage::Privileges => 2,
-        Stage::Invocation => 3,
-        Stage::Procfs => 4,
-        Stage::Lineage => 5,
-        Stage::Rules => 6,
-        Stage::Clock => 7,
-        Stage::Spool => 8,
-        Stage::Program => 9,
-        Stage::Audit => 10,
-        Stage::Exec => 11,
-        Stage::Config => 12,
+        Stage::CallerState => 2,
+        Stage::Privileges => 3,
+        Stage::Invocation => 4,
+        Stage::Procfs => 5,
+        Stage::Lineage => 6,
+        Stage::Rules => 7,
+        Stage::Clock => 8,
+        Stage::Spool => 9,
+        Stage::Program => 10,
+        Stage::Audit => 11,
+        Stage::Exec => 12,
+        Stage::Config => 13,
     }
 }
 
-const ALL_STAGES: [Stage; 13] = [
+const ALL_STAGES: [Stage; 14] = [
     Stage::Descriptors,
     Stage::Streams,
+    Stage::CallerState,
     Stage::Privileges,
     Stage::Invocation,
     Stage::Procfs,
@@ -63,8 +66,8 @@ fn every_gate_stage_audit_code_is_pinned() {
         lists_every_stage(stage);
         let _ = writeln!(snapshot, "{stage:?} {}", stage.code());
     }
-    assert_eq!(ALL_STAGES.len(), 13);
-    let mut positions = [false; 13];
+    assert_eq!(ALL_STAGES.len(), 14);
+    let mut positions = [false; 14];
     for stage in ALL_STAGES {
         let index = position(stage);
         assert_eq!(ALL_STAGES.get(index).copied(), Some(stage));
