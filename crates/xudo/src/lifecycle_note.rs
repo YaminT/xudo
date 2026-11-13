@@ -12,7 +12,7 @@ pub(crate) const ACTION_ID: &str = "xudo.svc.lifecycle";
 /// Printed on stdout, exactly, when [`missing`] is true.
 pub(crate) const TEXT: &str = concat!(
     "no service lifecycle rule: copy ",
-    "/usr/share/doc/xudo/examples/20-services-lifecycle.toml ",
+    "/usr/share/xudo/examples/20-services-lifecycle.toml ",
     "to /etc/xudo/rules.d/ and list your units"
 );
 
@@ -43,6 +43,6 @@ mod tests {
         assert!(missing(&rules("xudo.svc.reset-failed")));
         assert!(!missing(&rules(ACTION_ID)));
         assert!(TEXT.starts_with("no service lifecycle rule: "));
-        assert!(TEXT.contains("/usr/share/doc/xudo/examples/20-services-lifecycle.toml"));
+        assert!(TEXT.contains("/usr/share/xudo/examples/20-services-lifecycle.toml"));
     }
 }

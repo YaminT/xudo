@@ -11,7 +11,7 @@ All notable changes to xudo are documented here. This project follows
   reboot, rescue, kernel-module, device, and broker-socket units for any
   caller who could pass the password gate. The shipped rule set no longer
   contains a service lifecycle rule. Copy
-  `/usr/share/doc/xudo/examples/20-services-lifecycle.toml` to
+  `/usr/share/xudo/examples/20-services-lifecycle.toml` to
   `/etc/xudo/rules.d/` and list the units that host should expose.
   `xudo check` and `xudo doctor` note the omission. The compiled-in deny-list
   still refuses the units above, plus the systemd power and sleep services,

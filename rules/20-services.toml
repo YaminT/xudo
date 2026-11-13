@@ -8,7 +8,7 @@
 #
 # There is no shipped service-lifecycle rule. Restarting a service is an
 # enumeration the operator writes per host: copy
-# /usr/share/doc/xudo/examples/20-services-lifecycle.toml into this directory
+# /usr/share/xudo/examples/20-services-lifecycle.toml into this directory
 # and replace the placeholder units. The source of that example is
 # rules/examples/20-services-lifecycle.toml.example, which the loader cannot
 # read (the name does not end in `.toml`).

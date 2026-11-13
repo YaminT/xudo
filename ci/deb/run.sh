@@ -60,9 +60,9 @@ for binary in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/x
     fi
 done
 echo "PASS: normal_package_does_not_contain_the_short_ttl_feature"
-example="$package_root/usr/share/doc/xudo/examples/20-services-lifecycle.toml"
+example="$package_root/usr/share/xudo/examples/20-services-lifecycle.toml"
 if [ ! -f "$example" ]; then
-    echo "FAIL: lifecycle example missing from /usr/share/doc/xudo/examples" >&2
+    echo "FAIL: lifecycle example missing from /usr/share/xudo/examples" >&2
     exit 1
 fi
 if [ -e "$package_root/etc/xudo/rules.d/20-services-lifecycle.toml" ]; then
