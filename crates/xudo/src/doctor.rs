@@ -1927,7 +1927,7 @@ mod tests {
             dir.join("10-rules.toml"),
             "[[action]]\nid = \"xudo.svc.restart\"\ntier = \"svc-control\"\n\
              exe = \"/usr/bin/systemctl\"\nargs = [\n  { name = \"verb\", matcher = { literal = \
-             \"restart\" } },\n]\n",
+             \"daemon-reload\" } },\n]\n",
         )
         .unwrap();
         LoadedRules::from_dir(&dir).unwrap()
