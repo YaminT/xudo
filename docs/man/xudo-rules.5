@@ -363,12 +363,27 @@ binary name.
 A copy, a hardlink, or a multicall applet does not escape a class.
 On
 .B systemctl
-the list also refuses the unit, whatever the verb: a power or boot target,
+the list refuses the unit on a verb that starts, stops, signals, or
+otherwise acts.
+A read-only verb
+.RB ( status ,
+.BR show ,
+and the list queries)
+is not refused because of the unit.
+The list is names: an alias or a name that is not enumerated gets past,
+and the enumeration is the boundary.
+It names a power or boot target,
 a
 .B modprobe@
 template, an fsck, growfs, makefs, or
 .B mdadm@
-template, an
+template.
+A
+.B .mount
+unit is not on the list, and
+.B unit\-name
+accepts it.
+The list also names an
 .B xudod
 or
 .B xudo\-
@@ -378,7 +393,7 @@ or
 .BR auditd .
 A rule that still uses
 .B unit\-name
-cannot start those.
+cannot start those names.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .
