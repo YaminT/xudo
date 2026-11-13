@@ -8,15 +8,21 @@ All notable changes to xudo are documented here. This project follows
 ### Security
 
 - v0.1.0-beta.1 accepted `systemctl` start, stop, and restart of power,
-  reboot, rescue, kernel-module, device, and broker-socket units for any
-  caller who could pass the password gate. The shipped rule set no longer
-  contains a service lifecycle rule. Copy
+  reboot, rescue, kernel-module, filesystem-template, and broker-socket
+  units for any caller who could pass the password gate. The filesystem
+  templates on the deny-list are `systemd-fsck@`, `systemd-growfs@`,
+  `systemd-makefs@`, and `mdadm*@`. A `.mount` unit is not on that list, and
+  `unit-name` accepts it. The tripwire is a name list: an alias or a unit
+  that is not enumerated gets past, and the enumeration is the boundary.
+  The shipped rule set no longer contains a service lifecycle rule. Copy
   `/usr/share/xudo/examples/20-services-lifecycle.toml` to
   `/etc/xudo/rules.d/` and list the units that host should expose.
   `xudo check` and `xudo doctor` note the omission. The compiled-in deny-list
-  still refuses the units above, plus the systemd power and sleep services,
+  still refuses those names, plus the systemd power and sleep services,
   `debug-shell`, runlevel aliases, firewall and time-sync units, and the
-  journal units, including when an operator's rule names one of them.
+  journal units, on a verb that starts, stops, signals, or otherwise acts,
+  including when an operator's rule names one of them. A read-only verb is
+  not refused because of the unit name.
   If dpkg asked about `/etc/xudo/rules.d/20-services.toml` during the
   upgrade and you kept your version, you still have the beta.1 rule: run
   `xudo check`, and replace its `unit-name` with a `one-of` list of your
