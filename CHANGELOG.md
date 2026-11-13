@@ -17,6 +17,12 @@ All notable changes to xudo are documented here. This project follows
   still refuses the units above, plus the systemd power and sleep services,
   `debug-shell`, runlevel aliases, firewall and time-sync units, and the
   journal units, including when an operator's rule names one of them.
+  If dpkg asked about `/etc/xudo/rules.d/20-services.toml` during the
+  upgrade and you kept your version, you still have the beta.1 rule: run
+  `xudo check`, and replace its `unit-name` with a `one-of` list of your
+  units. `xudo check` exits 21 for that rule, and `xudo doctor` prints the
+  same sentence. The package upgrade prints it when the kept file still
+  contains `xudo.svc.lifecycle`.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now

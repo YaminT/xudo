@@ -16,9 +16,17 @@ getent group xudo >/dev/null || groupadd --system xudo
 
 # The old positional confirmation rows cannot be read safely by the strict
 # parser. Discard upgrade-era runtime state so it can be recreated cleanly.
-if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt '0.1.0~beta.2' &&
-    [ -d /run/xudo/confirm ]; then
-    find -P /run/xudo/confirm -mindepth 1 -maxdepth 1 -type f -name '*.json' -delete
+# A kept beta.1 conffile still has the open lifecycle rule. This is a notice:
+# the string is not a policy decision.
+if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt '0.1.0~beta.2'; then
+    if [ -d /run/xudo/confirm ]; then
+        find -P /run/xudo/confirm -mindepth 1 -maxdepth 1 -type f -name '*.json' -delete
+    fi
+    if [ -f /etc/xudo/rules.d/20-services.toml ] &&
+        grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml
+    then
+        echo 'xudo: /etc/xudo/rules.d/20-services.toml still contains the beta.1 rule xudo.svc.lifecycle. If you kept your version, run `xudo check`, and replace its unit-name with a one-of list of your units.' >&2
+    fi
 fi
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then

@@ -538,6 +538,25 @@ fn deb_postinst_fallback_matches_tmpfiles_paths_modes_and_owners() {
 }
 
 #[test]
+fn deb_postinst_warns_when_a_kept_beta1_lifecycle_rule_remains() {
+    let start = POSTINST
+        .find("lt '0.1.0~beta.2'")
+        .unwrap_or_else(|| panic!("version gate missing"));
+    let end = POSTINST
+        .find("systemd-tmpfiles")
+        .unwrap_or_else(|| panic!("tmpfiles step missing"));
+    let block = &POSTINST[start..end];
+    assert!(
+        block.contains("grep -q 'xudo.svc.lifecycle'"),
+        "upgrade notice does not look for the beta.1 lifecycle id"
+    );
+    assert!(
+        block.contains("replace its unit-name with a one-of list of your units"),
+        "upgrade notice does not say which edit to make"
+    );
+}
+
+#[test]
 fn the_parser_this_test_relies_on_refuses_what_it_cannot_read() {
     // A test that parsed nothing would pass everything.
     assert!(parse(SOCKET).len() > 8);

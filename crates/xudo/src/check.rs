@@ -33,10 +33,20 @@ const LIMITS: Limits = Limits {
     max_lines: 1,
 };
 
+/// A systemctl rule that can start or stop a unit it does not name.
+struct OpenUnit {
+    action: String,
+    file: String,
+    line: u32,
+    message: String,
+}
+
 /// Everything one run found.
 struct Report {
     /// A rule that allowlists what the deny-list refuses: the id and the classes.
     errors: Vec<(String, Vec<String>)>,
+    /// A systemctl rule whose unit matcher is not a finite list.
+    open_units: Vec<OpenUnit>,
     /// One rendered overlap each.
     warnings: Vec<String>,
     results: Vec<TestResult>,
@@ -56,8 +66,10 @@ impl Report {
     fn status(&self) -> ExitCode {
         [
             (self.failed() > 0).then_some(ExitCode::TestFailure),
-            (!self.errors.is_empty() || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
-                .then_some(ExitCode::LintError),
+            (!self.errors.is_empty()
+                || !self.open_units.is_empty()
+                || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
+            .then_some(ExitCode::LintError),
             (!self.warnings.is_empty()).then_some(ExitCode::LintWarning),
         ]
         .into_iter()
@@ -88,8 +100,8 @@ pub(crate) fn run(
     } else {
         loaded.rules().overlaps()
     };
-    let (errors, warnings) = if tests_only {
-        (Vec::new(), Vec::new())
+    let (errors, open_units, warnings) = if tests_only {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         (
             loaded
@@ -103,12 +115,24 @@ pub(crate) fn run(
                     )
                 })
                 .collect(),
+            loaded
+                .rules()
+                .open_unit_actions()
+                .iter()
+                .map(|lint| OpenUnit {
+                    action: lint.id.to_string(),
+                    file: lint.source.file.clone(),
+                    line: lint.source.line,
+                    message: lint.message(),
+                })
+                .collect(),
             overlaps.iter().map(ToString::to_string).collect(),
         )
     };
     let human = CallerFacts::new(Classification::Human, 1000);
     let report = Report {
         errors,
+        open_units,
         warnings,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
@@ -147,9 +171,12 @@ fn human_report(
             "xudo: a rule that allowlists a shell-capable binary defeats the design"
         );
     }
+    for open in &report.open_units {
+        let _ = writeln!(err, "xudo: {}", safe(&open.message));
+    }
 
     if !tests_only {
-        if report.errors.is_empty() {
+        if report.errors.is_empty() && report.open_units.is_empty() {
             let _ = writeln!(
                 out,
                 "ok: {} action(s) in {} file(s), generation {}",
@@ -310,17 +337,38 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
     let mut fields = Map::new();
     fields.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
     fields.insert("exit_code".to_owned(), json!(status.as_i32()));
-    fields.insert(
-        "lint".to_owned(),
-        json!({
-            "errors": report
+    let mut lint = Map::new();
+    lint.insert(
+        "errors".to_owned(),
+        json!(
+            report
                 .errors
                 .iter()
                 .map(|(id, classes)| json!({ "action": id, "classes": classes }))
-                .collect::<Vec<_>>(),
-            "warnings": report.warnings,
-        }),
+                .collect::<Vec<_>>()
+        ),
     );
+    lint.insert("warnings".to_owned(), json!(report.warnings));
+    // Absent when nothing matched, so a run with no such rule stays byte for
+    // byte what it was.
+    if !report.open_units.is_empty() {
+        lint.insert(
+            "open_units".to_owned(),
+            json!(
+                report
+                    .open_units
+                    .iter()
+                    .map(|open| json!({
+                        "action": open.action,
+                        "file": open.file,
+                        "line": open.line,
+                        "message": open.message,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    fields.insert("lint".to_owned(), Value::Object(lint));
     fields.insert(
         "tests".to_owned(),
         json!({
@@ -466,6 +514,7 @@ mod tests {
     fn a_fuzz_finding_sets_the_lint_error_status_and_the_envelope_lists_it() {
         let mut found = Report {
             errors: Vec::new(),
+            open_units: Vec::new(),
             warnings: Vec::new(),
             results: Vec::new(),
             fuzz: Some(report()),

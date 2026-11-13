@@ -23,8 +23,8 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::deny::evaluate_deny_list;
-use crate::matcher::ArgSpec;
+use crate::deny::{evaluate_deny_list, exe_is_systemctl, is_lifecycle_or_power_verb};
+use crate::matcher::{ArgSpec, Matcher};
 use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
@@ -329,6 +329,50 @@ pub struct RuleSet {
     actions: Vec<Action>,
 }
 
+/// A systemctl action whose unit position can name any unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenUnitLint<'a> {
+    /// The action id.
+    pub id: &'a ActionId,
+    /// The file and line of that action.
+    pub source: &'a Source,
+}
+
+impl OpenUnitLint<'_> {
+    /// The sentence `xudo check` and `xudo doctor` print.
+    pub fn message(&self) -> String {
+        format!(
+            "{} at {}: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units",
+            self.id, self.source
+        )
+    }
+}
+
+/// A literal or a `one-of` whose options are literals.
+fn matcher_is_closed_literals(matcher: &Matcher) -> bool {
+    match matcher {
+        Matcher::Literal(_) | Matcher::OneOf(_) => true,
+        Matcher::IntRange { .. }
+        | Matcher::PathUnder { .. }
+        | Matcher::Name(_)
+        | Matcher::Pattern(_) => false,
+    }
+}
+
+/// A literal or a `one-of` that contains a lifecycle or power verb.
+fn matcher_names_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
+    match matcher {
+        Matcher::Literal(text) => is_lifecycle_or_power_verb(text.as_bytes()),
+        Matcher::OneOf(options) => options
+            .iter()
+            .any(|option| is_lifecycle_or_power_verb(option.as_bytes())),
+        Matcher::IntRange { .. }
+        | Matcher::PathUnder { .. }
+        | Matcher::Name(_)
+        | Matcher::Pattern(_) => false,
+    }
+}
+
 impl RuleSet {
     /// Validates and takes ownership of a list of actions.
     ///
@@ -492,6 +536,55 @@ impl RuleSet {
                 }
             })
             .collect()
+    }
+
+    /// Systemctl actions that can start or stop a unit they do not name.
+    ///
+    /// The verb position accepts a lifecycle or power verb, as a literal or as
+    /// one option of a `one-of`, and a later position is not a literal or a
+    /// finite `one-of` of literals. `unit-name`, `service-unit-name`, a
+    /// pattern, a path, and an open repeat of any of those are that later
+    /// position. A finite list is the operator's own units, and it is not an
+    /// error. The check is the rule text, not an execution.
+    pub fn open_unit_actions(&self) -> Vec<OpenUnitLint<'_>> {
+        self.actions
+            .iter()
+            .filter_map(|action| {
+                if !exe_is_systemctl(action.exe.as_bytes()) {
+                    return None;
+                }
+                let verb_at = action
+                    .args
+                    .iter()
+                    .position(|spec| matcher_names_lifecycle_or_power_verb(&spec.matcher))?;
+                let open_unit = action
+                    .args
+                    .iter()
+                    .skip(verb_at.saturating_add(1))
+                    .any(|spec| !matcher_is_closed_literals(&spec.matcher));
+                if !open_unit {
+                    return None;
+                }
+                Some(OpenUnitLint {
+                    id: &action.id,
+                    source: &action.source,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether any action is `systemctl` with a lifecycle or power verb.
+    ///
+    /// The id is not consulted. An operator who copied the example and renamed
+    /// it still has a lifecycle rule.
+    pub fn has_systemctl_lifecycle_or_power(&self) -> bool {
+        self.actions.iter().any(|action| {
+            exe_is_systemctl(action.exe.as_bytes())
+                && action
+                    .args
+                    .iter()
+                    .any(|spec| matcher_names_lifecycle_or_power_verb(&spec.matcher))
+        })
     }
 
     /// How many actions the set contains.
@@ -815,5 +908,246 @@ exe = "true"
         assert!(offenders.first().is_some_and(|(_, classes)| {
             classes.contains(&crate::deny::CapabilityClass::SpawnsShell)
         }));
+    }
+
+    fn loads(source: &str) -> RuleSet {
+        RuleSet::from_toml("20-services.toml", source).unwrap()
+    }
+
+    fn lint_message(source: &str) -> Option<String> {
+        loads(source)
+            .open_unit_actions()
+            .first()
+            .map(OpenUnitLint::message)
+    }
+
+    #[test]
+    fn open_unit_lint_names_the_action_and_the_edit() {
+        let set = loads(
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"restart\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+        );
+        let found = set.open_unit_actions();
+        let lint = found.first().unwrap();
+        assert_eq!(lint.id.as_str(), "xudo.svc.lifecycle");
+        assert_eq!(lint.source.file, "20-services.toml");
+        assert_eq!(lint.source.line, 2);
+        let message = lint.message();
+        assert_eq!(
+            message,
+            "xudo.svc.lifecycle at 20-services.toml:2: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+        );
+        assert!(set.has_systemctl_lifecycle_or_power());
+        assert!(format!("{lint:?}").contains("xudo.svc.lifecycle"));
+    }
+
+    fn expect_lint(name: &str, source: &str, want: bool) {
+        assert_eq!(lint_message(source).is_some(), want, "{name}");
+    }
+
+    #[test]
+    fn open_unit_lint_flags_an_open_matcher_after_the_verb() {
+        expect_lint(
+            "one-of verb",
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/usr/local/sbin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { one-of = [\"status\", \"stop\"] } },
+  { name = \"unit\", matcher = { name = \"service-unit-name\" } },
+]
+",
+            true,
+        );
+        expect_lint(
+            "power verb",
+            "\
+[[action]]
+id = \"xudo.svc.power\"
+tier = \"svc-control\"
+exe = \"/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"poweroff\" } },
+  { name = \"unit\", matcher = { pattern = \"[a-z.]+\" } },
+]
+",
+            true,
+        );
+        expect_lint(
+            "integer after the verb",
+            "\
+[[action]]
+id = \"xudo.svc.range\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"start\" } },
+  { name = \"unit\", matcher = { int-range = { lo = 1, hi = 2 } } },
+]
+",
+            true,
+        );
+        expect_lint(
+            "path after the verb",
+            "\
+[[action]]
+id = \"xudo.svc.path\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"stop\" } },
+  { name = \"unit\", matcher = { path-under = { prefix = \"/tmp\" } } },
+]
+",
+            true,
+        );
+    }
+
+    #[test]
+    fn open_unit_lint_accepts_a_finite_list_and_a_harmless_verb() {
+        expect_lint(
+            "harmless literal verb",
+            "\
+[[action]]
+id = \"xudo.svc.reload-units\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"daemon-reload\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+            false,
+        );
+        expect_lint(
+            "closed one-of",
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"isolate\" } },
+  { name = \"flag\", matcher = { literal = \"--no-block\" }, repeat = \"optional\" },
+  { name = \"unit\", matcher = { one-of = [\"nginx.service\", \"example.service\"] }, repeat = { between = { min = 1, max = 4 } } },
+]
+",
+            false,
+        );
+        expect_lint(
+            "closed literal unit",
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"start\" } },
+  { name = \"unit\", matcher = { literal = \"nginx.service\" } },
+]
+",
+            false,
+        );
+        expect_lint(
+            "read-only verb",
+            "\
+[[action]]
+id = \"xudo.svc.status\"
+tier = \"diag-read\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { one-of = [\"status\", \"show\"] } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+            false,
+        );
+    }
+
+    #[test]
+    fn open_unit_lint_ignores_the_wrong_exe_and_a_unit_before_the_verb() {
+        let not_systemctl = "\
+[[action]]
+id = \"xudo.other\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl-helper\"
+args = [
+  { name = \"verb\", matcher = { literal = \"restart\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+";
+        expect_lint("not systemctl", not_systemctl, false);
+        assert!(!loads(not_systemctl).has_systemctl_lifecycle_or_power());
+        expect_lint(
+            "unit before the verb",
+            "\
+[[action]]
+id = \"xudo.svc.backwards\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+  { name = \"verb\", matcher = { literal = \"restart\" } },
+]
+",
+            false,
+        );
+        expect_lint(
+            "verb only",
+            "\
+[[action]]
+id = \"xudo.svc.poweroff\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { literal = \"reboot\" } },
+]
+",
+            false,
+        );
+        assert!(!loads("# nothing\n").has_systemctl_lifecycle_or_power());
+    }
+
+    #[test]
+    fn open_unit_lint_walks_every_matcher_before_the_verb() {
+        let open = "  { name = \"unit\", matcher = { name = \"unit-name\" } },\n";
+        let visited = format!(
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/systemctl\"
+args = [
+  {{ name = \"pat\", matcher = {{ pattern = \"restart\" }} }},
+  {{ name = \"num\", matcher = {{ int-range = {{ lo = 1, hi = 2 }} }} }},
+  {{ name = \"path\", matcher = {{ path-under = {{ prefix = \"/srv\" }} }} }},
+  {{ name = \"name\", matcher = {{ name = \"unit-name\" }} }},
+  {{ name = \"empty\", matcher = {{ one-of = [] }} }},
+  {{ name = \"verb\", matcher = {{ literal = \"exit\" }} }},
+  {open}
+]
+[[action]]
+id = \"xudo.svc.closed\"
+tier = \"svc-control\"
+exe = \"/usr/bin/true\"
+args = [
+  {{ name = \"verb\", matcher = {{ literal = \"start\" }} }},
+  {open}
+]
+"
+        );
+        let set = loads(&visited);
+        assert_eq!(set.open_unit_actions().len(), 1);
+        assert!(set.has_systemctl_lifecycle_or_power());
     }
 }

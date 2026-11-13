@@ -25,7 +25,10 @@ still ships, and accepts only a plain `.service` name. The compiled-in
 deny-list refuses the units above, the systemd power and sleep services,
 `debug-shell`, the runlevel aliases, firewall and time-sync units, and the
 journal units, on `systemctl` for every verb, including a unit an operator
-listed by mistake.
+listed by mistake. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`
+during the upgrade and you kept your version, you still have the beta.1
+rule: run `xudo check`, and replace its `unit-name` with a `one-of` list of
+your units.
 
 The published `v0.1.0-beta.1` install rule accepted a package name ending in
 `-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped

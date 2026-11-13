@@ -2480,6 +2480,28 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         Fixture::new(name).write("10-rules.toml", RULES)
     }
 
+    /// The same two actions, with the unit named. Check exits 0 on this file.
+    const CLOSED_RULES: &str = r#"
+[[action]]
+id = "xudo.svc.restart"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "verb", matcher = { literal = "restart" } },
+  { name = "unit", matcher = { one-of = ["nginx.service"] } },
+]
+
+[[action]]
+id = "xudo.pkg.update"
+tier = "pkg-install"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "update" } }]
+"#;
+
+    fn closed_fixture(name: &str) -> Fixture {
+        Fixture::new(name).write("10-rules.toml", CLOSED_RULES)
+    }
+
     /// A platform that cannot observe a caller at all.
     ///
     /// Exists so the "cannot attest, fail closed" branch is reachable from a
@@ -2903,7 +2925,13 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
 
     #[test]
     fn check_is_silent_about_lifecycle_when_the_operator_listed_one() {
-        let with_lifecycle = RULES.replacen("xudo.svc.restart", "xudo.svc.lifecycle", 1);
+        let with_lifecycle = RULES
+            .replacen("xudo.svc.restart", "xudo.svc.lifecycle", 1)
+            .replacen(
+                "matcher = { name = \"unit-name\" }",
+                "matcher = { one-of = [\"nginx.service\"] }",
+                1,
+            );
         let fx = Fixture::new("cli-check-lifecycle").write("10-rules.toml", &with_lifecycle);
         let (code, out, err) = fx.run(&["check"]);
         assert_eq!(code, ExitCode::Delegated, "{out}{err}");
@@ -2923,6 +2951,39 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         assert_eq!(code, ExitCode::Delegated, "{out}{err}");
         assert_eq!(out, "tests: none\n", "{out}");
         assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn check_rejects_an_open_unit_matcher() {
+        let (code, out, err) = fixture("cli-check-open-unit").run(&["check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        assert_eq!(code.as_i32(), 21);
+        assert!(!out.contains("ok:"), "{out}");
+        assert!(err.contains("xudo.svc.restart"), "{err}");
+        assert!(err.contains("10-rules.toml:"), "{err}");
+        assert!(
+            err.contains(
+                "this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+            ),
+            "{err}"
+        );
+        let (code, json, _) =
+            fixture("cli-check-open-unit-json").run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::LintError);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["exit_code"], 21);
+        assert_eq!(
+            parsed["lint"]["open_units"][0]["action"],
+            "xudo.svc.restart"
+        );
+        assert_eq!(parsed["lint"]["open_units"][0]["file"], "10-rules.toml");
+        let message = parsed["lint"]["open_units"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains(
+                "this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+            ),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2990,7 +3051,7 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
 
     #[test]
     fn check_passes_on_a_clean_ruleset() {
-        let (code, out, _) = fixture("cli-check").run(&["check"]);
+        let (code, out, _) = closed_fixture("cli-check").run(&["check"]);
         assert_eq!(code, ExitCode::Delegated);
         assert!(out.starts_with("ok: 2 action(s)"), "{out}");
         assert!(out.contains("generation "), "{out}");
@@ -3054,7 +3115,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn passing_rule_tests_exit_zero_and_are_counted() {
-        let fx = fixture("cli-check-test-pass").write("20-tests.toml", PASSING_TEST);
+        let fx = closed_fixture("cli-check-test-pass").write("20-tests.toml", PASSING_TEST);
         let (code, out, err) = fx.run(&["check"]);
         assert_eq!(code, ExitCode::Delegated, "{out}{err}");
         assert!(out.contains("tests: 2 passed, 0 failed"), "{out}");
@@ -3115,7 +3176,7 @@ expect = "deny"
 
     #[test]
     fn lint_error_and_test_failure_and_lint_warning_have_distinct_exit_codes() {
-        let warning = fixture("cli-codes-warning")
+        let warning = closed_fixture("cli-codes-warning")
             .write("20-a.toml", CONFIRMING)
             .write("30-b.toml", PERMISSIVE)
             .run(&["check"])
@@ -3194,7 +3255,7 @@ expect = "deny"
 
     #[test]
     fn check_fuzz_reports_counts_and_keeps_the_exit_status() {
-        let fx = fixture("cli-check-fuzz")
+        let fx = closed_fixture("cli-check-fuzz")
             .write("20-a.toml", CONFIRMING)
             .write("30-b.toml", PERMISSIVE);
         let (code, out, err) = fx.run(&["check", "--fuzz", "--fuzz-budget", "300"]);

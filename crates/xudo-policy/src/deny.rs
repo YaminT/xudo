@@ -757,6 +757,46 @@ fn basename(path: &[u8]) -> &[u8] {
     path.rsplit_str(b"/").next().unwrap_or(path)
 }
 
+/// Verbs that start, stop, reload, isolate, or power the machine.
+///
+/// A rule whose `systemctl` verb position accepts one of these, followed by a
+/// unit position that is not a finite list, can act on a unit the operator
+/// did not name. `xudo check` reports that. The power words are also the
+/// subcommands `systemctl` accepts with no unit argument.
+pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
+    b"start",
+    b"stop",
+    b"restart",
+    b"try-restart",
+    b"reload",
+    b"reload-or-restart",
+    b"try-reload-or-restart",
+    b"isolate",
+    b"poweroff",
+    b"reboot",
+    b"halt",
+    b"kexec",
+    b"suspend",
+    b"hibernate",
+    b"hybrid-sleep",
+    b"suspend-then-hibernate",
+    b"soft-reboot",
+    b"rescue",
+    b"emergency",
+    b"default",
+    b"exit",
+];
+
+/// Whether `exe` is `systemctl` by basename, byte for byte.
+pub(crate) fn exe_is_systemctl(exe: &[u8]) -> bool {
+    basename(exe) == b"systemctl"
+}
+
+/// Whether `verb` is a lifecycle verb or a power or boot subcommand.
+pub(crate) fn is_lifecycle_or_power_verb(verb: &[u8]) -> bool {
+    LIFECYCLE_OR_POWER_VERBS.contains(&verb)
+}
+
 /// Returns `true` when `name` is in `set`, ignoring a trailing version suffix.
 ///
 /// `python3.11` is `python`, and `mkfs.ext4` is `mkfs`. Matching the stem is
