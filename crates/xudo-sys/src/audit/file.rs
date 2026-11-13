@@ -46,8 +46,12 @@
 //! 6. One `write` of the whole line. A short count is a failure, so the
 //!    cut-back below runs while this process is still alive: looping into a
 //!    second `write` is how `RLIMIT_FSIZE` delivers `SIGXFSZ` and kills the
-//!    writer before a torn tail can be repaired. `EINTR` means that call wrote
-//!    nothing, so it is tried once more; a second interrupt is a failure too.
+//!    writer before a torn tail can be repaired. That holds for
+//!    `RLIMIT_FSIZE`. A fatal signal that is not a core-dump signal
+//!    (`SIGTERM`, `SIGHUP`, `SIGINT`) can still stop a `write` between pages
+//!    and leave a torn record; blocking signals around the write is a later
+//!    change. `EINTR` means that call wrote nothing, so it is tried once more;
+//!    a second interrupt is a failure too.
 //!    Then `fdatasync` — and, for a log's first record, `fsync` of the
 //!    directory too, since `fdatasync` makes the data durable but not the name
 //!    the file was just created under.
@@ -61,9 +65,11 @@
 //! reported once, so its own `fdatasync` could succeed while the earlier page
 //! never reached the disk), and not a first record whose directory entry may
 //! not survive a crash (the cut leaves the log without a record, so the next
-//! writer syncs the directory itself). If the cut fails too, the next writer
-//! finds what is left: a torn tail, which it refuses, or a whole record, which
-//! it continues from — the case this cannot close.
+//! writer syncs the directory itself). If the cut fails too, the error says
+//! the log may now be damaged and that recovery is to move the log aside. The
+//! refusal still stands. The next writer finds what is left: a torn tail,
+//! which it refuses, or a whole record, which it continues from — the case
+//! this cannot close.
 //!
 //! A receipt is made only after step 7. A log that ends in damage stops the
 //! writer at step 5, for the reasons in [`xudo_audit::tail`].
@@ -576,21 +582,27 @@ fn write_record(
         .and_then(|()| publish(&record));
     match committed {
         Ok(()) => Ok(record),
-        Err(error) => {
-            cut_back(file, size);
-            Err(error)
-        }
+        Err(error) => Err(cut_back(file, path, size, error)),
     }
 }
 
 /// Cuts the log back to `len` bytes and syncs the cut, while the caller still
 /// holds the lock and so keeps every other writer out.
 ///
-/// Best effort, because there is nothing left to try: if the cut fails, the
-/// caller's refusal still stands, and the next writer finds what is left — see
-/// the module docs.
-fn cut_back(file: &mut impl LogFile, len: u64) {
-    let _ = file.truncate(len).and_then(|()| file.sync_data());
+/// The caller's refusal stands either way. A cut that itself fails is not
+/// silent: the error says the log may now be damaged and names the recovery,
+/// which is to move the log aside. There is nothing left to try.
+fn cut_back(file: &mut impl LogFile, path: &Path, len: u64, error: AuditError) -> AuditError {
+    match file.truncate(len).and_then(|()| file.sync_data()) {
+        Ok(()) => error,
+        Err(cut) => AuditError::Io {
+            op: "repair",
+            path: path.display().to_string(),
+            reason: format!(
+                "{error}; cutting the log back failed ({cut}); the log may now be damaged; move the log aside to recover"
+            ),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -809,12 +821,20 @@ mod tests {
         // the disk. Linux reports a writeback error once, so the next writer's
         // own fdatasync could succeed while this page never lands: chained
         // onto, it would leave a receipted record after a hole. It is cut back
-        // under the lock, and the cut synced, so the next record follows the
-        // last one that did reach the disk.
+        // under the lock. This fake refuses every sync, so the cut's sync
+        // fails too and the error names the damage; truncate has already put
+        // the bytes back, and the next record follows the last one on disk.
         let before = log_of(2);
+        // This fake refuses every sync, so the cut-back's own sync fails too.
+        // Truncate still puts the bytes back; the error must say the log may
+        // now be damaged, because that sync did not land.
         let mut file = FakeLogFile::holding(&before).failing(Op::Sync);
         let err = write(&mut file).unwrap_err();
-        assert!(err.to_string().starts_with("cannot fdatasync"), "{err}");
+        let text = err.to_string();
+        assert!(text.starts_with("cannot repair"), "{text}");
+        assert!(text.contains("cannot fdatasync"), "{text}");
+        assert!(text.contains("the log may now be damaged"), "{text}");
+        assert!(text.contains("move the log aside to recover"), "{text}");
         assert_eq!(file.bytes, before);
         assert_eq!(
             file.ops(),
@@ -969,7 +989,12 @@ mod tests {
                 .failing(Op::Truncate)
         };
         let err = write(&mut file).unwrap_err();
-        assert!(err.to_string().starts_with("cannot write"), "{err}");
+        let text = err.to_string();
+        assert!(text.starts_with("cannot repair"), "{text}");
+        assert!(text.contains("cannot write"), "{text}");
+        assert!(text.contains("cutting the log back failed"), "{text}");
+        assert!(text.contains("the log may now be damaged"), "{text}");
+        assert!(text.contains("move the log aside to recover"), "{text}");
         assert_eq!(file.bytes.len(), before.len() + 17);
         assert_eq!(file.ops().last(), Some(&Op::Truncate), "nothing to sync");
         let mut next = FakeLogFile::holding(&file.bytes);
