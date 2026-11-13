@@ -42,6 +42,17 @@ All notable changes to xudo are documented here. This project follows
   `xudo.svc.status` and `xudo.svc.show` of `xudod`, the journal, chrony,
   nftables, apparmor, and auditd still run. A verb that starts, stops, or
   signals the unit is still refused, and a power subcommand is still refused.
+- The unit name list also refuses `umount.target`, `final.target`,
+  `rescue.service`, `emergency.service`, `syslog.socket`, the timesyncd
+  alias `dbus-org.freedesktop.timesync1.service`, `systemd-repart.service`,
+  and `systemd-sysctl.service`. Each of those exists on Debian 13, Ubuntu
+  24.04, or Ubuntu 26.04 (`systemd-repart` only on Ubuntu 24.04).
+  `systemd-sysctl` applies sysctl files at boot and uses the same class as
+  a file-driven sysctl flag. `systemd-tmpfiles-*` and `logrotate.service`
+  were left off: they run programs whose names are already refused.
+  `syslog.service`, `ntp.service`, `ntpsec.service`, `iptables.service`,
+  `systemd-mkswap@`, and `systemd-cryptsetup@` had no unit file on those
+  three images.
 - Package-manager config redirects are matched per tool. apt long options
   are case-insensitive and a short cluster is scanned for `c` or `o`.
   sysctl also refuses `-f` and a prefix of `--load` or `--system`. dnf,

@@ -502,6 +502,10 @@ const POWER_OR_BOOT_TARGETS: &[&[u8]] = &[
     b"emergency.target",
     b"exit.target",
     b"sysinit.target",
+    // Late shutdown. `CanStart` is no on the probed images; the name is
+    // still the unit a lifecycle rule would act on.
+    b"umount.target",
+    b"final.target",
 ];
 
 /// `runlevel0` (poweroff), `runlevel1` (rescue), `runlevel6` (reboot).
@@ -527,6 +531,10 @@ const POWER_SERVICES: &[&[u8]] = &[
     b"systemd-suspend-then-hibernate",
     // SuccessAction=exit-force. Starting it reboots the host.
     b"systemd-exit",
+    // The services behind rescue.target and emergency.target. The targets
+    // are listed above; these names are the `.service` units.
+    b"rescue",
+    b"emergency",
 ];
 
 /// `debug-shell.service` is an unauthenticated root shell on tty9.
@@ -537,6 +545,12 @@ const KERNEL_MODULE_TEMPLATES: &[&[u8]] = &[b"modprobe"];
 
 /// Template prefixes that check, grow, or create a filesystem.
 const DEVICE_TEMPLATES: &[&[u8]] = &[b"systemd-fsck", b"systemd-growfs", b"systemd-makefs"];
+
+/// A service that repartitions a disk. Not a template, so the `@` list misses it.
+const DEVICE_SERVICES: &[&[u8]] = &[b"systemd-repart"];
+
+/// Applies the sysctl files at boot. Same class as a file-driven `sysctl` flag.
+const SYSCTL_UNITS: &[&[u8]] = &[b"systemd-sysctl"];
 
 /// `systemctl` verbs that write or reinterpret a unit definition.
 const UNIT_MUTATING_VERBS: &[&[u8]] = &[
@@ -721,8 +735,10 @@ fn has_unit_stem(unit: &[u8], stem: &[u8]) -> bool {
 /// The journal itself is [`is_journal_unit`]: `systemd-journald` followed by
 /// `-`, `.`, or `@` is that journal for any continuation, including
 /// `-audit` and `-dev-log`. `rsyslog` is the same log path on a host that
-/// forwards the journal.
-const AUDIT_MIRROR_UNITS: &[&[u8]] = &[b"rsyslog"];
+/// forwards the journal. `syslog.socket` is the logging socket on the
+/// probed Debian and Ubuntu images. `syslog.service` was not installed
+/// there; the stem still covers that name.
+const AUDIT_MIRROR_UNITS: &[&[u8]] = &[b"rsyslog", b"syslog"];
 
 /// `systemd-journald`, and any continuation after `-`, `.`, or `@`.
 ///
@@ -758,6 +774,9 @@ const SECURITY_UNITS: &[&[u8]] = &[
     b"netfilter-persistent",
     b"firewalld",
     b"systemd-timesyncd",
+    // Alias of systemd-timesyncd.service on the probed images. The stem
+    // `systemd-timesyncd` does not match this name.
+    b"dbus-org.freedesktop.timesync1",
     b"chrony",
     b"chronyd",
 ];
@@ -796,6 +815,9 @@ fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
     if let Some(class) = template_class(unit) {
         return Some(class);
     }
+    if stem_in(unit, DEVICE_SERVICES) {
+        return Some(CapabilityClass::DeviceOrFilesystem);
+    }
     if stem_in(unit, SHELL_UNITS) {
         return Some(CapabilityClass::SpawnsShell);
     }
@@ -804,6 +826,9 @@ fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
     }
     if is_security_unit(unit) {
         return Some(CapabilityClass::SecuritySubsystem);
+    }
+    if stem_in(unit, SYSCTL_UNITS) {
+        return Some(CapabilityClass::ConfigNamedProgram);
     }
     None
 }
@@ -1745,6 +1770,10 @@ mod tests {
             "systemd-hybrid-sleep.service",
             "systemd-suspend-then-hibernate.service",
             "systemd-exit.service",
+            "rescue.service",
+            "emergency.service",
+            "umount.target",
+            "final.target",
             "runlevel0.target",
             "runlevel1.target",
             "runlevel6.target",
@@ -1758,6 +1787,26 @@ mod tests {
             );
         }
         assert!(!denies("/usr/bin/systemctl", &["start", "nginx.service"]));
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn denies_repart_sysctl_and_keeps_status_of_a_new_unit() {
+        assert!(
+            classes("/usr/bin/systemctl", &["start", "systemd-repart.service"])
+                .contains(&CapabilityClass::DeviceOrFilesystem)
+        );
+        assert!(
+            classes("/usr/bin/systemctl", &["restart", "systemd-sysctl.service"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            evaluate_deny_list(
+                b"/usr/bin/systemctl",
+                &Argv::new(vec!["status", "umount.target"])
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1785,6 +1834,7 @@ mod tests {
             "netfilter-persistent.service",
             "firewalld.service",
             "systemd-timesyncd.service",
+            "dbus-org.freedesktop.timesync1.service",
             "chrony.service",
             "chronyd.service",
         ];
@@ -1806,6 +1856,7 @@ mod tests {
             "systemd-journald.socket",
             "systemd-journald-dev-log.socket",
             "rsyslog.service",
+            "syslog.socket",
         ];
         for unit in journal {
             assert!(

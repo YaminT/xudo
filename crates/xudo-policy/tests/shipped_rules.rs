@@ -894,6 +894,8 @@ fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
         "emergency.target",
         "exit.target",
         "sysinit.target",
+        "umount.target",
+        "final.target",
         "runlevel0.target",
         "runlevel1.target",
         "runlevel6.target",
@@ -906,6 +908,9 @@ fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
         "systemd-hibernate.service",
         "systemd-hybrid-sleep.service",
         "systemd-suspend-then-hibernate.service",
+        "systemd-exit.service",
+        "rescue.service",
+        "emergency.service",
     ];
     for unit in power {
         units.push((unit, CapabilityClass::PowerState));
@@ -917,6 +922,7 @@ fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
         "systemd-growfs@dev-sda1.service",
         "systemd-makefs@dev-sda1.service",
         "mdadm@dev-md0.service",
+        "systemd-repart.service",
     ] {
         units.push((unit, CapabilityClass::DeviceOrFilesystem));
     }
@@ -928,6 +934,7 @@ fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
         "systemd-journald.socket",
         "systemd-journald-dev-log.socket",
         "rsyslog.service",
+        "syslog.socket",
     ] {
         units.push((unit, CapabilityClass::SelfModification));
     }
@@ -939,11 +946,16 @@ fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
         "netfilter-persistent.service",
         "firewalld.service",
         "systemd-timesyncd.service",
+        "dbus-org.freedesktop.timesync1.service",
         "chrony.service",
         "chronyd.service",
     ] {
         units.push((unit, CapabilityClass::SecuritySubsystem));
     }
+    units.push((
+        "systemd-sysctl.service",
+        CapabilityClass::ConfigNamedProgram,
+    ));
     units
 }
 

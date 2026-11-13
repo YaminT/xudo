@@ -28,8 +28,11 @@ contains a service lifecycle rule. Copy
 `/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
 still ships, and accepts only a plain `.service` name. The compiled-in
 deny-list refuses those names, the systemd power and sleep services,
-`debug-shell`, the runlevel aliases, firewall and time-sync units, and the
-journal units, on a `systemctl` verb that starts, stops, signals, or
+`umount.target`, `final.target`, `rescue.service`, `emergency.service`,
+`debug-shell`, the runlevel aliases, firewall and time-sync units (including
+the `dbus-org.freedesktop.timesync1` alias), the journal and `syslog`
+units, `systemd-repart`, and `systemd-sysctl`, on a `systemctl` verb that
+starts, stops, signals, or
 otherwise acts, including a unit an operator listed by mistake. A read-only
 verb (`status`, `show`, and the other queries) is not refused because of
 the unit name. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`

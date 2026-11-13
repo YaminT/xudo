@@ -387,10 +387,18 @@ The list also names an
 .B xudod
 or
 .B xudo\-
-unit, and
-.B apparmor
-or
-.BR auditd .
+unit,
+.BR syslog ,
+.BR apparmor ,
+and
+.BR auditd ,
+plus
+.BR umount.target ,
+.BR final.target ,
+.BR rescue.service ,
+.BR emergency.service ,
+the timesyncd dbus alias, and
+.BR systemd\-sysctl .
 A rule that still uses
 .B unit\-name
 cannot start those names.

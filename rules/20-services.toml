@@ -21,11 +21,13 @@
 # `foo.service`.
 #
 # The compiled-in deny-list also refuses, on a verb that acts, a power or boot target
-# (including runlevel0, runlevel1, and runlevel6), the systemd power services,
-# `debug-shell`, `modprobe@`, the fsck/growfs/makefs and `mdadm*@` templates,
-# `xudod` and `xudo-*` units, the journal and rsyslog units, the firewall
-# units, the time-sync units, and `apparmor` / `auditd`. A later rule that
-# lists one of those units cannot reopen it.
+# (including runlevel0, runlevel1, runlevel6, umount.target, and final.target),
+# the systemd power services, rescue.service, emergency.service, `debug-shell`,
+# `modprobe@`, the fsck/growfs/makefs and `mdadm*@` templates, systemd-repart,
+# `xudod` and `xudo-*` units, the journal, rsyslog, and syslog units, the firewall
+# units, the time-sync units (including the timesyncd dbus alias), systemd-sysctl,
+# and `apparmor` / `auditd`. The list is names: an alias or a unit that is not
+# enumerated gets past. A later rule that lists one of those names cannot reopen it.
 
 [[action]]
 id = "xudo.svc.reset-failed"
