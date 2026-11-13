@@ -2924,6 +2924,23 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
+    fn check_json_names_the_missing_lifecycle_rule() {
+        // daemon-reload is not a lifecycle verb, so the note is present, and
+        // the JSON object carries it. A restart rule does not.
+        let fx = Fixture::new("cli-check-note-json").write(
+            "10-rules.toml",
+            "[[action]]\nid = \"xudo.svc.reload\"\ntier = \"svc-control\"\n\
+             exe = \"/usr/bin/systemctl\"\nargs = [\n  { name = \"verb\", matcher = { literal = \
+             \"daemon-reload\" } },\n]\n",
+        );
+        let (code, json, err) = fx.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::Delegated, "{json}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["note"], crate::lifecycle_note::TEXT);
+        assert!(parsed["lint"].get("open_units").is_none(), "{json}");
+    }
+
+    #[test]
     fn check_is_silent_about_lifecycle_when_the_operator_listed_one() {
         let with_lifecycle = RULES
             .replacen("xudo.svc.restart", "xudo.svc.lifecycle", 1)
@@ -3246,11 +3263,9 @@ expect = "deny"
 
         let (code, out, _) = fixture("cli-tests-only-none").run(&["check", "--tests-only"]);
         assert_eq!(code, ExitCode::Delegated);
-        assert_eq!(
-            out,
-            format!("{}\ntests: none\n", crate::lifecycle_note::TEXT),
-            "{out}"
-        );
+        // RULES names a systemctl restart, so the "copy the example" note
+        // stays quiet. The open unit is a lint, and --tests-only skips it.
+        assert_eq!(out, "tests: none\n", "{out}");
     }
 
     #[test]
