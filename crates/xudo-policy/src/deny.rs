@@ -581,16 +581,43 @@ const POWER_SUBCOMMANDS: &[&[u8]] = &[
 
 /// The first `systemctl` argument that is not a flag, when it is a power or
 /// boot subcommand.
-fn systemctl_power_subcommand(argv: &Argv) -> Option<&[u8]> {
-    let verb = argv.as_slice().iter().find_map(|arg| {
+/// Verbs that only read unit state. The unit tripwire does not apply to them.
+/// A power subcommand is not in this list, so `systemctl poweroff` stays refused.
+const READ_ONLY_SYSTEMCTL_VERBS: &[&[u8]] = &[
+    b"status",
+    b"show",
+    b"is-active",
+    b"is-failed",
+    b"is-enabled",
+    b"cat",
+    b"list-units",
+    b"list-unit-files",
+    b"list-dependencies",
+    b"list-sockets",
+    b"list-timers",
+    b"list-jobs",
+];
+
+/// The first argument that is not a flag.
+fn first_positional(argv: &Argv) -> Option<&[u8]> {
+    argv.as_slice().iter().find_map(|arg| {
         let bytes = arg.as_bytes();
         if bytes.first() == Some(&b'-') {
             None
         } else {
             Some(bytes)
         }
-    })?;
+    })
+}
+
+fn systemctl_power_subcommand(argv: &Argv) -> Option<&[u8]> {
+    let verb = first_positional(argv)?;
     POWER_SUBCOMMANDS.contains(&verb).then_some(verb)
+}
+
+/// Whether the systemctl verb only reads state.
+fn systemctl_read_only(argv: &Argv) -> bool {
+    first_positional(argv).is_some_and(|verb| READ_ONLY_SYSTEMCTL_VERBS.contains(&verb))
 }
 
 /// One hexadecimal digit, or `None` when `byte` is not one.
@@ -985,18 +1012,23 @@ fn deny_by_executable(name: &[u8]) -> Vec<DenyFinding> {
 ///
 /// `name` is consulted only where a flag's meaning depends on which program
 /// receives it: `-p` is fatal to `sysctl` and harmless to `systemctl`.
+/// `systemctl poweroff` has no unit. `isolate` of an ordinary target is the
+/// same act. The subcommand is enough.
+fn power_subcommand_finding(name: &[u8], argv: &Argv) -> Option<DenyFinding> {
+    if name != b"systemctl" {
+        return None;
+    }
+    let verb = systemctl_power_subcommand(argv)?;
+    Some(DenyFinding::new(
+        CapabilityClass::PowerState,
+        format!("systemctl {} changes power or boot state", verb.as_bstr()),
+    ))
+}
+
 fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let mut findings: Vec<DenyFinding> = Vec::new();
-    // `systemctl poweroff` has no unit. `systemctl isolate multi-user.target`
-    // names a target this list does not otherwise refuse. The subcommand is
-    // enough.
-    if name == b"systemctl"
-        && let Some(verb) = systemctl_power_subcommand(argv)
-    {
-        findings.push(DenyFinding::new(
-            CapabilityClass::PowerState,
-            format!("systemctl {} changes power or boot state", verb.as_bstr()),
-        ));
+    if let Some(finding) = power_subcommand_finding(name, argv) {
+        findings.push(finding);
     }
     for (index, arg) in argv.as_slice().iter().enumerate() {
         let bytes = arg.as_bytes();
@@ -1092,10 +1124,11 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
             ));
         }
 
-        // A unit `systemctl` would act on, whatever the verb in front of it.
-        // The shipped rules do not start or stop a unit. This is what still
-        // refuses a listed unit when an operator's rule names it.
+        // A unit an acting verb would start, stop, or signal. Read-only verbs
+        // are exempt: diagnosing these units is not a hole. Power subcommands
+        // are refused above. This still refuses a listed unit an operator named.
         if name == b"systemctl"
+            && !systemctl_read_only(argv)
             && let Some(class) = classify_systemctl_unit(bytes)
         {
             findings.push(DenyFinding::new(
