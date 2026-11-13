@@ -217,6 +217,7 @@ Containment at execution is a separate check.
 .B name
 An identifier class:
 .BR deb\-name ,
+.BR deb\-name\-literal ,
 .BR rpm\-name ,
 .BR arch\-name ,
 .BR apk\-name ,
@@ -245,7 +246,8 @@ removes
 so that name is a removal, not an install.
 A trailing
 .B +
-is accepted.
+is accepted by
+.BR deb\-name .
 .B g++
 and
 .B libstdc++6
@@ -255,10 +257,41 @@ on
 .B apt\-get install
 asks apt to install
 .BR pkg .
-On
-.B remove
-the same suffix merely installs, and the remove action already asks for
-confirmation every time.
+On install that is harmless.
+.B deb\-name\-literal
+is
+.B deb\-name
+with no
+.B .
+and no
+.B +
+anywhere.
+Only the shipped remove action uses it.
+In
+.B apt\-get
+a name containing
+.B .
+or
+.B +
+that is not an exact cache hit is read as an unanchored regular expression.
+On install it can select many packages, and it cannot remove one because the
+install action requires
+.BR \-\-no\-remove ,
+so
+.B deb\-name
+is unchanged there.
+On remove it can select many packages under a single confirmation, and a
+trailing
+.B +
+installs; the remove action now refuses both.
+A package whose name contains a dot or a plus
+.RB ( python3.12 ,
+.BR g++ ,
+.BR libstdc++6 )
+can no longer be removed through xudo.
+Remove it with the host's own tools, or add an operator rule that lists
+that name with
+.BR one\-of .
 The shipped install action requires the literal option
 .B \-\-no\-remove
 with its other options, before the verb.

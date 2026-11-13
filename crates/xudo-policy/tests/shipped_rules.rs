@@ -118,7 +118,7 @@ fn shipped_rule_tests_pass() {
     // purpose, so a file that silently lost its tests cannot pass.
     assert_eq!(
         tests.len(),
-        31,
+        32,
         "the shipped test count changed: update this"
     );
     let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
@@ -1065,6 +1065,11 @@ fn package_install_permits_names_and_refuses_every_other_source() {
     }
 }
 
+/// `apparmor-` is a removal. The matcher unit tests
+/// (`deb_names_reject_every_local_and_pinned_install_form`) are the regression
+/// proof that a trailing `-` is refused. This test does not have to fail on a
+/// tree that merely lacks `--no-remove`; `install_without_no_remove_is_not_accepted`
+/// is that proof.
 #[test]
 fn denies_package_removal_via_install_trailing_hyphen() {
     // `apt-get install apparmor-` removes apparmor. The install rule must not
@@ -1216,6 +1221,112 @@ proptest! {
                 program = program,
                 name = name
             );
+        }
+    }
+}
+
+#[test]
+fn denies_regex_package_name_on_removal() {
+    // One confirmed token must not be an unanchored apt regular expression,
+    // and `+` on remove installs. Real names that contain either are refused
+    // here too: remove them with the host's tools or an operator `one-of` rule.
+    for name in ["lib.", "ba.h", "g++", "libstdc++6", "python3.12"] {
+        let args = ["-y", "remove", "--", name];
+        assert_eq!(
+            denial("xudo.pkg.remove", &args),
+            Some(DenialCode::ArgvRejected),
+            "{name} was not an argument refusal"
+        );
+        let decision = evaluate_command(
+            &load_all(),
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(args.to_vec()),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{name} was accepted");
+    }
+}
+
+#[test]
+fn removal_of_a_plain_package_name_is_still_accepted() {
+    assert_eq!(
+        verdict("xudo.pkg.remove", &["-y", "remove", "--", "ripgrep"]),
+        Verdict::AllowWithConfirmation
+    );
+    assert_eq!(
+        verdict(
+            "xudo.pkg.remove",
+            &["-y", "remove", "--", "build-essential"]
+        ),
+        Verdict::AllowWithConfirmation
+    );
+}
+
+#[test]
+fn install_still_accepts_dotted_and_plus_names() {
+    // Install keeps `deb-name`. `--no-remove` means a regex cannot remove a
+    // package, and a trailing `+` asks apt to install.
+    for name in [
+        "python3.12",
+        "g++",
+        "libstdc++6",
+        "libpng16-16",
+        "lib.",
+        "ba.h",
+    ] {
+        assert_eq!(
+            verdict("xudo.pkg.install", &install_argv(&[name])),
+            Verdict::Allow,
+            "{name} was not an install"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    /// No argv `xudo.pkg.remove` accepts contains `.` or `+` in a package
+    /// position. A generated set of plain names is accepted, so the property
+    /// is not vacuously true.
+    #[test]
+    fn no_argv_accepted_by_package_removal_contains_a_dot_or_plus(
+        names in proptest::collection::vec("[a-z0-9+._-]{1,16}", 1..=10)
+    ) {
+        let mut argv = vec!["-y".to_owned(), "remove".to_owned(), "--".to_owned()];
+        argv.extend(names.iter().cloned());
+        let rules = load_all();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(borrowed),
+            Settings::default(),
+        );
+        let plain = names.iter().all(|name| {
+            !name.contains('.')
+                && !name.contains('+')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("..")
+        });
+        if plain {
+            prop_assert_ne!(
+                decision.verdict,
+                Verdict::Deny,
+                "plain names {:?} were denied",
+                names
+            );
+        }
+        if decision.verdict != Verdict::Deny {
+            prop_assert_eq!(
+                decision.action.as_ref().map(xudo_policy::ActionId::as_str),
+                Some("xudo.pkg.remove")
+            );
+            for name in argv.iter().skip(3) {
+                prop_assert!(!name.contains('.'), "package position {:?} contains '.'", name);
+                prop_assert!(!name.contains('+'), "package position {:?} contains '+'", name);
+            }
         }
     }
 }
