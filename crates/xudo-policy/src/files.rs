@@ -329,6 +329,7 @@ fn put_matcher(out: &mut Vec<u8>, matcher: &Matcher) {
                 NameKind::ArchName => "arch-name",
                 NameKind::ApkName => "apk-name",
                 NameKind::UnitName => "unit-name",
+                NameKind::ServiceUnitName => "service-unit-name",
                 NameKind::Hostname => "hostname",
                 NameKind::SysctlKey => "sysctl-key",
             };
@@ -720,6 +721,7 @@ args = [
   { name = "d", matcher = { name = "apk-name" } },
   { name = "e", matcher = { name = "hostname" } },
   { name = "f", matcher = { name = "sysctl-key" } },
+  { name = "g", matcher = { name = "service-unit-name" } },
 ]
 
 [[action]]
@@ -746,7 +748,7 @@ args = [
             digests,
             [
                 "b324748da0c3bfb72a2ff3ca4d054df8a837b80f9bf5a0f5f3c4b80bfa74238a",
-                "80bd4e20b000d9556b4ccd33b702d8fe36eb8637c6f1461ccbd1ed9ca671b7f9",
+                "27b11bb80a69d4e47885e979d84b7ca8064e83938ee1f008f63083ded7342d0c",
                 "336bd13449dcfa10179cf3319d090841485898e4ff33c136104b13f4f6395095",
             ]
         );
@@ -772,12 +774,13 @@ args = [
 
         /// Every `NameKind`, as a fixed-size array so that adding a kind to the
         /// enum without listing it here is caught by the pin below.
-        const ALL_NAME_KINDS: [NameKind; 7] = [
+        const ALL_NAME_KINDS: [NameKind; 8] = [
             NameKind::DebName,
             NameKind::RpmName,
             NameKind::ArchName,
             NameKind::ApkName,
             NameKind::UnitName,
+            NameKind::ServiceUnitName,
             NameKind::Hostname,
             NameKind::SysctlKey,
         ];
@@ -971,7 +974,7 @@ args = [
 
         #[test]
         fn the_same_bytes_under_different_matchers_are_different_policy() {
-            let kind_words = ["deb-name", "hostname", "unit-name"];
+            let kind_words = ["deb-name", "hostname", "unit-name", "service-unit-name"];
             let texts = ["a", "", "/etc", "/", "a/b"];
             let texts = texts.into_iter().take(SAME_TEXTS);
             for text in texts.chain(kind_words) {
@@ -1044,7 +1047,9 @@ args = [
         // proptest's 256.
         proptest! {
             #![proptest_config(ProptestConfig {
-                cases: if cfg!(miri) { 4 } else { 256 },
+                // One name kind more lengthens every mutation. Two cases still
+                // build every strategy; the full 256 is the non-miri run.
+                cases: if cfg!(miri) { 2 } else { 256 },
                 // Miri's isolation refuses the regression file's I/O.
                 failure_persistence: if cfg!(miri) {
                     None

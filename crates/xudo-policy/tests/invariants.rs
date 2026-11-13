@@ -538,6 +538,7 @@ fn arb_overlapping_matcher() -> impl Strategy<Value = Matcher> {
         Just(Matcher::PathUnder { prefix: "/".into() }),
         Just(Matcher::Name(NameKind::DebName)),
         Just(Matcher::Name(NameKind::UnitName)),
+        Just(Matcher::Name(NameKind::ServiceUnitName)),
         Just(Matcher::Name(NameKind::Hostname)),
         Just(Matcher::Pattern(AnchoredPattern::new("[a-z]+").unwrap())),
         Just(Matcher::Pattern(AnchoredPattern::new("[0-9]+").unwrap())),
@@ -992,6 +993,7 @@ fn arb_parametric_matcher() -> impl Strategy<Value = Matcher> {
         }),
         1 => Just(Matcher::Name(NameKind::DebName)),
         1 => Just(Matcher::Name(NameKind::UnitName)),
+        1 => Just(Matcher::Name(NameKind::ServiceUnitName)),
         1 => Just(Matcher::Name(NameKind::SysctlKey)),
     ]
 }
