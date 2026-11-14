@@ -547,12 +547,18 @@ fn deb_postinst_warns_when_a_kept_beta1_lifecycle_rule_remains() {
         .unwrap_or_else(|| panic!("tmpfiles step missing"));
     let block = &POSTINST[start..end];
     assert!(
-        block.contains("grep -q 'xudo.svc.lifecycle'"),
-        "upgrade notice does not look for the beta.1 lifecycle id"
+        block.contains(
+            "if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`."
+        ),
+        "upgrade notice does not tell the operator to run xudo check"
     );
     assert!(
-        block.contains("replace its unit-name with a one-of list of your units"),
-        "upgrade notice does not say which edit to make"
+        !block.contains("xudo.svc.lifecycle"),
+        "upgrade notice still keys off the action id"
+    );
+    assert!(
+        block.contains("find -P /run/xudo/confirm"),
+        "confirm cleanup left the version gate"
     );
 }
 

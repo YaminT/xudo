@@ -153,10 +153,12 @@ pub struct RulesetReport {
     pub trust: TrustReport,
     /// Whether each loaded rule matches dpkg's shipped conffile checksum.
     pub package_drift: RuleDriftReport,
-    /// Set when the rules loaded and none of them is `xudo.svc.lifecycle`.
+    /// Set when the rules loaded and no systemctl action accepts a lifecycle
+    /// or power verb.
     ///
-    /// A note, not a fault: doctor still exits 0. Absent when the rules did
-    /// not load, and when the operator has copied the example.
+    /// The action id is not consulted. A note, not a fault: doctor still
+    /// exits 0. Absent when the rules did not load, and when such a verb
+    /// is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_note: Option<&'static str>,
     /// Systemctl rules that can start or stop a unit they do not name.

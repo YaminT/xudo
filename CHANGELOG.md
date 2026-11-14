@@ -27,13 +27,31 @@ All notable changes to xudo are documented here. This project follows
   upgrade and you kept your version, you still have the beta.1 rule: run
   `xudo check`, and replace its `unit-name` with a `one-of` list of your
   units. `xudo check` exits 21 for that rule, and `xudo doctor` prints the
-  same sentence. The package upgrade prints it when the kept file still
-  contains `xudo.svc.lifecycle`.
+  same sentence. On an upgrade from a version below `0.1.0~beta.2` the
+  package says to check that file with `xudo check`. It does not decide
+  whether the host is exposed. `xudo check` and `xudo doctor` both report
+  those rows as `open_unit_lints` (`check` nests the array under `lint`).
 - `systemctl poweroff`, `reboot`, `halt`, `kexec`, `suspend`, `hibernate`,
-  `hybrid-sleep`, `suspend-then-hibernate`, `soft-reboot`, `rescue`,
+  `hybrid-sleep`, `suspend-then-hibernate`, `soft-reboot`, `sleep`, `rescue`,
   `emergency`, `default`, and `exit` are refused with any arguments.
-  `isolate` is refused for every target. `systemd-exit.service` is refused
+  `isolate` is refused for every target, including `start --job-mode=isolate`,
+  the split form `--job-mode isolate`, and a getopt prefix such as
+  `--j=isolate`. `systemd-exit.service` is refused
   with the other power services: its unit file sets `SuccessAction=exit-force`.
+  An option value cannot hide the verb: `-p`, `-M`, `--when`, `--message`,
+  and the other options that take the next argument are scanned like every
+  other token. A command is read-only only when a read-only verb is present
+  and every other non-flag token is a unit name. `status rescue` is refused,
+  because `rescue` is a power subcommand. `status rescue.service` still reads.
+- The acting verbs also include `kill`, `clean`, `freeze`, `thaw`, and the
+  compatibility names `condrestart`, `force-reload`, `reload-or-try-restart`,
+  `condreload`, and `condstop`. Stock Debian 13 and Ubuntu images used for
+  the check do not ship `systemctl`, so those names were not confirmed with
+  `--help`. A verb systemd would reject is still refused.
+- The tripwire covers the `systemctl` program only. `service`,
+  `invoke-rc.d`, `busctl`, and a unit alias such as firewalld's
+  `dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
+  is the boundary.
 - `systemd-journald` followed by `-`, `.`, or `@` is the journal for any
   continuation. `systemd-journald-audit.socket` was not refused.
 - Read-only `systemctl` verbs (`status`, `show`, `is-active`, `is-failed`,
@@ -55,10 +73,17 @@ All notable changes to xudo are documented here. This project follows
   three images.
 - Package-manager config redirects are matched per tool. apt long options
   are case-insensitive and a short cluster is scanned for `c` or `o`.
-  sysctl also refuses `-f` and a prefix of `--load` or `--system`. dnf,
-  yum, zypper, pacman, and dpkg use their own option names. This is defence
-  in depth: the shipped rules still only name apt-get, and their positions
-  are literals.
+  sysctl also refuses `-f` and a prefix of `--load` or `--system`. dnf
+  and yum refuse `-c` (their short form of `--config`) and a prefix of
+  `--config`, `--setopt`, `--installroot`, or `--repofrompath`. pacman
+  refuses a prefix of `--config`, `--hookdir`, `--root`, `--dbpath`, or
+  `--sysroot`, and the short options `-c`, `-r`, and `-b`. pacman's `-c`
+  is `--clean` or `--cascade`, not a config file; refusing it is harmless.
+  zypper refuses `--root` and `--plus-repo`. dpkg refuses a prefix of
+  `--status-logger` (it runs a command) and `--log`. dnf, yum, pacman, and
+  zypper were not installed on the images used for the check. This is
+  defence in depth: the shipped rules still only name apt-get, and their
+  positions are literals.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
   the confirmation the remove rule demands. `deb-name` and `apk-name` now

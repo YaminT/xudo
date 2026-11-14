@@ -353,7 +353,7 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
     // byte what it was.
     if !report.open_units.is_empty() {
         lint.insert(
-            "open_units".to_owned(),
+            "open_unit_lints".to_owned(),
             json!(
                 report
                     .open_units
