@@ -13,14 +13,15 @@
 //!    kernel before 5.11 the call is refused and so is the gate; marking each
 //!    descriptor by hand would be another `unsafe` block, and a pre-5.11 host
 //!    is not one the beta supports.
-//! 2. **`/dev/null` for closed 0 to 2.** Before the first `open`, which would
-//!    otherwise take a closed descriptor's number and make the audit log the
-//!    gate's standard error.
-//! 3. **Umask `022` and working directory `/`.** Before anything is opened or
-//!    written. A caller umask of `000` would make a file an apt hook or a
-//!    maintainer script creates world-writable. The directory is an `O_PATH`
-//!    descriptor of `/`. Either failure refuses. The caller's resource limits
-//!    stay a later change.
+//! 2. **`/dev/null` for closed 0 to 2.** Before the umask and cwd reset, and
+//!    before any other `open`. The reset opens an `O_PATH` descriptor of `/`.
+//!    A closed standard stream would give that descriptor number 0, 1 or 2.
+//! 3. **Umask `022` and working directory `/`.** Immediately after the streams
+//!    are filled, and before anything else is opened or written. Nothing before
+//!    the reset depends on the umask or the working directory, so the reset
+//!    must not move earlier. A caller umask of `000` would make a file an apt
+//!    hook or a maintainer script creates world-writable. Either failure
+//!    refuses. The caller's resource limits stay a later change.
 //! 4. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
@@ -498,6 +499,10 @@ fn proceed(
         Stage::Descriptors,
         host.syscalls().mark_cloexec_from(FIRST_INHERITED_FD),
     )?;
+    // Streams before the reset. `reset_cwd` opens an `O_PATH` descriptor of
+    // `/`, and a closed 0, 1 or 2 would give that descriptor the stream's
+    // number. Nothing before the reset depends on the umask or the working
+    // directory, so moving the reset earlier only reopens that hole.
     stage(Stage::Streams, host.hygiene().ensure_std_streams())?;
     stage(Stage::CallerState, host.hygiene().reset_umask())?;
     stage(Stage::CallerState, host.hygiene().reset_cwd())?;

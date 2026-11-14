@@ -95,7 +95,10 @@ All notable changes to xudo are documented here. This project follows
 - apt-get reads a package name containing `.` or `+` that is not an exact
   cache hit as an unanchored regular expression. On install that can select
   many packages and cannot remove one, because the install rule requires
-  `--no-remove`, so `deb-name` is unchanged there. On remove one confirmed
+  `--no-remove`, so `deb-name` is unchanged there.
+  `APT::Cmd::Pattern-Only=true` would turn that regular expression off, but
+  the deny-list refuses `-o` and apt ignores an unknown key, so it is only
+  a possible later defence in depth. On remove one confirmed
   token such as `lib.` could remove hundreds of packages, and a trailing
   `+` installs. The remove rule now uses `deb-name-literal` (`deb-name`, and
   no `.` and no `+` anywhere). A package whose name contains either

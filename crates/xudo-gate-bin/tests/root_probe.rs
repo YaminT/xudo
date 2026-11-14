@@ -51,9 +51,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-struct FreezeMarkerGuard(std::path::PathBuf);
+/// Deletes one path when dropped.
+///
+/// Freeze markers, generated probe binaries, sudoers snippets and rule files
+/// a test created all use this. The name is the action, which is the same
+/// for each of them.
+struct DeleteOnDrop(std::path::PathBuf);
 
-impl Drop for FreezeMarkerGuard {
+impl Drop for DeleteOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
@@ -181,7 +186,7 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     let marker = dir.join("frozen");
     let stale = dir.join(format!("{}frozen", xudo_sys::TEMP_PREFIX));
     let _ = fs::remove_file(&marker);
-    let _marker_guard = FreezeMarkerGuard(marker.clone());
+    let _marker_guard = DeleteOnDrop(marker.clone());
     assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
     assert_eq!(
         fs::metadata(dir).unwrap().permissions().mode() & 0o777,
@@ -494,10 +499,10 @@ fn real_injection_payloads_never_reach_the_child_environment() {
     let _journal = install_everything();
     let marker = format!("{AUDIT_DIR}/environment-payload-ran-{}", std::process::id());
     let _ = fs::remove_file(&marker);
-    let _marker_guard = FreezeMarkerGuard(marker.clone().into());
+    let _marker_guard = DeleteOnDrop(marker.clone().into());
     let (preload_source, preload_library) = compile_environment_payload(&marker);
-    let _source_guard = FreezeMarkerGuard(preload_source.into());
-    let _library_guard = FreezeMarkerGuard(preload_library.clone().into());
+    let _source_guard = DeleteOnDrop(preload_source.into());
+    let _library_guard = DeleteOnDrop(preload_library.clone().into());
 
     let vars = [
         ("LD_PRELOAD", preload_library.as_str()),
@@ -509,8 +514,8 @@ fn real_injection_payloads_never_reach_the_child_environment() {
     ];
     let test_rule = format!("{RULES_DIR}/90-test-environment.toml");
     let sudoers = "/etc/sudoers.d/xudo-env-test";
-    let _sudoers_guard = FreezeMarkerGuard(sudoers.into());
-    let _rule_guard = FreezeMarkerGuard(test_rule.clone().into());
+    let _sudoers_guard = DeleteOnDrop(sudoers.into());
+    let _rule_guard = DeleteOnDrop(test_rule.clone().into());
 
     // Prove the payload itself works in an ordinary child. LD_PRELOAD is set
     // only for cat, never for runuser (which is itself running as root here).
@@ -1186,13 +1191,16 @@ fn the_gate_runs_the_command_with_umask_022_and_cwd_slash() {
     if !begin_root_test("the_gate_runs_the_command_with_umask_022_and_cwd_slash") {
         return;
     }
+    // Honest only because the probe below execs the gate directly from this
+    // root shell after `umask 000`. Routed through sudo, the umask would
+    // already be 022 and the probe would pass without the reset.
     note_escalator_umask();
-    let journal = install_everything();
+    let _journal = install_everything();
     let probe = "/usr/libexec/xudo/caller-state-probe";
     let rule = format!("{RULES_DIR}/90-caller-state.toml");
     let dir = "/tmp/xudo-a0e-cwd";
-    let _probe_guard = FreezeMarkerGuard(probe.into());
-    let _rule_guard = FreezeMarkerGuard(rule.clone().into());
+    let _probe_guard = DeleteOnDrop(probe.into());
+    let _rule_guard = DeleteOnDrop(rule.clone().into());
     let _ = fs::remove_dir_all(dir);
     fs::create_dir(dir).unwrap();
     let uid = id_of(&["-u", USER]);
@@ -1276,7 +1284,6 @@ int main(void) {
         "cwd stdout={stdout} stderr={stderr}"
     );
     assert!(!entry_exists(&nonce), "the request was not consumed");
-    let _ = journal.text();
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1289,8 +1296,9 @@ fn id_of(args: &[&str]) -> u32 {
         .unwrap()
 }
 
-/// What each installed escalator does with a caller umask of `000`. Recorded,
-/// not asserted. A password prompt is killed by `timeout`.
+/// What each installed escalator does with a caller umask of `000`, as the
+/// lane's unprivileged account `xudotest`. Recorded, not asserted. A password
+/// prompt is killed by `timeout`.
 #[allow(clippy::disallowed_methods)]
 fn note_escalator_umask() {
     let tools: &[(&str, &str, &[&str])] = &[
@@ -1322,9 +1330,9 @@ fn note_escalator_umask() {
             eprintln!("A0E_UMASK {label} skipped: /usr/bin/timeout absent");
             continue;
         }
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new("/usr/sbin/runuser");
         command
-            .arg("-c")
+            .args(["-u", USER, "--", "/bin/sh", "-c"])
             .arg("umask 000; exec /usr/bin/timeout --signal=KILL 3 \"$0\" \"$@\"")
             .arg(path)
             .args(*args);

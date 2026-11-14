@@ -1298,9 +1298,14 @@ fn removal_of_a_plain_package_name_is_still_accepted() {
 }
 
 #[test]
-fn install_still_accepts_dotted_and_plus_names() {
-    // Install keeps `deb-name`. `--no-remove` means a regex cannot remove a
-    // package, and a trailing `+` asks apt to install.
+fn install_still_accepts_dotted_names_a_known_regex_residual() {
+    // Install keeps `deb-name`, so `lib.` and `ba.h` are Allow. In apt-get a
+    // name containing `.` or `+` that is not an exact cache hit is an
+    // unanchored regular expression. On install it can fan out to many
+    // packages and cannot remove one, because the rule requires
+    // `--no-remove`. The remove rule refuses these names. See the Unreleased
+    // Security note in CHANGELOG.md: `APT::Cmd::Pattern-Only=true` would turn
+    // the expression off, and it is only a possible later defence.
     for name in [
         "python3.12",
         "g++",
