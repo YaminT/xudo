@@ -32,7 +32,7 @@
 //! fake that records it, and made to fail at each step.
 
 use std::cell::RefCell;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::fs::{Mode, OFlags, fstat, open};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
@@ -285,61 +285,81 @@ fn forbid_new_privileges() -> Result<(), SysError> {
     ))
 }
 
-/// Opens `/` and enters it. Split out so a test can fail each half without a
-/// real `fchdir` of this process.
-trait RootDir {
-    /// Opens `/` as a directory descriptor.
+/// Opens `/` and enters it.
+///
+/// Split out so a test can fail each half without a real `fchdir` of this
+/// process. Linux calls it for the host. A test calls it with a scripted
+/// root. A macOS build that is not a test has neither caller, so the trait,
+/// `reset_cwd_in`, and the `AsFd` import they need stay in this module and
+/// are not compiled there: a dead trait fails the lint.
+#[cfg(any(target_os = "linux", test))]
+mod root_dir {
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+    use super::SysError;
+    // Only the real `/` opens anything. A macOS test builds the trait and
+    // `reset_cwd_in` and never these.
+    #[cfg(target_os = "linux")]
+    use crate::error::lift;
+    #[cfg(target_os = "linux")]
+    use rustix::fs::{Mode, OFlags, open};
+
+    /// Opens `/` and enters it. Split out so a test can fail each half without
+    /// a real `fchdir` of this process.
+    pub(super) trait RootDir {
+        /// Opens `/` as a directory descriptor.
+        ///
+        /// # Errors
+        ///
+        /// [`SysError`] when the open fails.
+        fn open_root(&self) -> Result<OwnedFd, SysError>;
+
+        /// Makes `fd` the working directory.
+        ///
+        /// # Errors
+        ///
+        /// [`SysError`] when `fchdir` fails.
+        fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError>;
+    }
+
+    /// The real `/`. Linux only: `O_PATH` is how the open asks nothing of a
+    /// filesystem mounted on `/`.
+    #[cfg(target_os = "linux")]
+    pub(super) struct HostRoot;
+
+    #[cfg(target_os = "linux")]
+    impl RootDir for HostRoot {
+        fn open_root(&self) -> Result<OwnedFd, SysError> {
+            lift(
+                "open(/)",
+                open(
+                    "/",
+                    OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::PATH,
+                    Mode::empty(),
+                ),
+            )
+        }
+
+        fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError> {
+            lift("fchdir", rustix::process::fchdir(fd))
+        }
+    }
+
+    /// Enters the directory `root` opened. A failure of either half is the
+    /// caller's to refuse on.
     ///
     /// # Errors
     ///
-    /// [`SysError`] when the open fails.
-    fn open_root(&self) -> Result<OwnedFd, SysError>;
-
-    /// Makes `fd` the working directory.
-    ///
-    /// # Errors
-    ///
-    /// [`SysError`] when `fchdir` fails.
-    fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError>;
-}
-
-/// The real `/`. Linux only: `O_PATH` is how the open asks nothing of a
-/// filesystem mounted on `/`.
-#[cfg(target_os = "linux")]
-struct HostRoot;
-
-#[cfg(target_os = "linux")]
-impl RootDir for HostRoot {
-    fn open_root(&self) -> Result<OwnedFd, SysError> {
-        lift(
-            "open(/)",
-            open(
-                "/",
-                OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::PATH,
-                Mode::empty(),
-            ),
-        )
+    /// [`SysError`] from `root`.
+    pub(super) fn reset_cwd_in(root: &dyn RootDir) -> Result<(), SysError> {
+        let fd = root.open_root()?;
+        root.enter(fd.as_fd())
     }
-
-    fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError> {
-        lift("fchdir", rustix::process::fchdir(fd))
-    }
-}
-
-/// Enters the directory `root` opened. A failure of either half is the
-/// caller's to refuse on.
-///
-/// # Errors
-///
-/// [`SysError`] from `root`.
-fn reset_cwd_in(root: &dyn RootDir) -> Result<(), SysError> {
-    let fd = root.open_root()?;
-    root.enter(fd.as_fd())
 }
 
 #[cfg(target_os = "linux")]
 fn reset_cwd() -> Result<(), SysError> {
-    reset_cwd_in(&HostRoot)
+    root_dir::reset_cwd_in(&root_dir::HostRoot)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -459,6 +479,7 @@ mod tests {
 
     use rustix::fs::Mode;
 
+    use super::root_dir::{RootDir, reset_cwd_in};
     use super::*;
 
     /// A table whose open streams a test chooses. Records what was done to it.
