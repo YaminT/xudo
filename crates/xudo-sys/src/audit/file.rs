@@ -67,7 +67,9 @@
 //! not survive a crash (the cut leaves the log without a record, so the next
 //! writer syncs the directory itself). If the cut fails too, the error says
 //! the log may now be damaged and that recovery is to move the log aside. The
-//! refusal still stands. The next writer finds what is left: a torn tail,
+//! gate prints that recovery on stderr as a fixed line, with no path and no
+//! bytes from the log. The broker puts the error text in its refusal message.
+//! The refusal still stands. The next writer finds what is left: a torn tail,
 //! which it refuses, or a whole record, which it continues from — the case
 //! this cannot close.
 //!
@@ -596,7 +598,7 @@ fn cut_back(file: &mut impl LogFile, path: &Path, len: u64, error: AuditError) -
     match file.truncate(len).and_then(|()| file.sync_data()) {
         Ok(()) => error,
         Err(cut) => AuditError::Io {
-            op: "repair",
+            op: super::CUT_BACK_FAILED_OP,
             path: path.display().to_string(),
             reason: format!(
                 "{error}; cutting the log back failed ({cut}); the log may now be damaged; move the log aside to recover"

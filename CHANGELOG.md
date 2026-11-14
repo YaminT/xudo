@@ -117,7 +117,11 @@ All notable changes to xudo are documented here. This project follows
   a page boundary; the caller can steer that length through argv, and sudo
   relaying a signal (or the pty hanging up) can deliver it. That route
   predates this fix. xudo stays down until an operator moves the log aside.
-  Blocking signals around the write is a later change.
+  Blocking signals around the write is a later change. When the gate's own
+  append fails because the log is damaged or the cut-back did not land, it
+  prints one fixed line on stderr telling the operator to move the log
+  aside. The line has no path and no bytes from the log. The exit status
+  is unchanged. The broker's refusal message still carries the error text.
 - sudo-rs 0.2.5 and OpenDoas pass a caller umask of `000` through to the
   root command. Classic sudo applies `022`. Measured. A file an apt hook or
   a maintainer script creates would then be world-writable. The gate now

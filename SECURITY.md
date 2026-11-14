@@ -91,7 +91,11 @@ sudo relays, or the pty hanging up when the user kills sudo, is enough to
 deliver it. That route predates this fix. The impact is availability: xudo
 stays down until an operator moves the log aside. Blocking signals around
 the write and the cut-back is a later change. This change does not reset
-the caller's resource limits.
+the caller's resource limits. When the gate's own append fails because the
+log is damaged or the cut-back did not land, stderr gains one fixed line
+telling the operator to move the log aside. The line has no path and no
+bytes from the log. The exit status is unchanged. The broker's refusal
+message still carries the error text.
 
 sudo-rs 0.2.5 and OpenDoas pass a caller umask of `000` through to the root
 command. Classic sudo applies `022`. Measured. A file an apt hook or a

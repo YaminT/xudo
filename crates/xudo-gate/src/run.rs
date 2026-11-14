@@ -79,8 +79,10 @@
 //!
 //! The gate writes its refusal to the audit trail (best effort: a refusal
 //! stands without its record) and prints one line to standard error, the
-//! stable code and severity only. Nothing from the spool, the ruleset or the
-//! environment reaches that line.
+//! stable code and severity only. When an append fails because the log is
+//! damaged, or because cutting a torn tail back itself failed, it prints one
+//! more line: move the log aside. That line is fixed. Nothing from the log,
+//! the spool, the ruleset or the environment reaches either line.
 
 use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
@@ -325,7 +327,9 @@ pub struct GateExit {
     /// The exit status: 17, 18 or 19. The gate execs in place, so a child can
     /// exit with the same numbers; the stderr refusal line tells them apart.
     pub status: i32,
-    /// One line for standard error: the code and severity, nothing else.
+    /// Standard error. The first line is the code and severity. A second line
+    /// is present only when an audit append reported a damaged log, and it is
+    /// a fixed recovery sentence with nothing from the log or the caller.
     pub message: String,
 }
 
@@ -411,6 +415,10 @@ struct Progress {
     /// Evidence beyond what the record builders add: the lineage, the name the
     /// gate ran under, the program's digest.
     evidence: Vec<String>,
+    /// Set when the authorization append reported a damaged log. The refusal
+    /// record is a second append; either one is enough to warn the operator.
+    /// The sentence is static.
+    audit_notice: Option<&'static str>,
 }
 
 /// Runs the gate.
@@ -427,20 +435,32 @@ pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
         ..Progress::default()
     };
     let Err(refusal) = proceed(host, args, &mut progress);
-    record(host, &refusal, &progress);
+    // The authorization append and the refusal append are different calls.
+    // Either one reporting damage is enough, and the sentence is the same,
+    // so the operator sees it once.
+    let notice = record(host, &refusal, &progress).or(progress.audit_notice);
+    let mut message = format!(
+        "xudo-gate: refused ({}, severity {})",
+        refusal.code(),
+        refusal.severity().label()
+    );
+    if let Some(line) = notice {
+        message.push('\n');
+        message.push_str("xudo-gate: ");
+        message.push_str(line);
+    }
     GateExit {
         status: refusal.exit_code().as_i32(),
-        message: format!(
-            "xudo-gate: refused ({}, severity {})",
-            refusal.code(),
-            refusal.severity().label()
-        ),
+        message,
     }
 }
 
 /// Writes the refusal to the audit trail, or the failure of an exec that was
 /// already authorized. Best effort: a refusal stands whether or not it lands.
-fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) {
+///
+/// Returns the fixed recovery sentence when the append says the log may be
+/// damaged. The sentence contains nothing from the error.
+fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) -> Option<&'static str> {
     let caller = progress
         .caller
         .clone()
@@ -454,7 +474,10 @@ fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) {
             &progress.evidence,
         ),
     };
-    let _ = host.audit().append(&build);
+    host.audit()
+        .append(&build)
+        .err()
+        .and_then(|error| error.damaged_log_notice())
 }
 
 /// Adds evidence to a record the builders in [`crate::decide`] made.
@@ -567,7 +590,16 @@ fn proceed(
             &evidence,
         )
     };
-    let authorized = stage(Stage::Audit, authorize(host.audit(), approved, &build))?;
+    let authorized = match authorize(host.audit(), approved, &build) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            progress.audit_notice = error.damaged_log_notice();
+            return Err(Refusal::Failed {
+                stage: Stage::Audit,
+                reason: error.to_string(),
+            });
+        }
+    };
     progress.authorized = Some((
         authorized.receipt().seq().get(),
         authorized.approval().clone(),
@@ -773,11 +805,12 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    use xudo_audit::TailError;
     use xudo_audit::record::Decision as AuditDecision;
     use xudo_policy::{RuleFile, load_rule_files};
     use xudo_sys::{
-        FakeAuditSink, FakeHygiene, FakePrograms, FakeSpool, FakeSyscalls, FixedClock, HygieneCall,
-        MapSource, ProgramError, SpoolCall, SysError, TrustError,
+        AuditError, FakeAuditSink, FakeHygiene, FakePrograms, FakeSpool, FakeSyscalls, FixedClock,
+        HygieneCall, MapSource, ProgramError, SpoolCall, SysError, TrustError,
     };
 
     use super::*;
@@ -1558,6 +1591,88 @@ args = [
             "{}",
             exit.message
         );
+        assert_eq!(exit.message.lines().count(), 1, "{}", exit.message);
+        assert!(
+            !exit.message.contains("move the log aside"),
+            "{}",
+            exit.message
+        );
+        assert!(host.audit.records().is_empty());
+    }
+
+    /// Bytes that must never reach stderr. They sit in the audit error, which
+    /// is where a damaged tail quotes the log.
+    const CALLER_BYTES: &str = "caller-bytes-9f3a";
+
+    fn damaged_tail() -> AuditError {
+        AuditError::DamagedTail {
+            path: "/var/lib/xudo/audit.jsonl".to_owned(),
+            reason: TailError::NotARecord {
+                reason: CALLER_BYTES.to_owned(),
+            },
+        }
+    }
+
+    fn cut_back_failed() -> AuditError {
+        AuditError::Io {
+            op: "repair",
+            path: format!("/tmp/{CALLER_BYTES}"),
+            reason: format!("cutting the log back failed ({CALLER_BYTES})"),
+        }
+    }
+
+    fn assert_fixed_recovery(exit: &GateExit, code: &str) {
+        assert_eq!(exit.status, 19, "{}", exit.message);
+        assert!(exit.message.contains(code), "{}", exit.message);
+        assert!(
+            exit.message
+                .contains("xudo-gate: the audit log may be damaged; move the log aside to recover"),
+            "{}",
+            exit.message
+        );
+        assert!(!exit.message.contains(CALLER_BYTES), "{}", exit.message);
+        assert_eq!(exit.message.lines().count(), 2, "{}", exit.message);
+    }
+
+    #[test]
+    fn a_damaged_log_on_the_refusal_record_prints_a_fixed_recovery_line() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_with(damaged_tail());
+        let exit = run(
+            &mut host,
+            &[OsString::from("xudo-gate-auth"), OsString::from("--help")],
+        );
+        assert_fixed_recovery(&exit, "gate_failed_invocation");
+        assert!(host.audit.records().is_empty());
+        assert_eq!(exec_calls(&host), 0);
+        assert!(consumed(&spool).is_empty());
+    }
+
+    #[test]
+    fn a_cut_back_that_fails_on_the_authorization_prints_the_same_line() {
+        // The authorization append fails and the refusal append lands. The
+        // notice still comes from the authorization, once.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_times(1, cut_back_failed());
+        let exit = run(&mut host, &auth());
+        assert_fixed_recovery(&exit, "gate_failed_audit");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(
+            denial_codes(&host),
+            vec![Some("gate_failed_audit".to_owned())]
+        );
+    }
+
+    #[test]
+    fn both_appends_failing_on_a_damaged_log_prints_the_recovery_once() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_with(damaged_tail());
+        let exit = run(&mut host, &auth());
+        assert_fixed_recovery(&exit, "gate_failed_audit");
+        assert_eq!(exec_calls(&host), 0);
         assert!(host.audit.records().is_empty());
     }
 
