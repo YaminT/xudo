@@ -686,40 +686,33 @@ mod tests {
     }
 
     #[test]
-    fn the_host_sets_umask_022_and_the_working_directory_to_slash() {
-        // Process-global, and restored even if an assertion fails. The window
-        // is this test. Other tests that create files run in parallel; the
-        // mask is put back to `022` (tighter than a caller `000`) for the
-        // check and then to whatever it was.
+    fn the_host_sets_umask_022_from_a_tighter_caller_mask() {
+        // The umask is process-global. The other unit tests of this process
+        // run in parallel threads and create files. The seed is `077`: it
+        // differs from `022`, so the reset is visible, and a file created
+        // in the window is only tighter. `LOCK` serialises only this test
+        // with itself. This test does not `chdir`. The `fchdir` to `/`
+        // runs in `tests/reset_cwd.rs`, one process.
         struct Restore {
             umask: Mode,
-            cwd: std::ffi::CString,
         }
         impl Drop for Restore {
             fn drop(&mut self) {
                 let _ = rustix::process::umask(self.umask);
-                let _ = rustix::process::chdir(&self.cwd);
             }
         }
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_umask = rustix::process::umask(Mode::empty());
-        let previous_cwd = rustix::process::getcwd(Vec::new()).unwrap();
+        let caller = Mode::from_bits_truncate(0o077);
+        let previous_umask = rustix::process::umask(caller);
         let restore = Restore {
             umask: previous_umask,
-            cwd: previous_cwd,
         };
-        let _ = rustix::process::umask(Mode::empty());
-        rustix::process::chdir("/tmp").unwrap();
+        let seeded = rustix::process::umask(caller);
+        assert_eq!(seeded.bits() & 0o777, 0o077);
         HostHygiene.reset_umask().unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            HostHygiene.reset_cwd().unwrap();
-            let cwd = rustix::process::getcwd(Vec::new()).unwrap();
-            assert_eq!(cwd.as_bytes(), b"/");
-        }
         #[cfg(not(target_os = "linux"))]
         {
             let err = HostHygiene.reset_cwd().unwrap_err();
