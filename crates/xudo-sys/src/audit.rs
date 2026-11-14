@@ -310,7 +310,10 @@ impl AuditSink for JsonlLog {
 #[derive(Debug, Default)]
 pub struct FakeAuditSink {
     records: Vec<Record>,
-    failure: Option<String>,
+    failure: Option<AuditError>,
+    /// How many of the next appends fail. `None` means every append, once
+    /// `failure` is set. `Some(0)` accepts.
+    failures_left: Option<usize>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -322,9 +325,27 @@ impl FakeAuditSink {
 
     /// A sink that accepts nothing: a full disk, a missing journal.
     pub fn failing(reason: impl Into<String>) -> Self {
+        Self::failing_with(AuditError::Unavailable {
+            reason: reason.into(),
+        })
+    }
+
+    /// A sink that fails every append with `error`.
+    pub fn failing_with(error: AuditError) -> Self {
         Self {
             records: Vec::new(),
-            failure: Some(reason.into()),
+            failure: Some(error),
+            failures_left: None,
+        }
+    }
+
+    /// A sink that fails the next `times` appends with `error`, then accepts
+    /// records that follow the chain.
+    pub fn failing_times(times: usize, error: AuditError) -> Self {
+        Self {
+            records: Vec::new(),
+            failure: Some(error),
+            failures_left: Some(times),
         }
     }
 
@@ -341,10 +362,17 @@ impl AuditSink for FakeAuditSink {
         build: &dyn Fn(Option<&Record>) -> Record,
         check: &dyn Fn(&Record) -> Result<(), AuditError>,
     ) -> Result<AuditReceipt, AuditError> {
-        if let Some(reason) = &self.failure {
-            return Err(AuditError::Unavailable {
-                reason: reason.clone(),
-            });
+        if let Some(error) = self.failure.clone() {
+            match self.failures_left {
+                None => return Err(error),
+                Some(0) => {
+                    // The budget is spent. This append is accepted.
+                }
+                Some(left) => {
+                    self.failures_left = Some(left.saturating_sub(1));
+                    return Err(error);
+                }
+            }
         }
         let (record, _line) = next_record(self.records.last(), build, check)?;
         let receipt = AuditReceipt::of(&record);
@@ -378,6 +406,18 @@ fn next_record(
     }
     Ok((record, line))
 }
+
+/// `AuditError::Io::op` when cutting the log back itself failed.
+///
+/// The gate treats this op as "the log may be damaged". The text of the
+/// error is not what it prints: that text can quote the log.
+pub(crate) const CUT_BACK_FAILED_OP: &str = "repair";
+
+/// The sentence an operator can act on when the log may be damaged.
+///
+/// Fixed. A damaged tail's reason, and the path, can carry bytes the caller
+/// chose, so nothing from the error is safe to print on a terminal.
+const DAMAGED_LOG_NOTICE: &str = "the audit log may be damaged; move the log aside to recover";
 
 /// Why a record is not on the trail. Every variant means: refuse.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -474,6 +514,25 @@ pub enum AuditError {
     },
 }
 
+impl AuditError {
+    /// A fixed operator sentence when the log may be damaged.
+    ///
+    /// `DamagedTail`, and a cut-back whose own write failed (`op` is
+    /// `"repair"`). Every other failure is `None`: the log was put back, or
+    /// the failure was something else. The sentence never includes the path
+    /// or the tail.
+    pub fn damaged_log_notice(&self) -> Option<&'static str> {
+        match self {
+            Self::DamagedTail { .. }
+            | Self::Io {
+                op: CUT_BACK_FAILED_OP,
+                ..
+            } => Some(DAMAGED_LOG_NOTICE),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -541,6 +600,59 @@ mod tests {
             }
         );
         assert!(sink.records().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_log_has_a_fixed_operator_sentence() {
+        let marker = "caller-bytes-9f3a";
+        let tail = AuditError::DamagedTail {
+            path: "/var/lib/xudo/audit.jsonl".to_owned(),
+            reason: TailError::NotARecord {
+                reason: marker.to_owned(),
+            },
+        };
+        let notice = tail.damaged_log_notice().unwrap();
+        assert_eq!(
+            notice,
+            "the audit log may be damaged; move the log aside to recover"
+        );
+        assert!(!notice.contains(marker), "{notice}");
+        let cut = AuditError::Io {
+            op: CUT_BACK_FAILED_OP,
+            path: "/var/lib/xudo/audit.jsonl".to_owned(),
+            reason: format!("{marker}; cutting the log back failed"),
+        };
+        assert_eq!(cut.damaged_log_notice(), Some(notice));
+        assert_eq!(
+            AuditError::Io {
+                op: "write",
+                path: "/var/lib/xudo/audit.jsonl".to_owned(),
+                reason: marker.to_owned(),
+            }
+            .damaged_log_notice(),
+            None
+        );
+        assert_eq!(
+            AuditError::Unavailable {
+                reason: marker.to_owned(),
+            }
+            .damaged_log_notice(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sink_can_fail_a_fixed_number_of_appends() {
+        let mut sink = FakeAuditSink::failing_times(
+            1,
+            AuditError::Unavailable {
+                reason: "once".to_owned(),
+            },
+        );
+        assert!(authorize(&mut sink, Grant("/usr/bin/true"), &authorization).is_err());
+        let authorized = authorize(&mut sink, Grant("/usr/bin/true"), &authorization).unwrap();
+        assert_eq!(authorized.approval(), &Grant("/usr/bin/true"));
+        assert_eq!(sink.records().len(), 1);
     }
 
     #[test]
