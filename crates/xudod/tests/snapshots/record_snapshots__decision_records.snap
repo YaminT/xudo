@@ -13,7 +13,7 @@ expression: text
   "classification": "unattested",
   "decision": "allowed",
   "denial": null,
-  "deny_list_version": 3,
+  "deny_list_version": 4,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -32,7 +32,7 @@ expression: text
     "nonce=abababababababababababababababababababababababababababababababab",
     "deadline_ms=1900"
   ],
-  "hash": "d2f8d8d468dbd1dba4e84a2e6c8799ea3f4ca0ba1be45ef1d2f4c24027f87977",
+  "hash": "ce883de7f6d1b4e3a030a503cadc1dc3bac57de204b34d1724cb7dea7c942b1a",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -51,7 +51,7 @@ expression: text
   "classification": "unattested",
   "decision": "awaiting_confirmation",
   "denial": null,
-  "deny_list_version": 3,
+  "deny_list_version": 4,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -68,7 +68,7 @@ expression: text
     "claimed_classification=enrolled-agent-yolo",
     "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
   ],
-  "hash": "24ea81c5851bed8aa20cee7b78137510a39fdb45c16857624255ddfe23453836",
+  "hash": "6723c238f10818cb2b4fe4930e6cb7e376bbca56e614b9b3d6372e8318b2b44a",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -85,7 +85,7 @@ expression: text
   "classification": "unattested",
   "decision": "denied",
   "denial": "argv_rejected",
-  "deny_list_version": 3,
+  "deny_list_version": 4,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -102,7 +102,7 @@ expression: text
     "claimed_classification=enrolled-agent-yolo",
     "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
   ],
-  "hash": "070ca26ab112792b5349124497238536a055706336aa9411a5249008fee3603f",
+  "hash": "72a125dfbbc0a09610df2c626bd3a6f2addcb8bbffaebe7e45ab07add3774a8e",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": null,

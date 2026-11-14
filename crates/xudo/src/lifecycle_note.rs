@@ -70,6 +70,18 @@ mod tests {
         )));
         // daemon-reload does not start or stop a unit.
         assert!(missing(&systemctl("xudo.svc.reload", "daemon-reload", "")));
+        // A compatibility alias is a lifecycle verb. The note must not claim
+        // the operator has no lifecycle rule.
+        let compat = RuleSet::from_toml(
+            "note.toml",
+            "[[action]]\nid = \"xudo.svc.restart-web\"\ntier = \"svc-control\"\n\
+             exe = \"/usr/bin/systemctl\"\nargs = [\n  { name = \"verb\", matcher = { one-of = \
+             [\"condrestart\", \"force-reload\"] } },\n  { name = \"unit\", matcher = { name = \
+             \"unit-name\" } },\n]\n",
+        )
+        .unwrap();
+        assert!(!missing(&compat));
+        assert!(!compat.open_unit_actions().is_empty());
         assert!(TEXT.starts_with("no service lifecycle rule: "));
         assert!(TEXT.contains("/usr/share/xudo/examples/20-services-lifecycle.toml"));
     }

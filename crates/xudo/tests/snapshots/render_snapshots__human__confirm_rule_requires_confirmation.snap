@@ -11,5 +11,5 @@ ALLOW, after a human confirms
   trace
     canonicalized: unchanged (autoremove)
     matched xudo.pkg.autoremove at snapshot-fixture.toml:12
-    deny-list v3: no capability class matched
+    deny-list v4: no capability class matched
     confirmation required: the matched rule always requires confirmation
