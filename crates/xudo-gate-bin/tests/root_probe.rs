@@ -1205,6 +1205,7 @@ fn the_gate_runs_the_command_with_umask_022_and_cwd_slash() {
         source,
         r#"
 #include <stdio.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 int main(void) {
