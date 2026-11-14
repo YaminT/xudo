@@ -234,6 +234,11 @@ impl Hygiene for HostHygiene {
     }
 
     fn reset_umask(&self) -> Result<(), SysError> {
+        // Fixed `022`. `027` would make a file root writes under `/etc` or
+        // `/usr` unreadable to a non-root daemon. sudo's own rule combines the
+        // caller's umask with `022`, and a caller mask of `077` under sudo-rs
+        // or doas would do the same to other users' services. A fixed `022`
+        // is deterministic and matches what classic sudo applies.
         let _previous = rustix::process::umask(Mode::from_bits_truncate(0o022));
         Ok(())
     }

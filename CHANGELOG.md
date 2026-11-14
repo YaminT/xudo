@@ -118,6 +118,16 @@ All notable changes to xudo are documented here. This project follows
   relaying a signal (or the pty hanging up) can deliver it. That route
   predates this fix. xudo stays down until an operator moves the log aside.
   Blocking signals around the write is a later change.
+- sudo-rs 0.2.5 and OpenDoas pass a caller umask of `000` through to the
+  root command. Classic sudo applies `022`. Measured. A file an apt hook or
+  a maintainer script creates would then be world-writable. The gate now
+  always sets umask `022`, and the command starts in `/`. sudo's own rule
+  is the caller's umask combined with `022`, so a caller's `077` is now
+  loosened to `022`. `027` would make files root writes under `/etc` and
+  `/usr` unreadable to non-root daemons, and keeping sudo's combined rule
+  would let a tight caller umask under sudo-rs or doas do the same to other
+  users' services. A fixed `022` is deterministic and matches what classic
+  sudo gives.
 
 ### Added
 
