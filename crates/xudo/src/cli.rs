@@ -2937,7 +2937,7 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         assert_eq!(code, ExitCode::Delegated, "{json}{err}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["note"], crate::lifecycle_note::TEXT);
-        assert!(parsed["lint"].get("open_units").is_none(), "{json}");
+        assert!(parsed["lint"].get("open_unit_lints").is_none(), "{json}");
     }
 
     #[test]
@@ -2990,11 +2990,16 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exit_code"], 21);
         assert_eq!(
-            parsed["lint"]["open_units"][0]["action"],
+            parsed["lint"]["open_unit_lints"][0]["action"],
             "xudo.svc.restart"
         );
-        assert_eq!(parsed["lint"]["open_units"][0]["file"], "10-rules.toml");
-        let message = parsed["lint"]["open_units"][0]["message"].as_str().unwrap();
+        assert_eq!(
+            parsed["lint"]["open_unit_lints"][0]["file"],
+            "10-rules.toml"
+        );
+        let message = parsed["lint"]["open_unit_lints"][0]["message"]
+            .as_str()
+            .unwrap();
         assert!(
             message.contains(
                 "this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"

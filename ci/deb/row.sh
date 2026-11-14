@@ -92,8 +92,8 @@ shipped=$(find /etc/sudoers.d -mindepth 1 -maxdepth 1 ! -name xudo | sort)
 
 # Upgrade keeps the rule, a group member, and an operator's edit to a shipped rule.
 echo '# mine' >>/etc/xudo/rules.d/05-probe.toml
-# A comment keeps the file valid. The upgrade notice matches the id string.
-printf '\n# kept beta.1 rule id = "xudo.svc.lifecycle"\n' >>/etc/xudo/rules.d/20-services.toml
+# The operator kept the published beta.1 file. A comment is not that file.
+cp /harness/fixtures/20-services-beta.1.toml /etc/xudo/rules.d/20-services.toml
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
@@ -106,7 +106,13 @@ mkdir /run/xudo/confirm/nested
 printf '%s\n' 'keep nested' >/run/xudo/confirm/nested/legacy.json
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
 grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml || fail "upgrade did not keep the beta.1 lifecycle rule"
-grep -Fq 'replace its unit-name with a one-of list of your units' /tmp/apt.log || fail "upgrade did not warn about the kept lifecycle rule"
+grep -Fq 'if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`' /tmp/apt.log || fail "upgrade did not say to check a kept rules file"
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 21 ] || fail "xudo check on the kept beta.1 rule exited $rc, wanted 21"
+grep -Fq 'xudo.svc.lifecycle' /tmp/check.out || fail "xudo check did not name xudo.svc.lifecycle"
 gone /run/xudo/confirm/legacy.json
 [ -L /run/xudo/confirm/link.json ] || fail "confirm cleanup removed a symlink"
 [ "$(cat /run/xudo/confirm/target-data)" = 'keep target' ] || fail "confirm cleanup changed a symlink target"

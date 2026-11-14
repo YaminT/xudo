@@ -21,8 +21,10 @@ filesystem-template, and broker-socket units for any caller who passes the
 password gate. The filesystem templates on the deny-list are
 `systemd-fsck@`, `systemd-growfs@`, `systemd-makefs@`, and `mdadm*@`.
 A `.mount` unit is not on that list, and `unit-name` accepts it. The
-tripwire is a name list: an alias or a unit that is not enumerated gets
-past, and the enumeration is the boundary. The shipped rule set no longer
+tripwire covers the `systemctl` program only. `service`, `invoke-rc.d`,
+`busctl`, and a unit alias such as firewalld's
+`dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
+is the boundary. The shipped rule set no longer
 contains a service lifecycle rule. Copy
 `/usr/share/xudo/examples/20-services-lifecycle.toml` to
 `/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
@@ -35,10 +37,19 @@ units, `systemd-repart`, and `systemd-sysctl`, on a `systemctl` verb that
 starts, stops, signals, or
 otherwise acts, including a unit an operator listed by mistake. A read-only
 verb (`status`, `show`, and the other queries) is not refused because of
-the unit name. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`
-during the upgrade and you kept your version, you still have the beta.1
-rule: run `xudo check`, and replace its `unit-name` with a `one-of` list of
-your units.
+the unit name. An option value cannot hide the verb: every token is
+checked, so `-p status stop debug-shell.service` is `stop`, not a status
+query. `poweroff`, `reboot`, `sleep`, and the other power subcommands are
+refused in any position. `start --job-mode=isolate` and a prefix such as
+`--j=isolate` are refused for every target. `status rescue` is refused,
+because `rescue` is itself a power subcommand. The acting verbs also
+include `kill`, `clean`, `freeze`, `thaw`, and the compatibility names
+`condrestart`, `force-reload`, `reload-or-try-restart`, `condreload`, and
+`condstop`. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`
+during the upgrade and you kept your version, run `xudo check`, and
+replace its `unit-name` with a `one-of` list of your units. The package
+notice says to run that check. It does not decide whether the host is
+exposed.
 
 The published `v0.1.0-beta.1` install rule accepted a package name ending in
 `-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped

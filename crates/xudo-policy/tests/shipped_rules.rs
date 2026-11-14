@@ -47,6 +47,10 @@ const SHIPPED: &[(&str, &str)] = &[
 const LIFECYCLE_EXAMPLE: &str =
     include_str!("../../../rules/examples/20-services-lifecycle.toml.example");
 
+/// Published `v0.1.0-beta.1` `rules/20-services.toml`, byte for byte.
+/// The upgrade lane installs this file as the operator's kept conffile.
+const BETA1_SERVICES: &str = include_str!("../../../ci/deb/fixtures/20-services-beta.1.toml");
+
 /// The hole the tripwires close: a lifecycle rule whose unit position is the
 /// generic `unit-name` kind. The shipped rules do not contain this. A test
 /// that only calls `evaluate_deny_list` would pass even if matching an action
@@ -834,6 +838,8 @@ fn the_shipped_rules_have_no_lifecycle_rule() {
     // lifecycle or power verb on an ordinary service name. `status` still
     // reads one.
     let rules = load_all();
+    assert!(rules.open_unit_actions().is_empty());
+    assert!(!rules.has_systemctl_lifecycle_or_power());
     for verb in LIFECYCLE_OR_POWER_VERBS {
         let decision = evaluate_command(
             &rules,
@@ -863,6 +869,24 @@ fn the_shipped_rules_have_no_lifecycle_rule() {
             "nginx.service",
         ]),
         Verdict::Allow
+    );
+}
+
+#[test]
+fn the_beta1_services_file_lints_and_the_example_does_not() {
+    let beta1 = RuleSet::from_toml("20-services.toml", BETA1_SERVICES)
+        .unwrap_or_else(|e| panic!("beta.1 services file does not load: {e}"));
+    assert!(
+        beta1
+            .open_unit_actions()
+            .iter()
+            .any(|lint| lint.id.as_str() == "xudo.svc.lifecycle"),
+        "the published beta.1 lifecycle rule was not linted"
+    );
+    let example = example_lifecycle();
+    assert!(
+        example.open_unit_actions().is_empty(),
+        "the shipped example lints, so copying it would make xudo check exit 21"
     );
 }
 
