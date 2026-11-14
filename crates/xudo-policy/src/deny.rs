@@ -37,8 +37,11 @@
 //! Arguments to `systemctl` are classified by the unit name as well as by the
 //! verb. A power or boot target, a `modprobe@` template, a filesystem
 //! template, this broker's own units, and the `AppArmor` and audit units are
-//! refused whatever the verb is. A rule that matches the generic unit-name
-//! kind cannot reopen them.
+//! refused when the command acts on them. A read-only verb (`status`, `show`,
+//! and the other queries) is exempt, including when the unit is on this list.
+//! The exemption holds only when no token acts: an option value must not hide
+//! `stop` or `poweroff`. A rule that matches the generic unit-name kind cannot
+//! reopen an acting use.
 
 use bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
@@ -50,7 +53,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    3
+    4
 }
 
 /// A class of capability that is never permitted as root.
@@ -574,8 +577,14 @@ const UNIT_MUTATING_VERBS: &[&[u8]] = &[
 ];
 
 /// `systemctl` subcommands that power off, reboot, sleep, or change the boot
-/// target. Refused with no unit argument. `isolate` is one of them for every
-/// target, including a target this list does not name.
+/// target. Refused with no unit argument, wherever the word sits. `isolate`
+/// is one of them for every target, including a target this list does not name.
+///
+/// `sleep` is the combined sleep verb from systemd 256. The stock Debian and
+/// Ubuntu images used for the check do not ship `systemctl`, so this was not
+/// observed in `--help`. Refusing a word the binary would reject is harmless.
+/// `status rescue` is refused with these: a suffix-less unit whose name is a
+/// power word is the cost of not trusting the first non-flag token.
 const POWER_SUBCOMMANDS: &[&[u8]] = &[
     b"poweroff",
     b"reboot",
@@ -586,6 +595,7 @@ const POWER_SUBCOMMANDS: &[&[u8]] = &[
     b"hybrid-sleep",
     b"suspend-then-hibernate",
     b"soft-reboot",
+    b"sleep",
     b"rescue",
     b"emergency",
     b"default",
@@ -593,10 +603,39 @@ const POWER_SUBCOMMANDS: &[&[u8]] = &[
     b"isolate",
 ];
 
-/// The first `systemctl` argument that is not a flag, when it is a power or
-/// boot subcommand.
-/// Verbs that only read unit state. The unit tripwire does not apply to them.
-/// A power subcommand is not in this list, so `systemctl poweroff` stays refused.
+/// Verbs that start, stop, reload, or signal a unit.
+///
+/// A token in this list is not a unit name. `systemctl -p status stop
+/// debug-shell.service` is `stop`: the value of `-p` must not hide it.
+/// `kill`, `clean`, `freeze`, and `thaw` are acting verbs. The compatibility
+/// names are the LSB aliases `systemctl` still accepts. The stock images do
+/// not ship `systemctl`, so those names were not observed in `--help`. Keeping
+/// them refuses a verb the binary would reject, which is harmless.
+const ACTING_SYSTEMCTL_VERBS: &[&[u8]] = &[
+    b"start",
+    b"stop",
+    b"restart",
+    b"try-restart",
+    b"reload",
+    b"reload-or-restart",
+    b"try-reload-or-restart",
+    b"kill",
+    b"clean",
+    b"freeze",
+    b"thaw",
+    b"condrestart",
+    b"force-reload",
+    b"reload-or-try-restart",
+    b"condreload",
+    b"condstop",
+];
+
+/// Verbs that only read unit state.
+///
+/// The unit tripwire does not apply when every non-flag token is one of these
+/// or a unit name, at least one of these is present, and no token is an
+/// acting, mutating, or power verb. A power subcommand is not in this list,
+/// so `systemctl poweroff` stays refused.
 const READ_ONLY_SYSTEMCTL_VERBS: &[&[u8]] = &[
     b"status",
     b"show",
@@ -612,11 +651,32 @@ const READ_ONLY_SYSTEMCTL_VERBS: &[&[u8]] = &[
     b"list-jobs",
 ];
 
-/// The first argument that is not a flag.
-fn first_positional(argv: &Argv) -> Option<&[u8]> {
+fn is_flag_token(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&b'-')
+}
+
+/// A token that can be a unit name or the value of an option.
+///
+/// Acting and power verbs are excluded by the caller before this runs. An
+/// option value such as `now` or `root@host` lands here, which is safe: the
+/// acting verb, if there is one, is a different token and is checked on its
+/// own. A byte a unit name cannot hold (`/`, `=`) is an unknown verb.
+fn is_unit_ish(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'@' | b'\\' | b':')
+        })
+}
+
+/// Any non-flag token that is a power or boot subcommand.
+///
+/// systemctl's getopt takes the next argument as the value of `-p`, `-M`,
+/// `--when`, and the other options that take a separate value. The real verb
+/// can sit later. The first non-flag token is not the verb.
+fn systemctl_power_subcommand(argv: &Argv) -> Option<&[u8]> {
     argv.as_slice().iter().find_map(|arg| {
         let bytes = arg.as_bytes();
-        if bytes.first() == Some(&b'-') {
+        if is_flag_token(bytes) || !POWER_SUBCOMMANDS.contains(&bytes) {
             None
         } else {
             Some(bytes)
@@ -624,14 +684,62 @@ fn first_positional(argv: &Argv) -> Option<&[u8]> {
     })
 }
 
-fn systemctl_power_subcommand(argv: &Argv) -> Option<&[u8]> {
-    let verb = first_positional(argv)?;
-    POWER_SUBCOMMANDS.contains(&verb).then_some(verb)
+/// `--job-mode=isolate`, a unique prefix of that option, or the split form.
+///
+/// `start --job-mode=isolate` stops every other unit. The value is not its
+/// own token in the joined form, so the power-word scan does not see it.
+/// The split form (`--job-mode isolate`) is also a bare `isolate` token.
+fn job_mode_isolate(argv: &Argv) -> bool {
+    let tokens = argv.as_slice();
+    for (index, arg) in tokens.iter().enumerate() {
+        let bytes = arg.as_bytes();
+        if !long_option_prefix(bytes, b"job-mode") {
+            continue;
+        }
+        if let Some((_, value)) = bytes.split_once_str(b"=") {
+            if value == b"isolate" {
+                return true;
+            }
+            continue;
+        }
+        if tokens
+            .get(index.saturating_add(1))
+            .is_some_and(|next| next.as_bytes() == b"isolate")
+        {
+            return true;
+        }
+    }
+    false
 }
 
-/// Whether the systemctl verb only reads state.
+/// Whether the command only reads state.
+///
+/// True only when at least one read-only verb is present, every other
+/// non-flag token is a unit name (or an option value of that shape), and no
+/// token is an acting, mutating, or power verb. An unknown verb fails closed:
+/// the unit tripwire applies.
 fn systemctl_read_only(argv: &Argv) -> bool {
-    first_positional(argv).is_some_and(|verb| READ_ONLY_SYSTEMCTL_VERBS.contains(&verb))
+    let mut saw_read_only = false;
+    for arg in argv.as_slice() {
+        let bytes = arg.as_bytes();
+        if is_flag_token(bytes) {
+            continue;
+        }
+        if POWER_SUBCOMMANDS.contains(&bytes)
+            || UNIT_MUTATING_VERBS.contains(&bytes)
+            || ACTING_SYSTEMCTL_VERBS.contains(&bytes)
+        {
+            return false;
+        }
+        if READ_ONLY_SYSTEMCTL_VERBS.contains(&bytes) {
+            saw_read_only = true;
+            continue;
+        }
+        if !is_unit_ish(bytes) {
+            return false;
+        }
+    }
+    saw_read_only
 }
 
 /// One hexadecimal digit, or `None` when `byte` is not one.
@@ -879,6 +987,15 @@ pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
     b"reload",
     b"reload-or-restart",
     b"try-reload-or-restart",
+    b"kill",
+    b"clean",
+    b"freeze",
+    b"thaw",
+    b"condrestart",
+    b"force-reload",
+    b"reload-or-try-restart",
+    b"condreload",
+    b"condstop",
     b"isolate",
     b"poweroff",
     b"reboot",
@@ -889,6 +1006,7 @@ pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
     b"hybrid-sleep",
     b"suspend-then-hibernate",
     b"soft-reboot",
+    b"sleep",
     b"rescue",
     b"emergency",
     b"default",
@@ -898,11 +1016,6 @@ pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
 /// Whether `exe` is `systemctl` by basename, byte for byte.
 pub(crate) fn exe_is_systemctl(exe: &[u8]) -> bool {
     basename(exe) == b"systemctl"
-}
-
-/// Whether `verb` is a lifecycle verb or a power or boot subcommand.
-pub(crate) fn is_lifecycle_or_power_verb(verb: &[u8]) -> bool {
-    LIFECYCLE_OR_POWER_VERBS.contains(&verb)
 }
 
 /// Returns `true` when `name` is in `set`, ignoring a trailing version suffix.
@@ -997,30 +1110,59 @@ fn apt_redirects_config(bytes: &[u8]) -> bool {
         || long_option_is(bytes, b"config-file", true)
 }
 
-/// dnf and yum: `--config` and `--setopt`, not apt's `--config-file`.
+/// dnf and yum. `-c` is their short form of `--config`.
+///
+/// Argparse accepts a unique prefix, so `--conf=` is `--config` and
+/// `--setop=` is `--setopt`. `--installroot` and `--repofrompath` point the
+/// transaction at another root or another repository. dnf and yum were not
+/// installed on the probed images; the refusal is the conservative one.
 fn dnf_redirects_config(bytes: &[u8]) -> bool {
-    long_option_is(bytes, b"config", false) || long_option_is(bytes, b"setopt", false)
-}
-
-/// zypper: `-c` and `--config`.
-fn zypper_redirects_config(bytes: &[u8]) -> bool {
-    short_cluster_has(bytes, b"c") || long_option_is(bytes, b"config", false)
-}
-
-/// pacman: `--config`, `-c`, and `--hookdir`.
-fn pacman_redirects_config(bytes: &[u8]) -> bool {
     short_cluster_has(bytes, b"c")
-        || long_option_is(bytes, b"config", false)
-        || long_option_is(bytes, b"hookdir", false)
+        || long_option_prefix(bytes, b"config")
+        || long_option_prefix(bytes, b"setopt")
+        || long_option_prefix(bytes, b"installroot")
+        || long_option_prefix(bytes, b"repofrompath")
+}
+
+/// zypper: `-c`, `--config`, `--root`, and `--plus-repo`.
+///
+/// `--root` and `--plus-repo` were not checked on a zypper binary. Refusing
+/// them is the conservative reading of a root and an extra repository.
+fn zypper_redirects_config(bytes: &[u8]) -> bool {
+    short_cluster_has(bytes, b"c")
+        || long_option_prefix(bytes, b"config")
+        || long_option_prefix(bytes, b"root")
+        || long_option_prefix(bytes, b"plus-repo")
+}
+
+/// pacman config, hooks, root, database, and sysroot.
+///
+/// `-c` is pacman's `--clean` or `--cascade`, not a config file. Refusing
+/// that letter is harmless: it does not point pacman at another configuration,
+/// and a rule that meant to allow a clean still cannot retarget the database.
+/// `--hook` is a getopt prefix of `--hookdir`. `-r` is `--root` and `-b` is
+/// `--dbpath`. pacman was not installed on the probed images.
+fn pacman_redirects_config(bytes: &[u8]) -> bool {
+    short_cluster_has(bytes, b"crb")
+        || long_option_prefix(bytes, b"config")
+        || long_option_prefix(bytes, b"hookdir")
+        || long_option_prefix(bytes, b"root")
+        || long_option_prefix(bytes, b"dbpath")
+        || long_option_prefix(bytes, b"sysroot")
 }
 
 /// dpkg's own redirects. Apt's `-o` and `--config-file` are not dpkg options.
+///
+/// `--status-logger` runs a command. `--log` names the file those actions are
+/// written to. Both are in `dpkg --help` on Debian 13.
 fn dpkg_redirects_config(bytes: &[u8]) -> bool {
     long_option_is(bytes, b"admindir", false)
         || long_option_is(bytes, b"instdir", false)
         || long_option_is(bytes, b"root", false)
         || long_option_is(bytes, b"pre-invoke", false)
         || long_option_is(bytes, b"post-invoke", false)
+        || long_option_prefix(bytes, b"status-logger")
+        || long_option_prefix(bytes, b"log")
 }
 
 /// A package-manager argument that points config, hooks, or the root elsewhere.
@@ -1107,28 +1249,40 @@ fn deny_by_executable(name: &[u8]) -> Vec<DenyFinding> {
     findings
 }
 
-/// Classes implied by the shape of the arguments.
-///
-/// `name` is consulted only where a flag's meaning depends on which program
-/// receives it: `-p` is fatal to `sysctl` and harmless to `systemctl`.
 /// `systemctl poweroff` has no unit. `isolate` of an ordinary target is the
-/// same act. The subcommand is enough.
+/// same act, and so is `--job-mode=isolate`. The subcommand is any non-flag
+/// token: an option that takes a separate value does not hide it.
 fn power_subcommand_finding(name: &[u8], argv: &Argv) -> Option<DenyFinding> {
     if name != b"systemctl" {
         return None;
     }
-    let verb = systemctl_power_subcommand(argv)?;
-    Some(DenyFinding::new(
-        CapabilityClass::PowerState,
-        format!("systemctl {} changes power or boot state", verb.as_bstr()),
-    ))
+    if let Some(verb) = systemctl_power_subcommand(argv) {
+        return Some(DenyFinding::new(
+            CapabilityClass::PowerState,
+            format!("systemctl {} changes power or boot state", verb.as_bstr()),
+        ));
+    }
+    if job_mode_isolate(argv) {
+        return Some(DenyFinding::new(
+            CapabilityClass::PowerState,
+            "systemctl --job-mode=isolate changes power or boot state",
+        ));
+    }
+    None
 }
 
+/// Classes implied by the shape of the arguments.
+///
+/// `name` is consulted only where a flag's meaning depends on which program
+/// receives it: `-p` is fatal to `sysctl` and harmless to `systemctl`.
 fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let mut findings: Vec<DenyFinding> = Vec::new();
     if let Some(finding) = power_subcommand_finding(name, argv) {
         findings.push(finding);
     }
+    // Once per command. The unit tripwire asks the same question for every
+    // argument, and an option value must not change the answer halfway through.
+    let systemctl_reads = name == b"systemctl" && systemctl_read_only(argv);
     for (index, arg) in argv.as_slice().iter().enumerate() {
         let bytes = arg.as_bytes();
 
@@ -1227,7 +1381,7 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
         // are exempt: diagnosing these units is not a hole. Power subcommands
         // are refused above. This still refuses a listed unit an operator named.
         if name == b"systemctl"
-            && !systemctl_read_only(argv)
+            && !systemctl_reads
             && let Some(class) = classify_systemctl_unit(bytes)
         {
             findings.push(DenyFinding::new(
@@ -1272,7 +1426,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 3);
+        assert_eq!(deny_list_version(), 4);
     }
 
     #[test]
@@ -1716,6 +1870,139 @@ mod tests {
         assert!(systemctl_power_subcommand(&Argv::default()).is_none());
         assert!(systemctl_power_subcommand(&Argv::new(vec!["--no-pager"])).is_none());
         assert!(systemctl_power_subcommand(&Argv::new(vec!["start"])).is_none());
+        // The value of an option is not the verb. The power word can sit later.
+        assert_eq!(
+            systemctl_power_subcommand(&Argv::new(vec!["-p", "x", "poweroff"])),
+            Some(b"poweroff".as_slice())
+        );
+        assert_eq!(
+            systemctl_power_subcommand(&Argv::new(vec!["--when", "now", "sleep"])),
+            Some(b"sleep".as_slice())
+        );
+    }
+
+    #[test]
+    fn systemctl_verb_sets_do_not_overlap_and_the_lint_list_covers_them() {
+        for verb in READ_ONLY_SYSTEMCTL_VERBS {
+            // Built on the success path. A format argument runs only when the
+            // assertion fails, and that region would be uncovered.
+            let name = verb.as_bstr();
+            assert!(!POWER_SUBCOMMANDS.contains(verb), "{name}");
+            assert!(!ACTING_SYSTEMCTL_VERBS.contains(verb), "{name}");
+            assert!(!UNIT_MUTATING_VERBS.contains(verb), "{name}");
+        }
+        for verb in ACTING_SYSTEMCTL_VERBS {
+            let name = verb.as_bstr();
+            assert!(!POWER_SUBCOMMANDS.contains(verb), "{name}");
+        }
+        for verb in POWER_SUBCOMMANDS
+            .iter()
+            .chain(ACTING_SYSTEMCTL_VERBS.iter())
+        {
+            // The name is formatted on the success path. A format argument
+            // that runs only when the assertion fails is an uncovered line.
+            let name = verb.as_bstr();
+            assert!(LIFECYCLE_OR_POWER_VERBS.contains(verb), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_option_value_cannot_hide_the_verb() {
+        // Pure checks. The option × verb matrix lives in the integration
+        // tests, where miri does not pay for `evaluate_deny_list`.
+        assert!(job_mode_isolate(&Argv::new(vec![
+            "start",
+            "--job-mode=isolate",
+            "nginx.service",
+        ])));
+        assert!(job_mode_isolate(&Argv::new(vec![
+            "start",
+            "--j=isolate",
+            "nginx.service",
+        ])));
+        assert!(job_mode_isolate(&Argv::new(vec![
+            "start",
+            "--job-mode",
+            "isolate",
+        ])));
+        assert!(!job_mode_isolate(&Argv::new(vec![
+            "start",
+            "--job-mode=replace",
+            "nginx.service",
+        ])));
+        assert!(!job_mode_isolate(&Argv::new(vec!["start", "--job-mode"])));
+        assert!(!job_mode_isolate(&Argv::new(vec![
+            "start",
+            "--json=isolate",
+            "nginx.service",
+        ])));
+        assert!(systemctl_read_only(&Argv::new(vec![
+            "status",
+            "xudod.socket"
+        ])));
+        assert!(systemctl_read_only(&Argv::new(vec![
+            "--no-pager",
+            "--full",
+            "status",
+            "journald",
+        ])));
+        assert!(systemctl_read_only(&Argv::new(vec![
+            "-p",
+            "ActiveState",
+            "status",
+            "xudod.socket",
+        ])));
+        assert!(!systemctl_read_only(&Argv::new(vec![
+            "-p",
+            "status",
+            "stop",
+            "debug-shell.service",
+        ])));
+        assert!(!systemctl_read_only(&Argv::new(vec!["status", "rescue"])));
+        assert!(!systemctl_read_only(&Argv::new(vec!["status", "enable"])));
+        assert!(!systemctl_read_only(&Argv::new(vec!["status", "a/b"])));
+        assert!(!systemctl_read_only(&Argv::new(vec!["nginx.service"])));
+        assert!(!is_unit_ish(b""));
+        assert!(is_unit_ish(b"root@host"));
+        // The finding text is pinned here, off the miri path. Each
+        // `evaluate_deny_list` is most of a second there. The integration
+        // matrix names every option and verb.
+        #[cfg(not(miri))]
+        {
+            let hidden = classes(
+                "/usr/bin/systemctl",
+                &["-p", "status", "stop", "debug-shell.service"],
+            );
+            assert!(hidden.contains(&CapabilityClass::SpawnsShell), "{hidden:?}");
+            let isolate = evaluate_deny_list(
+                b"/usr/bin/systemctl",
+                &Argv::new(vec!["start", "--job-mode=isolate", "nginx.service"]),
+            );
+            assert!(
+                isolate
+                    .iter()
+                    .any(|finding| finding.evidence.contains("job-mode=isolate")),
+                "{isolate:?}"
+            );
+            assert!(
+                evaluate_deny_list(
+                    b"/usr/bin/systemctl",
+                    &Argv::new(vec!["status", "xudod.socket"])
+                )
+                .is_empty()
+            );
+            assert!(
+                evaluate_deny_list(
+                    b"/usr/bin/systemctl",
+                    &Argv::new(vec!["--no-pager", "--full", "status", "journald"])
+                )
+                .is_empty()
+            );
+            assert!(
+                classes("/usr/bin/systemctl", &["status", "rescue"])
+                    .contains(&CapabilityClass::PowerState)
+            );
+        }
     }
 
     #[test]
@@ -2064,17 +2351,38 @@ mod tests {
     fn denies_each_package_managers_own_config_options() {
         let rows = [
             ("/usr/bin/dnf", "--setopt=tsflags=nodocs"),
+            ("/usr/bin/dnf", "-c"),
+            ("/usr/bin/dnf", "-c/tmp/dnf.conf"),
+            ("/usr/bin/dnf", "--conf=/tmp/dnf.conf"),
+            ("/usr/bin/dnf", "--setop=tsflags=nodocs"),
+            ("/usr/bin/dnf", "--installroot=/tmp/root"),
+            (
+                "/usr/bin/dnf",
+                "--repofrompath=extra,https://example.test/repo",
+            ),
             ("/usr/bin/yum", "--config=/tmp/yum.conf"),
+            ("/usr/bin/yum", "-c/tmp/yum.conf"),
             ("/usr/bin/zypper", "--config=/tmp/zypp.conf"),
             ("/usr/bin/zypper", "-c/tmp/zypp.conf"),
+            ("/usr/bin/zypper", "--root=/tmp/root"),
+            ("/usr/bin/zypper", "--plus-repo=https://example.test/repo"),
             ("/usr/bin/pacman", "--hookdir=/tmp/hooks"),
+            ("/usr/bin/pacman", "--hook=/tmp/hooks"),
             ("/usr/bin/pacman", "--config=/tmp/pacman.conf"),
             ("/usr/bin/pacman", "-c/tmp/pacman.conf"),
+            ("/usr/bin/pacman", "--root=/tmp/root"),
+            ("/usr/bin/pacman", "-r"),
+            ("/usr/bin/pacman", "--dbpath=/tmp/db"),
+            ("/usr/bin/pacman", "-b/tmp/db"),
+            ("/usr/bin/pacman", "--sysroot=/tmp/root"),
             ("/usr/bin/dpkg", "--admindir=/tmp/adm"),
             ("/usr/bin/dpkg", "--instdir=/tmp/root"),
             ("/usr/bin/dpkg", "--root=/tmp/root"),
             ("/usr/bin/dpkg", "--pre-invoke=id"),
             ("/usr/bin/dpkg", "--post-invoke=id"),
+            ("/usr/bin/dpkg", "--status-logger=id"),
+            ("/usr/bin/dpkg", "--status-logge=id"),
+            ("/usr/bin/dpkg", "--log=/tmp/dpkg.log"),
         ];
         for (exe, arg) in rows {
             assert!(
@@ -2086,5 +2394,17 @@ mod tests {
             !classes("/usr/bin/dpkg", &["-oDir::Etc=/x"])
                 .contains(&CapabilityClass::ConfigNamedProgram)
         );
+        assert!(
+            !classes("/usr/bin/dpkg", &["--list"]).contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        assert!(
+            !classes("/usr/bin/dnf", &["--color=auto"])
+                .contains(&CapabilityClass::ConfigNamedProgram)
+        );
+        // `-c` on pacman is `--clean`/`--cascade`, not config. Refusing it is
+        // what the short-cluster check does, and it is harmless.
+        assert!(dnf_redirects_config(b"-c/tmp/dnf.conf"));
+        assert!(pacman_redirects_config(b"-c"));
+        assert!(!dpkg_redirects_config(b"--list"));
     }
 }

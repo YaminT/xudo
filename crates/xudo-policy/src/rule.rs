@@ -23,7 +23,8 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::deny::{evaluate_deny_list, exe_is_systemctl, is_lifecycle_or_power_verb};
+use crate::argv::Arg;
+use crate::deny::{LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl};
 use crate::matcher::{ArgSpec, Matcher};
 use crate::rule_test::RuleTest;
 
@@ -359,18 +360,16 @@ fn matcher_is_closed_literals(matcher: &Matcher) -> bool {
     }
 }
 
-/// A literal or a `one-of` that contains a lifecycle or power verb.
-fn matcher_names_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
-    match matcher {
-        Matcher::Literal(text) => is_lifecycle_or_power_verb(text.as_bytes()),
-        Matcher::OneOf(options) => options
-            .iter()
-            .any(|option| is_lifecycle_or_power_verb(option.as_bytes())),
-        Matcher::IntRange { .. }
-        | Matcher::PathUnder { .. }
-        | Matcher::Name(_)
-        | Matcher::Pattern(_) => false,
-    }
+/// Whether this position can accept a lifecycle or power verb.
+///
+/// Every matcher kind is asked. A `pattern` or a `name` that accepts `restart`
+/// is a verb position, the same as a literal. A kind that accepts none of the
+/// verbs is not.
+fn matcher_accepts_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
+    LIFECYCLE_OR_POWER_VERBS
+        .iter()
+        .copied()
+        .any(|verb| matcher.accepts(&Arg::new(verb.to_vec())))
 }
 
 impl RuleSet {
@@ -540,12 +539,13 @@ impl RuleSet {
 
     /// Systemctl actions that can start or stop a unit they do not name.
     ///
-    /// The verb position accepts a lifecycle or power verb, as a literal or as
-    /// one option of a `one-of`, and a later position is not a literal or a
-    /// finite `one-of` of literals. `unit-name`, `service-unit-name`, a
-    /// pattern, a path, and an open repeat of any of those are that later
-    /// position. A finite list is the operator's own units, and it is not an
-    /// error. The check is the rule text, not an execution.
+    /// A position can be the verb when its matcher accepts any lifecycle or
+    /// power verb, whatever the matcher kind. A later position that is not a
+    /// literal or a finite `one-of` of literals is the finding. `unit-name`,
+    /// `service-unit-name`, a pattern, a path, and an open repeat of any of
+    /// those are that later position. A finite list is the operator's own
+    /// units, and it is not an error. The check is the rule text, not an
+    /// execution.
     pub fn open_unit_actions(&self) -> Vec<OpenUnitLint<'_>> {
         self.actions
             .iter()
@@ -556,7 +556,7 @@ impl RuleSet {
                 let verb_at = action
                     .args
                     .iter()
-                    .position(|spec| matcher_names_lifecycle_or_power_verb(&spec.matcher))?;
+                    .position(|spec| matcher_accepts_lifecycle_or_power_verb(&spec.matcher))?;
                 let open_unit = action
                     .args
                     .iter()
@@ -575,15 +575,16 @@ impl RuleSet {
 
     /// Whether any action is `systemctl` with a lifecycle or power verb.
     ///
-    /// The id is not consulted. An operator who copied the example and renamed
-    /// it still has a lifecycle rule.
+    /// The id is not consulted. A pattern or a name that accepts the verb
+    /// counts, the same as a literal. An operator who copied the example and
+    /// renamed it still has a lifecycle rule.
     pub fn has_systemctl_lifecycle_or_power(&self) -> bool {
         self.actions.iter().any(|action| {
             exe_is_systemctl(action.exe.as_bytes())
                 && action
                     .args
                     .iter()
-                    .any(|spec| matcher_names_lifecycle_or_power_verb(&spec.matcher))
+                    .any(|spec| matcher_accepts_lifecycle_or_power_verb(&spec.matcher))
         })
     }
 
@@ -1089,7 +1090,23 @@ args = [
         expect_lint("not systemctl", not_systemctl, false);
         assert!(!loads(not_systemctl).has_systemctl_lifecycle_or_power());
         expect_lint(
-            "unit before the verb",
+            "pattern that accepts no lifecycle verb",
+            "\
+[[action]]
+id = \"xudo.svc.status-ish\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { pattern = \"status[0-9]*\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+            false,
+        );
+        // `unit-name` accepts none of the lifecycle verbs. Nothing after the
+        // verb is open, so the matcher before the verb is not a finding.
+        expect_lint(
+            "unit matcher before the verb",
             "\
 [[action]]
 id = \"xudo.svc.backwards\"
@@ -1116,6 +1133,69 @@ args = [
             false,
         );
         assert!(!loads("# nothing\n").has_systemctl_lifecycle_or_power());
+    }
+
+    #[test]
+    fn open_unit_lint_flags_a_matcher_that_can_be_the_verb() {
+        let pattern = "\
+[[action]]
+id = \"xudo.svc.pattern\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { pattern = \"[a-z-]+\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+";
+        expect_lint(
+            "pattern that accepts the verb, then an open unit",
+            pattern,
+            true,
+        );
+        assert!(loads(pattern).has_systemctl_lifecycle_or_power());
+        expect_lint(
+            "name kind that accepts the verb",
+            "\
+[[action]]
+id = \"xudo.svc.name\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { name = \"hostname\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+            true,
+        );
+        expect_lint(
+            "open matcher before the literal verb",
+            "\
+[[action]]
+id = \"xudo.svc.before\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { pattern = \"[a-z-]+\" } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+  { name = \"again\", matcher = { literal = \"restart\" } },
+]
+",
+            true,
+        );
+        expect_lint(
+            "compat aliases",
+            "\
+[[action]]
+id = \"xudo.svc.compat\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  { name = \"verb\", matcher = { one-of = [\"condrestart\", \"force-reload\"] } },
+  { name = \"unit\", matcher = { name = \"unit-name\" } },
+]
+",
+            true,
+        );
     }
 
     #[test]
