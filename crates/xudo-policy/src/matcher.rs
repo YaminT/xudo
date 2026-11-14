@@ -83,20 +83,54 @@ impl Repeat {
 /// tidy. The package-name kinds, for instance, all reject `/`, `=`, and `:`,
 /// which is what makes `apt-get install ./local.deb`, a version-pinned
 /// downgrade, and a URL install unrepresentable in a rule that only meant to
-/// name a package from a configured repository.
+/// name a package from a configured repository. `deb-name` and `apk-name`
+/// also reject a trailing `-`: `apt-get install pkg-` removes `pkg`. A
+/// trailing `+` stays, because `g++` is a real package name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum NameKind {
     /// A Debian binary package name.
+    ///
+    /// A trailing `-` is rejected. `apt-get install name-` removes `name`,
+    /// so the install rule would skip the confirmation a removal demands.
+    /// A trailing `+` is kept: `g++` and `libstdc++6` are real names, and
+    /// `name+` asks apt to install `name`.
     DebName,
+    /// A Debian package name with no `.` and no `+` anywhere.
+    ///
+    /// [`Self::DebName`], plus those two refusals. `apt-get` reads a name
+    /// containing either, when it is not an exact cache hit, as an unanchored
+    /// regular expression. The remove rule uses this kind so one confirmed
+    /// token cannot select many packages, and so `name+` cannot install.
+    /// A real name that contains `.` or `+` (`python3.12`, `g++`,
+    /// `libstdc++6`) is not removable through xudo.
+    DebNameLiteral,
     /// An RPM package name.
     RpmName,
     /// An Arch package name.
     ArchName,
     /// An Alpine package name.
+    ///
+    /// The same bytes as [`Self::DebName`], including the refusal of a
+    /// trailing `-`. One check, so a name apt would remove is not an Alpine
+    /// name either.
     ApkName,
     /// A systemd unit name with an explicit unit suffix.
+    ///
+    /// Accepts `.service`, `.socket`, `.timer`, `.target`, `.path`, and
+    /// `.mount`, including template instances (`@`) and systemd escapes
+    /// (`\`). The journal rules use this kind, because reading any unit's
+    /// log is the point. Lifecycle rules must not: a `.target` or a template
+    /// is a different act from restarting a service. Those use
+    /// [`Self::ServiceUnitName`].
     UnitName,
+    /// A plain systemd service name.
+    ///
+    /// The same shape rules as [`Self::UnitName`], except the name must end
+    /// in `.service` and must not contain `@` or `\`. `poweroff.target`,
+    /// `modprobe@dummy.service`, and `a\x2db.service` are not a service
+    /// restart.
+    ServiceUnitName,
     /// A DNS hostname label sequence.
     Hostname,
     /// A dotted `sysctl` key.
@@ -122,15 +156,27 @@ impl NameKind {
         }
 
         match self {
-            Self::DebName | Self::ApkName => bytes.iter().all(|b| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || matches!(b, b'+' | b'.' | b'-' | b'_')
-            }),
+            // A trailing `-` is how `apt-get install pkg-` removes `pkg`.
+            // A trailing `+` is a real name (`g++`) and asks apt to install.
+            Self::DebName | Self::ApkName => {
+                bytes.last() != Some(&b'-')
+                    && bytes.iter().all(|b| {
+                        b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || matches!(b, b'+' | b'.' | b'-' | b'_')
+                    })
+            }
+            // `.` and `+` are how apt-get turns a name that is not an exact
+            // cache hit into an unanchored regular expression. Removal uses
+            // this kind so one confirmed token cannot select many packages.
+            Self::DebNameLiteral => {
+                !bytes.contains(&b'.') && !bytes.contains(&b'+') && Self::DebName.accepts(bytes)
+            }
             Self::RpmName | Self::ArchName => bytes.iter().all(|b| {
                 b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'@')
             }),
             Self::UnitName => Self::accepts_unit(bytes),
+            Self::ServiceUnitName => Self::accepts_service_unit(bytes),
             Self::Hostname => {
                 bytes
                     .iter()
@@ -166,6 +212,21 @@ impl NameKind {
         bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@' | b'\\'))
+    }
+
+    /// A service the operator named, not a target, a socket, or a template.
+    ///
+    /// `@` starts a template instance (`modprobe@dummy.service` loads a
+    /// kernel module). `\` is a systemd escape, which can hide either of
+    /// those. Both are rejected here. [`Self::accepts_unit`] still allows
+    /// them, on purpose.
+    fn accepts_service_unit(bytes: &[u8]) -> bool {
+        if !bytes.ends_with(b".service") {
+            return false;
+        }
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
     }
 }
 
@@ -388,9 +449,9 @@ pub(crate) fn meet(a: &Matcher, b: &Matcher) -> Meet {
 /// Each arm is an argument about what the two accept, and the probes are
 /// chosen to make it hold. The name-kind arms rest on three facts about
 /// [`NameKind::accepts`] — no kind accepts a leading `-`, no kind accepts a
-/// `/`, and every kind but unit-name accepts a bare decimal — which
-/// `name_kinds_hold_what_overlap_detection_relies_on` pins, so a change to a
-/// kind fails a test before it can make this lie.
+/// `/`, and every kind but unit-name and service-unit-name accepts a bare
+/// decimal — which `name_kinds_hold_what_overlap_detection_relies_on` pins,
+/// so a change to a kind fails a test before it can make this lie.
 fn exhausts(a: &Matcher, b: &Matcher) -> bool {
     use Matcher::{IntRange, Literal, Name, OneOf, PathUnder, Pattern};
 
@@ -401,7 +462,8 @@ fn exhausts(a: &Matcher, b: &Matcher) -> bool {
         // Ranges: both probe their floor, and the larger floor lies in both
         // whenever they intersect. Against a name kind: names never start
         // with `-`, so only a value of zero or more can be shared, and the
-        // smallest such value is probed; unit-name accepts no decimal at all.
+        // smallest such value is probed; unit-name and service-unit-name
+        // accept no decimal at all.
         // Against a path: a path starts with `/`, an integer never does.
         | (IntRange { .. }, IntRange { .. } | Name(_) | PathUnder { .. })
         | (Name(_) | PathUnder { .. }, IntRange { .. })
@@ -847,6 +909,12 @@ mod tests {
             "..",
             "UPPER",
             "",
+            // `apt-get install` treats a trailing hyphen as removal.
+            "apparmor-",
+            "auditd-",
+            "xudo-",
+            "sudo-",
+            "a-",
         ] {
             assert!(!m.accepts(&Arg::from(bad)), "accepted {bad:?}");
         }
@@ -872,18 +940,61 @@ mod tests {
         for kind in [NameKind::DebName, NameKind::ApkName] {
             let m = Matcher::Name(kind);
             assert!(m.accepts(&Arg::from("libstdc++6")));
+            assert!(m.accepts(&Arg::from("g++")));
             assert!(m.accepts(&Arg::from("python3.11-dev")));
+            assert!(m.accepts(&Arg::from("python3.12")));
+            assert!(m.accepts(&Arg::from("libpng16-16")));
+            assert!(m.accepts(&Arg::from("x11-utils")));
             assert!(m.accepts(&Arg::from("linux_headers")));
+            // A trailing `+` stays. `pkg+` installs; it does not remove.
+            assert!(m.accepts(&Arg::from("libfoo+")));
             assert!(!m.accepts(&Arg::from("libStdc++6")));
             assert!(!m.accepts(&Arg::from("pkg name")));
+            assert!(!m.accepts(&Arg::from("libpng16-")));
+            assert!(!m.accepts(&Arg::from("x11-utils-")));
         }
+    }
+
+    #[test]
+    fn deb_name_literal_refuses_a_dot_or_a_plus_anywhere() {
+        // Removal uses this kind. A `.` or `+` that is not an exact apt cache
+        // hit is an unanchored regular expression, and `name+` on remove
+        // installs. A plain name, including an internal `-`, still matches.
+        let m = Matcher::Name(NameKind::DebNameLiteral);
+        assert!(m.accepts(&Arg::from("ripgrep")));
+        assert!(m.accepts(&Arg::from("build-essential")));
+        assert!(m.accepts(&Arg::from("libpng16-16")));
+        assert!(m.accepts(&Arg::from("a")));
+        assert!(m.accepts(&Arg::from("0")));
+        for bad in [
+            "lib.",
+            "ba.h",
+            "g++",
+            "libstdc++6",
+            "python3.12",
+            "libfoo+",
+            "pkg-",
+        ] {
+            assert!(!m.accepts(&Arg::from(bad)), "accepted {bad}");
+        }
+        assert_eq!(m.describe(), "DebNameLiteral");
+        let spec: ArgSpec = toml::from_str(
+            r#"
+            name = "pkg"
+            matcher = { name = "deb-name-literal" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.matcher, Matcher::Name(NameKind::DebNameLiteral));
     }
 
     #[test]
     fn apk_names_behave_like_deb_names() {
         let m = Matcher::Name(NameKind::ApkName);
         assert!(m.accepts(&Arg::from("busybox-extras")));
+        assert!(m.accepts(&Arg::from("g++")));
         assert!(!m.accepts(&Arg::from("Busybox")));
+        assert!(!m.accepts(&Arg::from("busybox-extras-")));
     }
 
     #[test]
@@ -913,6 +1024,41 @@ mod tests {
             assert!(m.accepts(&Arg::from(unit)), "rejected {unit}");
         }
         assert!(!m.accepts(&Arg::from("a.swap")));
+        // Escapes stay valid for this kind. The journal rules use it to name
+        // any unit, and tightening it would hide a target's log.
+        assert!(m.accepts(&Arg::from("a\\x2db.service")));
+        assert!(m.accepts(&Arg::from("getty@tty1.service")));
+    }
+
+    #[test]
+    fn service_unit_names_accept_only_a_plain_service() {
+        let m = Matcher::Name(NameKind::ServiceUnitName);
+        assert!(m.accepts(&Arg::from("nginx.service")));
+        assert!(m.accepts(&Arg::from("ssh.service")));
+        assert!(m.accepts(&Arg::from("a.b-c_d.service")));
+        for bad in [
+            "a@b.service",
+            "a.target",
+            "a.mount",
+            "a\\x2db.service",
+            "-a.service",
+            "../a.service",
+            "",
+        ] {
+            assert!(!m.accepts(&Arg::from(bad)), "accepted {bad:?}");
+        }
+        assert!(!m.accepts(&Arg::new(b"a\0.service".to_vec())));
+        assert!(!m.accepts(&Arg::new(vec![
+            b'a', 0xff, b'.', b's', b'e', b'r', b'v', b'i', b'c', b'e',
+        ])));
+        let spec: ArgSpec = toml::from_str(
+            r#"
+            name = "unit"
+            matcher = { name = "service-unit-name" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(spec.matcher, Matcher::Name(NameKind::ServiceUnitName));
     }
 
     #[test]
@@ -1237,10 +1383,12 @@ mod tests {
         // wrong `true` there is an overlap `xudo check` stays silent about.
         let kinds = [
             NameKind::DebName,
+            NameKind::DebNameLiteral,
             NameKind::RpmName,
             NameKind::ArchName,
             NameKind::ApkName,
             NameKind::UnitName,
+            NameKind::ServiceUnitName,
             NameKind::Hostname,
             NameKind::SysctlKey,
         ];
@@ -1248,10 +1396,11 @@ mod tests {
             for refused in ["-1", "-0", "/a", "a/b", "/"] {
                 assert!(!kind.accepts(refused.as_bytes()), "{kind:?} {refused}");
             }
+            let refuses_decimal = matches!(kind, NameKind::UnitName | NameKind::ServiceUnitName);
             for decimal in ["0", "7", "10", "65535", "9223372036854775807"] {
                 assert_eq!(
                     kind.accepts(decimal.as_bytes()),
-                    kind != NameKind::UnitName,
+                    !refuses_decimal,
                     "{kind:?} {decimal}"
                 );
             }

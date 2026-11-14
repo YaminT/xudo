@@ -21,7 +21,7 @@ expression: "render::json_of(&report)"
     "loaded": {
       "actions": 1,
       "files": 1,
-      "generation": "123774c299192bc0e65128b7f8dfdf6cc64ed8155a10df59b112ec55fe6c092f"
+      "generation": "064981249e9f115ccf66d27daadbab35f53cca72296d6ca64799957339e41f2e"
     },
     "load_error": null,
     "trust": {
@@ -37,7 +37,8 @@ expression: "render::json_of(&report)"
         }
       ],
       "unavailable": "test fixture has no dpkg record"
-    }
+    },
+    "lifecycle_note": "no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units"
   },
   "sudoers_snippet": {
     "installed_rule": null,

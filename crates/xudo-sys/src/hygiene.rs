@@ -1,6 +1,6 @@
 //! What a privileged process settles about itself before it believes anything.
 //!
-//! Three small facts, each of which the gate must establish and none of which
+//! Four small facts, each of which the gate must establish and none of which
 //! `xudo-sys-raw` is needed for:
 //!
 //! * **Descriptors 0, 1 and 2 are open.** A process started with one of them
@@ -15,6 +15,12 @@
 //!   before `main`, so in a Rust binary this is the second line of defence;
 //!   it is held anyway, because the guarantee must not rest on a runtime
 //!   detail.
+//! * **The umask is `022` and the working directory is `/`.** A caller umask
+//!   of `000` reaching an apt hook or a maintainer script would leave a file
+//!   root creates world-writable. The working directory is entered through an
+//!   `O_PATH` descriptor of `/`, so a caller-chosen directory is not where
+//!   the root command starts. Either failure refuses. The caller's resource
+//!   limits are a later change.
 //! * **The process may not gain privilege by exec.** `PR_SET_NO_NEW_PRIVS`
 //!   makes a set-user-ID or file-capability binary run with its caller's
 //!   credentials, so the command the gate runs cannot be anything but what the
@@ -43,6 +49,26 @@ pub trait Hygiene {
     /// [`SysError`] when `/dev/null` cannot be opened or installed: the caller
     /// cannot know what its next `open` would become, and must refuse.
     fn ensure_std_streams(&self) -> Result<(), SysError>;
+
+    /// Sets the process umask to `022`.
+    ///
+    /// `umask` cannot fail. The [`Result`] exists so a fake can refuse and the
+    /// gate can treat that the same way it treats every other step.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError`] when the implementation refuses. The host does not.
+    fn reset_umask(&self) -> Result<(), SysError>;
+
+    /// Makes `/` the working directory, through an `O_PATH` directory
+    /// descriptor. A failure refuses: the command must not start in a
+    /// directory the caller chose.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError`] when `/` cannot be opened or entered, or on a platform
+    /// without `O_PATH`.
+    fn reset_cwd(&self) -> Result<(), SysError>;
 
     /// Sets `PR_SET_NO_NEW_PRIVS` on this process, and confirms it took.
     ///
@@ -207,6 +233,20 @@ impl Hygiene for HostHygiene {
         ensure_std_streams_in(&HostStd)
     }
 
+    fn reset_umask(&self) -> Result<(), SysError> {
+        // Fixed `022`. `027` would make a file root writes under `/etc` or
+        // `/usr` unreadable to a non-root daemon. sudo's own rule combines the
+        // caller's umask with `022`, and a caller mask of `077` under sudo-rs
+        // or doas would do the same to other users' services. A fixed `022`
+        // is deterministic and matches what classic sudo applies.
+        let _previous = rustix::process::umask(Mode::from_bits_truncate(0o022));
+        Ok(())
+    }
+
+    fn reset_cwd(&self) -> Result<(), SysError> {
+        reset_cwd()
+    }
+
     fn forbid_new_privileges(&self) -> Result<(), SysError> {
         forbid_new_privileges()
     }
@@ -250,11 +290,97 @@ fn forbid_new_privileges() -> Result<(), SysError> {
     ))
 }
 
+/// Opens `/` and enters it.
+///
+/// Split out so a test can fail each half without a real `fchdir` of this
+/// process. Linux calls it for the host. A test calls it with a scripted
+/// root. A macOS build that is not a test has neither caller, so the trait,
+/// `reset_cwd_in`, and the `AsFd` import they need stay in this module and
+/// are not compiled there: a dead trait fails the lint.
+#[cfg(any(target_os = "linux", test))]
+mod root_dir {
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+    use super::SysError;
+    // Only the real `/` opens anything. A macOS test builds the trait and
+    // `reset_cwd_in` and never these.
+    #[cfg(target_os = "linux")]
+    use crate::error::lift;
+    #[cfg(target_os = "linux")]
+    use rustix::fs::{Mode, OFlags, open};
+
+    /// Opens `/` and enters it. Split out so a test can fail each half without
+    /// a real `fchdir` of this process.
+    pub(super) trait RootDir {
+        /// Opens `/` as a directory descriptor.
+        ///
+        /// # Errors
+        ///
+        /// [`SysError`] when the open fails.
+        fn open_root(&self) -> Result<OwnedFd, SysError>;
+
+        /// Makes `fd` the working directory.
+        ///
+        /// # Errors
+        ///
+        /// [`SysError`] when `fchdir` fails.
+        fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError>;
+    }
+
+    /// The real `/`. Linux only: `O_PATH` is how the open asks nothing of a
+    /// filesystem mounted on `/`.
+    #[cfg(target_os = "linux")]
+    pub(super) struct HostRoot;
+
+    #[cfg(target_os = "linux")]
+    impl RootDir for HostRoot {
+        fn open_root(&self) -> Result<OwnedFd, SysError> {
+            lift(
+                "open(/)",
+                open(
+                    "/",
+                    OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::PATH,
+                    Mode::empty(),
+                ),
+            )
+        }
+
+        fn enter(&self, fd: BorrowedFd<'_>) -> Result<(), SysError> {
+            lift("fchdir", rustix::process::fchdir(fd))
+        }
+    }
+
+    /// Enters the directory `root` opened. A failure of either half is the
+    /// caller's to refuse on.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError`] from `root`.
+    pub(super) fn reset_cwd_in(root: &dyn RootDir) -> Result<(), SysError> {
+        let fd = root.open_root()?;
+        root.enter(fd.as_fd())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reset_cwd() -> Result<(), SysError> {
+    root_dir::reset_cwd_in(&root_dir::HostRoot)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_cwd() -> Result<(), SysError> {
+    Err(SysError::unsupported("fchdir to / on a non-Linux platform"))
+}
+
 /// One call a [`FakeHygiene`] received.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HygieneCall {
     /// [`Hygiene::ensure_std_streams`].
     EnsureStdStreams,
+    /// [`Hygiene::reset_umask`].
+    ResetUmask,
+    /// [`Hygiene::reset_cwd`].
+    ResetCwd,
     /// [`Hygiene::forbid_new_privileges`].
     ForbidNewPrivileges,
 }
@@ -264,6 +390,8 @@ pub enum HygieneCall {
 pub struct FakeHygiene {
     calls: RefCell<Vec<HygieneCall>>,
     streams: Result<(), SysError>,
+    umask: Result<(), SysError>,
+    cwd: Result<(), SysError>,
     privileges: Result<(), SysError>,
     pid: u32,
 }
@@ -274,6 +402,8 @@ impl FakeHygiene {
         Self {
             calls: RefCell::new(Vec::new()),
             streams: Ok(()),
+            umask: Ok(()),
+            cwd: Ok(()),
             privileges: Ok(()),
             pid,
         }
@@ -283,6 +413,20 @@ impl FakeHygiene {
     #[must_use]
     pub fn with_streams_error(mut self, error: SysError) -> Self {
         self.streams = Err(error);
+        self
+    }
+
+    /// Makes [`Hygiene::reset_umask`] fail.
+    #[must_use]
+    pub fn with_umask_error(mut self, error: SysError) -> Self {
+        self.umask = Err(error);
+        self
+    }
+
+    /// Makes [`Hygiene::reset_cwd`] fail.
+    #[must_use]
+    pub fn with_cwd_error(mut self, error: SysError) -> Self {
+        self.cwd = Err(error);
         self
     }
 
@@ -303,6 +447,16 @@ impl Hygiene for FakeHygiene {
     fn ensure_std_streams(&self) -> Result<(), SysError> {
         self.calls.borrow_mut().push(HygieneCall::EnsureStdStreams);
         self.streams.clone()
+    }
+
+    fn reset_umask(&self) -> Result<(), SysError> {
+        self.calls.borrow_mut().push(HygieneCall::ResetUmask);
+        self.umask.clone()
+    }
+
+    fn reset_cwd(&self) -> Result<(), SysError> {
+        self.calls.borrow_mut().push(HygieneCall::ResetCwd);
+        self.cwd.clone()
     }
 
     fn forbid_new_privileges(&self) -> Result<(), SysError> {
@@ -326,8 +480,11 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, BorrowedFd};
 
+    use rustix::fs::Mode;
+
+    use super::root_dir::{RootDir, reset_cwd_in};
     use super::*;
 
     /// A table whose open streams a test chooses. Records what was done to it.
@@ -454,20 +611,121 @@ mod tests {
     fn the_fake_records_the_order_and_fails_where_it_is_told_to() {
         let fake = FakeHygiene::new(1);
         fake.ensure_std_streams().unwrap();
+        fake.reset_umask().unwrap();
+        fake.reset_cwd().unwrap();
         fake.forbid_new_privileges().unwrap();
         assert_eq!(
             fake.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetUmask,
+                HygieneCall::ResetCwd,
                 HygieneCall::ForbidNewPrivileges
             ]
         );
         let failing = FakeHygiene::new(1)
             .with_streams_error(SysError::unsupported("streams"))
+            .with_umask_error(SysError::unsupported("umask"))
+            .with_cwd_error(SysError::unsupported("cwd"))
             .with_privileges_error(SysError::unsupported("privileges"));
         assert!(failing.ensure_std_streams().is_err());
+        assert!(
+            failing
+                .reset_umask()
+                .unwrap_err()
+                .to_string()
+                .contains("umask")
+        );
+        assert!(failing.reset_cwd().unwrap_err().to_string().contains("cwd"));
         assert!(failing.forbid_new_privileges().is_err());
         assert!(format!("{failing:?}").contains("FakeHygiene"));
+        assert!(format!("{:?}", HygieneCall::ResetUmask).contains("ResetUmask"));
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_opened_or_entered_refuses_before_the_command_starts() {
+        struct ScriptedRoot {
+            open: Result<(), SysError>,
+            enter: Result<(), SysError>,
+            entered: RefCell<bool>,
+        }
+        impl RootDir for ScriptedRoot {
+            fn open_root(&self) -> Result<OwnedFd, SysError> {
+                self.open.clone()?;
+                // A real descriptor, so `enter` is reached. Not used as a
+                // working directory: the scripted enter does not `fchdir`.
+                HostStd.open_null()
+            }
+
+            fn enter(&self, _fd: BorrowedFd<'_>) -> Result<(), SysError> {
+                *self.entered.borrow_mut() = true;
+                self.enter.clone()
+            }
+        }
+
+        let closed = ScriptedRoot {
+            open: Err(SysError::unsupported("open(/)")),
+            enter: Ok(()),
+            entered: RefCell::new(false),
+        };
+        let err = reset_cwd_in(&closed).unwrap_err();
+        assert!(err.to_string().contains("open(/)"), "{err}");
+        assert!(!*closed.entered.borrow(), "fchdir ran after a failed open");
+
+        let stuck = ScriptedRoot {
+            open: Ok(()),
+            enter: Err(SysError::unsupported("fchdir")),
+            entered: RefCell::new(false),
+        };
+        let err = reset_cwd_in(&stuck).unwrap_err();
+        assert!(err.to_string().contains("fchdir"), "{err}");
+        assert!(*stuck.entered.borrow());
+
+        let open = ScriptedRoot {
+            open: Ok(()),
+            enter: Ok(()),
+            entered: RefCell::new(false),
+        };
+        reset_cwd_in(&open).unwrap();
+        assert!(*open.entered.borrow());
+    }
+
+    #[test]
+    fn the_host_sets_umask_022_from_a_tighter_caller_mask() {
+        // The umask is process-global. The other unit tests of this process
+        // run in parallel threads and create files. The seed is `077`: it
+        // differs from `022`, so the reset is visible, and a file created
+        // in the window is only tighter. `LOCK` serialises only this test
+        // with itself. This test does not `chdir`. The `fchdir` to `/`
+        // runs in `tests/reset_cwd.rs`, one process.
+        struct Restore {
+            umask: Mode,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = rustix::process::umask(self.umask);
+            }
+        }
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let caller = Mode::from_bits_truncate(0o077);
+        let previous_umask = rustix::process::umask(caller);
+        let restore = Restore {
+            umask: previous_umask,
+        };
+        let seeded = rustix::process::umask(caller);
+        assert_eq!(seeded.bits() & 0o777, 0o077);
+        HostHygiene.reset_umask().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        {
+            let err = HostHygiene.reset_cwd().unwrap_err();
+            assert!(err.to_string().contains("not supported"), "{err}");
+        }
+        let now = rustix::process::umask(Mode::from_bits_truncate(0o022));
+        assert_eq!(now.bits() & 0o777, 0o022);
+        drop(restore);
     }
 
     #[cfg(not(target_os = "linux"))]

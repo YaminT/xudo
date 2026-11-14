@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-07" "xudo 0.1.0-beta.1" "User Commands"
+.TH XUDO 1 "2026-11-13" "xudo 0.1.0-beta.1" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -235,6 +235,18 @@ action accepts is refused to an agent if any of them is human-only, and
 confirmed as strictly as the strictest demands.
 An action that allowlists an executable the compiled-in deny-list refuses is a
 lint error.
+A systemctl rule that can start or stop a unit it does not name is a lint
+error too.
+In the JSON envelope both sit under
+.BR lint :
+deny-list hits in
+.BR errors ,
+open units in
+.BR open_unit_lints .
+.B doctor
+uses that same field name,
+.BR open_unit_lints ,
+for the same rows.
 Everything found is printed, and the exit status is the most severe problem:
 .B 20
 for a lint warning,
@@ -251,6 +263,14 @@ the report is one envelope, with a result for each test.
 A ruleset that will not load, an unknown key in a test table included, is
 .BR 19 ,
 before any of this runs.
+When no loaded systemctl action accepts a lifecycle or power verb,
+.B check
+prints one note and does not change the exit status:
+.B no service lifecycle rule: copy /usr/share/xudo/examples/20\-services\-lifecycle.toml to /etc/xudo/rules.d/ and list your units
+The action id is not what decides this.
+The JSON envelope carries the same sentence in
+.B note
+only when that verb is absent.
 .IP
 .B \-\-fuzz
 also runs a bounded, deterministic fuzz of the ruleset: candidate commands are
@@ -301,6 +321,21 @@ prints the versioned machine-readable envelope, the same as
 .B \-\-fix
 proposes a fix for each path to root, including the command a human would
 run, and applies nothing.
+When the rules loaded and no systemctl action accepts a lifecycle or power verb,
+.B doctor
+prints the same one-line note as
+.BR check .
+That note is not a fault, and
+.B \-\-json
+includes it as
+.B lifecycle_note
+only then.
+Open unit lints are
+.B open_unit_lints
+in that envelope.
+Each row names the action, the file, the line, and the sentence
+.B check
+prints.
 .TP
 .B config
 Show the effective settings and where each value came from.
@@ -438,7 +473,8 @@ found a lint warning, and nothing worse.
 .TP
 .B 21
 .B check
-found a lint error: an action allowlists an executable the deny-list refuses.
+found a lint error: an action allowlists an executable the deny-list refuses,
+or a systemctl rule can start or stop a unit it does not name.
 .TP
 .B 22
 .B check

@@ -23,8 +23,9 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::deny::evaluate_deny_list;
-use crate::matcher::ArgSpec;
+use crate::argv::Arg;
+use crate::deny::{LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl};
+use crate::matcher::{ArgSpec, Matcher};
 use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
@@ -329,6 +330,48 @@ pub struct RuleSet {
     actions: Vec<Action>,
 }
 
+/// A systemctl action whose unit position can name any unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenUnitLint<'a> {
+    /// The action id.
+    pub id: &'a ActionId,
+    /// The file and line of that action.
+    pub source: &'a Source,
+}
+
+impl OpenUnitLint<'_> {
+    /// The sentence `xudo check` and `xudo doctor` print.
+    pub fn message(&self) -> String {
+        format!(
+            "{} at {}: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units",
+            self.id, self.source
+        )
+    }
+}
+
+/// A literal or a `one-of` whose options are literals.
+fn matcher_is_closed_literals(matcher: &Matcher) -> bool {
+    match matcher {
+        Matcher::Literal(_) | Matcher::OneOf(_) => true,
+        Matcher::IntRange { .. }
+        | Matcher::PathUnder { .. }
+        | Matcher::Name(_)
+        | Matcher::Pattern(_) => false,
+    }
+}
+
+/// Whether this position can accept a lifecycle or power verb.
+///
+/// Every matcher kind is asked. A `pattern` or a `name` that accepts `restart`
+/// is a verb position, the same as a literal. A kind that accepts none of the
+/// verbs is not.
+fn matcher_accepts_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
+    LIFECYCLE_OR_POWER_VERBS
+        .iter()
+        .copied()
+        .any(|verb| matcher.accepts(&Arg::new(verb.to_vec())))
+}
+
 impl RuleSet {
     /// Validates and takes ownership of a list of actions.
     ///
@@ -494,6 +537,57 @@ impl RuleSet {
             .collect()
     }
 
+    /// Systemctl actions that can start or stop a unit they do not name.
+    ///
+    /// A position can be the verb when its matcher accepts any lifecycle or
+    /// power verb, whatever the matcher kind. A later position that is not a
+    /// literal or a finite `one-of` of literals is the finding. `unit-name`,
+    /// `service-unit-name`, a pattern, a path, and an open repeat of any of
+    /// those are that later position. A finite list is the operator's own
+    /// units, and it is not an error. The check is the rule text, not an
+    /// execution.
+    pub fn open_unit_actions(&self) -> Vec<OpenUnitLint<'_>> {
+        self.actions
+            .iter()
+            .filter_map(|action| {
+                if !exe_is_systemctl(action.exe.as_bytes()) {
+                    return None;
+                }
+                let verb_at = action
+                    .args
+                    .iter()
+                    .position(|spec| matcher_accepts_lifecycle_or_power_verb(&spec.matcher))?;
+                let open_unit = action
+                    .args
+                    .iter()
+                    .skip(verb_at.saturating_add(1))
+                    .any(|spec| !matcher_is_closed_literals(&spec.matcher));
+                if !open_unit {
+                    return None;
+                }
+                Some(OpenUnitLint {
+                    id: &action.id,
+                    source: &action.source,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether any action is `systemctl` with a lifecycle or power verb.
+    ///
+    /// The id is not consulted. A pattern or a name that accepts the verb
+    /// counts, the same as a literal. An operator who copied the example and
+    /// renamed it still has a lifecycle rule.
+    pub fn has_systemctl_lifecycle_or_power(&self) -> bool {
+        self.actions.iter().any(|action| {
+            exe_is_systemctl(action.exe.as_bytes())
+                && action
+                    .args
+                    .iter()
+                    .any(|spec| matcher_accepts_lifecycle_or_power_verb(&spec.matcher))
+        })
+    }
+
     /// How many actions the set contains.
     pub fn len(&self) -> usize {
         self.actions.len()
@@ -510,7 +604,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
     use super::*;
-    use crate::matcher::{Matcher, NameKind};
+    use crate::matcher::{AnchoredPattern, Matcher, NameKind};
 
     fn action(id: &str) -> Action {
         Action {
@@ -815,5 +909,193 @@ exe = "true"
         assert!(offenders.first().is_some_and(|(_, classes)| {
             classes.contains(&crate::deny::CapabilityClass::SpawnsShell)
         }));
+    }
+
+    fn with_args(id: &str, args: Vec<ArgSpec>) -> Action {
+        let mut found = action(id);
+        found.args = args;
+        found
+    }
+
+    fn spec(name: &str, matcher: Matcher) -> ArgSpec {
+        ArgSpec::one(name, matcher)
+    }
+
+    /// Actions that together reach every arm of the open-unit lint.
+    ///
+    /// The pattern fixtures each compile a regex and match it against every
+    /// lifecycle verb. That matrix runs natively in
+    /// `crates/xudo-policy/tests/open_unit.rs`. This builds one pattern: as
+    /// the verb, so `accepts` matches `start` on the first verb, and after a
+    /// literal verb, so the closed-literal check sees a pattern without
+    /// walking the verb list.
+    /// Matchers that do not accept `start`, then the literal that does, then
+    /// an open unit. Each kind is asked `accepts` before the verb is found.
+    fn walked_before_the_verb(start: &Matcher, unit: &Matcher, service: &Matcher) -> Action {
+        with_args(
+            "walk",
+            vec![
+                spec("num", Matcher::IntRange { lo: 1, hi: 2 }),
+                spec(
+                    "path",
+                    Matcher::PathUnder {
+                        prefix: "/tmp".into(),
+                    },
+                ),
+                spec("unit", unit.clone()),
+                spec("service", service.clone()),
+                spec(
+                    "closed",
+                    Matcher::OneOf(vec!["status".into(), "show".into()]),
+                ),
+                spec("empty", Matcher::OneOf(vec![])),
+                spec("harmless", Matcher::Literal("daemon-reload".into())),
+                spec("verb", start.clone()),
+                spec("open", unit.clone()),
+            ],
+        )
+    }
+
+    fn open_unit_witness_actions() -> Vec<Action> {
+        let pattern = Matcher::Pattern(AnchoredPattern::new("start").unwrap());
+        let start = Matcher::Literal("start".into());
+        let unit = Matcher::Name(NameKind::UnitName);
+        let service = Matcher::Name(NameKind::ServiceUnitName);
+        let walked = walked_before_the_verb(&start, &unit, &service);
+        let by_name = with_args(
+            "by-name",
+            vec![
+                spec("verb", Matcher::Name(NameKind::Hostname)),
+                spec("unit", service),
+            ],
+        );
+        let by_one = with_args(
+            "by-one",
+            vec![
+                spec("verb", Matcher::OneOf(vec!["stop".into()])),
+                spec("unit", unit.clone()),
+            ],
+        );
+        let pattern_verb = with_args(
+            "pattern-verb",
+            vec![spec("verb", pattern.clone()), spec("unit", unit.clone())],
+        );
+        let range = with_args(
+            "range",
+            vec![
+                spec("verb", start.clone()),
+                spec("n", Matcher::IntRange { lo: 1, hi: 2 }),
+            ],
+        );
+        let path = with_args(
+            "path",
+            vec![
+                spec("verb", start.clone()),
+                spec(
+                    "p",
+                    Matcher::PathUnder {
+                        prefix: "/srv".into(),
+                    },
+                ),
+            ],
+        );
+        let pattern_unit = with_args(
+            "pattern-unit",
+            vec![spec("verb", start.clone()), spec("unit", pattern)],
+        );
+        let finite = with_args(
+            "finite",
+            vec![
+                spec("verb", start.clone()),
+                spec("flag", Matcher::Literal("--no-block".into())),
+                spec(
+                    "unit",
+                    Matcher::OneOf(vec!["nginx.service".into(), "example.service".into()]),
+                ),
+            ],
+        );
+        let mut other = action("other");
+        other.exe = "/usr/bin/systemctl-helper".into();
+        let verb_only = with_args(
+            "verb-only",
+            vec![spec("verb", Matcher::Literal("reboot".into()))],
+        );
+        let mut harmless = action("harmless");
+        harmless.args = vec![
+            spec("verb", Matcher::Literal("daemon-reload".into())),
+            spec("unit", unit),
+        ];
+        let mut helper = action("helper");
+        helper.exe = "/bin/systemctl-helper".into();
+        vec![
+            walked,
+            finite,
+            by_name,
+            by_one,
+            pattern_verb,
+            range,
+            path,
+            pattern_unit,
+            other,
+            verb_only,
+            harmless,
+            helper,
+        ]
+    }
+
+    fn assert_no_open_unit(set: &RuleSet, has_lifecycle: bool) {
+        assert!(set.open_unit_actions().is_empty());
+        assert_eq!(set.has_systemctl_lifecycle_or_power(), has_lifecycle);
+    }
+
+    #[test]
+    fn open_unit_lint_witnesses_each_matcher_kind() {
+        let actions = open_unit_witness_actions();
+        let finite = actions
+            .iter()
+            .find(|item| item.id.as_str() == "finite")
+            .unwrap();
+        let verb_only = actions
+            .iter()
+            .find(|item| item.id.as_str() == "verb-only")
+            .unwrap();
+        let harmless = actions
+            .iter()
+            .find(|item| item.id.as_str() == "harmless")
+            .unwrap();
+        let helper = actions
+            .iter()
+            .find(|item| item.id.as_str() == "helper")
+            .unwrap();
+        assert_no_open_unit(&RuleSet::load(vec![finite.clone()]).unwrap(), true);
+        assert_no_open_unit(&RuleSet::load(vec![verb_only.clone()]).unwrap(), true);
+        assert_no_open_unit(&RuleSet::load(vec![harmless.clone()]).unwrap(), false);
+        assert_no_open_unit(&RuleSet::load(vec![helper.clone()]).unwrap(), false);
+        assert_no_open_unit(&RuleSet::load(vec![]).unwrap(), false);
+
+        let set = RuleSet::load(actions).unwrap();
+        let lints = set.open_unit_actions();
+        let ids: Vec<_> = lints.iter().map(|lint| lint.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "walk",
+                "by-name",
+                "by-one",
+                "pattern-verb",
+                "range",
+                "path",
+                "pattern-unit",
+            ]
+        );
+        assert!(set.has_systemctl_lifecycle_or_power());
+        let lint = lints.first().unwrap();
+        assert_eq!(lint.source.file, "20-services.toml");
+        assert_eq!(lint.source.line, 3);
+        assert_eq!(
+            lint.message(),
+            "walk at 20-services.toml:3: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+        );
+        assert!(format!("{lint:?}").contains("walk"));
     }
 }

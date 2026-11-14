@@ -51,9 +51,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-struct FreezeMarkerGuard(std::path::PathBuf);
+/// Deletes one path when dropped.
+///
+/// Freeze markers, generated probe binaries, sudoers snippets and rule files
+/// a test created all use this. The name is the action, which is the same
+/// for each of them.
+struct DeleteOnDrop(std::path::PathBuf);
 
-impl Drop for FreezeMarkerGuard {
+impl Drop for DeleteOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
@@ -181,7 +186,7 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     let marker = dir.join("frozen");
     let stale = dir.join(format!("{}frozen", xudo_sys::TEMP_PREFIX));
     let _ = fs::remove_file(&marker);
-    let _marker_guard = FreezeMarkerGuard(marker.clone());
+    let _marker_guard = DeleteOnDrop(marker.clone());
     assert_eq!(fs::metadata(dir).unwrap().uid(), 0);
     assert_eq!(
         fs::metadata(dir).unwrap().permissions().mode() & 0o777,
@@ -494,10 +499,10 @@ fn real_injection_payloads_never_reach_the_child_environment() {
     let _journal = install_everything();
     let marker = format!("{AUDIT_DIR}/environment-payload-ran-{}", std::process::id());
     let _ = fs::remove_file(&marker);
-    let _marker_guard = FreezeMarkerGuard(marker.clone().into());
+    let _marker_guard = DeleteOnDrop(marker.clone().into());
     let (preload_source, preload_library) = compile_environment_payload(&marker);
-    let _source_guard = FreezeMarkerGuard(preload_source.into());
-    let _library_guard = FreezeMarkerGuard(preload_library.clone().into());
+    let _source_guard = DeleteOnDrop(preload_source.into());
+    let _library_guard = DeleteOnDrop(preload_library.clone().into());
 
     let vars = [
         ("LD_PRELOAD", preload_library.as_str()),
@@ -509,8 +514,8 @@ fn real_injection_payloads_never_reach_the_child_environment() {
     ];
     let test_rule = format!("{RULES_DIR}/90-test-environment.toml");
     let sudoers = "/etc/sudoers.d/xudo-env-test";
-    let _sudoers_guard = FreezeMarkerGuard(sudoers.into());
-    let _rule_guard = FreezeMarkerGuard(test_rule.clone().into());
+    let _sudoers_guard = DeleteOnDrop(sudoers.into());
+    let _rule_guard = DeleteOnDrop(test_rule.clone().into());
 
     // Prove the payload itself works in an ordinary child. LD_PRELOAD is set
     // only for cat, never for runuser (which is itself running as root here).
@@ -1179,4 +1184,171 @@ fn xudo_install_is_verified_by_the_gate_printing_zero_and_uninstalls_again() {
         .unwrap();
     assert!(removed.status.success(), "{removed:?}");
     assert!(!Path::new("/etc/sudoers.d/xudo").exists());
+}
+
+#[test]
+fn the_gate_runs_the_command_with_umask_022_and_cwd_slash() {
+    if !begin_root_test("the_gate_runs_the_command_with_umask_022_and_cwd_slash") {
+        return;
+    }
+    // Honest only because the probe below execs the gate directly from this
+    // root shell after `umask 000`. Routed through sudo, the umask would
+    // already be 022 and the probe would pass without the reset.
+    note_escalator_umask();
+    let _journal = install_everything();
+    let probe = "/usr/libexec/xudo/caller-state-probe";
+    let rule = format!("{RULES_DIR}/90-caller-state.toml");
+    let dir = "/tmp/xudo-a0e-cwd";
+    let _probe_guard = DeleteOnDrop(probe.into());
+    let _rule_guard = DeleteOnDrop(rule.clone().into());
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir(dir).unwrap();
+    let uid = id_of(&["-u", USER]);
+    let gid = id_of(&["-g", USER]);
+    chown(dir, Some(uid), Some(gid)).unwrap();
+    fs::set_permissions(dir, Permissions::from_mode(0o755)).unwrap();
+
+    let source = "/tmp/xudo-a0e-caller-state.c";
+    fs::write(
+        source,
+        r#"
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+int main(void) {
+    mode_t mask = umask(022);
+    umask(mask);
+    char cwd[4096];
+    if (getcwd(cwd, sizeof cwd) == NULL) return 2;
+    printf("%04o\n%s\n", (unsigned)mask, cwd);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let compiled = Command::new("cc")
+        .args(["-o", probe, source])
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::set_permissions(probe, Permissions::from_mode(0o755)).unwrap();
+    chown(probe, Some(0), Some(0)).unwrap();
+    let _ = fs::remove_file(source);
+
+    root_file(
+        &rule,
+        format!(
+            "[[action]]\nid = \"xudo.test.caller-state\"\ntier = \"diag-read\"\nexe = \"{probe}\"\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    let nonce = write_entry_for(own_pin(), 0, "xudo.test.caller-state", probe, Vec::new());
+
+    // The shell is the caller the gate inherits from: umask 000 and a
+    // directory owned by the unprivileged account. The gate must replace both
+    // before it execs the probe. `/bin/sh` is a symlink, so the gate itself
+    // is not asked to exec it.
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 000; cd \"$1\" || exit 90; exec \"$2\"")
+        .arg("xudo-a0e")
+        .arg(dir)
+        .arg(GATE_AUTH)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gate status {:?} stdout={stdout} stderr={stderr}",
+        output.status.code()
+    );
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("0022"),
+        "umask stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("/"),
+        "cwd stdout={stdout} stderr={stderr}"
+    );
+    assert!(!entry_exists(&nonce), "the request was not consumed");
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn id_of(args: &[&str]) -> u32 {
+    let output = Command::new("/usr/bin/id").args(args).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// What each installed escalator does with a caller umask of `000`, as the
+/// lane's unprivileged account `xudotest`. Recorded, not asserted. A password
+/// prompt is killed by `timeout`.
+#[allow(clippy::disallowed_methods)]
+fn note_escalator_umask() {
+    let tools: &[(&str, &str, &[&str])] = &[
+        ("sudo", "/usr/bin/sudo", &["-n", "/bin/sh", "-c", "umask"]),
+        (
+            "sudo-rs",
+            "/usr/bin/sudo-rs",
+            &["-n", "/bin/sh", "-c", "umask"],
+        ),
+        ("doas", "/usr/bin/doas", &["/bin/sh", "-c", "umask"]),
+        ("doas", "/usr/sbin/doas", &["/bin/sh", "-c", "umask"]),
+        ("doas", "/bin/doas", &["/bin/sh", "-c", "umask"]),
+    ];
+    let mut saw_doas = false;
+    for (label, path, args) in tools {
+        if *label == "doas" && saw_doas {
+            continue;
+        }
+        if !Path::new(path).is_file() {
+            if *label != "doas" {
+                eprintln!("A0E_UMASK {label} absent ({path})");
+            }
+            continue;
+        }
+        if *label == "doas" {
+            saw_doas = true;
+        }
+        if !Path::new("/usr/bin/timeout").is_file() {
+            eprintln!("A0E_UMASK {label} skipped: /usr/bin/timeout absent");
+            continue;
+        }
+        let mut command = Command::new("/usr/sbin/runuser");
+        command
+            .args(["-u", USER, "--", "/bin/sh", "-c"])
+            .arg("umask 000; exec /usr/bin/timeout --signal=KILL 3 \"$0\" \"$@\"")
+            .arg(path)
+            .args(*args);
+        match command.output() {
+            Ok(output) => {
+                eprintln!(
+                    "A0E_UMASK {label} path={path} status={:?} stdout={} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => eprintln!("A0E_UMASK {label} spawn-failed {error}"),
+        }
+    }
+    if !saw_doas {
+        eprintln!("A0E_UMASK doas absent (/usr/bin/doas, /usr/sbin/doas, /bin/doas)");
+    }
 }

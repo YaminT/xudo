@@ -538,6 +538,31 @@ fn deb_postinst_fallback_matches_tmpfiles_paths_modes_and_owners() {
 }
 
 #[test]
+fn deb_postinst_warns_when_a_kept_beta1_lifecycle_rule_remains() {
+    let start = POSTINST
+        .find("lt '0.1.0~beta.2'")
+        .unwrap_or_else(|| panic!("version gate missing"));
+    let end = POSTINST
+        .find("systemd-tmpfiles")
+        .unwrap_or_else(|| panic!("tmpfiles step missing"));
+    let block = &POSTINST[start..end];
+    assert!(
+        block.contains(
+            "if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`."
+        ),
+        "upgrade notice does not tell the operator to run xudo check"
+    );
+    assert!(
+        !block.contains("xudo.svc.lifecycle"),
+        "upgrade notice still keys off the action id"
+    );
+    assert!(
+        block.contains("find -P /run/xudo/confirm"),
+        "confirm cleanup left the version gate"
+    );
+}
+
+#[test]
 fn the_parser_this_test_relies_on_refuses_what_it_cannot_read() {
     // A test that parsed nothing would pass everything.
     assert!(parse(SOCKET).len() > 8);

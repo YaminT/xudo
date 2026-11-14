@@ -11,8 +11,10 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+use proptest::prelude::*;
 use xudo_policy::{
-    Argv, CallerFacts, Classification, DenialCode, Request, RuleSet, Verdict, engine::Settings,
+    Arg, Argv, CallerFacts, CapabilityClass, Classification, DenialCode, Matcher, NameKind,
+    Request, RuleSet, Verdict, engine::Settings, evaluate_command,
 };
 
 /// Each shipped file, paired with the name it has on disk.
@@ -38,6 +40,58 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../rules/40-tunables.toml"),
     ),
 ];
+
+/// The lifecycle example is not a shipped rule. The loader only reads names
+/// ending in `.toml`, and this file is `*.toml.example`, so `include_str!`
+/// is how the build attacks it.
+const LIFECYCLE_EXAMPLE: &str =
+    include_str!("../../../rules/examples/20-services-lifecycle.toml.example");
+
+/// Published `v0.1.0-beta.1` `rules/20-services.toml`, byte for byte.
+/// The upgrade lane installs this file as the operator's kept conffile.
+const BETA1_SERVICES: &str = include_str!("../../../ci/deb/fixtures/20-services-beta.1.toml");
+
+/// The hole the tripwires close: a lifecycle rule whose unit position is the
+/// generic `unit-name` kind. The shipped rules do not contain this. A test
+/// that only calls `evaluate_deny_list` would pass even if matching an action
+/// stopped the deny-list from running.
+const HOLE_LIFECYCLE: &str = r#"
+[[action]]
+id = "xudo.svc.lifecycle"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { one-of = [
+    "start", "stop", "restart", "try-restart", "reload",
+    "reload-or-restart", "try-reload-or-restart",
+  ] } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+fn example_lifecycle() -> RuleSet {
+    RuleSet::from_toml("20-services-lifecycle.toml", LIFECYCLE_EXAMPLE)
+        .unwrap_or_else(|e| panic!("lifecycle example does not load: {e}"))
+}
+
+fn hole_lifecycle() -> RuleSet {
+    RuleSet::from_toml("hole.toml", HOLE_LIFECYCLE)
+        .unwrap_or_else(|e| panic!("hole lifecycle rule does not load: {e}"))
+}
+
+/// The open `unit-name` lifecycle rule, which is the beta.1 hole. A refusal
+/// here is the deny-list, because the rule itself matches.
+fn hole_denial(args: &[&str]) -> Option<DenialCode> {
+    xudo_policy::evaluate(
+        &hole_lifecycle(),
+        &human(),
+        &Request::new("xudo.svc.lifecycle", Argv::new(args.to_vec())),
+        Settings::default(),
+    )
+    .denial
+}
 
 fn load_all() -> RuleSet {
     let mut actions = Vec::new();
@@ -68,7 +122,7 @@ fn shipped_rule_tests_pass() {
     // purpose, so a file that silently lost its tests cannot pass.
     assert_eq!(
         tests.len(),
-        28,
+        32,
         "the shipped test count changed: update this"
     );
     let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
@@ -134,6 +188,24 @@ fn denial(action: &str, args: &[&str]) -> Option<DenialCode> {
         Settings::default(),
     )
     .denial
+}
+
+/// The shipped install argv, without the package names.
+///
+/// `--no-remove` sits with the other apt options, before the verb. Apt reads
+/// options before the command, and a token after `--` would be a package name.
+const INSTALL_PREFIX: &[&str] = &[
+    "-y",
+    "--no-install-recommends",
+    "--no-remove",
+    "install",
+    "--",
+];
+
+fn install_argv<'a>(packages: &[&'a str]) -> Vec<&'a str> {
+    let mut args = INSTALL_PREFIX.to_vec();
+    args.extend_from_slice(packages);
+    args
 }
 
 #[test]
@@ -239,9 +311,254 @@ fn an_empty_rule_file_is_valid_and_permits_nothing() {
 
 // --- what the shipped rules actually permit ---------------------------------
 
+/// Verbs the example lists, and the verbs a lifecycle rule is for.
+const LIFECYCLE_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+];
+
+/// Lifecycle verbs plus the power and boot subcommands. No shipped action
+/// may accept one of these on an ordinary service name.
+const LIFECYCLE_OR_POWER_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "try-restart",
+    "reload",
+    "reload-or-restart",
+    "try-reload-or-restart",
+    "kill",
+    "clean",
+    "freeze",
+    "thaw",
+    "condrestart",
+    "force-reload",
+    "reload-or-try-restart",
+    "condreload",
+    "condstop",
+    "isolate",
+    "poweroff",
+    "reboot",
+    "halt",
+    "kexec",
+    "suspend",
+    "hibernate",
+    "hybrid-sleep",
+    "suspend-then-hibernate",
+    "soft-reboot",
+    "sleep",
+    "rescue",
+    "emergency",
+    "default",
+    "exit",
+];
+
 #[test]
 fn service_lifecycle_permits_the_verbs_it_lists() {
-    for verb in [
+    // The example, not the shipped rules. The shipped set has no lifecycle
+    // action; this is what an operator gets after copying the example and
+    // before replacing the placeholder names.
+    let rules = example_lifecycle();
+    for verb in LIFECYCLE_VERBS {
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
+                "xudo.svc.lifecycle",
+                Argv::new(vec![
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    "example.service",
+                ]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.verdict,
+            Verdict::Allow,
+            "{verb} was not permitted: {:?}",
+            decision.denial
+        );
+    }
+}
+
+#[test]
+fn reset_failed_still_accepts_a_plain_service() {
+    assert_eq!(
+        verdict(
+            "xudo.svc.reset-failed",
+            &["--no-pager", "reset-failed", "ssh.service"]
+        ),
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn journal_rules_still_accept_a_target_and_a_template_unit() {
+    // Reading a unit's log is the point of the generic unit-name kind.
+    // Narrowing it would hide the log of the unit the lifecycle rule refuses.
+    for unit in ["poweroff.target", "getty@tty1.service", "a\\x2db.service"] {
+        assert_eq!(
+            verdict("xudo.svc.logs", &["--no-pager", "-u", unit]),
+            Verdict::Allow,
+            "{unit}"
+        );
+    }
+}
+
+fn command_verdict(args: &[&str]) -> Verdict {
+    let rules = load_all();
+    let (program, operands) = args.split_first().unwrap();
+    xudo_policy::evaluate_command(
+        &rules,
+        &human(),
+        &xudo_policy::Arg::from(*program),
+        &Argv::new(operands.to_vec()),
+        Settings::default(),
+    )
+    .verdict
+}
+
+#[test]
+fn denies_every_systemctl_power_subcommand() {
+    const VERBS: &[&str] = &[
+        "poweroff",
+        "reboot",
+        "halt",
+        "kexec",
+        "suspend",
+        "hibernate",
+        "hybrid-sleep",
+        "suspend-then-hibernate",
+        "soft-reboot",
+        "rescue",
+        "emergency",
+        "default",
+        "exit",
+    ];
+    for verb in VERBS {
+        let findings = xudo_policy::evaluate_deny_list(
+            b"/usr/bin/systemctl",
+            &Argv::new(vec![verb, "--no-wall"]),
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.class == xudo_policy::CapabilityClass::PowerState),
+            "{verb} {findings:?}"
+        );
+    }
+    let ordinary = xudo_policy::evaluate_deny_list(
+        b"/usr/bin/systemctl",
+        &Argv::new(vec!["start", "multi-user.target"]),
+    );
+    assert!(
+        ordinary.is_empty(),
+        "start of an ordinary target is not a power subcommand: {ordinary:?}"
+    );
+}
+
+#[test]
+fn denies_poweroff_via_systemctl_start_poweroff_target() {
+    let args = [
+        "/usr/bin/systemctl",
+        "--no-pager",
+        "--no-ask-password",
+        "start",
+        "poweroff.target",
+    ];
+    assert_eq!(command_verdict(&args), Verdict::Deny);
+    assert_eq!(
+        denial(
+            "xudo.svc.reset-failed",
+            &["--no-pager", "reset-failed", "poweroff.target"]
+        ),
+        Some(DenialCode::ArgvRejected)
+    );
+    // The shipped set denies this because no rule matches. The open
+    // unit-name rule matches, and the deny-list still refuses the target.
+    assert_eq!(
+        hole_denial(&[
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "poweroff.target",
+        ]),
+        Some(DenialCode::DenyListed)
+    );
+}
+
+#[test]
+fn denies_kernel_module_load_via_modprobe_template_unit() {
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "modprobe@dummy.service",
+        ]),
+        Verdict::Deny
+    );
+    assert_eq!(
+        hole_denial(&[
+            "--no-pager",
+            "--no-ask-password",
+            "start",
+            "modprobe@dummy.service",
+        ]),
+        Some(DenialCode::DenyListed)
+    );
+}
+
+#[test]
+fn denies_stopping_the_broker_socket() {
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--no-ask-password",
+            "stop",
+            "xudod.socket",
+        ]),
+        Verdict::Deny
+    );
+    // The open unit-name rule matches the socket. The deny-list still refuses it.
+    assert_eq!(
+        hole_denial(&["--no-pager", "--no-ask-password", "stop", "xudod.socket",]),
+        Some(DenialCode::DenyListed)
+    );
+    // A unit-name lifecycle rule would accept this plain service name. The
+    // deny-list still refuses the broker's own service.
+    let decision = xudo_policy::evaluate(
+        &hole_lifecycle(),
+        &human(),
+        &Request::new(
+            "xudo.svc.lifecycle",
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "stop",
+                "xudod.service",
+            ]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(decision.denial, Some(DenialCode::DenyListed));
+}
+
+#[test]
+fn no_lifecycle_verb_reaches_a_special_target() {
+    // Every lifecycle verb, plus verbs the deny entry covers even though no
+    // shipped rule lists them (`isolate`, `reset-failed`, `kill`). `status`
+    // and `show` are read-only and are not in this list.
+    const VERBS: &[&str] = &[
         "start",
         "stop",
         "restart",
@@ -249,23 +566,216 @@ fn service_lifecycle_permits_the_verbs_it_lists() {
         "reload",
         "reload-or-restart",
         "try-reload-or-restart",
-    ] {
+        "isolate",
+        "kill",
+        "reset-failed",
+    ];
+    const TARGETS: &[&str] = &[
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "soft-reboot.target",
+        "ctrl-alt-del.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+        "sleep.target",
+        "shutdown.target",
+        "rescue.target",
+        "emergency.target",
+        "exit.target",
+        "sysinit.target",
+    ];
+    for verb in VERBS {
+        for target in TARGETS {
+            let argv = Argv::new(vec!["--no-pager", "--no-ask-password", verb, target]);
+            let findings = xudo_policy::evaluate_deny_list(b"/usr/bin/systemctl", &argv);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.class == xudo_policy::CapabilityClass::PowerState),
+                "{verb} {target} was not a power state: {findings:?}"
+            );
+            assert_eq!(
+                command_verdict(&[
+                    "/usr/bin/systemctl",
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    target,
+                ]),
+                Verdict::Deny,
+                "{verb} {target}"
+            );
+        }
+    }
+}
+
+#[test]
+fn status_of_a_tripwire_unit_is_allowed() {
+    // The shipped read-only rules. The deny-list must not turn them into a refusal.
+    const UNITS: &[&str] = &[
+        "xudod.socket",
+        "systemd-journald.service",
+        "chronyd.service",
+        "nftables.service",
+        "apparmor.service",
+        "auditd.service",
+    ];
+    for unit in UNITS {
         assert_eq!(
-            verdict(
-                "xudo.svc.lifecycle",
-                &["--no-pager", "--no-ask-password", verb, "nginx.service"]
-            ),
+            command_verdict(&["/usr/bin/systemctl", "--no-pager", "--full", "status", unit]),
             Verdict::Allow,
-            "{verb} was not permitted"
+            "status {unit}"
+        );
+        assert_eq!(
+            command_verdict(&[
+                "/usr/bin/systemctl",
+                "--no-pager",
+                "show",
+                unit,
+                "--property=ActiveState",
+            ]),
+            Verdict::Allow,
+            "show {unit}"
+        );
+        let findings = xudo_policy::evaluate_deny_list(
+            b"/usr/bin/systemctl",
+            &Argv::new(vec!["status", unit]),
+        );
+        assert!(
+            findings.is_empty(),
+            "status {unit} is a diagnostic: {findings:?}"
         );
     }
 }
 
 #[test]
+fn stop_of_a_tripwire_unit_is_refused() {
+    for unit in [
+        "xudod.socket",
+        "systemd-journald.service",
+        "chronyd.service",
+    ] {
+        assert_eq!(
+            command_verdict(&[
+                "/usr/bin/systemctl",
+                "--no-pager",
+                "--no-ask-password",
+                "stop",
+                unit,
+            ]),
+            Verdict::Deny,
+            "stop {unit}"
+        );
+        assert!(
+            unit_classes("stop", unit).contains(&xudo_policy::CapabilityClass::SelfModification)
+                || unit_classes("stop", unit)
+                    .contains(&xudo_policy::CapabilityClass::SecuritySubsystem),
+            "stop {unit}"
+        );
+    }
+}
+
+fn unit_classes(verb: &str, unit: &str) -> Vec<CapabilityClass> {
+    let argv = Argv::new(vec![verb, unit]);
+    xudo_policy::evaluate_deny_list(b"/usr/bin/systemctl", &argv)
+        .into_iter()
+        .map(|finding| finding.class)
+        .collect()
+}
+
+#[test]
+fn unit_keyed_deny_entries_cover_templates_security_and_escapes() {
+    // The cartesian power-target check is `no_lifecycle_verb_reaches_a_special_target`.
+    // This one is the rest of the unit-keyed list, including spellings that
+    // only decode to a refused unit. It lives here so miri, which runs the
+    // library tests only, does not pay for the matrix.
+    for unit in ["modprobe@foo\\x2dbar.service", "mod\\.probe@x.service"] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::KernelModule),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "systemd-fsck@dev-sda1.service",
+        "systemd-growfs@dev-sda1.service",
+        "systemd-makefs@dev-sda1.service",
+        "mdadm-last-resort@dev-sda1.service",
+        "mdadm-grow-continue@dev-md0.service",
+        "mdadm@dev-md0.service",
+    ] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::DeviceOrFilesystem),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "xudod.service",
+        "xudod",
+        "xudod@1.service",
+        "xudo-pasban.service",
+    ] {
+        assert!(
+            unit_classes("stop", unit).contains(&CapabilityClass::SelfModification),
+            "{unit}"
+        );
+    }
+    assert!(
+        !unit_classes("stop", "xudod-extra.service").contains(&CapabilityClass::SelfModification)
+    );
+    for unit in [
+        "apparmor.service",
+        "apparmor",
+        "apparmor@profile.service",
+        "auditd.service",
+        "auditd.socket",
+    ] {
+        assert!(
+            unit_classes("stop", unit).contains(&CapabilityClass::SecuritySubsystem),
+            "{unit}"
+        );
+    }
+    assert!(unit_classes("stop", "apparmor-helper.service").is_empty());
+    for unit in [
+        "ctrl\\x2dalt\\x2ddel.target",
+        "ctrl\\x2Dalt\\x2ddel.target",
+        "reboot\\x2etarget",
+        "poweroff\\.target",
+        "poweroff.target\\",
+    ] {
+        assert!(
+            unit_classes("start", unit).contains(&CapabilityClass::PowerState),
+            "{unit}"
+        );
+    }
+    for unit in [
+        "getty@tty\\x2d1.service",
+        "getty\\.service",
+        "nginx.service",
+        "@foo.service",
+        "reboot\\x",
+        "poweroff\\x2",
+        "poweroff\\xz.target",
+        "poweroff\\x2g.target",
+        "Poweroff.target",
+    ] {
+        assert!(unit_classes("start", unit).is_empty(), "{unit} was denied");
+    }
+    let journal = Argv::new(vec!["--no-pager", "-u", "poweroff.target"]);
+    assert!(xudo_policy::evaluate_deny_list(b"/usr/bin/journalctl", &journal).is_empty());
+    let both = unit_classes("enable", "poweroff.target");
+    assert!(both.contains(&CapabilityClass::UnitDefinitionMutation));
+    assert!(both.contains(&CapabilityClass::PowerState));
+}
+
+#[test]
 fn service_lifecycle_refuses_every_unit_mutating_verb() {
-    // Refused twice over: the verb is not in the enum, and the deny-list
-    // classifies it independently. Either alone would be enough; both is the
-    // point.
+    // The example's verb enum is the lifecycle verbs only. `enable` changes
+    // a unit definition and is not in that list.
+    let rules = example_lifecycle();
     for verb in [
         "enable",
         "disable",
@@ -277,44 +787,301 @@ fn service_lifecycle_refuses_every_unit_mutating_verb() {
         "set-property",
         "switch-root",
     ] {
-        let d = denial(
-            "xudo.svc.lifecycle",
-            &["--no-pager", "--no-ask-password", verb, "nginx.service"],
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
+                "xudo.svc.lifecycle",
+                Argv::new(vec![
+                    "--no-pager",
+                    "--no-ask-password",
+                    verb,
+                    "example.service",
+                ]),
+            ),
+            Settings::default(),
         );
-        assert!(
-            d == Some(DenialCode::ArgvRejected) || d == Some(DenialCode::DenyListed),
-            "{verb} gave {d:?}"
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::ArgvRejected),
+            "{verb} gave {:?}",
+            decision.denial
         );
     }
 }
 
 #[test]
 fn a_suffixless_unit_name_is_refused() {
-    // `systemctl restart nginx` resolves to nginx.service, so accepting a bare
-    // name would silently widen the rule.
-    assert_eq!(
-        denial(
+    // `systemctl restart example` resolves to example.service, so accepting a
+    // bare name would silently widen the operator's list.
+    let rules = example_lifecycle();
+    let decision = xudo_policy::evaluate(
+        &rules,
+        &human(),
+        &Request::new(
             "xudo.svc.lifecycle",
-            &["--no-pager", "--no-ask-password", "restart", "nginx"]
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "example",
+            ]),
         ),
-        Some(DenialCode::ArgvRejected)
+        Settings::default(),
     );
+    assert_eq!(decision.denial, Some(DenialCode::ArgvRejected));
+}
+
+#[test]
+fn the_shipped_rules_have_no_lifecycle_rule() {
+    // The engine, not the action id: no shipped systemctl action accepts a
+    // lifecycle or power verb on an ordinary service name. `status` still
+    // reads one.
+    let rules = load_all();
+    assert!(rules.open_unit_actions().is_empty());
+    assert!(!rules.has_systemctl_lifecycle_or_power());
+    for verb in LIFECYCLE_OR_POWER_VERBS {
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                *verb,
+                "nginx.service",
+            ]),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.verdict,
+            Verdict::Deny,
+            "{verb} of nginx.service was accepted: {:?}",
+            decision.denial
+        );
+    }
+    assert_eq!(
+        command_verdict(&[
+            "/usr/bin/systemctl",
+            "--no-pager",
+            "--full",
+            "status",
+            "nginx.service",
+        ]),
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn the_beta1_services_file_lints_and_the_example_does_not() {
+    let beta1 = RuleSet::from_toml("20-services.toml", BETA1_SERVICES)
+        .unwrap_or_else(|e| panic!("beta.1 services file does not load: {e}"));
+    assert!(
+        beta1
+            .open_unit_actions()
+            .iter()
+            .any(|lint| lint.id.as_str() == "xudo.svc.lifecycle"),
+        "the published beta.1 lifecycle rule was not linted"
+    );
+    let example = example_lifecycle();
+    assert!(
+        example.open_unit_actions().is_empty(),
+        "the shipped example lints, so copying it would make xudo check exit 21"
+    );
+}
+
+#[test]
+fn the_lifecycle_example_parses_and_its_tests_pass() {
+    let (rules, tests) =
+        RuleSet::from_toml_with_tests("20-services-lifecycle.toml", LIFECYCLE_EXAMPLE)
+            .unwrap_or_else(|e| panic!("lifecycle example does not load: {e}"));
+    assert_eq!(rules.actions().len(), 1);
+    assert!(
+        rules
+            .actions()
+            .iter()
+            .any(|action| action.id.as_str() == "xudo.svc.lifecycle")
+    );
+    assert!(
+        tests.len() >= 7,
+        "the example's [[test]] tables were dropped: {}",
+        tests.len()
+    );
+    let results = xudo_policy::run_tests(&rules, &tests, &human(), Settings::default());
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|result| !result.outcome.passed())
+        .map(|result| format!("{:?} {:?}", result.test.argv, result.outcome))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "example tests fail:\n{}",
+        failures.join("\n")
+    );
+
+    // Near misses the [[test]] tables also pin, asserted here so deleting a
+    // table cannot make an unlisted unit look allowed.
+    for unit in [
+        "nginx.service",
+        "systemd-poweroff.service",
+        "poweroff.target",
+        "example",
+        "example.service.extra",
+    ] {
+        let decision = xudo_policy::evaluate(
+            &rules,
+            &human(),
+            &Request::new(
+                "xudo.svc.lifecycle",
+                Argv::new(vec!["--no-pager", "--no-ask-password", "restart", unit]),
+            ),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{unit} was permitted");
+    }
+}
+
+/// Every unit the deny-list keys, with the class that entry uses.
+///
+/// The cartesian check below is the proof that a `unit-name` lifecycle rule
+/// (the hole) still cannot reach one. The class is pinned so a tripwire that
+/// moved to the wrong class fails here.
+fn listed_units() -> Vec<(&'static str, CapabilityClass)> {
+    let mut units = Vec::new();
+    let power = [
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "soft-reboot.target",
+        "ctrl-alt-del.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+        "sleep.target",
+        "shutdown.target",
+        "rescue.target",
+        "emergency.target",
+        "exit.target",
+        "sysinit.target",
+        "umount.target",
+        "final.target",
+        "runlevel0.target",
+        "runlevel1.target",
+        "runlevel6.target",
+        "systemd-poweroff.service",
+        "systemd-reboot.service",
+        "systemd-halt.service",
+        "systemd-kexec.service",
+        "systemd-soft-reboot.service",
+        "systemd-suspend.service",
+        "systemd-hibernate.service",
+        "systemd-hybrid-sleep.service",
+        "systemd-suspend-then-hibernate.service",
+        "systemd-exit.service",
+        "rescue.service",
+        "emergency.service",
+    ];
+    for unit in power {
+        units.push((unit, CapabilityClass::PowerState));
+    }
+    units.push(("debug-shell.service", CapabilityClass::SpawnsShell));
+    units.push(("modprobe@dummy.service", CapabilityClass::KernelModule));
+    for unit in [
+        "systemd-fsck@dev-sda1.service",
+        "systemd-growfs@dev-sda1.service",
+        "systemd-makefs@dev-sda1.service",
+        "mdadm@dev-md0.service",
+        "systemd-repart.service",
+    ] {
+        units.push((unit, CapabilityClass::DeviceOrFilesystem));
+    }
+    for unit in [
+        "xudod.service",
+        "xudod.socket",
+        "xudo-pasban.service",
+        "systemd-journald.service",
+        "systemd-journald.socket",
+        "systemd-journald-dev-log.socket",
+        "rsyslog.service",
+        "syslog.socket",
+    ] {
+        units.push((unit, CapabilityClass::SelfModification));
+    }
+    for unit in [
+        "apparmor.service",
+        "auditd.service",
+        "nftables.service",
+        "ufw.service",
+        "netfilter-persistent.service",
+        "firewalld.service",
+        "systemd-timesyncd.service",
+        "dbus-org.freedesktop.timesync1.service",
+        "chrony.service",
+        "chronyd.service",
+    ] {
+        units.push((unit, CapabilityClass::SecuritySubsystem));
+    }
+    units.push((
+        "systemd-sysctl.service",
+        CapabilityClass::ConfigNamedProgram,
+    ));
+    units
+}
+
+#[test]
+fn no_lifecycle_verb_reaches_a_listed_unit() {
+    let rules = hole_lifecycle();
+    // The fixture really is a hole for an ordinary service. If this failed,
+    // a later DenyListed would only mean "the rule did not match".
+    let ordinary = xudo_policy::evaluate(
+        &rules,
+        &human(),
+        &Request::new(
+            "xudo.svc.lifecycle",
+            Argv::new(vec![
+                "--no-pager",
+                "--no-ask-password",
+                "restart",
+                "nginx.service",
+            ]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(ordinary.verdict, Verdict::Allow, "{:?}", ordinary.denial);
+
+    for verb in LIFECYCLE_VERBS {
+        for (unit, class) in listed_units() {
+            let decision = xudo_policy::evaluate(
+                &rules,
+                &human(),
+                &Request::new(
+                    "xudo.svc.lifecycle",
+                    Argv::new(vec!["--no-pager", "--no-ask-password", verb, unit]),
+                ),
+                Settings::default(),
+            );
+            assert_eq!(
+                decision.denial,
+                Some(DenialCode::DenyListed),
+                "{verb} {unit} gave {:?} {:?}",
+                decision.verdict,
+                decision.denial
+            );
+            let classes = unit_classes(verb, unit);
+            assert!(
+                classes.contains(&class),
+                "{verb} {unit} was {classes:?}, expected {class:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn package_install_permits_names_and_refuses_every_other_source() {
     assert_eq!(
-        verdict(
-            "xudo.pkg.install",
-            &[
-                "-y",
-                "--no-install-recommends",
-                "install",
-                "--",
-                "ripgrep",
-                "fd-find"
-            ]
-        ),
+        verdict("xudo.pkg.install", &install_argv(&["ripgrep", "fd-find"])),
         Verdict::Allow
     );
 
@@ -327,11 +1094,84 @@ fn package_install_permits_names_and_refuses_every_other_source() {
         "-y",
         "../../etc/passwd",
     ] {
-        let d = denial(
-            "xudo.pkg.install",
-            &["-y", "--no-install-recommends", "install", "--", bad],
-        );
+        let d = denial("xudo.pkg.install", &install_argv(&[bad]));
         assert!(d.is_some(), "{bad} was permitted");
+    }
+}
+
+/// `apparmor-` is a removal. The matcher unit tests
+/// (`deb_names_reject_every_local_and_pinned_install_form`) are the regression
+/// proof that a trailing `-` is refused. This test does not have to fail on a
+/// tree that merely lacks `--no-remove`; `install_without_no_remove_is_not_accepted`
+/// is that proof.
+#[test]
+fn denies_package_removal_via_install_trailing_hyphen() {
+    // `apt-get install apparmor-` removes apparmor. The install rule must not
+    // be that removal: pkg.remove is the removal, and it confirms always.
+    for name in ["apparmor-", "auditd-", "xudo-", "sudo-"] {
+        let args = install_argv(&[name]);
+        assert_eq!(
+            denial("xudo.pkg.install", &args),
+            Some(DenialCode::ArgvRejected),
+            "{name} was not an argument refusal"
+        );
+        let decision = evaluate_command(
+            &load_all(),
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(args),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{name} was accepted");
+        assert_eq!(decision.denial, Some(DenialCode::ArgvRejected));
+    }
+}
+
+#[test]
+fn install_without_no_remove_is_not_accepted() {
+    // The flag is part of the rule, not a default apt adds. Without it an
+    // install that must remove a conflicting package would proceed.
+    let args = ["-y", "--no-install-recommends", "install", "--", "ripgrep"];
+    assert_eq!(
+        denial("xudo.pkg.install", &args),
+        Some(DenialCode::ArgvRejected)
+    );
+    let decision = evaluate_command(
+        &load_all(),
+        &human(),
+        &Arg::from("/usr/bin/apt-get"),
+        &Argv::new(args.to_vec()),
+        Settings::default(),
+    );
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert_eq!(
+        verdict("xudo.pkg.install", &install_argv(&["ripgrep"])),
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn legitimate_package_names_with_plus_dot_and_hyphen_are_accepted() {
+    // Real names. A trailing `+` stays: `g++` is a package, and `pkg+` on
+    // install asks apt to install. An internal `-` or `.` is not a removal.
+    for name in [
+        "libstdc++6",
+        "g++",
+        "python3.12",
+        "libpng16-16",
+        "x11-utils",
+    ] {
+        for kind in [NameKind::DebName, NameKind::ApkName] {
+            assert!(
+                Matcher::Name(kind).accepts(&Arg::from(name)),
+                "{kind:?} rejected {name}"
+            );
+        }
+        assert_eq!(
+            verdict("xudo.pkg.install", &install_argv(&[name])),
+            Verdict::Allow,
+            "{name} was not an install"
+        );
     }
 }
 
@@ -345,6 +1185,7 @@ fn package_install_refuses_a_configuration_redirect() {
         &[
             "-y",
             "--no-install-recommends",
+            "--no-remove",
             "install",
             "-o",
             "DPkg::Pre-Invoke::=sh -c id",
@@ -357,13 +1198,176 @@ fn package_install_refuses_a_configuration_redirect() {
 
 #[test]
 fn package_install_caps_the_number_of_names() {
-    let mut args = vec!["-y", "--no-install-recommends", "install", "--"];
+    let mut args = INSTALL_PREFIX.to_vec();
     let many = vec!["ripgrep"; 21];
     args.extend(many.iter().copied());
     assert_eq!(
         denial("xudo.pkg.install", &args),
         Some(DenialCode::ArgvRejected)
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+    /// A deb-name ending in `-` is a removal. No shipped action accepts one,
+    /// in a package slot or through the install, remove, or dry-run shape.
+    #[test]
+    fn no_deb_name_ending_in_a_hyphen_is_accepted_by_any_shipped_action(
+        body in "[a-z0-9+._]{0,48}"
+    ) {
+        let name = format!("{body}-");
+        let arg = Arg::from(name.as_str());
+        prop_assert!(!Matcher::Name(NameKind::DebName).accepts(&arg));
+        prop_assert!(!Matcher::Name(NameKind::ApkName).accepts(&arg));
+
+        let rules = load_all();
+        for action in rules.actions() {
+            for spec in &action.args {
+                if matches!(
+                    spec.matcher,
+                    Matcher::Name(NameKind::DebName | NameKind::ApkName)
+                ) {
+                    let id = action.id.as_str();
+                    prop_assert!(!spec.matcher.accepts(&arg), "{id} accepts {name}", id = id, name = name);
+                }
+            }
+        }
+
+        let shapes: &[(&str, &[&str])] = &[
+            ("/usr/bin/apt-get", INSTALL_PREFIX),
+            ("/usr/bin/apt-get", &["-y", "remove", "--"]),
+            ("/usr/bin/apt-get", &["-s", "install", "--"]),
+        ];
+        for (program, prefix) in shapes {
+            let mut argv = prefix.to_vec();
+            argv.push(name.as_str());
+            let decision = evaluate_command(
+                &rules,
+                &human(),
+                &Arg::from(*program),
+                &Argv::new(argv),
+                Settings::default(),
+            );
+            prop_assert_eq!(
+                decision.verdict,
+                Verdict::Deny,
+                "{program} accepted {name}",
+                program = program,
+                name = name
+            );
+        }
+    }
+}
+
+#[test]
+fn denies_regex_package_name_on_removal() {
+    // One confirmed token must not be an unanchored apt regular expression,
+    // and `+` on remove installs. Real names that contain either are refused
+    // here too: remove them with the host's tools or an operator `one-of` rule.
+    for name in ["lib.", "ba.h", "g++", "libstdc++6", "python3.12"] {
+        let args = ["-y", "remove", "--", name];
+        assert_eq!(
+            denial("xudo.pkg.remove", &args),
+            Some(DenialCode::ArgvRejected),
+            "{name} was not an argument refusal"
+        );
+        let decision = evaluate_command(
+            &load_all(),
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(args.to_vec()),
+            Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::Deny, "{name} was accepted");
+    }
+}
+
+#[test]
+fn removal_of_a_plain_package_name_is_still_accepted() {
+    assert_eq!(
+        verdict("xudo.pkg.remove", &["-y", "remove", "--", "ripgrep"]),
+        Verdict::AllowWithConfirmation
+    );
+    assert_eq!(
+        verdict(
+            "xudo.pkg.remove",
+            &["-y", "remove", "--", "build-essential"]
+        ),
+        Verdict::AllowWithConfirmation
+    );
+}
+
+#[test]
+fn install_still_accepts_dotted_names_a_known_regex_residual() {
+    // Install keeps `deb-name`, so `lib.` and `ba.h` are Allow. In apt-get a
+    // name containing `.` or `+` that is not an exact cache hit is an
+    // unanchored regular expression. On install it can fan out to many
+    // packages and cannot remove one, because the rule requires
+    // `--no-remove`. The remove rule refuses these names. See the Unreleased
+    // Security note in CHANGELOG.md: `APT::Cmd::Pattern-Only=true` would turn
+    // the expression off, and it is only a possible later defence.
+    for name in [
+        "python3.12",
+        "g++",
+        "libstdc++6",
+        "libpng16-16",
+        "lib.",
+        "ba.h",
+    ] {
+        assert_eq!(
+            verdict("xudo.pkg.install", &install_argv(&[name])),
+            Verdict::Allow,
+            "{name} was not an install"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    /// No argv `xudo.pkg.remove` accepts contains `.` or `+` in a package
+    /// position. A generated set of plain names is accepted, so the property
+    /// is not vacuously true.
+    #[test]
+    fn no_argv_accepted_by_package_removal_contains_a_dot_or_plus(
+        names in proptest::collection::vec("[a-z0-9+._-]{1,16}", 1..=10)
+    ) {
+        let mut argv = vec!["-y".to_owned(), "remove".to_owned(), "--".to_owned()];
+        argv.extend(names.iter().cloned());
+        let rules = load_all();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(borrowed),
+            Settings::default(),
+        );
+        let plain = names.iter().all(|name| {
+            !name.contains('.')
+                && !name.contains('+')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("..")
+        });
+        if plain {
+            prop_assert_ne!(
+                decision.verdict,
+                Verdict::Deny,
+                "plain names {:?} were denied",
+                names
+            );
+        }
+        if decision.verdict != Verdict::Deny {
+            prop_assert_eq!(
+                decision.action.as_ref().map(xudo_policy::ActionId::as_str),
+                Some("xudo.pkg.remove")
+            );
+            for name in argv.iter().skip(3) {
+                prop_assert!(!name.contains('.'), "package position {:?} contains '.'", name);
+                prop_assert!(!name.contains('+'), "package position {:?} contains '+'", name);
+            }
+        }
+    }
 }
 
 #[test]
@@ -409,12 +1413,6 @@ fn the_install_probe_permits_gnuid_dash_u_and_nothing_wider() {
 /// an action with no example here fails the tests that walk the ruleset.
 fn example(id: &str) -> Vec<&'static str> {
     match id {
-        "xudo.svc.lifecycle" => vec![
-            "--no-pager",
-            "--no-ask-password",
-            "restart",
-            "nginx.service",
-        ],
         "xudo.svc.status" => vec!["--no-pager", "--full", "status", "nginx.service"],
         "xudo.svc.show" => vec!["--no-pager", "show", "nginx.service"],
         "xudo.svc.logs" => vec!["--no-pager", "-u", "nginx.service"],
@@ -423,7 +1421,7 @@ fn example(id: &str) -> Vec<&'static str> {
         "xudo.dmesg" => vec!["--no-pager", "-k"],
         "xudo.probe.id" | "xudo.probe.gnuid" => vec!["-u"],
         "xudo.net.listeners" => vec!["-tulpnH"],
-        "xudo.pkg.install" => vec!["-y", "--no-install-recommends", "install", "--", "ripgrep"],
+        "xudo.pkg.install" => install_argv(&["ripgrep"]),
         "xudo.pkg.update" => vec!["update"],
         "xudo.pkg.remove" => vec!["-y", "remove", "--", "ripgrep"],
         "xudo.pkg.dry-run-install" => vec!["-s", "install", "--", "ripgrep"],

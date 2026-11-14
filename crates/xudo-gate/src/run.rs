@@ -13,26 +13,32 @@
 //!    kernel before 5.11 the call is refused and so is the gate; marking each
 //!    descriptor by hand would be another `unsafe` block, and a pre-5.11 host
 //!    is not one the beta supports.
-//! 2. **`/dev/null` for closed 0 to 2.** Before the first `open`, which would
-//!    otherwise take a closed descriptor's number and make the audit log the
-//!    gate's standard error.
-//! 3. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
+//! 2. **`/dev/null` for closed 0 to 2.** Before the umask and cwd reset, and
+//!    before any other `open`. The reset opens an `O_PATH` descriptor of `/`.
+//!    A closed standard stream would give that descriptor number 0, 1 or 2.
+//! 3. **Umask `022` and working directory `/`.** Immediately after the streams
+//!    are filled, and before anything else is opened or written. Nothing before
+//!    the reset depends on the umask or the working directory, so the reset
+//!    must not move earlier. A caller umask of `000` would make a file an apt
+//!    hook or a maintainer script creates world-writable. Either failure
+//!    refuses. The caller's resource limits stay a later change.
+//! 4. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
-//! 4. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
+//! 5. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
 //!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
-//! 5. **`/proc` verified as procfs**, on the descriptor it is read through.
-//! 6. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
+//! 6. **`/proc` verified as procfs**, on the descriptor it is read through.
+//! 7. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
 //!    by `(pid, starttime)`, bounded at [`LINEAGE_PROCESSES`] processes. The
 //!    names the walk reads are hints and go in the audit record; nothing
 //!    branches on them. What the walk yields is a set of pins, and the next
 //!    step matches an entry to one of them.
-//! 7. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
+//! 8. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
 //!    generation is [`xudo_policy::Generation::id`] of what was loaded, the
 //!    value the broker minted against.
-//! 8. **The spool and the clock.** The broker's spool, opened through the trust
+//! 9. **The spool and the clock.** The broker's spool, opened through the trust
 //!    walk and seen through [`RequestSpool`], which can list, read and consume
 //!    and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked, and the
 //!    listing is cut off one name past that, so a crowded spool is refused
@@ -42,18 +48,18 @@
 //!    more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
 //!    one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!    reading of zero is refused as no reading.
-//! 9. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
-//!    through the verified directory descriptor before anything executes, and
-//!    a failed unlink — `ENOENT` included, which means a second gate took it
-//!    first ([`xudo_sys::SpoolError::Gone`]) — is a refusal. An entry is
-//!    therefore used at most once. This is the one place the broker's own
-//!    `remove`, for which a missing name is success, must not be used.
-//! 10. **The program**, opened through the trust walk and judged and hashed on
+//! 10. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
+//!     through the verified directory descriptor before anything executes, and
+//!     a failed unlink — `ENOENT` included, which means a second gate took it
+//!     first ([`xudo_sys::SpoolError::Gone`]) — is a refusal. An entry is
+//!     therefore used at most once. This is the one place the broker's own
+//!     `remove`, for which a missing name is success, must not be used.
+//! 11. **The program**, opened through the trust walk and judged and hashed on
 //!     that descriptor. A `#!` script is refused as a script.
-//! 11. **The audit record**, through [`xudo_sys::authorize`], before the exec.
+//! 12. **The audit record**, through [`xudo_sys::authorize`], before the exec.
 //!     A gate that cannot write its record refuses, and the exec takes the
 //!     [`Authorized`] that only a written record makes.
-//! 12. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
+//! 13. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
 //!     from the canonical argv *bytes* and the environment from
 //!     [`crate::child_environment`].
 //!
@@ -74,8 +80,10 @@
 //!
 //! The gate writes its refusal to the audit trail (best effort: a refusal
 //! stands without its record) and prints one line to standard error, the
-//! stable code and severity only. Nothing from the spool, the ruleset or the
-//! environment reaches that line.
+//! stable code and severity only. When an append fails because the log is
+//! damaged, or because cutting a torn tail back itself failed, it prints one
+//! more line: move the log aside. That line is fixed. Nothing from the log,
+//! the spool, the ruleset or the environment reaches either line.
 
 use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
@@ -320,7 +328,9 @@ pub struct GateExit {
     /// The exit status: 17, 18 or 19. The gate execs in place, so a child can
     /// exit with the same numbers; the stderr refusal line tells them apart.
     pub status: i32,
-    /// One line for standard error: the code and severity, nothing else.
+    /// Standard error. The first line is the code and severity. A second line
+    /// is present only when an audit append reported a damaged log, and it is
+    /// a fixed recovery sentence with nothing from the log or the caller.
     pub message: String,
 }
 
@@ -406,6 +416,10 @@ struct Progress {
     /// Evidence beyond what the record builders add: the lineage, the name the
     /// gate ran under, the program's digest.
     evidence: Vec<String>,
+    /// Set when the authorization append reported a damaged log. The refusal
+    /// record is a second append; either one is enough to warn the operator.
+    /// The sentence is static.
+    audit_notice: Option<&'static str>,
 }
 
 /// Runs the gate.
@@ -422,20 +436,32 @@ pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
         ..Progress::default()
     };
     let Err(refusal) = proceed(host, args, &mut progress);
-    record(host, &refusal, &progress);
+    // The authorization append and the refusal append are different calls.
+    // Either one reporting damage is enough, and the sentence is the same,
+    // so the operator sees it once.
+    let notice = record(host, &refusal, &progress).or(progress.audit_notice);
+    let mut message = format!(
+        "xudo-gate: refused ({}, severity {})",
+        refusal.code(),
+        refusal.severity().label()
+    );
+    if let Some(line) = notice {
+        message.push('\n');
+        message.push_str("xudo-gate: ");
+        message.push_str(line);
+    }
     GateExit {
         status: refusal.exit_code().as_i32(),
-        message: format!(
-            "xudo-gate: refused ({}, severity {})",
-            refusal.code(),
-            refusal.severity().label()
-        ),
+        message,
     }
 }
 
 /// Writes the refusal to the audit trail, or the failure of an exec that was
 /// already authorized. Best effort: a refusal stands whether or not it lands.
-fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) {
+///
+/// Returns the fixed recovery sentence when the append says the log may be
+/// damaged. The sentence contains nothing from the error.
+fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) -> Option<&'static str> {
     let caller = progress
         .caller
         .clone()
@@ -449,7 +475,10 @@ fn record(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) {
             &progress.evidence,
         ),
     };
-    let _ = host.audit().append(&build);
+    host.audit()
+        .append(&build)
+        .err()
+        .and_then(|error| error.damaged_log_notice())
 }
 
 /// Adds evidence to a record the builders in [`crate::decide`] made.
@@ -470,7 +499,13 @@ fn proceed(
         Stage::Descriptors,
         host.syscalls().mark_cloexec_from(FIRST_INHERITED_FD),
     )?;
+    // Streams before the reset. `reset_cwd` opens an `O_PATH` descriptor of
+    // `/`, and a closed 0, 1 or 2 would give that descriptor the stream's
+    // number. Nothing before the reset depends on the umask or the working
+    // directory, so moving the reset earlier only reopens that hole.
     stage(Stage::Streams, host.hygiene().ensure_std_streams())?;
+    stage(Stage::CallerState, host.hygiene().reset_umask())?;
+    stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
     let entry = accept_invocation(args)?;
     progress
@@ -560,7 +595,16 @@ fn proceed(
             &evidence,
         )
     };
-    let authorized = stage(Stage::Audit, authorize(host.audit(), approved, &build))?;
+    let authorized = match authorize(host.audit(), approved, &build) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            progress.audit_notice = error.damaged_log_notice();
+            return Err(Refusal::Failed {
+                stage: Stage::Audit,
+                reason: error.to_string(),
+            });
+        }
+    };
     progress.authorized = Some((
         authorized.receipt().seq().get(),
         authorized.approval().clone(),
@@ -766,11 +810,12 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    use xudo_audit::TailError;
     use xudo_audit::record::Decision as AuditDecision;
     use xudo_policy::{RuleFile, load_rule_files};
     use xudo_sys::{
-        FakeAuditSink, FakeHygiene, FakePrograms, FakeSpool, FakeSyscalls, FixedClock, HygieneCall,
-        MapSource, ProgramError, SpoolCall, SysError, TrustError,
+        AuditError, FakeAuditSink, FakeHygiene, FakePrograms, FakeSpool, FakeSyscalls, FixedClock,
+        HygieneCall, MapSource, ProgramError, SpoolCall, SysError, TrustError,
     };
 
     use super::*;
@@ -1078,6 +1123,8 @@ args = [
             host.hygiene.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetUmask,
+                HygieneCall::ResetCwd,
                 HygieneCall::ForbidNewPrivileges
             ]
         );
@@ -1549,6 +1596,88 @@ args = [
             "{}",
             exit.message
         );
+        assert_eq!(exit.message.lines().count(), 1, "{}", exit.message);
+        assert!(
+            !exit.message.contains("move the log aside"),
+            "{}",
+            exit.message
+        );
+        assert!(host.audit.records().is_empty());
+    }
+
+    /// Bytes that must never reach stderr. They sit in the audit error, which
+    /// is where a damaged tail quotes the log.
+    const CALLER_BYTES: &str = "caller-bytes-9f3a";
+
+    fn damaged_tail() -> AuditError {
+        AuditError::DamagedTail {
+            path: "/var/lib/xudo/audit.jsonl".to_owned(),
+            reason: TailError::NotARecord {
+                reason: CALLER_BYTES.to_owned(),
+            },
+        }
+    }
+
+    fn cut_back_failed() -> AuditError {
+        AuditError::Io {
+            op: "repair",
+            path: format!("/tmp/{CALLER_BYTES}"),
+            reason: format!("cutting the log back failed ({CALLER_BYTES})"),
+        }
+    }
+
+    fn assert_fixed_recovery(exit: &GateExit, code: &str) {
+        assert_eq!(exit.status, 19, "{}", exit.message);
+        assert!(exit.message.contains(code), "{}", exit.message);
+        assert!(
+            exit.message
+                .contains("xudo-gate: the audit log may be damaged; move the log aside to recover"),
+            "{}",
+            exit.message
+        );
+        assert!(!exit.message.contains(CALLER_BYTES), "{}", exit.message);
+        assert_eq!(exit.message.lines().count(), 2, "{}", exit.message);
+    }
+
+    #[test]
+    fn a_damaged_log_on_the_refusal_record_prints_a_fixed_recovery_line() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_with(damaged_tail());
+        let exit = run(
+            &mut host,
+            &[OsString::from("xudo-gate-auth"), OsString::from("--help")],
+        );
+        assert_fixed_recovery(&exit, "gate_failed_invocation");
+        assert!(host.audit.records().is_empty());
+        assert_eq!(exec_calls(&host), 0);
+        assert!(consumed(&spool).is_empty());
+    }
+
+    #[test]
+    fn a_cut_back_that_fails_on_the_authorization_prints_the_same_line() {
+        // The authorization append fails and the refusal append lands. The
+        // notice still comes from the authorization, once.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_times(1, cut_back_failed());
+        let exit = run(&mut host, &auth());
+        assert_fixed_recovery(&exit, "gate_failed_audit");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(
+            denial_codes(&host),
+            vec![Some("gate_failed_audit".to_owned())]
+        );
+    }
+
+    #[test]
+    fn both_appends_failing_on_a_damaged_log_prints_the_recovery_once() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.audit = FakeAuditSink::failing_with(damaged_tail());
+        let exit = run(&mut host, &auth());
+        assert_fixed_recovery(&exit, "gate_failed_audit");
+        assert_eq!(exec_calls(&host), 0);
         assert!(host.audit.records().is_empty());
     }
 
@@ -1692,8 +1821,51 @@ args = [
         );
         assert_eq!(
             seen,
-            ["proc=false", "spool=false", "hygiene=2", "programs=0"]
+            ["proc=false", "spool=false", "hygiene=4", "programs=0"]
         );
+    }
+
+    #[test]
+    fn the_gate_resets_cwd_and_umask() {
+        // Both calls happen after the streams are filled and before anything
+        // is opened. A failure of either refuses, and the later one is not
+        // attempted when the earlier one failed.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut umask_host = FakeHost::new(&spool);
+        umask_host.hygiene =
+            FakeHygiene::new(GATE_PID).with_umask_error(SysError::unsupported("umask"));
+        let umask_exit = run(&mut umask_host, &auth());
+        assert!(
+            umask_exit.message.contains("gate_failed_caller_state"),
+            "{}",
+            umask_exit.message
+        );
+        assert_eq!(
+            umask_host.hygiene.calls(),
+            [HygieneCall::EnsureStdStreams, HygieneCall::ResetUmask]
+        );
+        assert!(!umask_host.proc_opened.get());
+        assert!(umask_host.programs.opened().is_empty());
+
+        let mut cwd_host = FakeHost::new(&spool);
+        cwd_host.hygiene = FakeHygiene::new(GATE_PID).with_cwd_error(SysError::unsupported("cwd"));
+        let cwd_exit = run(&mut cwd_host, &auth());
+        assert!(
+            cwd_exit.message.contains("gate_failed_caller_state"),
+            "{}",
+            cwd_exit.message
+        );
+        assert_eq!(
+            cwd_host.hygiene.calls(),
+            [
+                HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetUmask,
+                HygieneCall::ResetCwd
+            ]
+        );
+        assert!(!cwd_host.proc_opened.get());
+        assert!(cwd_host.programs.opened().is_empty());
+        assert_eq!(exec_calls(&cwd_host), 0);
     }
 
     #[test]

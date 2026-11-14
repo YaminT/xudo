@@ -15,6 +15,98 @@ path still requires the password. Session and terminal checks do not prove a
 human: a same-uid agent can run `script -qc 'xudo watch'`. M4's cgroup scope is
 needed to separate the agent from the human.
 
+The published `v0.1.0-beta.1` package ships `xudo.svc.lifecycle` accepting
+`systemctl` start, stop, and restart of power, reboot, rescue, kernel-module,
+filesystem-template, and broker-socket units for any caller who passes the
+password gate. The filesystem templates on the deny-list are
+`systemd-fsck@`, `systemd-growfs@`, `systemd-makefs@`, and `mdadm*@`.
+A `.mount` unit is not on that list, and `unit-name` accepts it. The
+tripwire covers the `systemctl` program only. `service`, `invoke-rc.d`,
+`busctl`, and a unit alias such as firewalld's
+`dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
+is the boundary. The shipped rule set no longer
+contains a service lifecycle rule. Copy
+`/usr/share/xudo/examples/20-services-lifecycle.toml` to
+`/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
+still ships, and accepts only a plain `.service` name. The compiled-in
+deny-list refuses those names, the systemd power and sleep services,
+`umount.target`, `final.target`, `rescue.service`, `emergency.service`,
+`debug-shell`, the runlevel aliases, firewall and time-sync units (including
+the `dbus-org.freedesktop.timesync1` alias), the journal and `syslog`
+units, `systemd-repart`, and `systemd-sysctl`, on a `systemctl` verb that
+starts, stops, signals, or
+otherwise acts, including a unit an operator listed by mistake. A read-only
+verb (`status`, `show`, and the other queries) is not refused because of
+the unit name. An option value cannot hide the verb: every token is
+checked, so `-p status stop debug-shell.service` is `stop`, not a status
+query. `poweroff`, `reboot`, `sleep`, and the other power subcommands are
+refused in any position. `start --job-mode=isolate` and a prefix such as
+`--j=isolate` are refused for every target. `status rescue` is refused,
+because `rescue` is itself a power subcommand. The acting verbs also
+include `kill`, `clean`, `freeze`, `thaw`, and the compatibility names
+`condrestart`, `force-reload`, `reload-or-try-restart`, `condreload`, and
+`condstop`. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`
+during the upgrade and you kept your version, run `xudo check`, and
+replace its `unit-name` with a `one-of` list of your units. The package
+notice says to run that check. It does not decide whether the host is
+exposed.
+
+The published `v0.1.0-beta.1` install rule accepted a package name ending in
+`-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped
+the confirmation `xudo.pkg.remove` demands and could remove a security
+package or xudo itself. `deb-name` and `apk-name` now reject a trailing `-`.
+The install rule also requires `--no-remove`: an install that would remove a
+conflicting package is refused, and the operator removes that package with
+the remove rule. A trailing `+` stays accepted by `deb-name`. `g++` and
+`libstdc++6` are real package names, and `pkg+` on `apt-get install` asks
+apt to install the package. On remove, a name containing `.` or `+` is no
+longer accepted. In apt-get a name containing either that is not an exact
+cache hit is read as an unanchored regular expression. On install that can
+select many packages and cannot remove one, because of `--no-remove`, so
+`deb-name` is unchanged there. On remove one confirmed token such as `lib.`
+could remove hundreds of packages, and `pkg+` installs. The remove rule uses
+`deb-name-literal`: the `deb-name` rules, and no `.` and no `+` anywhere. A
+package whose name contains either (`python3.12`, `g++`, `libstdc++6`) can
+no longer be removed through xudo. Remove it with the host's own tools, or
+add an operator rule that lists that name with `one-of`. The remove matcher's
+change is part of the ruleset generation, so an approval already minted
+against the previous ruleset no longer matches.
+
+The published `v0.1.0-beta.1` audit appender wrote each record with
+`write_all`. A caller who set `RLIMIT_FSIZE` to the log's size plus a few
+bytes made the first `write` return a short count and the next one raise
+`SIGXFSZ`, killing the `-auth` gate before it could cut the torn line back.
+The broker and every later gate then refused the damaged tail, so xudo stayed
+down until an operator moved the log aside. An append is now one `write` of
+the whole record. On this `RLIMIT_FSIZE` route a short count is a failure
+and the cut-back runs, denying the request and leaving the log as it was.
+`EINTR` wrote nothing, so it is tried once; a second interrupt fails the same
+way. A core-dump signal (`SIGXFSZ`, `SIGXCPU`) is not turned into a pending
+group-exit between the pages of one `write`, so it does not tear a record
+this way. A fatal signal that is not a core-dump signal (`SIGTERM`,
+`SIGHUP`, `SIGINT`) still can: the kernel marks the kill and checks for it
+between page-sized chunks, so a record that crosses a page boundary can be
+left half-written. The caller can steer that length through argv. A signal
+sudo relays, or the pty hanging up when the user kills sudo, is enough to
+deliver it. That route predates this fix. The impact is availability: xudo
+stays down until an operator moves the log aside. Blocking signals around
+the write and the cut-back is a later change. This change does not reset
+the caller's resource limits. When the gate's own append fails because the
+log is damaged or the cut-back did not land, stderr gains one fixed line
+telling the operator to move the log aside. The line has no path and no
+bytes from the log. The exit status is unchanged. The broker's refusal
+message still carries the error text.
+
+sudo-rs 0.2.5 and OpenDoas pass a caller umask of `000` through to the root
+command. Classic sudo applies `022`. Measured. A file an apt hook or a
+maintainer script creates would then be world-writable. The gate now always
+sets umask `022`, and the command starts in `/`. sudo's own rule is the
+caller's umask combined with `022`, so a caller's `077` is loosened to
+`022`. `027` would make files root writes under `/etc` and `/usr` unreadable
+to non-root daemons, and keeping sudo's combined rule would let a tight
+caller umask under sudo-rs or doas do the same to other users' services. A
+fixed `022` is deterministic and matches what classic sudo gives.
+
 ## Reporting
 
 Open a private security advisory on the GitHub repository. Please do not open a

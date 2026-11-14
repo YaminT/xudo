@@ -153,6 +153,33 @@ pub struct RulesetReport {
     pub trust: TrustReport,
     /// Whether each loaded rule matches dpkg's shipped conffile checksum.
     pub package_drift: RuleDriftReport,
+    /// Set when the rules loaded and no systemctl action accepts a lifecycle
+    /// or power verb.
+    ///
+    /// The action id is not consulted. A note, not a fault: doctor still
+    /// exits 0. Absent when the rules did not load, and when such a verb
+    /// is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_note: Option<&'static str>,
+    /// Systemctl rules that can start or stop a unit they do not name.
+    ///
+    /// A fault in the report, and `xudo check` exits 21 for the same rules.
+    /// Absent when the rules did not load or every unit matcher is a finite list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub open_unit_lints: Vec<OpenUnitLintRow>,
+}
+
+/// One systemctl rule whose unit matcher is not a finite list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OpenUnitLintRow {
+    /// The action id.
+    pub action: String,
+    /// The rule file.
+    pub file: String,
+    /// The 1-based line of the action.
+    pub line: u32,
+    /// The sentence check prints, including the id and the `file:line`.
+    pub message: String,
 }
 
 /// How a loaded rule relates to dpkg's original conffile record.
@@ -408,6 +435,25 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         load_error: loaded.err().map(ToString::to_string),
         trust,
         package_drift,
+        lifecycle_note: loaded.ok().and_then(|loaded| {
+            crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT)
+        }),
+        open_unit_lints: loaded
+            .ok()
+            .map(|loaded| {
+                loaded
+                    .rules()
+                    .open_unit_actions()
+                    .iter()
+                    .map(|lint| OpenUnitLintRow {
+                        action: lint.id.to_string(),
+                        file: lint.source.file.clone(),
+                        line: lint.source.line,
+                        message: lint.message(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -845,6 +891,12 @@ pub(crate) fn human(report: &Report) -> String {
     }
     backend_lines(&report.backend, &mut line);
     line("exec path", &report.exec_path);
+    // `line` borrows `out` until here. The helper writes before the trust row.
+    insert_ruleset_notes(
+        &mut out,
+        report.ruleset.lifecycle_note,
+        &report.ruleset.open_unit_lints,
+    );
     let _ = write!(out, "{}", paths_section(&report.paths_to_root));
     if let Some(proposals) = &report.proposals {
         let prefixed = report.backend.exe.is_some() && !report.paths_to_root.subject.is_root;
@@ -852,13 +904,36 @@ pub(crate) fn human(report: &Report) -> String {
     }
     let _ = writeln!(
         out,
-        "\nThis build performs no privileged operation. Agent detection is not a"
-    );
-    let _ = writeln!(
-        out,
-        "security boundary; the allowlist and the compiled-in deny-list are."
+        "\nThis build performs no privileged operation. Agent detection is not a\n\
+         security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+/// Puts the lifecycle note and any open-unit lints before the rules-trust row.
+///
+/// `human` cannot write them there directly: the row closure borrows the
+/// buffer until the last row. No anchor means the ruleset section was not
+/// rendered, and the lines are omitted rather than appended somewhere else.
+fn insert_ruleset_notes(out: &mut String, note: Option<&str>, lints: &[OpenUnitLintRow]) {
+    if note.is_none() && lints.is_empty() {
+        return;
+    }
+    let Some(pos) = out.find("\nrules trust") else {
+        return;
+    };
+    let mut block = String::new();
+    if let Some(note) = note {
+        block.push_str(note);
+        block.push('\n');
+    }
+    for lint in lints {
+        block.push_str(&safe(&lint.message));
+        block.push('\n');
+    }
+    // One past the newline that opens the trust row. Display layout only.
+    let at = pos.saturating_add(1);
+    out.insert_str(at, &block);
 }
 
 fn drift_label(status: RuleDriftStatus) -> &'static str {
@@ -1854,7 +1929,7 @@ mod tests {
             dir.join("10-rules.toml"),
             "[[action]]\nid = \"xudo.svc.restart\"\ntier = \"svc-control\"\n\
              exe = \"/usr/bin/systemctl\"\nargs = [\n  { name = \"verb\", matcher = { literal = \
-             \"restart\" } },\n]\n",
+             \"daemon-reload\" } },\n]\n",
         )
         .unwrap();
         LoadedRules::from_dir(&dir).unwrap()
@@ -2005,6 +2080,98 @@ mod tests {
     }
 
     #[test]
+    fn the_lifecycle_note_sits_between_the_ruleset_and_trust_rows() {
+        let mut out = "ruleset      1 action(s)\nrules trust  ok\n".to_owned();
+        insert_ruleset_notes(&mut out, Some("note line"), &[]);
+        assert_eq!(
+            out,
+            "ruleset      1 action(s)\nnote line\nrules trust  ok\n"
+        );
+        let mut untouched = out.clone();
+        insert_ruleset_notes(&mut untouched, None, &[]);
+        assert_eq!(untouched, out);
+        let mut no_anchor = "ruleset only\n".to_owned();
+        insert_ruleset_notes(&mut no_anchor, Some("note line"), &[]);
+        assert_eq!(no_anchor, "ruleset only\n");
+        let lint = OpenUnitLintRow {
+            action: "xudo.svc.lifecycle".to_owned(),
+            file: "20-services.toml".to_owned(),
+            line: 4,
+            message: "xudo.svc.lifecycle at 20-services.toml:4: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units".to_owned(),
+        };
+        let mut with_lint = "ruleset      1 action(s)\nrules trust  ok\n".to_owned();
+        insert_ruleset_notes(&mut with_lint, None, std::slice::from_ref(&lint));
+        assert!(
+            with_lint.contains("this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"),
+            "{with_lint}"
+        );
+        assert!(with_lint.contains("\nrules trust"), "{with_lint}");
+        let mut both = "ruleset      1 action(s)\nrules trust  ok\n".to_owned();
+        insert_ruleset_notes(&mut both, Some("note line"), std::slice::from_ref(&lint));
+        assert!(both.contains("note line\n"), "{both}");
+        assert!(
+            both.find("note line").unwrap() < both.find("one-of list").unwrap(),
+            "{both}"
+        );
+        let mut lint_no_anchor = "ruleset only\n".to_owned();
+        insert_ruleset_notes(&mut lint_no_anchor, None, std::slice::from_ref(&lint));
+        assert_eq!(lint_no_anchor, "ruleset only\n");
+    }
+
+    #[test]
+    fn doctor_reports_an_open_unit_matcher() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join("doctor-open-unit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("20-services.toml"),
+            "[[action]]\nid = \"xudo.svc.lifecycle\"\ntier = \"svc-control\"\n\
+             exe = \"/usr/bin/systemctl\"\nargs = [\n  { name = \"verb\", matcher = { literal = \
+             \"restart\" } },\n  { name = \"unit\", matcher = { name = \"unit-name\" } },\n]\n",
+        )
+        .unwrap();
+        let loaded = LoadedRules::from_dir(&dir).unwrap();
+        let section = ruleset(&dir, Ok(&loaded));
+        assert!(section.lifecycle_note.is_none());
+        let found = section.open_unit_lints.first().unwrap();
+        assert_eq!(found.action, "xudo.svc.lifecycle");
+        assert_eq!(found.file, "20-services.toml");
+        assert!(
+            found.message.contains(
+                "this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+            ),
+            "{}",
+            found.message
+        );
+        let report = gathered(
+            &clean_host(),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        let text = human(&report);
+        assert!(
+            text.contains(
+                "this rule can start or stop any unit: replace the unit matcher with a one-of list of your units"
+            ),
+            "{text}"
+        );
+        let json = render::json_of(&report);
+        assert!(json.contains("\"open_unit_lints\""), "{json}");
+        assert!(json.contains("xudo.svc.lifecycle"), "{json}");
+    }
+
+    #[test]
     fn the_envelope_of_a_clean_machine_is_pinned() {
         let loaded = fixture_rules("1");
         let report = gathered(
@@ -2035,6 +2202,15 @@ mod tests {
 
     #[test]
     fn the_envelope_of_a_machine_with_every_other_path_to_root_is_pinned() {
+        let hostile = hostile_report(true);
+        assert!(
+            hostile.ruleset.lifecycle_note.is_none(),
+            "a ruleset that did not load has no lifecycle note"
+        );
+        assert!(
+            !human(&hostile).contains("no service lifecycle rule:"),
+            "an unloaded ruleset must not ask for a lifecycle file"
+        );
         insta::assert_snapshot!("json_every_path", render::json_of(&hostile_report(true)));
         insta::assert_snapshot!("human_every_path", human(&hostile_report(true)));
     }

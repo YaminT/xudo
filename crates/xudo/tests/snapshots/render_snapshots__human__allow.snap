@@ -10,5 +10,5 @@ ALLOW
   trace
     canonicalized: unchanged (restart nginx.service)
     matched xudo.svc.restart at snapshot-fixture.toml:3
-    deny-list v1: no capability class matched
+    deny-list v4: no capability class matched
     confirmation not required: no confirmation requirement applies

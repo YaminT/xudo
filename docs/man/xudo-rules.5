@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-07" "xudo 0.1.0-beta.1" "File Formats"
+.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.1" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -217,10 +217,12 @@ Containment at execution is a separate check.
 .B name
 An identifier class:
 .BR deb\-name ,
+.BR deb\-name\-literal ,
 .BR rpm\-name ,
 .BR arch\-name ,
 .BR apk\-name ,
 .BR unit\-name ,
+.BR service\-unit\-name ,
 .BR hostname ,
 .BR sysctl\-key .
 Every class rejects an empty value and a value longer than 255 bytes.
@@ -233,6 +235,69 @@ or any occurrence of
 or
 .B ..
 anywhere in the value is rejected.
+.B deb\-name
+and
+.B apk\-name
+also reject a trailing
+.BR \- .
+.B apt\-get install pkg\-
+removes
+.BR pkg ,
+so that name is a removal, not an install.
+A trailing
+.B +
+is accepted by
+.BR deb\-name .
+.B g++
+and
+.B libstdc++6
+are real package names, and
+.B pkg+
+on
+.B apt\-get install
+asks apt to install
+.BR pkg .
+On install that is harmless.
+.B deb\-name\-literal
+is
+.B deb\-name
+with no
+.B .
+and no
+.B +
+anywhere.
+Only the shipped remove action uses it.
+In
+.B apt\-get
+a name containing
+.B .
+or
+.B +
+that is not an exact cache hit is read as an unanchored regular expression.
+On install it can select many packages, and it cannot remove one because the
+install action requires
+.BR \-\-no\-remove ,
+so
+.B deb\-name
+is unchanged there.
+On remove it can select many packages under a single confirmation, and a
+trailing
+.B +
+installs; the remove action now refuses both.
+A package whose name contains a dot or a plus
+.RB ( python3.12 ,
+.BR g++ ,
+.BR libstdc++6 )
+can no longer be removed through xudo.
+Remove it with the host's own tools, or add an operator rule that lists
+that name with
+.BR one\-of .
+The shipped install action requires the literal option
+.B \-\-no\-remove
+with its other options, before the verb.
+An install that would remove a conflicting package is refused.
+The operator removes that package with the remove action, which always
+asks for confirmation.
 .B unit\-name
 must end in
 .BR .service ,
@@ -241,13 +306,43 @@ must end in
 .BR .target ,
 .BR .path ,
 or
-.BR .mount .
+.BR .mount ,
+and may contain
+.B @
+and a backslash.
 A suffix-less name would match more units than it appears to, because
 .B systemctl restart foo
 resolves
 .B foo
 to
 .BR foo.service .
+The journal rules use this kind: reading any unit's log is the point.
+.B service\-unit\-name
+accepts only a name ending in
+.BR .service ,
+with no
+.B @
+and no backslash.
+.BR poweroff.target ,
+.BR modprobe@dummy.service ,
+and an escaped name are not a service restart.
+The shipped
+.B reset\-failed
+rule uses this kind.
+There is no shipped service-lifecycle rule.
+The example at
+.B /usr/share/xudo/examples/20\-services\-lifecycle.toml
+is a
+.B one\-of
+list of placeholder service names; copy it into
+.B rules.d
+and replace those names.
+The compiled-in deny-list still refuses a power or sleep unit, a runlevel
+alias,
+.BR debug\-shell ,
+a firewall or time-sync unit, and a journal unit, even when a rule lists it.
+.B unit\-name
+itself is not tightened.
 .TP
 .B pattern
 A regular expression.
@@ -299,10 +394,51 @@ It is enumerated by capability class (a shell, an interpreter, an arbitrary
 read or write, a unit-definition change, and the rest of that list), not by
 binary name.
 A copy, a hardlink, or a multicall applet does not escape a class.
+On
+.B systemctl
+the list refuses the unit on a verb that starts, stops, signals, or
+otherwise acts.
+A read-only verb
+.RB ( status ,
+.BR show ,
+and the list queries)
+is not refused because of the unit.
+The list is names: an alias or a name that is not enumerated gets past,
+and the enumeration is the boundary.
+It names a power or boot target,
+a
+.B modprobe@
+template, an fsck, growfs, makefs, or
+.B mdadm@
+template.
+A
+.B .mount
+unit is not on the list, and
+.B unit\-name
+accepts it.
+The list also names an
+.B xudod
+or
+.B xudo\-
+unit,
+.BR syslog ,
+.BR apparmor ,
+and
+.BR auditd ,
+plus
+.BR umount.target ,
+.BR final.target ,
+.BR rescue.service ,
+.BR emergency.service ,
+the timesyncd dbus alias, and
+.BR systemd\-sysctl .
+A rule that still uses
+.B unit\-name
+cannot start those names.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .
-The verb is an enumeration, and the unit must carry a suffix.
+The verb is an enumeration, and the unit is a plain service name.
 .PP
 .EX
 [[action]]
@@ -312,7 +448,7 @@ exe = "/usr/bin/systemctl"
 args = [
   { name = "no\-pager", matcher = { literal = "\-\-no\-pager" } },
   { name = "verb", matcher = { literal = "reset\-failed" } },
-  { name = "unit", matcher = { name = "unit\-name" } },
+  { name = "unit", matcher = { name = "service\-unit\-name" } },
 ]
 .EE
 .SH SEE ALSO

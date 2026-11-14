@@ -33,7 +33,7 @@ expression: "render::json(&decision)"
     },
     {
       "deny_list_evaluated": {
-        "version": 1,
+        "version": 4,
         "matched": []
       }
     },

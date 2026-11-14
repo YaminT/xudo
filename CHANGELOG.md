@@ -5,6 +5,137 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Security
+
+- v0.1.0-beta.1 accepted `systemctl` start, stop, and restart of power,
+  reboot, rescue, kernel-module, filesystem-template, and broker-socket
+  units for any caller who could pass the password gate. The filesystem
+  templates on the deny-list are `systemd-fsck@`, `systemd-growfs@`,
+  `systemd-makefs@`, and `mdadm*@`. A `.mount` unit is not on that list, and
+  `unit-name` accepts it. The tripwire is a name list: an alias or a unit
+  that is not enumerated gets past, and the enumeration is the boundary.
+  The shipped rule set no longer contains a service lifecycle rule. Copy
+  `/usr/share/xudo/examples/20-services-lifecycle.toml` to
+  `/etc/xudo/rules.d/` and list the units that host should expose.
+  `xudo check` and `xudo doctor` note the omission. The compiled-in deny-list
+  still refuses those names, plus the systemd power and sleep services,
+  `debug-shell`, runlevel aliases, firewall and time-sync units, and the
+  journal units, on a verb that starts, stops, signals, or otherwise acts,
+  including when an operator's rule names one of them. A read-only verb is
+  not refused because of the unit name.
+  If dpkg asked about `/etc/xudo/rules.d/20-services.toml` during the
+  upgrade and you kept your version, you still have the beta.1 rule: run
+  `xudo check`, and replace its `unit-name` with a `one-of` list of your
+  units. `xudo check` exits 21 for that rule, and `xudo doctor` prints the
+  same sentence. On an upgrade from a version below `0.1.0~beta.2` the
+  package says to check that file with `xudo check`. It does not decide
+  whether the host is exposed. `xudo check` and `xudo doctor` both report
+  those rows as `open_unit_lints` (`check` nests the array under `lint`).
+- `systemctl poweroff`, `reboot`, `halt`, `kexec`, `suspend`, `hibernate`,
+  `hybrid-sleep`, `suspend-then-hibernate`, `soft-reboot`, `sleep`, `rescue`,
+  `emergency`, `default`, and `exit` are refused with any arguments.
+  `isolate` is refused for every target, including `start --job-mode=isolate`,
+  the split form `--job-mode isolate`, and a getopt prefix such as
+  `--j=isolate`. `systemd-exit.service` is refused
+  with the other power services: its unit file sets `SuccessAction=exit-force`.
+  An option value cannot hide the verb: `-p`, `-M`, `--when`, `--message`,
+  and the other options that take the next argument are scanned like every
+  other token. A command is read-only only when a read-only verb is present
+  and every other non-flag token is a unit name. `status rescue` is refused,
+  because `rescue` is a power subcommand. `status rescue.service` still reads.
+- The acting verbs also include `kill`, `clean`, `freeze`, `thaw`, and the
+  compatibility names `condrestart`, `force-reload`, `reload-or-try-restart`,
+  `condreload`, and `condstop`. Stock Debian 13 and Ubuntu images used for
+  the check do not ship `systemctl`, so those names were not confirmed with
+  `--help`. A verb systemd would reject is still refused.
+- The tripwire covers the `systemctl` program only. `service`,
+  `invoke-rc.d`, `busctl`, and a unit alias such as firewalld's
+  `dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
+  is the boundary.
+- `systemd-journald` followed by `-`, `.`, or `@` is the journal for any
+  continuation. `systemd-journald-audit.socket` was not refused.
+- Read-only `systemctl` verbs (`status`, `show`, `is-active`, `is-failed`,
+  `is-enabled`, `cat`, and the `list-*` queries) are not refused just
+  because the unit is on the tripwire. Nothing changed for diagnostics:
+  `xudo.svc.status` and `xudo.svc.show` of `xudod`, the journal, chrony,
+  nftables, apparmor, and auditd still run. A verb that starts, stops, or
+  signals the unit is still refused, and a power subcommand is still refused.
+- The unit name list also refuses `umount.target`, `final.target`,
+  `rescue.service`, `emergency.service`, `syslog.socket`, the timesyncd
+  alias `dbus-org.freedesktop.timesync1.service`, `systemd-repart.service`,
+  and `systemd-sysctl.service`. Each of those exists on Debian 13, Ubuntu
+  24.04, or Ubuntu 26.04 (`systemd-repart` only on Ubuntu 24.04).
+  `systemd-sysctl` applies sysctl files at boot and uses the same class as
+  a file-driven sysctl flag. `systemd-tmpfiles-*` and `logrotate.service`
+  were left off: they run programs whose names are already refused.
+  `syslog.service`, `ntp.service`, `ntpsec.service`, `iptables.service`,
+  `systemd-mkswap@`, and `systemd-cryptsetup@` had no unit file on those
+  three images.
+- Package-manager config redirects are matched per tool. apt long options
+  are case-insensitive and a short cluster is scanned for `c` or `o`.
+  sysctl also refuses `-f` and a prefix of `--load` or `--system`. dnf
+  and yum refuse `-c` (their short form of `--config`) and a prefix of
+  `--config`, `--setopt`, `--installroot`, or `--repofrompath`. pacman
+  refuses a prefix of `--config`, `--hookdir`, `--root`, `--dbpath`, or
+  `--sysroot`, and the short options `-c`, `-r`, and `-b`. pacman's `-c`
+  is `--clean` or `--cascade`, not a config file; refusing it is harmless.
+  zypper refuses `--root` and `--plus-repo`. dpkg refuses a prefix of
+  `--status-logger` (it runs a command) and `--log`. dnf, yum, pacman, and
+  zypper were not installed on the images used for the check. This is
+  defence in depth: the shipped rules still only name apt-get, and their
+  positions are literals.
+- The install rule accepted a package name ending in `-` (`apparmor-`),
+  which `apt-get install` reads as a request to remove that package, skipping
+  the confirmation the remove rule demands. `deb-name` and `apk-name` now
+  reject a trailing `-`. The install rule also requires `--no-remove`, so an
+  install that would remove a conflicting package is refused; the operator
+  removes that package with the remove rule. A trailing `+` stays accepted
+  by `deb-name`: `g++` and `libstdc++6` are real names, and `pkg+` on
+  `apt-get install` is harmless.
+- apt-get reads a package name containing `.` or `+` that is not an exact
+  cache hit as an unanchored regular expression. On install that can select
+  many packages and cannot remove one, because the install rule requires
+  `--no-remove`, so `deb-name` is unchanged there.
+  `APT::Cmd::Pattern-Only=true` would turn that regular expression off, but
+  the deny-list refuses `-o` and apt ignores an unknown key, so it is only
+  a possible later defence in depth. On remove one confirmed
+  token such as `lib.` could remove hundreds of packages, and a trailing
+  `+` installs. The remove rule now uses `deb-name-literal` (`deb-name`, and
+  no `.` and no `+` anywhere). A package whose name contains either
+  (`python3.12`, `g++`, `libstdc++6`) can no longer be removed through xudo.
+  Remove it with the host's own tools, or add an operator rule that lists
+  that name with `one-of`. The ruleset generation changes, so an approval
+  already minted is no longer valid.
+- The audit appender wrote a record with `write_all`. A caller who set
+  `RLIMIT_FSIZE` just past the log made the first `write` return a short
+  count and the next one raise `SIGXFSZ`, which killed the gate before the
+  torn tail could be cut back. The broker and every later gate then refused
+  the damaged log. An append is now one `write`. On this `RLIMIT_FSIZE`
+  route a short count is a failure and the existing cut-back runs, so the
+  request is denied and the log stays intact. `EINTR` (which writes nothing)
+  is tried once more; a second interrupt is a failure too. This holds for
+  `RLIMIT_FSIZE` only. `SIGXFSZ` and `SIGXCPU` are core-dump signals and are
+  not delivered between the pages of one `write`, so they do not tear a
+  record. `SIGTERM`, `SIGHUP` and `SIGINT` still can, when the record crosses
+  a page boundary; the caller can steer that length through argv, and sudo
+  relaying a signal (or the pty hanging up) can deliver it. That route
+  predates this fix. xudo stays down until an operator moves the log aside.
+  Blocking signals around the write is a later change. When the gate's own
+  append fails because the log is damaged or the cut-back did not land, it
+  prints one fixed line on stderr telling the operator to move the log
+  aside. The line has no path and no bytes from the log. The exit status
+  is unchanged. The broker's refusal message still carries the error text.
+- sudo-rs 0.2.5 and OpenDoas pass a caller umask of `000` through to the
+  root command. Classic sudo applies `022`. Measured. A file an apt hook or
+  a maintainer script creates would then be world-writable. The gate now
+  always sets umask `022`, and the command starts in `/`. sudo's own rule
+  is the caller's umask combined with `022`, so a caller's `077` is now
+  loosened to `022`. `027` would make files root writes under `/etc` and
+  `/usr` unreadable to non-root daemons, and keeping sudo's combined rule
+  would let a tight caller umask under sudo-rs or doas do the same to other
+  users' services. A fixed `022` is deterministic and matches what classic
+  sudo gives.
+
 ### Added
 
 - Executable `[[test]]` tables in rule files, run by `xudo check` and by the

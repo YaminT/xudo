@@ -85,6 +85,10 @@ required-features = ["root-tests"]
 name = "root_sudo_names"
 required-features = ["root-tests"]
 
+[[test]]
+name = "root_audit_rlimit"
+required-features = ["root-tests"]
+
 [dev-dependencies]
 # The root-lane guard every `tests/root_*.rs` begins with.
 xudo-tests = { path = "../xudo-tests", version = "0.1.0-beta.1" }

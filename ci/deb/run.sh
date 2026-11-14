@@ -60,14 +60,35 @@ for binary in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/x
     fi
 done
 echo "PASS: normal_package_does_not_contain_the_short_ttl_feature"
+example="$package_root/usr/share/xudo/examples/20-services-lifecycle.toml"
+if [ ! -f "$example" ]; then
+    echo "FAIL: lifecycle example missing from /usr/share/xudo/examples" >&2
+    exit 1
+fi
+if [ -e "$package_root/etc/xudo/rules.d/20-services-lifecycle.toml" ]; then
+    echo "FAIL: lifecycle example installed into /etc/xudo/rules.d" >&2
+    exit 1
+fi
+if find "$package_root/etc/xudo/rules.d" -name '*lifecycle*' | grep -q .; then
+    echo "FAIL: a lifecycle file landed in rules.d" >&2
+    exit 1
+fi
+echo "PASS: lifecycle example is documentation, not a shipped rule"
 
-# Two packages from the same binaries: the upgrade is the next patch.
+# old.deb is stamped 0.1.0-beta.1 (Debian 0.1.0~beta.1), whatever Cargo
+# says now. postinst warns only when the previous version is below
+# 0.1.0~beta.2, so a later version bump must not skip that gate. The
+# binaries are the ones just built. new.deb is the next patch, which stays
+# newer than 0.1.0~beta.1 after that bump.
+rm -rf "$root/target/deb-old"
+old=$(VERSION=0.1.0-beta.1 "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-old")
+[ -f "$old" ] || { echo "FAIL: beta.1 package not at $old" >&2; exit 1; }
 rm -rf "$root/target/deb-upgrade"
 up=$(VERSION="${numeric%.*}.$((patch + 1))" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-upgrade")
 [ -f "$up" ] || { echo "FAIL: upgrade package not at $up" >&2; exit 1; }
 mkdir -p "$root/target/deb-mount"
 rm -f "$root"/target/deb-mount/*
-cp "$deb" "$root/target/deb-mount/old.deb"
+cp "$old" "$root/target/deb-mount/old.deb"
 cp "$up" "$root/target/deb-mount/new.deb"
 
 fail=0

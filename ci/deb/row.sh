@@ -43,6 +43,12 @@ grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted sy
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
+# /usr/share/xudo is not excluded by Ubuntu's path-exclude=/usr/share/doc/*.
+# The example must be on every image.
+example=/usr/share/xudo/examples/20-services-lifecycle.toml
+[ -f "$example" ] || fail "lifecycle example not installed"
+[ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
+printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
 matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
 [ "$matching_count" -eq "$rules_count" ] || fail "doctor did not report every shipped rule as matches shipped"
@@ -86,6 +92,8 @@ shipped=$(find /etc/sudoers.d -mindepth 1 -maxdepth 1 ! -name xudo | sort)
 
 # Upgrade keeps the rule, a group member, and an operator's edit to a shipped rule.
 echo '# mine' >>/etc/xudo/rules.d/05-probe.toml
+# The operator kept the published beta.1 file. A comment is not that file.
+cp /harness/fixtures/20-services-beta.1.toml /etc/xudo/rules.d/20-services.toml
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
@@ -97,6 +105,14 @@ printf '%s\n' 'keep non-json' >/run/xudo/confirm/preserve.txt
 mkdir /run/xudo/confirm/nested
 printf '%s\n' 'keep nested' >/run/xudo/confirm/nested/legacy.json
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml || fail "upgrade did not keep the beta.1 lifecycle rule"
+grep -Fq 'if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`' /tmp/apt.log || fail "upgrade did not say to check a kept rules file"
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 21 ] || fail "xudo check on the kept beta.1 rule exited $rc, wanted 21"
+grep -Fq 'xudo.svc.lifecycle' /tmp/check.out || fail "xudo check did not name xudo.svc.lifecycle"
 gone /run/xudo/confirm/legacy.json
 [ -L /run/xudo/confirm/link.json ] || fail "confirm cleanup removed a symlink"
 [ "$(cat /run/xudo/confirm/target-data)" = 'keep target' ] || fail "confirm cleanup changed a symlink target"

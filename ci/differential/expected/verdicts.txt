@@ -1,8 +1,8 @@
 # /usr/bin/systemctl --no-pager --no-ask-password restart nginx.service
-  "verdict": "allow",
-  "denial": null,
-  "action": "xudo.svc.lifecycle",
-exit 0
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
 
 # /usr/bin/systemctl restart nginx.service
   "verdict": "deny",
@@ -52,19 +52,31 @@ exit 17
   "action": "xudo.net.listeners",
 exit 0
 
-# /usr/bin/apt-get -y --no-install-recommends install -- curl
+# /usr/bin/apt-get -y --no-install-recommends --no-remove install -- curl
   "verdict": "allow",
   "denial": null,
   "action": "xudo.pkg.install",
 exit 0
 
-# /usr/bin/apt-get -y --no-install-recommends install -- ./evil.deb
+# /usr/bin/apt-get -y --no-install-recommends --no-remove install -- ./evil.deb
   "verdict": "deny",
   "denial": "argv_rejected",
   "action": null,
 exit 17
 
-# /usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends install -- curl
+# /usr/bin/apt-get -o DPkg::Pre-Invoke::=/bin/sh -y --no-install-recommends --no-remove install -- curl
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/apt-get -y --no-install-recommends --no-remove install -- apparmor-
+  "verdict": "deny",
+  "denial": "argv_rejected",
+  "action": null,
+exit 17
+
+# /usr/bin/apt-get -y --no-install-recommends install -- curl
   "verdict": "deny",
   "denial": "argv_rejected",
   "action": null,

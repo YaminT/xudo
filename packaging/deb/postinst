@@ -16,9 +16,15 @@ getent group xudo >/dev/null || groupadd --system xudo
 
 # The old positional confirmation rows cannot be read safely by the strict
 # parser. Discard upgrade-era runtime state so it can be recreated cleanly.
-if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt '0.1.0~beta.2' &&
-    [ -d /run/xudo/confirm ]; then
-    find -P /run/xudo/confirm -mindepth 1 -maxdepth 1 -type f -name '*.json' -delete
+# A kept beta.1 conffile may still be the operator's file. This is a notice:
+# it does not decide whether the host is exposed.
+if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt '0.1.0~beta.2'; then
+    if [ -d /run/xudo/confirm ]; then
+        find -P /run/xudo/confirm -mindepth 1 -maxdepth 1 -type f -name '*.json' -delete
+    fi
+    # The action id is not the signal: a comment can keep the string after
+    # the operator closed the rule. Say to check. Do not claim the host is exposed.
+    echo 'xudo: if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`.' >&2
 fi
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then

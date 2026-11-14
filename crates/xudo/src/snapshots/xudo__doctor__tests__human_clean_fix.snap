@@ -5,7 +5,8 @@ expression: human(&fixed)
 platform     test
 kernel       6.8 via SO_PEERPIDFD (kernel supports attestation for the planned agent path; agent path not in this build)
 rules dir    /usr/bin
-ruleset      1 action(s), 1 file(s), generation 123774c29919
+ruleset      1 action(s), 1 file(s), generation 064981249e9f
+no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units
 rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
 rule package /usr/bin/rule-0.toml: unknown
 rule package unknown: test fixture has no dpkg record
