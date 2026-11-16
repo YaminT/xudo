@@ -6,10 +6,12 @@ xudo is a Linux privilege broker. It checks commands against root-owned rules an
 
 ## Install
 
-No release has been published yet. When one is available, download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the GitHub Release, then verify both the checksum and the exact GitHub Actions identity before installing. Replace `<ver>` with the Debian version, `<arch>` with `amd64` or `arm64`, and `<tag>` with the Git tag; for example, `<ver>` `0.1.0~beta.1` corresponds to `<tag>` `v0.1.0-beta.1`:
+v0.1.0-beta.2 is a pre-release. Download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the GitHub Release, then verify both the checksum and the exact GitHub Actions identity before installing. Replace `<ver>` with the Debian version, `<arch>` with `amd64` or `arm64`, and `<tag>` with the Git tag; for example, `<ver>` `0.1.0~beta.1` corresponds to `<tag>` `v0.1.0-beta.1`:
+
+GitHub shows the `~` in the Debian version as `.` on the Release page, so the file you download is named with a `.`. Verify the checksum with `sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing`.
 
 ```sh
-sha256sum -c SHA256SUMS --ignore-missing
+sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing
 cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_<ver>_<arch>.deb
 sudo apt install ./xudo_<ver>_<arch>.deb
 ```
@@ -25,6 +27,10 @@ The four binaries also embed that dependency list (`cargo-auditable`). Read it f
 xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 
 The broker requires systemd and journald. Without them every privileged request is refused; `systemd` is recommended by the package and may be omitted by explicitly installing without recommendations.
+
+## Supported platforms
+
+Debian 13, Ubuntu 24.04 LTS and Ubuntu 26.04 LTS, on amd64 and arm64. Other releases and distributions are not supported for now. The agent path needs Linux 6.5 or later; it is not yet shipped (M4).
 
 ## Example
 

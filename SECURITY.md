@@ -65,7 +65,8 @@ exposed.
 
 The published `v0.1.0-beta.1` install rule accepted a package name ending in
 `-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped
-the confirmation `xudo.pkg.remove` demands and could remove a security
+the confirmation `xudo.pkg.remove` demands when `confirm_human_path` is on
+and could remove a security
 package or xudo itself. `deb-name` and `apk-name` now reject a trailing `-`.
 The install rule also requires `--no-remove`: an install that would remove a
 conflicting package is refused, and the operator removes that package with
@@ -83,6 +84,18 @@ no longer be removed through xudo. Remove it with the host's own tools, or
 add an operator rule that lists that name with `one-of`. The remove matcher's
 change is part of the ruleset generation, so an approval already minted
 against the previous ruleset no longer matches.
+
+With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
+`confirm = "always"` is satisfied by the password alone. A member of the
+`xudo` group who passes the password can remove packages through it,
+including xudo, sudo, apparmor, auditd, nftables, ufw and rsyslog. That was
+already true in `v0.1.0-beta.1` and is not changed here. A package-name
+tripwire for those is a later change.
+
+The shipped `xudo.time.set-ntp` rule accepts `timedatectl set-ntp false`,
+which has the same effect as stopping the time-sync unit. The tripwire
+refuses that stop for operator rules; it does not apply to this shipped
+action.
 
 The published `v0.1.0-beta.1` audit appender wrote each record with
 `write_all`. A caller who set `RLIMIT_FSIZE` to the log's size plus a few

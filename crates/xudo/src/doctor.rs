@@ -913,15 +913,13 @@ pub(crate) fn human(report: &Report) -> String {
 /// Puts the lifecycle note and any open-unit lints before the rules-trust row.
 ///
 /// `human` cannot write them there directly: the row closure borrows the
-/// buffer until the last row. No anchor means the ruleset section was not
-/// rendered, and the lines are omitted rather than appended somewhere else.
+/// buffer until the last row. With no anchor the lines are appended at the end
+/// of what is rendered so far: a lint must never be dropped silently.
 fn insert_ruleset_notes(out: &mut String, note: Option<&str>, lints: &[OpenUnitLintRow]) {
     if note.is_none() && lints.is_empty() {
         return;
     }
-    let Some(pos) = out.find("\nrules trust") else {
-        return;
-    };
+    let pos = out.find("\nrules trust");
     let mut block = String::new();
     if let Some(note) = note {
         block.push_str(note);
@@ -931,6 +929,13 @@ fn insert_ruleset_notes(out: &mut String, note: Option<&str>, lints: &[OpenUnitL
         block.push_str(&safe(&lint.message));
         block.push('\n');
     }
+    let Some(pos) = pos else {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        return;
+    };
     // One past the newline that opens the trust row. Display layout only.
     let at = pos.saturating_add(1);
     out.insert_str(at, &block);
@@ -2092,7 +2097,10 @@ mod tests {
         assert_eq!(untouched, out);
         let mut no_anchor = "ruleset only\n".to_owned();
         insert_ruleset_notes(&mut no_anchor, Some("note line"), &[]);
-        assert_eq!(no_anchor, "ruleset only\n");
+        assert_eq!(no_anchor, "ruleset only\nnote line\n");
+        let mut unterminated = "ruleset only".to_owned();
+        insert_ruleset_notes(&mut unterminated, Some("note line"), &[]);
+        assert_eq!(unterminated, "ruleset only\nnote line\n");
         let lint = OpenUnitLintRow {
             action: "xudo.svc.lifecycle".to_owned(),
             file: "20-services.toml".to_owned(),
@@ -2115,7 +2123,11 @@ mod tests {
         );
         let mut lint_no_anchor = "ruleset only\n".to_owned();
         insert_ruleset_notes(&mut lint_no_anchor, None, std::slice::from_ref(&lint));
-        assert_eq!(lint_no_anchor, "ruleset only\n");
+        assert!(
+            lint_no_anchor.starts_with("ruleset only\n"),
+            "{lint_no_anchor}"
+        );
+        assert!(lint_no_anchor.contains("one-of list"), "{lint_no_anchor}");
     }
 
     #[test]
