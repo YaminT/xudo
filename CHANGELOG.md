@@ -5,6 +5,8 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+## 0.1.0-beta.2 - 2026-11-16
+
 ### Security
 
 - v0.1.0-beta.1 accepted `systemctl` start, stop, and restart of power,
@@ -95,7 +97,7 @@ All notable changes to xudo are documented here. This project follows
   positions are literals.
 - The install rule accepted a package name ending in `-` (`apparmor-`),
   which `apt-get install` reads as a request to remove that package, skipping
-  the confirmation the remove rule demands. `deb-name` and `apk-name` now
+  the confirmation the remove rule demands when `confirm_human_path` is on. `deb-name` and `apk-name` now
   reject a trailing `-`. The install rule also requires `--no-remove`, so an
   install that would remove a conflicting package is refused; the operator
   removes that package with the remove rule. A trailing `+` stays accepted
@@ -144,6 +146,14 @@ All notable changes to xudo are documented here. This project follows
   would let a tight caller umask under sudo-rs or doas do the same to other
   users' services. A fixed `022` is deterministic and matches what classic
   sudo gives.
+- In the default configuration (`confirm_human_path` off),
+  `xudo.pkg.remove`'s `confirm = "always"` is satisfied by the password
+  alone. A member of the `xudo` group who passes the password can remove
+  packages through it, including xudo, sudo, apparmor, auditd, nftables, ufw
+  and rsyslog. This was already true in beta.1 and is not changed here; a
+  package-name tripwire for those is a later change.
+- The shipped `timedatectl set-ntp false` has the same effect as stopping
+  the time-sync unit, which the tripwire refuses for operator rules.
 
 ### Added
 
@@ -156,6 +166,19 @@ All notable changes to xudo are documented here. This project follows
 
 ### Changed
 
+- **Breaking:** the shipped argv and rules changed. The service-lifecycle
+  rule no longer ships: copy `/usr/share/xudo/examples/20-services-lifecycle.toml`
+  to `/etc/xudo/rules.d/` and list your units. `xudo.pkg.install` now
+  requires `--no-remove` before the verb, and the old argv is denied.
+  `xudo.pkg.remove` refuses names containing `.` or `+`. `reset-failed` takes
+  only a plain `.service` and is refused for the tripwire units (journald,
+  apparmor, chrony and others). The gate now starts the root command with
+  umask 022 and cwd `/`. Re-run `xudo agentdoc`, and drop queued `ido`
+  entries that use the old argv.
+- A kept or edited beta.1 `/etc/xudo/rules.d/30-packages.toml` still has the
+  old rule text. The compiled-in refusal of a trailing `-` applies to it, but
+  `--no-remove` and the literal-name rule do not, and no lint catches it.
+  Compare it with the new file (`xudo doctor` shows it as changed locally).
 - **Breaking:** `xudo check` exit codes. Overlapping actions now exit 20 (was
   0), the shell-allowlist lint exits 21 (was 17), and a failing rule test exits
   22. A failing test ranks above a lint error when one run finds both.

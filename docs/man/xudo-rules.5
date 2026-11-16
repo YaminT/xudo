@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.1" "File Formats"
+.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.2" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -296,8 +296,11 @@ The shipped install action requires the literal option
 .B \-\-no\-remove
 with its other options, before the verb.
 An install that would remove a conflicting package is refused.
-The operator removes that package with the remove action, which always
-asks for confirmation.
+The operator removes that package with the remove action, which asks for
+confirmation when
+.B confirm_human_path
+is on.
+With it off, the default, the password alone satisfies that confirmation.
 .B unit\-name
 must end in
 .BR .service ,
@@ -409,7 +412,7 @@ It names a power or boot target,
 a
 .B modprobe@
 template, an fsck, growfs, makefs, or
-.B mdadm@
+.B mdadm*@
 template.
 A
 .B .mount
