@@ -76,5 +76,5 @@ cd /work
 if [ "$#" -eq 0 ]; then
     run cargo test -p xudod -p xudo-gate
 fi
-run cargo test --workspace --all-features "$@"
+run cargo test --workspace --all-features "$@" -- --nocapture
 INNER
