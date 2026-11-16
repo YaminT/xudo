@@ -31,11 +31,13 @@ use crate::layer::{Layer, Origin, Tracked};
 pub enum Setting {
     /// Whether an enrolled agent's actions are confirmed by a human.
     ///
-    /// Defaults to `true`, and there is deliberately no global off switch:
-    /// narrowing the confirmation requirement takes a root-authored `trust.d`
-    /// record plus a per-invocation flag, both enforced by the broker.
+    /// Defaults to `true`. It has no effect in this release (no caller is a
+    /// verified harness), and the design replaces it: root's rules alone
+    /// decide what a verified harness runs. Removed with the agent path.
     ConfirmAgentActions,
-    /// Require an out-of-band human watch approval on the human path.
+    /// Optional extra check on the human path, off by default: a rule that
+    /// requires confirmation also needs an approval in `xudo watch`. Never
+    /// part of the agent path.
     ConfirmHumanPath,
     /// How long a pending confirmation waits before it is denied.
     ConfirmationTimeoutSecs,
@@ -218,8 +220,8 @@ pub struct Settings {
 impl Default for Settings {
     /// The built-in defaults.
     ///
-    /// `confirm_agent_actions` starts `true`. That is the project's headline
-    /// promise, so it is the default rather than something an installer sets.
+    /// `confirm_agent_actions` starts `true`, the fail-closed value for a setting
+    /// the design removes (see [`Setting::ConfirmAgentActions`]).
     fn default() -> Self {
         let mut values = BTreeMap::new();
         values.insert(

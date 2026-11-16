@@ -27,7 +27,7 @@
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
 //! 5. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
-//!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
+//!    `xudo-gate-nopass` is not shipped yet, so any other name is refused.
 //! 6. **`/proc` verified as procfs**, on the descriptor it is read through.
 //! 7. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
@@ -362,7 +362,7 @@ impl Entry {
 ///
 /// The name is the last `/`-separated segment of `argv[0]`, compared as bytes
 /// and exactly: no normalisation, so `xudo-gate-auth/` and `xudo-gate-auth/.`
-/// are not it. `xudo-gate-nopass` is refused with the rest until M4 ships it.
+/// are not it. `xudo-gate-nopass` is refused with the rest until it ships.
 fn accept_invocation(args: &[OsString]) -> Result<Entry, Refusal> {
     let refuse = |reason: String| Refusal::Failed {
         stage: Stage::Invocation,

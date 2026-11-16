@@ -1,4 +1,4 @@
-//! Public docs must describe the shipped M3 confirmation and telemetry check.
+//! Public docs must describe what ships, and no permanent claim of the old approval model.
 
 #![allow(clippy::unwrap_used)]
 
@@ -232,4 +232,107 @@ fn stale_probe_claims_fail_the_old_readme_and_allow_current_wording() {
     ));
     assert_eq!(flatten_claim(""), "");
     assert_eq!(flatten_claim("GNU"), "gnu");
+}
+
+/// Words that make a password claim a statement about the current release.
+const RELEASE_QUALIFIERS: [&str; 6] = [
+    "beta",
+    "this release",
+    "today",
+    "currently",
+    "this build",
+    "for now",
+];
+
+/// Phrases of the approval model the owner replaced on 2026-11-16: the agent
+/// path is not confirmed live, and invariant 2 is no longer "never broader".
+const REPLACED_MODEL: [&str; 6] = [
+    "never broader than the human path",
+    "passwordless but confirmed",
+    "confirmation always",
+    "always confirmed",
+    "a human approves every",
+    "confirmation lives outside",
+];
+
+/// A sentence that states the old model, or says every request asks for a
+/// password as a permanent property instead of as this release's status.
+fn stale_approval_claim(text: &str) -> bool {
+    flatten_claim(text)
+        .split(['.', '!', '?', ';'])
+        .any(|sentence| {
+            let every_request_password = [
+                "every request",
+                "every privileged request",
+                "every invocation",
+                "always prompt",
+                "always asks",
+            ]
+            .iter()
+            .any(|phrase| sentence.contains(phrase))
+                && sentence.contains("password");
+            REPLACED_MODEL
+                .iter()
+                .any(|phrase| sentence.contains(phrase))
+                || (every_request_password
+                    && !RELEASE_QUALIFIERS
+                        .iter()
+                        .any(|qualifier| sentence.contains(qualifier)))
+        })
+}
+
+#[test]
+fn public_docs_do_not_state_the_replaced_approval_model() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // CHANGELOG.md is excluded: shipped sections are history and say
+    // "Every request uses the human password path" about their own release.
+    let mut files = vec![
+        "README.md".to_owned(),
+        "SECURITY.md".to_owned(),
+        "howiwork.md".to_owned(),
+        "packaging/deb/first-install-notice".to_owned(),
+        "docs/man/xudo.1".to_owned(),
+        "docs/man/xudo-rules.5".to_owned(),
+        "docs/man/ido.1".to_owned(),
+        "docs/man/ido-queue.5".to_owned(),
+    ];
+    markdown_and_html_files(&root.join("site"), &mut files);
+    let stale: Vec<_> = files
+        .iter()
+        .filter(|file| stale_approval_claim(&fs::read_to_string(root.join(file)).unwrap()))
+        .cloned()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "replaced approval model stated in: {stale:?}"
+    );
+}
+
+#[test]
+fn the_approval_check_catches_permanent_claims_and_allows_the_beta_status() {
+    assert!(stale_approval_claim("Every request asks for a password."));
+    assert!(stale_approval_claim(
+        "A human is always prompted for a password."
+    ));
+    assert!(stale_approval_claim(
+        "The agent path is never broader than the human path in authentication."
+    ));
+    assert!(stale_approval_claim(
+        "An enrolled agent is passwordless but confirmed."
+    ));
+    assert!(stale_approval_claim(
+        "Confirmation lives outside the requester's process tree."
+    ));
+    assert!(!stale_approval_claim(
+        "In this release every privileged request asks for a password."
+    ));
+    assert!(!stale_approval_claim(
+        "This beta always prompts for a password."
+    ));
+    assert!(!stale_approval_claim(
+        "Today's beta builds the password half only: every request, from anyone, asks for a password."
+    ));
+    assert!(!stale_approval_claim(
+        "A command runs without a password only for a verified harness."
+    ));
 }

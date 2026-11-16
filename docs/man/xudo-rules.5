@@ -97,11 +97,20 @@ Two positions in one action may not share a name.
 .B confirm
 When a human must approve.
 .B default
-(the default) follows
-.BR confirm_agent_actions ,
-which starts true, so an enrolled agent is confirmed.
+(the default) asks a person only when the action is
+.B critical
+or an overlapping action demands it.
 .B always
-confirms for every caller.
+asks a person for every caller.
+On the human path the password is that answer, plus an approval in
+.B xudo watch
+when
+.B confirm_human_path
+is on.
+In the design a verified harness never waits for a live approval: a command
+that needs a person goes to the
+.B ido
+queue.
 .B never
 asks for no confirmation from this action.
 It is not a grant against a stricter overlapping action, and a

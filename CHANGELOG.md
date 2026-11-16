@@ -21,6 +21,15 @@ All notable changes to xudo are documented here. This project follows
   `path-under` matcher and exits 20. A rule that allowlists one of these
   tools is a lint error, as with any other deny-listed executable.
 
+### Changed
+
+- The agent design changed; nothing in the package behaves differently.
+  Root's rules alone decide what a verified agent harness may run: allowed
+  (runs as root without a password), denied, or needs a person (waits in the
+  `ido` queue). No agent request waits for a live approval. `xudo watch`
+  stays as an optional extra check for people, off by default. In this
+  release every privileged request still asks for a password.
+
 ## 0.1.0-beta.2 - 2026-11-16
 
 ### Security

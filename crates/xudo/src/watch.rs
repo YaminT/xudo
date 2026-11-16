@@ -1,4 +1,8 @@
 //! The out-of-band confirmation terminal.
+//!
+//! This is the optional extra check on the human path (`confirm_human_path`,
+//! off by default). In the design no agent request waits for it: root's rules
+//! alone decide what a verified harness may run.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};

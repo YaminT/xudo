@@ -120,7 +120,11 @@ impl Request {
 pub struct Settings {
     /// Whether an enrolled agent's actions are confirmed by a human.
     ///
-    /// Defaults to `true` via [`Settings::default`].
+    /// Defaults to `true` via [`Settings::default`]. Read only for an attested
+    /// agent, and no caller is one in this release. The design lets root's
+    /// rules alone decide what a verified harness runs, with no live approval,
+    /// so this setting goes when the agent path is built; until then `true`
+    /// is the fail-closed value.
     pub confirm_agent_actions: bool,
     /// Whether human-path confirmation rules also require a watch approval.
     pub confirm_human_path: bool,
