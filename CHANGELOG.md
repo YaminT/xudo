@@ -5,6 +5,22 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Security
+
+- `path-under` is lexical only. Nothing in xudo enforces containment for
+  argument paths. Never use it for a program that opens the path as root.
+  A rule that allowlists `rm` of a home directory accepts a path the agent
+  planted as a symlink and deletes whatever that symlink points at. The
+  compiled-in deny-list now refuses that class of tool
+  (`ChangesPathMetadataOrExistence`, deny-list version 6): `rm`, `rmdir`,
+  `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
+  `touch`, `mkdir`, `mkfifo`, `rename`, and `prename`, including a copy or
+  hardlink that keeps the name and a `busybox` applet. `mknod` joins
+  `DeviceOrFilesystem`. `setcap` was already `PrivilegeTool`. `mount` and
+  `umount` are not named on the list. `xudo check` warns on every
+  `path-under` matcher and exits 20. A rule that allowlists one of these
+  tools is a lint error, as with any other deny-listed executable.
+
 ## 0.1.0-beta.2 - 2026-11-16
 
 ### Security

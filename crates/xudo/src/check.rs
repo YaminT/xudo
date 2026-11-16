@@ -6,6 +6,9 @@
 //! One run that finds several prints every one and exits with the most severe,
 //! which is the largest of the three numbers.
 //!
+//! A `path-under` matcher is a lint warning on every use. The match is lexical
+//! only, and nothing in xudo enforces containment for an argument path.
+//!
 //! The tests are decided by [`xudo_policy::run_tests`], which asks the engine
 //! `xudo explain` asks, for an unattested human and the default settings, so
 //! the answer does not depend on the machine or its configuration.
@@ -15,7 +18,8 @@ use std::io::Write;
 use serde_json::{Map, Value, json};
 use term_sanitize::{Clean, Limits};
 use xudo_policy::{
-    CallerFacts, Classification, DenialCode, ExitCode, TestError, TestOutcome, TestResult,
+    CallerFacts, Classification, DenialCode, ExitCode, Matcher, RuleSet, TestError, TestOutcome,
+    TestResult,
     engine::Settings,
     fuzz_check::{Finding, FindingKind, FuzzConfig, FuzzReport, fuzz},
     run_tests,
@@ -49,6 +53,8 @@ struct Report {
     open_units: Vec<OpenUnit>,
     /// One rendered overlap each.
     warnings: Vec<String>,
+    /// One line per `path-under` matcher. Also a lint warning.
+    path_under: Vec<String>,
     results: Vec<TestResult>,
     /// What the fuzz found, when it ran.
     fuzz: Option<FuzzReport>,
@@ -70,7 +76,8 @@ impl Report {
                 || !self.open_units.is_empty()
                 || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
             .then_some(ExitCode::LintError),
-            (!self.warnings.is_empty()).then_some(ExitCode::LintWarning),
+            (!self.warnings.is_empty() || !self.path_under.is_empty())
+                .then_some(ExitCode::LintWarning),
         ]
         .into_iter()
         .flatten()
@@ -100,8 +107,8 @@ pub(crate) fn run(
     } else {
         loaded.rules().overlaps()
     };
-    let (errors, open_units, warnings) = if tests_only {
-        (Vec::new(), Vec::new(), Vec::new())
+    let (errors, open_units, warnings, path_under) = if tests_only {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     } else {
         (
             loaded
@@ -127,6 +134,7 @@ pub(crate) fn run(
                 })
                 .collect(),
             overlaps.iter().map(ToString::to_string).collect(),
+            path_under_warnings(loaded.rules()),
         )
     };
     let human = CallerFacts::new(Classification::Human, 1000);
@@ -134,6 +142,7 @@ pub(crate) fn run(
         errors,
         open_units,
         warnings,
+        path_under,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
@@ -193,6 +202,9 @@ fn human_report(
         // action accepts to the strictest of them, so an overlap is not a hole.
         // It is still two rules whose interaction nobody wrote down, and the
         // report never stays silent about a pair it cannot decide.
+        for warning in &report.path_under {
+            let _ = writeln!(out, "{}", safe(warning));
+        }
         for warning in &report.warnings {
             let _ = writeln!(out, "{}", safe(warning));
         }
@@ -348,7 +360,12 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
                 .collect::<Vec<_>>()
         ),
     );
-    lint.insert("warnings".to_owned(), json!(report.warnings));
+    let warning_lines: Vec<&String> = report
+        .warnings
+        .iter()
+        .chain(report.path_under.iter())
+        .collect();
+    lint.insert("warnings".to_owned(), json!(warning_lines));
     // Absent when nothing matched, so a run with no such rule stays byte for
     // byte what it was.
     if !report.open_units.is_empty() {
@@ -428,6 +445,28 @@ fn result_json(result: &TestResult) -> Value {
             .map(|(key, value)| (key.to_owned(), value))
             .collect(),
     )
+}
+
+/// One warning per `path-under` matcher.
+///
+/// The sentence is the whole warning: the match is lexical only, nothing in
+/// xudo enforces containment for argument paths, and it must not be used for
+/// a program that opens the path as root.
+fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for action in rules.actions() {
+        for (index, spec) in action.args.iter().enumerate() {
+            if let Matcher::PathUnder { .. } = spec.matcher {
+                warnings.push(format!(
+                    "path-under: {} at {}: argument {index} ({}) is lexical only; nothing in \
+                     xudo enforces containment for argument paths; never use it for a program \
+                     that opens the path as root",
+                    action.id, action.source, spec.name
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// Text from a rule file, made safe for a terminal and flagged when anything
@@ -516,6 +555,7 @@ mod tests {
             errors: Vec::new(),
             open_units: Vec::new(),
             warnings: Vec::new(),
+            path_under: Vec::new(),
             results: Vec::new(),
             fuzz: Some(report()),
         };

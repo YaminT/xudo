@@ -17,10 +17,10 @@
 //!
 //! # What this crate deliberately cannot do
 //!
-//! * It cannot resolve a path. [`Matcher::PathUnder`] is a *syntactic*
-//!   pre-filter only; symlink-resistant resolution via `openat2` is enforced in
-//!   `xudo-sys`, and a decision from this crate is never sufficient authority
-//!   to open a file.
+//! * It cannot resolve a path. [`Matcher::PathUnder`] is lexical only.
+//!   Nothing in xudo enforces containment for argument paths. Never use it
+//!   for a program that opens the path as root. A decision from this crate
+//!   is never sufficient authority to open a file.
 //! * It cannot classify a caller. It consumes a [`Classification`] that the
 //!   root broker derived from kernel-attested facts.
 //! * It cannot be widened by configuration. The deny-list is compiled in.

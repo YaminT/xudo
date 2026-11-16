@@ -2963,6 +2963,36 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         assert!(err.is_empty(), "{err}");
     }
 
+    /// The library test binary has its own copy of `xudo check`. Coverage counts
+    /// that copy on its own, so the path-under warning has to run here and not
+    /// only in the integration test.
+    #[test]
+    fn check_warns_when_path_under_is_only_lexical() {
+        let fx = Fixture::new("cli-check-path-under").write(
+            "10-rules.toml",
+            "[[action]]\nid = \"xudo.files.copy-names\"\ntier = \"diag-read\"\n\
+             exe = \"/usr/bin/true\"\nargs = [\n  \
+             { name = \"flags\", matcher = { literal = \"-n\" }, repeat = \"optional\" },\n  \
+             { name = \"path\", matcher = { path-under = { prefix = \"/home/agent\" } } },\n]\n",
+        );
+        let (code, out, err) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::LintWarning, "{out}{err}");
+        assert!(out.contains("is lexical only"), "{out}");
+        assert!(out.contains("argument 1 (path)"), "{out}");
+        assert!(
+            out.contains("never use it for a program that opens the path as root"),
+            "{out}"
+        );
+        assert!(err.is_empty(), "{err}");
+        let (code, json, err) = fx.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::LintWarning, "{json}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["exit_code"], 20);
+        let warnings = parsed["lint"]["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{json}");
+        assert!(warnings[0].as_str().unwrap().contains("is lexical only"));
+    }
+
     #[test]
     fn check_rejects_an_open_unit_matcher() {
         let (code, out, err) = fixture("cli-check-open-unit").run(&["check"]);
