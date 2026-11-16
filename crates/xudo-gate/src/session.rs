@@ -88,6 +88,9 @@ fn valid_label(label: &str) -> bool {
 
 /// Adapter used by xudo-sys without making the privileged syscall crate depend
 /// on this higher-level pure parser.
+///
+/// `boot_id` and `now_boottime_ms` must be the caller's own reads of the boot
+/// id and `CLOCK_BOOTTIME`; `xudo_sys::scope_status` trusts the two booleans.
 pub fn record_identity(
     bytes: &[u8],
     name: &str,

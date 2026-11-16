@@ -68,7 +68,14 @@ pub struct ScopeFacts {
     pub populated: bool,
     /// Committed-record contents; absent means no authority.
     pub record: Option<Vec<u8>>,
-    /// Number and start-time pin of processes in the scope.
+    /// Record owner uid, from `fstat` on the descriptor that was read.
+    pub record_owner: u32,
+    /// Record mode bits, file type included.
+    pub record_mode: u32,
+    /// Record hard-link count.
+    pub record_nlink: u64,
+    /// Number and start-time pin of processes in the scope. Filled only when
+    /// the caller asked for it (watch scopes).
     pub processes: Vec<(u32, u64)>,
 }
 
@@ -79,9 +86,11 @@ pub struct RecordIdentity {
     pub kind: ScopeKind,
     /// Record owner uid.
     pub uid: u32,
-    /// Whether the record boot id equals this boot.
+    /// Whether the record boot id equals this boot. The parser behind
+    /// [`scope_status`] must be built from `xudo_gate::record_identity`, fed
+    /// the caller's own boot id and clock, never values the record supplied.
     pub current_boot: bool,
-    /// Whether its deadline is still in the future.
+    /// Whether its deadline is still in the future (same rule as above).
     pub live: bool,
     /// Adopted pid and starttime.
     pub process: (u32, u64),
@@ -133,12 +142,21 @@ pub trait CgroupCalls {
     /// Returns an error if the liveness poll fails.
     fn peer_alive(&self, pidfd: BorrowedFd<'_>) -> Result<bool, SysError>;
     /// Inspects `xudo.slice/<name>` and its cgroup files using pinned dirfds.
+    /// The scope directory's inode is compared with `id` first: any other
+    /// scope returns `None` before a file of it is read, so one user's
+    /// unreadable or exiting scope cannot fail another user's check.
+    /// `with_processes` asks for the process list (watch scopes only).
     ///
     /// # Errors
     ///
     /// Returns an error if descriptor resolution or a required file read
     /// fails.
-    fn scope_facts(&self, name: &str) -> Result<Option<ScopeFacts>, SysError>;
+    fn scope_facts(
+        &self,
+        name: &str,
+        id: u64,
+        with_processes: bool,
+    ) -> Result<Option<ScopeFacts>, SysError>;
     /// Lists candidate names from the pinned session-record directory.
     ///
     /// # Errors
@@ -189,8 +207,13 @@ impl CgroupCalls for HostCgroup {
     fn peer_alive(&self, pidfd: BorrowedFd<'_>) -> Result<bool, SysError> {
         imp::peer_alive(pidfd)
     }
-    fn scope_facts(&self, name: &str) -> Result<Option<ScopeFacts>, SysError> {
-        imp::scope_facts(self, name)
+    fn scope_facts(
+        &self,
+        name: &str,
+        id: u64,
+        with_processes: bool,
+    ) -> Result<Option<ScopeFacts>, SysError> {
+        imp::scope_facts(self, name, id, with_processes)
     }
     fn scope_names(&self) -> Result<Vec<String>, SysError> {
         imp::scope_names(self)
@@ -200,12 +223,11 @@ impl CgroupCalls for HostCgroup {
 #[cfg(target_os = "linux")]
 mod imp {
     use std::io::Read;
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::os::fd::{AsFd, OwnedFd};
 
     use rustix::fs::{
-        Mode, OFlags, ResolveFlags, fstat, fstatfs, open as open_path, openat, openat2,
+        Dir, FileType, Mode, OFlags, ResolveFlags, fstat, fstatfs, open as open_path, openat,
+        openat2,
     };
 
     use super::{HostCgroup, ScopeFacts, is_record_name};
@@ -264,9 +286,11 @@ mod imp {
     }
 
     fn check_cgroup2_fd(fd: std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> {
-        let magic = fstatfs(fd)
-            .map(|stat| i128::from(stat.f_type))
-            .unwrap_or_default();
+        cgroup2_from(fstatfs(fd).map(|stat| i128::from(stat.f_type)))
+    }
+
+    pub(super) fn cgroup2_from(magic: Result<i128, rustix::io::Errno>) -> Result<(), SysError> {
+        let magic = rustix_result(magic, "fstatfs cgroup root")?;
         if magic == CGROUP2_MAGIC {
             Ok(())
         } else {
@@ -300,17 +324,26 @@ mod imp {
         .union(OFlags::CLOEXEC);
     const FILE_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::CLOEXEC)
-        .union(OFlags::NOFOLLOW);
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::NONBLOCK);
     const READ_LIMIT: u64 = 1024 * 1024;
 
     // Tests fail the n-th fallible step of a host walk in turn, so every
     // early return is reached without a kernel that misbehaves on demand.
-    // Nothing outside this module's tests ever sets it, so it stays inert.
+    // The hook exists only in test builds; elsewhere `inject` is a no-op.
+    #[cfg(test)]
     thread_local! {
         pub(super) static FAIL_AT: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
     }
 
+    #[cfg(not(test))]
+    #[allow(clippy::unnecessary_wraps, reason = "same shape as the test hook")]
+    fn inject(_: &'static str) -> Result<(), SysError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn inject(operation: &'static str) -> Result<(), SysError> {
         FAIL_AT.with(|cell| match cell.get() {
             Some(0) => {
@@ -354,11 +387,18 @@ mod imp {
         rustix_result(openat(dir, name, FILE_FLAGS, Mode::empty()), operation)
     }
 
-    fn is_missing(error: &SysError) -> bool {
-        error.os_code() == Some(rustix::io::Errno::NOENT.raw_os_error())
+    pub(super) fn is_missing(error: &SysError) -> bool {
+        // ESRCH: a /proc entry whose process was reaped since it was listed.
+        [rustix::io::Errno::NOENT, rustix::io::Errno::SRCH]
+            .iter()
+            .any(|errno| error.os_code() == Some(errno.raw_os_error()))
     }
 
-    fn read_fd(fd: OwnedFd, limit: u64, operation: &'static str) -> Result<Vec<u8>, SysError> {
+    pub(super) fn read_fd(
+        fd: OwnedFd,
+        limit: u64,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, SysError> {
         inject(operation)?;
         let mut bytes = Vec::new();
         io_result(
@@ -406,20 +446,18 @@ mod imp {
 
     pub(super) fn scope_names(host: &HostCgroup) -> Result<Vec<String>, SysError> {
         let dir = sessions_dir(Some(host))?;
-        let path = Path::new("/proc/self/fd").join(dir.as_raw_fd().to_string());
-        names_from(
-            std::fs::read_dir(path)
-                .map(|entries| entries.map(|entry| entry.map(|e| e.file_name()))),
-        )
+        names_from(Dir::read_from(&dir).map(|entries| {
+            entries.map(|entry| entry.map(|entry| entry.file_name().to_bytes().to_vec()))
+        }))
     }
 
-    pub(super) fn names_from<I: Iterator<Item = std::io::Result<std::ffi::OsString>>>(
-        entries: std::io::Result<I>,
+    pub(super) fn names_from<I: Iterator<Item = Result<Vec<u8>, rustix::io::Errno>>>(
+        entries: Result<I, rustix::io::Errno>,
     ) -> Result<Vec<String>, SysError> {
         let mut names = Vec::new();
-        for entry in io_result(entries, "list session records")? {
-            let entry = io_result(entry, "read session record name")?;
-            if let Ok(name) = std::str::from_utf8(entry.as_bytes())
+        for entry in rustix_result(entries, "list session records")? {
+            let entry = rustix_result(entry, "read session record name")?;
+            if let Ok(name) = std::str::from_utf8(&entry)
                 && is_record_name(name)
             {
                 names.push(name.to_owned());
@@ -431,6 +469,8 @@ mod imp {
     pub(super) fn scope_facts(
         host: &HostCgroup,
         name: &str,
+        id: u64,
+        with_processes: bool,
     ) -> Result<Option<ScopeFacts>, SysError> {
         if !valid_scope_name(name) {
             return Ok(None);
@@ -458,6 +498,11 @@ mod imp {
             Err(error) => return Err(error),
         };
         let stat = stat_of(&dir, "fstat scope")?;
+        // Identity first: a scope that is not the peer's is nothing of ours to
+        // read, however it is owned or whatever state its files are in.
+        if stat.st_ino != id {
+            return Ok(None);
+        }
         let (procs_stat, procs) = read_text(&dir, "cgroup.procs")?;
         let (_, events) = read_text(&dir, "cgroup.events")?;
         let populated = events
@@ -465,19 +510,23 @@ mod imp {
             .find_map(|line| line.strip_prefix("populated "))
             .is_some_and(|value| value == "1");
         let mut processes = Vec::new();
-        for line in procs.lines() {
+        for line in procs.lines().filter(|_| with_processes) {
             let pid = line
                 .parse::<u32>()
                 .map_err(|_| SysError::malformed("cgroup.procs", "invalid process id"))?;
             match read_starttime(pid) {
                 Ok(starttime) => processes.push((pid, starttime)),
-                // Exited since the list was read: not in the scope any more.
+                // Exited (ENOENT) or reaped (ESRCH) since the list was read.
                 Err(error) if is_missing(&error) => {}
                 Err(error) => return Err(error),
             }
         }
         let record_name = name.strip_suffix(".scope").unwrap_or_default();
         let record = read_record(host, record_name)?;
+        let (record, record_owner, record_mode, record_nlink) = match record {
+            Some(file) => (Some(file.bytes), file.owner, file.mode, file.nlink),
+            None => (None, 0, 0, 0),
+        };
         Ok(Some(ScopeFacts {
             cgroup2: true,
             inode: stat.st_ino,
@@ -487,6 +536,9 @@ mod imp {
             procs_mode: procs_stat.st_mode,
             populated,
             record,
+            record_owner,
+            record_mode,
+            record_nlink,
             processes,
         }))
     }
@@ -517,7 +569,19 @@ mod imp {
         Ok((stat, text))
     }
 
-    pub(super) fn read_record(host: &HostCgroup, name: &str) -> Result<Option<Vec<u8>>, SysError> {
+    /// A committed record's bytes with the stat of the descriptor they came
+    /// from; whether to trust them is `scope_status`'s decision.
+    pub(super) struct RecordFile {
+        pub(super) bytes: Vec<u8>,
+        pub(super) owner: u32,
+        pub(super) mode: u32,
+        pub(super) nlink: u64,
+    }
+
+    pub(super) fn read_record(
+        host: &HostCgroup,
+        name: &str,
+    ) -> Result<Option<RecordFile>, SysError> {
         let dir = sessions_dir(Some(host))?;
         let fd = match open_file_at(&dir, name, "open committed record") {
             Ok(fd) => fd,
@@ -525,14 +589,16 @@ mod imp {
             Err(error) => return Err(error),
         };
         let stat = stat_of(&fd, "fstat committed record")?;
-        if !test_mode(host) && !trusted_record(stat.st_uid, stat.st_mode, stat.st_nlink == 1) {
+        // Never read a FIFO or device a writer planted under a record name.
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Ok(None);
         }
-        read_fd(fd, 64 * 1024, "read committed record").map(Some)
-    }
-
-    pub(super) fn trusted_record(owner: u32, mode: u32, single_link: bool) -> bool {
-        owner == 0 && mode.trailing_zeros() >= 6 && single_link
+        Ok(Some(RecordFile {
+            bytes: read_fd(fd, 64 * 1024, "read committed record")?,
+            owner: stat.st_uid,
+            mode: stat.st_mode,
+            nlink: u64::from(stat.st_nlink),
+        }))
     }
 
     pub(super) fn sessions_dir(host: Option<&HostCgroup>) -> Result<OwnedFd, SysError> {
@@ -670,7 +736,12 @@ mod imp {
     pub(super) fn peer_alive(_: BorrowedFd<'_>) -> Result<bool, SysError> {
         Err(SysError::unsupported("pidfd poll"))
     }
-    pub(super) fn scope_facts(_: &HostCgroup, _: &str) -> Result<Option<ScopeFacts>, SysError> {
+    pub(super) fn scope_facts(
+        _: &HostCgroup,
+        _: &str,
+        _: u64,
+        _: bool,
+    ) -> Result<Option<ScopeFacts>, SysError> {
         Err(SysError::unsupported("scope status"))
     }
     pub(super) fn scope_names(_: &HostCgroup) -> Result<Vec<String>, SysError> {
@@ -823,6 +894,12 @@ fn read_cgroup_path<C: CgroupCalls + ?Sized>(calls: &C, pid: u32) -> Result<Stri
     Ok(path.as_str().to_owned())
 }
 
+/// A committed record is trusted only as a root-owned, private, single-link
+/// regular file.
+fn trusted_record(owner: u32, mode: u32, nlink: u64) -> bool {
+    owner == 0 && mode & 0o170_000 == 0o100_000 && mode.trailing_zeros() >= 6 && nlink == 1
+}
+
 /// Whether `name` is a committed `agent-<32 hex>` or `watch-<32 hex>` record
 /// name. `pending-*` names and anything else carry no authority.
 fn is_record_name(name: &str) -> bool {
@@ -858,7 +935,7 @@ pub fn scope_status(
                 continue;
             }
             let name = format!("{record_name}.scope");
-            let Some(facts) = calls.scope_facts(&name)? else {
+            let Some(facts) = calls.scope_facts(&name, id, kind == ScopeKind::Watch)? else {
                 continue;
             };
             if !facts.cgroup2
@@ -869,6 +946,9 @@ pub fn scope_status(
                 || facts.procs_mode & 0o022 != 0
                 || !facts.populated
             {
+                continue;
+            }
+            if !trusted_record(facts.record_owner, facts.record_mode, facts.record_nlink) {
                 continue;
             }
             let Some(record_bytes) = facts.record else {
@@ -1009,6 +1089,9 @@ mod tests {
                 procs_mode,
                 populated,
                 record: with_record.then(|| record(kind, record_id)),
+                record_owner: 0,
+                record_mode: 0o100_600,
+                record_nlink: 1,
                 processes,
             },
         );
@@ -1056,7 +1139,12 @@ mod tests {
         fn peer_alive(&self, _pidfd: BorrowedFd<'_>) -> Result<bool, SysError> {
             self.alive.borrow().clone()
         }
-        fn scope_facts(&self, name: &str) -> Result<Option<ScopeFacts>, SysError> {
+        fn scope_facts(
+            &self,
+            name: &str,
+            _id: u64,
+            _with_processes: bool,
+        ) -> Result<Option<ScopeFacts>, SysError> {
             if self.fail_scopes {
                 return Err(SysError::read("scope", "unreadable"));
             }
@@ -1160,7 +1248,15 @@ mod tests {
         std::fs::create_dir_all(&missing_slice).unwrap();
         let mut host = fixture_host();
         host.root = open_dir(&missing_slice);
-        assert!(imp::scope_facts(&host, "agent-0123456789abcdef0123456789abcdef.scope").is_err());
+        assert!(
+            imp::scope_facts(
+                &host,
+                "agent-0123456789abcdef0123456789abcdef.scope",
+                1,
+                true
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(missing_slice).unwrap();
     }
 
@@ -1174,9 +1270,14 @@ mod tests {
                 .contains(&AGENT_RECORD_NAME.to_owned())
         );
         assert!(
-            CgroupCalls::scope_facts(&host, "agent-0123456789abcdef0123456789abcdef.scope")
-                .unwrap()
-                .is_some()
+            CgroupCalls::scope_facts(
+                &host,
+                "agent-0123456789abcdef0123456789abcdef.scope",
+                fixture_scope_inode(),
+                false,
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -1229,9 +1330,18 @@ mod tests {
         let mut host = fixture_host();
         host.root = open_dir(&root_path);
         let name = "agent-0123456789abcdef0123456789abcdef.scope";
-        let facts = imp::scope_facts(&host, name).unwrap().unwrap();
+        let id = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&scope_dir).unwrap());
+        let facts = imp::scope_facts(&host, name, id, true).unwrap().unwrap();
         assert_eq!(facts.processes.len(), 1);
-        every_step_failing(&|| imp::scope_facts(&host, name).map(drop));
+        // Agent scopes never pay for the process list.
+        assert!(
+            imp::scope_facts(&host, name, id, false)
+                .unwrap()
+                .unwrap()
+                .processes
+                .is_empty()
+        );
+        every_step_failing(&|| imp::scope_facts(&host, name, id, true).map(drop));
         // A process that left the scope after the list was read is dropped.
         std::fs::write(
             scope_dir.join("cgroup.procs"),
@@ -1239,7 +1349,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            imp::scope_facts(&host, name)
+            imp::scope_facts(&host, name, id, true)
                 .unwrap()
                 .unwrap()
                 .processes
@@ -1255,9 +1365,24 @@ mod tests {
         assert_eq!(process.0, std::process::id());
         assert!(process.1 > 0);
         assert!(imp::read_starttime(u32::MAX).is_err());
-        assert!(imp::scope_facts(&host, "agent-ffffffffffffffffffffffffffffffff.scope").is_err());
+        assert!(
+            imp::scope_facts(
+                &host,
+                "agent-ffffffffffffffffffffffffffffffff.scope",
+                id,
+                true
+            )
+            .is_err()
+        );
         std::fs::write(scope_dir.join("cgroup.procs"), b"not-a-pid\n").unwrap();
-        assert!(imp::scope_facts(&host, name).is_err());
+        assert!(imp::scope_facts(&host, name, id, true).is_err());
+        // Another user's scope that is broken is skipped before its files are
+        // read, so it cannot fail the check for the scope that matches.
+        assert!(
+            imp::scope_facts(&host, name, id.wrapping_add(1), true)
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
@@ -1266,7 +1391,12 @@ mod tests {
     fn host_scope_refuses_a_non_root_slice_and_a_non_root_record() {
         let host = fixture_host();
         assert!(imp::test_mode(&host));
-        assert!(imp::read_record(&host, "watch-ffffffffffffffffffffffffffffffff").is_err());
+        // A directory under a record name is no record.
+        assert!(
+            imp::read_record(&host, "watch-ffffffffffffffffffffffffffffffff")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             imp::read_record(&host, "agent-ffffffffffffffffffffffffffffffff")
                 .unwrap()
@@ -1280,16 +1410,161 @@ mod tests {
         };
         assert!(!imp::test_mode(&untrusted));
         assert!(
-            imp::scope_facts(&untrusted, "agent-0123456789abcdef0123456789abcdef.scope")
+            imp::scope_facts(
+                &untrusted,
+                "agent-0123456789abcdef0123456789abcdef.scope",
+                fixture_scope_inode(),
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        // The host reports what it saw; scope_status judges the ownership.
+        let file = imp::read_record(&untrusted, "agent-0123456789abcdef0123456789abcdef")
+            .unwrap()
+            .unwrap();
+        assert_ne!(file.owner, 0);
+        assert_eq!(file.nlink, 1);
+        let _ = imp::sessions_dir(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_record_is_refused() {
+        let dir = PathBuf::from("/tmp").join(format!("xudo-e1-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.join(AGENT_RECORD_NAME),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+        let mut host = fixture_host();
+        host.test_records = Some(open_dir(&dir));
+        // Must return at once: opening a FIFO for reading may not block, and
+        // its (empty) contents are never read.
+        assert!(
+            imp::read_record(&host, AGENT_RECORD_NAME)
                 .unwrap()
                 .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!trusted_record(0, 0o010_600, 1));
+    }
+
+    #[test]
+    fn a_record_with_loose_owner_or_mode_is_refused_by_scope_status() {
+        for (owner, mode, nlink) in [
+            (1000, 0o100_600, 1),
+            (0, 0o100_640, 1),
+            (0, 0o100_606, 1),
+            (0, 0o100_600, 2),
+            (0, 0o010_600, 1),
+            (0, 0o120_600, 1),
+        ] {
+            let mut fake = scope_fake("agent", 1, 1, 0, 0o100_644, true, vec![(42, 73)], true);
+            let facts = fake.scopes.values_mut().next().unwrap();
+            facts.record_owner = owner;
+            facts.record_mode = mode;
+            facts.record_nlink = nlink;
+            assert!(
+                scope_status(&fake, 1, 1000, &parse_record)
+                    .unwrap()
+                    .is_none(),
+                "{owner} {mode:o} {nlink}"
+            );
+        }
+        let fake = scope_fake("agent", 1, 1, 0, 0o100_644, true, vec![(42, 73)], true);
+        assert!(
+            scope_status(&fake, 1, 1000, &parse_record)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_reaped_process_in_another_users_scope_does_not_fail_the_check() {
+        // The other scope's inode differs: the host returns None before it
+        // reads a process, so a reaped pid there is not this peer's error.
+        let mut fake = scope_fake("agent", 2, 1, 0, 0o100_644, true, vec![(42, 73)], true);
+        fake.names.push(WATCH_RECORD_NAME.to_owned());
+        fake.scopes.insert(
+            format!("{WATCH_RECORD_NAME}.scope"),
+            fake.scopes.values().next().unwrap().clone(),
         );
         assert!(
-            imp::read_record(&untrusted, "agent-0123456789abcdef0123456789abcdef")
+            scope_status(&fake, 1, 1000, &parse_record)
                 .unwrap()
                 .is_none()
         );
-        let _ = imp::sessions_dir(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scope_that_is_not_the_peers_is_never_read() {
+        // Inode first: this scope's record is unreadable, and still no error.
+        let host = fixture_host();
+        let name = format!("{AGENT_RECORD_NAME}.scope");
+        let id = fixture_scope_inode();
+        assert!(
+            imp::scope_facts(&host, &name, id.wrapping_add(1), true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scope_without_a_committed_record_carries_no_record_facts() {
+        let dir = PathBuf::from("/tmp").join(format!("xudo-e1-norecord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = fixture_host();
+        host.test_records = Some(open_dir(&dir));
+        let name = format!("{AGENT_RECORD_NAME}.scope");
+        let facts = imp::scope_facts(&host, &name, fixture_scope_inode(), false)
+            .unwrap()
+            .unwrap();
+        assert!(facts.record.is_none());
+        assert_eq!(
+            (facts.record_owner, facts.record_mode, facts.record_nlink),
+            (0, 0, 0)
+        );
+        // A directory read as a file fails; the error is not swallowed.
+        assert!(imp::read_fd(open_dir(&dir), 16, "read directory").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reaped_pid_is_gone_not_an_error() {
+        let esrch = SysError::os("x", &std::io::Error::from_raw_os_error(3));
+        assert!(imp::is_missing(&esrch));
+        let eio = SysError::os("x", &std::io::Error::from_raw_os_error(5));
+        assert!(!imp::is_missing(&eio));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_fstatfs_failure_keeps_its_errno() {
+        let error = imp::cgroup2_from(Err(rustix::io::Errno::BADF)).unwrap_err();
+        assert_eq!(
+            error.os_code(),
+            Some(rustix::io::Errno::BADF.raw_os_error())
+        );
+        assert!(imp::cgroup2_from(Ok(0x6367_7270)).is_ok());
+        assert!(imp::cgroup2_from(Ok(0)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_scope_inode() -> u64 {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cgroup/xudo.slice")
+            .join(format!("{AGENT_RECORD_NAME}.scope"));
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())
     }
 
     #[cfg(target_os = "linux")]
@@ -1619,7 +1894,9 @@ mod tests {
     fn pinned_host_scope_reads_directory_files_and_committed_record() {
         let host = fixture_host();
         let name = format!("{AGENT_RECORD_NAME}.scope");
-        let facts = imp::scope_facts(&host, &name).unwrap().unwrap();
+        let facts = imp::scope_facts(&host, &name, fixture_scope_inode(), false)
+            .unwrap()
+            .unwrap();
         let expected_record =
             include_bytes!("../tests/fixtures/sessions/agent-0123456789abcdef0123456789abcdef");
         assert!(facts.cgroup2);
@@ -1641,14 +1918,19 @@ mod tests {
     fn pinned_host_scope_refuses_unsafe_names_and_missing_components() {
         let host = fixture_host();
         assert!(
-            imp::scope_facts(&host, "agent-../x.scope")
+            imp::scope_facts(&host, "agent-../x.scope", 1, true)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            imp::scope_facts(&host, "agent-ffffffffffffffffffffffffffffffff.scope")
-                .unwrap()
-                .is_none()
+            imp::scope_facts(
+                &host,
+                "agent-ffffffffffffffffffffffffffffffff.scope",
+                1,
+                true
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(imp::cgroup_inode(&host, "/../outside").is_err());
         assert!(imp::cgroup_inode(&host, "relative").is_err());
@@ -1805,7 +2087,8 @@ mod tests {
         every_step_failing(&|| imp::scope_names(&host).map(drop));
         every_step_failing(&|| imp::read_record(&host, AGENT_RECORD_NAME).map(drop));
         every_step_failing(&|| imp::cgroup_inode(&host, &format!("/xudo.slice/{name}")).map(drop));
-        every_step_failing(&|| imp::scope_facts(&host, &name).map(drop));
+        let id = fixture_scope_inode();
+        every_step_failing(&|| imp::scope_facts(&host, &name, id, true).map(drop));
         let run =
             || open_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run"));
         every_step_failing(&|| imp::sessions_dir_from(Some(&host), Ok(run())).map(drop));
@@ -1815,22 +2098,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_record_is_trusted_only_when_root_owned_private_and_unlinked() {
-        assert!(imp::trusted_record(0, 0o100_600, true));
-        assert!(!imp::trusted_record(1000, 0o100_600, true));
-        assert!(!imp::trusted_record(0, 0o100_640, true));
-        assert!(!imp::trusted_record(0, 0o100_600, false));
+        assert!(trusted_record(0, 0o100_600, 1));
+        assert!(!trusted_record(1000, 0o100_600, 1));
+        assert!(!trusted_record(0, 0o100_640, 1));
+        assert!(!trusted_record(0, 0o100_600, 2));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_listing_or_entry_or_run_directory_is_closed() {
-        assert!(imp::names_from::<std::vec::IntoIter<_>>(Err(std::io::Error::other("x"))).is_err());
-        let bad = vec![Err(std::io::Error::other("x"))].into_iter();
+        assert!(imp::names_from::<std::vec::IntoIter<_>>(Err(rustix::io::Errno::IO)).is_err());
+        let bad = vec![Err(rustix::io::Errno::IO)].into_iter();
         assert!(imp::names_from(Ok(bad)).is_err());
         let names = vec![
-            Ok(std::ffi::OsString::from(AGENT_RECORD_NAME)),
-            Ok(std::ffi::OsString::from("pending-agent-1")),
-            Ok(std::os::unix::ffi::OsStringExt::from_vec(vec![0xff])),
+            Ok(AGENT_RECORD_NAME.as_bytes().to_vec()),
+            Ok(b"pending-agent-1".to_vec()),
+            Ok(vec![0xff]),
         ];
         assert_eq!(imp::names_from(Ok(names.into_iter())).unwrap().len(), 1);
         let host = fixture_host();
@@ -1857,7 +2140,7 @@ mod tests {
             test_force_cgroup2: false,
         };
         assert!(imp::cgroup_inode(&host, "/xudo.slice").is_err());
-        assert!(imp::scope_facts(&host, &format!("{AGENT_RECORD_NAME}.scope")).is_err());
+        assert!(imp::scope_facts(&host, &format!("{AGENT_RECORD_NAME}.scope"), 1, true).is_err());
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
