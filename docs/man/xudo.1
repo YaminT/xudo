@@ -209,9 +209,9 @@ Freeze the agent path with an operator supplied reason. The scope is the
 caller's. A user's freeze stops only that user's own agents: it writes a
 marker named by the user's uid, and root's global freeze is untouched.
 Root's freeze is global and stops every user's agents. An attested agent
-cannot freeze, and neither can a peer in another user namespace. Until agent
-enrollment ships (M4) this sets the flag but changes nothing for new requests
-or for human requests: every caller is unattested, and the human password path
+cannot freeze, and neither can a peer in another user namespace. Until the
+passwordless agent path ships this sets the flag but changes nothing for new
+requests or for human requests: every caller is unattested, and the human password path
 stays available. Pending or approved requests of an enrolled agent in the
 freezer's scope (every user's, for root) are denied and audited, without a
 backoff strike; a human's pending request is left alone.
