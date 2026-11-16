@@ -742,19 +742,19 @@ mod tests {
             expires_in_ms: 20_000,
         });
         let entry_id = id.clone();
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = server_listener.accept().unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            assert!(
-                BrokerRequest::parse(&request)
-                    .unwrap()
-                    .run_fields()
-                    .is_some()
-            );
-            *server_spool.lock().unwrap() = Some(entry_id);
-            stream.write_all(&response).unwrap();
-        });
+        let broker = crate::test_broker::serve_many_with(
+            server_listener,
+            vec![response],
+            move |_, request| {
+                assert!(
+                    BrokerRequest::parse(request)
+                        .unwrap()
+                        .run_fields()
+                        .is_some()
+                );
+                *server_spool.lock().unwrap() = Some(entry_id.clone());
+            },
+        );
         let cli = cli();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = plan_with_confirmation_timeout(
@@ -768,7 +768,7 @@ mod tests {
             &mut out,
             &mut err,
         );
-        broker.join().unwrap();
+        broker.finish();
         listener.set_nonblocking(true).unwrap();
         assert_eq!(result, Err(ExitCode::NotConfirmed));
         assert_eq!(*spool_entry.lock().unwrap(), Some(id));
@@ -1511,26 +1511,8 @@ mod tests {
         };
         let approved_status = decided(allow(), Some(matching_mint.clone()));
         let consumed_run = decided(allow(), Some(matching_mint));
-        let broker = thread::spawn(move || {
-            let mut received = Vec::new();
-            for (index, response) in [pending, approved_status, consumed_run]
-                .into_iter()
-                .enumerate()
-            {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                stream.read_to_end(&mut request).unwrap();
-                received.push(BrokerRequest::parse(&request).unwrap());
-                if index == 1 {
-                    assert_eq!(
-                        std::mem::discriminant(&received[index].question),
-                        std::mem::discriminant(&Question::Status { id: String::new() })
-                    );
-                }
-                stream.write_all(&response).unwrap();
-            }
-            received
-        });
+        let broker =
+            crate::test_broker::serve_many(listener, vec![pending, approved_status, consumed_run]);
         let mut cli = cli();
         cli.output = crate::cli::Format::Json;
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1555,9 +1537,23 @@ mod tests {
             &mut err,
         );
         assert!(result.is_ok());
-        let requests = broker.join().unwrap();
+        let report = broker.finish_report();
+        let requests = report
+            .requests
+            .iter()
+            .map(|request| BrokerRequest::parse(request).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(report.accept_error, None);
+        assert_eq!(
+            report.writes,
+            vec![crate::test_broker::ReplyWrite::Written; 3]
+        );
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0], requests[2]);
+        assert_eq!(
+            std::mem::discriminant(&requests[1].question),
+            std::mem::discriminant(&Question::Status { id: String::new() })
+        );
         assert_eq!(
             std::mem::discriminant(&requests[0].question),
             std::mem::discriminant(&Question::Run {
