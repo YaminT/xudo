@@ -15,8 +15,29 @@ use xudo_policy::{
 
 /// The file-tool names. A copy or a hardlink is denied when it keeps one.
 const FILE_TOOLS: &[&str] = &[
-    "rm", "rmdir", "unlink", "chmod", "chown", "chgrp", "chattr", "setfacl", "setfattr", "touch",
-    "mkdir", "mkfifo", "rename", "prename",
+    "rm",
+    "rmdir",
+    "unlink",
+    "chmod",
+    "chown",
+    "chgrp",
+    "chattr",
+    "setfacl",
+    "setfattr",
+    "touch",
+    "mkdir",
+    "mkfifo",
+    "rename",
+    "prename",
+    "link",
+    "chcon",
+    "restorecon",
+    "setfiles",
+    "chacl",
+    "attr",
+    "fallocate",
+    "mktemp",
+    "file-rename",
 ];
 
 fn findings(exe: &str, args: &[&str]) -> Vec<CapabilityClass> {
@@ -60,11 +81,18 @@ fn denies_rm_under_a_path_under_rule_via_agent_symlink() {
     );
     assert!(matches!(matcher, Matcher::PathUnder { .. }));
 
-    let human = CallerFacts::new(Classification::Human, 1000);
+    let agent = CallerFacts::new(
+        Classification::EnrolledAgent {
+            agent_id: "claude-code".into(),
+            session_id: "s-1".into(),
+            declared_yolo: true,
+        },
+        1000,
+    );
     let argv = Argv::new(["-rf", path]);
     let decision = evaluate_command(
         &rules,
-        &human,
+        &agent,
         &Arg::from("/bin/rm"),
         &argv,
         Settings::default(),
@@ -181,6 +209,67 @@ fn denies_rm_via_busybox_applet() {
 }
 
 #[test]
+fn denies_rm_via_coreutils_and_toybox_multicall() {
+    let class = CapabilityClass::ChangesPathMetadataOrExistence;
+    for exe in ["/usr/bin/coreutils", "/bin/toybox", "/opt/x/coreutils"] {
+        assert!(has(exe, &["rm", "-rf", "/tmp/x"], class), "{exe}");
+        assert!(has(exe, &["/bin/chmod", "4755", "/tmp/x"], class), "{exe}");
+        // No applet, or a flag in its place: the applet is unknown, so refused.
+        assert!(has(exe, &[], class), "{exe}");
+        assert!(has(exe, &["--help"], class), "{exe}");
+        // An applet from another class keeps that class.
+        assert!(has(
+            exe,
+            &["cp", "/a", "/b"],
+            CapabilityClass::ArbitraryWrite
+        ));
+    }
+    assert!(has(
+        "/usr/bin/coreutils",
+        &["--coreutils-prog=rm", "/tmp/x"],
+        class
+    ));
+    assert!(has(
+        "/usr/bin/coreutils",
+        &["--coreutils-prog=tee", "/tmp/x"],
+        CapabilityClass::ArbitraryWrite
+    ));
+    // A plain applet no list knows is not a file tool.
+    assert!(!has("/usr/bin/coreutils", &["true"], class));
+    // Only coreutils reads the joined spelling; busybox reads it as a flag.
+    assert!(!has("/bin/busybox", &["--coreutils-prog=rm"], class));
+    // toybox is a shell-class multicall like busybox.
+    assert!(has("/bin/toybox", &["true"], CapabilityClass::SpawnsShell));
+}
+
+#[test]
+fn denies_writes_via_patch_compressors_alternatives_and_debugfs() {
+    for tool in [
+        "patch",
+        "gzip",
+        "xz",
+        "zstd",
+        "bzip2",
+        "update-alternatives",
+        "dpkg-divert",
+    ] {
+        assert!(
+            has(
+                &format!("/usr/bin/{tool}"),
+                &[],
+                CapabilityClass::ArbitraryWrite
+            ),
+            "{tool}"
+        );
+    }
+    assert!(has(
+        "/sbin/debugfs",
+        &[],
+        CapabilityClass::DeviceOrFilesystem
+    ));
+}
+
+#[test]
 fn an_rm_path_under_rule_is_self_denying() {
     let rules = RuleSet::from_toml("rm-home.toml", RM_HOME).unwrap();
     let offenders = rules.self_denying_actions();
@@ -222,14 +311,6 @@ fn setcap_mknod_mount_and_umount_were_checked_against_the_existing_lists() {
         &[],
         CapabilityClass::ChangesPathMetadataOrExistence
     ));
-    assert!(
-        findings("/bin/mount", &[]).is_empty(),
-        "mount is not a named class"
-    );
-    assert!(
-        findings("/bin/umount", &[]).is_empty(),
-        "umount is not a named class"
-    );
 }
 
 proptest! {
@@ -240,12 +321,12 @@ proptest! {
         copy in prop::sample::select(&["/bin", "/usr/bin", "/tmp/copy", "/opt/hardlink"][..]),
         arg in "[a-zA-Z0-9._/=-]{0,32}",
         extra in "[a-zA-Z0-9._/=-]{0,24}",
-        via_busybox in any::<bool>(),
+        multicall in prop::sample::select(&["", "busybox", "toybox", "coreutils"][..]),
     ) {
-        let (exe, mut args) = if via_busybox {
-            ("/bin/busybox".to_owned(), vec![Arg::from(tool)])
-        } else {
+        let (exe, mut args) = if multicall.is_empty() {
             (format!("{copy}/{tool}"), Vec::new())
+        } else {
+            (format!("/bin/{multicall}"), vec![Arg::from(tool)])
         };
         args.push(Arg::from(arg.as_str()));
         let before = evaluate_deny_list(exe.as_bytes(), &Argv::new(args.clone()));
