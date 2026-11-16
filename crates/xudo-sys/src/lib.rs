@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod cgroup;
 pub mod clock;
 pub mod connection;
 pub mod entropy;
@@ -70,6 +71,11 @@ pub use audit::FakeAuditSink;
 pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
+};
+pub use cgroup::{
+    CgroupCalls, CgroupIdentity, CgroupRung, HostCgroup, ProcessSecurityStatus, RecordIdentity,
+    Scope, ScopeFacts, ScopeKind, parse_process_security_status, peer_cgroup_id,
+    process_security_status, scope_status, verify_parent_pid,
 };
 #[cfg(target_os = "linux")]
 pub use clock::DEADLINE_CLOCK;
