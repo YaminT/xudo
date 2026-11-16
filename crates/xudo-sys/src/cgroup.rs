@@ -578,6 +578,8 @@ mod imp {
         pub(super) nlink: u64,
     }
 
+    // The width of st_nlink differs by architecture (u64 on x86_64, u32 on aarch64), so the widening is needed on one and "useless" on the other.
+    #[allow(clippy::useless_conversion)]
     pub(super) fn read_record(
         host: &HostCgroup,
         name: &str,
@@ -1298,8 +1300,7 @@ mod tests {
         assert!(imp::validate_sessions_directory(fixture_sessions, true).is_ok());
         assert!(imp::sessions_dir_from(None, Ok(open_dir(&fixture.join("run")))).is_err());
         assert!(
-            imp::sessions_dir_from(Some(&host), Ok(open_dir(&fixture.join("run-missing"))))
-                .is_err()
+            imp::sessions_dir_from(Some(&host), Ok(open_dir(&fixture.join("cgroup")))).is_err()
         );
     }
 
