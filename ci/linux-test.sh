@@ -64,7 +64,7 @@ run() {
         env -i PATH=/usr/local/cargo/bin:/usr/bin:/bin HOME=/work \
         CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target \
         RUSTUP_HOME=/usr/local/rustup RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | cut -d' ' -f1)" \
-        "$@"
+        "$@" </dev/null
 }
 
 if [[ $(run id -u) == 0 ]]; then
@@ -77,6 +77,7 @@ if [ "$#" -eq 0 ]; then
     run cargo test -p xudod -p xudo-gate
 fi
 run cargo test --workspace --all-features "$@"
+# (run() closes stdin: a test that reads it would eat the rest of this script.)
 # Quote the cgroup rung and errno the real kernel chose; fail if it is silent.
 rung=$(run cargo test -p xudo-sys --lib -- --exact --nocapture \
     cgroup::tests::linux_cgroup_sources_agree_and_print_the_selected_rung 2>&1)
