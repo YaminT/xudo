@@ -3,7 +3,7 @@
 //! Deliberately the whole of it. The sequence — descriptors, `/dev/null`,
 //! `/proc`, lineage, rules, spool, program, audit, exec — is `xudo_gate::run`,
 //! written against traits and tested at 100% in the library; what remains is
-//! to hand it the real host, print the one line it returns, and leave with its
+//! to hand it the real host, print the lines it returns, and leave with its
 //! status. `tests/binary.rs` asserts that through a real process.
 //!
 //! It reads no environment. `args_os`, not `args`: `argv` is bytes, and one

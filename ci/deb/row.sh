@@ -1,6 +1,7 @@
 #!/bin/sh
 # One row of the .deb matrix, run as root in a fresh container with the old
-# package at /debs/old.deb and a higher version at /debs/new.deb.
+# package at /debs/old.deb, a higher version at /debs/new.deb, and the real
+# package the lane was given (the one that gets signed) at /debs/real.deb.
 # APT_NO_RECOMMENDS, when set, is passed to every package install (Debian).
 set -eu
 export DEBIAN_FRONTEND=noninteractive
@@ -21,7 +22,7 @@ deb_install() {
 }
 
 apt-get update -qq >/dev/null
-cp /debs/old.deb /debs/new.deb /tmp/ && cd /tmp
+cp /debs/old.deb /debs/new.deb /debs/real.deb /tmp/ && cd /tmp
 
 # Install: pulls sudo, writes the rule, creates an empty group.
 deb_install ./old.deb
@@ -43,6 +44,11 @@ grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted sy
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
+# /usr/share/xudo is not excluded by Ubuntu's path-exclude=/usr/share/doc/*.
+# The example must be on every image.
+example=/usr/share/xudo/examples/20-services-lifecycle.toml
+[ -f "$example" ] || fail "lifecycle example not installed"
+[ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
 matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
 [ "$matching_count" -eq "$rules_count" ] || fail "doctor did not report every shipped rule as matches shipped"
@@ -86,6 +92,10 @@ shipped=$(find /etc/sudoers.d -mindepth 1 -maxdepth 1 ! -name xudo | sort)
 
 # Upgrade keeps the rule, a group member, and an operator's edit to a shipped rule.
 echo '# mine' >>/etc/xudo/rules.d/05-probe.toml
+# old.deb itself ships the published beta.1 file as its conffile. The operator
+# edits it, so both upstream and local differ from what dpkg last installed.
+cmp /etc/xudo/rules.d/20-services.toml /harness/fixtures/20-services-beta.1.toml || fail "old.deb does not ship the beta.1 services file"
+echo '# edited by the operator' >>/etc/xudo/rules.d/20-services.toml
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
@@ -97,6 +107,15 @@ printf '%s\n' 'keep non-json' >/run/xudo/confirm/preserve.txt
 mkdir /run/xudo/confirm/nested
 printf '%s\n' 'keep nested' >/run/xudo/confirm/nested/legacy.json
 deb_install -o Dpkg::Options::=--force-confold ./new.deb
+grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml || fail "upgrade did not keep the beta.1 lifecycle rule"
+grep -Fq 'if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`' /tmp/apt.log || fail "upgrade did not say to check a kept rules file"
+grep -Fq 'if you kept /etc/xudo/rules.d/30-packages.toml, compare it with the new package file' /tmp/apt.log || fail "upgrade did not name the kept packages rule"
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 21 ] || fail "xudo check on the kept beta.1 rule exited $rc, wanted 21"
+grep -Fq 'xudo.svc.lifecycle' /tmp/check.out || fail "xudo check did not name xudo.svc.lifecycle"
 gone /run/xudo/confirm/legacy.json
 [ -L /run/xudo/confirm/link.json ] || fail "confirm cleanup removed a symlink"
 [ "$(cat /run/xudo/confirm/target-data)" = 'keep target' ] || fail "confirm cleanup changed a symlink target"
@@ -133,6 +152,22 @@ gone /var/lib/xudo
 ! getent group xudo >/dev/null || fail "purge left the group"
 for f in $shipped; do [ -e "$f" ] || fail "purge removed $f"; done
 
+# An operator who never edited the services file: dpkg replaces it with the
+# new package's, which has no lifecycle rule, and xudo check is clean.
+deb_install ./old.deb
+cmp /etc/xudo/rules.d/20-services.toml /harness/fixtures/20-services-beta.1.toml || fail "old.deb does not ship the beta.1 services file"
+deb_install ./new.deb
+if grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml; then fail "dpkg kept an unedited beta.1 services file"; fi
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { cat /tmp/check.out >&2; fail "xudo check after dpkg replaced the file exited $rc, wanted 0"; }
+if grep -Eq 'dpkg: error|^E:' /tmp/apt.log; then cat /tmp/apt.log >&2; fail "replacing the unedited file failed"; fi
+doctor_out=$(xudo doctor)
+printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
+apt purge xudo
+
 # A rule the operator removed is not put back by an upgrade.
 deb_install ./old.deb
 meta $rule "440 root:root"
@@ -145,4 +180,35 @@ deb_install -o Dpkg::Options::=--force-confold ./new.deb
 gone $rule
 [ ! -e "$timer" ] && [ ! -L "$timer" ] || fail "upgrade re-enabled a timer the operator disabled"
 grep -q 'no xudo rule installed' /tmp/apt.log || fail "upgrade did not report the missing rule"
+
+# The real package, the one that is signed: a fresh install on a clean state,
+# with the same assertions as the first row.
+apt purge xudo
+gone $rule
+deb_install ./real.deb
+real_ver=$(dpkg-deb -f /tmp/real.deb Version)
+[ "$(dpkg-query -W -f='${Version}' xudo)" = "$real_ver" ] || fail "real.deb installed a different version"
+dpkg -s xudo | grep -q '^Status: install ok installed' || fail "real.deb not installed"
+grep -Fq 'every privileged request asks for a password' /tmp/apt.log || fail "real.deb first install notice missing"
+grep -Fq '/usr/share/doc/xudo/SECURITY.md' /tmp/apt.log || fail "real.deb notice omitted SECURITY.md path"
+if command -v debsums >/dev/null 2>&1; then debsums -s xudo || fail "real.deb debsums"; else dpkg --verify xudo || fail "real.deb dpkg --verify"; fi
+meta $rule "440 root:root"
+! grep -qs NOPASSWD "$rule" || fail "NOPASSWD found in the real package's sudoers rule"
+gone /usr/libexec/xudo/xudo-gate-nopass
+[ -x /usr/libexec/xudo/xudo-gate-auth ] || fail "real.deb auth gate missing"
+[ -f /usr/share/xudo/examples/20-services-lifecycle.toml ] || fail "real.deb lifecycle example not installed"
+[ -L "$socket" ] || fail "real.deb socket was not enabled"
+[ -L "$timer" ] || fail "real.deb timer was not enabled"
+xudo list >/dev/null || fail "real.deb xudo list does not run"
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { cat /tmp/check.out >&2; fail "xudo check on the real package exited $rc, wanted 0"; }
+doctor_out=$(xudo doctor)
+rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
+matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
+[ "$matching_count" -eq "$rules_count" ] || fail "real.deb: doctor did not report every shipped rule as matches shipped"
+apt purge xudo
+gone /etc/xudo
 echo "row ok"

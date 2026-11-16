@@ -74,5 +74,5 @@ pub use files::{
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use overlap::Overlap;
-pub use rule::{Action, ActionId, RuleSet, RuleSetError, Source, Tier};
+pub use rule::{Action, ActionId, OpenUnitLint, RuleSet, RuleSetError, Source, Tier};
 pub use rule_test::{Expectation, RuleTest, TestError, TestOutcome, TestResult, run_tests};

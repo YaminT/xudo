@@ -33,9 +33,12 @@ pub mod cli;
 pub mod doctor;
 mod exchange;
 pub mod exec;
+mod lifecycle_note;
 pub mod probe;
 pub mod render;
 pub mod rules;
+#[cfg(test)]
+mod test_broker;
 pub mod watch;
 
 pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with, run_with_installer};
