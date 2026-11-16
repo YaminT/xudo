@@ -2193,19 +2193,19 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn a_host_without_cgroup2_attests_nothing() {
-        fn unsupported<T>(result: &Result<T, SysError>) {
-            assert!(matches!(*result, Err(SysError::Unsupported { .. })));
+        fn unsupported<T>(result: Result<T, SysError>, what: &'static str) {
+            assert_eq!(result.map(drop), Err(SysError::unsupported(what)));
         }
-        unsupported(&HostCgroup::open());
+        unsupported(HostCgroup::open(), "cgroup2 attestation");
         let host = HostCgroup::for_tests();
         let stream = UnixStream::pair().unwrap().0;
-        unsupported(&host.require_cgroup2());
-        unsupported(&host.pidfd_cgroup_id(stream.as_fd()));
-        unsupported(&host.proc_cgroup(1));
-        unsupported(&host.cgroup_inode("a"));
-        unsupported(&host.peer_alive(stream.as_fd()));
-        unsupported(&host.scope_facts("a", 1, false));
-        unsupported(&host.scope_names());
+        unsupported(host.require_cgroup2(), "cgroup2 fstatfs");
+        unsupported(host.pidfd_cgroup_id(stream.as_fd()), "PIDFD_GET_INFO");
+        unsupported(host.proc_cgroup(1), "/proc cgroup read");
+        unsupported(host.cgroup_inode("a"), "cgroup fstat");
+        unsupported(host.peer_alive(stream.as_fd()), "pidfd poll");
+        unsupported(host.scope_facts("a", 1, false), "scope status");
+        unsupported(host.scope_names(), "session record listing");
     }
 
     #[test]
