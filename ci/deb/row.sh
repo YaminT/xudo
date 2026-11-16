@@ -48,7 +48,6 @@ printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoer
 example=/usr/share/xudo/examples/20-services-lifecycle.toml
 [ -f "$example" ] || fail "lifecycle example not installed"
 [ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
-printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
 matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)
 [ "$matching_count" -eq "$rules_count" ] || fail "doctor did not report every shipped rule as matches shipped"
@@ -163,6 +162,8 @@ rc=$?
 set -e
 [ "$rc" -eq 0 ] || { cat /tmp/check.out >&2; fail "xudo check after dpkg replaced the file exited $rc, wanted 0"; }
 if grep -Eq 'dpkg: error|^E:' /tmp/apt.log; then cat /tmp/apt.log >&2; fail "replacing the unedited file failed"; fi
+doctor_out=$(xudo doctor)
+printf '%s\n' "$doctor_out" | grep -Fq 'no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units' || fail "doctor omitted the lifecycle note"
 apt purge xudo
 
 # A rule the operator removed is not put back by an upgrade.
