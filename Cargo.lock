@@ -840,6 +840,7 @@ name = "xudo-gate"
 version = "0.1.0-beta.2"
 dependencies = [
  "insta",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",

@@ -73,10 +73,12 @@ pub mod policy;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
     pub use crate::policy::{FreezeRecord, parse_freeze_record};
+    pub use crate::session::{SessionRecord, parse_session_record};
 }
 pub use policy::{MAX_CONFIG_BYTES, PolicyError, SettingsError, settings_from};
 pub mod request;
 pub mod run;
+pub mod session;
 pub use run::CONFIG_FILE;
 pub mod status;
 
@@ -87,4 +89,5 @@ pub use decide::{
 pub use env::child_environment;
 pub use request::{PendingRequest, RequestError, SPOOL_DIR};
 pub use run::{GateExit, GateHost, SystemHost, run};
+pub use session::{SessionKind, SessionRecord, parse_session_record, record_identity};
 pub use status::Termination;
