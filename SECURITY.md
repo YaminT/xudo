@@ -21,10 +21,11 @@ filesystem-template, and broker-socket units for any caller who passes the
 password gate. The filesystem templates on the deny-list are
 `systemd-fsck@`, `systemd-growfs@`, `systemd-makefs@`, and `mdadm*@`.
 A `.mount` unit is not on that list, and `unit-name` accepts it. The
-tripwire covers the `systemctl` program only. `service`, `invoke-rc.d`,
-`busctl`, and a unit alias such as firewalld's
-`dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
-is the boundary. The shipped rule set no longer
+tripwire is best effort and covers the `systemctl` program only. A rule
+whose exe is not exactly named `systemctl` (a renamed copy of the binary)
+gets no checks and no lint. `service`, `invoke-rc.d`, `busctl`, and a unit
+alias such as firewalld's `dbus-org.fedoraproject.FirewallD1.service` get
+around it. The enumeration is the boundary. The shipped rule set no longer
 contains a service lifecycle rule. Copy
 `/usr/share/xudo/examples/20-services-lifecycle.toml` to
 `/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
@@ -35,11 +36,22 @@ deny-list refuses those names, the systemd power and sleep services,
 the `dbus-org.freedesktop.timesync1` alias), the journal and `syslog`
 units, `systemd-repart`, and `systemd-sysctl`, on a `systemctl` verb that
 starts, stops, signals, or
-otherwise acts, including a unit an operator listed by mistake. A read-only
-verb (`status`, `show`, and the other queries) is not refused because of
-the unit name. An option value cannot hide the verb: every token is
-checked, so `-p status stop debug-shell.service` is `stop`, not a status
-query. `poweroff`, `reboot`, `sleep`, and the other power subcommands are
+otherwise acts, including a unit an operator listed by mistake. A command is
+exempt from the unit-name check only in the plain read-only shape: optional
+`--no-pager`, `--full`, `--no-ask-password`, `-l`, `--no-legend`, `--plain`,
+`--value` or `--all`, then a read-only verb (`status`, `show`, and the other
+queries), then only unit names or joined `--property=` flags. Any other
+option, including `-p` with a separate value, and any verb that is not
+read-only (`reenable`, `reset-failed`, and every other verb of the systemctl
+table), removes the exemption, so `-p status reenable debug-shell.service`
+is refused. What is checked: every non-flag token against the verb sets and
+the unit list; options by their form (`-H`, `--host`, `-M`, `--machine` and
+their prefixes are refused); and a `*`, `?` or `[` in a token outside the
+plain shape is refused, because `systemctl` expands globs itself against the
+loaded units. What is not checked: the items in the first paragraph above,
+and any other spelling `systemctl` resolves that this list does not name.
+`xudo check` also reports an enumerated unit list that names a refused unit
+or a glob. `poweroff`, `reboot`, `sleep`, and the other power subcommands are
 refused in any position. `start --job-mode=isolate` and a prefix such as
 `--j=isolate` are refused for every target. `status rescue` is refused,
 because `rescue` is itself a power subcommand. The acting verbs also

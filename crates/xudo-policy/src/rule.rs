@@ -24,7 +24,9 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::argv::Arg;
-use crate::deny::{LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl};
+use crate::deny::{
+    LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl, unit_literal_is_refused,
+};
 use crate::matcher::{ArgSpec, Matcher};
 use crate::rule_test::RuleTest;
 
@@ -337,11 +339,20 @@ pub struct OpenUnitLint<'a> {
     pub id: &'a ActionId,
     /// The file and line of that action.
     pub source: &'a Source,
+    /// The unit position is closed, but lists a unit or glob the tripwire
+    /// refuses, so the rule can never allow it.
+    pub names_refused_unit: bool,
 }
 
 impl OpenUnitLint<'_> {
     /// The sentence `xudo check` and `xudo doctor` print.
     pub fn message(&self) -> String {
+        if self.names_refused_unit {
+            return format!(
+                "{} at {}: a unit position lists a unit or glob that xudo always refuses: remove it from the list",
+                self.id, self.source
+            );
+        }
         format!(
             "{} at {}: this rule can start or stop any unit: replace the unit matcher with a one-of list of your units",
             self.id, self.source
@@ -353,6 +364,20 @@ impl OpenUnitLint<'_> {
 fn matcher_is_closed_literals(matcher: &Matcher) -> bool {
     match matcher {
         Matcher::Literal(_) | Matcher::OneOf(_) => true,
+        Matcher::IntRange { .. }
+        | Matcher::PathUnder { .. }
+        | Matcher::Name(_)
+        | Matcher::Pattern(_) => false,
+    }
+}
+
+/// A closed literal or `one-of` that lists a refused unit or a glob.
+fn matcher_lists_refused_unit(matcher: &Matcher) -> bool {
+    match matcher {
+        Matcher::Literal(want) => unit_literal_is_refused(want.as_bytes()),
+        Matcher::OneOf(options) => options
+            .iter()
+            .any(|option| unit_literal_is_refused(option.as_bytes())),
         Matcher::IntRange { .. }
         | Matcher::PathUnder { .. }
         | Matcher::Name(_)
@@ -537,7 +562,8 @@ impl RuleSet {
             .collect()
     }
 
-    /// Systemctl actions that can start or stop a unit they do not name.
+    /// Systemctl actions that can start or stop a unit they do not name, or
+    /// that list a unit or glob the tripwire always refuses.
     ///
     /// A position can be the verb when its matcher accepts any lifecycle or
     /// power verb, whatever the matcher kind. A later position that is not a
@@ -562,12 +588,18 @@ impl RuleSet {
                     .iter()
                     .skip(verb_at.saturating_add(1))
                     .any(|spec| !matcher_is_closed_literals(&spec.matcher));
-                if !open_unit {
+                let names_refused_unit = action
+                    .args
+                    .iter()
+                    .skip(verb_at.saturating_add(1))
+                    .any(|spec| matcher_lists_refused_unit(&spec.matcher));
+                if !open_unit && !names_refused_unit {
                     return None;
                 }
                 Some(OpenUnitLint {
                     id: &action.id,
                     source: &action.source,
+                    names_refused_unit: !open_unit,
                 })
             })
             .collect()

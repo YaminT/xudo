@@ -37,11 +37,13 @@
 //! Arguments to `systemctl` are classified by the unit name as well as by the
 //! verb. A power or boot target, a `modprobe@` template, a filesystem
 //! template, this broker's own units, and the `AppArmor` and audit units are
-//! refused when the command acts on them. A read-only verb (`status`, `show`,
-//! and the other queries) is exempt, including when the unit is on this list.
-//! The exemption holds only when no token acts: an option value must not hide
-//! `stop` or `poweroff`. A rule that matches the generic unit-name kind cannot
-//! reopen an acting use.
+//! refused when the command acts on them. Only the plain read-only shape is
+//! exempt, including when the unit is on this list: no-value flags, a
+//! read-only verb (`status`, `show`, and the other queries), then unit names
+//! or joined `--property=` flags. Any other option or any non-read-only verb
+//! removes the exemption: an option value must not hide `stop` or
+//! `poweroff`. This is a best-effort tripwire for operator rules. A rule that
+//! matches the generic unit-name kind cannot reopen an acting use.
 
 use bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
@@ -53,7 +55,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    4
+    5
 }
 
 /// A class of capability that is never permitted as root.
@@ -364,6 +366,7 @@ const POWER_TOOLS: &[&[u8]] = &[
     b"telinit",
     b"init",
     b"kexec-reboot",
+    b"rtcwake",
 ];
 
 /// Container runtimes and daemons.
@@ -574,6 +577,8 @@ const UNIT_MUTATING_VERBS: &[&[u8]] = &[
     b"add-requires",
     b"set-default",
     b"switch-root",
+    // disable then enable from `[Install]`: the same act as `enable`.
+    b"reenable",
 ];
 
 /// `systemctl` subcommands that power off, reboot, sleep, or change the boot
@@ -603,38 +608,10 @@ const POWER_SUBCOMMANDS: &[&[u8]] = &[
     b"isolate",
 ];
 
-/// Verbs that start, stop, reload, or signal a unit.
-///
-/// A token in this list is not a unit name. `systemctl -p status stop
-/// debug-shell.service` is `stop`: the value of `-p` must not hide it.
-/// `kill`, `clean`, `freeze`, and `thaw` are acting verbs. The compatibility
-/// names are the LSB aliases `systemctl` still accepts. The stock images do
-/// not ship `systemctl`, so those names were not observed in `--help`. Keeping
-/// them refuses a verb the binary would reject, which is harmless.
-const ACTING_SYSTEMCTL_VERBS: &[&[u8]] = &[
-    b"start",
-    b"stop",
-    b"restart",
-    b"try-restart",
-    b"reload",
-    b"reload-or-restart",
-    b"try-reload-or-restart",
-    b"kill",
-    b"clean",
-    b"freeze",
-    b"thaw",
-    b"condrestart",
-    b"force-reload",
-    b"reload-or-try-restart",
-    b"condreload",
-    b"condstop",
-];
-
 /// Verbs that only read unit state.
 ///
-/// The unit tripwire does not apply when every non-flag token is one of these
-/// or a unit name, at least one of these is present, and no token is an
-/// acting, mutating, or power verb. A power subcommand is not in this list,
+/// The unit tripwire is skipped only for the plain shape
+/// [`systemctl_read_only`] describes. A power subcommand is not in this list,
 /// so `systemctl poweroff` stays refused.
 const READ_ONLY_SYSTEMCTL_VERBS: &[&[u8]] = &[
     b"status",
@@ -649,6 +626,91 @@ const READ_ONLY_SYSTEMCTL_VERBS: &[&[u8]] = &[
     b"list-sockets",
     b"list-timers",
     b"list-jobs",
+];
+
+/// Every `systemctl` verb that is not read-only, from the verb table of
+/// systemd 257. NOT VERIFIED against a binary: the stock images ship no
+/// `systemctl`, so this is a superset on purpose. A token in this set anywhere
+/// in the argv takes the command out of the read-only shape, so the unit
+/// tripwire applies to it. It is disjoint from [`READ_ONLY_SYSTEMCTL_VERBS`].
+const NON_READ_ONLY_VERBS: &[&[u8]] = &[
+    b"start",
+    b"stop",
+    b"restart",
+    b"try-restart",
+    b"reload",
+    b"reload-or-restart",
+    b"try-reload-or-restart",
+    b"reload-or-try-restart",
+    b"condrestart",
+    b"condreload",
+    b"condstop",
+    b"force-reload",
+    b"kill",
+    b"clean",
+    b"freeze",
+    b"thaw",
+    b"isolate",
+    b"set-property",
+    b"bind",
+    b"mount-image",
+    b"service-log-level",
+    b"service-log-target",
+    b"reset-failed",
+    b"whoami",
+    b"help",
+    b"enable",
+    b"disable",
+    b"reenable",
+    b"preset",
+    b"preset-all",
+    b"mask",
+    b"unmask",
+    b"link",
+    b"revert",
+    b"add-wants",
+    b"add-requires",
+    b"edit",
+    b"set-default",
+    b"cancel",
+    b"set-environment",
+    b"unset-environment",
+    b"import-environment",
+    b"daemon-reload",
+    b"daemon-reexec",
+    b"log-level",
+    b"log-target",
+    b"service-watchdogs",
+    b"switch-root",
+    b"poweroff",
+    b"reboot",
+    b"halt",
+    b"kexec",
+    b"suspend",
+    b"hibernate",
+    b"hybrid-sleep",
+    b"suspend-then-hibernate",
+    b"soft-reboot",
+    b"sleep",
+    b"rescue",
+    b"emergency",
+    b"default",
+    b"exit",
+];
+
+/// The only options the read-only shape allows before its verb. Each takes no
+/// value (NOT VERIFIED against `systemctl --help`; no binary on the images).
+/// Any other `-` token, a short cluster, or an option that could take a
+/// separate value, takes the command out of the shape.
+const NO_VALUE_FLAGS: &[&[u8]] = &[
+    b"--no-pager",
+    b"--full",
+    b"--no-ask-password",
+    b"-l",
+    b"--no-legend",
+    b"--plain",
+    b"--value",
+    b"--all",
 ];
 
 fn is_flag_token(bytes: &[u8]) -> bool {
@@ -712,34 +774,57 @@ fn job_mode_isolate(argv: &Argv) -> bool {
     false
 }
 
-/// Whether the command only reads state.
-///
-/// True only when at least one read-only verb is present, every other
-/// non-flag token is a unit name (or an option value of that shape), and no
-/// token is an acting, mutating, or power verb. An unknown verb fails closed:
-/// the unit tripwire applies.
+/// Whether the command has exactly the plain read-only shape:
+/// `[no-value flag]* <read-only verb> <token>*`, where each later token is a
+/// unit-ish name or a joined `--property=` flag and none is a verb of
+/// [`NON_READ_ONLY_VERBS`]. Anything else, including every option outside
+/// [`NO_VALUE_FLAGS`], returns `false`, and the unit tripwire applies to every
+/// token.
 fn systemctl_read_only(argv: &Argv) -> bool {
-    let mut saw_read_only = false;
+    let mut seen_verb = false;
     for arg in argv.as_slice() {
         let bytes = arg.as_bytes();
-        if is_flag_token(bytes) {
+        if !seen_verb {
+            if NO_VALUE_FLAGS.contains(&bytes) {
+                continue;
+            }
+            if !READ_ONLY_SYSTEMCTL_VERBS.contains(&bytes) {
+                return false;
+            }
+            seen_verb = true;
             continue;
         }
-        if POWER_SUBCOMMANDS.contains(&bytes)
-            || UNIT_MUTATING_VERBS.contains(&bytes)
-            || ACTING_SYSTEMCTL_VERBS.contains(&bytes)
-        {
-            return false;
-        }
-        if READ_ONLY_SYSTEMCTL_VERBS.contains(&bytes) {
-            saw_read_only = true;
+        if bytes.starts_with(b"--property=") {
             continue;
         }
-        if !is_unit_ish(bytes) {
+        if is_flag_token(bytes) || NON_READ_ONLY_VERBS.contains(&bytes) || !is_unit_ish(bytes) {
             return false;
         }
     }
-    saw_read_only
+    seen_verb
+}
+
+/// A `-H`/`--host` or `-M`/`--machine` option, in any form `getopt` accepts:
+/// a short cluster, a joined value, or a unique long prefix. `-H` makes root
+/// run `ssh`, and `-M` reaches another manager.
+fn systemctl_remote_option(bytes: &[u8]) -> Option<CapabilityClass> {
+    if short_cluster_has(bytes, b"H") || long_option_prefix(bytes, b"host") {
+        Some(CapabilityClass::ExecProxy)
+    } else if short_cluster_has(bytes, b"M") || long_option_prefix(bytes, b"machine") {
+        Some(CapabilityClass::PrivilegeTool)
+    } else {
+        None
+    }
+}
+
+/// `systemctl` expands `*`, `?` and `[` against loaded units itself.
+fn has_glob(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+/// Whether a unit named in a rule is one the tripwire refuses, or a glob.
+pub(crate) fn unit_literal_is_refused(bytes: &[u8]) -> bool {
+    has_glob(bytes) || classify_systemctl_unit(bytes).is_some()
 }
 
 /// One hexadecimal digit, or `None` when `byte` is not one.
@@ -887,6 +972,9 @@ const SECURITY_UNITS: &[&[u8]] = &[
     b"dbus-org.freedesktop.timesync1",
     b"chrony",
     b"chronyd",
+    b"ntp",
+    b"ntpsec",
+    b"ntpd",
 ];
 
 /// xudo's own units. Stopping the broker socket, or an `xudo-*` service,
@@ -894,7 +982,10 @@ const SECURITY_UNITS: &[&[u8]] = &[
 /// audit mirror; see [`AUDIT_MIRROR_UNITS`].
 fn is_self_unit(unit: &[u8]) -> bool {
     has_unit_stem(unit, b"xudod")
+        || has_unit_stem(unit, b"xudo")
         || unit.starts_with(b"xudo-")
+        || ((unit.starts_with(b"agent-") || unit.starts_with(b"watch-"))
+            && unit.ends_with(b".scope"))
         || is_journal_unit(unit)
         || stem_in(unit, AUDIT_MIRROR_UNITS)
 }
@@ -916,6 +1007,15 @@ fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
     // Runlevels are stems: `runlevel0.target` and the bare name both match.
     if unit.ends_with(b".target") && POWER_OR_BOOT_TARGETS.contains(&unit) {
         return Some(CapabilityClass::PowerState);
+    }
+    // `init.scope` holds PID 1, which reboots the host on SIGRTMIN+15; the
+    // effect was not verified, and refusing it is harmless. `-.slice` is every
+    // unit at once.
+    if unit == b"init.scope" || unit == b"-.slice" {
+        return Some(CapabilityClass::PowerState);
+    }
+    if unit == b"-.mount" {
+        return Some(CapabilityClass::DeviceOrFilesystem);
     }
     if stem_in(unit, RUNLEVELS) || stem_in(unit, POWER_SERVICES) {
         return Some(CapabilityClass::PowerState);
@@ -949,7 +1049,8 @@ fn class_of_unit(unit: &[u8]) -> Option<CapabilityClass> {
 /// then read both ways [`decode_unit`] documents, and refused when either
 /// reading is a unit this list refuses. The comparison is case-sensitive.
 fn classify_systemctl_unit(raw: &[u8]) -> Option<CapabilityClass> {
-    if raw.first() == Some(&b'-') {
+    // `-.slice` and `-.mount` start with a dash and are units, not flags.
+    if raw.first() == Some(&b'-') && raw != b"-.slice" && raw != b"-.mount" {
         return None;
     }
     if let Some(class) = class_of_unit(raw) {
@@ -973,12 +1074,14 @@ fn basename(path: &[u8]) -> &[u8] {
     path.rsplit_str(b"/").next().unwrap_or(path)
 }
 
-/// Verbs that start, stop, reload, isolate, or power the machine.
+/// Verbs that act on a unit, change its definition, or power the machine.
 ///
 /// A rule whose `systemctl` verb position accepts one of these, followed by a
 /// unit position that is not a finite list, can act on a unit the operator
-/// did not name. `xudo check` reports that. The power words are also the
-/// subcommands `systemctl` accepts with no unit argument.
+/// did not name. `xudo check` reports that. It is every verb of
+/// [`NON_READ_ONLY_VERBS`] except `reset-failed`, `daemon-reload` and
+/// `daemon-reexec`, which the shipped rules use and which name no unit
+/// definition or power state.
 pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
     b"start",
     b"stop",
@@ -987,16 +1090,44 @@ pub(crate) const LIFECYCLE_OR_POWER_VERBS: &[&[u8]] = &[
     b"reload",
     b"reload-or-restart",
     b"try-reload-or-restart",
+    b"reload-or-try-restart",
+    b"condrestart",
+    b"condreload",
+    b"condstop",
+    b"force-reload",
     b"kill",
     b"clean",
     b"freeze",
     b"thaw",
-    b"condrestart",
-    b"force-reload",
-    b"reload-or-try-restart",
-    b"condreload",
-    b"condstop",
     b"isolate",
+    b"set-property",
+    b"bind",
+    b"mount-image",
+    b"service-log-level",
+    b"service-log-target",
+    b"whoami",
+    b"help",
+    b"enable",
+    b"disable",
+    b"reenable",
+    b"preset",
+    b"preset-all",
+    b"mask",
+    b"unmask",
+    b"link",
+    b"revert",
+    b"add-wants",
+    b"add-requires",
+    b"edit",
+    b"set-default",
+    b"cancel",
+    b"set-environment",
+    b"unset-environment",
+    b"import-environment",
+    b"log-level",
+    b"log-target",
+    b"service-watchdogs",
+    b"switch-root",
     b"poweroff",
     b"reboot",
     b"halt",
@@ -1271,6 +1402,49 @@ fn power_subcommand_finding(name: &[u8], argv: &Argv) -> Option<DenyFinding> {
     None
 }
 
+/// The findings for one `systemctl` token. `reads` is whether the whole
+/// command has the plain read-only shape.
+fn systemctl_token_findings(index: usize, bytes: &[u8], reads: bool) -> Vec<DenyFinding> {
+    let mut findings = Vec::new();
+    // A unit-definition-mutating verb.
+    if UNIT_MUTATING_VERBS.contains(&bytes) {
+        findings.push(DenyFinding::new(
+            CapabilityClass::UnitDefinitionMutation,
+            format!(
+                "argument {index} is the unit-mutating verb {}",
+                bytes.as_bstr()
+            ),
+        ));
+    }
+    if let Some(class) = systemctl_remote_option(bytes) {
+        findings.push(DenyFinding::new(
+            class,
+            format!("argument {index} reaches another host or machine"),
+        ));
+    }
+    // A glob is expanded by systemctl against every loaded unit.
+    if !reads && has_glob(bytes) {
+        findings.push(DenyFinding::new(
+            CapabilityClass::SelfModification,
+            format!("argument {index} is a glob that can name any unit"),
+        ));
+    }
+    // A unit an acting verb would start, stop, or signal. Only the plain
+    // read-only shape is exempt: diagnosing these units is not a hole. Power
+    // subcommands are refused elsewhere. This still refuses a listed unit an
+    // operator named.
+    if !reads && let Some(class) = classify_systemctl_unit(bytes) {
+        findings.push(DenyFinding::new(
+            class,
+            format!(
+                "argument {index} names the restricted unit {}",
+                bytes.as_bstr()
+            ),
+        ));
+    }
+    findings
+}
+
 /// Classes implied by the shape of the arguments.
 ///
 /// `name` is consulted only where a flag's meaning depends on which program
@@ -1366,31 +1540,8 @@ fn deny_by_arguments(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
             ));
         }
 
-        // A unit-definition-mutating verb.
-        if name == b"systemctl" && UNIT_MUTATING_VERBS.contains(&bytes) {
-            findings.push(DenyFinding::new(
-                CapabilityClass::UnitDefinitionMutation,
-                format!(
-                    "argument {index} is the unit-mutating verb {}",
-                    bytes.as_bstr()
-                ),
-            ));
-        }
-
-        // A unit an acting verb would start, stop, or signal. Read-only verbs
-        // are exempt: diagnosing these units is not a hole. Power subcommands
-        // are refused above. This still refuses a listed unit an operator named.
-        if name == b"systemctl"
-            && !systemctl_reads
-            && let Some(class) = classify_systemctl_unit(bytes)
-        {
-            findings.push(DenyFinding::new(
-                class,
-                format!(
-                    "argument {index} names the restricted unit {}",
-                    bytes.as_bstr()
-                ),
-            ));
+        if name == b"systemctl" {
+            findings.extend(systemctl_token_findings(index, bytes, systemctl_reads));
         }
 
         // An option that redirects a package manager's configuration, hooks, or
@@ -1426,7 +1577,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 4);
+        assert_eq!(deny_list_version(), 5);
     }
 
     #[test]
@@ -1888,22 +2039,35 @@ mod tests {
             // assertion fails, and that region would be uncovered.
             let name = verb.as_bstr();
             assert!(!POWER_SUBCOMMANDS.contains(verb), "{name}");
-            assert!(!ACTING_SYSTEMCTL_VERBS.contains(verb), "{name}");
             assert!(!UNIT_MUTATING_VERBS.contains(verb), "{name}");
+            assert!(!NON_READ_ONLY_VERBS.contains(verb), "{name}");
         }
-        for verb in ACTING_SYSTEMCTL_VERBS {
+        for verb in POWER_SUBCOMMANDS.iter().chain(UNIT_MUTATING_VERBS.iter()) {
             let name = verb.as_bstr();
-            assert!(!POWER_SUBCOMMANDS.contains(verb), "{name}");
+            assert!(NON_READ_ONLY_VERBS.contains(verb), "{name}");
         }
-        for verb in POWER_SUBCOMMANDS
-            .iter()
-            .chain(ACTING_SYSTEMCTL_VERBS.iter())
-        {
-            // The name is formatted on the success path. A format argument
-            // that runs only when the assertion fails is an uncovered line.
+        for verb in NON_READ_ONLY_VERBS {
             let name = verb.as_bstr();
-            assert!(LIFECYCLE_OR_POWER_VERBS.contains(verb), "{name}");
+            let exempt = [
+                b"reset-failed".as_slice(),
+                b"daemon-reload".as_slice(),
+                b"daemon-reexec".as_slice(),
+            ]
+            .contains(verb);
+            assert_eq!(LIFECYCLE_OR_POWER_VERBS.contains(verb), !exempt, "{name}");
         }
+    }
+
+    #[test]
+    fn remote_options_and_refused_literals_are_recognised() {
+        assert!(systemctl_remote_option(b"-lH").is_some());
+        assert!(systemctl_remote_option(b"-M").is_some());
+        assert!(systemctl_remote_option(b"--ma").is_some());
+        assert!(systemctl_remote_option(b"--host=x").is_some());
+        assert!(systemctl_remote_option(b"--help").is_none());
+        assert!(unit_literal_is_refused(b"stop*"));
+        assert!(unit_literal_is_refused(b"-.mount"));
+        assert!(!unit_literal_is_refused(b"nginx.service"));
     }
 
     #[test]
@@ -1947,11 +2111,22 @@ mod tests {
             "journald",
         ])));
         assert!(systemctl_read_only(&Argv::new(vec![
+            "show",
+            "xudod.socket",
+            "--property=ActiveState",
+        ])));
+        assert!(!systemctl_read_only(&Argv::new(vec![
             "-p",
             "ActiveState",
             "status",
             "xudod.socket",
         ])));
+        assert!(!systemctl_read_only(&Argv::new(vec![
+            "status",
+            "xudod.socket",
+            "-H",
+        ])));
+        assert!(!systemctl_read_only(&Argv::default()));
         assert!(!systemctl_read_only(&Argv::new(vec![
             "-p",
             "status",
@@ -1988,13 +2163,6 @@ mod tests {
                 evaluate_deny_list(
                     b"/usr/bin/systemctl",
                     &Argv::new(vec!["status", "xudod.socket"])
-                )
-                .is_empty()
-            );
-            assert!(
-                evaluate_deny_list(
-                    b"/usr/bin/systemctl",
-                    &Argv::new(vec!["--no-pager", "--full", "status", "journald"])
                 )
                 .is_empty()
             );

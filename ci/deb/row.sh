@@ -92,8 +92,10 @@ shipped=$(find /etc/sudoers.d -mindepth 1 -maxdepth 1 ! -name xudo | sort)
 
 # Upgrade keeps the rule, a group member, and an operator's edit to a shipped rule.
 echo '# mine' >>/etc/xudo/rules.d/05-probe.toml
-# The operator kept the published beta.1 file. A comment is not that file.
-cp /harness/fixtures/20-services-beta.1.toml /etc/xudo/rules.d/20-services.toml
+# old.deb itself ships the published beta.1 file as its conffile. The operator
+# edits it, so both upstream and local differ from what dpkg last installed.
+cmp /etc/xudo/rules.d/20-services.toml /harness/fixtures/20-services-beta.1.toml || fail "old.deb does not ship the beta.1 services file"
+echo '# edited by the operator' >>/etc/xudo/rules.d/20-services.toml
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
@@ -148,6 +150,20 @@ gone /etc/xudo
 gone /var/lib/xudo
 ! getent group xudo >/dev/null || fail "purge left the group"
 for f in $shipped; do [ -e "$f" ] || fail "purge removed $f"; done
+
+# An operator who never edited the services file: dpkg replaces it with the
+# new package's, which has no lifecycle rule, and xudo check is clean.
+deb_install ./old.deb
+cmp /etc/xudo/rules.d/20-services.toml /harness/fixtures/20-services-beta.1.toml || fail "old.deb does not ship the beta.1 services file"
+deb_install ./new.deb
+if grep -q 'xudo.svc.lifecycle' /etc/xudo/rules.d/20-services.toml; then fail "dpkg kept an unedited beta.1 services file"; fi
+set +e
+xudo check >/tmp/check.out 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { cat /tmp/check.out >&2; fail "xudo check after dpkg replaced the file exited $rc, wanted 0"; }
+if grep -Eq 'dpkg: error|^E:' /tmp/apt.log; then cat /tmp/apt.log >&2; fail "replacing the unedited file failed"; fi
+apt purge xudo
 
 # A rule the operator removed is not put back by an upgrade.
 deb_install ./old.deb

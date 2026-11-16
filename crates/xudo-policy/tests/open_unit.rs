@@ -329,3 +329,32 @@ args = [
     assert_eq!(set.open_unit_actions().len(), 1);
     assert!(set.has_systemctl_lifecycle_or_power());
 }
+
+#[test]
+fn a_one_of_listing_a_tripwire_unit_is_linted() {
+    let rule = |unit: &str| {
+        format!(
+            "\
+[[action]]
+id = \"xudo.svc.lifecycle\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+args = [
+  {{ name = \"verb\", matcher = {{ literal = \"restart\" }} }},
+  {{ name = \"unit\", matcher = {{ one-of = [\"nginx.service\", \"{unit}\"] }} }},
+]
+"
+        )
+    };
+    for unit in [
+        "debug-shell.service",
+        "xudod.socket",
+        "*",
+        "ngin?.service",
+        "-.mount",
+    ] {
+        let message = lint_message(&rule(unit)).unwrap();
+        assert!(message.contains("always refuses"), "{unit}: {message}");
+    }
+    expect_lint("a plain list", &rule("example.service"), false);
+}
