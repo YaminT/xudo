@@ -76,5 +76,10 @@ cd /work
 if [ "$#" -eq 0 ]; then
     run cargo test -p xudod -p xudo-gate
 fi
-run cargo test --workspace --all-features "$@" -- --nocapture
+run cargo test --workspace --all-features "$@"
+# Quote the cgroup rung and errno the real kernel chose; fail if it is silent.
+rung=$(run cargo test -p xudo-sys --lib -- --exact --nocapture \
+    cgroup::tests::linux_cgroup_sources_agree_and_print_the_selected_rung 2>&1)
+echo "$rung"
+grep -q 'linux-test cgroup rung=' <<<"$rung"
 INNER
