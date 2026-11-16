@@ -3,6 +3,7 @@
 #
 #   packaging/deb/build.sh <musl triple> [outdir]      (or: just deb)
 #
+# SERVICES_CONFFILE replaces the packaged 20-services.toml (the upgrade test).
 # VERSION overrides the workspace version (the upgrade test builds a second one).
 # Run `cargo build --release --target <triple>` for the four binaries first.
 set -eu
@@ -44,6 +45,17 @@ install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-auth"
 install -m 0644 "$root"/packaging/systemd/* "$stage/usr/lib/systemd/system/"
 install -m 0644 "$root/packaging/tmpfiles.d/xudo.conf" "$stage/usr/lib/tmpfiles.d/"
 install -m 0644 "$root"/rules/*.toml "$stage/etc/xudo/rules.d/"
+# The upgrade test packages the published beta.1 services conffile as
+# the old package's own, so dpkg sees a real upstream change on upgrade.
+if [ -n "${SERVICES_CONFFILE:-}" ]; then
+    install -m 0644 "$SERVICES_CONFFILE" "$stage/etc/xudo/rules.d/20-services.toml"
+fi
+# The lifecycle example is not a rule. `rules/*.toml` does not match
+# `rules/examples/*.toml.example`. It is installed under /usr/share/xudo,
+# which Ubuntu images do not path-exclude, and it is not a conffile.
+mkdir -p "$stage/usr/share/xudo/examples"
+install -m 0644 "$root/rules/examples/20-services-lifecycle.toml.example" \
+    "$stage/usr/share/xudo/examples/20-services-lifecycle.toml"
 mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \

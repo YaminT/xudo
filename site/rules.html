@@ -3,6 +3,17 @@
 <body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
 <h1>Rule format</h1><p>Native rules are TOML files. Each action fixes one executable and constrains each argument by position. There are no globs.</p>
 <pre><code>[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "full", matcher = { literal = "--full" } },
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]</code></pre>
+<p>This read-only action is from <code>rules/10-diagnostics.toml</code>. The shipped rules do not start or stop a service. To allow that on one host, copy the package's example, <code>/usr/share/xudo/examples/20-services-lifecycle.toml</code>, to <code>/etc/xudo/rules.d/</code> and list your units in an enumerated <code>one-of</code>. Leave a unit out and the command is refused:</p>
+<pre><code>[[action]]
 id = "xudo.svc.lifecycle"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
@@ -10,7 +21,7 @@ args = [
   { name = "no-pager", matcher = { literal = "--no-pager" } },
   { name = "no-ask", matcher = { literal = "--no-ask-password" } },
   { name = "verb", matcher = { one-of = ["start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "try-reload-or-restart"] } },
-  { name = "unit", matcher = { name = "unit-name" } },
+  { name = "unit", matcher = { one-of = ["example.service", "example-other.service"] } },
 ]</code></pre>
-<p>This example is from <code>rules/20-services.toml</code>. See the repository's <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rule files</a> and <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">behavior source</a>.</p>
+<p>See the repository's <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rule files</a> and <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">behavior source</a>.</p>
 </main><footer><a href="./">xudo documentation</a></footer></body></html>

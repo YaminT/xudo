@@ -501,7 +501,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Read};
     use std::os::unix::net::UnixListener;
-    use std::thread;
 
     use super::*;
     use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
@@ -1306,15 +1305,8 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("broker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).unwrap();
-            let _request = BrokerRequest::parse(&bytes).unwrap();
-            stream
-                .write_all(watching(Vec::new()).to_json().as_bytes())
-                .unwrap();
-        });
+        let broker =
+            crate::test_broker::serve_once(listener, watching(Vec::new()).to_json().into_bytes());
         let request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Pending,
@@ -1327,7 +1319,7 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
                 omitted: 0,
             }
         );
-        broker.join().unwrap();
+        broker.finish();
     }
 
     #[test]
@@ -1335,19 +1327,14 @@ args = [{ name = "verb", matcher = { literal = "remove" } }]
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("broker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).unwrap();
-            stream.write_all(b"not json").unwrap();
-        });
+        let broker = crate::test_broker::serve_once(listener, b"not json".to_vec());
         let request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Pending,
         };
         let err = ask_within(&socket, &request, PATIENT).unwrap_err();
         assert!(err.contains("broker response"), "{err}");
-        broker.join().unwrap();
+        broker.finish();
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::io::Write;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use term_sanitize::{Clean, Limits};
 use xudo_policy::{
     CallerFacts, Classification, DenialCode, ExitCode, TestError, TestOutcome, TestResult,
@@ -33,10 +33,20 @@ const LIMITS: Limits = Limits {
     max_lines: 1,
 };
 
+/// A systemctl rule that can start or stop a unit it does not name.
+struct OpenUnit {
+    action: String,
+    file: String,
+    line: u32,
+    message: String,
+}
+
 /// Everything one run found.
 struct Report {
     /// A rule that allowlists what the deny-list refuses: the id and the classes.
     errors: Vec<(String, Vec<String>)>,
+    /// A systemctl rule whose unit matcher is not a finite list.
+    open_units: Vec<OpenUnit>,
     /// One rendered overlap each.
     warnings: Vec<String>,
     results: Vec<TestResult>,
@@ -56,8 +66,10 @@ impl Report {
     fn status(&self) -> ExitCode {
         [
             (self.failed() > 0).then_some(ExitCode::TestFailure),
-            (!self.errors.is_empty() || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
-                .then_some(ExitCode::LintError),
+            (!self.errors.is_empty()
+                || !self.open_units.is_empty()
+                || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
+            .then_some(ExitCode::LintError),
             (!self.warnings.is_empty()).then_some(ExitCode::LintWarning),
         ]
         .into_iter()
@@ -88,8 +100,8 @@ pub(crate) fn run(
     } else {
         loaded.rules().overlaps()
     };
-    let (errors, warnings) = if tests_only {
-        (Vec::new(), Vec::new())
+    let (errors, open_units, warnings) = if tests_only {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         (
             loaded
@@ -103,21 +115,35 @@ pub(crate) fn run(
                     )
                 })
                 .collect(),
+            loaded
+                .rules()
+                .open_unit_actions()
+                .iter()
+                .map(|lint| OpenUnit {
+                    action: lint.id.to_string(),
+                    file: lint.source.file.clone(),
+                    line: lint.source.line,
+                    message: lint.message(),
+                })
+                .collect(),
             overlaps.iter().map(ToString::to_string).collect(),
         )
     };
     let human = CallerFacts::new(Classification::Human, 1000);
     let report = Report {
         errors,
+        open_units,
         warnings,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
     let status = report.status();
+    let note =
+        crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT);
     match cli.output {
-        Format::Human => human_report(loaded, &report, tests_only, out, err),
+        Format::Human => human_report(loaded, &report, tests_only, note, out, err),
         Format::Json => {
-            let _ = writeln!(out, "{}", envelope(&report, status));
+            let _ = writeln!(out, "{}", envelope(&report, status, note));
         }
     }
     status
@@ -127,6 +153,7 @@ fn human_report(
     loaded: &LoadedRules,
     report: &Report,
     tests_only: bool,
+    note: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) {
@@ -144,9 +171,12 @@ fn human_report(
             "xudo: a rule that allowlists a shell-capable binary defeats the design"
         );
     }
+    for open in &report.open_units {
+        let _ = writeln!(err, "xudo: {}", safe(&open.message));
+    }
 
     if !tests_only {
-        if report.errors.is_empty() {
+        if report.errors.is_empty() && report.open_units.is_empty() {
             let _ = writeln!(
                 out,
                 "ok: {} action(s) in {} file(s), generation {}",
@@ -154,6 +184,10 @@ fn human_report(
                 loaded.files().len(),
                 loaded.generation().get(..12).unwrap_or(loaded.generation())
             );
+        }
+        // A note, not a finding: the exit status above does not count it.
+        if let Some(note) = note {
+            let _ = writeln!(out, "{note}");
         }
         // Reported, not refused: the engine resolves a command more than one
         // action accepts to the strictest of them, so an overlap is not a hole.
@@ -171,6 +205,8 @@ fn human_report(
                 report.warnings.len()
             );
         }
+    } else if let Some(note) = note {
+        let _ = writeln!(out, "{note}");
     }
     if let Some(fuzz) = &report.fuzz {
         fuzz_lines(fuzz, out, err);
@@ -294,31 +330,62 @@ fn failure(result: &TestResult, out: &mut dyn Write) {
 
 /// The machine-readable report. Strings are JSON-escaped, not sanitized: the
 /// consumer is a program, and it gets the bytes the rule file holds.
-fn envelope(report: &Report, status: ExitCode) -> Value {
+fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
     let results: Vec<Value> = report.results.iter().map(result_json).collect();
-    let mut envelope = json!({
-        "schema_version": SCHEMA_VERSION,
-        "exit_code": status.as_i32(),
-        "lint": {
-            "errors": report
+    // A map, not `json!` then `as_object_mut`: that `if let` has a `None` arm
+    // `json!` can never take, and coverage has nothing to mark it with.
+    let mut fields = Map::new();
+    fields.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
+    fields.insert("exit_code".to_owned(), json!(status.as_i32()));
+    let mut lint = Map::new();
+    lint.insert(
+        "errors".to_owned(),
+        json!(
+            report
                 .errors
                 .iter()
                 .map(|(id, classes)| json!({ "action": id, "classes": classes }))
-                .collect::<Vec<_>>(),
-            "warnings": report.warnings,
-        },
-        "tests": {
+                .collect::<Vec<_>>()
+        ),
+    );
+    lint.insert("warnings".to_owned(), json!(report.warnings));
+    // Absent when nothing matched, so a run with no such rule stays byte for
+    // byte what it was.
+    if !report.open_units.is_empty() {
+        lint.insert(
+            "open_unit_lints".to_owned(),
+            json!(
+                report
+                    .open_units
+                    .iter()
+                    .map(|open| json!({
+                        "action": open.action,
+                        "file": open.file,
+                        "line": open.line,
+                        "message": open.message,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    fields.insert("lint".to_owned(), Value::Object(lint));
+    fields.insert(
+        "tests".to_owned(),
+        json!({
             "total": report.results.len(),
             "failed": report.failed(),
             "results": results,
-        },
-    });
+        }),
+    );
     // Only when asked for, so a run without `--fuzz` is byte for byte what it
-    // was.
-    if let (Some(fuzz), Some(fields)) = (&report.fuzz, envelope.as_object_mut()) {
+    // was. The lifecycle note is the same: absent when the rule is loaded.
+    if let Some(fuzz) = &report.fuzz {
         fields.insert("fuzz".to_owned(), fuzz_json(fuzz));
     }
-    envelope
+    if let Some(note) = note {
+        fields.insert("note".to_owned(), json!(note));
+    }
+    Value::Object(fields)
 }
 
 fn result_json(result: &TestResult) -> Value {
@@ -447,12 +514,13 @@ mod tests {
     fn a_fuzz_finding_sets_the_lint_error_status_and_the_envelope_lists_it() {
         let mut found = Report {
             errors: Vec::new(),
+            open_units: Vec::new(),
             warnings: Vec::new(),
             results: Vec::new(),
             fuzz: Some(report()),
         };
         assert_eq!(found.status(), ExitCode::LintError);
-        let json = envelope(&found, found.status());
+        let json = envelope(&found, found.status(), None);
         insta::assert_snapshot!(
             "fuzz_envelope",
             serde_json::to_string_pretty(&json).unwrap()

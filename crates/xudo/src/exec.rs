@@ -641,13 +641,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            s.read_to_end(&mut request).unwrap();
-            s.write_all(&reply).unwrap();
-            request
-        });
+        let broker = crate::test_broker::serve_once(listener, reply);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = plan_with_confirmation_timeout(
             cli,
@@ -660,7 +654,7 @@ mod tests {
             &mut out,
             &mut err,
         );
-        let request = broker.join().unwrap();
+        let request = broker.finish();
         // What the broker received is exactly what the caller typed.
         let sent = BrokerRequest::parse(&request).unwrap();
         assert_eq!(
@@ -716,18 +710,13 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         std::path::PathBuf,
-        thread::JoinHandle<()>,
+        crate::test_broker::Served,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("broker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let reply = reply.to_json().into_bytes();
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            stream.write_all(&reply).unwrap();
-        });
+        let broker = crate::test_broker::serve_once(listener, reply);
         (dir, socket, broker)
     }
 
@@ -798,12 +787,7 @@ mod tests {
             id: "c".repeat(64),
             expires_in_ms: 20_000,
         });
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).unwrap();
-            stream.write_all(&response).unwrap();
-        });
+        let broker = crate::test_broker::serve_once(listener, response);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         // The first sleep lasts the whole window, so no status is asked: the
         // outcome does not depend on how fast the machine is.
@@ -818,7 +802,7 @@ mod tests {
             &mut out,
             &mut err,
         );
-        broker.join().unwrap();
+        broker.finish();
         assert_eq!(result, Err(ExitCode::NotConfirmed));
     }
 
@@ -1246,7 +1230,7 @@ mod tests {
             ),
             Err(ExitCode::NotConfirmed)
         );
-        broker.join().unwrap();
+        broker.finish();
         drop(dir);
         assert!(
             String::from_utf8(err)
@@ -1304,7 +1288,7 @@ mod tests {
                 ),
                 Err(ExitCode::Unusable)
             );
-            broker.join().unwrap();
+            broker.finish();
             drop(dir);
         }
     }
@@ -1341,7 +1325,7 @@ mod tests {
             ),
             Err(ExitCode::NotConfirmed)
         );
-        broker.join().unwrap();
+        broker.finish();
         drop(dir);
     }
 
@@ -1382,7 +1366,7 @@ mod tests {
                 .unwrap()
                 .contains("broker refused the approval re-run")
         );
-        broker.join().unwrap();
+        broker.finish();
         drop(dir);
     }
 
@@ -1423,7 +1407,7 @@ mod tests {
             ),
             Err(ExitCode::Unusable)
         );
-        broker.join().unwrap();
+        broker.finish();
         drop(dir);
         assert!(String::from_utf8(err).unwrap().contains("minted no entry"));
     }

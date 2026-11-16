@@ -174,6 +174,8 @@ pub enum Stage {
     Descriptors,
     /// Replace closed standard streams with `/dev/null`.
     Streams,
+    /// Set umask `022` and the working directory to `/`.
+    CallerState,
     /// Forbid gaining privilege by exec.
     Privileges,
     /// Accept the invocation: no arguments, and the one name that runs.
@@ -204,6 +206,7 @@ impl Stage {
         match self {
             Self::Descriptors => "mark its inherited descriptors close-on-exec",
             Self::Streams => "settle its standard streams",
+            Self::CallerState => "reset its umask and working directory",
             Self::Privileges => "forbid new privileges",
             Self::Invocation => "accept this invocation",
             Self::Procfs => "verify /proc",
@@ -223,6 +226,7 @@ impl Stage {
         match self {
             Self::Descriptors => "gate_failed_descriptors",
             Self::Streams => "gate_failed_streams",
+            Self::CallerState => "gate_failed_caller_state",
             Self::Privileges => "gate_failed_privileges",
             Self::Invocation => "gate_failed_invocation",
             Self::Procfs => "gate_failed_procfs",
@@ -1533,6 +1537,7 @@ args = [
         let stages = [
             Stage::Descriptors,
             Stage::Streams,
+            Stage::CallerState,
             Stage::Privileges,
             Stage::Invocation,
             Stage::Procfs,

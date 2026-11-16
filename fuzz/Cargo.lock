@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "term-sanitize"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 
 [[package]]
 name = "thiserror"
@@ -450,7 +450,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "xudo-audit"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-backend"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-config"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-gate"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-policy"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bstr",
  "regex",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "xudo-sys"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "bstr",
  "rustix",
@@ -531,14 +531,14 @@ dependencies = [
 
 [[package]]
 name = "xudo-sys-raw"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "xudo-wire"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "xudod"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",

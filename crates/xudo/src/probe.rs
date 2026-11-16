@@ -195,9 +195,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
     use std::cell::RefCell;
-    use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
-    use std::thread;
 
     use xudo_policy::{Decision, DenialCode, Verdict};
     use xudo_sys::{Output, SysError};
@@ -294,13 +292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            s.read_to_end(&mut request).unwrap();
-            let _ = s.write_all(&reply);
-            request
-        });
+        let broker = crate::test_broker::serve_once(listener, reply);
         let probe = BrokerProbe {
             socket: &socket,
             timeout: PATIENT,
@@ -308,10 +300,7 @@ mod tests {
             files,
         };
         let result = probe.verify(&argv());
-        (
-            result,
-            BrokerRequest::parse(&broker.join().unwrap()).unwrap(),
-        )
+        (result, BrokerRequest::parse(&broker.finish()).unwrap())
     }
 
     /// The result as text, after checking it is `Unavailable`.
