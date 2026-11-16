@@ -13,7 +13,8 @@
 # is a real name, and pkg+ asks apt to install. The install action also
 # requires the literal --no-remove, in the option group before the verb, so an
 # install that would remove a conflicting package is refused. The operator
-# removes that package with xudo.pkg.remove, which always confirms. The
+# removes that package with xudo.pkg.remove, which confirms when confirm_human_path is on (off by
+# default, where the password alone satisfies it). The
 # compiled-in deny-list independently refuses `-o`/`--option`/`--config-file`,
 # because `apt-get -o DPkg::Pre-Invoke::='...'` is a /bin/sh-as-root injection
 # through a rule that only meant to install a package.
