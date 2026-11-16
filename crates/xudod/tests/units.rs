@@ -553,6 +553,12 @@ fn deb_postinst_warns_when_a_kept_beta1_lifecycle_rule_remains() {
         "upgrade notice does not tell the operator to run xudo check"
     );
     assert!(
+        block.contains(
+            "if you kept /etc/xudo/rules.d/30-packages.toml, compare it with the new package file"
+        ),
+        "upgrade notice does not name the kept packages rule"
+    );
+    assert!(
         !block.contains("xudo.svc.lifecycle"),
         "upgrade notice still keys off the action id"
     );

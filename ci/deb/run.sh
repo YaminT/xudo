@@ -90,6 +90,8 @@ mkdir -p "$root/target/deb-mount"
 rm -f "$root"/target/deb-mount/*
 cp "$old" "$root/target/deb-mount/old.deb"
 cp "$up" "$root/target/deb-mount/new.deb"
+# The package the lane was given is the one that gets signed: install it too.
+cp "$deb" "$root/target/deb-mount/real.deb"
 
 fail=0
 for image in "${rows[@]}"; do
@@ -108,7 +110,7 @@ done
 echo "== lintian"
 docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$root/target/deb-mount:/debs:ro" -v "$here:/harness:ro" debian:13 sh -c '
     apt-get update -qq && apt-get install -y -qq lintian >/dev/null &&
-    lintian --fail-on warning,error /debs/old.deb' ||
+    lintian --fail-on warning,error /debs/old.deb /debs/real.deb' ||
     { echo "FAIL: lintian" >&2; fail=1; }
 
 ((fail == 0)) || exit 1

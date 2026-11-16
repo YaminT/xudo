@@ -25,6 +25,7 @@ if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt '0.1.0~beta.2'; then
     # The action id is not the signal: a comment can keep the string after
     # the operator closed the rule. Say to check. Do not claim the host is exposed.
     echo 'xudo: if you kept /etc/xudo/rules.d/20-services.toml, check it with `xudo check`.' >&2
+    echo 'xudo: if you kept /etc/xudo/rules.d/30-packages.toml, compare it with the new package file (`xudo doctor` shows it as changed locally).' >&2
 fi
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
