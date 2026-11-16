@@ -12,8 +12,12 @@ package does not install a `NOPASSWD` rule. The passwordless agent path,
 Landlock confinement, and same-uid watcher separation are not in this release.
 Out-of-band confirmation through `xudo watch` is built but off by default; every
 path still requires the password. Session and terminal checks do not prove a
-human: a same-uid agent can run `script -qc 'xudo watch'`. M4's cgroup scope is
-needed to separate the agent from the human.
+human: a same-uid agent can run `script -qc 'xudo watch'`. A cgroup scope for agents, not in this
+release, is needed to separate the agent from the human.
+
+The doas rule `xudo install` writes is `permit persist`. On an OpenDoas built
+with timestamp support, one password then covers about five minutes, unlike the
+sudo rule, which sets `timestamp_timeout=0`. The package depends on sudo.
 
 The published `v0.1.0-beta.1` package ships `xudo.svc.lifecycle` accepting
 `systemctl` start, stop, and restart of power, reboot, rescue, kernel-module,
