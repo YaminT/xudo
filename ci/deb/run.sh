@@ -81,7 +81,7 @@ echo "PASS: lifecycle example is documentation, not a shipped rule"
 # binaries are the ones just built. new.deb is the next patch, which stays
 # newer than 0.1.0~beta.1 after that bump.
 rm -rf "$root/target/deb-old"
-old=$(VERSION=0.1.0-beta.1 "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-old")
+old=$(VERSION=0.1.0-beta.1 SERVICES_CONFFILE="$here/fixtures/20-services-beta.1.toml" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-old")
 [ -f "$old" ] || { echo "FAIL: beta.1 package not at $old" >&2; exit 1; }
 rm -rf "$root/target/deb-upgrade"
 up=$(VERSION="${numeric%.*}.$((patch + 1))" "$root/packaging/deb/build.sh" "$triple" "$root/target/deb-upgrade")

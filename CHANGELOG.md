@@ -40,18 +40,27 @@ All notable changes to xudo are documented here. This project follows
   with the other power services: its unit file sets `SuccessAction=exit-force`.
   An option value cannot hide the verb: `-p`, `-M`, `--when`, `--message`,
   and the other options that take the next argument are scanned like every
-  other token. A command is read-only only when a read-only verb is present
-  and every other non-flag token is a unit name. `status rescue` is refused,
+  other token. The read-only exemption is a whitelist of one shape: optional
+  no-value flags (`--no-pager`, `--full`, `--no-ask-password`, `-l`,
+  `--no-legend`, `--plain`, `--value`, `--all`), a read-only verb, then only
+  unit names or joined `--property=` flags. Any other option, or any verb of
+  the non-read-only set (including `reenable`, `reset-failed`), removes it
+  and the full check applies to every token. `*`, `?` and `[` in a token
+  outside that shape, and `-H`, `--host`, `-M`, `--machine` and their
+  prefixes, are refused. `status rescue` is refused,
   because `rescue` is a power subcommand. `status rescue.service` still reads.
 - The acting verbs also include `kill`, `clean`, `freeze`, `thaw`, and the
   compatibility names `condrestart`, `force-reload`, `reload-or-try-restart`,
   `condreload`, and `condstop`. Stock Debian 13 and Ubuntu images used for
   the check do not ship `systemctl`, so those names were not confirmed with
   `--help`. A verb systemd would reject is still refused.
-- The tripwire covers the `systemctl` program only. `service`,
-  `invoke-rc.d`, `busctl`, and a unit alias such as firewalld's
-  `dbus-org.fedoraproject.FirewallD1.service` get around it. The enumeration
-  is the boundary.
+- The tripwire is best effort for operator rules and covers the `systemctl`
+  program only. A rule whose exe is not exactly `systemctl` gets no checks
+  and no lint. `service`, `invoke-rc.d`, `busctl`, and a unit alias such as
+  firewalld's `dbus-org.fedoraproject.FirewallD1.service` get around it. The
+  enumeration is the boundary. `xudo check` also reports an enumerated unit
+  list that names a refused unit or a glob. The set of non-read-only verbs
+  is from the systemd 257 verb table and was not checked against a binary.
 - `systemd-journald` followed by `-`, `.`, or `@` is the journal for any
   continuation. `systemd-journald-audit.socket` was not refused.
 - Read-only `systemctl` verbs (`status`, `show`, `is-active`, `is-failed`,
