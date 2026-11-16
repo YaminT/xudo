@@ -208,7 +208,7 @@ mod imp {
         Mode, OFlags, ResolveFlags, fstat, fstatfs, open as open_path, openat, openat2,
     };
 
-    use super::{HostCgroup, ScopeFacts};
+    use super::{HostCgroup, ScopeFacts, is_record_name};
     use crate::SysError;
     use crate::syscall::Syscalls as _;
 
@@ -373,10 +373,14 @@ mod imp {
         let relative = path.strip_prefix('/').ok_or_else(|| {
             SysError::malformed("/proc/<pid>/cgroup", "unified path is not absolute")
         })?;
-        if relative.is_empty()
-            || relative
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
+        if relative.is_empty() {
+            // A container's private cgroup namespace shows its own root as
+            // "/". That is the pinned root itself: no scope can be that inode.
+            return stat_of(&host.root, "fstat cgroup root").map(|stat| stat.st_ino);
+        }
+        if relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         {
             return Err(SysError::malformed(
                 "/proc/<pid>/cgroup",
@@ -394,8 +398,10 @@ mod imp {
             PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
         )];
         let timeout = Timespec::default();
-        rustix_result(poll(&mut fds, Some(&timeout)), "poll(pidfd)")
-            .map(|_| fds[0].revents().is_empty())
+        rustix_result(poll(&mut fds, Some(&timeout)), "poll(pidfd)").map(|_| {
+            let [polled] = &fds;
+            polled.revents().is_empty()
+        })
     }
 
     pub(super) fn scope_names(host: &HostCgroup) -> Result<Vec<String>, SysError> {
@@ -422,15 +428,6 @@ mod imp {
         Ok(names)
     }
 
-    fn is_record_name(name: &str) -> bool {
-        let Some((kind, suffix)) = name.split_once('-') else {
-            return false;
-        };
-        (kind == "agent" || kind == "watch")
-            && suffix.len() == 32
-            && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }
-
     pub(super) fn scope_facts(
         host: &HostCgroup,
         name: &str,
@@ -455,8 +452,7 @@ mod imp {
         {
             return Ok(None);
         }
-        let path = format!("xudo.slice/{name}");
-        let dir = match open_dir_at(&host.root, path.as_str(), "openat2 scope") {
+        let dir = match open_dir_at(&slice, name, "openat2 scope") {
             Ok(fd) => fd,
             Err(error) if is_missing(&error) => return Ok(None),
             Err(error) => return Err(error),
@@ -473,7 +469,12 @@ mod imp {
             let pid = line
                 .parse::<u32>()
                 .map_err(|_| SysError::malformed("cgroup.procs", "invalid process id"))?;
-            processes.push((pid, read_starttime(pid)?));
+            match read_starttime(pid) {
+                Ok(starttime) => processes.push((pid, starttime)),
+                // Exited since the list was read: not in the scope any more.
+                Err(error) if is_missing(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         let record_name = name.strip_suffix(".scope").unwrap_or_default();
         let record = read_record(host, record_name)?;
@@ -822,6 +823,17 @@ fn read_cgroup_path<C: CgroupCalls + ?Sized>(calls: &C, pid: u32) -> Result<Stri
     Ok(path.as_str().to_owned())
 }
 
+/// Whether `name` is a committed `agent-<32 hex>` or `watch-<32 hex>` record
+/// name. `pending-*` names and anything else carry no authority.
+fn is_record_name(name: &str) -> bool {
+    let Some((kind, suffix)) = name.split_once('-') else {
+        return false;
+    };
+    (kind == "agent" || kind == "watch")
+        && suffix.len() == 32
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Finds a live agent/watch scope by cgroup id, never by a name alone.
 ///
 /// # Errors
@@ -842,7 +854,7 @@ pub fn scope_status(
             ScopeKind::Watch => "watch-",
         };
         for record_name in calls.scope_names()? {
-            if !record_name.starts_with(prefix) {
+            if !record_name.starts_with(prefix) || !is_record_name(&record_name) {
                 continue;
             }
             let name = format!("{record_name}.scope");
@@ -1220,6 +1232,25 @@ mod tests {
         let facts = imp::scope_facts(&host, name).unwrap().unwrap();
         assert_eq!(facts.processes.len(), 1);
         every_step_failing(&|| imp::scope_facts(&host, name).map(drop));
+        // A process that left the scope after the list was read is dropped.
+        std::fs::write(
+            scope_dir.join("cgroup.procs"),
+            format!("{}\n{}\n", std::process::id(), u32::MAX),
+        )
+        .unwrap();
+        assert_eq!(
+            imp::scope_facts(&host, name)
+                .unwrap()
+                .unwrap()
+                .processes
+                .len(),
+            1
+        );
+        std::fs::write(
+            scope_dir.join("cgroup.procs"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
         let process = facts.processes.first().copied().unwrap();
         assert_eq!(process.0, std::process::id());
         assert!(process.1 > 0);
@@ -1621,7 +1652,7 @@ mod tests {
         );
         assert!(imp::cgroup_inode(&host, "/../outside").is_err());
         assert!(imp::cgroup_inode(&host, "relative").is_err());
-        assert!(imp::cgroup_inode(&host, "/").is_err());
+        assert!(imp::cgroup_inode(&host, "/").is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -1855,6 +1886,17 @@ mod tests {
             let c = FakeCgroup::path_result(info, "", Ok(42), true);
             assert!(peer_cgroup_id(&c, 9, a.as_fd()).is_err());
         }
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_committed_record_name_is_never_a_scope() {
+        let mut fake = scope_fake("agent", 1, 1, 0, 0o100_644, true, vec![(42, 73)], true);
+        fake.names = vec![format!("agent-{}", "g".repeat(32)), "agent-1".to_owned()];
+        assert!(
+            scope_status(&fake, 1, 1000, &parse_record)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

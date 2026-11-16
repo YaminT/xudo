@@ -200,3 +200,65 @@ fn the_pure_cgroup_and_peer_decisions_run_through_the_external_fake_seams() {
     );
     assert!(parse_process_security_status(b"TracerPid: 1\n").is_err());
 }
+
+mod props {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn committed(name: &str) -> bool {
+        name.split_once('-').is_some_and(|(kind, hex)| {
+            (kind == "agent" || kind == "watch")
+                && hex.len() == 32
+                && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }
+
+    proptest! {
+        // Liveness is never granted to a name root did not commit, even when
+        // every fact and the record parser say yes.
+        #[test]
+        fn a_name_that_is_not_committed_is_never_live(
+            name in prop_oneof![
+                "\\PC{0,48}",
+                "(pending-)?(agent|watch)-[0-9a-fA-Fg-z]{0,40}",
+            ],
+        ) {
+            prop_assume!(!committed(&name));
+            let fake = FakeCgroup {
+                info: Ok(42),
+                proc: Ok(Vec::new()),
+                inode: Ok(42),
+                alive: true,
+                names: vec![name],
+                facts: Some(ScopeFacts {
+                    cgroup2: true,
+                    inode: 42,
+                    owner: 0,
+                    mode: 0o40_755,
+                    procs_owner: 0,
+                    procs_mode: 0o100_644,
+                    populated: true,
+                    record: Some(b"committed".to_vec()),
+                    processes: Vec::new(),
+                }),
+            };
+            let scope = scope_status(&fake, 42, 1000, &|_, record_name| {
+                Some(RecordIdentity {
+                    kind: if record_name.starts_with("agent-") {
+                        ScopeKind::Agent
+                    } else {
+                        ScopeKind::Watch
+                    },
+                    uid: 1000,
+                    current_boot: true,
+                    live: true,
+                    process: (7, 9),
+                    cgroup_id: 42,
+                })
+            })
+            .unwrap();
+            prop_assert!(scope.is_none());
+        }
+    }
+}
