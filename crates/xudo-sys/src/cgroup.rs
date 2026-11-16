@@ -180,6 +180,13 @@ pub struct HostCgroup {
     test_force_cgroup2: bool,
 }
 
+#[cfg(all(test, not(target_os = "linux")))]
+impl HostCgroup {
+    fn for_tests() -> Self {
+        Self {}
+    }
+}
+
 impl HostCgroup {
     /// Opens and pins the cgroup root, refusing hybrid and non-cgroup2 hosts.
     ///
@@ -2170,6 +2177,35 @@ mod tests {
             let c = FakeCgroup::path_result(info, "", Ok(42), true);
             assert!(peer_cgroup_id(&c, 9, a.as_fd()).is_err());
         }
+    }
+
+    #[test]
+    fn record_names_need_a_kind_a_dash_and_32_hex_digits() {
+        let hex = "0123456789abcdef0123456789ABCDEF";
+        assert!(is_record_name(&format!("agent-{hex}")));
+        assert!(is_record_name(&format!("watch-{hex}")));
+        assert!(!is_record_name(&format!("pending-{hex}")));
+        assert!(!is_record_name("nodash"));
+        assert!(!is_record_name("agent-short"));
+        assert!(!is_record_name(&format!("agent-{}g", &hex[..31])));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_host_without_cgroup2_attests_nothing() {
+        fn unsupported<T>(result: &Result<T, SysError>) {
+            assert!(matches!(*result, Err(SysError::Unsupported { .. })));
+        }
+        unsupported(&HostCgroup::open());
+        let host = HostCgroup::for_tests();
+        let stream = UnixStream::pair().unwrap().0;
+        unsupported(&host.require_cgroup2());
+        unsupported(&host.pidfd_cgroup_id(stream.as_fd()));
+        unsupported(&host.proc_cgroup(1));
+        unsupported(&host.cgroup_inode("a"));
+        unsupported(&host.peer_alive(stream.as_fd()));
+        unsupported(&host.scope_facts("a", 1, false));
+        unsupported(&host.scope_names());
     }
 
     #[test]
