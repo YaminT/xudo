@@ -265,5 +265,5 @@ fn version_reports_the_beta_version_and_audit_status() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("xudo 0.1.0-beta.1 (beta, not externally audited)\n");
+        .stdout("xudo 0.1.0-beta.2 (beta, not externally audited)\n");
 }
