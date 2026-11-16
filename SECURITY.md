@@ -159,6 +159,15 @@ one you know you lack.
 - **The deny-list is defence in depth.** The set of programs that can be turned
   into a root shell is not enumerable. It catches a mistake in a rule; it is not
   the boundary.
+- **`path-under` is lexical only.** Nothing in xudo enforces containment for
+  argument paths. Never use it for a program that opens the path as root.
+  A symlink inside the prefix is a path the rule never named. `rm`, `rmdir`,
+  `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
+  `touch`, `mkdir`, `mkfifo`, `rename`, and `prename` are the compiled-in
+  class `ChangesPathMetadataOrExistence` (deny-list version 6), including a
+  copy or hardlink that keeps the name and a `busybox` applet. `mknod` is
+  `DeviceOrFilesystem`. `setcap` is `PrivilegeTool`. `xudo check` warns on
+  every `path-under` use and exits 20.
 - **One overbroad allowlist entry voids the design.** A single allowlisted shell,
   interpreter, pager, exec proxy, or `apt-get -o DPkg::Pre-Invoke::=` is
   unrestricted root regardless of how the arguments are written.

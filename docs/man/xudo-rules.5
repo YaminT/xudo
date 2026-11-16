@@ -210,9 +210,10 @@ component, or an embedded NUL is refused, and
 .B /etc/nginx\-evil
 is not under
 .BR /etc/nginx .
-This is a syntactic pre-filter.
+The check is lexical only.
+Nothing in xudo enforces containment for argument paths.
+Never use it for a program that opens the path as root.
 It does not see symlinks, bind mounts, or hardlinks.
-Containment at execution is a separate check.
 .TP
 .B name
 An identifier class:
