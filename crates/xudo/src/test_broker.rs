@@ -92,6 +92,10 @@ fn serve_many_with_bound(
                     break;
                 }
             };
+            // macOS and the BSDs let an accepted socket inherit the listener's
+            // O_NONBLOCK (Linux does not). Without this a read before the client
+            // has written returns WouldBlock and is taken for an empty request.
+            stream.set_nonblocking(false).unwrap();
             let _ = stream.set_read_timeout(Some(read_bound));
             let _ = stream.set_write_timeout(Some(read_bound));
             let mut request = Vec::new();
