@@ -110,8 +110,9 @@ All notable changes to xudo are documented here. This project follows
   `APT::Cmd::Pattern-Only=true` would turn that regular expression off, but
   the deny-list refuses `-o` and apt ignores an unknown key, so it is only
   a possible later defence in depth. On remove one confirmed
-  token such as `lib.` could remove hundreds of packages, and a trailing
-  `+` installs. The remove rule now uses `deb-name-literal` (`deb-name`, and
+  token such as `lib.` or `libstdc++` could remove hundreds of packages
+  (`+` is a regular expression character too), and a trailing `+` on remove
+  installs. The remove rule now uses `deb-name-literal` (`deb-name`, and
   no `.` and no `+` anywhere). A package whose name contains either
   (`python3.12`, `g++`, `libstdc++6`) can no longer be removed through xudo.
   Remove it with the host's own tools, or add an operator rule that lists
@@ -163,6 +164,20 @@ All notable changes to xudo are documented here. This project follows
 - `xudo check --fuzz [--fuzz-budget N] [--fuzz-seed S]`: a bounded,
   deterministic differential fuzz of the loaded ruleset that cross-checks the
   overlap report and the standing invariants; a finding is a lint error (21).
+- `xudo config` (`get`, `list`, `schema`) shows the effective configuration
+  and the file and line each value came from. `ido config list` shows ido's
+  user layer.
+- `xudo exec --queue`: a request refused only because it needs the human path
+  goes into the caller's `ido` queue. It runs nothing and keeps the denial's
+  exit status.
+- `ido queue --root` marks an entry to run through `xudo exec`, with policy,
+  audit and the password prompt, and so does every entry `xudo exec --queue`
+  writes. `ido run --yes` refuses a root-marked entry. The queue format and
+  the `AGENTS.md` / `xudo agentdoc` block are now version 2.
+- Release engineering: the binaries embed their dependency list
+  (cargo-auditable), each release ships a signed CycloneDX SBOM, CI rebuilds
+  each package on a second runner and requires matching bytes before signing,
+  and cargo-vet is part of the supply-chain checks.
 
 ### Changed
 
@@ -188,6 +203,10 @@ All notable changes to xudo are documented here. This project follows
   request.
 - A rule file may carry at most 4096 `[[test]]` tables, and a ruleset at most
   16384 in all; more fails to load.
+- The doas rule `xudo install` writes uses `permit persist`. On an OpenDoas
+  built with timestamp support, one password then covers about five minutes
+  of `xudo exec`, unlike the sudo rule, which sets `timestamp_timeout=0`. The
+  package depends on sudo.
 
 ### Compatibility
 

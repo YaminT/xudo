@@ -50,7 +50,7 @@ pub enum Format {
     about = "Linux privilege broker; this beta uses the human password path",
     long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
                   password-authenticated path through the host backend. The passwordless \
-                  agent path is not available in this beta (M4)."
+                  agent path is not available in this beta."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
