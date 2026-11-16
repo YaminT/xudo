@@ -55,7 +55,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    5
+    6
 }
 
 /// A class of capability that is never permitted as root.
@@ -78,6 +78,12 @@ pub enum CapabilityClass {
     /// execution: `/etc/ld.so.preload`, `/etc/cron.d`, `/etc/sudoers.d`, and
     /// `/root/.ssh/authorized_keys` each suffice on their own.
     ArbitraryWrite,
+    /// Removes a caller-chosen path or changes its owner, mode or attributes.
+    ///
+    /// `path-under` does not contain this. The match is lexical only, so a
+    /// symlink inside the prefix is a path the rule never named, and
+    /// `chmod u+s` on any file is a shell.
+    ChangesPathMetadataOrExistence,
     /// Executes a program named in a configuration value or hook.
     ConfigNamedProgram,
     /// Writes any file that decides what is permitted, including xudo's own.
@@ -130,6 +136,11 @@ impl CapabilityClass {
             Self::ArbitraryWrite => {
                 "an arbitrary root write is root code execution: ld.so.preload, cron.d, \
                  sudoers.d, and authorized_keys each suffice on their own"
+            }
+            Self::ChangesPathMetadataOrExistence => {
+                "removing a caller-chosen path or changing its owner, mode or attributes \
+                 is a root write: a symlink inside an allowed prefix reaches a path the \
+                 rule never named, and setuid on any file is a shell"
             }
             Self::ConfigNamedProgram => {
                 "a configuration value or hook that names a program is a shell injection \
@@ -236,6 +247,8 @@ const PRIVILEGE_TOOLS: &[&[u8]] = &[
     b"machinectl",
     b"setpriv",
     b"capsh",
+    // File capabilities. Already this class; checked again before the file-tool
+    // list below was added, so it is not also `ChangesPathMetadataOrExistence`.
     b"setcap",
     b"sudo",
     b"doas",
@@ -306,6 +319,37 @@ const ARBITRARY_WRITERS: &[&[u8]] = &[
     b"wget",
 ];
 
+/// Removes a caller-chosen path or changes its owner, mode or attributes.
+///
+/// Matched by basename, so a copy or a hardlink that keeps the name is the
+/// same class. A `busybox` applet is classified from its first argument in
+/// [`busybox_file_tool_applet`], because the executable name there is
+/// `busybox`.
+///
+/// Already covered elsewhere, and not repeated here: `mv`, `cp`, `install`,
+/// `ln`, `truncate`, `shred`, `dd`, `rsync`, and `tar` are
+/// [`ARBITRARY_WRITERS`]; `find` is an [`ARBITRARY_READERS`] entry, so
+/// `find -delete` is refused with it; `mknod` is a [`DEVICE_TOOLS`] entry;
+/// `setcap` is already a [`PRIVILEGE_TOOLS`] entry. `mount` and `umount` are
+/// not in any name list. A `.mount` unit and `umount.target` are classified
+/// by the `systemctl` unit tripwire, not by these names.
+const PATH_METADATA_TOOLS: &[&[u8]] = &[
+    b"rm",
+    b"rmdir",
+    b"unlink",
+    b"chmod",
+    b"chown",
+    b"chgrp",
+    b"chattr",
+    b"setfacl",
+    b"setfattr",
+    b"touch",
+    b"mkdir",
+    b"mkfifo",
+    b"rename",
+    b"prename",
+];
+
 /// Filesystem and block-device tools.
 const DEVICE_TOOLS: &[&[u8]] = &[
     b"mkfs",
@@ -325,6 +369,9 @@ const DEVICE_TOOLS: &[&[u8]] = &[
     b"lvremove",
     b"vgremove",
     b"pvremove",
+    // A caller-chosen device type and path. Not a metadata tool: it creates a
+    // device node, so it joins this class rather than the file-tool list.
+    b"mknod",
 ];
 
 /// User, group, and credential tools.
@@ -1345,10 +1392,31 @@ pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let name = basename(exe);
     let mut findings = deny_by_executable(name);
     findings.extend(deny_by_arguments(name, argv));
+    if let Some(finding) = busybox_file_tool_applet(name, argv) {
+        findings.push(finding);
+    }
 
     findings.sort_by(|a, b| (a.class, a.evidence.as_str()).cmp(&(b.class, b.evidence.as_str())));
     findings.dedup();
     findings
+}
+
+/// `busybox rm` is the `rm` applet. The executable's basename is `busybox`,
+/// which is already a shell, so the file-tool class has to be read from the
+/// first argument. A copy or hardlink that is itself named `rm` is handled by
+/// [`deny_by_executable`].
+fn busybox_file_tool_applet(name: &[u8], argv: &Argv) -> Option<DenyFinding> {
+    if !matches_name(name, &[b"busybox"]) {
+        return None;
+    }
+    let applet = basename(argv.as_slice().first()?.as_bytes());
+    if !matches_name(applet, PATH_METADATA_TOOLS) {
+        return None;
+    }
+    Some(DenyFinding::new(
+        CapabilityClass::ChangesPathMetadataOrExistence,
+        format!("argument 0 is the busybox applet {}", applet.as_bstr()),
+    ))
 }
 
 /// Classes implied by the executable's identity alone.
@@ -1361,6 +1429,10 @@ fn deny_by_executable(name: &[u8]) -> Vec<DenyFinding> {
         (PRIVILEGE_TOOLS, CapabilityClass::PrivilegeTool),
         (ARBITRARY_READERS, CapabilityClass::ArbitraryRead),
         (ARBITRARY_WRITERS, CapabilityClass::ArbitraryWrite),
+        (
+            PATH_METADATA_TOOLS,
+            CapabilityClass::ChangesPathMetadataOrExistence,
+        ),
         (DEVICE_TOOLS, CapabilityClass::DeviceOrFilesystem),
         (CREDENTIAL_TOOLS, CapabilityClass::CredentialTool),
         (KERNEL_MODULE_TOOLS, CapabilityClass::KernelModule),
@@ -1577,7 +1649,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 5);
+        assert_eq!(deny_list_version(), 6);
     }
 
     #[test]
@@ -1942,13 +2014,14 @@ mod tests {
 
     #[test]
     fn every_class_states_why_it_is_denied() {
-        const ALL: [CapabilityClass; 17] = [
+        const ALL: [CapabilityClass; 18] = [
             CapabilityClass::SpawnsShell,
             CapabilityClass::Interpreter,
             CapabilityClass::ExecProxy,
             CapabilityClass::PrivilegeTool,
             CapabilityClass::ArbitraryRead,
             CapabilityClass::ArbitraryWrite,
+            CapabilityClass::ChangesPathMetadataOrExistence,
             CapabilityClass::ConfigNamedProgram,
             CapabilityClass::SelfModification,
             CapabilityClass::DeviceOrFilesystem,

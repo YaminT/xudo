@@ -338,12 +338,10 @@ pub enum Matcher {
     },
     /// An absolute path lexically beneath `prefix`.
     ///
-    /// This is a **syntactic pre-filter, not a security boundary.** It cannot
-    /// see symlinks, bind mounts, or hardlinks, because this crate performs no
-    /// I/O. Actual containment is enforced in `xudo-sys` with
-    /// `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`
-    /// from a pinned directory file descriptor, and a match here is never
-    /// sufficient authority to open anything.
+    /// Lexical only. Nothing in xudo enforces containment for argument paths.
+    /// Never use it for a program that opens the path as root. It cannot see
+    /// symlinks, bind mounts, or hardlinks, because this crate performs no
+    /// I/O, and a match here is never sufficient authority to open anything.
     PathUnder {
         /// Absolute directory the argument must sit beneath.
         prefix: String,
