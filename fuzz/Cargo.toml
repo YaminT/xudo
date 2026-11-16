@@ -70,6 +70,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "session_record"
+path = "fuzz_targets/session_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "confirm_file"
 path = "fuzz_targets/confirm_file.rs"
 test = false

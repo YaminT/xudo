@@ -1,0 +1,1 @@
+{"kind":"agent","uid":1000,"label":"codex","boot_id":"01234567-89ab-cdef-0123-456789abcdef","created_at_boottime_ms":10,"deadline":100,"pid":42,"starttime":73,"cgroup_id":9001,"extra":true}
