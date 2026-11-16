@@ -209,7 +209,8 @@ impl DenyFinding {
 
 /// Executables that are, or can become, a shell.
 const SHELLS: &[&[u8]] = &[
-    b"sh", b"bash", b"dash", b"zsh", b"ksh", b"csh", b"tcsh", b"fish", b"ash", b"rbash", b"busybox",
+    b"sh", b"bash", b"dash", b"zsh", b"ksh", b"csh", b"tcsh", b"fish", b"ash", b"rbash",
+    b"busybox", b"toybox",
 ];
 
 /// General-purpose interpreters.
@@ -317,13 +318,20 @@ const ARBITRARY_WRITERS: &[&[u8]] = &[
     b"ftp",
     b"curl",
     b"wget",
+    b"patch",
+    b"gzip",
+    b"xz",
+    b"zstd",
+    b"bzip2",
+    b"update-alternatives",
+    b"dpkg-divert",
 ];
 
 /// Removes a caller-chosen path or changes its owner, mode or attributes.
 ///
 /// Matched by basename, so a copy or a hardlink that keeps the name is the
 /// same class. A `busybox` applet is classified from its first argument in
-/// [`busybox_file_tool_applet`], because the executable name there is
+/// [`multicall_applet`], because the executable name there is
 /// `busybox`.
 ///
 /// Already covered elsewhere, and not repeated here: `mv`, `cp`, `install`,
@@ -348,6 +356,15 @@ const PATH_METADATA_TOOLS: &[&[u8]] = &[
     b"mkfifo",
     b"rename",
     b"prename",
+    b"link",
+    b"chcon",
+    b"restorecon",
+    b"setfiles",
+    b"chacl",
+    b"attr",
+    b"fallocate",
+    b"mktemp",
+    b"file-rename",
 ];
 
 /// Filesystem and block-device tools.
@@ -372,6 +389,7 @@ const DEVICE_TOOLS: &[&[u8]] = &[
     // A caller-chosen device type and path. Not a metadata tool: it creates a
     // device node, so it joins this class rather than the file-tool list.
     b"mknod",
+    b"debugfs",
 ];
 
 /// User, group, and credential tools.
@@ -1392,31 +1410,67 @@ pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let name = basename(exe);
     let mut findings = deny_by_executable(name);
     findings.extend(deny_by_arguments(name, argv));
-    if let Some(finding) = busybox_file_tool_applet(name, argv) {
-        findings.push(finding);
-    }
+    findings.extend(multicall_applet(name, argv));
 
     findings.sort_by(|a, b| (a.class, a.evidence.as_str()).cmp(&(b.class, b.evidence.as_str())));
     findings.dedup();
     findings
 }
 
-/// `busybox rm` is the `rm` applet. The executable's basename is `busybox`,
-/// which is already a shell, so the file-tool class has to be read from the
-/// first argument. A copy or hardlink that is itself named `rm` is handled by
-/// [`deny_by_executable`].
-fn busybox_file_tool_applet(name: &[u8], argv: &Argv) -> Option<DenyFinding> {
-    if !matches_name(name, &[b"busybox"]) {
-        return None;
+/// A multicall binary names its applet in the first argument: `busybox rm`,
+/// `toybox rm`, `coreutils rm`, or `coreutils --coreutils-prog=rm`. The
+/// executable's basename is the multicall name, so the applet's class has to
+/// be read from the argument. A copy or hardlink that is itself named `rm` is
+/// handled by [`deny_by_executable`].
+///
+/// The executable that reaches the deny-list is the one the rule declares, as
+/// written (`seed.exe` in the engine, `action.exe` in the rule check), and it
+/// is never resolved. On a host where `/usr/bin/rm` is a symlink to the
+/// uutils `coreutils` multicall, a rule naming `/usr/bin/rm` is classified as
+/// `rm`; a rule naming `coreutils` is read here.
+///
+/// `busybox` keeps its file-tool-only reading, since it is already a shell.
+/// `coreutils` and `toybox` are refused as the file-tool class when the
+/// applet cannot be read: a flag, or a missing applet, has unknown meaning.
+fn multicall_applet(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
+    let busybox = matches_name(name, &[b"busybox"]);
+    if !busybox && !matches_name(name, &[b"coreutils", b"toybox"]) {
+        return Vec::new();
     }
-    let applet = basename(argv.as_slice().first()?.as_bytes());
-    if !matches_name(applet, PATH_METADATA_TOOLS) {
-        return None;
+    let first = argv.as_slice().first().map(super::argv::Arg::as_bytes);
+    let applet = match first {
+        Some(bytes) => match bytes.strip_prefix(b"--coreutils-prog=") {
+            Some(rest) if !busybox => Some(rest),
+            _ if is_flag_token(bytes) => None,
+            _ => Some(bytes),
+        },
+        None => None,
+    };
+    let Some(applet) = applet.map(basename) else {
+        if busybox {
+            return Vec::new();
+        }
+        return vec![DenyFinding::new(
+            CapabilityClass::ChangesPathMetadataOrExistence,
+            format!("multicall {} without a plain applet name", name.as_bstr()),
+        )];
+    };
+    let mut findings = Vec::new();
+    if matches_name(applet, PATH_METADATA_TOOLS) {
+        findings.push(DenyFinding::new(
+            CapabilityClass::ChangesPathMetadataOrExistence,
+            format!("argument 0 is the multicall applet {}", applet.as_bstr()),
+        ));
     }
-    Some(DenyFinding::new(
-        CapabilityClass::ChangesPathMetadataOrExistence,
-        format!("argument 0 is the busybox applet {}", applet.as_bstr()),
-    ))
+    if !busybox {
+        findings.extend(deny_by_executable(applet).into_iter().map(|f| {
+            DenyFinding::new(
+                f.class,
+                format!("multicall applet {}: {}", applet.as_bstr(), f.evidence),
+            )
+        }));
+    }
+    findings
 }
 
 /// Classes implied by the executable's identity alone.
