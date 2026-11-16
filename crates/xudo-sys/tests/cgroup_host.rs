@@ -41,7 +41,7 @@ impl CgroupCalls for FakeCgroup {
     fn peer_alive(&self, _: BorrowedFd<'_>) -> Result<bool, SysError> {
         Ok(self.alive)
     }
-    fn scope_facts(&self, _: &str) -> Result<Option<ScopeFacts>, SysError> {
+    fn scope_facts(&self, _: &str, _: u64, _: bool) -> Result<Option<ScopeFacts>, SysError> {
         Ok(self.facts.clone())
     }
     fn scope_names(&self) -> Result<Vec<String>, SysError> {
@@ -103,7 +103,7 @@ fn the_host_cgroup_adapter_reads_the_callers_live_kernel_identity() {
     assert_eq!(host.cgroup_inode(path).unwrap(), identity.id);
 
     let _ = host.scope_names();
-    let _ = host.scope_facts("agent-0123456789abcdef0123456789abcdef.scope");
+    let _ = host.scope_facts("agent-0123456789abcdef0123456789abcdef.scope", 1, true);
     let _ = scope_status(&host, identity.id, 1000, &|_, _| None);
 }
 
@@ -122,6 +122,9 @@ fn the_pure_cgroup_and_peer_decisions_run_through_the_external_fake_seams() {
         procs_mode: 0o100_644,
         populated: true,
         record: Some(scope_record.clone()),
+        record_owner: 0,
+        record_mode: 0o100_600,
+        record_nlink: 1,
         processes: Vec::new(),
     };
     let fake = FakeCgroup {
@@ -240,6 +243,9 @@ mod props {
                     procs_mode: 0o100_644,
                     populated: true,
                     record: Some(b"committed".to_vec()),
+                    record_owner: 0,
+                    record_mode: 0o100_600,
+                    record_nlink: 1,
                     processes: Vec::new(),
                 }),
             };
