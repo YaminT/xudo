@@ -1379,9 +1379,8 @@ mod tests {
     )]
 
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
-    use std::thread;
     use xudo_backend::Capability;
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
     use xudo_config::Setting;
@@ -1495,23 +1494,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("broker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).unwrap();
-            let request = xudo_wire::BrokerRequest::parse(&bytes).unwrap();
-            assert_eq!(request.question, xudo_wire::Question::Pending);
-            let response = xudo_wire::BrokerResponse {
-                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
-                answer: xudo_wire::Answer::Watching {
-                    prompts: Vec::new(),
-                    omitted: 0,
-                },
-            };
-            stream.write_all(response.to_json().as_bytes()).unwrap();
-        });
+        let response = xudo_wire::BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer: xudo_wire::Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+        };
+        let broker = crate::test_broker::serve_once(listener, response.to_json().into_bytes());
         let (code, out, err) = fixture.run_at_socket(&["pending"], &socket);
-        broker.join().unwrap();
+        let request = xudo_wire::BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(request.question, xudo_wire::Question::Pending);
         assert_eq!(code, ExitCode::Delegated);
         assert_eq!(out, "");
         assert_eq!(err, "");
