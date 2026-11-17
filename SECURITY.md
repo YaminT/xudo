@@ -98,11 +98,15 @@ shipped `apt-get remove` action. Its purge, autoremove, autopurge,
 those spellings. These
 checks protect xudo-mediated paths only. They cannot prevent a host-side apt or
 dpkg command, a root shell, or an indirect transaction such as installing
-`sudo-ldap` that removes a conflicting package. `xudo doctor` warns when one
-of the shipped deny-rule ids is absent. The policy loader continues to reject
-deny rules whose program has no loaded action; therefore apt and dpkg package
-tripwires are exercised as operator-rule fixtures until xudo ships actions for
-those programs.
+`sudo-ldap` that removes a conflicting package. Removing `openssh-client` can
+remove `openssh-server`; removing `libip4tc2` or `libxtables12` can remove
+`iptables`; removing `libnftables1` can remove `nftables`; removing `python3`
+can remove `ufw` or `firewalld`; and removing `init-system-helpers` can remove
+xudo. `xudo doctor` warns when a shipped deny-rule id is missing or inert.
+Rules for programs with no loaded action load as inactive and cannot allow
+anything; `xudo check` and `doctor` say "inert today" until an operator action
+names that program. The apt and dpkg package protections are tested against
+later operator actions as well as the shipped apt-get action.
 
 The shipped `xudo.time.set-ntp` rule accepts `timedatectl set-ntp false`,
 which has the same effect as stopping the time-sync unit. The tripwire

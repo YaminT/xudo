@@ -2931,6 +2931,14 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             !out.contains("deny-rule:"),
             "shipped deny rules have workspace adversarial coverage: {out}"
         );
+        assert!(
+            out.contains("xudo.protect.pkg-remove for apt is inert today"),
+            "{out}"
+        );
+        assert!(
+            out.contains("xudo.protect.dpkg-remove for dpkg is inert today"),
+            "{out}"
+        );
     }
 
     #[test]

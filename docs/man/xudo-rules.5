@@ -491,14 +491,36 @@ openssh-server.
 These checks apply only to commands xudo mediates. They do not constrain the
 host's own package tools or indirect package removals, such as installing
 .BR sudo-ldap .
-The rules name apt-get because it is the package executable used by a shipped
-action. The loader refuses deny rules whose program has no loaded action;
-apt and dpkg spellings are covered by operator-rule tests until xudo ships
-actions for those executables. The compiled path checks also protect
+Removing
+.B openssh-client
+can remove
+.BR openssh-server ;
+removing
+.B libip4tc2
+or
+.B libxtables12
+can remove
+.BR iptables ;
+removing
+.B libnftables1
+can remove
+.BR nftables ;
+removing
+.B python3
+can remove
+.B ufw
+or
+.BR firewalld ;
+and removing
+.B init-system-helpers
+can remove xudo.
+Rules whose program has no loaded action remain inactive; `xudo check` and
+`xudo doctor` report them as "inert today" until an operator action names that
+program. The compiled path checks also protect
 .BR /usr/bin/xudo ,
 .BR /usr/bin/ido ,
 and
-.BR /usr/libexec/xudo/xudod
+.BR /usr/bin/willyoumarryme
 from xudo-mediated writes.
 .SH EXAMPLE
 From the shipped

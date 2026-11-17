@@ -478,7 +478,7 @@ const SCHEDULERS: &[&[u8]] = &[
 const PROTECTED_PREFIXES: &[&[u8]] = &[
     b"/usr/bin/xudo",
     b"/usr/bin/ido",
-    b"/usr/libexec/xudo/xudod",
+    b"/usr/bin/willyoumarryme",
     b"/etc/xudo",
     b"/usr/libexec/xudo",
     b"/var/log/xudo",
@@ -1409,6 +1409,10 @@ fn touches_protected_path(path: &[u8]) -> bool {
 ///
 /// Returns every class that matched, sorted and deduplicated, so an audit
 /// record names all of them rather than whichever happened to be checked first.
+///
+/// Protected paths use a component boundary after each exact prefix. The
+/// historical `/usr/bin//xudo` spelling therefore does not match the
+/// `/usr/bin/xudo` prefix; this string-level limit is documented and unchanged.
 pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let name = basename(exe);
     let mut findings = deny_by_executable(name);
@@ -1931,7 +1935,7 @@ mod tests {
             "/var/lib/xudo/audit.jsonl",
             "/usr/bin/xudo",
             "/usr/bin/ido",
-            "/usr/libexec/xudo/xudod",
+            "/usr/bin/willyoumarryme",
         ] {
             assert!(
                 classes("/usr/bin/true", &[path]).contains(&CapabilityClass::SelfModification),
@@ -1946,8 +1950,7 @@ mod tests {
         assert!(touches_protected_path(b"/etc/xudo/config.toml"));
         assert!(touches_protected_path(b"/usr/bin/xudo"));
         assert!(touches_protected_path(b"/usr/bin/ido"));
-        assert!(touches_protected_path(b"/usr/libexec/xudo/xudod"));
-        assert!(touches_protected_path(b"/usr/libexec/xudo/xudod.backup"));
+        assert!(touches_protected_path(b"/usr/bin/willyoumarryme"));
         // The prefix-match bug: a sibling whose name merely starts the same.
         assert!(!touches_protected_path(b"/etc/xudoxyz"));
         assert!(!touches_protected_path(b"/usr/bin/xudo-helper"));

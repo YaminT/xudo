@@ -26,7 +26,7 @@ use xudo_policy::{
 };
 
 use crate::cli::{CheckArgs, Cli, Format};
-use crate::rules::{LoadError, LoadedRules};
+use crate::rules::{LoadError, LoadedRules, SHIPPED_PROTECT_DENY_IDS};
 
 /// The envelope's schema version.
 const SCHEMA_VERSION: u32 = 1;
@@ -35,11 +35,6 @@ const SCHEMA_VERSION: u32 = 1;
 /// `xudo-policy/tests/shipped_rules.rs`. Their clauses intentionally include
 /// operator-only spellings that no shipped action accepts, so an inline
 /// `[[test]]` cannot honestly name them as the deciding rule.
-const WORKSPACE_TESTED_SHIPPED_DENY_RULES: &[&str] = &[
-    "xudo.protect.pkg-remove",
-    "xudo.protect.pkg-install-removal",
-];
-
 /// One rendered line is at most this many columns.
 const LIMITS: Limits = Limits {
     max_cols: 200,
@@ -66,6 +61,8 @@ struct Report {
     path_under: Vec<String>,
     /// Deny rules that have no test pinning them.
     deny_rule_warnings: Vec<String>,
+    /// Shipped deny rules that currently have no matching action.
+    notes: Vec<String>,
     results: Vec<TestResult>,
     /// What the fuzz found, when it ran.
     fuzz: Option<FuzzReport>,
@@ -134,7 +131,7 @@ pub(crate) fn run(
             .iter()
             .filter(|rule| {
                 !named.iter().any(|id| id == &&rule.id)
-                    && !WORKSPACE_TESTED_SHIPPED_DENY_RULES.contains(&rule.id.as_str())
+                    && !SHIPPED_PROTECT_DENY_IDS.contains(&rule.id.as_str())
             })
             .map(|rule| {
                 format!(
@@ -178,6 +175,11 @@ pub(crate) fn run(
         warnings,
         path_under,
         deny_rule_warnings,
+        notes: if tests_only {
+            Vec::new()
+        } else {
+            crate::rules::inert_shipped_deny_notes(loaded.rules())
+        },
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
@@ -249,6 +251,9 @@ fn human_report(
         // A note, not a finding: the exit status above does not count it.
         if let Some(note) = note {
             let _ = writeln!(out, "{note}");
+        }
+        for note in &report.notes {
+            let _ = writeln!(out, "note: {}", safe(note));
         }
         // Reported, not refused: the engine resolves a command more than one
         // action accepts to the strictest of them, so an overlap is not a hole.
@@ -422,6 +427,9 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
         .chain(report.deny_rule_warnings.iter())
         .collect();
     lint.insert("warnings".to_owned(), json!(warning_lines));
+    if !report.notes.is_empty() {
+        lint.insert("notes".to_owned(), json!(report.notes));
+    }
     // Absent when nothing matched, so a run with no such rule stays byte for
     // byte what it was.
     if !report.open_units.is_empty() {
@@ -613,11 +621,20 @@ mod tests {
             warnings: Vec::new(),
             path_under: Vec::new(),
             deny_rule_warnings: Vec::new(),
+            notes: vec!["xudo.protect.dpkg-remove is inert today".to_owned()],
             results: Vec::new(),
             fuzz: Some(report()),
         };
         assert_eq!(found.status(), ExitCode::LintError);
         let json = envelope(&found, found.status(), None);
+        assert!(
+            json.get("lint")
+                .and_then(|lint| lint.get("notes"))
+                .and_then(Value::as_array)
+                .and_then(|notes| notes.first())
+                .and_then(Value::as_str)
+                .is_some_and(|note| note == "xudo.protect.dpkg-remove is inert today")
+        );
         insta::assert_snapshot!(
             "fuzz_envelope",
             serde_json::to_string_pretty(&json).unwrap()

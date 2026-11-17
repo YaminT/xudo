@@ -47,6 +47,7 @@ dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
 # and its architecture-qualified trailing removal marker as tested spellings.
 apt -s --auto-remove remove xudo >/tmp/apt-auto-remove.log || fail "apt --auto-remove remove spelling"
 apt-get -s --AUTO-REMOVE remove xudo >/tmp/apt-option-case.log || fail "apt-get case-folded option spelling"
+apt-get -s auto-remove xudo >/tmp/apt-get-auto-remove.log || fail "apt-get auto-remove verb alias"
 if dpkg --no-act -rP xudo >/tmp/dpkg-rp.log 2>&1; then
     fail "dpkg accepted conflicting -rP actions"
 fi

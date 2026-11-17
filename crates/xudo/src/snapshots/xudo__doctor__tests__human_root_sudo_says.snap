@@ -1,6 +1,5 @@
 ---
 source: crates/xudo/src/doctor.rs
-assertion_line: 2399
 expression: human(&report)
 ---
 platform     test
@@ -13,6 +12,7 @@ rule package /usr/bin/rule-0.toml: unknown
 rule package unknown: test fixture has no dpkg record
 protect rule missing shipped deny rule xudo.protect.pkg-remove
 protect rule missing shipped deny rule xudo.protect.pkg-install-removal
+protect rule missing shipped deny rule xudo.protect.dpkg-remove
 sudoers xudo unknown: canonical rule could not be read
 sudoers xudo unknown: test fixture has no sudoers directory
 classified   unattested
