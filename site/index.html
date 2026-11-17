@@ -4,19 +4,27 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>xudo — Linux privilege broker</title>
-  <meta name="description" content="Linux privilege broker for narrowly scoped privileged commands. This beta uses the human password path.">
+  <meta name="description" content="sudo for AI agents: root's rules decide what a verified agent may run. This beta asks a password for every request.">
   <link rel="canonical" href="https://yamint.github.io/xudo/">
   <link rel="stylesheet" href="style.css">
   <script type="application/ld+json">
-  {"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"xudo","applicationCategory":"SecurityApplication","operatingSystem":"Linux","url":"https://yamint.github.io/xudo/","description":"Linux privilege broker for narrowly scoped privileged commands. Beta uses the human password path."},{"@type":"SoftwareSourceCode","name":"xudo","codeRepository":"https://github.com/YaminT/xudo","programmingLanguage":"Rust","runtimePlatform":"Linux","license":"https://www.apache.org/licenses/LICENSE-2.0"}]}
+  {"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"xudo","applicationCategory":"SecurityApplication","operatingSystem":"Linux","url":"https://yamint.github.io/xudo/","description":"sudo for AI agents: root's rules decide what a verified agent may run. This beta asks a password for every request."},{"@type":"SoftwareSourceCode","name":"xudo","codeRepository":"https://github.com/YaminT/xudo","programmingLanguage":"Rust","runtimePlatform":"Linux","license":"https://www.apache.org/licenses/LICENSE-2.0"}]}
   </script>
 </head>
 <body>
 <header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header>
 <main>
 <h1>xudo</h1>
-<p>xudo is a Linux privilege broker for operators who want AI coding agents to request narrowly defined privileged commands. It checks commands against root-owned rules and uses the host's privilege backend. This beta runs every request through the human password path.</p>
-<p><strong>Beta. Not externally audited.</strong> The policy engine, the backend model, the broker, the gate and the audit trail are built and tested (2026-10-30): the broker mints entries, the gate consumes one and runs it as root, <code>xudo exec</code> and <code>xudo install</code> ask the broker, both write one hash-chained audit trail, and the same ruleset behaves the same through sudo, sudo-rs and OpenDoas. Out-of-band confirmation via <code>xudo watch</code> is off by default, and every path still requires the password. The broker runs under its real systemd sandbox, and Pasban verifies the audit chain daily. The doas install probe remains NOT VERIFIED. Not yet built: enrollment and the passwordless agent path, temporary permissions, narrowing and volume controls, more ergonomics, and confinement with an external audit. <code>confirm_human_path=false</code> by default. <code>just telemetry</code> runs the strace no-telemetry check, also run by the CI job “no telemetry”. The passwordless agent path and Landlock are not in this release. See <a href="security.html">security status and limits</a>.</p>
+<p><strong>xudo is sudo for AI agents.</strong> Your agent (Claude Code, Codex, Grok…) calls <code>xudo</code> where it would call <code>sudo</code>. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root with no password prompt. If a rule says a person must decide, the command waits in the <code>ido</code> queue until you review and run it. Anyone else gets the normal <code>sudo</code> password prompt, and a command no rule allows is refused. xudo itself never asks for or handles a password. Every decision goes into a tamper-evident log.</p>
+<p>The design, in five steps:</p>
+<ol>
+<li>You install one package and choose rule files: what agents may run, down to each argument.</li>
+<li>You verify a harness once (being built): on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
+<li>The agent runs <code>xudo exec -- &lt;command&gt;</code>. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.</li>
+<li>Allowed: runs as root now, with no password (being built). Needs a person: waits in <code>ido</code>. Anyone else: the normal <code>sudo</code> password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
+<li>Everything is recorded in a log that shows any tampering.</li>
+</ol>
+<p><strong>Beta. Not externally audited.</strong> Today's beta asks your password for every request. The passwordless agent path and Landlock confinement are not in this release. See <a href="security.html">security status and limits</a>.</p>
 <h2>Install</h2>
 <p>v0.1.0-beta.2 is a pre-release. Download the <code>.deb</code>, <code>SHA256SUMS</code>, and its <code>.cosign.bundle</code> from the GitHub Release. GitHub shows the <code>~</code> in the Debian version as <code>.</code>, so verify the checksum with <code>sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing</code>. Replace <code>&lt;ver&gt;</code> with the Debian version, <code>&lt;arch&gt;</code> with <code>amd64</code> or <code>arm64</code>, and <code>&lt;tag&gt;</code> with the Git tag; for example, <code>&lt;ver&gt;</code> <code>0.1.0~beta.1</code> corresponds to <code>&lt;tag&gt;</code> <code>v0.1.0-beta.1</code>.</p>
 <pre><code>sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing

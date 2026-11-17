@@ -1,6 +1,16 @@
 # xudo
 
-xudo is a Linux privilege broker. It checks commands against root-owned rules and uses the host's `sudo`, `sudo-rs`, or `doas` for privileged execution. This beta uses the human password path for every request.
+**xudo is `sudo` for AI agents.** Your agent (Claude Code, Codex, Grok…) calls `xudo` where it would call `sudo`. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root with no password prompt. If a rule says a person must decide, the command waits in the `ido` queue until you review and run it. Anyone else gets the normal `sudo` password prompt, and a command no rule allows is refused. xudo itself never asks for or handles a password. Every decision goes into a tamper-evident log.
+
+Today's beta asks your password for every request. The passwordless path for verified agents is being built.
+
+## How it works (the design; steps 2 and 4 are being built)
+
+1. You install one package and choose rule files: what agents may run, down to each argument.
+2. You verify a harness once: on a server the admin registers it; on a laptop you type your sudo password once per session.
+3. The agent runs `xudo exec -- <command>`. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.
+4. Allowed: runs as root now, with no password. Needs a person: waits in `ido`. Anyone else: the normal `sudo` password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.
+5. Everything is recorded in a log that shows any tampering.
 
 > This README is a derived view of [howiwork.md](howiwork.md), the source of truth for product behavior.
 
@@ -8,21 +18,13 @@ xudo is a Linux privilege broker. It checks commands against root-owned rules an
 
 v0.1.0-beta.2 is a pre-release. Download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the GitHub Release, then verify both the checksum and the exact GitHub Actions identity before installing. Replace `<ver>` with the Debian version, `<arch>` with `amd64` or `arm64`, and `<tag>` with the Git tag; for example, `<ver>` `0.1.0~beta.1` corresponds to `<tag>` `v0.1.0-beta.1`:
 
-GitHub shows the `~` in the Debian version as `.` on the Release page, so the file you download is named with a `.`. Verify the checksum with `sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing`.
+GitHub shows the `~` in the Debian version as `.` on the Release page, so the file you download is named with a `.`.
 
 ```sh
 sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing
 cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_<ver>_<arch>.deb
 sudo apt install ./xudo_<ver>_<arch>.deb
 ```
-
-Each release also carries a CycloneDX SBOM, `xudo-<version>.cdx.json` (`<version>` is Cargo's spelling, for example `0.1.0-beta.1`), listing every crate the shipped binaries link, as resolved for the two musl targets, with its `Cargo.lock` version and checksum. It is signed like the package; verify it with the same identity:
-
-```sh
-cosign verify-blob --bundle xudo-<version>.cdx.json.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo-<version>.cdx.json
-```
-
-The four binaries also embed that dependency list (`cargo-auditable`). Read it from an installed binary with `cargo audit bin /usr/bin/xudo`. That embedded list may name a crate the binary does not link (`errno`); the SBOM does not. Building the package (`just deb`) needs `cargo-auditable` 0.7.7.
 
 xudo has no `curl | sh` installer because a privileged shell script is difficult to inspect before execution.
 
@@ -46,23 +48,17 @@ ido queue -m "show listeners after review" -- /usr/bin/ss -tulpnH
 
 Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. `ido queue` stores exact arguments for a human to review and run with `ido`.
 
-## Security status
+## Status
 
-**Beta. Not externally audited.** The rule-file format and command-line interface may change, and an upgrade may require rule edits. Do not deploy this where a compromise would matter.
+**Beta (v0.1.0-beta.2). Not externally audited.** Do not deploy it where a compromise would matter. The rule format and command line may still change.
 
-Agent detection is not a security boundary. The passwordless agent path is not in this release, so a successful impersonation cannot skip the password today. The allowlist is the boundary; the compiled-in deny-list is defense in depth because the set of programs that can become a root shell is not enumerable. `xudo doctor` reports some other paths to root, but cannot prove that a host has none.
+- Built: the rules and built-in deny-list, the root service and gate, `xudo exec`, `xudo install`, `xudo doctor`, the `ido` queue, and the tamper-evident audit log, checked daily. The same rules behave the same through sudo, sudo-rs and OpenDoas.
+- In this release every privileged request asks for a password. The passwordless agent path and Landlock confinement are not in this release.
+- Being built: verified harnesses, rule-allowed commands without a password, and a root-held queue for commands that need a person.
+- An optional extra confirmation for people (`xudo watch`, `confirm_human_path`) is built and off by default.
+- The rules are the boundary; the deny-list is a safety net. `xudo doctor` reports some other paths to root but cannot prove there are none. The audit log records decisions, not whether a command finished. The doas install probe reports NOT VERIFIED.
 
-The policy engine, the backend model, the broker, the gate and the audit trail are built and tested (2026-10-30): the broker mints entries, the gate consumes one and runs it as root, `xudo exec` and `xudo install` ask the broker, both write one hash-chained audit trail, and the same ruleset behaves the same through sudo, sudo-rs and OpenDoas. Out-of-band confirmation via `xudo watch` is off by default, and every path still requires the password. The broker runs under its real systemd sandbox, and Pasban verifies the audit chain daily. The doas install probe remains NOT VERIFIED. Not yet built: enrollment and the passwordless agent path, temporary permissions, narrowing and volume controls, more ergonomics, and confinement with an external audit. `confirm_human_path=false` by default. `just telemetry` runs the strace no-telemetry check, also run by the CI job “no telemetry”. The passwordless agent path and Landlock confinement are not in this release.
-
-The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so stock Ubuntu 26.04 verifies. It reports `installed, but NOT VERIFIED` on doas and on a multicall-coreutils system with no regular probe program, such as Alpine.
-
-The audit trail records authorization, not execution outcomes. Pasban runs daily as root. It verifies the audit chain and compares journal copies with the file by hash. It detects removed tails, cut-and-continued files, and forged chains the journal never saw. It does not prevent privileged tampering or prove that a command completed.
-
-## How it works
-
-`xudo explain` loads the selected rules and reports what the policy would decide. For `xudo exec`, the front end sends the request to the root broker over a Unix socket. The broker identifies the connected peer from kernel-provided facts, checks the root-owned rules and deny-list, and records the authorization decision. If permitted, it creates a bounded one-use request. The host's `sudo`, `sudo-rs`, or `doas` performs the uid transition through the password-authenticated gate. The gate independently checks policy and the one-use request before executing the validated program. Errors fail closed.
-
-Every caller is currently classified as unattested. The beta therefore uses the password path for every invocation; no `NOPASSWD` rule is installed by the package.
+Details and limits: [SECURITY.md](SECURITY.md). The default build has no network code; `just telemetry` runs the strace no-telemetry check in CI.
 
 ## Rule format
 
@@ -94,15 +90,15 @@ No. A command must match an action in the root-owned rules and pass the compiled
 
 ### Is this safe? What are the limits?
 
-This is beta software and has not been externally audited. A broad rule can grant broad root access, the deny-list is not a complete boundary, and other host paths to root remain outside xudo's control. Agent detection is not a security boundary; the allowlist is. The policy engine, the backend model, the broker, the gate and the audit trail are built and tested (2026-10-30): the broker mints entries, the gate consumes one and runs it as root, `xudo exec` and `xudo install` ask the broker, both write one hash-chained audit trail, and the same ruleset behaves the same through sudo, sudo-rs and OpenDoas. Out-of-band confirmation via `xudo watch` is off by default, and every path still requires the password. The broker runs under its real systemd sandbox, and Pasban verifies the audit chain daily. The doas install probe remains NOT VERIFIED. Not yet built: enrollment and the passwordless agent path, temporary permissions, narrowing and volume controls, more ergonomics, and confinement with an external audit. `confirm_human_path=false` by default. `just telemetry` runs the strace no-telemetry check, also run by the CI job “no telemetry”. The passwordless agent path and Landlock confinement are not in this release.
+Beta, not externally audited. A broad rule gives broad root access, the deny-list is a safety net and not a complete boundary, and other paths to root on the machine are outside xudo's control. See [SECURITY.md](SECURITY.md).
 
 ### Does this work with Claude Code, Codex CLI, Gemini CLI, or Aider?
 
-The policy engine does not depend on a particular agent. This beta does not enroll or authenticate agents, and it does not provide passwordless agent execution. Any caller that gets permission still follows the host password path.
+Yes. Any harness that can run a command can call `xudo exec`. xudo does not trust a program's name: a harness is verified by the machine, registered once by root. In this release no harness is verified yet, so every request asks for a password.
 
 ### What happens if an agent lies about being an agent?
 
-Agent names and environment variables do not authorize a request. Kernel-attested identity is required for the future passwordless path, which is not in this beta. Today every caller is unattested and uses the password path.
+Nothing changes. Names and environment variables never grant anything. Only a harness root registered, running inside the scope the kernel tracks for it, can run commands without a password, and only what its rules allow. In this release every request asks for a password.
 
 ### How is this different from `NOPASSWD: ALL`?
 

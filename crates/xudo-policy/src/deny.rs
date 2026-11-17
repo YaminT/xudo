@@ -20,8 +20,10 @@
 //!
 //! # This is defence in depth, not the boundary
 //!
-//! The boundary is a small set of narrow named actions. This list is what
-//! catches the mistake in one of them. A design that relies on the deny-list
+//! The boundary is a small set of narrow named actions. In the design a verified
+//! harness runs what those actions allow with no password and no person watching,
+//! so each must be narrow enough to run unattended. This list is what catches
+//! the mistake in one of them. A design that relies on the deny-list
 //! being complete has already lost, because the space of programs that can be
 //! turned into a root shell is not enumerable — see `GTFOBins`, and the CI gate
 //! that checks every allowlisted binary against it.

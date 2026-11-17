@@ -190,6 +190,9 @@ each pending update is one compact JSON object per line (JSON Lines).
 .TP
 .B watch
 Watch for pending confirmation requests on this terminal.
+This is an optional extra check for a person on the human path, turned on by
+.BR confirm_human_path ;
+it is not how agents are approved.
 The broker checks the watcher's session and terminal on each heartbeat and
 answer. A line shows the canonical command, governing rule, classification,
 evidence, time left, and the action's final word. Type that word to approve,
@@ -212,7 +215,7 @@ Root's freeze is global and stops every user's agents. An attested agent
 cannot freeze, and neither can a peer in another user namespace. Until the
 passwordless agent path ships this sets the flag but changes nothing for new
 requests or for human requests: every caller is unattested, and the human password path
-stays available. Pending or approved requests of an enrolled agent in the
+stays available. Pending or approved requests of a verified harness in the
 freezer's scope (every user's, for root) are denied and audited, without a
 backoff strike; a human's pending request is left alone.
 .TP
@@ -363,7 +366,7 @@ A file that does not parse, or that contains an unrecognised key, exits
 .BR 19 .
 The keys are
 .B confirm_agent_actions
-(default true),
+(default true; no effect in this release, and the design removes it),
 .B confirm_human_path
 (default false),
 .B confirmation_timeout_secs
@@ -377,8 +380,12 @@ The keys are
 (default true), and
 .BR use_pty ,
 which is compiled in as true and is refused if set.
-When enabled, a rule that requires confirmation also requires an out-of-band
-watch approval; the password alone does not satisfy it.
+When
+.B confirm_human_path
+is on, a rule that requires confirmation also requires an approval in
+.BR "xudo watch" ;
+the password alone does not satisfy it.
+It applies to the human path only.
 The command marks security-relevant settings and says they are never
 settable from the environment.
 This binary does not read the environment for them.
@@ -547,11 +554,16 @@ the command line,
 and process ancestry are unauthenticated hints.
 They are recorded.
 Authorization does not branch on them.
-An unattested caller takes the human path and is asked for a password.
+A command runs without a password only for a caller the kernel shows is
+inside a harness scope root registered, and only when a root-written rule
+allows that exact command for that harness.
+No caller is such a harness in this release, so every caller takes the human path and is asked for a password.
+Misclassification may only withhold: a caller that is not recognized
+takes the human path or is denied.
 .PP
-Confirmation is not read from the requester's standard input, standard
-output, or terminal.
-No live confirmation channel means deny.
+A request that needs a person never resolves by itself.
+The person's answer is never read from the requester's standard input,
+standard output, or terminal; with no person to answer, it does not run.
 .PP
 This beta has not been externally audited.
 .SH SEE ALSO
