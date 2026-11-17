@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "argv_rejected",
   "remediation": "the action exists but these arguments are not permitted; run `xudo explain -- <argv>` to see which position was rejected",

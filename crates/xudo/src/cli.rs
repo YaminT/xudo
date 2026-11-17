@@ -3061,7 +3061,10 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             "nginx.service",
         ]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert_eq!(parsed["action"], "xudo.svc.restart");
     }
 

@@ -90,6 +90,9 @@ pub struct RuleTest {
     /// every action that runs the program takes part, as in `xudo explain`.
     #[serde(default)]
     pub action: Option<ActionId>,
+    /// The configured deny rule that must decide this test, when pinned.
+    #[serde(default)]
+    pub deny_rule: Option<ActionId>,
     /// Human text shown when the test fails. Display only.
     #[serde(default)]
     pub reason: Option<String>,
@@ -211,7 +214,11 @@ fn run_one(
         .action
         .as_ref()
         .is_some_and(|named| decision.action.as_ref().is_some_and(|by| by != named));
-    if actual == test.expect && !cited_elsewhere {
+    let cited_deny_rule = test.deny_rule.as_ref().is_none_or(|wanted| {
+        decision.denial == Some(DenialCode::DenyRule)
+            && decision.trace.iter().any(|step| matches!(step, crate::decision::TraceStep::DenyRulesEvaluated { matched } if matched.iter().any(|rule| &rule.id == wanted)))
+    });
+    if actual == test.expect && !cited_elsewhere && cited_deny_rule {
         TestOutcome::Pass
     } else {
         TestOutcome::Fail {
@@ -377,6 +384,35 @@ action = "xudo.pkg.purge"
     }
 
     #[test]
+    fn a_test_with_deny_rule_passes_only_for_the_named_configured_refusal() {
+        let text = format!(
+            "{RULES}\n[[deny]]\nid = \"xudo.protect.update\"\nreason = \"updates are paused\"\nprogram = [\"apt-get\"]\nall = [{{ any-arg = [\"update\"] }}]\n\n[[test]]\nargv = [\"/usr/bin/apt-get\", \"update\"]\nexpect = \"deny\"\ndeny-rule = \"xudo.protect.update\"\n"
+        );
+        let (rules, tests) = RuleSet::from_toml_with_tests("test.toml", &text).unwrap();
+        let human = CallerFacts::new(Classification::Human, 1000);
+        let outcomes = run_tests(&rules, &tests, &human, Settings::default());
+        assert!(
+            outcomes
+                .first()
+                .is_some_and(|result| result.outcome == TestOutcome::Pass)
+        );
+        let (wrong_rules, wrong_tests) = RuleSet::from_toml_with_tests(
+            "test.toml",
+            &text.replace(
+                "deny-rule = \"xudo.protect.update\"",
+                "deny-rule = \"xudo.protect.other\"",
+            ),
+        )
+        .unwrap();
+        let wrong_outcome = run_tests(&wrong_rules, &wrong_tests, &human, Settings::default());
+        assert!(
+            wrong_outcome
+                .first()
+                .is_some_and(|result| matches!(result.outcome, TestOutcome::Fail { .. }))
+        );
+    }
+
+    #[test]
     fn a_test_that_names_an_unknown_action_fails() {
         let outcomes = run(
             "[[test]]\nargv = [\"/usr/bin/apt-get\", \"update\"]\nexpect = \"deny\"\naction = \"xudo.nope\"\n",
@@ -486,6 +522,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             argv: vec!["/usr/bin/apt-get".into(), "update".into()],
             expect: Expectation::Confirm,
             action: Some(ActionId::new(action)),
+            deny_rule: None,
             reason: None,
             source: Source::default(),
         };

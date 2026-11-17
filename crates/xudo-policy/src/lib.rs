@@ -55,6 +55,7 @@ pub mod argv;
 pub mod caller;
 pub mod decision;
 pub mod deny;
+pub mod deny_rule;
 pub mod engine;
 pub mod files;
 pub mod fuzz_check;
@@ -67,6 +68,7 @@ pub use argv::{Arg, Argv};
 pub use caller::{CallerFacts, Classification, Hint, HintSource};
 pub use decision::{Confirm, ConfirmReason, Decision, DenialCode, ExitCode, TraceStep, Verdict};
 pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_list};
+pub use deny_rule::{DenyClause, DenyRule, DenyRuleMatch, MAX_DENY_RULES, evaluate_deny_rules};
 pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{
     Generation, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError, is_rule_file_name,

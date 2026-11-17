@@ -66,6 +66,7 @@ use crate::decision::{
     Confirm, ConfirmReason, Decision, DenialCode, ENVELOPE_SCHEMA_VERSION, TraceStep, Verdict,
 };
 use crate::deny::{deny_list_version, evaluate_deny_list};
+use crate::deny_rule::evaluate_deny_rules;
 use crate::matcher::match_argv;
 use crate::rule::{Action, ActionId, ConfirmPolicy, RuleSet};
 
@@ -197,7 +198,7 @@ pub fn evaluate(
     }
 
     let accepting = run.accepting(rules, action.exe.as_bytes());
-    run.settle(action, &accepting)
+    run.settle(action, &accepting, rules.deny_rules())
 }
 
 /// Evaluates a command against every action in the ruleset, without naming
@@ -228,7 +229,7 @@ pub fn evaluate_command(
 
     let accepting = run.accepting(rules, program.as_bytes());
     if let Some((first, _)) = accepting.split_first() {
-        return run.settle(first, &accepting);
+        return run.settle(first, &accepting, rules.deny_rules());
     }
 
     let refusals = run.refusals(rules, program.as_bytes());
@@ -320,7 +321,12 @@ impl<'c> Run<'c> {
     ///
     /// `accepting` is in declaration order and includes `seed`, the action
     /// that wins a tie: the one asked for, or the first that accepts.
-    fn settle(mut self, seed: &Action, accepting: &[&Action]) -> Decision {
+    fn settle(
+        mut self,
+        seed: &Action,
+        accepting: &[&Action],
+        deny_rules: &[crate::deny_rule::DenyRule],
+    ) -> Decision {
         for action in accepting {
             self.trace.push(TraceStep::ActionMatched {
                 action: action.id.to_string(),
@@ -355,8 +361,25 @@ impl<'c> Run<'c> {
                 .map(|f| format!("{:?}: {}", f.class, f.evidence))
                 .collect(),
         });
+        let deny_rule_matches =
+            evaluate_deny_rules(deny_rules, seed.exe.as_bytes(), &self.canonical);
+        self.trace.push(TraceStep::DenyRulesEvaluated {
+            matched: deny_rule_matches
+                .iter()
+                .map(|rule| crate::deny_rule::DenyRuleMatch {
+                    id: rule.id.clone(),
+                    source: rule.source.clone(),
+                    reason: rule.reason.clone(),
+                })
+                .collect(),
+        });
         if !findings.is_empty() {
             return self.deny(DenialCode::DenyListed);
+        }
+        if let Some(rule) = deny_rule_matches.first() {
+            let mut decision = self.deny(DenialCode::DenyRule);
+            decision.rule_source = Some(rule.source.clone());
+            return decision;
         }
 
         let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
@@ -855,6 +878,36 @@ mod tests {
             matched.iter().any(|m| m.contains("SpawnsShell")),
             "{matched:?}"
         );
+    }
+
+    #[test]
+    fn compiled_deny_code_wins_while_a_configured_deny_is_traced() {
+        let rules = RuleSet::from_toml(
+            "both.toml",
+            r#"[[action]]
+id = "xudo.oops.shell"
+tier = "diag-read"
+exe = "/bin/sh"
+args = [{ name = "flag", matcher = { literal = "-c" } }]
+
+[[deny]]
+id = "xudo.protect.shell"
+reason = "shell is refused"
+program = ["sh"]
+all = []
+"#,
+        )
+        .unwrap();
+        let decision = evaluate(
+            &rules,
+            &human(),
+            &Request::for_program("xudo.oops.shell", "/bin/sh", Argv::new(["-c"])),
+            Settings::default(),
+        );
+        assert_eq!(decision.denial, Some(DenialCode::DenyListed));
+        assert!(decision.trace.iter().any(|step| matches!(step,
+            TraceStep::DenyRulesEvaluated { matched } if matched.iter().any(|rule| rule.id.as_str() == "xudo.protect.shell")
+        )));
     }
 
     #[test]

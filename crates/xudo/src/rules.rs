@@ -351,7 +351,7 @@ nopasswd = true
             .write("10-a.toml", ONE_ACTION)
             .write("20-b.toml", ONE_ACTION);
         let err = fx.load().unwrap_err();
-        assert!(err.to_string().contains("duplicate action id"), "{err}");
+        assert!(err.to_string().contains("duplicate rule id"), "{err}");
     }
 
     #[test]

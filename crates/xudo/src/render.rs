@@ -112,6 +112,20 @@ fn trace_line(step: &TraceStep) -> String {
                 format!("deny-list v{version}: {}", matched.join("; "))
             }
         }
+        TraceStep::DenyRulesEvaluated { matched } => {
+            if matched.is_empty() {
+                "deny-rules: no configured rule matched".to_owned()
+            } else {
+                format!(
+                    "deny-rules: {}",
+                    matched
+                        .iter()
+                        .map(|rule| format!("{} ({}): {}", rule.id, rule.source, rule.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        }
         TraceStep::ConfirmationDecided { required, reason } => {
             let state = if *required {
                 "required"
@@ -380,7 +394,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let decision = decide(&["restart", "nginx.service"], false);
         let text = json(&decision);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert_eq!(parsed["verdict"], "allow");
         assert_eq!(parsed["action"], "xudo.svc.restart");
         assert!(parsed["trace"].is_array());
@@ -415,7 +432,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["verdict"], "deny");
         assert_eq!(parsed["denial"], "policy_unloadable");
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert!(
             parsed["remediation"]
                 .as_str()
@@ -472,6 +492,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             TraceStep::DenyListEvaluated {
                 version: 1,
                 matched: vec!["SpawnsShell: /bin/sh".into()],
+            },
+            TraceStep::DenyRulesEvaluated {
+                matched: Vec::new(),
+            },
+            TraceStep::DenyRulesEvaluated {
+                matched: vec![xudo_policy::DenyRuleMatch {
+                    id: xudo_policy::ActionId::new("xudo.protect.test"),
+                    source: xudo_policy::Source::new("00-protect.toml", 3),
+                    reason: "protected package".into(),
+                }],
             },
             TraceStep::ConfirmationDecided {
                 required: true,

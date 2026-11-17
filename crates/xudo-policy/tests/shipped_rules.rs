@@ -190,6 +190,136 @@ fn denial(action: &str, args: &[&str]) -> Option<DenialCode> {
     .denial
 }
 
+/// Test-only broad package actions model an operator rule that accepts more
+/// apt/dpkg spellings than the shipped install action. These are deliberately
+/// not installed or included in `load_all()`.
+const OPERATOR_PACKAGE_FIXTURE: &str = r#"
+[[action]]
+id = "operator.apt.broad"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { min = 0, max = 12 } } }]
+
+[[action]]
+id = "operator.dpkg.broad"
+tier = "pkg-remove"
+exe = "/usr/bin/dpkg"
+args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { min = 0, max = 12 } } }]
+
+[[deny]]
+id = "operator.protect.package-removal"
+reason = "protected system packages cannot be removed through xudo"
+program = ["apt-get", "apt"]
+all = [
+  { any-arg = ["remove", "purge", "autoremove", "autopurge"] },
+  { any-deb-name = ["xudo", "sudo", "apparmor", "auditd"] },
+]
+
+[[deny]]
+id = "operator.protect.package-install-removal"
+reason = "protected system packages cannot be removed through xudo"
+program = ["apt-get", "apt"]
+all = [{ any-arg = ["xudo-", "sudo-", "apparmor-", "auditd-"] }]
+
+[[deny]]
+id = "operator.protect.dpkg-removal"
+reason = "protected system packages cannot be removed through xudo"
+program = ["dpkg"]
+all = [
+  { any-arg = ["-r", "-P", "--remove", "--purge"] },
+  { any-deb-name = ["xudo", "sudo", "apparmor", "auditd"] },
+]
+"#;
+
+fn operator_package_rules() -> RuleSet {
+    RuleSet::from_toml("operator-test.toml", OPERATOR_PACKAGE_FIXTURE)
+        .unwrap_or_else(|e| panic!("operator deny fixture does not load: {e}"))
+}
+
+fn operator_package_decision(program: &str, argv: &[&str]) -> xudo_policy::Decision {
+    evaluate_command(
+        &operator_package_rules(),
+        &human(),
+        &Arg::from(program),
+        &Argv::new(argv.to_vec()),
+        Settings::default(),
+    )
+}
+
+fn assert_operator_deny(program: &str, argv: &[&str], expected_id: &str) {
+    let decision = operator_package_decision(program, argv);
+    assert_eq!(decision.denial, Some(DenialCode::DenyRule), "{decision:?}");
+    assert!(
+        decision.trace.iter().any(|step| matches!(step,
+            xudo_policy::TraceStep::DenyRulesEvaluated { matched }
+                if matched.iter().any(|rule| rule.id.as_str() == expected_id)
+        )),
+        "deny trace did not cite {expected_id}: {:?}",
+        decision.trace
+    );
+}
+
+#[test]
+fn denies_removing_xudo_via_pkg_remove() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["remove", "xudo"],
+        "operator.protect.package-removal",
+    );
+}
+
+#[test]
+fn denies_removing_sudo_with_options_after_the_verb() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["remove", "-y", "sudo"],
+        "operator.protect.package-removal",
+    );
+}
+
+#[test]
+fn denies_purge_of_apparmor_via_operator_rule() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["purge", "apparmor"],
+        "operator.protect.package-removal",
+    );
+}
+
+#[test]
+fn denies_removal_via_install_trailing_hyphen_through_operator_rule() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["install", "xudo-"],
+        "operator.protect.package-install-removal",
+    );
+}
+
+#[test]
+fn denies_arch_qualified_removal_of_auditd() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["autoremove", "auditd:amd64"],
+        "operator.protect.package-removal",
+    );
+}
+
+#[test]
+fn denies_dpkg_purge_of_xudo() {
+    assert_operator_deny(
+        "/usr/bin/dpkg",
+        &["-P", "xudo"],
+        "operator.protect.dpkg-removal",
+    );
+}
+
+#[test]
+fn allows_removing_an_unprotected_package() {
+    let decision = operator_package_decision("/usr/bin/apt-get", &["remove", "ripgrep"]);
+    assert_eq!(decision.verdict, Verdict::Allow, "{decision:?}");
+    assert_eq!(decision.denial, None);
+}
+
 /// The shipped install argv, without the package names.
 ///
 /// `--no-remove` sits with the other apt options, before the verb. Apt reads

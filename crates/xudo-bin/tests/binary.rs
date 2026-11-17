@@ -122,7 +122,10 @@ fn the_json_envelope_is_parseable_from_a_pipe() {
         .output()
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(
+        parsed["schema_version"],
+        xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+    );
     assert_eq!(parsed["verdict"], "allow");
 }
 
