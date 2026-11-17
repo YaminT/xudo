@@ -15,12 +15,15 @@
 //!   before `main`, so in a Rust binary this is the second line of defence;
 //!   it is held anyway, because the guarantee must not rest on a runtime
 //!   detail.
+//! * **The caller's resource limits match PID 1's.** `/proc/1/limits` is read
+//!   through a pinned descriptor verified as procfs, and every Linux limit is
+//!   applied before the gate opens policy, spool, program, or audit state. A
+//!   missing or malformed limit refuses the gate.
 //! * **The umask is `022` and the working directory is `/`.** A caller umask
 //!   of `000` reaching an apt hook or a maintainer script would leave a file
 //!   root creates world-writable. The working directory is entered through an
 //!   `O_PATH` descriptor of `/`, so a caller-chosen directory is not where
-//!   the root command starts. Either failure refuses. The caller's resource
-//!   limits are a later change.
+//!   the root command starts. Either failure refuses.
 //! * **The process may not gain privilege by exec.** `PR_SET_NO_NEW_PRIVS`
 //!   makes a set-user-ID or file-capability binary run with its caller's
 //!   credentials, so the command the gate runs cannot be anything but what the
@@ -49,6 +52,18 @@ pub trait Hygiene {
     /// [`SysError`] when `/dev/null` cannot be opened or installed: the caller
     /// cannot know what its next `open` would become, and must refuse.
     fn ensure_std_streams(&self) -> Result<(), SysError>;
+
+    /// Resets every Linux resource limit to PID 1's soft and hard values.
+    ///
+    /// The PID 1 file is read through a pinned and validated procfs descriptor.
+    /// Any missing, malformed, or un-settable limit refuses before the gate
+    /// touches a request, policy, program, or audit record.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError`] when procfs cannot be validated/read or a limit cannot be
+    /// parsed or applied. Unsupported platforms refuse.
+    fn reset_rlimits_from_pid1(&self) -> Result<(), SysError>;
 
     /// Sets the process umask to `022`.
     ///
@@ -233,6 +248,18 @@ impl Hygiene for HostHygiene {
         ensure_std_streams_in(&HostStd)
     }
 
+    #[cfg(target_os = "linux")]
+    fn reset_rlimits_from_pid1(&self) -> Result<(), SysError> {
+        reset_rlimits_from_pid1_with(&HostLimitOps)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reset_rlimits_from_pid1(&self) -> Result<(), SysError> {
+        Err(SysError::unsupported(
+            "resetting resource limits from PID 1",
+        ))
+    }
+
     fn reset_umask(&self) -> Result<(), SysError> {
         // Fixed `022`. `027` would make a file root writes under `/etc` or
         // `/usr` unreadable to a non-root daemon. sudo's own rule combines the
@@ -257,6 +284,198 @@ impl Hygiene for HostHygiene {
             .get()
             .unsigned_abs()
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LimitSpec {
+    resource: rustix::process::Resource,
+    label: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_LIMITS: &[LimitSpec] = &[
+    LimitSpec {
+        resource: rustix::process::Resource::Cpu,
+        label: "Max cpu time",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Fsize,
+        label: "Max file size",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Data,
+        label: "Max data size",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Stack,
+        label: "Max stack size",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Core,
+        label: "Max core file size",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Rss,
+        label: "Max resident set",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Nproc,
+        label: "Max processes",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Nofile,
+        label: "Max open files",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Memlock,
+        label: "Max locked memory",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::As,
+        label: "Max address space",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Locks,
+        label: "Max file locks",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Sigpending,
+        label: "Max pending signals",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Msgqueue,
+        label: "Max msgqueue size",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Nice,
+        label: "Max nice priority",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Rtprio,
+        label: "Max realtime priority",
+    },
+    LimitSpec {
+        resource: rustix::process::Resource::Rttime,
+        label: "Max realtime timeout",
+    },
+];
+
+#[cfg(target_os = "linux")]
+fn parse_limit_value(label: &str, value: Option<&str>) -> Result<Option<u64>, SysError> {
+    match value {
+        Some("unlimited") => Ok(None),
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| SysError::malformed("1/limits", format!("invalid value for {label}"))),
+        None => Err(SysError::malformed(
+            "1/limits",
+            format!("missing value for {label}"),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pid1_limit(contents: &str, label: &str) -> Result<rustix::process::Rlimit, SysError> {
+    let mut found = None;
+    for line in contents.lines().skip(1) {
+        let Some(values) = line.strip_prefix(label) else {
+            continue;
+        };
+        if !values.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let mut fields = values.split_whitespace();
+        let current = parse_limit_value(label, fields.next())?;
+        let maximum = parse_limit_value(label, fields.next())?;
+        if found
+            .replace(rustix::process::Rlimit { current, maximum })
+            .is_some()
+        {
+            return Err(SysError::malformed(
+                "1/limits",
+                format!("duplicate {label}"),
+            ));
+        }
+    }
+    found.ok_or_else(|| SysError::malformed("1/limits", format!("missing {label}")))
+}
+
+#[cfg(target_os = "linux")]
+trait LimitOps {
+    fn pid1_limits(&self) -> Result<String, SysError>;
+    fn set(
+        &self,
+        resource: rustix::process::Resource,
+        limit: rustix::process::Rlimit,
+    ) -> Result<(), SysError>;
+}
+
+#[cfg(target_os = "linux")]
+trait Pid1Proc {
+    fn open(&self) -> Result<Box<dyn crate::ProcSource>, SysError>;
+}
+
+#[cfg(target_os = "linux")]
+struct HostPid1Proc;
+
+#[cfg(target_os = "linux")]
+impl Pid1Proc for HostPid1Proc {
+    fn open(&self) -> Result<Box<dyn crate::ProcSource>, SysError> {
+        crate::VerifiedProc::open().map(|proc| Box::new(proc) as Box<dyn crate::ProcSource>)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid1_limits(proc: &dyn Pid1Proc) -> Result<String, SysError> {
+    let source = proc.open()?;
+    let contents = source.read("1/limits")?;
+    std::str::from_utf8(&contents)
+        .map(str::to_owned)
+        .map_err(|_| SysError::malformed("1/limits", "not valid UTF-8"))
+}
+
+#[cfg(target_os = "linux")]
+struct HostLimitOps;
+
+#[cfg(target_os = "linux")]
+impl LimitOps for HostLimitOps {
+    fn pid1_limits(&self) -> Result<String, SysError> {
+        // The open descriptor is verified as procfs and every child file is
+        // opened relative to that descriptor, so an attacker cannot
+        // substitute the values the gate will inherit.
+        read_pid1_limits(&HostPid1Proc)
+    }
+
+    fn set(
+        &self,
+        resource: rustix::process::Resource,
+        limit: rustix::process::Rlimit,
+    ) -> Result<(), SysError> {
+        crate::error::lift(
+            "setrlimit(PID 1 values)",
+            rustix::process::setrlimit(resource, limit),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reset_rlimits_from_pid1_with(ops: &dyn LimitOps) -> Result<(), SysError> {
+    let contents = ops.pid1_limits()?;
+    apply_pid1_limits(&contents, ops)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_pid1_limits(contents: &str, ops: &dyn LimitOps) -> Result<(), SysError> {
+    let limits = LINUX_LIMITS
+        .iter()
+        .map(|spec| Ok((spec.resource, parse_pid1_limit(contents, spec.label)?)))
+        .collect::<Result<Vec<_>, SysError>>()?;
+    for (resource, limit) in limits {
+        ops.set(resource, limit)?;
+    }
+    Ok(())
 }
 
 /// Confirms a `PR_GET_NO_NEW_PRIVS` answer says the attribute is set.
@@ -377,6 +596,8 @@ fn reset_cwd() -> Result<(), SysError> {
 pub enum HygieneCall {
     /// [`Hygiene::ensure_std_streams`].
     EnsureStdStreams,
+    /// [`Hygiene::reset_rlimits_from_pid1`].
+    ResetRlimitsFromPid1,
     /// [`Hygiene::reset_umask`].
     ResetUmask,
     /// [`Hygiene::reset_cwd`].
@@ -390,6 +611,7 @@ pub enum HygieneCall {
 pub struct FakeHygiene {
     calls: RefCell<Vec<HygieneCall>>,
     streams: Result<(), SysError>,
+    rlimits: Result<(), SysError>,
     umask: Result<(), SysError>,
     cwd: Result<(), SysError>,
     privileges: Result<(), SysError>,
@@ -402,6 +624,7 @@ impl FakeHygiene {
         Self {
             calls: RefCell::new(Vec::new()),
             streams: Ok(()),
+            rlimits: Ok(()),
             umask: Ok(()),
             cwd: Ok(()),
             privileges: Ok(()),
@@ -413,6 +636,13 @@ impl FakeHygiene {
     #[must_use]
     pub fn with_streams_error(mut self, error: SysError) -> Self {
         self.streams = Err(error);
+        self
+    }
+
+    /// Makes [`Hygiene::reset_rlimits_from_pid1`] fail.
+    #[must_use]
+    pub fn with_rlimits_error(mut self, error: SysError) -> Self {
+        self.rlimits = Err(error);
         self
     }
 
@@ -449,6 +679,13 @@ impl Hygiene for FakeHygiene {
         self.streams.clone()
     }
 
+    fn reset_rlimits_from_pid1(&self) -> Result<(), SysError> {
+        self.calls
+            .borrow_mut()
+            .push(HygieneCall::ResetRlimitsFromPid1);
+        self.rlimits.clone()
+    }
+
     fn reset_umask(&self) -> Result<(), SysError> {
         self.calls.borrow_mut().push(HygieneCall::ResetUmask);
         self.umask.clone()
@@ -480,6 +717,8 @@ mod tests {
         clippy::indexing_slicing
     )]
 
+    #[cfg(target_os = "linux")]
+    use std::fmt::Write as _;
     use std::os::fd::{AsFd, BorrowedFd};
 
     use rustix::fs::Mode;
@@ -611,6 +850,7 @@ mod tests {
     fn the_fake_records_the_order_and_fails_where_it_is_told_to() {
         let fake = FakeHygiene::new(1);
         fake.ensure_std_streams().unwrap();
+        fake.reset_rlimits_from_pid1().unwrap();
         fake.reset_umask().unwrap();
         fake.reset_cwd().unwrap();
         fake.forbid_new_privileges().unwrap();
@@ -618,6 +858,7 @@ mod tests {
             fake.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetRlimitsFromPid1,
                 HygieneCall::ResetUmask,
                 HygieneCall::ResetCwd,
                 HygieneCall::ForbidNewPrivileges
@@ -625,10 +866,12 @@ mod tests {
         );
         let failing = FakeHygiene::new(1)
             .with_streams_error(SysError::unsupported("streams"))
+            .with_rlimits_error(SysError::unsupported("rlimits"))
             .with_umask_error(SysError::unsupported("umask"))
             .with_cwd_error(SysError::unsupported("cwd"))
             .with_privileges_error(SysError::unsupported("privileges"));
         assert!(failing.ensure_std_streams().is_err());
+        assert!(failing.reset_rlimits_from_pid1().is_err());
         assert!(
             failing
                 .reset_umask()
@@ -640,6 +883,202 @@ mod tests {
         assert!(failing.forbid_new_privileges().is_err());
         assert!(format!("{failing:?}").contains("FakeHygiene"));
         assert!(format!("{:?}", HygieneCall::ResetUmask).contains("ResetUmask"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pid1_limit_table_resets_nofile_and_fsize_from_the_pinned_values() {
+        struct Limits {
+            source: String,
+            applied: RefCell<Vec<(rustix::process::Resource, rustix::process::Rlimit)>>,
+        }
+        impl LimitOps for Limits {
+            fn pid1_limits(&self) -> Result<String, SysError> {
+                Ok(self.source.clone())
+            }
+
+            fn set(
+                &self,
+                resource: rustix::process::Resource,
+                limit: rustix::process::Rlimit,
+            ) -> Result<(), SysError> {
+                self.applied.borrow_mut().push((resource, limit));
+                Ok(())
+            }
+        }
+
+        let mut proc_limits = String::from(
+            "Limit                     Soft Limit           Hard Limit           Units\n",
+        );
+        for spec in LINUX_LIMITS {
+            let pair = match spec.resource {
+                rustix::process::Resource::Fsize => ("1234", "5678"),
+                rustix::process::Resource::Nofile => ("45", "67"),
+                _ => ("unlimited", "unlimited"),
+            };
+            writeln!(proc_limits, "{}  {} {} units", spec.label, pair.0, pair.1).unwrap();
+        }
+        let limits = Limits {
+            source: proc_limits,
+            applied: RefCell::new(Vec::new()),
+        };
+        reset_rlimits_from_pid1_with(&limits).unwrap();
+        let applied = limits.applied.borrow();
+        assert_eq!(applied.len(), LINUX_LIMITS.len());
+        assert!(applied.iter().any(|(resource, limit)| {
+            *resource == rustix::process::Resource::Fsize
+                && *limit
+                    == rustix::process::Rlimit {
+                        current: Some(1234),
+                        maximum: Some(5678),
+                    }
+        }));
+        assert!(applied.iter().any(|(resource, limit)| {
+            *resource == rustix::process::Resource::Nofile
+                && *limit
+                    == rustix::process::Rlimit {
+                        current: Some(45),
+                        maximum: Some(67),
+                    }
+        }));
+        assert!(applied.iter().any(|(_, limit)| {
+            *limit
+                == rustix::process::Rlimit {
+                    current: None,
+                    maximum: None,
+                }
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_or_malformed_pid1_limits_refuse_before_any_set() {
+        struct Limits {
+            source: String,
+            applied: RefCell<Vec<rustix::process::Resource>>,
+        }
+        impl LimitOps for Limits {
+            fn pid1_limits(&self) -> Result<String, SysError> {
+                Ok(self.source.clone())
+            }
+
+            fn set(
+                &self,
+                resource: rustix::process::Resource,
+                _limit: rustix::process::Rlimit,
+            ) -> Result<(), SysError> {
+                self.applied.borrow_mut().push(resource);
+                Ok(())
+            }
+        }
+
+        let limits = Limits {
+            source: "Limit Soft Hard Units\n".to_owned(),
+            applied: RefCell::new(Vec::new()),
+        };
+        assert!(reset_rlimits_from_pid1_with(&limits).is_err());
+        let malformed = "Limit Soft Hard Units\nMax cpu time nope 2 seconds\n";
+        let limits = Limits {
+            source: malformed.to_owned(),
+            applied: RefCell::new(Vec::new()),
+        };
+        assert!(reset_rlimits_from_pid1_with(&limits).is_err());
+        assert!(limits.applied.borrow().is_empty());
+        limits
+            .set(
+                rustix::process::Resource::Cpu,
+                rustix::process::Rlimit {
+                    current: Some(1),
+                    maximum: Some(2),
+                },
+            )
+            .unwrap();
+        assert_eq!(limits.applied.borrow().len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn duplicate_or_incomplete_pid1_limit_rows_are_refused() {
+        let duplicate =
+            "Limit Soft Hard Units\nMax cpu time 1 2 seconds\nMax cpu time 3 4 seconds\n";
+        assert!(parse_pid1_limit(duplicate, "Max cpu time").is_err());
+        let missing_value = "Limit Soft Hard Units\nMax cpu time   \n";
+        assert!(parse_pid1_limit(missing_value, "Max cpu time").is_err());
+        let missing_hard = "Limit Soft Hard Units\nMax cpu time 1 seconds\n";
+        assert!(parse_pid1_limit(missing_hard, "Max cpu time").is_err());
+        let prefix_not_a_row = "Limit Soft Hard Units\nMax cpu timeX 1 2 seconds\n";
+        assert!(parse_pid1_limit(prefix_not_a_row, "Max cpu time").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid1_limit_proc_open_read_and_utf8_failures_refuse() {
+        struct Proc(Result<crate::MapSource, SysError>);
+        impl Pid1Proc for Proc {
+            fn open(&self) -> Result<Box<dyn crate::ProcSource>, SysError> {
+                self.0
+                    .clone()
+                    .map(|source| Box::new(source) as Box<dyn crate::ProcSource>)
+            }
+        }
+
+        assert!(read_pid1_limits(&Proc(Err(SysError::unsupported("procfs")))).is_err());
+        assert!(read_pid1_limits(&Proc(Ok(crate::MapSource::new()))).is_err());
+        let invalid = crate::MapSource::new().with("1/limits", vec![0xff]);
+        assert!(read_pid1_limits(&Proc(Ok(invalid))).is_err());
+        let valid = crate::MapSource::new().with("1/limits", b"Limit\n".to_vec());
+        assert_eq!(read_pid1_limits(&Proc(Ok(valid))).unwrap(), "Limit\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid1_limit_read_failure_refuses_before_any_set() {
+        struct RefusingLimits(RefCell<Vec<rustix::process::Resource>>);
+        impl LimitOps for RefusingLimits {
+            fn pid1_limits(&self) -> Result<String, SysError> {
+                Err(SysError::unsupported("PID 1 limits"))
+            }
+
+            fn set(
+                &self,
+                resource: rustix::process::Resource,
+                _limit: rustix::process::Rlimit,
+            ) -> Result<(), SysError> {
+                self.0.borrow_mut().push(resource);
+                Ok(())
+            }
+        }
+
+        let limits = RefusingLimits(RefCell::new(Vec::new()));
+        assert!(reset_rlimits_from_pid1_with(&limits).is_err());
+        assert!(limits.0.borrow().is_empty());
+        limits
+            .set(
+                rustix::process::Resource::Cpu,
+                rustix::process::Rlimit {
+                    current: Some(1),
+                    maximum: Some(2),
+                },
+            )
+            .unwrap();
+        assert_eq!(limits.0.borrow().len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_reads_pid1_limits_from_the_verified_procfs() {
+        let contents = HostLimitOps.pid1_limits().unwrap();
+        assert!(contents.contains("Max file size"));
+        assert!(contents.contains("Max open files"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_attempts_to_apply_pid1_limits() {
+        // An unprivileged test process may be unable to raise its hard limit;
+        // the gate treats that error as a refusal. The fake tests cover both
+        // success and failure without changing the test runner's limits.
+        let _result = HostHygiene.reset_rlimits_from_pid1();
     }
 
     #[test]

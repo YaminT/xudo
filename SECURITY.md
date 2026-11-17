@@ -131,8 +131,14 @@ left half-written. The caller can steer that length through argv. A signal
 sudo relays, or the pty hanging up when the user kills sudo, is enough to
 deliver it. That route predates this fix. The impact is availability: xudo
 stays down until an operator moves the log aside. Blocking signals around
-the write and the cut-back is a later change. This change does not reset
-the caller's resource limits. When the gate's own append fails because the
+the write and the cut-back remains unavailable through a safe API: rustix's
+signal-mask call is `unsafe`, and the published unsafe-block budget was not
+changed. A record crossing a page boundary therefore remains vulnerable to
+a fatal non-core-dump signal. The gate now resets every Linux resource limit
+to PID 1's soft and hard values
+before it handles a request. It reads `/proc/1/limits` through a pinned
+descriptor verified as procfs and refuses if the file, any value, or any
+`setrlimit` call fails. When the gate's own append fails because the
 log is damaged or the cut-back did not land, stderr gains one fixed line
 telling the operator to move the log aside. The line has no path and no
 bytes from the log. The exit status is unchanged. The broker's refusal
