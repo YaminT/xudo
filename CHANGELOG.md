@@ -7,6 +7,11 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- Let the broker read `/proc/sys/kernel/random/boot_id` by removing
+  `ProcSubset=pid` from its unit. Keep `ProtectKernelTunables=yes`; the unit
+  remains at the configured 1.2 systemd exposure ceiling. Use the same strict
+  lowercase boot-id validator in the syscall seam and broker paths.
+
 - Reset every resource limit from PID 1 before the gate reads policy, consumes
   a request, writes an audit record, or runs a command. Cap the soft open-file
   limit at 1024 and disable core dumps. In a container or PID namespace, PID 1

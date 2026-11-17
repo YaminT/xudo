@@ -21,6 +21,7 @@ xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 # step is reached by a test on a laptop; `xudo-sys` dev-depends on this crate
 # for its own contract test, which cargo allows.
 xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

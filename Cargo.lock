@@ -848,6 +848,7 @@ dependencies = [
  "xudo-config",
  "xudo-policy",
  "xudo-sys",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -898,6 +899,7 @@ dependencies = [
  "xudo-policy",
  "xudo-sys-raw",
  "xudo-tests",
+ "xudo-wire",
 ]
 
 [[package]]

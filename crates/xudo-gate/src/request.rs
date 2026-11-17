@@ -659,16 +659,7 @@ pub fn is_nonce(candidate: &str) -> bool {
 }
 
 /// Whether `candidate` is a canonical lowercase UUID boot id.
-pub fn is_boot_id(candidate: &str) -> bool {
-    candidate.len() == 36
-        && candidate.bytes().enumerate().all(|(offset, byte)| {
-            if matches!(offset, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        })
-}
+pub use xudo_wire::is_boot_id;
 
 /// Whether a request fingerprint is lowercase SHA-256 hex.
 fn is_fingerprint(candidate: &str) -> bool {
