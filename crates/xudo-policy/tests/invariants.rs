@@ -49,6 +49,105 @@ fn arb_argv() -> impl Strategy<Value = Argv> {
     prop::collection::vec(token, 0..8).prop_map(Argv::new)
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 64 }))]
+
+    #[test]
+    fn adding_a_deny_rule_never_turns_a_deny_into_an_allow(extra in prop::collection::vec("[a-z]{1,8}", 0..3)) {
+        let before = RuleSet::from_toml("before.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}")).unwrap();
+        let extra_rule = "[[deny]]\nid = \"xudo.protect.another\"\nreason = \"another protected package\"\nprogram = [\"apt-get\"]\nall = [{ any-arg = [\"purge\"] }]\n";
+        let after = RuleSet::from_toml("after.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}{extra_rule}")).unwrap();
+        let mut args = vec!["remove", "xudo"];
+        args.extend(extra.iter().map(String::as_str));
+        for who in both_callers() {
+            let old = decide_deny_test(&before, &who, &args);
+            let new = decide_deny_test(&after, &who, &args);
+            prop_assert_eq!(old.denial, Some(DenialCode::DenyRule));
+            prop_assert_eq!(new.denial, Some(DenialCode::DenyRule));
+            prop_assert!(!old.verdict.is_permitted() || !new.verdict.is_permitted());
+        }
+    }
+
+    #[test]
+    fn a_deny_rule_never_changes_the_verdict_of_a_command_it_does_not_match(arg in "[a-z]{1,8}") {
+        prop_assume!(arg != "remove" && arg != "xudo");
+        let who = caller(false, Vec::new());
+        let old = decide_deny_test(&deny_test_rules(false), &who, &["install", &arg]);
+        let new = decide_deny_test(&deny_test_rules(true), &who, &["install", &arg]);
+        prop_assert_eq!(new.verdict, old.verdict);
+        prop_assert_eq!(new.denial, old.denial);
+    }
+
+    #[test]
+    fn deny_rules_in_any_file_order_give_the_same_decisions(reverse in any::<bool>()) {
+        let first = "[[deny]]\nid = \"xudo.protect.first\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = [{ any-arg = [\"remove\"] }]\n";
+        let second = "[[deny]]\nid = \"xudo.protect.second\"\nreason = \"protected system\"\nprogram = [\"apt-get\"]\nall = [{ any-deb-name = [\"xudo\"] }]\n";
+        let a_text = if reverse { format!("{DENY_ACTION}{second}{first}") } else { format!("{DENY_ACTION}{first}{second}") };
+        let b_text = if reverse { format!("{DENY_ACTION}{first}{second}") } else { format!("{DENY_ACTION}{second}{first}") };
+        let a = RuleSet::from_toml("a.toml", &a_text).unwrap();
+        let b = RuleSet::from_toml("b.toml", &b_text).unwrap();
+        let who = caller(false, Vec::new());
+        let x = decide_deny_test(&a, &who, &["remove", "xudo"]);
+        let y = decide_deny_test(&b, &who, &["remove", "xudo"]);
+        prop_assert_eq!(x.verdict, y.verdict);
+        prop_assert_eq!(x.denial, y.denial);
+        let gen_a = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: a_text.into_bytes() }]).unwrap();
+        let gen_b = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: b_text.into_bytes() }]).unwrap();
+        prop_assert_eq!(gen_a.generation, gen_b.generation);
+    }
+
+    #[test]
+    fn appending_an_argument_never_unmatches_a_deny_rule(extra in "[a-z]{0,8}") {
+        let rules = deny_test_rules(true);
+        let rule = &rules.deny_rules()[0];
+        let before = Argv::new(["remove", "xudo"]);
+        let after = Argv::new(["remove", "xudo", extra.as_str()]);
+        prop_assert!(rule.matches(b"/usr/bin/apt-get", &before));
+        prop_assert!(rule.matches(b"/usr/bin/apt-get", &after));
+    }
+
+    #[test]
+    fn a_matching_deny_rule_denies_every_caller_class(_unit in Just(())) {
+        let rules = deny_test_rules(true);
+        for who in both_callers() {
+            let decision = decide_deny_test(&rules, &who, &["remove", "xudo"]);
+            prop_assert_eq!(decision.verdict, Verdict::Deny);
+            prop_assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        }
+    }
+
+    #[test]
+    fn deny_rules_win_over_every_overlapping_rule(_unit in Just(())) {
+        let extra_action = DENY_ACTION.replace("xudo.pkg.remove", "xudo.pkg.remove.overlap");
+        let text = format!("{DENY_ACTION}{extra_action}{DENY_RULE_TEXT}");
+        let rules = RuleSet::from_toml("overlap.toml", &text).unwrap();
+        let decision = decide_deny_test(&rules, &caller(false, Vec::new()), &["remove", "xudo"]);
+        prop_assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        prop_assert!(decision.action.is_none());
+    }
+
+    #[test]
+    fn adding_a_deny_rule_changes_the_generation(_unit in Just(())) {
+        let with_rule = format!("{DENY_ACTION}{DENY_RULE_TEXT}");
+        let plain = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() }]).unwrap();
+        let changed = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: with_rule.into_bytes() }]).unwrap();
+        let without = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() }]).unwrap();
+        prop_assert_eq!(plain.generation, without.generation);
+        prop_assert_ne!(plain.generation, changed.generation);
+    }
+
+    #[test]
+    fn a_test_naming_a_deny_rule_never_changes_the_generation(_unit in Just(())) {
+        let plain_text = format!("{DENY_ACTION}{DENY_RULE_TEXT}");
+        let test_text = format!("{plain_text}\n[[test]]\nargv = [\"/usr/bin/apt-get\", \"remove\", \"xudo\"]\nexpect = \"deny\"\ndeny-rule = \"xudo.protect.pkg-remove\"\n");
+        let plain = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: plain_text.into_bytes() }]).unwrap();
+        let changed = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: test_text.into_bytes() }]).unwrap();
+        prop_assert_eq!(plain.generation, changed.generation);
+        prop_assert_eq!(changed.tests.len(), 1);
+        prop_assert_eq!(changed.tests[0].deny_rule.as_ref().map(ActionId::as_str), Some("xudo.protect.pkg-remove"));
+    }
+}
+
 fn arb_specs() -> impl Strategy<Value = Vec<ArgSpec>> {
     let spec = prop_oneof![
         Just(ArgSpec::one("verb", Matcher::Literal("restart".into()))),
@@ -1057,6 +1156,38 @@ fn arb_rules_text() -> impl Strategy<Value = Vec<&'static str>> {
 
 fn both_callers() -> [CallerFacts; 2] {
     [caller(false, Vec::new()), caller(true, Vec::new())]
+}
+
+const DENY_ACTION: &str = r#"[[action]]
+id = "xudo.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "arg", matcher = { name = "deb-name" }, repeat = { between = { min = 0, max = 4 } } }]
+"#;
+const DENY_RULE_TEXT: &str = r#"[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"] }, { any-deb-name = ["xudo"] }]
+"#;
+
+fn deny_test_rules(add_deny: bool) -> RuleSet {
+    let text = if add_deny {
+        format!("{DENY_ACTION}\n{DENY_RULE_TEXT}")
+    } else {
+        DENY_ACTION.to_owned()
+    };
+    RuleSet::from_toml("invariants.toml", &text).unwrap()
+}
+
+fn decide_deny_test(rules: &RuleSet, caller: &CallerFacts, args: &[&str]) -> Decision {
+    evaluate_command(
+        rules,
+        caller,
+        &Arg::from("/usr/bin/apt-get"),
+        &Argv::new(args.iter().copied()),
+        Settings::default(),
+    )
 }
 
 proptest! {

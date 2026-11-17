@@ -1,0 +1,5 @@
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected\u001bpackages"
+program = ["apt-get"]
+all = []

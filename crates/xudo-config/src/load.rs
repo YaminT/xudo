@@ -335,6 +335,15 @@ mod tests {
     }
 
     #[test]
+    fn no_config_layer_can_set_a_deny_rule() {
+        let mut settings = Settings::default();
+        let err =
+            apply_file(&mut settings, Layer::System, "config.toml", "deny = []\n").unwrap_err();
+        assert!(err.to_string().contains("deny"), "{err}");
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
     fn invalid_toml_fails_with_the_file_named() {
         let mut settings = Settings::default();
         let err = apply_file(&mut settings, Layer::System, "broken.toml", "frozen =").unwrap_err();

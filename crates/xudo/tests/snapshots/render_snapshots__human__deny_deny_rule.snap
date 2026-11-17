@@ -1,0 +1,16 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  command   protect-deny
+  rule      snapshot-fixture.toml:48
+  reason    deny_rule
+
+  trace
+    canonicalized: unchanged (protect-deny)
+    matched xudo.pkg.protected at snapshot-fixture.toml:42
+    deny-list v6: no capability class matched
+    deny-rules: xudo.protect.test (snapshot-fixture.toml:48): protected by the test fixture
+
+  next      an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person
