@@ -26,7 +26,7 @@ use xudo_policy::{
 };
 
 use crate::cli::{CheckArgs, Cli, Format};
-use crate::rules::LoadedRules;
+use crate::rules::{LoadError, LoadedRules};
 
 /// The envelope's schema version.
 const SCHEMA_VERSION: u32 = 1;
@@ -55,6 +55,8 @@ struct Report {
     warnings: Vec<String>,
     /// One line per `path-under` matcher. Also a lint warning.
     path_under: Vec<String>,
+    /// Deny rules that have no test pinning them.
+    deny_rule_warnings: Vec<String>,
     results: Vec<TestResult>,
     /// What the fuzz found, when it ran.
     fuzz: Option<FuzzReport>,
@@ -76,8 +78,10 @@ impl Report {
                 || !self.open_units.is_empty()
                 || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
             .then_some(ExitCode::LintError),
-            (!self.warnings.is_empty() || !self.path_under.is_empty())
-                .then_some(ExitCode::LintWarning),
+            (!self.warnings.is_empty()
+                || !self.path_under.is_empty()
+                || !self.deny_rule_warnings.is_empty())
+            .then_some(ExitCode::LintWarning),
         ]
         .into_iter()
         .flatten()
@@ -107,9 +111,26 @@ pub(crate) fn run(
     } else {
         loaded.rules().overlaps()
     };
-    let (errors, open_units, warnings, path_under) = if tests_only {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    let (errors, open_units, warnings, path_under, deny_rule_warnings) = if tests_only {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     } else {
+        let named: Vec<_> = loaded
+            .tests()
+            .iter()
+            .filter_map(|test| test.deny_rule.as_ref())
+            .collect();
+        let warnings = loaded
+            .rules()
+            .deny_rules()
+            .iter()
+            .filter(|rule| !named.iter().any(|id| id == &&rule.id))
+            .map(|rule| {
+                format!(
+                    "deny-rule: {} at {}: no test names this rule",
+                    rule.id, rule.source
+                )
+            })
+            .collect();
         (
             loaded
                 .rules()
@@ -135,6 +156,7 @@ pub(crate) fn run(
                 .collect(),
             overlaps.iter().map(ToString::to_string).collect(),
             path_under_warnings(loaded.rules()),
+            warnings,
         )
     };
     let human = CallerFacts::new(Classification::Human, 1000);
@@ -143,6 +165,7 @@ pub(crate) fn run(
         open_units,
         warnings,
         path_under,
+        deny_rule_warnings,
         results: run_tests(loaded.rules(), loaded.tests(), &human, Settings::default()),
         fuzz: fuzz_config.map(|config| fuzz(loaded.rules(), &overlaps, config)),
     };
@@ -156,6 +179,23 @@ pub(crate) fn run(
         }
     }
     status
+}
+
+/// Reports a ruleset load failure through `xudo check`'s lint-error status.
+pub(crate) fn dispatch(
+    cli: &Cli,
+    loaded: Result<&LoadedRules, &LoadError>,
+    args: &CheckArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match loaded {
+        Ok(loaded) => run(cli, loaded, args, out, err),
+        Err(error) => {
+            let _ = writeln!(err, "xudo: {error}");
+            ExitCode::LintError
+        }
+    }
 }
 
 fn human_report(
@@ -203,6 +243,9 @@ fn human_report(
         // It is still two rules whose interaction nobody wrote down, and the
         // report never stays silent about a pair it cannot decide.
         for warning in &report.path_under {
+            let _ = writeln!(out, "{}", safe(warning));
+        }
+        for warning in &report.deny_rule_warnings {
             let _ = writeln!(out, "{}", safe(warning));
         }
         for warning in &report.warnings {
@@ -364,6 +407,7 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
         .warnings
         .iter()
         .chain(report.path_under.iter())
+        .chain(report.deny_rule_warnings.iter())
         .collect();
     lint.insert("warnings".to_owned(), json!(warning_lines));
     // Absent when nothing matched, so a run with no such rule stays byte for
@@ -556,6 +600,7 @@ mod tests {
             open_units: Vec::new(),
             warnings: Vec::new(),
             path_under: Vec::new(),
+            deny_rule_warnings: Vec::new(),
             results: Vec::new(),
             fuzz: Some(report()),
         };

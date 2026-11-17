@@ -473,7 +473,7 @@ pub fn run_with_installer_at_socket(
             .err()
             .unwrap_or(ExitCode::Unusable)
         }
-        Command::Check(args) => with_rules!(|l| check::run(cli, l, args, out, err)),
+        Command::Check(args) => check::dispatch(cli, loaded.as_ref(), args, out, err),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
@@ -1190,6 +1190,19 @@ fn list(
             label,
             action.exe,
             action.source
+        );
+        shown = shown.saturating_add(1);
+    }
+    let _ = writeln!(out, "deny rules");
+    for rule in loaded.rules().deny_rules() {
+        let _ = writeln!(
+            out,
+            "{:<28} {:<12} {:<26} {}: {}",
+            rule.id.as_str(),
+            "deny",
+            rule.program.join(","),
+            rule.source,
+            rule.reason
         );
         shown = shown.saturating_add(1);
     }
@@ -3377,8 +3390,51 @@ expect = "deny"
             "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\nnopasswd = true\n",
         );
         let (code, _, err) = fx.run(&["check"]);
-        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(code, ExitCode::LintError);
         assert!(err.contains("nopasswd"), "{err}");
+    }
+
+    #[test]
+    fn check_warns_for_a_deny_rule_that_no_test_names() {
+        let fx = closed_fixture("cli-check-deny-rule-lint").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.unused\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::LintWarning, "{out}");
+        assert!(out.contains("xudo.protect.unused"), "{out}");
+        assert!(out.contains("no test names this rule"), "{out}");
+    }
+
+    #[test]
+    fn check_accepts_a_test_pinned_to_the_deny_rule_that_decided() {
+        let fx = closed_fixture("cli-check-deny-rule-pin")
+            .write(
+                "30-deny.toml",
+                "[[deny]]\nid = \"xudo.protect.update\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+            )
+            .write(
+                "40-test.toml",
+                "[[test]]\nargv = [\"/usr/bin/apt-get\", \"update\"]\nexpect = \"deny\"\ndeny-rule = \"xudo.protect.update\"\n",
+            );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}");
+        assert!(out.contains("tests: 1 passed, 0 failed"), "{out}");
+        assert!(!out.contains("no test names this rule"), "{out}");
+    }
+
+    #[test]
+    fn list_shows_deny_rules_in_their_own_section() {
+        let fx = fixture("cli-list-deny-rule").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.listed\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["list"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}");
+        let section = out.find("deny rules").expect("deny section");
+        let entry = out.find("xudo.protect.listed").expect("deny entry");
+        assert!(entry > section, "{out}");
+        assert!(out.contains("operator protection"), "{out}");
     }
 
     #[test]
@@ -4337,6 +4393,18 @@ expect = "deny"
     }
 
     #[test]
+    fn doctor_reports_the_loaded_deny_rule_count() {
+        let fx = fixture("cli-doctor-deny-count").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.doctor\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["--output", "json", "doctor"]);
+        assert_eq!(code, ExitCode::Delegated);
+        let report: serde_json::Value = serde_json::from_str(&out).expect("doctor JSON");
+        assert_eq!(report["ruleset"]["loaded"]["deny_rules"], 1);
+    }
+
+    #[test]
     fn a_broken_ruleset_fails_closed_for_every_command_that_needs_it() {
         let broken = Fixture::new("cli-broken").write("10-a.toml", "[[action]\nid =");
         for args in [
@@ -4346,8 +4414,18 @@ expect = "deny"
             vec!["agentdoc"],
         ] {
             let (code, _, err) = broken.run(&args);
-            assert_eq!(code, ExitCode::Unusable, "{args:?}");
-            assert!(err.contains("failing closed"), "{args:?}: {err}");
+            let expected = if args.first() == Some(&"check") {
+                ExitCode::LintError
+            } else {
+                ExitCode::Unusable
+            };
+            assert_eq!(code, expected, "{args:?}");
+            if expected == ExitCode::Unusable {
+                assert!(err.contains("failing closed"), "{args:?}: {err}");
+            } else {
+                assert!(!err.is_empty(), "{args:?}: {err}");
+                assert!(!err.contains("failing closed"), "{args:?}: {err}");
+            }
         }
     }
 
@@ -4358,7 +4436,7 @@ expect = "deny"
         let mut err = Vec::new();
         assert_eq!(
             run(&cli, &Invocation::default(), &mut out, &mut err),
-            ExitCode::Unusable
+            ExitCode::LintError
         );
         assert!(String::from_utf8_lossy(&err).contains("cannot read the rules directory"));
     }
