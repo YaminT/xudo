@@ -80,7 +80,10 @@ take_machine_lock root-test
 # come after the fixed ones, so they can add to what runs (`-p xudo-sys`, or a
 # test name after `--`) and cannot remove the selection that keeps the
 # unprivileged suite out of a root run.
+# SYS_RESOURCE is needed for the gate to restore a hard limit to the value
+# visible on PID 1 when sudo passes a lower hard limit through.
 docker run --rm -i \
+    --cap-add SYS_RESOURCE \
     -v "$root:/src:ro" \
     -v xudo-linux-cargo:/cache/cargo \
     -v xudo-linux-target:/cache/target \

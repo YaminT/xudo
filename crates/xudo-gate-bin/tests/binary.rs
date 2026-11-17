@@ -13,10 +13,10 @@
 //!
 //! # Where each refusal comes from depends on the host
 //!
-//! On Linux the gate gets as far as its invocation check, and, for the one
-//! name that runs, as far as the ruleset, which a test host does not have.
-//! Off Linux `close_range` is refused first, because nothing privileged may
-//! happen on a development host. Each test names both.
+//! On Linux an unprivileged test process may be unable to raise its limits to
+//! PID 1's values, so the gate refuses at caller-state reset. A privileged
+//! test host proceeds to the invocation check and then the absent ruleset.
+//! Off Linux `close_range` is refused first.
 
 #![allow(
     clippy::unwrap_used,
@@ -68,6 +68,17 @@ fn refusal_line(code: &str, severity: &str) -> String {
     format!("xudo-gate: refused ({code}, severity {severity})\n")
 }
 
+fn assert_first_refusal(stderr: &str, expected_later_code: &str, later_severity: &str) {
+    let mut allowed = vec![refusal_line(expected_later_code, later_severity)];
+    if cfg!(target_os = "linux") {
+        allowed.push(refusal_line("gate_failed_caller_state", "normal"));
+    }
+    assert!(
+        allowed.iter().any(|expected| expected == stderr),
+        "{stderr:?}"
+    );
+}
+
 #[test]
 fn a_direct_hostile_invocation_with_no_entry_does_nothing_and_exits_unusable() {
     // Every member of the `xudo` group may start the gate through sudo, so
@@ -77,24 +88,32 @@ fn a_direct_hostile_invocation_with_no_entry_does_nothing_and_exits_unusable() {
         .assert()
         .code(19)
         .stdout("")
-        .stderr(starts_with("xudo-gate: refused (gate_failed_").and(contains(NO_XUDO_HERE)));
+        .stderr(
+            starts_with("xudo-gate: refused (gate_failed_")
+                .and(contains(NO_XUDO_HERE).or(contains("gate_failed_caller_state"))),
+        );
 }
 
 #[test]
 fn arguments_are_refused() {
     // The sudoers rule grants the gate with no arguments at all.
-    let expected = if cfg!(target_os = "linux") {
-        refusal_line("gate_failed_invocation", "high")
+    let (later_code, later_severity) = if cfg!(target_os = "linux") {
+        ("gate_failed_invocation", "high")
     } else {
-        refusal_line("gate_failed_descriptors", "normal")
+        ("gate_failed_descriptors", "normal")
     };
     for args in [vec!["--help"], vec!["exec", "/bin/sh"], vec![""]] {
-        Command::new(named("xudo-gate-auth"))
+        let output = Command::new(named("xudo-gate-auth"))
             .args(&args)
-            .assert()
-            .code(19)
-            .stdout("")
-            .stderr(expected.clone());
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(19));
+        assert!(output.stdout.is_empty());
+        assert_first_refusal(
+            &String::from_utf8(output.stderr).unwrap(),
+            later_code,
+            later_severity,
+        );
     }
 }
 
@@ -107,10 +126,15 @@ fn an_unexpected_argv0_is_refused() {
         assert_eq!(output.status.code(), Some(19), "{name}");
         assert!(output.stdout.is_empty(), "{name}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains(FIRST_STEP), "{name}: {stderr}");
-        if cfg!(target_os = "linux") {
-            assert!(stderr.contains("severity high"), "{name}: {stderr}");
-        }
+        assert_first_refusal(
+            &stderr,
+            FIRST_STEP,
+            if cfg!(target_os = "linux") {
+                "high"
+            } else {
+                "normal"
+            },
+        );
     }
 }
 
@@ -184,6 +208,9 @@ fn the_environment_is_never_read() {
             .unwrap();
         assert_eq!(output.status.code(), Some(19), "{key}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains(NO_XUDO_HERE), "{key}: {stderr}");
+        assert!(
+            stderr.contains(NO_XUDO_HERE) || stderr.contains("gate_failed_caller_state"),
+            "{key}: {stderr}"
+        );
     }
 }
