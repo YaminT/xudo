@@ -18,7 +18,8 @@
 //!    the next opened descriptor number 0, 1 or 2.
 //! 3. **PID 1's resource limits.** Read through a pinned descriptor verified
 //!    as procfs, then set every limit before the gate opens policy, spool,
-//!    program, or audit state. Any failure refuses.
+//!    program, or audit state. The soft open-file limit is capped at 1024 and
+//!    core dumps are disabled. Any failure refuses.
 //! 4. **Umask `022` and working directory `/`.** Before anything else is opened
 //!    or written. A caller umask of `000` would make a file an apt hook or a
 //!    maintainer script creates world-writable. Either failure refuses.
@@ -1906,7 +1907,7 @@ all = [{ any-arg = ["restart"] }]
     }
 
     #[test]
-    fn the_gate_resets_rlimit_nofile_and_fsize_from_pid1() {
+    fn the_gate_resets_limits_before_it_opens_policy_or_executes() {
         let spool = Rc::new(holding(&[(NONCE_A, ours())]));
         let mut host = FakeHost::new(&spool);
         let _ = run(&mut host, &auth());
