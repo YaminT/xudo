@@ -98,13 +98,13 @@ use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
 use xudo_sys::TrustedRulesError;
 use xudo_sys::{
-    AuditSink, Authorized, Clock, HostClock, HostHygiene, HostPrograms, HostSyscalls, Hygiene,
-    ProcRef, ProcSource, Program, Programs, Spool, SpoolDir, SpoolError, Syscalls, VerifiedProc,
-    authorize, lineage,
+    AuditSink, Authorized, CgroupCalls, Clock, HostClock, HostHygiene, HostPeer, HostPrograms,
+    HostSyscalls, Hygiene, PeerCalls, ProcRef, ProcSource, Program, Programs, Spool, SpoolDir,
+    SpoolError, Syscalls, VerifiedProc, authorize, lineage,
 };
 
 use crate::decide::{
-    Approved, GateCaller, GateContext, Refusal, Stage, UNKNOWN_UID, authorization_record, decide,
+    Approved, GateCaller, GateContext, Refusal, Stage, authorization_record, decide,
     exec_failure_record, refusal_record,
 };
 use crate::policy::{LoadedPolicy, PolicyError};
@@ -161,6 +161,15 @@ const LISTED_NAMES: usize = MAX_SPOOL_NAMES + 1;
 pub trait GateHost {
     /// The system calls that need `unsafe`.
     fn syscalls(&self) -> &dyn Syscalls;
+    /// The safe process calls used by the ancestor recheck.
+    fn peers(&self) -> &dyn PeerCalls;
+    /// Opens the kernel cgroup view and its root-owned session records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `/sys/fs/cgroup` or the session-record directory
+    /// cannot be opened and verified.
+    fn cgroups(&self) -> Result<Box<dyn CgroupCalls>, xudo_sys::SysError>;
     /// What the gate settles about its own process.
     fn hygiene(&self) -> &dyn Hygiene;
     /// The boottime clock.
@@ -219,6 +228,14 @@ impl Default for SystemHost {
 impl GateHost for SystemHost {
     fn syscalls(&self) -> &dyn Syscalls {
         &HostSyscalls
+    }
+
+    fn peers(&self) -> &dyn PeerCalls {
+        &HostPeer
+    }
+
+    fn cgroups(&self) -> Result<Box<dyn CgroupCalls>, xudo_sys::SysError> {
+        xudo_sys::HostCgroup::open().map(|calls| Box::new(calls) as Box<dyn CgroupCalls>)
     }
 
     fn hygiene(&self) -> &dyn Hygiene {
@@ -546,7 +563,7 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
-    let caller = caller_for(matched.as_ref(), own);
+    let caller = caller_for(host, matched.as_ref(), own, &ancestors.chain, now);
     progress.caller = Some(caller.clone());
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
@@ -660,32 +677,56 @@ struct Matched {
     caller: CallerPin,
 }
 
-/// The caller `decide` judges the entry for.
-///
-/// With an entry matched, the process the walk matched it to. Without one
-/// there is no caller to name: the gate's own pin stands in, and `decide`
-/// refuses on the missing entry before it looks at the pin. The attestation
-/// is the same either way, because the gate attests no one.
-///
-/// Hard-coded `Unattested`/`None`/`None` on purpose: the gate attests no class
-/// until E6, so an entry minted for any other class (an enrolled agent's scope,
-/// a human) fails `live_attested_identity_matches` and is refused. That is the
-/// fail-closed interim: nothing mints another class before E2, and the gate
-/// must never take a class from the entry it is judging.
-fn caller_for(matched: Option<&Matched>, own: CallerPin) -> GateCaller {
-    GateCaller {
-        pin: matched.map_or(own, |found| found.caller),
-        facts: CallerFacts::new(
-            Classification::Unattested {
-                reason: "the gate attests no caller: classification is the broker's, and the \
-                         passwordless path is M4"
-                    .to_owned(),
+/// The caller `decide` judges the entry for. Any class comes from a fresh
+/// kernel cgroup read and ancestor recheck; the entry supplies only the uid
+/// against which the root record is checked.
+fn caller_for(
+    host: &dyn GateHost,
+    matched: Option<&Matched>,
+    own: CallerPin,
+    ancestors: &[ProcRef],
+    now: u64,
+) -> GateCaller {
+    let Some(found) = matched else {
+        return GateCaller::unidentified(own.pid);
+    };
+    let index = ancestors.iter().position(|ancestor| {
+        ancestor.pid == found.caller.pid && ancestor.starttime == found.caller.starttime
+    });
+    let child = index
+        .and_then(|at| at.checked_sub(1))
+        .and_then(|at| ancestors.get(at))
+        .map(|child| (child.pid, child.starttime));
+    let live = match (host.cgroups(), child) {
+        (Ok(cgroups), Some(child)) => crate::classify::classify(
+            cgroups.as_ref(),
+            host.peers(),
+            host.syscalls(),
+            crate::classify::AncestorPin {
+                caller: (found.caller.pid, found.caller.starttime),
+                uid: found.entry.caller_uid,
+                child,
+                now_boottime_ms: now,
             },
-            UNKNOWN_UID,
         ),
-        attested_class: crate::request::AttestedClass::Unattested,
-        attested_scope_id: None,
-        boot_id: None,
+        _ => crate::classify::LiveClass {
+            facts: CallerFacts::new(
+                Classification::Unattested {
+                    reason: "the gate could not recheck its caller's lineage".to_owned(),
+                },
+                found.entry.caller_uid,
+            ),
+            attested_class: crate::request::AttestedClass::Unattested,
+            scope_id: None,
+            boot_id: None,
+        },
+    };
+    GateCaller {
+        pin: found.caller,
+        facts: live.facts,
+        attested_class: live.attested_class,
+        attested_scope_id: live.scope_id,
+        boot_id: live.boot_id,
     }
 }
 
@@ -808,7 +849,9 @@ mod tests {
     )]
 
     use std::cell::Cell;
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -816,8 +859,9 @@ mod tests {
     use xudo_audit::record::Decision as AuditDecision;
     use xudo_policy::{RuleFile, load_rule_files};
     use xudo_sys::{
-        AuditError, FakeAuditSink, FakeHygiene, FakePrograms, FakeSpool, FakeSyscalls, FixedClock,
-        HygieneCall, MapSource, ProgramError, SpoolCall, SysError, TrustError,
+        AuditError, FakeAuditSink, FakeHygiene, FakePeer, FakePrograms, FakeSpool, FakeSyscalls,
+        FixedClock, HygieneCall, MapSource, ProcFile, ProgramError, ScopeFacts, SpoolCall,
+        SysError, TrustError,
     };
 
     use super::*;
@@ -866,6 +910,28 @@ args = [
         }
         tail.push(starttime.to_string());
         format!("{pid} ({comm}) {}", tail.join(" "))
+    }
+
+    fn a_descriptor() -> OwnedFd {
+        OwnedFd::from(UnixStream::pair().unwrap().0)
+    }
+
+    fn agent_parent_peers() -> FakePeer {
+        FakePeer::new()
+            .with_open(Ok(a_descriptor()))
+            .with_open(Ok(a_descriptor()))
+            .with_proc(
+                300,
+                ProcFile::Stat,
+                stat(300, "sudo", 200, 8_000).into_bytes(),
+            )
+            .with_proc(
+                200,
+                ProcFile::Stat,
+                stat(200, "xudo", 100, XUDO_START).into_bytes(),
+            )
+            .with_exit(Ok(false))
+            .with_exit(Ok(false))
     }
 
     /// The gate under sudo with `use_pty`, under xudo, under a shell:
@@ -963,8 +1029,19 @@ args = [
     }
 
     /// A host a test scripts, step by step.
+    #[derive(Clone, Copy, Default)]
+    enum FakeCgroupMode {
+        #[default]
+        Host,
+        Agent,
+        MissingAgentFacts,
+        Unavailable,
+    }
+
     struct FakeHost {
         syscalls: FakeSyscalls,
+        peers: FakePeer,
+        cgroup_mode: FakeCgroupMode,
         hygiene: FakeHygiene,
         clock: FixedClock,
         proc: Result<MapSource, SysError>,
@@ -979,6 +1056,60 @@ args = [
         user_freezes: Vec<u32>,
         /// The uids the gate asked about.
         freeze_asked: std::cell::RefCell<Vec<u32>>,
+    }
+
+    struct AgentCgroup {
+        missing_facts: bool,
+    }
+
+    impl CgroupCalls for AgentCgroup {
+        fn require_cgroup2(&self) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn pidfd_cgroup_id(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn proc_cgroup(&self, _pid: u32) -> Result<Vec<u8>, SysError> {
+            Ok(b"0::/xudo.slice/agent-0123456789abcdef0123456789abcdef.scope\n".to_vec())
+        }
+        fn cgroup_inode(&self, _path: &str) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn peer_alive(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<bool, SysError> {
+            Ok(true)
+        }
+        fn scope_facts(
+            &self,
+            name: &str,
+            _id: u64,
+            _with_processes: bool,
+        ) -> Result<Option<ScopeFacts>, SysError> {
+            if name != "agent-0123456789abcdef0123456789abcdef.scope" {
+                return Ok(None);
+            }
+            Ok(Some(ScopeFacts {
+                cgroup2: true,
+                inode: 90,
+                owner: 0,
+                mode: 0o40755,
+                procs_owner: 0,
+                procs_mode: 0o100_644,
+                populated: true,
+                record: Some(br#"{"kind":"agent","uid":1000,"label":"codex","boot_id":"abcdef01-2345-6789-abcd-ef0123456789","created_at_boottime_ms":20,"deadline":200,"pid":200,"starttime":7000,"cgroup_id":90}"#.to_vec()),
+                record_owner: 0,
+                record_mode: 0o100_600,
+                record_nlink: 1,
+                processes: Vec::new(),
+            }))
+        }
+        fn scope_names(&self) -> Result<Vec<String>, SysError> {
+            let name = if self.missing_facts {
+                "agent-ffffffffffffffffffffffffffffffff"
+            } else {
+                "agent-0123456789abcdef0123456789abcdef"
+            };
+            Ok(vec![name.to_owned()])
+        }
     }
 
     /// An executable under `target/`, owned by whoever runs the tests, made
@@ -1011,6 +1142,8 @@ args = [
             let (path, owner) = program_file("tool", b"the program that would run as root");
             Self {
                 syscalls: FakeSyscalls::new().with_cloexec(Ok(())),
+                peers: FakePeer::new(),
+                cgroup_mode: FakeCgroupMode::Host,
                 hygiene: FakeHygiene::new(GATE_PID),
                 clock: FixedClock(NOW),
                 proc: Ok(proc_tree()),
@@ -1033,6 +1166,28 @@ args = [
     impl GateHost for FakeHost {
         fn syscalls(&self) -> &dyn Syscalls {
             &self.syscalls
+        }
+        fn peers(&self) -> &dyn PeerCalls {
+            &self.peers
+        }
+        fn cgroups(&self) -> Result<Box<dyn CgroupCalls>, SysError> {
+            match self.cgroup_mode {
+                FakeCgroupMode::Unavailable => {
+                    return Err(SysError::unsupported("fake cgroup host unavailable"));
+                }
+                FakeCgroupMode::Agent => {
+                    return Ok(Box::new(AgentCgroup {
+                        missing_facts: false,
+                    }));
+                }
+                FakeCgroupMode::MissingAgentFacts => {
+                    return Ok(Box::new(AgentCgroup {
+                        missing_facts: true,
+                    }));
+                }
+                FakeCgroupMode::Host => {}
+            }
+            xudo_sys::HostCgroup::open().map(|calls| Box::new(calls) as Box<dyn CgroupCalls>)
         }
         fn hygiene(&self) -> &dyn Hygiene {
             &self.hygiene
@@ -1179,6 +1334,105 @@ args = [
         assert!(has_line(after, "authorization_seq=1"), "{after:?}");
     }
 
+    #[test]
+    fn a_human_broker_class_and_an_unattested_gate_class_still_run_on_auth() {
+        let mut human = ours();
+        human.attested_class = crate::request::AttestedClass::Human;
+        let spool = Rc::new(holding(&[(NONCE_A, human)]));
+        let mut host = FakeHost::new(&spool);
+        let exit = run(&mut host, &auth());
+
+        assert_eq!(exec_calls(&host), 1);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(exit.message.contains("gate_failed_exec"));
+        let records = host.audit.records();
+        assert_eq!(records[0].decision, AuditDecision::Allowed);
+        assert!(has_line(&records[0].evidence, "confirmation=password"));
+    }
+
+    #[test]
+    fn an_unavailable_gate_cgroup_seam_still_runs_the_auth_entry() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Unavailable;
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 1);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(exit.message.contains("gate_failed_exec"));
+    }
+
+    #[test]
+    fn a_missing_root_registered_scope_record_cannot_attest_the_gate_ancestor() {
+        let mut agent = ours();
+        agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        agent.attested_scope_id = Some(90);
+        agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let spool = Rc::new(holding(&[(NONCE_A, agent)]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::MissingAgentFacts;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 0);
+        assert!(exit.message.contains("not_confirmed") || exit.message.contains("refused"));
+    }
+
+    #[test]
+    fn a_missing_scope_facts_reply_is_unattested_at_the_gate_classifier() {
+        let peers = agent_parent_peers();
+        let syscalls =
+            FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let live = crate::classify::classify(
+            &AgentCgroup {
+                missing_facts: true,
+            },
+            &peers,
+            &syscalls,
+            crate::classify::AncestorPin {
+                caller: (200, XUDO_START),
+                uid: 1000,
+                child: (300, 8_000),
+                now_boottime_ms: NOW,
+            },
+        );
+        assert_eq!(
+            live.attested_class,
+            crate::request::AttestedClass::Unattested
+        );
+    }
+
+    #[test]
+    fn system_host_constructs_its_peer_and_cgroup_adapters() {
+        let host = SystemHost::new();
+        let _peers = host.peers();
+        #[cfg(target_os = "linux")]
+        assert!(host.cgroups().is_ok());
+        #[cfg(not(target_os = "linux"))]
+        assert!(host.cgroups().is_err());
+    }
+
+    #[test]
+    fn a_user_freeze_marker_denies_an_enrolled_entry_at_the_gate() {
+        let mut agent = ours();
+        agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        agent.attested_scope_id = Some(90);
+        agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        let spool = Rc::new(holding(&[(NONCE_A, agent)]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.user_freezes = vec![1000];
+
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_eq!(*host.freeze_asked.borrow(), [1000]);
+    }
+
     /// Whether some line of evidence begins with `prefix`.
     fn has_line(evidence: &[String], prefix: &str) -> bool {
         evidence.iter().any(|line| line.starts_with(prefix))
@@ -1287,7 +1541,9 @@ args = [
             caller: CallerPin::new(claim.caller_pid, claim.caller_starttime + 1),
             entry: claim,
         };
-        let caller = caller_for(Some(&found), CallerPin::new(500, 9_000));
+        let spool = Rc::new(holding(&[]));
+        let host = FakeHost::new(&spool);
+        let caller = caller_for(&host, Some(&found), CallerPin::new(500, 9_000), &[], 100);
         let context = GateContext {
             generation: rules().generation.id(),
             now: BoottimeMillis(100),
@@ -1741,10 +1997,14 @@ all = [{ any-arg = ["restart"] }]
     }
 
     #[test]
-    fn the_gate_refuses_a_human_entry_it_cannot_attest_live() {
+    fn a_human_entry_keeps_running_through_the_auth_gate() {
         let mut request = ours();
         request.attested_class = crate::request::AttestedClass::Human;
-        refused_for_class(request);
+        let spool = Rc::new(holding(&[(NONCE_A, request)]));
+        let mut host = FakeHost::new(&spool);
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 1);
+        assert!(exit.message.contains("gate_failed_exec"));
     }
 
     // ---- exec -------------------------------------------------------------

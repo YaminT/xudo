@@ -21,12 +21,12 @@ use serde::{Deserialize, Serialize};
 use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
-    AuditError, AuditSink, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool, SpoolError,
-    Syscalls, authorize,
+    AuditError, AuditSink, CgroupCalls, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool,
+    SpoolError, Syscalls, authorize,
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
-use crate::identify::{Fault, PeerIdentity, identify};
+use crate::identify::{Fault, PeerIdentity, identify_classified};
 use crate::mint::{
     AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
     entry_for_classified, publish,
@@ -46,6 +46,8 @@ pub struct Platform<'a> {
     /// The calls that need `unsafe` and that the ladder makes itself:
     /// `SO_PEERPIDFD` and `PIDFD_GET_INFO`.
     pub syscalls: &'a dyn Syscalls,
+    /// Cgroup identity and root-recorded scope checks.
+    pub cgroups: Option<&'a dyn CgroupCalls>,
     /// `pidfd_open`, `/proc`, and the liveness poll, which are safe in rustix,
     /// and `SO_PEERCRED`, which is not and is carried here only as a seam: the
     /// host reads it through `Syscalls::peer_cred`, behind a check of the
@@ -257,7 +259,17 @@ pub fn serve(
     if let Err(error) = platform.hygiene.forbid_new_privileges() {
         return refuse_hygiene_failure(conn, platform.audit, &error);
     }
-    let identity = match identify(conn.socket(), platform.syscalls, platform.peers) {
+    let identified = match platform.cgroups {
+        Some(cgroups) => identify_classified(
+            conn.socket(),
+            platform.syscalls,
+            platform.peers,
+            cgroups,
+            platform.clock,
+        ),
+        None => crate::identify::identify(conn.socket(), platform.syscalls, platform.peers),
+    };
+    let identity = match identified {
         Ok(identity) => identity,
         Err(error) => return refuse(conn, platform.audit, &Refusal::from(&error), None, None),
     };
@@ -2757,6 +2769,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Platform {
                 hygiene: &self.hygiene,
                 syscalls: &self.syscalls,
+                cgroups: None,
                 peers: &self.peers,
                 clock: &self.clock,
                 entropy: &self.entropy,
@@ -3711,7 +3724,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let make_evaluated = |host: &Host, request: BrokerRequest| {
             let conn = connection(Ok(Vec::new()));
-            let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+            let identity =
+                crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
             let policy = confirming_policy();
             let caller = classify(&identity);
             let decision = decide(&policy, &caller, &request);
@@ -8388,6 +8402,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             diverged: false,
             pinned: true,
             cgroup_id: None,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: crate::identify::EuidSource::PidfdInfo,
         }
     }
@@ -8906,6 +8922,35 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             outcome.records[0].decision,
             AuditDecision::AwaitingConfirmation
         );
+    }
+
+    #[test]
+    fn a_user_freeze_marker_denies_an_enrolled_entry_at_mint() {
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        assert_eq!(served, Served::Decided);
+        let written = conn.written();
+        let response = BrokerResponse::parse(&written).unwrap();
+        let (decision, minted) = decision_of(&response.answer).unwrap();
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(minted.is_none());
+        assert!(spool.files().is_empty());
     }
 
     #[test]
@@ -9449,7 +9494,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         decision.verdict = Verdict::Allow;
         decision.denial = None;
         let request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
-        let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+        let identity =
+            crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let evaluated = Evaluated {
             caller: crate::policy::classify(&identity),
             decision,
@@ -9476,7 +9522,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let conn = restart();
         let spool = FakeSpool::new();
-        let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+        let identity =
+            crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let caller = crate::policy::classify(&identity);
         let loaded = policy();
         let mut request = BrokerRequest::new(

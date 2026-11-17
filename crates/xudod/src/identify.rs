@@ -45,10 +45,27 @@
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use xudo_sys::{
-    Attestation, PeerCalls, PidfdInfo, ProcFile, SysError, Syscalls, lacks_peer_pidfd,
-    lacks_pidfd_info, lacks_pidfd_open, parse_stat, parse_status_euid, peer_was_reaped,
-    process_is_gone,
+    Attestation, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo, ProcFile,
+    Scope, ScopeKind, SysError, Syscalls, lacks_peer_pidfd, lacks_pidfd_info, lacks_pidfd_open,
+    parse_stat, parse_status_euid, peer_cgroup_id, peer_was_reaped, process_is_gone, scope_status,
 };
+
+/// Kernel-derived cgroup result retained for classification and audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CgroupAttestation {
+    /// The peer is in a committed, live, root-owned agent scope.
+    AgentScope(Scope),
+    /// The peer is outside `xudo.slice` on a supported pidfd rung.
+    Outside,
+    /// A live root-created scope has a valid record, but it is not an agent scope.
+    OtherScope(Scope),
+    /// The peer is in the slice, but no committed live agent record describes it.
+    Recordless,
+    /// The kernel facts were insufficient or inconsistent; fail closed.
+    Unattested,
+    /// Identification-only callers have not requested cgroup classification.
+    NotChecked,
+}
 
 /// The peer, as the kernel described it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,8 +92,12 @@ pub struct PeerIdentity {
     /// False only on [`Attestation::PeerCredOnly`], where there is no pidfd.
     pub pinned: bool,
     /// The cgroup id `PIDFD_GET_INFO` reported, when it answered. Recorded,
-    /// never used: M4 is where a cgroup can mean something.
+    /// used only after the cgroup seam independently validates the ladder.
     pub cgroup_id: Option<u64>,
+    /// Scope result derived from cgroup id, record, boot id and boottime.
+    pub cgroup_attestation: CgroupAttestation,
+    /// The `/proc` plus fstat or pidfd-info rung, if cgroup attestation worked.
+    pub cgroup_rung: Option<CgroupRung>,
     /// Where the current effective uid that was compared came from.
     pub euid_source: EuidSource,
 }
@@ -236,6 +257,32 @@ pub fn identify(
     syscalls: &dyn Syscalls,
     peers: &dyn PeerCalls,
 ) -> Result<PeerIdentity, IdentifyError> {
+    identify_inner(socket, syscalls, peers, None)
+}
+
+/// Identifies the peer and, while the socket-provided pidfd is still held,
+/// derives its class from the kernel cgroup facts and the committed record.
+///
+/// # Errors
+///
+/// Returns an [`IdentifyError`] if the peer cannot be pinned or its kernel
+/// identity changes during identification.
+pub fn identify_classified(
+    socket: BorrowedFd<'_>,
+    syscalls: &dyn Syscalls,
+    peers: &dyn PeerCalls,
+    cgroups: &dyn CgroupCalls,
+    clock: &dyn Clock,
+) -> Result<PeerIdentity, IdentifyError> {
+    identify_inner(socket, syscalls, peers, Some((cgroups, clock)))
+}
+
+fn identify_inner(
+    socket: BorrowedFd<'_>,
+    syscalls: &dyn Syscalls,
+    peers: &dyn PeerCalls,
+    cgroup_inputs: Option<(&dyn CgroupCalls, &dyn Clock)>,
+) -> Result<PeerIdentity, IdentifyError> {
     let cred = peers.peer_cred(socket).map_err(IdentifyError::PeerCred)?;
     // Pid 0 names no process: refuse it before any call that takes a pid.
     if cred.pid == 0 {
@@ -274,6 +321,17 @@ pub fn identify(
         confirm_unreaped(pidfd.as_fd(), peers)?;
     }
 
+    let cgroup_result =
+        cgroup_inputs.map_or((CgroupAttestation::NotChecked, None), |(cgroups, clock)| {
+            attest_cgroup(
+                cgroups,
+                syscalls,
+                pin.as_ref(),
+                cred.pid,
+                cred.uid,
+                clock.boottime_millis(),
+            )
+        });
     Ok(PeerIdentity {
         rung: rung_of(pin.as_ref().map(|(_, source)| *source), info.is_some()),
         pid: cred.pid,
@@ -284,9 +342,62 @@ pub fn identify(
         tty: stat.tty_nr,
         diverged: namespaces,
         pinned: pin.is_some(),
-        cgroup_id: info.as_ref().and_then(PidfdInfo::cgroup_id),
+        cgroup_id: cgroup_result
+            .1
+            .map(|identity| identity.id)
+            .or_else(|| info.as_ref().and_then(PidfdInfo::cgroup_id)),
+        cgroup_attestation: cgroup_result.0,
+        cgroup_rung: cgroup_result.1.map(|identity| identity.rung),
         euid_source,
     })
+}
+
+fn attest_cgroup(
+    cgroups: &dyn CgroupCalls,
+    syscalls: &dyn Syscalls,
+    pin: Option<&(OwnedFd, PinSource)>,
+    pid: u32,
+    uid: u32,
+    now: u64,
+) -> (CgroupAttestation, Option<CgroupIdentity>) {
+    let Some((pidfd, PinSource::Socket)) = pin else {
+        return (CgroupAttestation::Unattested, None);
+    };
+    if uid == 0 {
+        return (CgroupAttestation::Outside, None);
+    }
+    let Ok(cgroup) = peer_cgroup_id(cgroups, pid, pidfd.as_fd()) else {
+        return (CgroupAttestation::Unattested, None);
+    };
+    let boot_id = match syscalls.boot_id() {
+        Ok(id) if xudo_gate::request::is_boot_id(&id) => id,
+        _ => return (CgroupAttestation::Unattested, Some(cgroup)),
+    };
+    let parse =
+        |bytes: &[u8], name: &str| xudo_gate::record_identity(bytes, name, uid, &boot_id, now);
+    match scope_status(cgroups, cgroup.id, uid, &parse) {
+        Ok(Some(scope)) if scope.kind == ScopeKind::Agent => {
+            (CgroupAttestation::AgentScope(scope.clone()), Some(cgroup))
+        }
+        Ok(Some(scope)) => (CgroupAttestation::OtherScope(scope), Some(cgroup)),
+        Ok(None) => {
+            let in_xudo_slice = cgroups
+                .proc_cgroup(pid)
+                .ok()
+                .and_then(|bytes| {
+                    std::str::from_utf8(&bytes)
+                        .ok()
+                        .and_then(xudo_sys::parse_cgroup)
+                })
+                .is_some_and(|path| path.is_under("/xudo.slice"));
+            if in_xudo_slice {
+                (CgroupAttestation::Recordless, Some(cgroup))
+            } else {
+                (CgroupAttestation::Outside, Some(cgroup))
+            }
+        }
+        Err(_) => (CgroupAttestation::Unattested, Some(cgroup)),
+    }
 }
 
 /// A pidfd for the peer, from the highest rung the kernel has.
@@ -646,6 +757,8 @@ mod tests {
                 diverged: false,
                 pinned: true,
                 cgroup_id: Some(77),
+                cgroup_attestation: CgroupAttestation::NotChecked,
+                cgroup_rung: None,
                 euid_source: EuidSource::PidfdInfo,
             }
         );

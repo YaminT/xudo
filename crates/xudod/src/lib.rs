@@ -59,8 +59,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use xudo_sys::{
-    AuditSink, HostClock, HostEntropy, HostHygiene, HostPeer, HostSyscalls, Hygiene, SpoolDir,
-    UnixConnection,
+    AuditSink, HostCgroup, HostClock, HostEntropy, HostHygiene, HostPeer, HostSyscalls, Hygiene,
+    SpoolDir, UnixConnection,
 };
 use xudo_wire::RefusalCode;
 
@@ -100,10 +100,14 @@ fn run_with_hygiene(
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
             let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
+            let cgroups = HostCgroup::open().ok();
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
                 syscalls: &HostSyscalls,
+                cgroups: cgroups
+                    .as_ref()
+                    .map(|calls| calls as &dyn xudo_sys::CgroupCalls),
                 peers: &HostPeer,
                 clock: &HostClock,
                 entropy: &HostEntropy,

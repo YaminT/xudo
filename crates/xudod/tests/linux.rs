@@ -278,6 +278,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     let mut platform = Platform {
         hygiene: &hygiene,
         syscalls: &HostSyscalls,
+        cgroups: None,
         peers: &HostPeer,
         clock: &HostClock,
         entropy: &HostEntropy,
