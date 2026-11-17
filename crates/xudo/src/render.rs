@@ -72,7 +72,15 @@ pub fn human(decision: &Decision) -> String {
         let _ = writeln!(out, "  action    {action}");
     }
     if let Some(source) = &decision.rule_source {
-        let _ = writeln!(out, "  rule      {source}");
+        if let Some(rule) = deciding_deny_rule(decision) {
+            let _ = writeln!(
+                out,
+                "  rule      {} ({}): {}",
+                rule.id, rule.source, rule.reason
+            );
+        } else {
+            let _ = writeln!(out, "  rule      {source}");
+        }
     }
     if let Some(code) = decision.denial {
         let _ = writeln!(out, "  reason    {}", code.as_str());
@@ -91,6 +99,16 @@ pub fn human(decision: &Decision) -> String {
     }
 
     out
+}
+
+fn deciding_deny_rule(decision: &Decision) -> Option<&xudo_policy::DenyRuleMatch> {
+    if decision.denial != Some(xudo_policy::DenialCode::DenyRule) {
+        return None;
+    }
+    decision.trace.iter().find_map(|step| match step {
+        TraceStep::DenyRulesEvaluated { matched } => matched.first(),
+        _ => None,
+    })
 }
 
 /// One trace step, as a single line.

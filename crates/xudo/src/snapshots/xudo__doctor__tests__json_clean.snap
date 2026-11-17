@@ -20,6 +20,7 @@ expression: "render::json_of(&report)"
     "dir": "/usr/bin",
     "loaded": {
       "actions": 1,
+      "deny_rules": 0,
       "files": 1,
       "generation": "e23df87444d6b784d62a52b692b479744922a74c3a77ae347f49d6fb39100150"
     },
