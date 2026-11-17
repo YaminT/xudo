@@ -1,0 +1,5 @@
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected packages"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"], typo = true }]

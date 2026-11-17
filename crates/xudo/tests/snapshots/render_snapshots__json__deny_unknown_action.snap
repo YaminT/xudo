@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "unknown_action",
   "remediation": "no rule defines this action; run `xudo list` to see what is permitted, or ask an administrator to add a rule",

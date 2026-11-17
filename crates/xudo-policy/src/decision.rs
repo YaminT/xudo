@@ -14,13 +14,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::deny_rule::DenyRuleMatch;
 use crate::rule::{ActionId, Source};
 
 /// Schema version of the decision envelope.
 ///
 /// Bump on any change to the serialized shape so a consumer can refuse an
 /// envelope it does not understand rather than misread one.
-pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 2;
 
 /// What the engine decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +141,8 @@ pub enum DenialCode {
     ConfirmationExpired,
     /// A duplicate or backoff-limited confirmation request was throttled.
     ConfirmationThrottled,
+    /// A root-authored deny rule matched this command.
+    DenyRule,
 }
 
 impl DenialCode {
@@ -157,6 +160,7 @@ impl DenialCode {
             Self::ConfirmationRefused => 9,
             Self::ConfirmationExpired => 10,
             Self::ConfirmationThrottled => 11,
+            Self::DenyRule => 12,
         }
     }
 
@@ -174,6 +178,7 @@ impl DenialCode {
             Self::ConfirmationRefused => "confirmation_refused",
             Self::ConfirmationExpired => "confirmation_expired",
             Self::ConfirmationThrottled => "confirmation_throttled",
+            Self::DenyRule => "deny_rule",
         }
     }
 
@@ -221,6 +226,9 @@ impl DenialCode {
             }
             Self::ConfirmationThrottled => {
                 "an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`"
+            }
+            Self::DenyRule => {
+                "an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person"
             }
         }
     }
@@ -306,6 +314,11 @@ pub enum TraceStep {
         version: u32,
         /// Which capability classes matched, if any.
         matched: Vec<String>,
+    },
+    /// Configurable deny rules were evaluated after the compiled-in list.
+    DenyRulesEvaluated {
+        /// Every matching configured rule, in declaration order.
+        matched: Vec<DenyRuleMatch>,
     },
     /// The confirmation requirement was decided.
     ConfirmationDecided {
@@ -416,7 +429,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 11] = [
+    const ALL_CODES: [DenialCode; 12] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -428,6 +441,7 @@ mod tests {
         DenialCode::ConfirmationRefused,
         DenialCode::ConfirmationExpired,
         DenialCode::ConfirmationThrottled,
+        DenialCode::DenyRule,
     ];
 
     #[test]
@@ -442,7 +456,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();

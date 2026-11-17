@@ -27,6 +27,7 @@ use crate::argv::Arg;
 use crate::deny::{
     LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl, unit_literal_is_refused,
 };
+use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
 use crate::matcher::{ArgSpec, Matcher};
 use crate::rule_test::RuleTest;
 
@@ -206,6 +207,8 @@ pub struct Action {
 struct RuleFile {
     #[serde(default)]
     action: Vec<Action>,
+    #[serde(default)]
+    deny: Vec<DenyRule>,
     /// Executable tests. Kept apart from `action` on purpose: a test is not
     /// policy and never reaches the compiled ruleset.
     #[serde(default)]
@@ -260,8 +263,8 @@ fn line_of_id(contents: &str, id: &str) -> u32 {
 /// Why a ruleset was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuleSetError {
-    /// Two actions share an id.
-    #[error("duplicate action id {id} at {second} (first defined at {first})")]
+    /// Two actions or deny rules share an id.
+    #[error("duplicate rule id {id} at {second} (first defined at {first})")]
     DuplicateId {
         /// The repeated id.
         id: String,
@@ -330,6 +333,7 @@ pub enum RuleSetError {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RuleSet {
     actions: Vec<Action>,
+    deny_rules: Vec<DenyRule>,
 }
 
 /// A systemctl action whose unit position can name any unit.
@@ -405,6 +409,50 @@ impl RuleSet {
     /// Returns the first [`RuleSetError`] found. Loading is all-or-nothing: a
     /// partially-loaded ruleset is a ruleset whose contents nobody reviewed.
     pub fn load(actions: Vec<Action>) -> Result<Self, RuleSetError> {
+        Self::load_with_deny_rules(actions, Vec::new())
+    }
+
+    /// Validates a complete ruleset, including operator-authored deny rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation error; no partial ruleset is returned.
+    pub fn load_with_deny_rules(
+        actions: Vec<Action>,
+        deny_rules: Vec<DenyRule>,
+    ) -> Result<Self, RuleSetError> {
+        if deny_rules.len() > MAX_DENY_RULES {
+            return Err(RuleSetError::Parse {
+                file: "<ruleset>".into(),
+                reason: format!("more than {MAX_DENY_RULES} deny rules"),
+            });
+        }
+        for (index, deny) in deny_rules.iter().enumerate() {
+            if let Err(reason) = deny.validate() {
+                return Err(RuleSetError::Parse {
+                    file: deny.source.file.clone(),
+                    reason: format!("deny rule {} at {}: {reason}", deny.id, deny.source),
+                });
+            }
+            if let Some(prior) = deny_rules
+                .iter()
+                .take(index)
+                .find(|other| other.id == deny.id)
+            {
+                return Err(RuleSetError::DuplicateId {
+                    id: deny.id.as_str().to_owned(),
+                    first: prior.source.clone(),
+                    second: deny.source.clone(),
+                });
+            }
+            if let Some(action) = actions.iter().find(|action| action.id == deny.id) {
+                return Err(RuleSetError::DuplicateId {
+                    id: deny.id.as_str().to_owned(),
+                    first: action.source.clone(),
+                    second: deny.source.clone(),
+                });
+            }
+        }
         for (index, action) in actions.iter().enumerate() {
             if let Some(prior) = actions
                 .iter()
@@ -462,7 +510,10 @@ impl RuleSet {
             }
         }
 
-        Ok(Self { actions })
+        Ok(Self {
+            actions,
+            deny_rules,
+        })
     }
 
     /// Parses one rule file and validates it.
@@ -505,6 +556,14 @@ impl RuleSet {
                 action
             })
             .collect();
+        let deny_rules = parsed
+            .deny
+            .into_iter()
+            .map(|mut deny| {
+                deny.source = Source::new(file, line_of_id(contents, deny.id.as_str()));
+                deny
+            })
+            .collect();
         if parsed.test.len() > MAX_TESTS_PER_FILE {
             return Err(RuleSetError::TooManyTests {
                 file: file.to_owned(),
@@ -525,7 +584,7 @@ impl RuleSet {
                 test
             })
             .collect();
-        Ok((Self::load(actions)?, tests))
+        Ok((Self::load_with_deny_rules(actions, deny_rules)?, tests))
     }
 
     /// Looks up an action by id.
@@ -536,6 +595,11 @@ impl RuleSet {
     /// Every action, in declaration order.
     pub fn actions(&self) -> &[Action] {
         &self.actions
+    }
+
+    /// Every configured deny rule, in declaration order.
+    pub fn deny_rules(&self) -> &[DenyRule] {
+        &self.deny_rules
     }
 
     /// Every allowlisted executable that the compiled-in deny-list refuses.
@@ -648,6 +712,92 @@ mod tests {
             agent_allowed: true,
             env_allow: Vec::new(),
             source: Source::new("20-services.toml", 3),
+        }
+    }
+
+    const DENY_RULE: &str = r#"
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"] }, { any-deb-name = ["xudo"] }]
+"#;
+
+    #[test]
+    fn a_deny_rule_with_an_unknown_key_fails_the_file() {
+        let text = DENY_RULE.replace(
+            "reason = \"protected package\"",
+            "reason = \"protected package\"\nallow = true",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+        let text = DENY_RULE.replace(
+            "any-arg = [\"remove\"]",
+            "any-arg = [\"remove\"]\npattern = \".*\"",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_deny_rule_cannot_declare_its_source() {
+        let text = DENY_RULE.replace(
+            "reason = \"protected package\"",
+            "reason = \"protected package\"\nsource = { file = \"evil\", line = 1 }",
+        );
+        assert!(RuleSet::from_toml("trusted.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_program_with_a_slash_is_refused() {
+        let text = DENY_RULE.replace(
+            "program = [\"apt-get\"]",
+            "program = [\"/usr/bin/apt-get\"]",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_deny_id_equal_to_an_action_id_is_refused() {
+        let action_text = r#"[[action]]
+id = "xudo.protect.pkg-remove"
+tier = "diag-read"
+exe = "/usr/bin/apt-get"
+"#;
+        assert!(
+            RuleSet::from_toml("collision.toml", &format!("{action_text}{DENY_RULE}")).is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_deny_ids_are_refused() {
+        assert!(RuleSet::from_toml("duplicate.toml", &format!("{DENY_RULE}{DENY_RULE}")).is_err());
+    }
+
+    #[test]
+    fn a_ruleset_over_the_deny_rule_bound_is_refused() {
+        let rules = (0..=MAX_DENY_RULES)
+            .map(|index| DenyRule {
+                id: ActionId::new(format!("xudo.protect.{index}")),
+                reason: "protected package".into(),
+                program: vec!["apt-get".into()],
+                all: Vec::new(),
+                source: Source::new("many.toml", 1),
+            })
+            .collect();
+        assert!(RuleSet::load_with_deny_rules(Vec::new(), rules).is_err());
+    }
+
+    #[test]
+    fn deny_clauses_require_exactly_one_known_matcher() {
+        for clause in [
+            "{}",
+            "{ any-arg = [], any-deb-name = [] }",
+            "{ any-package = [] }",
+        ] {
+            let text = DENY_RULE.replace("{ any-arg = [\"remove\"] }", clause);
+            assert!(
+                RuleSet::from_toml("clause.toml", &text).is_err(),
+                "{clause}"
+            );
         }
     }
 
