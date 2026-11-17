@@ -993,6 +993,18 @@ fn rendered_or(rendered: Result<String, serde_json::Error>, fallback: &str) -> S
     }
 }
 
+/// Whether `candidate` is a canonical lowercase UUID boot id.
+pub fn is_boot_id(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.bytes().enumerate().all(|(offset, byte)| {
+            if matches!(offset, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -1000,6 +1012,28 @@ mod tests {
     use xudo_policy::{DenialCode, Verdict};
 
     use super::*;
+
+    #[test]
+    fn is_boot_id_accepts_a_lowercase_dashed_uuid() {
+        assert!(is_boot_id("0123abcd-4567-89ab-cdef-0123456789ab"));
+    }
+
+    #[test]
+    fn is_boot_id_refuses_every_malformed_spelling() {
+        for bad in [
+            "0123ABCD-4567-89ab-cdef-0123456789ab",
+            "0123abcd-4567-89ab-cdef-0123456789a",
+            "0123abcd-4567-89ab-cdef-0123456789abc",
+            "0123abcd4-567-89ab-cdef-0123456789ab",
+            "0123abcd-4567-89ab-cdef0-123456789ab",
+            "0123abcd-4567-89ab-cdef-0123456789ag",
+            "",
+            "0123abcd-4567-89ab-cdef-0123456789ab\n",
+            "0123abcd-4567-89ab-cdef-0123456789a\0",
+        ] {
+            assert!(!is_boot_id(bad), "{bad:?}");
+        }
+    }
 
     fn request() -> BrokerRequest {
         BrokerRequest::new(
