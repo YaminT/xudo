@@ -7,6 +7,15 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- Reset every resource limit from PID 1 before the gate reads policy, consumes
+  a request, writes an audit record, or runs a command. Cap the soft open-file
+  limit at 1024 and disable core dumps. In a container or PID namespace, PID 1
+  is that namespace's init, and using its limits is acceptable. The refusal
+  record after a failed reset is still written under caller limits; CPU time or
+  signals can tear that one record. Blocking signals around audit append and
+  cut-back remains unavailable through a safe API.
+- Bound the macOS `cross` and `gate` CI jobs to eight minutes; Ubuntu gate
+  jobs retain their existing timeout and no retries were added.
 - Ship active `00-protect.toml` rules that refuse removal of xudo, sudo,
   sudo-rs, AppArmor, audit, firewall, logging, time-sync, and SSH server
   packages through the shipped `apt-get remove` action. Its other clauses are

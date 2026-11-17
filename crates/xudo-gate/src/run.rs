@@ -13,53 +13,54 @@
 //!    kernel before 5.11 the call is refused and so is the gate; marking each
 //!    descriptor by hand would be another `unsafe` block, and a pre-5.11 host
 //!    is not one the beta supports.
-//! 2. **`/dev/null` for closed 0 to 2.** Before the umask and cwd reset, and
-//!    before any other `open`. The reset opens an `O_PATH` descriptor of `/`.
-//!    A closed standard stream would give that descriptor number 0, 1 or 2.
-//! 3. **Umask `022` and working directory `/`.** Immediately after the streams
-//!    are filled, and before anything else is opened or written. Nothing before
-//!    the reset depends on the umask or the working directory, so the reset
-//!    must not move earlier. A caller umask of `000` would make a file an apt
-//!    hook or a maintainer script creates world-writable. Either failure
-//!    refuses. The caller's resource limits stay a later change.
-//! 4. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
+//! 2. **`/dev/null` for closed 0 to 2.** Before the rlimit read, umask and cwd
+//!    reset, and before any other `open`. A closed standard stream would give
+//!    the next opened descriptor number 0, 1 or 2.
+//! 3. **PID 1's resource limits.** Read through a pinned descriptor verified
+//!    as procfs, then set every limit before the gate opens policy, spool,
+//!    program, or audit state. The soft open-file limit is capped at 1024 and
+//!    core dumps are disabled. Any failure refuses.
+//! 4. **Umask `022` and working directory `/`.** Before anything else is opened
+//!    or written. A caller umask of `000` would make a file an apt hook or a
+//!    maintainer script creates world-writable. Either failure refuses.
+//! 5. **`PR_SET_NO_NEW_PRIVS`.** Irreversible and inherited by the exec, so
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
-//! 5. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
+//! 6. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
 //!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
-//! 6. **`/proc` verified as procfs**, on the descriptor it is read through.
-//! 7. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
+//! 7. **`/proc` verified as procfs**, on the descriptor it is read through.
+//! 8. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
 //!    by `(pid, starttime)`, bounded at [`LINEAGE_PROCESSES`] processes. The
 //!    names the walk reads are hints and go in the audit record; nothing
 //!    branches on them. What the walk yields is a set of pins, and the next
 //!    step matches an entry to one of them.
-//! 8. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
+//! 9. **The ruleset**, only through `xudo_sys::load_trusted_rules`. The
 //!    generation is [`xudo_policy::Generation::id`] of what was loaded, the
 //!    value the broker minted against.
-//! 9. **The spool and the clock.** The broker's spool, opened through the trust
-//!    walk and seen through [`RequestSpool`], which can list, read and consume
-//!    and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked, and the
-//!    listing is cut off one name past that, so a crowded spool is refused
-//!    without being read to its end. Every
-//!    entry named by a nonce is read on a descriptor of its own. Exactly one
-//!    must be pinned to an ancestor: none is [`Refusal::NoPendingRequest`],
-//!    more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
-//!    one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
-//!    reading of zero is refused as no reading.
-//! 10. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
+//! 10. **The spool and the clock.** The broker's spool, opened through the trust
+//!     walk and seen through [`RequestSpool`], which can list, read and consume
+//!     and nothing else; at most [`MAX_SPOOL_NAMES`] names are walked, and the
+//!     listing is cut off one name past that, so a crowded spool is refused
+//!     without being read to its end. Every
+//!     entry named by a nonce is read on a descriptor of its own. Exactly one
+//!     must be pinned to an ancestor: none is [`Refusal::NoPendingRequest`],
+//!     more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
+//!     one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
+//!     reading of zero is refused as no reading.
+//! 11. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
 //!     through the verified directory descriptor before anything executes, and
 //!     a failed unlink — `ENOENT` included, which means a second gate took it
 //!     first ([`xudo_sys::SpoolError::Gone`]) — is a refusal. An entry is
 //!     therefore used at most once. This is the one place the broker's own
 //!     `remove`, for which a missing name is success, must not be used.
-//! 11. **The program**, opened through the trust walk and judged and hashed on
+//! 12. **The program**, opened through the trust walk and judged and hashed on
 //!     that descriptor. A `#!` script is refused as a script.
-//! 12. **The audit record**, through [`xudo_sys::authorize`], before the exec.
+//! 13. **The audit record**, through [`xudo_sys::authorize`], before the exec.
 //!     A gate that cannot write its record refuses, and the exec takes the
 //!     [`Authorized`] that only a written record makes.
-//! 13. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
+//! 14. **`execveat(fd, "", AT_EMPTY_PATH)`**, with the argument vector built
 //!     from the canonical argv *bytes* and the environment from
 //!     [`crate::child_environment`].
 //!
@@ -504,6 +505,7 @@ fn proceed(
     // number. Nothing before the reset depends on the umask or the working
     // directory, so moving the reset earlier only reopens that hole.
     stage(Stage::Streams, host.hygiene().ensure_std_streams())?;
+    stage(Stage::CallerState, host.hygiene().reset_rlimits_from_pid1())?;
     stage(Stage::CallerState, host.hygiene().reset_umask())?;
     stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
@@ -1123,6 +1125,7 @@ args = [
             host.hygiene.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetRlimitsFromPid1,
                 HygieneCall::ResetUmask,
                 HygieneCall::ResetCwd,
                 HygieneCall::ForbidNewPrivileges
@@ -1851,7 +1854,7 @@ all = [{ any-arg = ["restart"] }]
         );
         assert_eq!(
             seen,
-            ["proc=false", "spool=false", "hygiene=4", "programs=0"]
+            ["proc=false", "spool=false", "hygiene=5", "programs=0"]
         );
     }
 
@@ -1872,7 +1875,11 @@ all = [{ any-arg = ["restart"] }]
         );
         assert_eq!(
             umask_host.hygiene.calls(),
-            [HygieneCall::EnsureStdStreams, HygieneCall::ResetUmask]
+            [
+                HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetRlimitsFromPid1,
+                HygieneCall::ResetUmask
+            ]
         );
         assert!(!umask_host.proc_opened.get());
         assert!(umask_host.programs.opened().is_empty());
@@ -1889,6 +1896,7 @@ all = [{ any-arg = ["restart"] }]
             cwd_host.hygiene.calls(),
             [
                 HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetRlimitsFromPid1,
                 HygieneCall::ResetUmask,
                 HygieneCall::ResetCwd
             ]
@@ -1896,6 +1904,55 @@ all = [{ any-arg = ["restart"] }]
         assert!(!cwd_host.proc_opened.get());
         assert!(cwd_host.programs.opened().is_empty());
         assert_eq!(exec_calls(&cwd_host), 0);
+    }
+
+    #[test]
+    fn the_gate_resets_limits_before_it_opens_policy_or_executes() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        let _ = run(&mut host, &auth());
+        assert_eq!(
+            host.hygiene.calls().get(0..2),
+            Some(
+                &[
+                    HygieneCall::EnsureStdStreams,
+                    HygieneCall::ResetRlimitsFromPid1
+                ][..]
+            )
+        );
+        assert!(host.proc_opened.get());
+        assert_eq!(exec_calls(&host), 1);
+    }
+
+    #[test]
+    fn a_failed_rlimit_reset_refuses_before_any_action() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.hygiene = FakeHygiene::new(GATE_PID)
+            .with_rlimits_error(SysError::unsupported("PID 1 resource limits"));
+        let exit = run(&mut host, &auth());
+        assert!(
+            exit.message.contains("gate_failed_caller_state"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(
+            host.hygiene.calls(),
+            [
+                HygieneCall::EnsureStdStreams,
+                HygieneCall::ResetRlimitsFromPid1
+            ]
+        );
+        assert!(!host.proc_opened.get());
+        assert!(!host.spool_opened.get());
+        assert_eq!(host.audit.records().len(), 1, "the refusal is audited");
+        assert_eq!(
+            host.audit.records()[0].denial.as_deref(),
+            Some("gate_failed_caller_state")
+        );
+        assert!(host.programs.opened().is_empty());
+        assert_eq!(exec_calls(&host), 0);
+        assert!(consumed(&spool).is_empty());
     }
 
     #[test]
