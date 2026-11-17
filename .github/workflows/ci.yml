@@ -26,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Green gate (macos-15) runs finish in 2m07s to 3m47s. 30 minutes is
     # room for a slow runner; a hang fails here, not at the 6-hour default.
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.os == 'macos-15' && 8 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +74,7 @@ jobs:
   cross:
     name: linux targets from the dev host
     runs-on: macos-15
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup show active-toolchain || rustup toolchain install

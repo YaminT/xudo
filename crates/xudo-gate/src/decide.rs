@@ -174,7 +174,7 @@ pub enum Stage {
     Descriptors,
     /// Replace closed standard streams with `/dev/null`.
     Streams,
-    /// Set umask `022` and the working directory to `/`.
+    /// Reset every resource limit from PID 1, then set umask `022` and cwd `/`.
     CallerState,
     /// Forbid gaining privilege by exec.
     Privileges,
@@ -206,7 +206,7 @@ impl Stage {
         match self {
             Self::Descriptors => "mark its inherited descriptors close-on-exec",
             Self::Streams => "settle its standard streams",
-            Self::CallerState => "reset its umask and working directory",
+            Self::CallerState => "reset its resource limits and caller state",
             Self::Privileges => "forbid new privileges",
             Self::Invocation => "accept this invocation",
             Self::Procfs => "verify /proc",
