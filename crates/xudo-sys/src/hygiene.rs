@@ -1213,6 +1213,13 @@ mod tests {
         assert!(err.to_string().contains("not supported"), "{err}");
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_limits_cannot_be_reset_from_pid1_and_so_the_gate_refuses() {
+        let err = HostHygiene.reset_rlimits_from_pid1().unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_new_privileges_are_forbidden_and_the_kernel_agrees() {
