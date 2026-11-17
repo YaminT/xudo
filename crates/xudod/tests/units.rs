@@ -384,9 +384,14 @@ fn the_only_writable_paths_are_confirmation_state_the_spool_and_audit_log() {
     }
 }
 
+/// Proves three things only: the unit text sets no `ProcSubset=` (so it does
+/// not hide the boot id), the X8 comment explaining why is present, and the
+/// validator accepts the value the host reads. It runs in the cargo test
+/// process, not in the unit's sandbox, so it says nothing about what the live
+/// broker can read; the end-to-end proof is the systemd lane (`ci/systemd`).
 #[cfg(target_os = "linux")]
 #[test]
-fn the_shipped_broker_reads_a_valid_boot_id() {
+fn the_shipped_unit_does_not_hide_the_boot_id_and_the_host_reads_a_valid_one() {
     let service = parse(SERVICE);
     assert_eq!(value(&service, "Service", "ProtectKernelTunables"), "yes");
     assert_eq!(value(&service, "Service", "ProtectControlGroups"), "yes");

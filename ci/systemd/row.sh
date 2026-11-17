@@ -88,6 +88,11 @@ if [ -n "$instance" ]; then
     else
         bad "running broker has NoNewPrivs: 1 (unit=$instance pid=$pid)"
     fi
+    # This runs as full root via nsenter into the broker's mount namespace, so
+    # it proves the /proc mount option (no ProcSubset=pid), not the broker's
+    # seccomp filter or capabilities. The end-to-end proof (an enrolled request
+    # through the live broker must not return "live boot id is unavailable")
+    # comes with step E2, where classification exists.
     if boot_id=$(nsenter -t "$pid" -m -- cat /proc/sys/kernel/random/boot_id 2>/dev/null) &&
         printf '%s\n' "$boot_id" | grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'; then
         good "the_shipped_broker_reads_a_valid_boot_id"

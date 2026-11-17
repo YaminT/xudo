@@ -1013,6 +1013,28 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn is_boot_id_accepts_a_lowercase_dashed_uuid() {
+        assert!(is_boot_id("0123abcd-4567-89ab-cdef-0123456789ab"));
+    }
+
+    #[test]
+    fn is_boot_id_refuses_every_malformed_spelling() {
+        for bad in [
+            "0123ABCD-4567-89ab-cdef-0123456789ab",
+            "0123abcd-4567-89ab-cdef-0123456789a",
+            "0123abcd-4567-89ab-cdef-0123456789abc",
+            "0123abcd4-567-89ab-cdef-0123456789ab",
+            "0123abcd-4567-89ab-cdef0-123456789ab",
+            "0123abcd-4567-89ab-cdef-0123456789ag",
+            "",
+            "0123abcd-4567-89ab-cdef-0123456789ab\n",
+            "0123abcd-4567-89ab-cdef-0123456789a\0",
+        ] {
+            assert!(!is_boot_id(bad), "{bad:?}");
+        }
+    }
+
     fn request() -> BrokerRequest {
         BrokerRequest::new(
             "/usr/bin/systemctl",
