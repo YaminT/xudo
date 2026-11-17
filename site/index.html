@@ -15,12 +15,13 @@
 <header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header>
 <main>
 <h1>xudo</h1>
-<p><strong>xudo is sudo for AI agents.</strong> Your agent (Claude Code, Codex, Grok…) calls <code>xudo</code> where it would call <code>sudo</code>. xudo itself never asks for or handles a password. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root. If a rule says a person must decide, the command waits in the <code>ido</code> queue until you review and run it. Everything else is refused, and every decision goes into a tamper-evident log.</p>
+<p><strong>xudo is sudo for AI agents.</strong> Your agent (Claude Code, Codex, Grok…) calls <code>xudo</code> where it would call <code>sudo</code>. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root with no password prompt. If a rule says a person must decide, the command waits in the <code>ido</code> queue until you review and run it. Anyone else gets the normal <code>sudo</code> password prompt, and a command no rule allows is refused. xudo itself never asks for or handles a password. Every decision goes into a tamper-evident log.</p>
+<p>The design, in five steps:</p>
 <ol>
 <li>You install one package and choose rule files: what agents may run, down to each argument.</li>
-<li>You verify a harness once: on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
+<li>You verify a harness once (being built): on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
 <li>The agent runs <code>xudo exec -- &lt;command&gt;</code>. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.</li>
-<li>Allowed: runs as root now. Needs a person: waits in <code>ido</code>. Anything else: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
+<li>Allowed: runs as root now, with no password (being built). Needs a person: waits in <code>ido</code>. Anyone else: the normal <code>sudo</code> password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
 <li>Everything is recorded in a log that shows any tampering.</li>
 </ol>
 <p><strong>Beta. Not externally audited.</strong> Today's beta asks your password for every request. The passwordless agent path and Landlock confinement are not in this release. See <a href="security.html">security status and limits</a>.</p>

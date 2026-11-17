@@ -59,7 +59,8 @@ beside the escalator they already have (`sudo`, `sudo-rs`, or `doas`).
    the human path.
 3. **A human decision is made where the requester cannot answer it.**
    Anything that needs a human is decided by the human on a channel the
-   requesting process (or anything it controls) cannot answer. "Needs a human"
+   requesting process (or anything it controls) cannot answer: never from its
+   stdin, stdout, or `/dev/tty`. "Needs a human"
    never resolves by itself; with no human, it does not run.
 
 ## The permission model: action X, situation Y, requester Z
@@ -140,8 +141,8 @@ What makes it safe:
   identified. A grant without `--agent` covers the sole registered harness,
   and `--agent` is required when more than one is registered. During the
   window, actions marked `grant-only` (defined and reviewed, but dormant)
-  become usable, and granted actions that would otherwise go to a human run
-  without waiting for one. It does **not** lift a human-only action, the
+  become usable, and granted actions that are marked to need a human (not the human-only
+  ones) run without waiting for one. It does **not** lift a human-only action, the
   critical tier, or rate limits: a burst still sends the command to a human,
   then denies.
 - **Bounded.** The default is 30 minutes. Each permission or set may declare
@@ -260,8 +261,9 @@ capability: a component that can be prompt-injected must not be a component
 that can grant root.
 
 When the provider is unreachable or the quota is exhausted, the operator's
-configured fallback applies: continue in blind mode (default), queue
-everything unmatched to ido, or reject everything unmatched. There is no
+configured fallback applies: continue in blind mode (default), or send
+every request that needs a human decision to the human path with no AI
+opinion. A command no rule allows stays denied either way. There is no
 configuration in which the absence of AI widens what passes.
 
 ### Pasban

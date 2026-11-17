@@ -10,10 +10,12 @@ The broker and password-authenticated gate are built. Every caller is currently
 classified as `Unattested`, so every request uses the password path. The
 package does not install a `NOPASSWD` rule. The passwordless agent path,
 Landlock confinement, and same-uid watcher separation are not in this release.
-Out-of-band confirmation through `xudo watch` is built but off by default; every
-path still requires the password. Session and terminal checks do not prove a
-human: a same-uid agent can run `script -qc 'xudo watch'`. A cgroup scope for agents, not in this
-release, is needed to separate the agent from the human.
+Out-of-band confirmation through `xudo watch` is built but off by default. It
+is an optional extra on the human path; the agent path never depends
+on it. Every path still requires the password. Session and terminal checks do
+not prove a human: a same-uid agent can run `script -qc 'xudo watch'`. This
+limits only that extra. A cgroup scope for agents, not in this release, is
+needed to separate the agent from the human.
 
 The doas rule `xudo install` writes is `permit persist`. On an OpenDoas built
 with timestamp support, one password then covers about five minutes, unlike the
