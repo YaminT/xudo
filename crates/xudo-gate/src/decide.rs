@@ -531,6 +531,11 @@ pub fn refusal_record(
                 .collect::<String>()
         ));
     }
+    if let Refusal::Policy(decision) | Refusal::ConfirmationMissing(decision) = refusal
+        && let Some(id) = deciding_deny_rule_id(decision)
+    {
+        evidence.push(format!("deny_rule_id={id}"));
+    }
 
     Record::after(
         previous,
@@ -541,6 +546,15 @@ pub fn refusal_record(
     .with_denial(refusal.code())
     .with_evidence(evidence)
     .with_outcome(Outcome::NotExecuted)
+}
+
+fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
+    decision.trace.iter().find_map(|step| match step {
+        xudo_policy::TraceStep::DenyRulesEvaluated { matched } => {
+            matched.first().map(|rule| rule.id.as_str())
+        }
+        _ => None,
+    })
 }
 
 /// The audit record for an authorization, before the child runs.
@@ -699,6 +713,33 @@ args = [
         .unwrap()
     }
 
+    fn package_protection_rules() -> RuleSet {
+        RuleSet::from_toml(
+            "00-protect.toml",
+            r#"
+[[action]]
+id = "xudo.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "remove" } },
+  { name = "separator", matcher = { literal = "--" } },
+  { name = "pkg", matcher = { name = "deb-name-literal" }, repeat = { between = { min = 1, max = 10 } } },
+]
+
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [
+  { any-arg = ["remove", "purge", "autoremove", "autopurge"] },
+  { any-deb-name = ["xudo", "sudo"] },
+]
+"#,
+        )
+        .unwrap()
+    }
+
     fn agent(pid: u32) -> GateCaller {
         GateCaller {
             pin: CallerPin::new(pid, 555),
@@ -807,6 +848,70 @@ args = [
         assert_eq!(approved.rule_source, "test-rules.toml:3");
         assert_eq!(approved.nonce, NONCE);
         assert_eq!(approved.environment, child_environment());
+    }
+
+    #[test]
+    fn the_gate_refuses_what_a_deny_rule_matches() {
+        let mut pending = request(77, "xudo.pkg.remove", &["remove", "--", "xudo"]);
+        pending.program = "/usr/bin/apt-get".to_owned();
+        let refusal = decide(
+            &package_protection_rules(),
+            &human(77),
+            Some(&pending),
+            context(),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "deny_rule");
+        let decision = refused_decision(&refusal).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        assert!(
+            decision.trace.iter().any(|step| matches!(step,
+                xudo_policy::TraceStep::DenyRulesEvaluated { matched }
+                    if matched.iter().any(|rule| rule.id.as_str() == "xudo.protect.pkg-remove")
+            )),
+            "the gate's decision did not cite the shipped rule: {:?}",
+            decision.trace
+        );
+        let record = refusal_record(None, &refusal, &human(77), Some(&pending));
+        assert!(
+            record
+                .evidence
+                .contains(&"deny_rule_id=xudo.protect.pkg-remove".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_confirmation_refusal_record_carries_no_deny_rule_id() {
+        let refusal = Refusal::ConfirmationMissing(Box::new(Decision::deny(
+            DenialCode::ArgvRejected,
+            vec!["x".to_owned()],
+            Vec::new(),
+        )));
+        let record = refusal_record(None, &refusal, &human(77), None);
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("deny_rule_id=")),
+            "a confirmation refusal has no deciding deny rule: {:?}",
+            record.evidence
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_added_after_mint_makes_the_entry_stale() {
+        let mut pending = request(77, "xudo.pkg.remove", &["remove", "--", "xudo"]);
+        pending.program = "/usr/bin/apt-get".to_owned();
+        let mut after_rule_change = context();
+        after_rule_change.generation = GENERATION.saturating_add(1);
+        let refusal = decide(
+            &package_protection_rules(),
+            &human(77),
+            Some(&pending),
+            after_rule_change,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "request_stale_generation");
     }
 
     #[test]

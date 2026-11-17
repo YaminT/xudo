@@ -55,7 +55,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    6
+    7
 }
 
 /// A class of capability that is never permitted as root.
@@ -476,6 +476,9 @@ const SCHEDULERS: &[&[u8]] = &[
 /// Ordered longest-prefix-irrelevant: a match on any of these is fatal, so the
 /// order is only for readability.
 const PROTECTED_PREFIXES: &[&[u8]] = &[
+    b"/usr/bin/xudo",
+    b"/usr/bin/ido",
+    b"/usr/libexec/xudo/xudod",
     b"/etc/xudo",
     b"/usr/libexec/xudo",
     b"/var/log/xudo",
@@ -1703,7 +1706,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 6);
+        assert_eq!(deny_list_version(), 7);
     }
 
     #[test]
@@ -1926,6 +1929,9 @@ mod tests {
             "/etc/apt/sources.list.d/evil.list",
             "/var/log/xudo/audit.jsonl",
             "/var/lib/xudo/audit.jsonl",
+            "/usr/bin/xudo",
+            "/usr/bin/ido",
+            "/usr/libexec/xudo/xudod",
         ] {
             assert!(
                 classes("/usr/bin/true", &[path]).contains(&CapabilityClass::SelfModification),
@@ -1938,8 +1944,13 @@ mod tests {
     fn a_protected_prefix_matches_the_directory_itself_and_its_children() {
         assert!(touches_protected_path(b"/etc/xudo"));
         assert!(touches_protected_path(b"/etc/xudo/config.toml"));
+        assert!(touches_protected_path(b"/usr/bin/xudo"));
+        assert!(touches_protected_path(b"/usr/bin/ido"));
+        assert!(touches_protected_path(b"/usr/libexec/xudo/xudod"));
+        assert!(touches_protected_path(b"/usr/libexec/xudo/xudod.backup"));
         // The prefix-match bug: a sibling whose name merely starts the same.
         assert!(!touches_protected_path(b"/etc/xudoxyz"));
+        assert!(!touches_protected_path(b"/usr/bin/xudo-helper"));
         assert!(!touches_protected_path(b"etc/xudo"));
     }
 

@@ -1,5 +1,6 @@
 ---
 source: crates/xudo/src/doctor.rs
+assertion_line: 2269
 expression: human(&fixed)
 ---
 platform     test
@@ -10,6 +11,8 @@ no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.t
 rules trust  root-owned, no writable component, no user-made mount; 0 rule file(s) checked on their descriptors
 rule package /usr/bin/rule-0.toml: unknown
 rule package unknown: test fixture has no dpkg record
+protect rule missing shipped deny rule xudo.protect.pkg-remove
+protect rule missing shipped deny rule xudo.protect.pkg-install-removal
 sudoers xudo unknown: canonical rule could not be read
 sudoers xudo unknown: test fixture has no sudoers directory
 classified   unattested
