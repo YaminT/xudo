@@ -90,11 +90,19 @@ change is part of the ruleset generation, so an approval already minted
 against the previous ruleset no longer matches.
 
 With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
-`confirm = "always"` is satisfied by the password alone. A member of the
-`xudo` group who passes the password can remove packages through it,
-including xudo, sudo, apparmor, auditd, nftables, ufw and rsyslog. That was
-already true in `v0.1.0-beta.1` and is not changed here. A package-name
-tripwire for those is a later change.
+`confirm = "always"` is satisfied by the password alone. The shipped active
+`00-protect.toml` deny rules refuse removal of xudo, sudo, sudo-rs, AppArmor,
+auditd, firewall, logging, time-sync, and openssh-server packages through the
+shipped `apt-get remove` action. Its purge, autoremove, autopurge,
+`install pkg-`, and dpkg clauses are tripwires for operator actions that accept
+those spellings. These
+checks protect xudo-mediated paths only. They cannot prevent a host-side apt or
+dpkg command, a root shell, or an indirect transaction such as installing
+`sudo-ldap` that removes a conflicting package. `xudo doctor` warns when one
+of the shipped deny-rule ids is absent. The policy loader continues to reject
+deny rules whose program has no loaded action; therefore apt and dpkg package
+tripwires are exercised as operator-rule fixtures until xudo ships actions for
+those programs.
 
 The shipped `xudo.time.set-ntp` rule accepts `timedatectl set-ntp false`,
 which has the same effect as stopping the time-sync unit. The tripwire
@@ -164,7 +172,7 @@ one you know you lack.
   A symlink inside the prefix is a path the rule never named. `rm`, `rmdir`,
   `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
   `touch`, `mkdir`, `mkfifo`, `rename`, and `prename` are the compiled-in
-  class `ChangesPathMetadataOrExistence` (deny-list version 6), including a
+  class `ChangesPathMetadataOrExistence` (deny-list version 7), including a
   copy or hardlink that keeps the name and a `busybox` applet. `mknod` is
   `DeviceOrFilesystem`. `setcap` is `PrivilegeTool`. `xudo check` warns on
   every `path-under` use and exits 20.

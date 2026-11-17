@@ -7,12 +7,21 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- Ship active `00-protect.toml` rules that refuse removal of xudo, sudo,
+  sudo-rs, AppArmor, audit, firewall, logging, time-sync, and SSH server
+  packages through the shipped `apt-get remove` action. Its other clauses are
+  tripwires for broader operator actions. The policy loader still rejects deny
+  rules for programs with no loaded action, so apt and dpkg tripwires are tested
+  with broad test-only operator actions until those executables have shipped actions.
+- Protect `/usr/bin/xudo`, `/usr/bin/ido`, and `/usr/libexec/xudo/xudod` from
+  xudo-mediated writes; bump the compiled deny-list version to 7.
+
 - `path-under` is lexical only. Nothing in xudo enforces containment for
   argument paths. Never use it for a program that opens the path as root.
   A rule that allowlists `rm` of a home directory accepts a path the agent
   planted as a symlink and deletes whatever that symlink points at. The
   compiled-in deny-list now refuses that class of tool
-  (`ChangesPathMetadataOrExistence`, deny-list version 6): `rm`, `rmdir`,
+  (`ChangesPathMetadataOrExistence`, deny-list version 7): `rm`, `rmdir`,
   `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
   `touch`, `mkdir`, `mkfifo`, `rename`, and `prename`, including a copy or
   hardlink that keeps the name and a `busybox` applet. `mknod` joins

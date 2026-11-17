@@ -475,6 +475,31 @@ or a dependency change that removes
 .BR libpam0g .
 Use confirmation policy for actions whose dependency resolution can remove
 other packages.
+.SS Shipped package protect rules
+The package installs
+.IR 00-protect.toml
+as an active dpkg conffile in
+.IR /etc/xudo/rules.d/ .
+It refuses the protected package names in the shipped
+.B apt-get remove
+action. Its purge, autoremove, autopurge, trailing-hyphen install, and dpkg
+clauses are tripwires for operator actions that accept those spellings.
+The protected names are xudo, sudo, sudo-rs, apparmor, auditd, nftables,
+iptables, ufw, firewalld, rsyslog, systemd-timesyncd, chrony, and
+openssh-server.
+.PP
+These checks apply only to commands xudo mediates. They do not constrain the
+host's own package tools or indirect package removals, such as installing
+.BR sudo-ldap .
+The rules name apt-get because it is the package executable used by a shipped
+action. The loader refuses deny rules whose program has no loaded action;
+apt and dpkg spellings are covered by operator-rule tests until xudo ships
+actions for those executables. The compiled path checks also protect
+.BR /usr/bin/xudo ,
+.BR /usr/bin/ido ,
+and
+.BR /usr/libexec/xudo/xudod
+from xudo-mediated writes.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .

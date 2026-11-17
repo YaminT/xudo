@@ -1,0 +1,54 @@
+# Protect the broker and core security/availability packages through
+# xudo.pkg.remove. Other verbs, install-as-removal spellings, and dpkg options
+# are tripwires for broader operator actions. Operators may add apt or dpkg
+# actions; combined loading rejects rules for programs no loaded action uses.
+
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "xudo protects itself and core security packages from removal"
+program = ["apt-get"]
+all = [
+  { any-arg = [
+    "remove",
+    "purge",
+    "autoremove",
+    "autopurge",
+  ] },
+  { any-deb-name = [
+    "xudo",
+    "sudo",
+    "sudo-rs",
+    "apparmor",
+    "auditd",
+    "nftables",
+    "iptables",
+    "ufw",
+    "firewalld",
+    "rsyslog",
+    "systemd-timesyncd",
+    "chrony",
+    "openssh-server",
+  ] },
+]
+
+[[deny]]
+id = "xudo.protect.pkg-install-removal"
+reason = "xudo protects core packages from install-as-removal spellings"
+program = ["apt-get"]
+all = [
+  { any-arg = [
+    "xudo-",
+    "sudo-",
+    "sudo-rs-",
+    "apparmor-",
+    "auditd-",
+    "nftables-",
+    "iptables-",
+    "ufw-",
+    "firewalld-",
+    "rsyslog-",
+    "systemd-timesyncd-",
+    "chrony-",
+    "openssh-server-",
+  ] },
+]

@@ -153,6 +153,9 @@ pub struct RulesetReport {
     pub trust: TrustReport,
     /// Whether each loaded rule matches dpkg's shipped conffile checksum.
     pub package_drift: RuleDriftReport,
+    /// Shipped deny-rule ids that are absent from the loaded ruleset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_shipped_deny_rules: Vec<&'static str>,
     /// Set when the rules loaded and no systemctl action accepts a lifecycle
     /// or power verb.
     ///
@@ -438,6 +441,24 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         load_error: loaded.err().map(ToString::to_string),
         trust,
         package_drift,
+        missing_shipped_deny_rules: loaded
+            .ok()
+            .map(|loaded| {
+                [
+                    "xudo.protect.pkg-remove",
+                    "xudo.protect.pkg-install-removal",
+                ]
+                .into_iter()
+                .filter(|id| {
+                    !loaded
+                        .rules()
+                        .deny_rules()
+                        .iter()
+                        .any(|rule| rule.id.as_str() == *id)
+                })
+                .collect()
+            })
+            .unwrap_or_default(),
         lifecycle_note: loaded.ok().and_then(|loaded| {
             crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT)
         }),
@@ -830,6 +851,9 @@ pub(crate) fn human(report: &Report) -> String {
     }
     if let Some(reason) = &report.ruleset.package_drift.unavailable {
         line("rule package", &format!("unknown: {}", safe(reason)));
+    }
+    for id in &report.ruleset.missing_shipped_deny_rules {
+        line("protect rule", &format!("missing shipped deny rule {id}"));
     }
     if report.backend.implementation == Some(BackendKind::Doas) {
         line("sudoers xudo", "does not apply to the doas backend");
@@ -1946,6 +1970,31 @@ mod tests {
         )
         .unwrap();
         LoadedRules::from_dir(&dir).unwrap()
+    }
+
+    #[test]
+    fn doctor_warns_when_a_shipped_deny_rule_is_missing() {
+        let loaded = fixture_rules("missing-protect-deny");
+        let report = gathered(
+            &clean_host(),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        assert_eq!(
+            report.ruleset.missing_shipped_deny_rules,
+            [
+                "xudo.protect.pkg-remove",
+                "xudo.protect.pkg-install-removal"
+            ]
+        );
+        let text = human(&report);
+        assert!(text.contains("protect rule missing shipped deny rule xudo.protect.pkg-remove"));
     }
 
     /// Nothing wrong, everything readable, and the caller already in `xudo`.

@@ -31,6 +31,15 @@ use crate::rules::{LoadError, LoadedRules};
 /// The envelope's schema version.
 const SCHEMA_VERSION: u32 = 1;
 
+/// Shipped deny rules are covered by the exhaustive workspace test in
+/// `xudo-policy/tests/shipped_rules.rs`. Their clauses intentionally include
+/// operator-only spellings that no shipped action accepts, so an inline
+/// `[[test]]` cannot honestly name them as the deciding rule.
+const WORKSPACE_TESTED_SHIPPED_DENY_RULES: &[&str] = &[
+    "xudo.protect.pkg-remove",
+    "xudo.protect.pkg-install-removal",
+];
+
 /// One rendered line is at most this many columns.
 const LIMITS: Limits = Limits {
     max_cols: 200,
@@ -123,7 +132,10 @@ pub(crate) fn run(
             .rules()
             .deny_rules()
             .iter()
-            .filter(|rule| !named.iter().any(|id| id == &&rule.id))
+            .filter(|rule| {
+                !named.iter().any(|id| id == &&rule.id)
+                    && !WORKSPACE_TESTED_SHIPPED_DENY_RULES.contains(&rule.id.as_str())
+            })
             .map(|rule| {
                 format!(
                     "deny-rule: {} at {}: no test names this rule",

@@ -2927,6 +2927,10 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             out.contains(crate::lifecycle_note::TEXT),
             "shipped rules have no lifecycle action, so check must say so: {out}"
         );
+        assert!(
+            !out.contains("deny-rule:"),
+            "shipped deny rules have workspace adversarial coverage: {out}"
+        );
     }
 
     #[test]

@@ -82,6 +82,8 @@ args = [
 
 There are no argument globs. Each argument is constrained by position. The shipped rules are the TOML files under [rules/](rules/). The lifecycle example is not one of them.
 
+The package also ships `rules/00-protect.toml` as an active dpkg conffile. It refuses removal of `xudo`, `sudo`, `sudo-rs`, AppArmor, audit, firewall, logging, time-sync, and SSH server packages through the shipped `apt-get remove` action. Its `purge`, `autoremove`, `autopurge`, trailing-hyphen install, and dpkg clauses are tripwires for operator actions that accept those spellings. These rules protect xudo-mediated commands only. They cannot stop the host's own package tools or a dependency/conflict transaction that indirectly removes a package, such as installing `sudo-ldap`. `xudo doctor` reports if either shipped protect rule is missing. The compiled-in path checks also protect `/usr/bin/xudo`, `/usr/bin/ido`, and the broker binary from xudo-mediated writes.
+
 ## FAQ
 
 ### What is the difference between `xudo` and `sudo`?

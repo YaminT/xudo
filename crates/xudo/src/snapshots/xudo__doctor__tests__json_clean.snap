@@ -1,5 +1,6 @@
 ---
 source: crates/xudo/src/doctor.rs
+assertion_line: 2257
 expression: "render::json_of(&report)"
 ---
 {
@@ -39,6 +40,10 @@ expression: "render::json_of(&report)"
       ],
       "unavailable": "test fixture has no dpkg record"
     },
+    "missing_shipped_deny_rules": [
+      "xudo.protect.pkg-remove",
+      "xudo.protect.pkg-install-removal"
+    ],
     "lifecycle_note": "no service lifecycle rule: copy /usr/share/xudo/examples/20-services-lifecycle.toml to /etc/xudo/rules.d/ and list your units"
   },
   "sudoers_snippet": {

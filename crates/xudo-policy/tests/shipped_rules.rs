@@ -20,6 +20,10 @@ use xudo_policy::{
 /// Each shipped file, paired with the name it has on disk.
 const SHIPPED: &[(&str, &str)] = &[
     (
+        "00-protect.toml",
+        include_str!("../../../rules/00-protect.toml"),
+    ),
+    (
         "05-probe.toml",
         include_str!("../../../rules/05-probe.toml"),
     ),
@@ -95,12 +99,15 @@ fn hole_denial(args: &[&str]) -> Option<DenialCode> {
 
 fn load_all() -> RuleSet {
     let mut actions = Vec::new();
+    let mut deny_rules = Vec::new();
     for (name, contents) in SHIPPED {
         let set = RuleSet::from_toml(name, contents)
             .unwrap_or_else(|e| panic!("shipped rule file {name} does not load: {e}"));
         actions.extend(set.actions().iter().cloned());
+        deny_rules.extend(set.deny_rules().iter().cloned());
     }
-    RuleSet::load(actions).unwrap_or_else(|e| panic!("shipped rules do not combine: {e}"))
+    RuleSet::load_with_deny_rules(actions, deny_rules)
+        .unwrap_or_else(|e| panic!("shipped rules do not combine: {e}"))
 }
 
 /// Every shipped file's `[[test]]` tables, and the ruleset they run against.
@@ -137,11 +144,14 @@ fn shipped_rule_tests_pass() {
         failures.join("\n")
     );
 
-    for (name, _) in SHIPPED {
-        assert!(
-            tests.iter().any(|t| &t.source.file == name),
-            "{name} carries no tests"
-        );
+    for (name, contents) in SHIPPED {
+        let file = RuleSet::from_toml(name, contents).unwrap();
+        if !file.actions().is_empty() {
+            assert!(
+                tests.iter().any(|t| &t.source.file == name),
+                "{name} carries no tests"
+            );
+        }
     }
 
     for action in rules.actions() {
@@ -201,6 +211,12 @@ exe = "/usr/bin/apt-get"
 args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { min = 0, max = 12 } } }]
 
 [[action]]
+id = "operator.apt.frontend"
+tier = "pkg-remove"
+exe = "/usr/bin/apt"
+args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { min = 0, max = 12 } } }]
+
+[[action]]
 id = "operator.dpkg.broad"
 tier = "pkg-remove"
 exe = "/usr/bin/dpkg"
@@ -212,22 +228,22 @@ reason = "protected system packages cannot be removed through xudo"
 program = ["apt-get", "apt"]
 all = [
   { any-arg = ["remove", "purge", "autoremove", "autopurge"] },
-  { any-deb-name = ["xudo", "sudo", "apparmor", "auditd"] },
+  { any-deb-name = ["xudo", "sudo", "sudo-rs", "apparmor", "auditd", "nftables", "iptables", "ufw", "firewalld", "rsyslog", "systemd-timesyncd", "chrony", "openssh-server"] },
 ]
 
 [[deny]]
 id = "operator.protect.package-install-removal"
 reason = "protected system packages cannot be removed through xudo"
 program = ["apt-get", "apt"]
-all = [{ any-arg = ["xudo-", "sudo-", "apparmor-", "auditd-"] }]
+all = [{ any-arg = ["xudo-", "sudo-", "sudo-rs-", "apparmor-", "auditd-", "nftables-", "iptables-", "ufw-", "firewalld-", "rsyslog-", "systemd-timesyncd-", "chrony-", "openssh-server-"] }]
 
 [[deny]]
 id = "operator.protect.dpkg-removal"
 reason = "protected system packages cannot be removed through xudo"
 program = ["dpkg"]
 all = [
-  { any-arg = ["-r", "-P", "--remove", "--purge"] },
-  { any-deb-name = ["xudo", "sudo", "apparmor", "auditd"] },
+  { any-arg = ["-r", "-P", "--remove", "--purge", "-rP", "-Gr"] },
+  { any-deb-name = ["xudo", "sudo", "sudo-rs", "apparmor", "auditd", "nftables", "iptables", "ufw", "firewalld", "rsyslog", "systemd-timesyncd", "chrony", "openssh-server"] },
 ]
 "#;
 
@@ -287,6 +303,73 @@ fn denies_purge_of_apparmor_via_operator_rule() {
 }
 
 #[test]
+fn denies_apt_and_apt_get_removal_verbs_with_options() {
+    for program in ["apt", "apt-get"] {
+        for (verb, option) in [
+            ("remove", "--assume-yes"),
+            ("purge", "--assume-yes"),
+            ("autoremove", "--auto-remove"),
+            ("autopurge", "--AUTO-REMOVE"),
+        ] {
+            assert_operator_deny(
+                &format!("/usr/bin/{program}"),
+                &[option, verb, "openssh-server"],
+                "operator.protect.package-removal",
+            );
+        }
+    }
+}
+
+#[test]
+fn denies_every_owner_selected_protected_package_on_the_shipped_remove_path() {
+    for package in [
+        "xudo",
+        "sudo",
+        "sudo-rs",
+        "apparmor",
+        "auditd",
+        "nftables",
+        "iptables",
+        "ufw",
+        "firewalld",
+        "rsyslog",
+        "systemd-timesyncd",
+        "chrony",
+        "openssh-server",
+    ] {
+        let decision = evaluate_command(
+            &load_all(),
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(vec!["-y", "remove", "--", package]),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::DenyRule),
+            "{package}: {decision:?}"
+        );
+        assert!(
+            decision.trace.iter().any(|step| matches!(step,
+                xudo_policy::TraceStep::DenyRulesEvaluated { matched }
+                    if matched.iter().any(|rule| rule.id.as_str() == "xudo.protect.pkg-remove")
+            )),
+            "the shipped rule did not decide {package}: {:?}",
+            decision.trace
+        );
+    }
+}
+
+#[test]
+fn denies_arch_qualified_removal_name_with_trailing_hyphen() {
+    assert_operator_deny(
+        "/usr/bin/apt-get",
+        &["remove", "xudo:arm64-"],
+        "operator.protect.package-removal",
+    );
+}
+
+#[test]
 fn denies_removal_via_install_trailing_hyphen_through_operator_rule() {
     assert_operator_deny(
         "/usr/bin/apt-get",
@@ -311,6 +394,28 @@ fn denies_dpkg_purge_of_xudo() {
         &["-P", "xudo"],
         "operator.protect.dpkg-removal",
     );
+}
+
+#[test]
+fn denies_dpkg_short_and_long_remove_and_purge_options() {
+    for option in ["-r", "-P", "--remove", "--purge"] {
+        assert_operator_deny(
+            "/usr/bin/dpkg",
+            &[option, "xudo"],
+            "operator.protect.dpkg-removal",
+        );
+    }
+}
+
+#[test]
+fn denies_dpkg_clustered_short_remove_and_purge_options() {
+    for option in ["-rP", "-Gr"] {
+        assert_operator_deny(
+            "/usr/bin/dpkg",
+            &[option, "xudo"],
+            "operator.protect.dpkg-removal",
+        );
+    }
 }
 
 #[test]
@@ -342,7 +447,10 @@ fn install_argv<'a>(packages: &[&'a str]) -> Vec<&'a str> {
 fn every_shipped_file_loads_and_reports_real_provenance() {
     for (name, contents) in SHIPPED {
         let set = RuleSet::from_toml(name, contents).unwrap();
-        assert!(!set.is_empty(), "{name} defines no actions");
+        assert!(
+            !set.is_empty() || !set.deny_rules().is_empty(),
+            "{name} defines no actions or deny rules"
+        );
         for action in set.actions() {
             assert_eq!(&action.source.file, name);
             assert!(
@@ -363,6 +471,77 @@ fn every_shipped_file_loads_and_reports_real_provenance() {
                 action.source.line
             );
         }
+        for rule in set.deny_rules() {
+            assert_eq!(&rule.source.file, name);
+            assert!(rule.source.line > 0, "{} has no source line", rule.id);
+            let line = contents
+                .lines()
+                .nth((rule.source.line as usize).saturating_sub(1))
+                .unwrap_or_default();
+            assert!(
+                line.contains(rule.id.as_str()),
+                "{}: line {} does not declare it: {line:?}",
+                rule.id,
+                rule.source.line
+            );
+        }
+    }
+}
+
+#[test]
+fn every_shipped_deny_rule_has_a_test_that_it_decides() {
+    let protect = RuleSet::from_toml(
+        "00-protect.toml",
+        include_str!("../../../rules/00-protect.toml"),
+    )
+    .unwrap();
+    let shipped_rules = load_all();
+    let broad = RuleSet::from_toml(
+        "test-only-broad-apt-get.toml",
+        r#"
+[[action]]
+id = "test.broad.apt-get"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { min = 0, max = 20 } } }]
+"#,
+    )
+    .unwrap();
+
+    for rule in protect.deny_rules() {
+        let (rules, argv) = match rule.id.as_str() {
+            "xudo.protect.pkg-remove" => {
+                (shipped_rules.clone(), vec!["-y", "remove", "--", "xudo"])
+            }
+            "xudo.protect.pkg-install-removal" => (
+                RuleSet::load_with_deny_rules(broad.actions().to_vec(), vec![rule.clone()])
+                    .unwrap(),
+                vec!["install", "--", "xudo-"],
+            ),
+            other => panic!("shipped deny rule {other} has no attack case"),
+        };
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(argv.clone()),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::DenyRule),
+            "{rule:?}: {decision:?}"
+        );
+        assert!(
+            decision.trace.iter().any(|step| matches!(step,
+                xudo_policy::TraceStep::DenyRulesEvaluated { matched }
+                    if matched.iter().any(|found| found.id == rule.id)
+            )),
+            "{} did not decide {:?}: {:?}",
+            rule.id,
+            argv,
+            decision.trace
+        );
     }
 }
 
