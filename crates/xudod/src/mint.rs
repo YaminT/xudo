@@ -592,6 +592,8 @@ mod tests {
             diverged: false,
             pinned: true,
             cgroup_id: None,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::ProcStatus,
         }
     }
