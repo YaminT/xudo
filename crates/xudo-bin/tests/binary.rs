@@ -96,14 +96,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 }
 
 #[test]
-fn an_unusable_ruleset_exits_nineteen() {
+fn check_load_error_exits_twenty_one() {
     let dir = rules_dir("bin-unusable");
     std::fs::write(dir.join("20-broken.toml"), "[[action]\nid =").unwrap();
     xudo(&dir)
         .args(["check"])
         .assert()
-        .code(19)
-        .stderr(contains("failing closed"));
+        .code(21)
+        .stderr(contains("TOML parse error"));
 }
 
 #[test]

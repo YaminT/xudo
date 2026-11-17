@@ -234,6 +234,8 @@ pub struct SnippetReport {
 pub struct LoadedSummary {
     /// How many actions.
     pub actions: usize,
+    /// How many configured deny rules.
+    pub deny_rules: usize,
     /// How many files.
     pub files: usize,
     /// The policy generation, all 64 hex characters.
@@ -429,6 +431,7 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         dir: rules.display().to_string(),
         loaded: loaded.ok().map(|loaded| LoadedSummary {
             actions: loaded.rules().len(),
+            deny_rules: loaded.rules().deny_rules().len(),
             files: loaded.files().len(),
             generation: loaded.generation().to_owned(),
         }),
@@ -816,17 +819,7 @@ pub(crate) fn human(report: &Report) -> String {
     line("rules dir", &safe(&report.ruleset.dir));
     line(
         "ruleset",
-        &report.ruleset.loaded.as_ref().map_or_else(
-            || "NOT LOADED (run `xudo check` for the parse error)".to_owned(),
-            |loaded| {
-                format!(
-                    "{} action(s), {} file(s), generation {}",
-                    loaded.actions,
-                    loaded.files,
-                    loaded.generation.get(..12).unwrap_or_default()
-                )
-            },
-        ),
+        &loaded_ruleset_label(report.ruleset.loaded.as_ref()),
     );
     line("rules trust", &trust_line(&report.ruleset.trust));
     for row in &report.ruleset.package_drift.files {
@@ -908,6 +901,21 @@ pub(crate) fn human(report: &Report) -> String {
          security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+fn loaded_ruleset_label(loaded: Option<&LoadedSummary>) -> String {
+    loaded.map_or_else(
+        || "NOT LOADED (run `xudo check` for the parse error)".to_owned(),
+        |loaded| {
+            format!(
+                "{} action(s), {} deny rule(s), {} file(s), generation {}",
+                loaded.actions,
+                loaded.deny_rules,
+                loaded.files,
+                loaded.generation.get(..12).unwrap_or_default()
+            )
+        },
+    )
 }
 
 /// Puts the lifecycle note and any open-unit lints before the rules-trust row.
