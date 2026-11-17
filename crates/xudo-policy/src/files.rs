@@ -233,24 +233,6 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
         }
     }
 
-    for deny in &deny_rules {
-        for program in &deny.program {
-            let has_action = actions
-                .iter()
-                .any(|action| action.exe.rsplit('/').next() == Some(program.as_str()));
-            if !has_action {
-                return Err(RuleSetError::Parse {
-                    file: deny.source.file.clone(),
-                    reason: format!(
-                        "deny rule {} names program {program:?}, which no loaded action uses",
-                        deny.id
-                    ),
-                }
-                .into());
-            }
-        }
-    }
-
     Ok(LoadedRuleSet {
         rules: RuleSet::load_with_deny_rules(actions, deny_rules)?,
         generation: Generation(hasher.finalize().into()),
@@ -696,17 +678,21 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
-    fn a_deny_rule_naming_an_unused_program_fails_the_combined_load() {
+    fn a_deny_rule_naming_an_unused_program_loads_inert() {
         let deny = "[[deny]]\nid = \"xudo.protect.pkg\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
-        let err = load_rule_files(vec![
+        let loaded = load_rule_files(vec![
             file("10-actions.toml", ONE_ACTION),
             file("20-deny.toml", deny),
         ])
-        .unwrap_err();
+        .unwrap();
         assert!(
-            err.to_string().contains("which no loaded action uses"),
-            "{err}"
+            loaded
+                .rules
+                .actions()
+                .iter()
+                .all(|action| action.exe != "/usr/bin/apt-get")
         );
+        assert_eq!(loaded.rules.deny_rules()[0].id.as_str(), "xudo.protect.pkg");
     }
 
     const WITH_TESTS: &str = r#"

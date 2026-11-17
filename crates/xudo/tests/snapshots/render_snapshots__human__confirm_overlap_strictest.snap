@@ -12,6 +12,6 @@ ALLOW, after a human confirms
     canonicalized: unchanged (autoremove)
     matched xudo.pkg.autoremove at snapshot-overlap.toml:3
     matched xudo.pkg.autoremove-quick at snapshot-overlap.toml:10
-    deny-list v6: no capability class matched
+    deny-list v7: no capability class matched
     deny-rules: no configured rule matched
     confirmation required: the matched rule always requires confirmation; the strictest requirement among the 2 actions that accept this command

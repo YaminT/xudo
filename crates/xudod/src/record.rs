@@ -40,6 +40,9 @@ pub fn decided(
         evidence.push(format!("nonce={}", entry.nonce));
         evidence.push(format!("deadline_ms={}", entry.deadline.0));
     }
+    if let Some(id) = deciding_deny_rule_id(decision) {
+        evidence.push(format!("deny_rule_id={id}"));
+    }
 
     // A minted entry is recorded as the gate will read it, which is what
     // `authorize` checks the record against.
@@ -60,6 +63,15 @@ pub fn decided(
         record = record.with_rule(action.as_str(), source.to_string());
     }
     record
+}
+
+fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
+    decision.trace.iter().find_map(|step| match step {
+        xudo_policy::TraceStep::DenyRulesEvaluated { matched } => {
+            matched.first().map(|rule| rule.id.as_str())
+        }
+        _ => None,
+    })
 }
 
 /// The record of a refusal.
@@ -379,6 +391,35 @@ mod tests {
         assert_eq!(record.decision, AuditDecision::Denied);
         assert_eq!(record.denial.as_deref(), Some("argv_rejected"));
         assert_eq!(record.action, None);
+    }
+
+    #[test]
+    fn a_deny_rule_denial_records_the_deciding_rule_id() {
+        let mut denial = Decision::deny(DenialCode::DenyRule, vec!["x".to_owned()], Vec::new());
+        denial
+            .trace
+            .push(xudo_policy::TraceStep::DenyRulesEvaluated {
+                matched: vec![xudo_policy::DenyRuleMatch {
+                    id: ActionId::from("xudo.protect.pkg-remove"),
+                    source: Source::new("00-protect.toml", 6),
+                    reason: "protected package".to_owned(),
+                }],
+            });
+        let record = decided(
+            None,
+            &denial,
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            record
+                .evidence
+                .contains(&"deny_rule_id=xudo.protect.pkg-remove".to_owned())
+        );
+        assert!(record.is_sealed());
     }
 
     #[test]

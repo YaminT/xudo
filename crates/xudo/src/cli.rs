@@ -2927,6 +2927,18 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             out.contains(crate::lifecycle_note::TEXT),
             "shipped rules have no lifecycle action, so check must say so: {out}"
         );
+        assert!(
+            !out.contains("deny-rule:"),
+            "shipped deny rules have workspace adversarial coverage: {out}"
+        );
+        assert!(
+            out.contains("xudo.protect.pkg-remove for apt is inert today"),
+            "{out}"
+        );
+        assert!(
+            out.contains("xudo.protect.dpkg-remove for dpkg is inert today"),
+            "{out}"
+        );
     }
 
     #[test]

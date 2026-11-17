@@ -41,6 +41,9 @@ expression: "serde_json::to_string_pretty(&json).unwrap()"
   },
   "lint": {
     "errors": [],
+    "notes": [
+      "xudo.protect.dpkg-remove is inert today"
+    ],
     "warnings": []
   },
   "schema_version": 1,

@@ -9,7 +9,7 @@ DENY
   trace
     canonicalized: unchanged (-c)
     matched xudo.oops.shell at snapshot-fixture.toml:36
-    deny-list v6: SpawnsShell: executable sh
+    deny-list v7: SpawnsShell: executable sh
     deny-rules: no configured rule matched
 
   next      this is permanently denied by a compiled-in rule and no configuration can allow it; do not retry, and do not look for a variant that slips past
