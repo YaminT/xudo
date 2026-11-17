@@ -227,7 +227,7 @@ id = "operator.protect.package-removal"
 reason = "protected system packages cannot be removed through xudo"
 program = ["apt-get", "apt"]
 all = [
-  { any-arg = ["remove", "purge", "autoremove", "autopurge"] },
+  { any-arg = ["remove", "purge", "autoremove", "auto-remove", "autopurge"] },
   { any-deb-name = ["xudo", "sudo", "sudo-rs", "apparmor", "auditd", "nftables", "iptables", "ufw", "firewalld", "rsyslog", "systemd-timesyncd", "chrony", "openssh-server"] },
 ]
 
@@ -309,6 +309,7 @@ fn denies_apt_and_apt_get_removal_verbs_with_options() {
             ("remove", "--assume-yes"),
             ("purge", "--assume-yes"),
             ("autoremove", "--auto-remove"),
+            ("auto-remove", "--assume-yes"),
             ("autopurge", "--AUTO-REMOVE"),
         ] {
             assert_operator_deny(
@@ -376,6 +377,68 @@ fn denies_removal_via_install_trailing_hyphen_through_operator_rule() {
         &["install", "xudo-"],
         "operator.protect.package-install-removal",
     );
+}
+
+#[test]
+fn denies_qualified_trailing_hyphen_install_names_via_shipped_rule() {
+    let shipped = RuleSet::from_toml(
+        "00-protect.toml",
+        include_str!("../../../rules/00-protect.toml"),
+    )
+    .unwrap();
+    let broad = RuleSet::from_toml("operator-apt-actions.toml", OPERATOR_PACKAGE_FIXTURE).unwrap();
+    let rule = shipped
+        .deny_rules()
+        .iter()
+        .find(|rule| rule.id.as_str() == "xudo.protect.pkg-install-removal")
+        .unwrap();
+    let rules =
+        RuleSet::load_with_deny_rules(broad.actions().to_vec(), vec![rule.clone()]).unwrap();
+    for operand in ["xudo:amd64-", "xudo=1.0-", "sudo/stable-"] {
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from("/usr/bin/apt-get"),
+            &Argv::new(vec!["install", operand]),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::DenyRule),
+            "{operand}: {decision:?}"
+        );
+    }
+}
+
+#[test]
+fn denies_auto_remove_alias_against_a_shipped_deny_rule() {
+    let shipped = RuleSet::from_toml(
+        "00-protect.toml",
+        include_str!("../../../rules/00-protect.toml"),
+    )
+    .unwrap();
+    let broad = RuleSet::from_toml("operator-apt-actions.toml", OPERATOR_PACKAGE_FIXTURE).unwrap();
+    let rule = shipped
+        .deny_rules()
+        .iter()
+        .find(|rule| rule.id.as_str() == "xudo.protect.pkg-remove")
+        .unwrap();
+    let rules =
+        RuleSet::load_with_deny_rules(broad.actions().to_vec(), vec![rule.clone()]).unwrap();
+    for program in ["/usr/bin/apt", "/usr/bin/apt-get"] {
+        let decision = evaluate_command(
+            &rules,
+            &human(),
+            &Arg::from(program),
+            &Argv::new(vec!["auto-remove", "iptables"]),
+            Settings::default(),
+        );
+        assert_eq!(
+            decision.denial,
+            Some(DenialCode::DenyRule),
+            "{program}: {decision:?}"
+        );
+    }
 }
 
 #[test]
@@ -507,23 +570,34 @@ args = [{ name = "argv", matcher = { pattern = ".*" }, repeat = { between = { mi
 "#,
     )
     .unwrap();
+    let operator =
+        RuleSet::from_toml("operator-package-actions.toml", OPERATOR_PACKAGE_FIXTURE).unwrap();
 
     for rule in protect.deny_rules() {
-        let (rules, argv) = match rule.id.as_str() {
-            "xudo.protect.pkg-remove" => {
-                (shipped_rules.clone(), vec!["-y", "remove", "--", "xudo"])
-            }
+        let (rules, program, argv) = match rule.id.as_str() {
+            "xudo.protect.pkg-remove" => (
+                shipped_rules.clone(),
+                "/usr/bin/apt-get",
+                vec!["-y", "remove", "--", "xudo"],
+            ),
             "xudo.protect.pkg-install-removal" => (
                 RuleSet::load_with_deny_rules(broad.actions().to_vec(), vec![rule.clone()])
                     .unwrap(),
+                "/usr/bin/apt-get",
                 vec!["install", "--", "xudo-"],
+            ),
+            "xudo.protect.dpkg-remove" => (
+                RuleSet::load_with_deny_rules(operator.actions().to_vec(), vec![rule.clone()])
+                    .unwrap(),
+                "/usr/bin/dpkg",
+                vec!["-r", "xudo"],
             ),
             other => panic!("shipped deny rule {other} has no attack case"),
         };
         let decision = evaluate_command(
             &rules,
             &human(),
-            &Arg::from("/usr/bin/apt-get"),
+            &Arg::from(program),
             &Argv::new(argv.clone()),
             Settings::default(),
         );
@@ -1607,28 +1681,28 @@ fn removal_of_a_plain_package_name_is_still_accepted() {
 }
 
 #[test]
-fn install_still_accepts_dotted_names_a_known_regex_residual() {
-    // Install keeps `deb-name`, so `lib.` and `ba.h` are Allow. In apt-get a
-    // name containing `.` or `+` that is not an exact cache hit is an
-    // unanchored regular expression. On install it can fan out to many
-    // packages and cannot remove one, because the rule requires
-    // `--no-remove`. The remove rule refuses these names. See the Unreleased
-    // Security note in CHANGELOG.md: `APT::Cmd::Pattern-Only=true` would turn
-    // the expression off, and it is only a possible later defence.
-    for name in [
-        "python3.12",
-        "g++",
-        "libstdc++6",
-        "libpng16-16",
-        "lib.",
-        "ba.h",
-    ] {
+fn install_denies_ambiguous_patterns_that_may_select_protected_packages() {
+    // `any-deb-name` treats apt patterns as matches because a pattern may
+    // select a protected package. Plain non-protected literal package names
+    // still install.
+    for name in ["python3.12", "g++", "libstdc++6", "libpng16-16"] {
         assert_eq!(
             verdict("xudo.pkg.install", &install_argv(&[name])),
             Verdict::Allow,
             "{name} was not an install"
         );
     }
+    let name = "lib.";
+    assert_eq!(
+        verdict("xudo.pkg.install", &install_argv(&[name])),
+        Verdict::Deny,
+        "ambiguous apt pattern {name} could select a protected package"
+    );
+    assert_eq!(
+        verdict("xudo.pkg.install", &install_argv(&["ba.h"])),
+        Verdict::Allow,
+        "a valid literal name with a dot remains an install"
+    );
 }
 
 proptest! {

@@ -1349,11 +1349,41 @@ args = [
     }
 
     #[test]
-    fn an_entry_from_before_the_rules_changed_is_refused() {
-        let mut stale = ours();
-        stale.generation ^= 1;
+    fn adding_a_deny_rule_changes_generation_and_refuses_an_old_spool_entry() {
+        let stale = ours();
+        let old_generation = rules().generation.id();
+        assert_eq!(
+            stale.generation, old_generation,
+            "the spool entry uses the old ruleset"
+        );
+        let changed = load_rule_files(vec![
+            RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            },
+            RuleFile {
+                name: b"20-protect.toml".to_vec(),
+                bytes: br#"[[deny]]
+id = "xudo.protect.restart"
+reason = "restart is temporarily protected"
+program = ["systemctl"]
+all = [{ any-arg = ["restart"] }]
+"#
+                .to_vec(),
+            },
+        ])
+        .unwrap();
+        let current_generation = changed.generation.id();
+        assert_ne!(
+            current_generation, old_generation,
+            "adding the deny rule must move the ruleset generation"
+        );
         let spool = Rc::new(holding(&[(NONCE_A, stale)]));
         let mut host = FakeHost::new(&spool);
+        host.policy = Ok(LoadedPolicy {
+            rules: changed,
+            settings: engine::Settings::default(),
+        });
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_stale_generation");
     }
