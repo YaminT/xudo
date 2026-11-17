@@ -21,7 +21,7 @@ expression: "render::json_of(&report)"
     "loaded": {
       "actions": 1,
       "files": 1,
-      "generation": "064981249e9f115ccf66d27daadbab35f53cca72296d6ca64799957339e41f2e"
+      "generation": "e23df87444d6b784d62a52b692b479744922a74c3a77ae347f49d6fb39100150"
     },
     "load_error": null,
     "trust": {

@@ -1,0 +1,11 @@
+[[action]]
+id = "xudo.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "remove" } }, { name = "pkg", matcher = { name = "deb-name" } }]
+
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"] }, { any-deb-name = ["xudo"] }]

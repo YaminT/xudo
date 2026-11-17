@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "allow",
   "denial": null,
   "remediation": null,
@@ -34,6 +34,11 @@ expression: "render::json(&decision)"
     {
       "deny_list_evaluated": {
         "version": 6,
+        "matched": []
+      }
+    },
+    {
+      "deny_rules_evaluated": {
         "matched": []
       }
     },

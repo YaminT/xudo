@@ -439,6 +439,42 @@ the timesyncd dbus alias, and
 A rule that still uses
 .B unit\-name
 cannot start those names.
+.SS Operator deny rules
+An operator may add
+.B [[deny]]
+tables to refuse selected commands after an action matches.
+Each
+.B any\-arg
+member is compared with one argv element byte for byte. No option parsing
+unifies equivalent spellings: clustered dpkg short options, GNU long-option
+prefixes such as
+.BR --purg ,
+and joined options such as
+.B --opt=value
+must each be listed when required.
+.PP
+.B any\-deb\-name
+compares a package operand after removing one trailing removal suffix
+.RB ( - or + )
+and cutting an architecture, version, or suite suffix at
+.BR : ,
+.BR = ,
+or
+.BR / .
+A non-plain apt pattern operand is treated as a match because it may select a
+protected package. Valid literal Debian names, including names with
+.B .
+or
+.BR + ,
+are compared exactly.
+.PP
+These name checks see only the explicit argv operands. They cannot identify
+indirect removals, such as an apt conflict that removes
+.BR sudo\-ldap ,
+or a dependency change that removes
+.BR libpam0g .
+Use confirmation policy for actions whose dependency resolution can remove
+other packages.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .

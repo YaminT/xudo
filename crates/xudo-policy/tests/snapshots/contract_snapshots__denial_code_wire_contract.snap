@@ -24,3 +24,5 @@ expression: table
     the request expired; ask a person to approve it again with `xudo watch` before running it
 11  confirmation_throttled
     an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`
+12  deny_rule
+    an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person

@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "confirmation_expired",
   "remediation": "the request expired; ask a person to approve it again with `xudo watch` before running it",

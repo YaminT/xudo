@@ -1,0 +1,5 @@
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected packages"
+program = ["apt-get", "apt"]
+all = [{ any-arg = ["remove", "purge"] }, { any-deb-name = ["xudo", "sudo"] }]

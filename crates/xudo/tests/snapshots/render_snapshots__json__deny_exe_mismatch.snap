@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "exe_mismatch",
   "remediation": "this action runs a different program than the one requested; run `xudo list` to find the action that names this program",

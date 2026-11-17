@@ -20,6 +20,7 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::deny_rule::{DenyClause, DenyRule};
 use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
 use crate::rule::{Action, ConfirmPolicy, RuleSet, RuleSetError, Tier};
 use crate::rule_test::RuleTest;
@@ -29,7 +30,7 @@ pub const RULE_FILE_SUFFIX: &[u8] = b".toml";
 
 /// Separates this hash from every other SHA-256 the project computes, and
 /// names the framing version so a later change cannot collide with this one.
-const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v2\0";
+const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v3\0";
 
 /// The most `[[test]]` tables one ruleset may carry across all its files.
 ///
@@ -58,8 +59,10 @@ pub struct RuleFile {
 
 /// Which policy a set of rule files is.
 ///
-/// A SHA-256 over the name of every rule file that defines actions, and those
-/// actions, in name order, each field length-prefixed. The prefixes matter: hashing names and
+/// A SHA-256 over the name of every rule file that defines actions or deny
+/// rules, then its actions and deny rules in canonical form, each field
+/// length-prefixed. Deny rules are sorted by their canonical form, since their
+/// declaration order changes only trace ordering. The prefixes matter: hashing names and
 /// contents back to back would give `1.toml` holding `#a2.toml#b` the same
 /// generation as `1.toml` holding `#a` beside `2.toml` holding `#b`, two
 /// different rulesets that a stale request could not tell apart.
@@ -68,9 +71,9 @@ pub struct RuleFile {
 /// policy is not in the digest: a `[[test]]` table (see [`crate::rule_test`]),
 /// a comment, and the line an action sits on can all change without
 /// invalidating a request minted under the same rules. Every field of
-/// [`Action`] that can change a decision is hashed. Two things that also bear
-/// on a decision are outside the generation: the settings, and the compiled
-/// engine (the deny-list), which no rule file can change. The generation only
+/// [`Action`] and [`DenyRule`] that can change a decision is hashed. Two things
+/// that also bear on a decision are outside the generation: the settings, and
+/// the compiled engine (the deny-list), which no rule file can change. The generation only
 /// tells a stale request from a fresh one; the gate re-decides from root-owned
 /// state, so it never trusts a generation to vouch for either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +189,7 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
     let mut hasher = Sha256::new();
     hasher.update(GENERATION_DOMAIN);
     let mut actions: Vec<Action> = Vec::new();
+    let mut deny_rules: Vec<DenyRule> = Vec::new();
     let mut tests: Vec<RuleTest> = Vec::new();
 
     for file in &files {
@@ -203,12 +207,18 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
 
         let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
 
-        // A file with no actions is not policy, so it is not hashed: a file
-        // of tests alone, added or removed, must not move the generation.
-        if !parsed.actions().is_empty() {
+        // A file with no actions or deny rules is not policy, so it is not
+        // hashed: a file of tests alone must not move the generation.
+        if !parsed.actions().is_empty() || !parsed.deny_rules().is_empty() {
             framed(&mut hasher, &file.name);
             for action in parsed.actions() {
                 framed(&mut hasher, &policy_form(action));
+            }
+            framed(&mut hasher, b"deny-rules-v1");
+            let mut deny_forms: Vec<_> = parsed.deny_rules().iter().map(policy_form_deny).collect();
+            deny_forms.sort_unstable();
+            for form in deny_forms {
+                framed(&mut hasher, &form);
             }
             // Closes the file, so the last action of one cannot be read as the
             // first of the next.
@@ -216,17 +226,81 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
         }
 
         actions.extend(parsed.actions().iter().cloned());
+        deny_rules.extend(parsed.deny_rules().iter().cloned());
         tests.extend(file_tests);
         if tests.len() > MAX_TESTS {
             return Err(RuleFilesError::TooManyTests { limit: MAX_TESTS });
         }
     }
 
+    for deny in &deny_rules {
+        for program in &deny.program {
+            let has_action = actions
+                .iter()
+                .any(|action| action.exe.rsplit('/').next() == Some(program.as_str()));
+            if !has_action {
+                return Err(RuleSetError::Parse {
+                    file: deny.source.file.clone(),
+                    reason: format!(
+                        "deny rule {} names program {program:?}, which no loaded action uses",
+                        deny.id
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+
     Ok(LoadedRuleSet {
-        rules: RuleSet::load(actions)?,
+        rules: RuleSet::load_with_deny_rules(actions, deny_rules)?,
         generation: Generation(hasher.finalize().into()),
         tests,
     })
+}
+
+/// Exhaustive canonical encoding of every field that changes deny evaluation.
+/// Provenance is excluded because it affects the trace only.
+fn policy_form_deny(rule: &DenyRule) -> Vec<u8> {
+    let DenyRule {
+        id,
+        reason,
+        program,
+        all,
+        source: _,
+    } = rule;
+    let mut out = Vec::new();
+    put(&mut out, b"deny-rule-v1");
+    put(&mut out, id.as_str().as_bytes());
+    put(&mut out, reason.as_bytes());
+    put_len(&mut out, program.len());
+    for item in program {
+        put(&mut out, item.as_bytes());
+    }
+    put_len(&mut out, all.len());
+    for clause in all {
+        let DenyClause {
+            any_arg,
+            any_deb_name,
+        } = clause;
+        match (any_arg, any_deb_name) {
+            (Some(values), None) => {
+                put(&mut out, b"any-arg");
+                put_len(&mut out, values.len());
+                for value in values {
+                    put(&mut out, value.as_bytes());
+                }
+            }
+            (None, Some(values)) => {
+                put(&mut out, b"any-deb-name");
+                put_len(&mut out, values.len());
+                for value in values {
+                    put(&mut out, value.as_bytes());
+                }
+            }
+            (Some(_), Some(_)) | (None, None) => put(&mut out, b"invalid-clause"),
+        }
+    }
+    out
 }
 
 /// Everything about an action that can change a decision, as bytes.
@@ -503,11 +577,11 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         ]);
         assert_eq!(
             pinned.hex(),
-            "aa1f8736c26f54a0bcfb00cd90243f6991fffd6e010c83044cbbc85120784cf8"
+            "5e0c3d2b07766bd3b976031f438a84848f7b32dfec78d3f836dba1e71c8b26e4"
         );
         assert_eq!(
             generation(Vec::new()).hex(),
-            "8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
+            "d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
         );
     }
 
@@ -598,8 +672,41 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             file("20-b.toml", ONE_ACTION),
         ])
         .unwrap_err();
-        assert!(err.to_string().contains("duplicate action id"), "{err}");
+        assert!(err.to_string().contains("duplicate rule id"), "{err}");
         assert!(format!("{err:?}").contains("DuplicateId"));
+    }
+
+    #[test]
+    fn a_duplicate_deny_id_across_two_files_fails_the_combined_load() {
+        let deny = "[[deny]]\nid = \"xudo.protect.same\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
+        let err = load_rule_files(vec![
+            file(
+                "00-actions.toml",
+                &ONE_ACTION.replace("systemctl", "apt-get"),
+            ),
+            file("10-a.toml", deny),
+            file("20-b.toml", deny),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate rule id xudo.protect.same"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_naming_an_unused_program_fails_the_combined_load() {
+        let deny = "[[deny]]\nid = \"xudo.protect.pkg\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
+        let err = load_rule_files(vec![
+            file("10-actions.toml", ONE_ACTION),
+            file("20-deny.toml", deny),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("which no loaded action uses"),
+            "{err}"
+        );
     }
 
     const WITH_TESTS: &str = r#"
@@ -768,6 +875,46 @@ args = [
             moved.iter().map(policy_form).collect::<Vec<_>>(),
             fixed_actions().iter().map(policy_form).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn every_deny_policy_field_is_canonical_and_provenance_is_not() {
+        let base = DenyRule {
+            id: crate::rule::ActionId::new("xudo.protect.test"),
+            reason: "protected package".into(),
+            program: vec!["apt-get".into()],
+            all: vec![DenyClause {
+                any_arg: Some(vec!["remove".into()]),
+                any_deb_name: None,
+            }],
+            source: Source::new("a.toml", 1),
+        };
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.id = crate::rule::ActionId::new("xudo.protect.other");
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.reason.push('!');
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.program.push("apt".into());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.all[0].any_arg = Some(vec!["purge".into()]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.all[0].any_arg = None;
+        changed.all[0].any_deb_name = Some(vec!["xudo".into()]);
+        variants.push(changed);
+        for variant in variants {
+            assert_ne!(policy_form_deny(&variant), policy_form_deny(&base));
+        }
+        let mut moved = base.clone();
+        moved.source = Source::new("elsewhere.toml", 55);
+        assert_eq!(policy_form_deny(&moved), policy_form_deny(&base));
+        let mut invalid = base.clone();
+        invalid.all[0].any_deb_name = Some(vec!["xudo".into()]);
+        assert!(policy_form_deny(&invalid).ends_with(b"invalid-clause"));
     }
 
     mod canonical {
