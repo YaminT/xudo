@@ -90,11 +90,23 @@ change is part of the ruleset generation, so an approval already minted
 against the previous ruleset no longer matches.
 
 With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
-`confirm = "always"` is satisfied by the password alone. A member of the
-`xudo` group who passes the password can remove packages through it,
-including xudo, sudo, apparmor, auditd, nftables, ufw and rsyslog. That was
-already true in `v0.1.0-beta.1` and is not changed here. A package-name
-tripwire for those is a later change.
+`confirm = "always"` is satisfied by the password alone. The shipped active
+`00-protect.toml` deny rules refuse removal of xudo, sudo, sudo-rs, AppArmor,
+auditd, firewall, logging, time-sync, and openssh-server packages through the
+shipped `apt-get remove` action. Its purge, autoremove, autopurge,
+`install pkg-`, and dpkg clauses are tripwires for operator actions that accept
+those spellings. These
+checks protect xudo-mediated paths only. They cannot prevent a host-side apt or
+dpkg command, a root shell, or an indirect transaction such as installing
+`sudo-ldap` that removes a conflicting package. Removing `openssh-client` can
+remove `openssh-server`; removing `libip4tc2` or `libxtables12` can remove
+`iptables`; removing `libnftables1` can remove `nftables`; removing `python3`
+can remove `ufw` or `firewalld`; and removing `init-system-helpers` can remove
+xudo. `xudo doctor` warns when a shipped deny-rule id is missing or inert.
+Rules for programs with no loaded action load as inactive and cannot allow
+anything; `xudo check` and `doctor` say "inert today" until an operator action
+names that program. The apt and dpkg package protections are tested against
+later operator actions as well as the shipped apt-get action.
 
 The shipped `xudo.time.set-ntp` rule accepts `timedatectl set-ntp false`,
 which has the same effect as stopping the time-sync unit. The tripwire
@@ -164,7 +176,7 @@ one you know you lack.
   A symlink inside the prefix is a path the rule never named. `rm`, `rmdir`,
   `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
   `touch`, `mkdir`, `mkfifo`, `rename`, and `prename` are the compiled-in
-  class `ChangesPathMetadataOrExistence` (deny-list version 6), including a
+  class `ChangesPathMetadataOrExistence` (deny-list version 7), including a
   copy or hardlink that keeps the name and a `busybox` applet. `mknod` is
   `DeviceOrFilesystem`. `setcap` is `PrivilegeTool`. `xudo check` warns on
   every `path-under` use and exits 20.

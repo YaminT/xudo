@@ -30,6 +30,42 @@ use xudo_policy::{
 /// The default location of the root-owned rule files.
 pub const DEFAULT_RULES_DIR: &str = "/etc/xudo/rules.d";
 
+/// Protect rules shipped with the package and checked by `doctor` and `check`.
+pub const SHIPPED_PROTECT_DENY_IDS: &[&str] = &[
+    "xudo.protect.pkg-remove",
+    "xudo.protect.pkg-install-removal",
+    "xudo.protect.dpkg-remove",
+];
+
+/// Notes for shipped deny-rule programs that no loaded action currently uses.
+pub(crate) fn inert_shipped_deny_notes(rules: &RuleSet) -> Vec<String> {
+    SHIPPED_PROTECT_DENY_IDS
+        .iter()
+        .filter_map(|id| {
+            rules
+                .deny_rules()
+                .iter()
+                .find(|rule| rule.id.as_str() == *id)
+        })
+        .flat_map(|rule| {
+            rule.program
+                .iter()
+                .filter(|program| {
+                    !rules
+                        .actions()
+                        .iter()
+                        .any(|action| action.exe.rsplit('/').next() == Some(program.as_str()))
+                })
+                .map(|program| {
+                    format!(
+                        "{} for {program} is inert today; no loaded action runs that program",
+                        rule.id
+                    )
+                })
+        })
+        .collect()
+}
+
 /// A loaded ruleset, with the provenance needed to talk about it.
 #[derive(Clone, Debug)]
 pub struct LoadedRules {

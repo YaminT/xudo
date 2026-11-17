@@ -1,0 +1,90 @@
+# Protect the broker and core security/availability packages through
+# xudo.pkg.remove. Other verbs, install-as-removal spellings, and dpkg options
+# are tripwires for broader operator actions. Operators may add apt or dpkg
+# actions. Rules for programs with no loaded action stay inert until an
+# operator action names them, and xudo check/doctor reports that fact.
+
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "xudo protects itself and core security packages from removal"
+program = ["apt-get", "apt"]
+all = [
+  { any-arg = [
+    "remove",
+    "purge",
+    "autoremove",
+    "autopurge",
+    "auto-remove",
+  ] },
+  { any-deb-name = [
+    "xudo",
+    "sudo",
+    "sudo-rs",
+    "apparmor",
+    "auditd",
+    "nftables",
+    "iptables",
+    "ufw",
+    "firewalld",
+    "rsyslog",
+    "systemd-timesyncd",
+    "chrony",
+    "openssh-server",
+  ] },
+]
+
+[[deny]]
+id = "xudo.protect.pkg-install-removal"
+reason = "xudo protects core packages from install-as-removal spellings"
+program = ["apt-get", "apt"]
+all = [
+  { any-arg = [
+    "install",
+    "reinstall",
+  ] },
+  { any-deb-name = [
+    "xudo",
+    "sudo",
+    "sudo-rs",
+    "apparmor",
+    "auditd",
+    "nftables",
+    "iptables",
+    "ufw",
+    "firewalld",
+    "rsyslog",
+    "systemd-timesyncd",
+    "chrony",
+    "openssh-server",
+  ] },
+]
+
+[[deny]]
+id = "xudo.protect.dpkg-remove"
+reason = "xudo protects itself and core security packages from removal"
+program = ["dpkg"]
+all = [
+  { any-arg = [
+    "-r",
+    "-P",
+    "-rP",
+    "-Gr",
+    "--remove",
+    "--purge",
+  ] },
+  { any-deb-name = [
+    "xudo",
+    "sudo",
+    "sudo-rs",
+    "apparmor",
+    "auditd",
+    "nftables",
+    "iptables",
+    "ufw",
+    "firewalld",
+    "rsyslog",
+    "systemd-timesyncd",
+    "chrony",
+    "openssh-server",
+  ] },
+]
