@@ -15,10 +15,11 @@
 //!   before `main`, so in a Rust binary this is the second line of defence;
 //!   it is held anyway, because the guarantee must not rest on a runtime
 //!   detail.
-//! * **The caller's resource limits match PID 1's.** `/proc/1/limits` is read
-//!   through a pinned descriptor verified as procfs, and every Linux limit is
-//!   applied before the gate opens policy, spool, program, or audit state. A
-//!   missing or malformed limit refuses the gate.
+//! * **The caller's resource limits are reset from PID 1.** `/proc/1/limits`
+//!   is read through a pinned descriptor verified as procfs, and every Linux
+//!   limit is applied before the gate opens policy, spool, program, or audit
+//!   state. The soft open-file limit is capped at 1024 and core dumps are
+//!   disabled. A missing or malformed limit refuses the gate.
 //! * **The umask is `022` and the working directory is `/`.** A caller umask
 //!   of `000` reaching an apt hook or a maintainer script would leave a file
 //!   root creates world-writable. The working directory is entered through an
@@ -53,7 +54,8 @@ pub trait Hygiene {
     /// cannot know what its next `open` would become, and must refuse.
     fn ensure_std_streams(&self) -> Result<(), SysError>;
 
-    /// Resets every Linux resource limit to PID 1's soft and hard values.
+    /// Resets every Linux resource limit from PID 1's values, with a soft
+    /// open-file limit capped at 1024 and core dumps disabled.
     ///
     /// The PID 1 file is read through a pinned and validated procfs descriptor.
     /// Any missing, malformed, or un-settable limit refuses before the gate
@@ -470,7 +472,23 @@ fn reset_rlimits_from_pid1_with(ops: &dyn LimitOps) -> Result<(), SysError> {
 fn apply_pid1_limits(contents: &str, ops: &dyn LimitOps) -> Result<(), SysError> {
     let limits = LINUX_LIMITS
         .iter()
-        .map(|spec| Ok((spec.resource, parse_pid1_limit(contents, spec.label)?)))
+        .map(|spec| {
+            let mut limit = parse_pid1_limit(contents, spec.label)?;
+            match spec.resource {
+                rustix::process::Resource::Nofile => {
+                    let hard = limit.maximum.unwrap_or(u64::MAX);
+                    limit.current = Some(limit.current.unwrap_or(u64::MAX).min(1024).min(hard));
+                }
+                rustix::process::Resource::Core => {
+                    limit = rustix::process::Rlimit {
+                        current: Some(0),
+                        maximum: Some(0),
+                    };
+                }
+                _ => {}
+            }
+            Ok((spec.resource, limit))
+        })
         .collect::<Result<Vec<_>, SysError>>()?;
     for (resource, limit) in limits {
         ops.set(resource, limit)?;
@@ -887,7 +905,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_pid1_limit_table_resets_nofile_and_fsize_from_the_pinned_values() {
+    fn the_gate_caps_open_files_and_core_after_the_pid1_copy() {
         struct Limits {
             source: String,
             applied: RefCell<Vec<(rustix::process::Resource, rustix::process::Rlimit)>>,
@@ -913,7 +931,7 @@ mod tests {
         for spec in LINUX_LIMITS {
             let pair = match spec.resource {
                 rustix::process::Resource::Fsize => ("1234", "5678"),
-                rustix::process::Resource::Nofile => ("45", "67"),
+                rustix::process::Resource::Nofile => ("1000000000", "1000000000"),
                 _ => ("unlimited", "unlimited"),
             };
             writeln!(proc_limits, "{}  {} {} units", spec.label, pair.0, pair.1).unwrap();
@@ -937,8 +955,16 @@ mod tests {
             *resource == rustix::process::Resource::Nofile
                 && *limit
                     == rustix::process::Rlimit {
-                        current: Some(45),
-                        maximum: Some(67),
+                        current: Some(1024),
+                        maximum: Some(1_000_000_000),
+                    }
+        }));
+        assert!(applied.iter().any(|(resource, limit)| {
+            *resource == rustix::process::Resource::Core
+                && *limit
+                    == rustix::process::Rlimit {
+                        current: Some(0),
+                        maximum: Some(0),
                     }
         }));
         assert!(applied.iter().any(|(_, limit)| {
@@ -1074,11 +1100,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn the_host_attempts_to_apply_pid1_limits() {
-        // An unprivileged test process may be unable to raise its hard limit;
-        // the gate treats that error as a refusal. The fake tests cover both
-        // success and failure without changing the test runner's limits.
-        let _result = HostHygiene.reset_rlimits_from_pid1();
+        // Applying PID 1's values may lower the process's hard limits. Run it
+        // in a fresh test-binary child so the test runner keeps its limits.
+        const CHILD_MARKER: &str = "XUDO_HOST_LIMIT_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let _result = HostHygiene.reset_rlimits_from_pid1();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hygiene::tests::the_host_attempts_to_apply_pid1_limits",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "host limit child failed: {status}");
     }
 
     #[test]

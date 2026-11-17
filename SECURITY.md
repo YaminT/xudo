@@ -135,11 +135,16 @@ the write and the cut-back remains unavailable through a safe API: rustix's
 signal-mask call is `unsafe`, and the published unsafe-block budget was not
 changed. A record crossing a page boundary therefore remains vulnerable to
 a fatal non-core-dump signal. The gate now resets every Linux resource limit
-to PID 1's soft and hard values
-before it handles a request. It reads `/proc/1/limits` through a pinned
+from PID 1's values before it handles a request, caps the soft open-file limit
+at 1024, and disables core dumps. It reads `/proc/1/limits` through a pinned
 descriptor verified as procfs and refuses if the file, any value, or any
-`setrlimit` call fails. When the gate's own append fails because the
-log is damaged or the cut-back did not land, stderr gains one fixed line
+`setrlimit` call fails. In a container or PID namespace, PID 1 is that
+namespace's init; copying its limits is acceptable because those limits are
+the baseline the namespace provides. If the resource-limit reset fails, the
+refusal audit record is written under the caller's limits. A caller's CPU-time
+limit or a delivered signal can still tear that one record. When the gate's
+own append fails because the log is damaged or the cut-back did not land,
+stderr gains one fixed line
 telling the operator to move the log aside. The line has no path and no
 bytes from the log. The exit status is unchanged. The broker's refusal
 message still carries the error text.
