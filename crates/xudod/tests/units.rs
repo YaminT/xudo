@@ -11,6 +11,8 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use xudo_sys::Syscalls;
 use xudod::CONFIRM_DIR;
 
 const SOCKET: &str = include_str!("../../../packaging/systemd/xudod.socket");
@@ -299,7 +301,6 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "ProtectHome",
             "PrivateTmp",
             "PrivateDevices",
-            "ProcSubset",
             "ProtectKernelTunables",
             "ProtectKernelModules",
             "ProtectKernelLogs",
@@ -381,7 +382,17 @@ fn the_only_writable_paths_are_confirmation_state_the_spool_and_audit_log() {
     ] {
         assert_eq!(value(&service, "Service", key), "yes", "{key}");
     }
-    assert_eq!(value(&service, "Service", "ProcSubset"), "pid");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_shipped_broker_reads_a_valid_boot_id() {
+    let service = parse(SERVICE);
+    assert_eq!(value(&service, "Service", "ProtectKernelTunables"), "yes");
+    assert_eq!(value(&service, "Service", "ProtectControlGroups"), "yes");
+    assert!(values(&service, "Service", "ProcSubset").is_empty());
+    assert!(SERVICE.contains("# X8: ProcSubset=pid hides the kernel boot id"));
+    assert!(xudo_sys::HostSyscalls.boot_id().is_ok());
 }
 
 #[test]
