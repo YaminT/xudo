@@ -993,6 +993,18 @@ fn rendered_or(rendered: Result<String, serde_json::Error>, fallback: &str) -> S
     }
 }
 
+/// Whether `candidate` is a canonical lowercase UUID boot id.
+pub fn is_boot_id(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.bytes().enumerate().all(|(offset, byte)| {
+            if matches!(offset, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]

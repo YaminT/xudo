@@ -15,6 +15,7 @@ xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 # The five system calls that need `unsafe`. The only crate that may depend on
 # it; everything else reaches those calls through `Syscalls`.
 xudo-sys-raw = { path = "../xudo-sys-raw", version = "0.1.0-beta.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
 bstr.workspace = true
 # Descriptor-relative opens and `fstat`, through rustix's safe API, so the
 # ruleset is verified on the descriptors it is read through. Two users share
