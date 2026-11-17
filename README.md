@@ -1,15 +1,15 @@
 # xudo
 
-**xudo is `sudo` for AI agents.** Your agent (Claude Code, Codex, Grok…) calls `xudo` where it would call `sudo`. xudo itself never asks for or handles a password. Instead it checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root. If a rule says a person must decide, the command waits in the `ido` queue until you review and run it. Everything else is refused, and every decision goes into a tamper-evident log.
+**xudo is `sudo` for AI agents.** Your agent (Claude Code, Codex, Grok…) calls `xudo` where it would call `sudo`. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root with no password prompt. If a rule says a person must decide, the command waits in the `ido` queue until you review and run it. Anyone else gets the normal `sudo` password prompt, and a command no rule allows is refused. xudo itself never asks for or handles a password. Every decision goes into a tamper-evident log.
 
 Today's beta asks your password for every request. The passwordless path for verified agents is being built.
 
-## How it works
+## How it works (the design; steps 2 and 4 are being built)
 
 1. You install one package and choose rule files: what agents may run, down to each argument.
 2. You verify a harness once: on a server the admin registers it; on a laptop you type your sudo password once per session.
 3. The agent runs `xudo exec -- <command>`. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.
-4. Allowed: runs as root now. Needs a person: waits in `ido`. Anything else: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.
+4. Allowed: runs as root now, with no password. Needs a person: waits in `ido`. Anyone else: the normal `sudo` password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.
 5. Everything is recorded in a log that shows any tampering.
 
 > This README is a derived view of [howiwork.md](howiwork.md), the source of truth for product behavior.
