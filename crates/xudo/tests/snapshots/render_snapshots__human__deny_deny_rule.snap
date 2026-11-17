@@ -4,7 +4,7 @@ expression: "render::human(&decision)"
 ---
 DENY
   command   protect-deny
-  rule      snapshot-fixture.toml:48
+  rule      xudo.protect.test (snapshot-fixture.toml:48): protected by the test fixture
   reason    deny_rule
 
   trace
