@@ -1,5 +1,9 @@
 //! Operator-authored deny rules. These rules can only turn an accepted command
 //! into a refusal; they never create an allow.
+//!
+//! `any-arg` compares each argv element exactly. Option spellings are not
+//! unified: clustered short options, GNU long-option abbreviations, and
+//! `--option=value` are distinct elements and must be listed separately.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +42,8 @@ impl DenyClause {
                 .any(|arg| values.iter().any(|v| arg.as_bytes() == v.as_bytes())),
             (None, Some(values)) => argv.as_slice().iter().any(|arg| {
                 let normalized = deb_name(arg.as_bytes());
-                values.iter().any(|v| normalized == v.as_bytes())
+                is_ambiguous_deb_pattern(normalized)
+                    || values.iter().any(|v| normalized == v.as_bytes())
             }),
             _ => false,
         }
@@ -63,6 +68,35 @@ fn deb_name(argument: &[u8]) -> &[u8] {
         .split(|byte| matches!(byte, b':' | b'=' | b'/'))
         .next()
         .unwrap_or(argument)
+}
+
+/// Apt accepts several pattern syntaxes in package operands. A token that is
+/// not a plain Debian package name may select a protected package, so a
+/// package-name clause treats it as a match. Valid literal names (including
+/// names with `.` and `+`) retain exact matching.
+fn is_ambiguous_deb_pattern(value: &[u8]) -> bool {
+    if is_plain_deb_name(value) || value.starts_with(b"-") || value.is_empty() {
+        return false;
+    }
+    value.iter().any(|byte| {
+        matches!(
+            byte,
+            b'^' | b'$' | b'?' | b'~' | b'*' | b'[' | b'(' | b'|' | b'.'
+        )
+    })
+}
+
+fn is_plain_deb_name(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'+')
+        && value.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'.' | b'-')
+        })
 }
 
 /// A root-authored refusal that only narrows an already accepted action.
@@ -123,6 +157,14 @@ impl DenyRule {
             let Some((kind, values)) = clause.kind_and_values() else {
                 return Err("each clause must contain exactly one matcher".into());
             };
+            if values.is_empty() {
+                let label = if kind == b"any-arg" {
+                    "any-arg"
+                } else {
+                    "any-deb-name"
+                };
+                return Err(format!("{label} must contain at least one member"));
+            }
             if values.len() > MAX_DENY_MEMBERS {
                 let label = if kind == b"any-arg" {
                     "any-arg"
@@ -151,7 +193,30 @@ impl DenyRule {
 
 fn is_control(character: char) -> bool {
     let value = u32::from(character);
-    value <= 0x1f || (0x7f..=0x9f).contains(&value)
+    value <= 0x1f
+        || (0x7f..=0x9f).contains(&value)
+        || matches!(
+            value,
+            0x00ad
+                | 0x0600..=0x0605
+                | 0x061c
+                | 0x06dd
+                | 0x070f
+                | 0x0890..=0x0891
+                | 0x08e2
+                | 0x180e
+                | 0x200b..=0x200f
+                | 0x202a..=0x202e
+                | 0x2060..=0x206f
+                | 0xfeff
+                | 0xfff9..=0xfffb
+                | 0x110bd..=0x110cd
+                | 0x13430..=0x1343f
+                | 0x1bca0..=0x1bca3
+                | 0x1d173..=0x1d17a
+                | 0xe0001
+                | 0xe0020..=0xe007f
+        )
 }
 
 /// Trace payload for a configured deny rule that matched.
@@ -221,6 +286,109 @@ mod tests {
         }
     }
 
+    fn pattern_denied(name: &str) -> bool {
+        let deny = rule(vec![DenyClause {
+            any_arg: None,
+            any_deb_name: Some(vec!["xudo".into()]),
+        }]);
+        deny.matches(b"/usr/bin/apt-get", &Argv::new(["install", name]))
+    }
+
+    #[test]
+    fn denies_removal_via_apt_name_pattern_caret() {
+        assert!(pattern_denied("^xudo"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_dollar() {
+        assert!(pattern_denied("xudo$"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_question() {
+        assert!(pattern_denied("?name(^xudo$)"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_tilde() {
+        assert!(pattern_denied("~nxudo"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_star() {
+        assert!(pattern_denied("xud*"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_bracket() {
+        assert!(pattern_denied("xudo[0-9]"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_parenthesis() {
+        assert!(pattern_denied("xudo(foo)"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_pipe() {
+        assert!(pattern_denied("xudo|other"));
+    }
+    #[test]
+    fn denies_removal_via_apt_name_pattern_dot() {
+        assert!(pattern_denied("xudo."));
+    }
+
+    #[test]
+    fn install_deb_name_clauses_refuse_removal_suffix_with_architecture() {
+        let deny = rule(vec![
+            DenyClause {
+                any_arg: Some(vec!["install".into()]),
+                any_deb_name: None,
+            },
+            DenyClause {
+                any_arg: None,
+                any_deb_name: Some(vec!["xudo".into()]),
+            },
+        ]);
+        assert!(deny.matches(b"/usr/bin/apt-get", &Argv::new(["install", "xudo:amd64-"])));
+    }
+
+    #[test]
+    fn install_deb_name_clauses_refuse_removal_suffix_with_suite() {
+        let deny = rule(vec![
+            DenyClause {
+                any_arg: Some(vec!["install".into()]),
+                any_deb_name: None,
+            },
+            DenyClause {
+                any_arg: None,
+                any_deb_name: Some(vec!["sudo".into()]),
+            },
+        ]);
+        assert!(deny.matches(b"/usr/bin/apt-get", &Argv::new(["install", "sudo/stable-"])));
+    }
+
+    #[test]
+    fn valid_debian_names_with_dot_and_plus_match_exactly() {
+        for protected in ["python3.12", "libstdc++6"] {
+            let deny = rule(vec![DenyClause {
+                any_arg: None,
+                any_deb_name: Some(vec![protected.into()]),
+            }]);
+            assert!(deny.matches(b"/usr/bin/apt-get", &Argv::new([protected])));
+        }
+        assert!(!pattern_denied("python3.12"));
+    }
+
+    #[test]
+    fn any_arg_keeps_option_spellings_byte_exact() {
+        let deny = rule(vec![DenyClause {
+            any_arg: Some(vec![
+                "--purge".into(),
+                "-Br".into(),
+                "--option=value".into(),
+            ]),
+            any_deb_name: None,
+        }]);
+        assert!(deny.matches(b"/usr/bin/apt-get", &Argv::new(["--purge"])));
+        assert!(!deny.matches(b"/usr/bin/apt-get", &Argv::new(["--purg"])));
+        assert!(!deny.matches(b"/usr/bin/apt-get", &Argv::new(["--option", "value"])));
+        assert!(!deny.matches(b"/usr/bin/apt-get", &Argv::new(["-B", "-r"])));
+    }
+
     #[test]
     fn all_empty_refuses_every_call_to_a_named_program() {
         assert!(rule(Vec::new()).matches(b"/usr/bin/apt", &Argv::default()));
@@ -280,6 +448,8 @@ mod tests {
         assert!(deny.validate().is_err());
         deny.reason = "bad\u{0085}reason".into();
         assert!(deny.validate().is_err());
+        deny.reason = "bad\u{202e}reason".into();
+        assert!(deny.validate().is_err());
         deny.reason = "ok".into();
         deny.program = vec!["/usr/bin/apt".into()];
         assert!(deny.validate().is_err());
@@ -325,6 +495,16 @@ mod tests {
         }];
         assert!(deny.validate().is_err());
         deny.all = vec![DenyClause {
+            any_arg: Some(Vec::new()),
+            any_deb_name: None,
+        }];
+        assert!(deny.validate().is_err());
+        deny.all = vec![DenyClause {
+            any_arg: None,
+            any_deb_name: Some(Vec::new()),
+        }];
+        assert!(deny.validate().is_err());
+        deny.all = vec![DenyClause {
             any_arg: None,
             any_deb_name: None,
         }];
@@ -344,5 +524,34 @@ mod tests {
             any_deb_name: None,
         }];
         assert!(deny.validate().is_err());
+    }
+
+    #[test]
+    fn deny_rule_reasons_reject_unicode_format_characters() {
+        let mut deny = rule(Vec::new());
+        for character in [
+            '\u{00ad}',
+            '\u{0600}',
+            '\u{061c}',
+            '\u{06dd}',
+            '\u{070f}',
+            '\u{0890}',
+            '\u{08e2}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{202a}',
+            '\u{2060}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{110bd}',
+            '\u{13430}',
+            '\u{1bca0}',
+            '\u{1d173}',
+            '\u{e0001}',
+            '\u{e0020}',
+        ] {
+            deny.reason = format!("reason{character}text");
+            assert!(deny.validate().is_err());
+        }
     }
 }

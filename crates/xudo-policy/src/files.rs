@@ -233,6 +233,24 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
         }
     }
 
+    for deny in &deny_rules {
+        for program in &deny.program {
+            let has_action = actions
+                .iter()
+                .any(|action| action.exe.rsplit('/').next() == Some(program.as_str()));
+            if !has_action {
+                return Err(RuleSetError::Parse {
+                    file: deny.source.file.clone(),
+                    reason: format!(
+                        "deny rule {} names program {program:?}, which no loaded action uses",
+                        deny.id
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+
     Ok(LoadedRuleSet {
         rules: RuleSet::load_with_deny_rules(actions, deny_rules)?,
         generation: Generation(hasher.finalize().into()),
@@ -661,11 +679,32 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     #[test]
     fn a_duplicate_deny_id_across_two_files_fails_the_combined_load() {
         let deny = "[[deny]]\nid = \"xudo.protect.same\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
-        let err =
-            load_rule_files(vec![file("10-a.toml", deny), file("20-b.toml", deny)]).unwrap_err();
+        let err = load_rule_files(vec![
+            file(
+                "00-actions.toml",
+                &ONE_ACTION.replace("systemctl", "apt-get"),
+            ),
+            file("10-a.toml", deny),
+            file("20-b.toml", deny),
+        ])
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("duplicate rule id xudo.protect.same"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_naming_an_unused_program_fails_the_combined_load() {
+        let deny = "[[deny]]\nid = \"xudo.protect.pkg\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
+        let err = load_rule_files(vec![
+            file("10-actions.toml", ONE_ACTION),
+            file("20-deny.toml", deny),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("which no loaded action uses"),
             "{err}"
         );
     }

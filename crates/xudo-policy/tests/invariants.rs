@@ -53,55 +53,62 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 64 }))]
 
     #[test]
-    fn adding_a_deny_rule_never_turns_a_deny_into_an_allow(extra in prop::collection::vec("[a-z]{1,8}", 0..3)) {
+    fn adding_an_arbitrary_deny_rule_never_turns_a_deny_into_an_allow(member in "[a-z*?^$]{1,8}", argv in arb_argv()) {
         let before = RuleSet::from_toml("before.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}")).unwrap();
-        let extra_rule = "[[deny]]\nid = \"xudo.protect.another\"\nreason = \"another protected package\"\nprogram = [\"apt-get\"]\nall = [{ any-arg = [\"purge\"] }]\n";
+        let extra_rule = format!("[[deny]]\nid = \"xudo.protect.another\"\nreason = \"another protected package\"\nprogram = [\"apt-get\"]\nall = [{{ any-arg = [{member:?}] }}]\n");
         let after = RuleSet::from_toml("after.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}{extra_rule}")).unwrap();
         let mut args = vec!["remove", "xudo"];
-        args.extend(extra.iter().map(String::as_str));
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
         for who in both_callers() {
             let old = decide_deny_test(&before, &who, &args);
             let new = decide_deny_test(&after, &who, &args);
-            prop_assert_eq!(old.denial, Some(DenialCode::DenyRule));
-            prop_assert_eq!(new.denial, Some(DenialCode::DenyRule));
-            prop_assert!(!old.verdict.is_permitted() || !new.verdict.is_permitted());
+            prop_assert!(!old.verdict.is_permitted());
+            prop_assert!(!new.verdict.is_permitted());
         }
     }
 
     #[test]
-    fn a_deny_rule_never_changes_the_verdict_of_a_command_it_does_not_match(arg in "[a-z]{1,8}") {
-        prop_assume!(arg != "remove" && arg != "xudo");
+    fn a_deny_rule_never_changes_the_verdict_of_a_command_it_does_not_match(argv in arb_argv()) {
+        prop_assume!(!argv.as_slice().iter().any(|arg| arg.as_bytes() == b"remove" || arg.as_bytes() == b"xudo"));
         let who = caller(false, Vec::new());
-        let old = decide_deny_test(&deny_test_rules(false), &who, &["install", &arg]);
-        let new = decide_deny_test(&deny_test_rules(true), &who, &["install", &arg]);
+        let mut args = vec!["install"];
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
+        let old = decide_deny_test(&deny_test_rules(false), &who, &args);
+        let new = decide_deny_test(&deny_test_rules(true), &who, &args);
         prop_assert_eq!(new.verdict, old.verdict);
         prop_assert_eq!(new.denial, old.denial);
     }
 
     #[test]
-    fn deny_rules_in_any_file_order_give_the_same_decisions(reverse in any::<bool>()) {
+    fn deny_rules_in_any_file_order_give_the_same_decisions(reverse in any::<bool>(), argv in arb_argv()) {
         let first = "[[deny]]\nid = \"xudo.protect.first\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = [{ any-arg = [\"remove\"] }]\n";
         let second = "[[deny]]\nid = \"xudo.protect.second\"\nreason = \"protected system\"\nprogram = [\"apt-get\"]\nall = [{ any-deb-name = [\"xudo\"] }]\n";
-        let a_text = if reverse { format!("{DENY_ACTION}{second}{first}") } else { format!("{DENY_ACTION}{first}{second}") };
-        let b_text = if reverse { format!("{DENY_ACTION}{first}{second}") } else { format!("{DENY_ACTION}{second}{first}") };
-        let a = RuleSet::from_toml("a.toml", &a_text).unwrap();
-        let b = RuleSet::from_toml("b.toml", &b_text).unwrap();
+        let action_file = RuleFile { name: b"00-actions.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() };
+        let first_file = RuleFile { name: b"10-first.toml".to_vec(), bytes: first.as_bytes().to_vec() };
+        let second_file = RuleFile { name: b"20-second.toml".to_vec(), bytes: second.as_bytes().to_vec() };
+        let mut files_a = vec![action_file.clone(), first_file.clone(), second_file.clone()];
+        let mut files_b = vec![action_file, second_file, first_file];
+        if reverse { files_a.reverse(); files_b.reverse(); }
+        let a = load_rule_files(files_a).unwrap();
+        let b = load_rule_files(files_b).unwrap();
         let who = caller(false, Vec::new());
-        let x = decide_deny_test(&a, &who, &["remove", "xudo"]);
-        let y = decide_deny_test(&b, &who, &["remove", "xudo"]);
+        let mut args = vec!["remove", "xudo"];
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
+        let x = decide_deny_test(&a.rules, &who, &args);
+        let y = decide_deny_test(&b.rules, &who, &args);
         prop_assert_eq!(x.verdict, y.verdict);
         prop_assert_eq!(x.denial, y.denial);
-        let gen_a = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: a_text.into_bytes() }]).unwrap();
-        let gen_b = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: b_text.into_bytes() }]).unwrap();
-        prop_assert_eq!(gen_a.generation, gen_b.generation);
+        prop_assert_eq!(a.generation, b.generation);
     }
 
     #[test]
-    fn appending_an_argument_never_unmatches_a_deny_rule(extra in "[a-z]{0,8}") {
+    fn appending_an_arbitrary_argument_never_unmatches_a_deny_rule(extra in arb_argv()) {
         let rules = deny_test_rules(true);
         let rule = &rules.deny_rules()[0];
         let before = Argv::new(["remove", "xudo"]);
-        let after = Argv::new(["remove", "xudo", extra.as_str()]);
+        let mut after_args = before.as_slice().to_vec();
+        after_args.extend(extra.as_slice().iter().cloned());
+        let after = Argv::new(after_args);
         prop_assert!(rule.matches(b"/usr/bin/apt-get", &before));
         prop_assert!(rule.matches(b"/usr/bin/apt-get", &after));
     }
