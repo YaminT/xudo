@@ -1077,6 +1077,13 @@ args = [
         assert!(boxed_cgroups::<AgentCgroup>(Err(SysError::unsupported("x"))).is_err());
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_real_seam_type_is_boxed_off_linux_where_it_never_opens() {
+        let boxed = boxed_cgroups(Ok(xudo_sys::HostCgroup::inert())).unwrap();
+        assert!(boxed.require_cgroup2().is_err());
+    }
+
     struct AgentCgroup {
         missing_facts: bool,
     }
