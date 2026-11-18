@@ -2589,6 +2589,9 @@ all = [{ any-arg = ["restart"] }]
         }
         #[cfg(target_os = "linux")]
         assert!(host.open_proc().is_ok());
+        // The real cgroup view opens on a cgroup2 Linux host and refuses elsewhere;
+        // either answer is fine here, a panic is not.
+        let _cgroups = host.cgroups();
         // The audit trail is the system's. Handed out, never written to: a
         // test must not leave a record in a real log if it is run as root.
         let _trail = host.audit();
