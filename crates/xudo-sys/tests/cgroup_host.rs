@@ -140,6 +140,7 @@ fn the_pure_cgroup_and_peer_decisions_run_through_the_external_fake_seams() {
         identity,
         CgroupIdentity {
             id: 42,
+            path: "/xudo.slice/agent-a.scope".to_owned(),
             rung: CgroupRung::PidfdInfo,
             fallback_errno: None,
         }

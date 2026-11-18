@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use xudo_policy::{Arg, Argv, CallerFacts, Classification, Decision, evaluate_command};
 use xudo_wire::BrokerRequest;
 
-use crate::identify::PeerIdentity;
+use crate::identify::{CgroupAttestation, PeerIdentity};
 
 pub use xudo_gate::policy::{LoadedPolicy, PolicyError};
 /// The largest settings file the broker will accept, in bytes.
@@ -56,30 +56,40 @@ impl PolicySource for HostPolicy {
     }
 }
 
-/// How the broker classifies the peer: `Unattested`, always, in M2b.
-///
-/// There is no cgroup classification until M4, so no caller can be an
-/// enrolled agent, and unattested routes to the human path with a password —
-/// misclassification here can only withhold capability. The reason records
-/// how the peer was identified, for the audit trail.
+/// Classifies the peer from the cgroup result derived while its kernel pidfd
+/// was held. Process names and caller-controlled environment are audit hints
+/// only and are never inputs here.
 pub fn classify(identity: &PeerIdentity) -> CallerFacts {
-    let pin = if identity.pinned {
-        "pinned by pidfd"
+    let classification = if identity.diverged {
+        xudo_policy::Classification::Unattested {
+            reason: "the peer's identity namespace diverges from the broker's".to_owned(),
+        }
     } else {
-        "unpinned"
-    };
-    CallerFacts::new(
-        Classification::Unattested {
-            reason: format!(
-                "no cgroup classification until M4; identified via {} as pid {} started at {} \
-                 ({pin})",
-                identity.rung.mechanism(),
-                identity.pid,
-                identity.starttime,
+        match &identity.cgroup_attestation {
+            CgroupAttestation::AgentScope(scope) => identity.cgroup_id.map_or_else(
+                || xudo_policy::Classification::Unattested {
+                    reason: "validated agent scope lacks a cgroup id".to_owned(),
+                },
+                |scope_id| xudo_policy::Classification::EnrolledAgent {
+                    agent_id: format!("scope-{scope_id}"),
+                    session_id: scope.name.clone(),
+                    declared_yolo: false,
+                },
             ),
-        },
-        identity.uid,
-    )
+            CgroupAttestation::Outside | CgroupAttestation::OtherScope(_) => {
+                xudo_policy::Classification::Human
+            }
+            CgroupAttestation::Recordless
+            | CgroupAttestation::Unattested
+            | CgroupAttestation::NotChecked => xudo_policy::Classification::Unattested {
+                reason: format!(
+                    "cgroup facts were not sufficient at {}",
+                    identity.rung.mechanism()
+                ),
+            },
+        }
+    };
+    CallerFacts::new(classification, identity.uid)
 }
 
 /// The requester's facts as the broker stored them at mint, from kernel
@@ -188,6 +198,8 @@ args = [
             diverged: false,
             pinned,
             cgroup_id: None,
+            cgroup_attestation: CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
         }
     }
@@ -201,24 +213,32 @@ args = [
     }
 
     #[test]
-    fn every_peer_is_unattested_in_m2b_and_keeps_its_connect_time_uid() {
-        for pinned in [true, false] {
-            let facts = classify(&identity(pinned));
-            assert_eq!(facts.classification.label(), "unattested");
-            assert!(facts.classification.requires_password());
-            assert_eq!(facts.uid, 1000);
-            let reason = format!("{:?}", facts.classification);
-            assert!(reason.contains("SO_PEERPIDFD + PIDFD_GET_INFO"), "{reason}");
-            assert!(reason.contains("pid 4242 started at 998877"), "{reason}");
-            assert!(
-                reason.contains(if pinned {
-                    "pinned by pidfd"
-                } else {
-                    "unpinned"
-                }),
-                "{reason}"
-            );
-        }
+    fn claudecode_env_and_agent_comm_without_a_scope_is_human() {
+        let mut peer = identity(true);
+        peer.cgroup_attestation = CgroupAttestation::Outside;
+        let facts = classify(&peer);
+        assert_eq!(facts.classification.label(), "human");
+        assert!(facts.classification.requires_password());
+        assert_eq!(facts.uid, 1000);
+    }
+
+    #[test]
+    fn a_broker_agent_uses_the_attested_scope_name_as_its_session_id() {
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: Vec::new(),
+        });
+
+        let facts = classify(&peer);
+
+        assert!(matches!(
+            facts.classification,
+            xudo_policy::Classification::EnrolledAgent { session_id, .. }
+                if session_id == "agent-0123456789abcdef0123456789abcdef.scope"
+        ));
     }
 
     #[test]

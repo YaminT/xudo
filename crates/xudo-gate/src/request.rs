@@ -595,11 +595,10 @@ impl PendingRequest {
         boot_id: Option<&str>,
     ) -> bool {
         match &self.attested_class {
-            AttestedClass::Unattested => {
-                class == &AttestedClass::Unattested && scope_id.is_none() && boot_id.is_none()
-            }
-            AttestedClass::Human => {
-                class == &AttestedClass::Human && scope_id.is_none() && boot_id.is_none()
+            AttestedClass::Unattested | AttestedClass::Human => {
+                matches!(class, AttestedClass::Unattested | AttestedClass::Human)
+                    && scope_id.is_none()
+                    && boot_id.is_none()
             }
             AttestedClass::EnrolledAgent { scope_id: saved } => {
                 class == &AttestedClass::EnrolledAgent { scope_id: *saved }
@@ -870,14 +869,19 @@ mod tests {
     }
 
     #[test]
-    fn a_human_entry_matches_only_a_live_human_with_no_scope_or_boot() {
+    fn a_human_entry_matches_the_auth_bucket_with_no_scope_or_boot() {
         let mut request = live();
         request.attested_class = AttestedClass::Human;
         let boot = "abcdef01-2345-6789-abcd-ef0123456789";
         assert!(request.live_attested_identity_matches(&AttestedClass::Human, None, None));
+        assert!(!request.live_attested_identity_matches(
+            &AttestedClass::EnrolledAgent { scope_id: 44 },
+            None,
+            None,
+        ));
         assert!(!request.live_attested_identity_matches(&AttestedClass::Human, Some(44), None));
         assert!(!request.live_attested_identity_matches(&AttestedClass::Human, None, Some(boot)));
-        assert!(!request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
+        assert!(request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
     }
 
     #[test]

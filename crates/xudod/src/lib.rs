@@ -59,8 +59,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use xudo_sys::{
-    AuditSink, HostClock, HostEntropy, HostHygiene, HostPeer, HostSyscalls, Hygiene, SpoolDir,
-    UnixConnection,
+    AuditSink, HostCgroup, HostClock, HostEntropy, HostHygiene, HostPeer, HostSyscalls, Hygiene,
+    SpoolDir, UnixConnection,
 };
 use xudo_wire::RefusalCode;
 
@@ -100,10 +100,12 @@ fn run_with_hygiene(
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
             let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
+            let cgroups = open_cgroups(audit, HostCgroup::open());
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
                 syscalls: &HostSyscalls,
+                cgroups: as_calls(cgroups.as_ref()),
                 peers: &HostPeer,
                 clock: &HostClock,
                 entropy: &HostEntropy,
@@ -122,9 +124,88 @@ fn run_with_hygiene(
     }
 }
 
+/// The opened seam as the trait object `serve` takes. A function of its own so
+/// a test can run the `Some` path on a host where the real seam never opens.
+fn as_calls<T: xudo_sys::CgroupCalls>(opened: Option<&T>) -> Option<&dyn xudo_sys::CgroupCalls> {
+    opened.map(|calls| calls as &dyn xudo_sys::CgroupCalls)
+}
+
+/// Records why cgroup classification could not be initialized. The broker
+/// still serves only as Unattested when this host capability is unavailable.
+fn open_cgroups<T>(audit: &mut dyn AuditSink, result: Result<T, xudo_sys::SysError>) -> Option<T> {
+    match result {
+        Ok(cgroups) => Some(cgroups),
+        Err(error) => {
+            let refusal = Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                format!("cgroup classification unavailable: {error}"),
+            );
+            let _ = audit.append(&|previous| record::refused(previous, &refusal, None, None));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod cgroup_open_audit_tests {
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+
+    #[test]
+    fn a_cgroup_open_failure_is_named_in_the_audit_trail() {
+        let mut audit = xudo_sys::FakeAuditSink::new();
+        let error = xudo_sys::SysError::read("/sys/fs/cgroup", "mount unavailable");
+
+        let cgroups = open_cgroups::<u8>(&mut audit, Err(error));
+
+        assert!(cgroups.is_none());
+        assert_eq!(audit.records().len(), 1);
+        let record = &audit.records()[0];
+        assert_eq!(record.classification, "unattested");
+        assert!(record.evidence.iter().any(|line| {
+            line.contains("cgroup classification unavailable") && line.contains("mount unavailable")
+        }));
+    }
+
+    #[test]
+    fn an_opened_cgroup_seam_is_handed_to_serve_as_a_trait_object() {
+        assert!(as_calls(Some(&crate::serve::NoCgroups)).is_some());
+        assert!(as_calls::<crate::serve::NoCgroups>(None).is_none());
+    }
+
+    #[test]
+    fn an_opened_cgroup_seam_is_kept_and_nothing_is_audited() {
+        let mut audit = xudo_sys::FakeAuditSink::new();
+
+        let cgroups = open_cgroups(&mut audit, Ok(7_u8));
+
+        assert_eq!(cgroups, Some(7));
+        assert!(audit.records().is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
+    /// The records a request produced. On a host without cgroup2 (macOS) the
+    /// broker also audits why classification is unavailable; that record is
+    /// not what these tests count.
+    macro_rules! served {
+        ($audit:expr) => {
+            $audit
+                .records()
+                .iter()
+                .filter(|record| {
+                    !record
+                        .evidence
+                        .iter()
+                        .any(|line| line.contains("cgroup classification unavailable"))
+                })
+                .collect::<Vec<_>>()
+        };
+    }
 
     use std::io::{Read as _, Write as _};
     use std::net::Shutdown;
@@ -162,7 +243,7 @@ mod tests {
         let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut audit = FakeAuditSink::new();
         assert_eq!(run(file.as_fd(), &mut audit), UNUSABLE);
-        let record = &audit.records()[0];
+        let record = &served!(audit)[0];
         assert_eq!(record.denial.as_deref(), Some("broker_unusable"));
         assert!(record.evidence.join(" ").contains("not a socket"));
     }
@@ -185,13 +266,10 @@ mod tests {
         let response = BrokerResponse::parse(&answer).unwrap();
         assert_eq!(code_of(&response.answer), Some(RefusalCode::BrokerUnusable));
         assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
-        assert_eq!(audit.records().len(), 1);
-        assert_eq!(
-            audit.records()[0].denial.as_deref(),
-            Some("broker_unusable")
-        );
+        assert_eq!(served!(audit).len(), 1);
+        assert_eq!(served!(audit)[0].denial.as_deref(), Some("broker_unusable"));
         assert!(
-            audit.records()[0]
+            served!(audit)[0]
                 .evidence
                 .join(" ")
                 .contains("PR_SET_NO_NEW_PRIVS")
@@ -218,9 +296,9 @@ mod tests {
         let response = BrokerResponse::parse(&answer).unwrap();
         assert_eq!(code_of(&response.answer), Some(AFTER_HYGIENE));
         assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
-        assert_eq!(audit.records().len(), 1);
+        assert_eq!(served!(audit).len(), 1);
         assert_eq!(
-            audit.records()[0].denial.as_deref(),
+            served!(audit)[0].denial.as_deref(),
             Some(AFTER_HYGIENE.as_str())
         );
     }
@@ -258,10 +336,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            audit.records()[0].denial.as_deref(),
-            Some(EXPECTED.as_str())
-        );
+        assert_eq!(served!(audit)[0].denial.as_deref(), Some(EXPECTED.as_str()));
     }
 
     #[test]

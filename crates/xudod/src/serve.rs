@@ -21,12 +21,12 @@ use serde::{Deserialize, Serialize};
 use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
-    AuditError, AuditSink, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool, SpoolError,
-    Syscalls, authorize,
+    AuditError, AuditSink, CgroupCalls, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool,
+    SpoolError, Syscalls, authorize,
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
-use crate::identify::{Fault, PeerIdentity, identify};
+use crate::identify::{Fault, PeerIdentity, identify_classified};
 use crate::mint::{
     AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
     entry_for_classified, publish,
@@ -46,6 +46,8 @@ pub struct Platform<'a> {
     /// The calls that need `unsafe` and that the ladder makes itself:
     /// `SO_PEERPIDFD` and `PIDFD_GET_INFO`.
     pub syscalls: &'a dyn Syscalls,
+    /// Cgroup identity and root-recorded scope checks.
+    pub cgroups: Option<&'a dyn CgroupCalls>,
     /// `pidfd_open`, `/proc`, and the liveness poll, which are safe in rustix,
     /// and `SO_PEERCRED`, which is not and is carried here only as a seam: the
     /// host reads it through `Syscalls::peer_cred`, behind a check of the
@@ -257,7 +259,17 @@ pub fn serve(
     if let Err(error) = platform.hygiene.forbid_new_privileges() {
         return refuse_hygiene_failure(conn, platform.audit, &error);
     }
-    let identity = match identify(conn.socket(), platform.syscalls, platform.peers) {
+    let identified = match platform.cgroups {
+        Some(cgroups) => identify_classified(
+            conn.socket(),
+            platform.syscalls,
+            platform.peers,
+            cgroups,
+            platform.clock,
+        ),
+        None => crate::identify::identify(conn.socket(), platform.syscalls, platform.peers),
+    };
+    let identity = match identified {
         Ok(identity) => identity,
         Err(error) => return refuse(conn, platform.audit, &Refusal::from(&error), None, None),
     };
@@ -2377,6 +2389,36 @@ fn mint(
     spool: &dyn Spool,
     evaluated: Evaluated,
 ) -> Served {
+    let nonce = match draw_nonce(platform.entropy) {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            let refusal = Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                format!("cannot draw a nonce: {error}"),
+            );
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(&evaluated.identity),
+                Some(&evaluated.request),
+            );
+        }
+    };
+    let now = platform.clock.boottime_millis();
+    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
+    let entry = match mint_entry(platform, &evaluated, deadline, nonce) {
+        Ok(entry) => entry,
+        Err(refusal) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(&evaluated.identity),
+                Some(&evaluated.request),
+            );
+        }
+    };
     let Evaluated {
         decision,
         caller,
@@ -2385,43 +2427,6 @@ fn mint(
         policy,
     } = evaluated;
     let known = (Some(&identity), Some(&request));
-
-    let nonce = match draw_nonce(platform.entropy) {
-        Ok(nonce) => nonce,
-        Err(error) => {
-            let refusal = Refusal::broker(
-                RefusalCode::BrokerUnusable,
-                format!("cannot draw a nonce: {error}"),
-            );
-            return refuse(conn, platform.audit, &refusal, known.0, known.1);
-        }
-    };
-    let now = platform.clock.boottime_millis();
-    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
-    let entry = match entry_for_classified(
-        &decision,
-        &AttestedCaller {
-            identity: &identity,
-            facts: &caller,
-            boot_id: None,
-        },
-        &request,
-        policy.rules.generation.id(),
-        policy.settings.confirm_human_path,
-        deadline,
-        nonce,
-    ) {
-        Ok(entry) => entry,
-        Err(error) => {
-            return refuse(
-                conn,
-                platform.audit,
-                &Refusal::from(&error),
-                known.0,
-                known.1,
-            );
-        }
-    };
 
     // No record, no entry: `publish` takes the authorization.
     let build = |previous: Option<&Record>, grant: &Grant| {
@@ -2479,6 +2484,29 @@ fn mint(
     };
     let response = minted_response(&authorized.approval().0, decision, minted);
     answer(conn, &response, Served::Minted)
+}
+
+fn mint_entry(
+    platform: &Platform<'_>,
+    evaluated: &Evaluated,
+    deadline: u64,
+    nonce: String,
+) -> Result<xudo_gate::request::PendingRequest, Refusal> {
+    let live = live_attestation(platform.syscalls, &evaluated.caller, &evaluated.identity)?;
+    entry_for_classified(
+        &evaluated.decision,
+        &AttestedCaller {
+            identity: &evaluated.identity,
+            facts: &evaluated.caller,
+            boot_id: live.boot_id.as_deref(),
+        },
+        &evaluated.request,
+        evaluated.policy.rules.generation.id(),
+        evaluated.policy.settings.confirm_human_path,
+        deadline,
+        nonce,
+    )
+    .map_err(|error| Refusal::from(&error))
 }
 
 fn minted_response(
@@ -2574,6 +2602,42 @@ pub(crate) fn refuse_hygiene_failure(
         None,
         None,
     )
+}
+
+/// A cgroup seam that knows nothing: every read fails, as on a host
+/// without cgroup2. It lets the classified arm of `serve` run on any
+/// platform.
+#[cfg(test)]
+pub(crate) struct NoCgroups;
+
+#[cfg(test)]
+impl xudo_sys::CgroupCalls for NoCgroups {
+    fn require_cgroup2(&self) -> Result<(), xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn pidfd_cgroup_id(&self, _: std::os::fd::BorrowedFd<'_>) -> Result<u64, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn proc_cgroup(&self, _: u32) -> Result<Vec<u8>, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn cgroup_inode(&self, _: &str) -> Result<u64, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn peer_alive(&self, _: std::os::fd::BorrowedFd<'_>) -> Result<bool, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn scope_facts(
+        &self,
+        _: &str,
+        _: u64,
+        _: bool,
+    ) -> Result<Option<xudo_sys::ScopeFacts>, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
+    fn scope_names(&self) -> Result<Vec<String>, xudo_sys::SysError> {
+        Err(xudo_sys::SysError::unsupported("test cgroup"))
+    }
 }
 
 #[cfg(test)]
@@ -2757,6 +2821,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Platform {
                 hygiene: &self.hygiene,
                 syscalls: &self.syscalls,
+                cgroups: None,
                 peers: &self.peers,
                 clock: &self.clock,
                 entropy: &self.entropy,
@@ -2856,6 +2921,40 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             | Answer::Watching { .. }
             | Answer::Done => None,
         }
+    }
+
+    #[test]
+    fn a_seam_that_knows_nothing_answers_every_read_with_an_error() {
+        use std::os::fd::AsFd as _;
+        use xudo_sys::CgroupCalls as _;
+
+        let seam = super::NoCgroups;
+        let fd = a_descriptor();
+        assert!(seam.require_cgroup2().is_err());
+        assert!(seam.pidfd_cgroup_id(fd.as_fd()).is_err());
+        assert!(seam.proc_cgroup(1).is_err());
+        assert!(seam.cgroup_inode("x").is_err());
+        assert!(seam.peer_alive(fd.as_fd()).is_err());
+        assert!(seam.scope_facts("x", 1, false).is_err());
+        assert!(seam.scope_names().is_err());
+    }
+
+    #[test]
+    fn a_broker_whose_cgroup_reads_all_fail_never_classifies_an_agent() {
+        let mut host = Host::honest();
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let seam = super::NoCgroups;
+        let mut platform = host.platform();
+        platform.cgroups = Some(&seam);
+        let _served = serve(&conn, &mut platform, Ok(&spool as &dyn Spool));
+        assert!(!host.audit.records().is_empty());
+        assert!(
+            host.audit
+                .records()
+                .iter()
+                .all(|record| record.classification != "agent")
+        );
     }
 
     #[test]
@@ -3711,7 +3810,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let make_evaluated = |host: &Host, request: BrokerRequest| {
             let conn = connection(Ok(Vec::new()));
-            let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+            let identity =
+                crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
             let policy = confirming_policy();
             let caller = classify(&identity);
             let decision = decide(&policy, &caller, &request);
@@ -8388,6 +8488,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             diverged: false,
             pinned: true,
             cgroup_id: None,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: crate::identify::EuidSource::PidfdInfo,
         }
     }
@@ -8906,6 +9008,107 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             outcome.records[0].decision,
             AuditDecision::AwaitingConfirmation
         );
+    }
+
+    #[test]
+    fn a_user_freeze_marker_denies_an_enrolled_entry_at_mint() {
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        assert_eq!(served, Served::Decided);
+        let written = conn.written();
+        let response = BrokerResponse::parse(&written).unwrap();
+        let (decision, minted) = decision_of(&response.answer).unwrap();
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.denial, Some(DenialCode::Frozen));
+        assert!(minted.is_none());
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
+        let mut host = Host::honest();
+        host.policy
+            .answer
+            .as_mut()
+            .unwrap()
+            .settings
+            .confirm_agent_actions = false;
+        host.syscalls =
+            FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+
+        assert_eq!(served, Served::Minted);
+        let response = BrokerResponse::parse(&conn.written()).unwrap();
+        let (decision, minted) = decision_of(&response.answer).unwrap();
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert!(minted.is_some());
+        assert_eq!(spool.files().len(), 1);
+    }
+
+    #[test]
+    fn an_enrolled_entry_with_an_unavailable_live_boot_id_is_not_minted() {
+        let mut host = Host::honest();
+        host.policy
+            .answer
+            .as_mut()
+            .unwrap()
+            .settings
+            .confirm_agent_actions = false;
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+
+        assert_eq!(served, Served::Refused(Fault::Broker));
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        assert!(spool.files().is_empty());
     }
 
     #[test]
@@ -9449,7 +9652,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         decision.verdict = Verdict::Allow;
         decision.denial = None;
         let request = BrokerRequest::new("/usr/bin/systemctl", Vec::new(), "x");
-        let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+        let identity =
+            crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let evaluated = Evaluated {
             caller: crate::policy::classify(&identity),
             decision,
@@ -9476,7 +9680,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let conn = restart();
         let spool = FakeSpool::new();
-        let identity = identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
+        let identity =
+            crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let caller = crate::policy::classify(&identity);
         let loaded = policy();
         let mut request = BrokerRequest::new(

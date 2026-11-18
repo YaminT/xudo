@@ -35,6 +35,8 @@ fn identity() -> PeerIdentity {
         diverged: true,
         pinned: true,
         cgroup_id: Some(77),
+        cgroup_attestation: xudod::identify::CgroupAttestation::NotChecked,
+        cgroup_rung: None,
         euid_source: EuidSource::PidfdInfo,
     }
 }

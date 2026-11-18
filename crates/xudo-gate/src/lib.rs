@@ -65,6 +65,7 @@ pub(crate) fn keep_lane_short_ttl_marker_linked() {
     std::hint::black_box(XUDO_GATE_LANE_SHORT_TTL_MARKER);
 }
 
+pub mod classify;
 pub mod decide;
 pub mod env;
 pub mod policy;

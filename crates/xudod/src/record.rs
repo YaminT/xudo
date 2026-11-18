@@ -181,6 +181,8 @@ mod tests {
             diverged: false,
             pinned: true,
             cgroup_id,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
         }
     }
