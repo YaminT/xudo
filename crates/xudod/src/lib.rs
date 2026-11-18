@@ -172,6 +172,24 @@ mod cgroup_open_audit_tests {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+    /// The records a request produced. On a host without cgroup2 (macOS) the
+    /// broker also audits why classification is unavailable; that record is
+    /// not what these tests count.
+    macro_rules! served {
+        ($audit:expr) => {
+            $audit
+                .records()
+                .iter()
+                .filter(|record| {
+                    !record
+                        .evidence
+                        .iter()
+                        .any(|line| line.contains("cgroup classification unavailable"))
+                })
+                .collect::<Vec<_>>()
+        };
+    }
+
     use std::io::{Read as _, Write as _};
     use std::net::Shutdown;
     use std::os::fd::AsFd as _;
@@ -208,7 +226,7 @@ mod tests {
         let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut audit = FakeAuditSink::new();
         assert_eq!(run(file.as_fd(), &mut audit), UNUSABLE);
-        let record = &audit.records()[0];
+        let record = &served!(audit)[0];
         assert_eq!(record.denial.as_deref(), Some("broker_unusable"));
         assert!(record.evidence.join(" ").contains("not a socket"));
     }
@@ -231,13 +249,10 @@ mod tests {
         let response = BrokerResponse::parse(&answer).unwrap();
         assert_eq!(code_of(&response.answer), Some(RefusalCode::BrokerUnusable));
         assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
-        assert_eq!(audit.records().len(), 1);
-        assert_eq!(
-            audit.records()[0].denial.as_deref(),
-            Some("broker_unusable")
-        );
+        assert_eq!(served!(audit).len(), 1);
+        assert_eq!(served!(audit)[0].denial.as_deref(), Some("broker_unusable"));
         assert!(
-            audit.records()[0]
+            served!(audit)[0]
                 .evidence
                 .join(" ")
                 .contains("PR_SET_NO_NEW_PRIVS")
@@ -264,9 +279,9 @@ mod tests {
         let response = BrokerResponse::parse(&answer).unwrap();
         assert_eq!(code_of(&response.answer), Some(AFTER_HYGIENE));
         assert_eq!(hygiene.calls(), [HygieneCall::ForbidNewPrivileges]);
-        assert_eq!(audit.records().len(), 1);
+        assert_eq!(served!(audit).len(), 1);
         assert_eq!(
-            audit.records()[0].denial.as_deref(),
+            served!(audit)[0].denial.as_deref(),
             Some(AFTER_HYGIENE.as_str())
         );
     }
@@ -304,10 +319,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            audit.records()[0].denial.as_deref(),
-            Some(EXPECTED.as_str())
-        );
+        assert_eq!(served!(audit)[0].denial.as_deref(), Some(EXPECTED.as_str()));
     }
 
     #[test]
