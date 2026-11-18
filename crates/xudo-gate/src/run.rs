@@ -1084,6 +1084,28 @@ args = [
         assert!(boxed.require_cgroup2().is_err());
     }
 
+    #[test]
+    fn the_agent_cgroup_double_answers_every_read() {
+        use std::os::fd::AsFd as _;
+
+        let fd = std::os::unix::net::UnixStream::pair().unwrap().0;
+        for missing_facts in [false, true] {
+            let seam = AgentCgroup { missing_facts };
+            assert!(seam.require_cgroup2().is_ok());
+            assert_eq!(seam.pidfd_cgroup_id(fd.as_fd()).unwrap(), 90);
+            assert!(seam.proc_cgroup(1).is_ok());
+            assert_eq!(seam.cgroup_inode("x").unwrap(), 90);
+            assert!(seam.peer_alive(fd.as_fd()).unwrap());
+            assert!(seam.scope_facts("other", 90, false).unwrap().is_none());
+            assert!(
+                seam.scope_facts("agent-0123456789abcdef0123456789abcdef.scope", 90, false)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(seam.scope_names().unwrap().len(), 1);
+        }
+    }
+
     struct AgentCgroup {
         missing_facts: bool,
     }
