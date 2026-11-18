@@ -1235,7 +1235,7 @@ args = [
                 }
                 FakeCgroupMode::Host => {}
             }
-            xudo_sys::HostCgroup::open().map(|calls| Box::new(calls) as Box<dyn CgroupCalls>)
+            boxed_cgroups(xudo_sys::HostCgroup::open())
         }
         fn hygiene(&self) -> &dyn Hygiene {
             &self.hygiene
