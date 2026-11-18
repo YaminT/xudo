@@ -182,9 +182,14 @@ pub struct HostCgroup {
     test_force_cgroup2: bool,
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 impl HostCgroup {
-    fn for_tests() -> Self {
+    /// A seam that never opens: every call answers `Unsupported`. Off Linux
+    /// `open()` can never hand out a `HostCgroup`, so this is how a caller's
+    /// test runs the code that holds one, on the platform where it is
+    /// developed. It does not exist on Linux, where the real one opens.
+    #[must_use]
+    pub fn inert() -> Self {
         Self {}
     }
 }
@@ -2200,7 +2205,7 @@ mod tests {
             assert_eq!(result.map(drop), Err(SysError::unsupported(what)));
         }
         unsupported(HostCgroup::open(), "cgroup2 attestation");
-        let host = HostCgroup::for_tests();
+        let host = HostCgroup::inert();
         let stream = UnixStream::pair().unwrap().0;
         unsupported(host.require_cgroup2(), "cgroup2 fstatfs");
         unsupported(host.pidfd_cgroup_id(stream.as_fd()), "PIDFD_GET_INFO");
