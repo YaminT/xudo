@@ -105,9 +105,7 @@ fn run_with_hygiene(
             let mut platform = Platform {
                 hygiene,
                 syscalls: &HostSyscalls,
-                cgroups: cgroups
-                    .as_ref()
-                    .map(|calls| calls as &dyn xudo_sys::CgroupCalls),
+                cgroups: as_calls(cgroups.as_ref()),
                 peers: &HostPeer,
                 clock: &HostClock,
                 entropy: &HostEntropy,
@@ -124,6 +122,12 @@ fn run_with_hygiene(
             UNUSABLE
         }
     }
+}
+
+/// The opened seam as the trait object `serve` takes. A function of its own so
+/// a test can run the `Some` path on a host where the real seam never opens.
+fn as_calls<T: xudo_sys::CgroupCalls>(opened: Option<&T>) -> Option<&dyn xudo_sys::CgroupCalls> {
+    opened.map(|calls| calls as &dyn xudo_sys::CgroupCalls)
 }
 
 /// Records why cgroup classification could not be initialized. The broker
@@ -162,6 +166,12 @@ mod cgroup_open_audit_tests {
         assert!(record.evidence.iter().any(|line| {
             line.contains("cgroup classification unavailable") && line.contains("mount unavailable")
         }));
+    }
+
+    #[test]
+    fn an_opened_cgroup_seam_is_handed_to_serve_as_a_trait_object() {
+        assert!(as_calls(Some(&crate::serve::NoCgroups)).is_some());
+        assert!(as_calls::<crate::serve::NoCgroups>(None).is_none());
     }
 
     #[test]
