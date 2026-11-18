@@ -235,7 +235,7 @@ impl GateHost for SystemHost {
     }
 
     fn cgroups(&self) -> Result<Box<dyn CgroupCalls>, xudo_sys::SysError> {
-        xudo_sys::HostCgroup::open().map(|calls| Box::new(calls) as Box<dyn CgroupCalls>)
+        boxed_cgroups(xudo_sys::HostCgroup::open())
     }
 
     fn hygiene(&self) -> &dyn Hygiene {
@@ -838,6 +838,14 @@ fn execute(host: &dyn GateHost, authorized: &Authorized<Approved>, program: &Pro
     }
 }
 
+/// Boxes an opened cgroup seam. A function of its own so a test can run the
+/// `Ok` path on a host where the real seam never opens (macOS).
+fn boxed_cgroups<T: CgroupCalls + 'static>(
+    opened: Result<T, xudo_sys::SysError>,
+) -> Result<Box<dyn CgroupCalls>, xudo_sys::SysError> {
+    opened.map(|calls| Box::new(calls) as Box<dyn CgroupCalls>)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1056,6 +1064,17 @@ args = [
         user_freezes: Vec<u32>,
         /// The uids the gate asked about.
         freeze_asked: std::cell::RefCell<Vec<u32>>,
+    }
+
+    #[test]
+    fn an_opened_cgroup_seam_is_boxed_and_a_failed_open_stays_an_error() {
+        assert!(
+            boxed_cgroups(Ok(AgentCgroup {
+                missing_facts: false
+            }))
+            .is_ok()
+        );
+        assert!(boxed_cgroups::<AgentCgroup>(Err(SysError::unsupported("x"))).is_err());
     }
 
     struct AgentCgroup {
