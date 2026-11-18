@@ -100,7 +100,7 @@ fn run_with_hygiene(
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
             let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
-            let cgroups = HostCgroup::open().ok();
+            let cgroups = open_cgroups(audit, HostCgroup::open());
             let policy = HostPolicy::system();
             let mut platform = Platform {
                 hygiene,
@@ -123,6 +123,48 @@ fn run_with_hygiene(
             let _ = audit.append(&|previous| record::refused(previous, &refusal, None, None));
             UNUSABLE
         }
+    }
+}
+
+/// Records why cgroup classification could not be initialized. The broker
+/// still serves only as Unattested when this host capability is unavailable.
+fn open_cgroups(
+    audit: &mut dyn AuditSink,
+    result: Result<HostCgroup, xudo_sys::SysError>,
+) -> Option<HostCgroup> {
+    match result {
+        Ok(cgroups) => Some(cgroups),
+        Err(error) => {
+            let refusal = Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                format!("cgroup classification unavailable: {error}"),
+            );
+            let _ = audit.append(&|previous| record::refused(previous, &refusal, None, None));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod cgroup_open_audit_tests {
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+
+    #[test]
+    fn a_cgroup_open_failure_is_named_in_the_audit_trail() {
+        let mut audit = xudo_sys::FakeAuditSink::new();
+        let error = xudo_sys::SysError::read("/sys/fs/cgroup", "mount unavailable");
+
+        let cgroups = open_cgroups(&mut audit, Err(error));
+
+        assert!(cgroups.is_none());
+        assert_eq!(audit.records().len(), 1);
+        let record = &audit.records()[0];
+        assert_eq!(record.classification, "unattested");
+        assert!(record.evidence.iter().any(|line| {
+            line.contains("cgroup classification unavailable") && line.contains("mount unavailable")
+        }));
     }
 }
 

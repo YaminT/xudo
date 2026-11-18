@@ -19,10 +19,12 @@ pub enum CgroupRung {
 }
 
 /// A cgroup id together with the kernel rung and fallback errno, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CgroupIdentity {
     /// Inode of the peer's cgroup directory.
     pub id: u64,
+    /// Unified cgroup path read while the pidfd pinned the peer.
+    pub path: String,
     /// The rung chosen by asking the kernel.
     pub rung: CgroupRung,
     /// `ENOTTY` or `EINVAL` that selected the proc rung.
@@ -771,19 +773,19 @@ pub fn peer_cgroup_id<C: CgroupCalls + ?Sized>(
 ) -> Result<CgroupIdentity, SysError> {
     calls.require_cgroup2()?;
     let ioctl = calls.pidfd_cgroup_id(pidfd);
-    let (id, rung, fallback_errno) = match ioctl {
+    let (id, path, rung, fallback_errno) = match ioctl {
         Ok(info_id) => {
             let path = read_cgroup_path(calls, pid)?;
             let proc_id = calls.cgroup_inode(&path)?;
             if info_id != proc_id {
                 return Err(unattested("PIDFD_GET_INFO and /proc cgroup ids disagree"));
             }
-            (proc_id, CgroupRung::PidfdInfo, None)
+            (proc_id, path, CgroupRung::PidfdInfo, None)
         }
         Err(error) if missing_pidfd_ioctl(&error) => {
             let path = read_cgroup_path(calls, pid)?;
             let proc_id = calls.cgroup_inode(&path)?;
-            (proc_id, CgroupRung::ProcFstat, error.os_code())
+            (proc_id, path, CgroupRung::ProcFstat, error.os_code())
         }
         Err(error) => return Err(error),
     };
@@ -792,6 +794,7 @@ pub fn peer_cgroup_id<C: CgroupCalls + ?Sized>(
     }
     Ok(CgroupIdentity {
         id,
+        path,
         rung,
         fallback_errno,
     })

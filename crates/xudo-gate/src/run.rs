@@ -1376,7 +1376,7 @@ args = [
             .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let exit = run(&mut host, &auth());
         assert_eq!(exec_calls(&host), 0);
-        assert!(exit.message.contains("not_confirmed") || exit.message.contains("refused"));
+        assert!(exit.message.contains("request_wrong_attested_identity"));
     }
 
     #[test]
