@@ -19,10 +19,12 @@ pub enum CgroupRung {
 }
 
 /// A cgroup id together with the kernel rung and fallback errno, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CgroupIdentity {
     /// Inode of the peer's cgroup directory.
     pub id: u64,
+    /// Unified cgroup path read while the pidfd pinned the peer.
+    pub path: String,
     /// The rung chosen by asking the kernel.
     pub rung: CgroupRung,
     /// `ENOTTY` or `EINVAL` that selected the proc rung.
@@ -180,9 +182,14 @@ pub struct HostCgroup {
     test_force_cgroup2: bool,
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 impl HostCgroup {
-    fn for_tests() -> Self {
+    /// A seam that never opens: every call answers `Unsupported`. Off Linux
+    /// `open()` can never hand out a `HostCgroup`, so this is how a caller's
+    /// test runs the code that holds one, on the platform where it is
+    /// developed. It does not exist on Linux, where the real one opens.
+    #[must_use]
+    pub fn inert() -> Self {
         Self {}
     }
 }
@@ -771,19 +778,19 @@ pub fn peer_cgroup_id<C: CgroupCalls + ?Sized>(
 ) -> Result<CgroupIdentity, SysError> {
     calls.require_cgroup2()?;
     let ioctl = calls.pidfd_cgroup_id(pidfd);
-    let (id, rung, fallback_errno) = match ioctl {
+    let (id, path, rung, fallback_errno) = match ioctl {
         Ok(info_id) => {
             let path = read_cgroup_path(calls, pid)?;
             let proc_id = calls.cgroup_inode(&path)?;
             if info_id != proc_id {
                 return Err(unattested("PIDFD_GET_INFO and /proc cgroup ids disagree"));
             }
-            (proc_id, CgroupRung::PidfdInfo, None)
+            (proc_id, path, CgroupRung::PidfdInfo, None)
         }
         Err(error) if missing_pidfd_ioctl(&error) => {
             let path = read_cgroup_path(calls, pid)?;
             let proc_id = calls.cgroup_inode(&path)?;
-            (proc_id, CgroupRung::ProcFstat, error.os_code())
+            (proc_id, path, CgroupRung::ProcFstat, error.os_code())
         }
         Err(error) => return Err(error),
     };
@@ -792,6 +799,7 @@ pub fn peer_cgroup_id<C: CgroupCalls + ?Sized>(
     }
     Ok(CgroupIdentity {
         id,
+        path,
         rung,
         fallback_errno,
     })
@@ -2197,7 +2205,7 @@ mod tests {
             assert_eq!(result.map(drop), Err(SysError::unsupported(what)));
         }
         unsupported(HostCgroup::open(), "cgroup2 attestation");
-        let host = HostCgroup::for_tests();
+        let host = HostCgroup::inert();
         let stream = UnixStream::pair().unwrap().0;
         unsupported(host.require_cgroup2(), "cgroup2 fstatfs");
         unsupported(host.pidfd_cgroup_id(stream.as_fd()), "PIDFD_GET_INFO");
