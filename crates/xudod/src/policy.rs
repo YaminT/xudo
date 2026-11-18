@@ -66,13 +66,13 @@ pub fn classify(identity: &PeerIdentity) -> CallerFacts {
         }
     } else {
         match &identity.cgroup_attestation {
-            CgroupAttestation::AgentScope(_) => identity.cgroup_id.map_or_else(
+            CgroupAttestation::AgentScope(scope) => identity.cgroup_id.map_or_else(
                 || xudo_policy::Classification::Unattested {
                     reason: "validated agent scope lacks a cgroup id".to_owned(),
                 },
                 |scope_id| xudo_policy::Classification::EnrolledAgent {
                     agent_id: format!("scope-{scope_id}"),
-                    session_id: format!("boot-{}", identity.rung.mechanism()),
+                    session_id: scope.name.clone(),
                     declared_yolo: false,
                 },
             ),
@@ -220,6 +220,25 @@ args = [
         assert_eq!(facts.classification.label(), "human");
         assert!(facts.classification.requires_password());
         assert_eq!(facts.uid, 1000);
+    }
+
+    #[test]
+    fn a_broker_agent_uses_the_attested_scope_name_as_its_session_id() {
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: Vec::new(),
+        });
+
+        let facts = classify(&peer);
+
+        assert!(matches!(
+            facts.classification,
+            xudo_policy::Classification::EnrolledAgent { session_id, .. }
+                if session_id == "agent-0123456789abcdef0123456789abcdef.scope"
+        ));
     }
 
     #[test]

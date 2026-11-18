@@ -31,7 +31,7 @@ pub struct AncestorPin {
     pub uid: u32,
     /// The immediate child pin from the lineage walk.
     pub child: (u32, u64),
-    /// The caller's own clock reading in milliseconds since boot.
+    /// The gate's own clock reading in milliseconds since boot.
     pub now_boottime_ms: u64,
 }
 
@@ -86,6 +86,7 @@ mod tests {
         names: Vec<String>,
         fail_peer_id: bool,
         fail_scope: bool,
+        fail_proc_read: bool,
     }
 
     impl Cgroup {
@@ -96,6 +97,7 @@ mod tests {
                 names: Vec::new(),
                 fail_peer_id: false,
                 fail_scope: false,
+                fail_proc_read: false,
             }
         }
 
@@ -119,6 +121,7 @@ mod tests {
                 names: vec![NAME.to_owned()],
                 fail_peer_id: false,
                 fail_scope: false,
+                fail_proc_read: false,
             }
         }
 
@@ -138,6 +141,11 @@ mod tests {
             self.fail_scope = true;
             self
         }
+
+        fn failing_proc_cgroup(mut self) -> Self {
+            self.fail_proc_read = true;
+            self
+        }
     }
 
     impl CgroupCalls for Cgroup {
@@ -152,7 +160,11 @@ mod tests {
             }
         }
         fn proc_cgroup(&self, _pid: u32) -> Result<Vec<u8>, SysError> {
-            Ok(self.path.clone())
+            if self.fail_proc_read {
+                Err(SysError::read("/proc/<pid>/cgroup", "unreadable"))
+            } else {
+                Ok(self.path.clone())
+            }
         }
         fn cgroup_inode(&self, _path: &str) -> Result<u64, SysError> {
             Ok(90)
@@ -271,6 +283,11 @@ mod tests {
         );
         assert_eq!(result.scope_id, Some(90));
         assert_eq!(result.boot_id.as_deref(), Some(BOOT));
+        assert!(matches!(
+            &result.facts.classification,
+            Classification::EnrolledAgent { session_id, .. }
+                if session_id == &format!("{NAME}.scope")
+        ));
     }
 
     #[test]
@@ -306,6 +323,90 @@ mod tests {
                 child: (200, 700),
                 now_boottime_ms: 50,
             },
+        );
+        assert_eq!(result.attested_class, AttestedClass::Human);
+    }
+
+    #[test]
+    fn a_failed_cgroup_read_inside_the_slice_is_unattested() {
+        let result = classify_case(
+            &Cgroup::agent(record(1000, BOOT, 200)).failing_proc_cgroup(),
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
+        );
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
+    }
+
+    #[test]
+    fn another_uids_root_scope_record_cannot_attest_the_gate_ancestor() {
+        let result = classify_case(
+            &Cgroup::agent(record(1001, BOOT, 200)),
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
+        );
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
+    }
+
+    #[test]
+    fn a_previous_boot_scope_record_cannot_attest_the_gate_ancestor() {
+        let result = classify_case(
+            &Cgroup::agent(record(1000, "11111111-2222-3333-4444-555555555555", 200)),
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
+        );
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
+    }
+
+    #[test]
+    fn an_expired_scope_record_cannot_attest_the_gate_ancestor() {
+        let result = classify_case(
+            &Cgroup::agent(record(1000, BOOT, 50)),
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
+        );
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
+    }
+
+    #[test]
+    fn a_recreated_scope_name_with_a_different_inode_cannot_attest_the_gate_ancestor() {
+        let mut recreated = Cgroup::agent(record(1000, BOOT, 200));
+        recreated.facts.as_mut().unwrap().inode = 91;
+        let result = classify_case(
+            &recreated,
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
+        );
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
+    }
+
+    #[test]
+    fn a_user_manager_scope_named_like_an_agent_is_not_an_agent_scope() {
+        let user_scope = Cgroup {
+            path: format!("0::/user.slice/{NAME}.scope\n").into_bytes(),
+            ..Cgroup::outside()
+        };
+        let result = classify_case(
+            &user_scope,
+            &fake_peers(100),
+            &FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
+            (100, 500),
+            1000,
+            (200, 700),
         );
         assert_eq!(result.attested_class, AttestedClass::Human);
     }
@@ -658,15 +759,7 @@ pub fn classify(
         },
         Ok(Some(_)) => human(),
         Ok(None) => {
-            let in_slice = cgroups
-                .proc_cgroup(pid)
-                .ok()
-                .and_then(|bytes| {
-                    std::str::from_utf8(&bytes)
-                        .ok()
-                        .and_then(xudo_sys::parse_cgroup)
-                })
-                .is_some_and(|path| path.is_under("/xudo.slice"));
+            let in_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
             if in_slice { unattested() } else { human() }
         }
         Err(_) => unattested(),

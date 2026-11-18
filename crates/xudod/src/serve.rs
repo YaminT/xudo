@@ -2389,6 +2389,36 @@ fn mint(
     spool: &dyn Spool,
     evaluated: Evaluated,
 ) -> Served {
+    let nonce = match draw_nonce(platform.entropy) {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            let refusal = Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                format!("cannot draw a nonce: {error}"),
+            );
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(&evaluated.identity),
+                Some(&evaluated.request),
+            );
+        }
+    };
+    let now = platform.clock.boottime_millis();
+    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
+    let entry = match mint_entry(platform, &evaluated, deadline, nonce) {
+        Ok(entry) => entry,
+        Err(refusal) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(&evaluated.identity),
+                Some(&evaluated.request),
+            );
+        }
+    };
     let Evaluated {
         decision,
         caller,
@@ -2397,43 +2427,6 @@ fn mint(
         policy,
     } = evaluated;
     let known = (Some(&identity), Some(&request));
-
-    let nonce = match draw_nonce(platform.entropy) {
-        Ok(nonce) => nonce,
-        Err(error) => {
-            let refusal = Refusal::broker(
-                RefusalCode::BrokerUnusable,
-                format!("cannot draw a nonce: {error}"),
-            );
-            return refuse(conn, platform.audit, &refusal, known.0, known.1);
-        }
-    };
-    let now = platform.clock.boottime_millis();
-    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
-    let entry = match entry_for_classified(
-        &decision,
-        &AttestedCaller {
-            identity: &identity,
-            facts: &caller,
-            boot_id: None,
-        },
-        &request,
-        policy.rules.generation.id(),
-        policy.settings.confirm_human_path,
-        deadline,
-        nonce,
-    ) {
-        Ok(entry) => entry,
-        Err(error) => {
-            return refuse(
-                conn,
-                platform.audit,
-                &Refusal::from(&error),
-                known.0,
-                known.1,
-            );
-        }
-    };
 
     // No record, no entry: `publish` takes the authorization.
     let build = |previous: Option<&Record>, grant: &Grant| {
@@ -2491,6 +2484,29 @@ fn mint(
     };
     let response = minted_response(&authorized.approval().0, decision, minted);
     answer(conn, &response, Served::Minted)
+}
+
+fn mint_entry(
+    platform: &Platform<'_>,
+    evaluated: &Evaluated,
+    deadline: u64,
+    nonce: String,
+) -> Result<xudo_gate::request::PendingRequest, Refusal> {
+    let live = live_attestation(platform.syscalls, &evaluated.caller, &evaluated.identity)?;
+    entry_for_classified(
+        &evaluated.decision,
+        &AttestedCaller {
+            identity: &evaluated.identity,
+            facts: &evaluated.caller,
+            boot_id: live.boot_id.as_deref(),
+        },
+        &evaluated.request,
+        evaluated.policy.rules.generation.id(),
+        evaluated.policy.settings.confirm_human_path,
+        deadline,
+        nonce,
+    )
+    .map_err(|error| Refusal::from(&error))
 }
 
 fn minted_response(
@@ -8949,7 +8965,79 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let response = BrokerResponse::parse(&written).unwrap();
         let (decision, minted) = decision_of(&response.answer).unwrap();
         assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.denial, Some(DenialCode::Frozen));
         assert!(minted.is_none());
+        assert!(spool.files().is_empty());
+    }
+
+    #[test]
+    fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
+        let mut host = Host::honest();
+        host.policy
+            .answer
+            .as_mut()
+            .unwrap()
+            .settings
+            .confirm_agent_actions = false;
+        host.syscalls =
+            FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+
+        assert_eq!(served, Served::Minted);
+        let response = BrokerResponse::parse(&conn.written()).unwrap();
+        let (decision, minted) = decision_of(&response.answer).unwrap();
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert!(minted.is_some());
+        assert_eq!(spool.files().len(), 1);
+    }
+
+    #[test]
+    fn an_enrolled_entry_with_an_unavailable_live_boot_id_is_not_minted() {
+        let mut host = Host::honest();
+        host.policy
+            .answer
+            .as_mut()
+            .unwrap()
+            .settings
+            .confirm_agent_actions = false;
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "enrolled-agent-yolo",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+
+        assert_eq!(served, Served::Refused(Fault::Broker));
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
         assert!(spool.files().is_empty());
     }
 

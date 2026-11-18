@@ -344,10 +344,11 @@ fn identify_inner(
         pinned: pin.is_some(),
         cgroup_id: cgroup_result
             .1
+            .as_ref()
             .map(|identity| identity.id)
             .or_else(|| info.as_ref().and_then(PidfdInfo::cgroup_id)),
         cgroup_attestation: cgroup_result.0,
-        cgroup_rung: cgroup_result.1.map(|identity| identity.rung),
+        cgroup_rung: cgroup_result.1.as_ref().map(|identity| identity.rung),
         euid_source,
     })
 }
@@ -381,15 +382,7 @@ fn attest_cgroup(
         }
         Ok(Some(scope)) => (CgroupAttestation::OtherScope(scope), Some(cgroup)),
         Ok(None) => {
-            let in_xudo_slice = cgroups
-                .proc_cgroup(pid)
-                .ok()
-                .and_then(|bytes| {
-                    std::str::from_utf8(&bytes)
-                        .ok()
-                        .and_then(xudo_sys::parse_cgroup)
-                })
-                .is_some_and(|path| path.is_under("/xudo.slice"));
+            let in_xudo_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
             if in_xudo_slice {
                 (CgroupAttestation::Recordless, Some(cgroup))
             } else {
@@ -528,7 +521,10 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use rustix::io::Errno;
-    use xudo_sys::{Creds, FakeCall, FakePeer, FakeSyscalls, PeerCall, PeerCred, ProcessIds};
+    use xudo_sys::{
+        CgroupCalls, Creds, FakeCall, FakePeer, FakeSyscalls, FixedClock, PeerCall, PeerCred,
+        ProcessIds, ScopeFacts,
+    };
 
     use super::*;
 
@@ -619,6 +615,50 @@ mod tests {
         UnixStream::pair().unwrap().0
     }
 
+    struct FakeProcCgroup {
+        fail_proc_read: bool,
+        path: Vec<u8>,
+    }
+
+    impl CgroupCalls for FakeProcCgroup {
+        fn require_cgroup2(&self) -> Result<(), SysError> {
+            Ok(())
+        }
+
+        fn pidfd_cgroup_id(&self, _pidfd: BorrowedFd<'_>) -> Result<u64, SysError> {
+            Ok(77)
+        }
+
+        fn proc_cgroup(&self, _pid: u32) -> Result<Vec<u8>, SysError> {
+            if self.fail_proc_read {
+                Err(SysError::read("/proc/<pid>/cgroup", "unreadable"))
+            } else {
+                Ok(self.path.clone())
+            }
+        }
+
+        fn cgroup_inode(&self, _path: &str) -> Result<u64, SysError> {
+            Ok(77)
+        }
+
+        fn peer_alive(&self, _pidfd: BorrowedFd<'_>) -> Result<bool, SysError> {
+            Ok(true)
+        }
+
+        fn scope_facts(
+            &self,
+            _name: &str,
+            _id: u64,
+            _with_processes: bool,
+        ) -> Result<Option<ScopeFacts>, SysError> {
+            Ok(None)
+        }
+
+        fn scope_names(&self) -> Result<Vec<String>, SysError> {
+            Ok(vec!["agent-0123456789abcdef0123456789abcdef".to_owned()])
+        }
+    }
+
     /// Syscalls for the top rung: a pidfd from the socket and a record.
     fn top_rung(info: Result<PidfdInfo, SysError>) -> FakeSyscalls {
         FakeSyscalls::new().with_peer(Ok(a_pidfd())).with_info(info)
@@ -658,6 +698,52 @@ mod tests {
         assert_eq!(identity.tty, 0);
         assert_eq!(identity.sid, 1);
         assert!(!identity.diverged);
+    }
+
+    #[test]
+    fn a_failed_cgroup_read_inside_the_slice_is_unattested() {
+        let sock = socket();
+        let identity = identify_classified(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID)))
+                .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned())),
+            &honest_peer(),
+            &FakeProcCgroup {
+                fail_proc_read: true,
+                path: b"0::/xudo.slice/agent-0123456789abcdef0123456789abcdef.scope\n".to_vec(),
+            },
+            &FixedClock(50),
+        )
+        .unwrap();
+        assert_eq!(identity.cgroup_attestation, CgroupAttestation::Unattested);
+        assert_eq!(
+            std::mem::discriminant(&crate::policy::classify(&identity).classification),
+            std::mem::discriminant(&xudo_policy::Classification::Unattested {
+                reason: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_user_manager_scope_named_like_an_agent_remains_human_at_the_broker() {
+        let sock = socket();
+        let identity = identify_classified(
+            sock.as_fd(),
+            &top_rung(Ok(record(PID, UID)))
+                .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned())),
+            &honest_peer(),
+            &FakeProcCgroup {
+                fail_proc_read: false,
+                path: b"0::/user.slice/agent-0123456789abcdef0123456789abcdef.scope\n".to_vec(),
+            },
+            &FixedClock(50),
+        )
+        .unwrap();
+        assert_eq!(identity.cgroup_attestation, CgroupAttestation::Outside);
+        assert_eq!(
+            crate::policy::classify(&identity).classification.label(),
+            "human"
+        );
     }
 
     #[test]
