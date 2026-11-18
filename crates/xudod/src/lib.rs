@@ -128,10 +128,7 @@ fn run_with_hygiene(
 
 /// Records why cgroup classification could not be initialized. The broker
 /// still serves only as Unattested when this host capability is unavailable.
-fn open_cgroups(
-    audit: &mut dyn AuditSink,
-    result: Result<HostCgroup, xudo_sys::SysError>,
-) -> Option<HostCgroup> {
+fn open_cgroups<T>(audit: &mut dyn AuditSink, result: Result<T, xudo_sys::SysError>) -> Option<T> {
     match result {
         Ok(cgroups) => Some(cgroups),
         Err(error) => {
@@ -156,7 +153,7 @@ mod cgroup_open_audit_tests {
         let mut audit = xudo_sys::FakeAuditSink::new();
         let error = xudo_sys::SysError::read("/sys/fs/cgroup", "mount unavailable");
 
-        let cgroups = open_cgroups(&mut audit, Err(error));
+        let cgroups = open_cgroups::<u8>(&mut audit, Err(error));
 
         assert!(cgroups.is_none());
         assert_eq!(audit.records().len(), 1);
@@ -165,6 +162,16 @@ mod cgroup_open_audit_tests {
         assert!(record.evidence.iter().any(|line| {
             line.contains("cgroup classification unavailable") && line.contains("mount unavailable")
         }));
+    }
+
+    #[test]
+    fn an_opened_cgroup_seam_is_kept_and_nothing_is_audited() {
+        let mut audit = xudo_sys::FakeAuditSink::new();
+
+        let cgroups = open_cgroups(&mut audit, Ok(7_u8));
+
+        assert_eq!(cgroups, Some(7));
+        assert!(audit.records().is_empty());
     }
 }
 

@@ -2887,6 +2887,77 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    /// A cgroup seam that knows nothing: every read fails, as on a host
+    /// without cgroup2. It lets the classified arm of `serve` run on any
+    /// platform.
+    struct NoCgroups;
+
+    impl xudo_sys::CgroupCalls for NoCgroups {
+        fn require_cgroup2(&self) -> Result<(), xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn pidfd_cgroup_id(
+            &self,
+            _: std::os::fd::BorrowedFd<'_>,
+        ) -> Result<u64, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn proc_cgroup(&self, _: u32) -> Result<Vec<u8>, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn cgroup_inode(&self, _: &str) -> Result<u64, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn peer_alive(&self, _: std::os::fd::BorrowedFd<'_>) -> Result<bool, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn scope_facts(
+            &self,
+            _: &str,
+            _: u64,
+            _: bool,
+        ) -> Result<Option<xudo_sys::ScopeFacts>, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+        fn scope_names(&self) -> Result<Vec<String>, xudo_sys::SysError> {
+            Err(xudo_sys::SysError::unsupported("test cgroup"))
+        }
+    }
+
+    #[test]
+    fn a_seam_that_knows_nothing_answers_every_read_with_an_error() {
+        use std::os::fd::AsFd as _;
+        use xudo_sys::CgroupCalls as _;
+
+        let seam = NoCgroups;
+        let fd = a_descriptor();
+        assert!(seam.require_cgroup2().is_err());
+        assert!(seam.pidfd_cgroup_id(fd.as_fd()).is_err());
+        assert!(seam.proc_cgroup(1).is_err());
+        assert!(seam.cgroup_inode("x").is_err());
+        assert!(seam.peer_alive(fd.as_fd()).is_err());
+        assert!(seam.scope_facts("x", 1, false).is_err());
+        assert!(seam.scope_names().is_err());
+    }
+
+    #[test]
+    fn a_broker_whose_cgroup_reads_all_fail_never_classifies_an_agent() {
+        let mut host = Host::honest();
+        let conn = asking("/usr/bin/apt-get", &["-y", "remove", "gcc"]);
+        let spool = FakeSpool::new();
+        let seam = NoCgroups;
+        let mut platform = host.platform();
+        platform.cgroups = Some(&seam);
+        let _served = serve(&conn, &mut platform, Ok(&spool as &dyn Spool));
+        assert!(!host.audit.records().is_empty());
+        assert!(
+            host.audit
+                .records()
+                .iter()
+                .all(|record| record.classification != "agent")
+        );
+    }
+
     #[test]
     fn a_watcher_without_a_terminal_is_refused() {
         let mut host = Host::honest();
