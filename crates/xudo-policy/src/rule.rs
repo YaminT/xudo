@@ -156,16 +156,17 @@ pub enum ConfirmPolicy {
     Always,
     /// Ask for no confirmation from this action, on the human path.
     ///
-    /// An enrolled agent is still confirmed. This is not a passwordless grant,
-    /// and it does not lift a stricter overlapping action. A critical action
-    /// cannot set it.
+    /// This is not a passwordless grant: a rule that lists no `harness` is
+    /// never passwordless. An agent-specific confirmation for `never` rules is
+    /// part of the passwordless step still to come. It does not lift a
+    /// stricter overlapping action. A critical action cannot set it.
     Never,
 }
 
 /// What a matching harness rule would do, once a passwordless grant exists.
 ///
-/// Parsed and stored now. It does not change a decision: every enrolled agent
-/// is still confirmed, and a human's verdict does not depend on it.
+/// Parsed and stored now. It does not change a decision, and a human's verdict
+/// does not depend on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
@@ -1019,6 +1020,10 @@ harness = [\"codex\"]
         listed.outcome = Outcome::AskHuman;
         assert_eq!(listed.outcome.as_str(), "ask-human");
         assert!(!listed.passwordless_for("codex"));
+        for label in ["1codex", "-codex"] {
+            listed.harness = vec![label.into()];
+            assert!(RuleSet::load(vec![listed.clone()]).is_err(), "{label}");
+        }
         listed.harness = vec!["nope!".into()];
         assert!(RuleSet::load(vec![listed.clone()]).is_err());
         listed.harness = vec!["codex".into(), "codex".into()];

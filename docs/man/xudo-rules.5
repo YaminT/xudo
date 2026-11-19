@@ -109,7 +109,12 @@ When a human must approve.
 .B always
 confirms for every caller.
 .B never
-asks for no confirmation from this action.
+skips confirmation for this action.
+A rule that lists no
+.B harness
+is never passwordless, and confirming an agent under
+.B never
+is part of the passwordless step still to come.
 It is not a grant against a stricter overlapping action, and a
 .B critical
 action cannot set it.

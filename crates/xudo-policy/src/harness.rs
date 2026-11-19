@@ -3,7 +3,7 @@
 //! A harness is a name root chose, not a fact about a binary. This module
 //! parses one registry file and answers whether a live session record still
 //! names that exact entry. It does not read the filesystem, and nothing here
-//! grants a passwordless run: the engine still confirms every enrolled agent.
+//! grants a passwordless run yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -249,13 +249,15 @@ struct HarnessFile {
     max_sessions: u32,
 }
 
-/// Whether `label` is `[a-z0-9-]{1,32}`.
+/// Whether `label` is `[a-z][a-z0-9-]{0,31}`.
 pub fn valid_harness_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 32
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    let mut bytes = label.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    label.len() <= 32
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Whether `name` is an account name: `[a-z_][a-z0-9_-]{0,31}`.
@@ -587,8 +589,9 @@ max-sessions = 1
         );
         assert!(!valid_harness_label(""));
         assert!(!valid_harness_label("A"));
-        assert!(valid_harness_label("1"));
-        assert!(valid_harness_label("-"));
+        assert!(valid_harness_label("a"));
+        assert!(valid_harness_label("a-1"));
+        assert!(!valid_harness_label(&"a".repeat(33)));
         assert!(!valid_account_name(""));
         assert!(!valid_account_name("1abc"));
         assert!(valid_account_name("_x"));
@@ -598,6 +601,15 @@ max-sessions = 1
         assert_eq!(ok.entries().count(), 2);
         assert!(HarnessRegistry::empty().is_empty());
         assert!(!ok.is_empty());
+    }
+
+    #[test]
+    fn a_harness_label_cannot_start_with_a_digit_or_dash() {
+        for label in ["1codex", "-codex", "1", "-"] {
+            assert!(!valid_harness_label(label), "{label}");
+            let text = SERVICE.replace("\"codex\"", &format!("\"{label}\""));
+            assert!(parse_harness_file(&format!("{label}.toml"), &text).is_err());
+        }
     }
 
     #[test]
