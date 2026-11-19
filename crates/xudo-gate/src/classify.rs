@@ -2,9 +2,10 @@
 
 use std::os::fd::AsFd;
 
-use xudo_policy::{CallerFacts, Classification};
+use xudo_policy::{CallerFacts, Classification, HarnessRegistry};
 use xudo_sys::{
-    CgroupCalls, PeerCalls, ProcFile, Syscalls, peer_cgroup_id, scope_status, verify_parent_pid,
+    CgroupCalls, PeerCalls, ProcFile, Scope, ScopeKind, Syscalls, peer_cgroup_id, scope_status,
+    verify_parent_pid,
 };
 
 use crate::request::AttestedClass;
@@ -77,6 +78,23 @@ mod tests {
     }
 
     const BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+
+    #[test]
+    fn a_live_non_agent_scope_stays_on_the_human_path() {
+        let live = registered_scope(
+            Scope {
+                kind: ScopeKind::Watch,
+                name: "watch-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: Vec::new(),
+            },
+            90,
+            BOOT.to_owned(),
+            1000,
+        );
+        assert_eq!(live.attested_class, AttestedClass::Human);
+        assert_eq!(live.scope_id, None);
+        assert_eq!(live.boot_id, None);
+    }
     const NAME: &str = "agent-0123456789abcdef0123456789abcdef";
     const WATCH_NAME: &str = "watch-0123456789abcdef0123456789abcdef";
 
@@ -244,12 +262,23 @@ mod tests {
         assert_eq!(calls.get(2), Some(&PeerCall::ReadProc(200, ProcFile::Stat)));
     }
 
+    const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+
+    fn registry() -> xudo_policy::HarnessRegistry {
+        xudo_policy::HarnessRegistry::from_files([(
+            "codex.toml",
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
+        )])
+        .unwrap()
+    }
+
     fn record(uid: u32, boot: &str, deadline: u64) -> Vec<u8> {
-        format!(r#"{{"kind":"agent","uid":{uid},"label":"codex","boot_id":"{boot}","created_at_boottime_ms":20,"deadline":{deadline},"pid":100,"starttime":500,"cgroup_id":90}}"#).into_bytes()
+        let hash = registry().get("codex").unwrap().hash_hex();
+        format!(r#"{{"uid":{uid},"label":"codex","way":"service","registry_entry_hash":"{hash}","boot_id":"{boot}","created_at_boottime_ms":20,"deadline":{deadline},"pid":100,"starttime":500,"cgroup_id":90}}"#).into_bytes()
     }
 
     fn non_agent_record(uid: u32, boot: &str, deadline: u64) -> Vec<u8> {
-        format!(r#"{{"kind":"watch","uid":{uid},"label":"codex","boot_id":"{boot}","created_at_boottime_ms":20,"deadline":{deadline},"pid":100,"starttime":500,"cgroup_id":90}}"#).into_bytes()
+        record(uid, boot, deadline)
     }
 
     fn fake_peers(child_parent: u32) -> FakePeer {
@@ -266,10 +295,12 @@ mod tests {
     fn the_gate_accepts_only_a_live_registered_agent_scope() {
         let peers = fake_peers(100);
         let syscalls = FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned()));
-        let result = classify(
+        let result = classify_with_registry(
             &Cgroup::agent(record(1000, BOOT, 200)),
             &peers,
             &syscalls,
+            &registry(),
+            PASSWD,
             AncestorPin {
                 caller: (100, 500),
                 uid: 1000,
@@ -294,10 +325,12 @@ mod tests {
     fn a_changed_parent_link_withholds_the_gate_agent_class() {
         let peers = fake_peers(101);
         let syscalls = FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned()));
-        let result = classify(
+        let result = classify_with_registry(
             &Cgroup::agent(record(1000, BOOT, 200)),
             &peers,
             &syscalls,
+            &registry(),
+            PASSWD,
             AncestorPin {
                 caller: (100, 500),
                 uid: 1000,
@@ -310,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_non_agent_scope_is_classified_as_human() {
+    fn a_watch_scope_is_unattested_after_the_record_kind_was_removed() {
         let peers = fake_peers(100);
         let syscalls = FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned()));
         let result = classify(
@@ -324,7 +357,7 @@ mod tests {
                 now_boottime_ms: 50,
             },
         );
-        assert_eq!(result.attested_class, AttestedClass::Human);
+        assert_eq!(result.attested_class, AttestedClass::Unattested);
     }
 
     #[test]
@@ -419,10 +452,12 @@ mod tests {
         uid: u32,
         child: (u32, u64),
     ) -> LiveClass {
-        classify(
+        classify_with_registry(
             cgroup,
             peers,
             syscalls,
+            &registry(),
+            PASSWD,
             AncestorPin {
                 caller,
                 uid,
@@ -686,6 +721,26 @@ pub fn classify(
     syscalls: &dyn Syscalls,
     ancestor: AncestorPin,
 ) -> LiveClass {
+    classify_with_registry(
+        cgroups,
+        peers,
+        syscalls,
+        &HarnessRegistry::empty(),
+        "",
+        ancestor,
+    )
+}
+
+/// As [`classify`], requiring the record to match the current root registry
+/// and the root-owned passwd mapping before treating the peer as a harness.
+pub fn classify_with_registry(
+    cgroups: &dyn CgroupCalls,
+    peers: &dyn PeerCalls,
+    syscalls: &dyn Syscalls,
+    registry: &HarnessRegistry,
+    passwd: &str,
+    ancestor: AncestorPin,
+) -> LiveClass {
     let (pid, starttime) = ancestor.caller;
     let uid = ancestor.uid;
     let child = ancestor.child;
@@ -740,28 +795,42 @@ pub fn classify(
     if !matches!(peers.has_exited(pidfd.as_fd()), Ok(false)) {
         return unattested();
     }
-    let parse = |bytes: &[u8], name: &str| crate::record_identity(bytes, name, uid, &boot_id, now);
+    let parse = |bytes: &[u8], name: &str| {
+        crate::record_identity_registered(bytes, name, uid, &boot_id, now, registry, passwd)
+    };
     match scope_status(cgroups, cgroup.id, uid, &parse) {
-        Ok(Some(scope)) if scope.kind == xudo_sys::ScopeKind::Agent => LiveClass {
+        Ok(Some(scope)) => registered_scope(scope, cgroup.id, boot_id, uid),
+        Ok(None) => {
+            let in_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
+            if in_slice { unattested() } else { human() }
+        }
+        Err(_) => unattested(),
+    }
+}
+
+fn registered_scope(scope: Scope, cgroup_id: u64, boot_id: String, uid: u32) -> LiveClass {
+    if scope.kind == ScopeKind::Agent {
+        LiveClass {
             facts: CallerFacts::new(
                 Classification::EnrolledAgent {
-                    agent_id: format!("scope-{}", cgroup.id),
+                    agent_id: format!("scope-{cgroup_id}"),
                     session_id: scope.name,
                     declared_yolo: false,
                 },
                 uid,
             ),
             attested_class: AttestedClass::EnrolledAgent {
-                scope_id: cgroup.id,
+                scope_id: cgroup_id,
             },
-            scope_id: Some(cgroup.id),
+            scope_id: Some(cgroup_id),
             boot_id: Some(boot_id),
-        },
-        Ok(Some(_)) => human(),
-        Ok(None) => {
-            let in_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
-            if in_slice { unattested() } else { human() }
         }
-        Err(_) => unattested(),
+    } else {
+        LiveClass {
+            facts: CallerFacts::new(Classification::Human, uid),
+            attested_class: AttestedClass::Human,
+            scope_id: None,
+            boot_id: None,
+        }
     }
 }

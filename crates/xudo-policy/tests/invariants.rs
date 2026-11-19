@@ -25,7 +25,7 @@ use xudo_policy::{
     evaluate_command, load_rule_files,
     matcher::{AnchoredPattern, ArgSpec, Repeat, match_argv},
     overlap::Extent,
-    rule::ConfirmPolicy,
+    rule::{ConfirmPolicy, Outcome},
 };
 
 /// An argv built from a mixed alphabet: plausible operands, flag shapes,
@@ -254,6 +254,8 @@ prop_compose! {
             confirm,
             agent_allowed,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: Outcome::Allow,
             source: Source::new("generated.toml", 1),
         }
     }
@@ -576,6 +578,43 @@ proptest! {
         }
     }
 
+    #[test]
+    fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
+        action in arb_action("h1.test"),
+        argv in arb_argv(),
+        label in "[a-z0-9-]{1,32}",
+        ask_human in any::<bool>(),
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        let before = decide(&action, &argv, false, Vec::new());
+        let mut with_harness = action;
+        with_harness.harness = vec![label];
+        with_harness.outcome = if ask_human { Outcome::AskHuman } else { Outcome::Allow };
+        let after = decide(&with_harness, &argv, false, Vec::new());
+        prop_assert_eq!(after.verdict, before.verdict);
+        prop_assert_eq!(after.confirm, before.confirm);
+        prop_assert_eq!(after.denial, before.denial);
+    }
+
+    #[test]
+    fn every_harness_action_auth_can_run_too(
+        action in arb_action("h1.test"),
+        argv in arb_argv(),
+        label in "[a-z0-9-]{1,32}",
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        let human_before = decide(&action, &argv, false, Vec::new());
+        let agent_before = decide(&action, &argv, true, Vec::new());
+        let mut with_harness = action;
+        with_harness.harness = vec![label];
+        with_harness.outcome = Outcome::Allow;
+        let human_after = decide(&with_harness, &argv, false, Vec::new());
+        let agent_after = decide(&with_harness, &argv, true, Vec::new());
+        prop_assert_eq!(human_after.verdict, human_before.verdict);
+        prop_assert_eq!(agent_after.verdict, agent_before.verdict);
+        prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+    }
+
     /// The generation is a function of the files, never of the order a reader
     /// happened to list them in.
     ///
@@ -736,6 +775,8 @@ fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed): Parts) -> Actio
         confirm,
         agent_allowed,
         env_allow: Vec::new(),
+        harness: Vec::new(),
+        outcome: Outcome::Allow,
         source: Source::new("generated.toml", 1),
     }
 }

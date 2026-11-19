@@ -13,6 +13,14 @@ Unknown keys are a hard error, on the file and on every table in it
 A key that is silently ignored would be a constraint the operator believes
 is in force.
 A file that fails to parse fails the whole directory.
+.PP
+Harness registrations are separate files under
+.IR /etc/xudo/harnesses.d/ ,
+one named
+.I <label>.toml
+per label. They are root-owned policy inputs and contribute to the ruleset
+generation. A missing or changed registration invalidates records that name
+the old entry.
 .SH LOCATION
 The default directory is
 .IR /etc/xudo/rules.d/ .
@@ -97,9 +105,7 @@ Two positions in one action may not share a name.
 .B confirm
 When a human must approve.
 .B default
-(the default) follows
-.BR confirm_agent_actions ,
-which starts true, so an enrolled agent is confirmed.
+(the default) keeps the human password path in force.
 .B always
 confirms for every caller.
 .B never
@@ -121,6 +127,20 @@ Environment variable names to pass through, by exact name.
 The default is none.
 The child's environment is built from scratch, so a name on no list does not
 exist for the child.
+.TP
+.B harness
+Labels from the root-owned harness registry. Without this key, an action is
+never eligible for the planned harness path. At this stage the field is
+metadata only: every command still requires the human password path.
+.TP
+.B outcome
+The planned harness outcome,
+.B allow
+or
+.BR ask-human .
+Defaults to
+.BR allow .
+Neither value changes execution in this release.
 .SH TESTS
 A rule file may carry
 .B [[test]]

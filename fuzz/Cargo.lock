@@ -501,6 +501,7 @@ dependencies = [
  "xudo-config",
  "xudo-policy",
  "xudo-sys",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -527,6 +528,7 @@ dependencies = [
  "xudo-backend",
  "xudo-policy",
  "xudo-sys-raw",
+ "xudo-wire",
 ]
 
 [[package]]
