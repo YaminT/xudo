@@ -111,8 +111,8 @@ pub use spool::{FakeSpool, SpoolCall};
 pub use spool::{Spool, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
-    PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,
-    read_trusted_dir, verify_path,
+    PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_policy, load_trusted_rules,
+    open_trusted, read_trusted_dir, verify_path,
 };
 pub use trusted_file::read_trusted_file;
 

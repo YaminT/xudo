@@ -32,7 +32,7 @@ stage=$out/stage
 rm -rf "$stage"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
     "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
-    "$stage/etc/xudo/rules.d" \
+    "$stage/etc/xudo/rules.d" "$stage/etc/xudo/harnesses.d" \
     "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
 mkdir -p "$stage/usr/share/xudo"
 

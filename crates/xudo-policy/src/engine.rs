@@ -502,6 +502,8 @@ mod tests {
             confirm: ConfirmPolicy::Default,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("20-services.toml", 3),
         }
     }
@@ -523,6 +525,8 @@ mod tests {
             confirm: ConfirmPolicy::Default,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("30-packages.toml", 4),
         }
     }
@@ -730,6 +734,8 @@ mod tests {
             confirm: ConfirmPolicy::Never,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("20-services.toml", 1),
         }
     }
@@ -849,6 +855,8 @@ mod tests {
             confirm: ConfirmPolicy::Never,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell]).unwrap();
@@ -1035,6 +1043,8 @@ all = []
             confirm: ConfirmPolicy::Default,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("30-packages.toml", line),
         }
     }
@@ -1285,6 +1295,8 @@ all = []
             confirm: ConfirmPolicy::Never,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: crate::rule::Outcome::Allow,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell("xudo.oops.one"), shell("xudo.oops.two")]).unwrap();

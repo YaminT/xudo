@@ -7,10 +7,11 @@ use proptest::prelude::*;
 use xudo_gate::parse_session_record;
 
 const NAME: &str = "agent-0123456789abcdef0123456789abcdef";
-const FIELDS: [&str; 9] = [
-    "\"kind\":\"agent\"",
+const FIELDS: [&str; 10] = [
     "\"uid\":1000",
     "\"label\":\"codex\"",
+    "\"way\":\"service\"",
+    "\"registry_entry_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\"",
     "\"boot_id\":\"boot-a\"",
     "\"created_at_boottime_ms\":20",
     "\"deadline\":200",
@@ -18,10 +19,11 @@ const FIELDS: [&str; 9] = [
     "\"starttime\":71",
     "\"cgroup_id\":9001",
 ];
-const KNOWN: [&str; 9] = [
-    "kind",
+const KNOWN: [&str; 10] = [
     "uid",
     "label",
+    "way",
+    "registry_entry_hash",
     "boot_id",
     "created_at_boottime_ms",
     "deadline",

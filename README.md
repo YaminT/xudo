@@ -68,6 +68,8 @@ Every caller is currently classified as unattested. The beta therefore uses the 
 
 Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names.
 
+Harness registrations are planned in root-owned `/etc/xudo/harnesses.d/<label>.toml` files, and actions may name labels with `harness = ["codex"]` plus an `outcome`. This release only parses and checks that metadata; it does not provide passwordless execution. Every command still follows the human password path.
+
 ```toml
 [[action]]
 id = "xudo.svc.reset-failed"
