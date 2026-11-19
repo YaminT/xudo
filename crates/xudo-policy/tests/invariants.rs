@@ -582,7 +582,7 @@ proptest! {
     fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
         action in arb_action("h1.test"),
         argv in arb_argv(),
-        label in "[a-z0-9-]{1,32}",
+        label in "[a-z][a-z0-9-]{0,31}",
         ask_human in any::<bool>(),
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
@@ -600,7 +600,7 @@ proptest! {
     fn every_harness_action_auth_can_run_too(
         action in arb_action("h1.test"),
         argv in arb_argv(),
-        label in "[a-z0-9-]{1,32}",
+        label in "[a-z][a-z0-9-]{0,31}",
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
         let human_before = decide(&action, &argv, false, Vec::new());

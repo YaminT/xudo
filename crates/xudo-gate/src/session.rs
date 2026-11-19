@@ -291,6 +291,13 @@ mod tests {
             "\"created_at_boottime_ms\":20",
             "\"created_at_boottime_ms\":200",
         );
+        for label in ["1codex", "-codex"] {
+            let candidate = RECORD.replace("codex", label);
+            assert!(
+                parse_session_record(candidate.as_bytes(), NAME, 1000, "boot-a", 199).is_none(),
+                "{label}"
+            );
+        }
         for candidate in [bad_label, bad_hash, future_created, backward_deadline] {
             assert!(
                 parse_session_record(candidate.as_bytes(), NAME, 1000, "boot-a", 199).is_none()
