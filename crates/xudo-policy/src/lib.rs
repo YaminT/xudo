@@ -59,6 +59,7 @@ pub mod deny_rule;
 pub mod engine;
 pub mod files;
 pub mod fuzz_check;
+pub mod harness;
 pub mod matcher;
 pub mod overlap;
 pub mod rule;
@@ -71,10 +72,17 @@ pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_li
 pub use deny_rule::{DenyClause, DenyRule, DenyRuleMatch, MAX_DENY_RULES, evaluate_deny_rules};
 pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{
-    Generation, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError, is_rule_file_name,
-    load_rule_files,
+    Generation, HarnessFile, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError,
+    is_rule_file_name, load_policy, load_rule_files,
+};
+pub use harness::{
+    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, parse_harness_file, passwd_uid,
+    uid_from_passwd_read, valid_account_name, valid_harness_label,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use overlap::Overlap;
-pub use rule::{Action, ActionId, OpenUnitLint, RuleSet, RuleSetError, Source, Tier};
+pub use rule::{
+    Action, ActionId, GtfobinSets, HarnessLint, OpenUnitLint, Outcome, RuleSet, RuleSetError,
+    Source, Tier, gtfobin_sets, harness_near_miss,
+};
 pub use rule_test::{Expectation, RuleTest, TestError, TestOutcome, TestResult, run_tests};

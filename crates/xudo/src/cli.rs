@@ -1215,10 +1215,9 @@ fn list(
 
 /// Loads the settings file and derives the engine's view of it.
 ///
-/// Without this the layered configuration would be reported by `xudo config` and
-/// then ignored by every decision, which is worse than having no configuration
-/// at all: an operator would set `confirm_agent_actions` and be told it took
-/// effect while the engine ran on its defaults.
+/// A broken file yields `None` and the caller fails closed. Agent actions stay
+/// on the human confirmation path until a later policy change introduces a
+/// separate, explicit authorization model.
 ///
 /// A broken file yields `None` and the caller fails closed. Falling back to the
 /// defaults would be *safe* — they are the strict values — but it would also be
@@ -1242,8 +1241,7 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     }
 
     Some(Settings {
-        confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value
-            == ConfigValue::Bool(true),
+        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
@@ -1329,7 +1327,6 @@ fn legacy_report(settings: &ConfigSettings, out: &mut dyn Write) {
         out,
         "\n* security-relevant: never settable from the environment."
     );
-    let _ = writeln!(out, "confirm_agent_actions has no effect until M4.");
 }
 
 /// Classifies the current process, falling back to a password-requiring caller.
@@ -3057,6 +3054,55 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
+    fn check_reports_harness_guardrails_as_lint_errors() {
+        let root = test_tmp_root().join("cli-check-harness-guardrails");
+        let _ = std::fs::remove_dir_all(&root);
+        let rules = root.join("rules.d");
+        let harnesses = root.join("harnesses.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&harnesses).unwrap();
+        std::fs::write(
+            rules.join("10-harness.toml"),
+            r#"
+[[action]]
+id = "xudo.harness.broad"
+tier = "diag-read"
+exe = "/usr/bin/awk"
+agent-allowed = false
+harness = ["codex"]
+args = [
+  { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
+  { name = "name", matcher = { pattern = "[a-z]+" } },
+]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            harnesses.join("codex.toml"),
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
+        )
+        .unwrap();
+        let fixture = Fixture { dir: rules };
+        let (code, out, err) = fixture.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 21);
+        let lints = parsed["lint"]["harness_lints"].as_array().unwrap();
+        assert!(lints.len() >= 5, "{out}");
+        let messages = lints
+            .iter()
+            .filter_map(|item| item["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(messages.contains("path-under"), "{messages}");
+        assert!(messages.contains("pattern"), "{messages}");
+        assert!(messages.contains("agent-allowed"), "{messages}");
+        assert!(messages.contains("GTFOBins"), "{messages}");
+        assert!(messages.contains("near-miss"), "{messages}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_command_with_no_program_named_matches_nothing() {
         // Before the program became part of the decision, a bare `restart
         // nginx.service` was matched against the argument list and *allowed* by
@@ -4075,16 +4121,11 @@ expect = "deny"
         assert_eq!(code, ExitCode::Delegated);
         // Every setting appears, defaults say they are defaults, and a
         // compiled-in value says it is compiled in rather than being omitted.
-        assert!(out.contains("confirm_agent_actions      true"), "{out}");
+        assert!(!out.contains("confirm_agent_actions"), "{out}");
         assert!(out.contains("<default>"), "{out}");
         assert!(out.contains("use_pty"), "{out}");
         assert!(out.contains("<compiled-in>"), "{out}");
-        assert!(
-            out.contains("confirm_agent_actions has no effect until M4"),
-            "{out}"
-        );
         // Security-relevant settings are marked, and the legend explains it.
-        assert!(out.contains("* confirm_agent_actions"), "{out}");
         assert!(out.contains("  color"), "{out}");
         assert!(out.contains("never settable from the environment"), "{out}");
     }
@@ -4123,7 +4164,7 @@ expect = "deny"
             "config",
         ]);
         assert_eq!(code, ExitCode::Delegated);
-        assert!(out.contains("confirm_agent_actions      true"), "{out}");
+        assert!(!out.contains("confirm_agent_actions"), "{out}");
         assert!(out.contains("<default>"), "{out}");
     }
 
@@ -4140,12 +4181,7 @@ expect = "deny"
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let entries = parsed.as_array().unwrap();
         assert_eq!(entries.len(), Setting::ALL.len());
-        let confirm = entries
-            .iter()
-            .find(|e| e["key"] == "confirm_agent_actions")
-            .unwrap();
-        assert_eq!(confirm["settable_from_environment"], false);
-        assert_eq!(confirm["default"], "true");
+        assert!(!entries.iter().any(|e| e["key"] == "confirm_agent_actions"));
         let color = entries.iter().find(|e| e["key"] == "color").unwrap();
         assert_eq!(color["settable_from_environment"], true);
     }

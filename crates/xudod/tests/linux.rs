@@ -237,6 +237,7 @@ args = [
         Ok(LoadedPolicy {
             rules,
             settings: xudo_policy::engine::Settings::default(),
+            passwd: Vec::new(),
         })
     }
 }

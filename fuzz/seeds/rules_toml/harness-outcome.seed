@@ -1,0 +1,7 @@
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "ask-human"
+args = [{ name = "verb", matcher = { literal = "status" } }]
