@@ -49,13 +49,17 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use bstr::BString;
 use rustix::fs::{CWD, Dir, Mode, OFlags, Stat, fstat, openat};
-use xudo_policy::{LoadedRuleSet, RuleFile, RuleFilesError, is_rule_file_name, load_rule_files};
+use rustix::io::Errno;
+use xudo_policy::{
+    HarnessFile, LoadedRuleSet, RuleFile, RuleFilesError, is_rule_file_name, load_policy,
+    load_rule_files,
+};
 
 use crate::mounts::{self, HostMounts, MountPolicy, MountRefusal, MountView};
 
@@ -174,6 +178,12 @@ pub enum TrustError {
         at: String,
         /// Why.
         reason: String,
+    },
+    /// A path component does not exist.
+    #[error("{at} cannot be inspected: does not exist")]
+    NotFound {
+        /// The missing component.
+        at: String,
     },
     /// The path was relative.
     ///
@@ -465,15 +475,21 @@ const PROBE: OFlags = OFlags::RDONLY.union(OFlags::NONBLOCK);
 
 /// Opens `name` under `base` as [`PROBE`] says, without following a link.
 fn probe(base: BorrowedFd<'_>, name: &OsStr, path: &Path) -> Result<OwnedFd, TrustError> {
-    or_unreadable(
-        openat(
-            base,
-            name,
-            PROBE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ),
-        path,
-    )
+    match openat(
+        base,
+        name,
+        PROBE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(Errno::NOENT) => Err(TrustError::NotFound {
+            at: path.display().to_string(),
+        }),
+        Err(error) => Err(TrustError::Unreadable {
+            at: path.display().to_string(),
+            reason: error.to_string(),
+        }),
+    }
 }
 
 /// A component [`step`] opened and passed, with what `fstat` said of it.
@@ -696,6 +712,54 @@ pub fn load_trusted_rules(dir: &Path) -> Result<LoadedRuleSet, TrustedRulesError
     load_rules_with(dir, TRUSTED_UID, &HostMounts::proc())
 }
 
+/// Loads rules and the adjacent root-owned harness registry through the same
+/// descriptor trust walk. The registry directory is `harnesses.d` beside the
+/// rules directory. If it is absent, the registry is empty; any present
+/// directory is still checked by the full trust walk.
+///
+/// # Errors
+///
+/// Returns [`TrustedRulesError::Trust`] if either directory fails the trust
+/// walk, and [`TrustedRulesError::Rules`] if any file is invalid policy data.
+pub fn load_trusted_policy(dir: &Path) -> Result<LoadedRuleSet, TrustedRulesError> {
+    load_trusted_policy_with(dir, TRUSTED_UID, &HostMounts::proc())
+}
+
+fn load_trusted_policy_with(
+    dir: &Path,
+    owner: u32,
+    view: &dyn MountView,
+) -> Result<LoadedRuleSet, TrustedRulesError> {
+    let read = |path: &Path| Ok(read_dir_with(path, owner, view)?);
+    load_trusted_policy_from(dir, &read)
+}
+
+fn load_trusted_policy_from(
+    dir: &Path,
+    read: &dyn Fn(&Path) -> Result<Vec<TrustedFile>, TrustedRulesError>,
+) -> Result<LoadedRuleSet, TrustedRulesError> {
+    let parent = dir.parent().unwrap_or(dir);
+    let harness_dir = parent.join("harnesses.d");
+    let rules = read(dir)?;
+    let harnesses = match read(&harness_dir) {
+        Ok(files) => files,
+        Err(TrustedRulesError::Trust(TrustError::NotFound { at }))
+            if at == harness_dir.display().to_string() =>
+        {
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    assemble_trusted_policy(rules, harnesses)
+}
+
+fn assemble_trusted_policy(
+    rules: Vec<TrustedFile>,
+    harnesses: Vec<TrustedFile>,
+) -> Result<LoadedRuleSet, TrustedRulesError> {
+    into_policy(rules, harnesses)
+}
+
 /// [`load_trusted_rules`], with the owner and the mount table as parameters.
 fn load_rules_with(
     dir: &Path,
@@ -715,6 +779,28 @@ fn into_ruleset(files: Vec<TrustedFile>) -> Result<LoadedRuleSet, TrustedRulesEr
         })
         .collect();
     Ok(load_rule_files(files)?)
+}
+
+fn into_policy(
+    files: Vec<TrustedFile>,
+    harnesses: Vec<TrustedFile>,
+) -> Result<LoadedRuleSet, TrustedRulesError> {
+    let files = files
+        .into_iter()
+        .map(|file| RuleFile {
+            name: file.name.into_vec(),
+            bytes: file.bytes,
+        })
+        .collect();
+    let harnesses = harnesses
+        .into_iter()
+        .filter(|file| file.name.as_bytes().ends_with(b".toml"))
+        .map(|file| HarnessFile {
+            name: file.name.into_vec(),
+            bytes: file.bytes,
+        })
+        .collect::<Vec<_>>();
+    Ok(load_policy(files, &harnesses)?)
 }
 
 /// The walk's last step for a directory reader: the rules directory `name` in
@@ -1346,6 +1432,145 @@ mod tests {
         assert_eq!(facts_of(&fstat(&fd).unwrap()).kind, Kind::File);
         assert!(read_dir_with(Path::new("/usr/bin"), TRUSTED_UID, &ext4).is_ok());
         assert!(load_rules_with(Path::new("/usr/bin"), TRUSTED_UID, &ext4).is_ok());
+    }
+
+    #[test]
+    fn a_registry_file_not_owned_by_root_fails_closed() {
+        let dir = scratch_dir("harness-registry-owner");
+        mkdir(&dir.join("harnesses.d"));
+        std::fs::write(
+            dir.join("harnesses.d/codex.toml"),
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n",
+        )
+        .unwrap();
+        let error =
+            read_step(&dir.join("harnesses.d"), TRUSTED_UID, &FakeMounts::ext4()).unwrap_err();
+        assert!(error.to_string().contains("not root"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_policy_loader_converts_trusted_files_and_filters_registry_entries() {
+        let loaded = assemble_trusted_policy(
+            vec![TrustedFile { name: "10-empty.toml".into(), bytes: Vec::new() }],
+            vec![
+                TrustedFile {
+                    name: "codex.toml".into(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 2\n".to_vec(),
+                },
+                TrustedFile { name: "README".into(), bytes: b"ignored".to_vec() },
+            ],
+        ).unwrap();
+        assert!(loaded.rules.is_empty());
+        assert!(loaded.harnesses.get("codex").is_some());
+    }
+
+    #[test]
+    fn shared_policy_loader_returns_invalid_registry_errors() {
+        let error = assemble_trusted_policy(
+            vec![TrustedFile { name: "10-empty.toml".into(), bytes: Vec::new() }],
+            vec![TrustedFile {
+                name: "codex.toml".into(),
+                bytes: b"label = \"someone-else\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 2\n".to_vec(),
+            }],
+        );
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn trusted_policy_walk_loads_registry_through_the_same_descriptor_path() {
+        let paths = std::cell::RefCell::new(Vec::new());
+        let loaded = load_trusted_policy_from(Path::new("/etc/xudo/rules.d"), &|path| {
+            paths.borrow_mut().push(path.to_owned());
+            if path.ends_with("harnesses.d") {
+                Ok(vec![TrustedFile {
+                    name: "codex.toml".into(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 2\n".to_vec(),
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap();
+        assert!(loaded.harnesses.get("codex").is_some());
+        assert_eq!(
+            *paths.borrow(),
+            [
+                Path::new("/etc/xudo/rules.d"),
+                Path::new("/etc/xudo/harnesses.d")
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_policy_walk_treats_a_missing_registry_as_empty() {
+        let loaded = load_trusted_policy_from(Path::new("/etc/xudo/rules.d"), &|path| {
+            if path.ends_with("harnesses.d") {
+                Err(TrustedRulesError::Trust(TrustError::NotFound {
+                    at: path.display().to_string(),
+                }))
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap();
+        assert!(loaded.rules.is_empty());
+        assert!(loaded.harnesses.is_empty());
+    }
+
+    #[test]
+    fn trusted_policy_walk_fails_closed_when_registry_cannot_be_read() {
+        let error = load_trusted_policy_from(Path::new("/etc/xudo/rules.d"), &|path| {
+            if path.ends_with("harnesses.d") {
+                Err(TrustedRulesError::Trust(TrustError::Unreadable {
+                    at: path.display().to_string(),
+                    reason: "permission denied".to_owned(),
+                }))
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("permission denied"), "{error}");
+
+        // Only absence of the exact adjacent registry directory means empty.
+        // A lower-level or mismatched missing path stays a trust failure.
+        let error = load_trusted_policy_from(Path::new("/etc/xudo/rules.d"), &|path| {
+            if path.ends_with("harnesses.d") {
+                Err(TrustedRulesError::Trust(TrustError::NotFound {
+                    at: "/etc/xudo/other.d".to_owned(),
+                }))
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("/etc/xudo/other.d"), "{error}");
+    }
+
+    #[test]
+    fn trusted_policy_walk_refuses_a_rules_directory_read_error() {
+        let error = load_trusted_policy_from(Path::new("/etc/xudo/rules.d"), &|path| {
+            Err(TrustedRulesError::Trust(TrustError::Unreadable {
+                at: path.display().to_string(),
+                reason: "permission denied".to_owned(),
+            }))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("/etc/xudo/rules.d"), "{error}");
+    }
+
+    #[test]
+    fn trusted_policy_loader_uses_the_host_trust_adapter() {
+        let result = load_trusted_policy(Path::new("/usr/bin"));
+        #[cfg(target_os = "linux")]
+        {
+            let loaded = result.unwrap();
+            assert!(loaded.rules.is_empty());
+            assert!(loaded.harnesses.is_empty());
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(result.is_err());
     }
 
     #[cfg(target_os = "linux")]

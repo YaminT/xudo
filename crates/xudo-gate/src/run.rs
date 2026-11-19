@@ -540,21 +540,7 @@ fn proceed(
         .evidence
         .push(format!("lineage={}", ancestors.describe()));
 
-    let loaded = match host.load_policy() {
-        Ok(loaded) => loaded,
-        Err(error @ PolicyError::Rules(_)) => {
-            return Err(Refusal::Failed {
-                stage: Stage::Rules,
-                reason: error.to_string(),
-            });
-        }
-        Err(error) => {
-            return Err(Refusal::Failed {
-                stage: Stage::Config,
-                reason: error.to_string(),
-            });
-        }
-    };
+    let loaded = load_policy_or_refuse(host)?;
     let spool = stage(Stage::Spool, host.open_spool())?;
     let now = read_clock(host.clock())?;
 
@@ -563,7 +549,16 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
-    let caller = caller_for(host, matched.as_ref(), own, &ancestors.chain, now);
+    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or_default();
+    let caller = caller_for(
+        host,
+        matched.as_ref(),
+        own,
+        &ancestors.chain,
+        now,
+        &loaded.rules.harnesses,
+        passwd,
+    );
     progress.caller = Some(caller.clone());
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
@@ -632,6 +627,20 @@ fn proceed(
     Err(execute(host, &authorized, &program))
 }
 
+fn load_policy_or_refuse(host: &dyn GateHost) -> Result<LoadedPolicy, Refusal> {
+    match host.load_policy() {
+        Ok(loaded) => Ok(loaded),
+        Err(error @ PolicyError::Rules(_)) => Err(Refusal::Failed {
+            stage: Stage::Rules,
+            reason: error.to_string(),
+        }),
+        Err(error) => Err(Refusal::Failed {
+            stage: Stage::Config,
+            reason: error.to_string(),
+        }),
+    }
+}
+
 /// Reads boottime, refusing a reading that cannot be one.
 ///
 /// The clock is the broker's: [`xudo_sys::HostClock`], the one `CLOCK_BOOTTIME`
@@ -686,6 +695,8 @@ fn caller_for(
     own: CallerPin,
     ancestors: &[ProcRef],
     now: u64,
+    registry: &xudo_policy::HarnessRegistry,
+    passwd: &str,
 ) -> GateCaller {
     let Some(found) = matched else {
         return GateCaller::unidentified(own.pid);
@@ -698,10 +709,12 @@ fn caller_for(
         .and_then(|at| ancestors.get(at))
         .map(|child| (child.pid, child.starttime));
     let live = match (host.cgroups(), child) {
-        (Ok(cgroups), Some(child)) => crate::classify::classify(
+        (Ok(cgroups), Some(child)) => crate::classify::classify_with_registry(
             cgroups.as_ref(),
             host.peers(),
             host.syscalls(),
+            registry,
+            passwd,
             crate::classify::AncestorPin {
                 caller: (found.caller.pid, found.caller.starttime),
                 uid: found.entry.caller_uid,
@@ -865,7 +878,7 @@ mod tests {
 
     use xudo_audit::TailError;
     use xudo_audit::record::Decision as AuditDecision;
-    use xudo_policy::{RuleFile, load_rule_files};
+    use xudo_policy::{HarnessFile, RuleFile, load_policy, load_rule_files};
     use xudo_sys::{
         AuditError, FakeAuditSink, FakeHygiene, FakePeer, FakePrograms, FakeSpool, FakeSyscalls,
         FixedClock, HygieneCall, MapSource, ProcFile, ProgramError, ScopeFacts, SpoolCall,
@@ -904,10 +917,16 @@ args = [
 "#;
 
     fn rules() -> LoadedRuleSet {
-        load_rule_files(vec![RuleFile {
-            name: b"10-test.toml".to_vec(),
-            bytes: RULES.as_bytes().to_vec(),
-        }])
+        load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+            }],
+        )
         .unwrap()
     }
 
@@ -918,6 +937,14 @@ args = [
         }
         tail.push(starttime.to_string());
         format!("{pid} ({comm}) {}", tail.join(" "))
+    }
+
+    fn agent_record() -> Vec<u8> {
+        let hash = rules().harnesses.get("codex").unwrap().hash_hex();
+        format!(
+            r#"{{"uid":1000,"label":"codex","way":"service","registry_entry_hash":"{hash}","boot_id":"abcdef01-2345-6789-abcd-ef0123456789","created_at_boottime_ms":20,"deadline":200,"pid":200,"starttime":7000,"cgroup_id":90}}"#
+        )
+        .into_bytes()
     }
 
     fn a_descriptor() -> OwnedFd {
@@ -1143,7 +1170,7 @@ args = [
                 procs_owner: 0,
                 procs_mode: 0o100_644,
                 populated: true,
-                record: Some(br#"{"kind":"agent","uid":1000,"label":"codex","boot_id":"abcdef01-2345-6789-abcd-ef0123456789","created_at_boottime_ms":20,"deadline":200,"pid":200,"starttime":7000,"cgroup_id":90}"#.to_vec()),
+                record: Some(agent_record()),
                 record_owner: 0,
                 record_mode: 0o100_600,
                 record_nlink: 1,
@@ -1198,6 +1225,7 @@ args = [
                 policy: Ok(LoadedPolicy {
                     rules: rules(),
                     settings: engine::Settings::default(),
+                    passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
                 }),
                 spool: Ok(Rc::clone(spool)),
                 rival: false,
@@ -1591,7 +1619,15 @@ args = [
         };
         let spool = Rc::new(holding(&[]));
         let host = FakeHost::new(&spool);
-        let caller = caller_for(&host, Some(&found), CallerPin::new(500, 9_000), &[], 100);
+        let caller = caller_for(
+            &host,
+            Some(&found),
+            CallerPin::new(500, 9_000),
+            &[],
+            100,
+            &xudo_policy::HarnessRegistry::empty(),
+            "",
+        );
         let context = GateContext {
             generation: rules().generation.id(),
             now: BoottimeMillis(100),
@@ -1690,6 +1726,7 @@ all = [{ any-arg = ["restart"] }]
         host.policy = Ok(LoadedPolicy {
             rules: changed,
             settings: engine::Settings::default(),
+            passwd: Vec::new(),
         });
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_stale_generation");

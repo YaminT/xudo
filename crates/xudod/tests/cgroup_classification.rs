@@ -7,12 +7,12 @@ use std::os::unix::net::UnixStream;
 
 use proptest::prelude::*;
 use rustix::io::Errno;
-use xudo_policy::Classification;
+use xudo_policy::{Classification, HarnessRegistry};
 use xudo_sys::{
     CgroupCalls, FakePeer, FakeSyscalls, PeerCred, PidfdInfo, ProcessIds, ScopeFacts, SysError,
 };
 use xudod::identify::{CgroupAttestation, identify_classified};
-use xudod::policy::classify;
+use xudod::policy::{classify, classify_with_registry};
 
 const PID: u32 = 4242;
 const UID: u32 = 1000;
@@ -143,7 +143,22 @@ fn stat(pid: u32, _uid: u32, _nested: bool) -> Vec<u8> {
 }
 
 fn record(uid: u32, boot: &str, deadline: u64, kind: &str) -> Vec<u8> {
-    format!(r#"{{"kind":"{kind}","uid":{uid},"label":"claude","boot_id":"{boot}","created_at_boottime_ms":20,"deadline":{deadline},"pid":{PID},"starttime":998877,"cgroup_id":{ID}}}"#).into_bytes()
+    let registry = registry();
+    let entry_hash = registry.get("claude").unwrap().hash_hex();
+    let way = if kind == "agent" {
+        "service"
+    } else {
+        "session"
+    };
+    format!(r#"{{"uid":{uid},"label":"claude","way":"{way}","registry_entry_hash":"{entry_hash}","boot_id":"{boot}","created_at_boottime_ms":20,"deadline":{deadline},"pid":{PID},"starttime":998877,"cgroup_id":{ID}}}"#).into_bytes()
+}
+
+fn registry() -> HarnessRegistry {
+    HarnessRegistry::from_files([(
+        "claude.toml",
+        "label = \"claude\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"root\"]\nmax-sessions = 4\n",
+    )])
+    .unwrap()
 }
 
 fn identify(
@@ -237,7 +252,12 @@ fn a_live_root_registered_agent_scope_is_classified_from_its_record() {
     let cgroup = FakeCgroup::scoped(Some(record(UID, BOOT, 200, "agent")));
     let identity = identify(UID, &cgroup, false, true);
     assert!(matches!(
-        classify(&identity).classification,
+        classify_with_registry(
+            &identity,
+            &registry(),
+            "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n"
+        )
+        .classification,
         Classification::EnrolledAgent { .. }
     ));
 }
@@ -379,18 +399,16 @@ fn an_unavailable_or_malformed_boot_id_is_unattested() {
 }
 
 #[test]
-fn a_non_agent_scope_record_is_human() {
-    // The only other supported root-registered record kind is deliberately
-    // not classified as an agent by the broker.
+fn a_watch_scope_record_is_not_a_harness() {
     let cgroup = FakeCgroup::watch(record(UID, BOOT, 200, "watch"));
     let identity = identify(UID, &cgroup, false, true);
     assert!(matches!(
         identity.cgroup_attestation,
-        CgroupAttestation::OtherScope(_)
+        CgroupAttestation::Recordless
     ));
     assert!(matches!(
         classify(&identity).classification,
-        Classification::Human
+        Classification::Unattested { .. }
     ));
 }
 

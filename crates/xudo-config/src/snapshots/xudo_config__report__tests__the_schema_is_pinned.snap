@@ -4,14 +4,6 @@ expression: "Settings::schema()"
 ---
 [
   {
-    "key": "confirm_agent_actions",
-    "value_type": "boolean",
-    "default": "true",
-    "configurable": true,
-    "security_relevant": true,
-    "settable_from_environment": false
-  },
-  {
     "key": "confirm_human_path",
     "value_type": "boolean",
     "default": "false",

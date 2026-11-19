@@ -4,12 +4,14 @@ use std::path::Path;
 
 use xudo_config::{Layer, LoadError, Setting, Settings as ConfigSettings, Value};
 use xudo_policy::{LoadedRuleSet, engine::Settings};
-use xudo_sys::{TrustError, TrustedRulesError, load_trusted_rules, read_trusted_file};
+use xudo_sys::{TrustError, TrustedRulesError, load_trusted_policy, read_trusted_file};
 
 /// The largest settings file the gate reads.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// The freeze marker is small and never controls an allocation.
 pub const MAX_FREEZE_BYTES: usize = 2048;
+/// The host account database used to bind registry names to peer uids.
+pub const MAX_PASSWD_BYTES: usize = 1 << 20;
 /// The broker-owned freeze marker.
 pub const FREEZE_FILE: &str = "/var/lib/xudo/frozen";
 /// The state directory the freeze markers live in.
@@ -76,6 +78,8 @@ pub struct LoadedPolicy {
     pub rules: LoadedRuleSet,
     /// Settings derived from the trusted config bytes.
     pub settings: Settings,
+    /// Root-owned account records used to match harness accounts to uids.
+    pub passwd: Vec<u8>,
 }
 
 /// Why settings bytes could not be interpreted.
@@ -112,13 +116,27 @@ pub enum PolicyError {
 ///
 /// Returns [`PolicyError`] if either input fails the trust walk or parsing.
 pub fn load(rules_dir: &Path, config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
-    load_with(
+    // Read passwd through the trust walk even when the rules path later fails;
+    // defer propagating its error to preserve rules/config error precedence.
+    let passwd = read_trusted_file(Path::new("/etc/passwd"), MAX_PASSWD_BYTES)
+        .map_err(PolicyError::ConfigUntrusted);
+    let loaded = load_with(
         rules_dir,
         config_file,
-        &load_trusted_rules,
+        &load_trusted_policy,
         &read_trusted_file,
         &read_trusted_file,
-    )
+    );
+    attach_passwd(loaded, passwd)
+}
+
+fn attach_passwd(
+    loaded: Result<LoadedPolicy, PolicyError>,
+    passwd: Result<Option<Vec<u8>>, PolicyError>,
+) -> Result<LoadedPolicy, PolicyError> {
+    let mut loaded = loaded?;
+    loaded.passwd = passwd?.unwrap_or_default();
+    Ok(loaded)
 }
 
 type RulesRead = dyn Fn(&Path) -> Result<LoadedRuleSet, TrustedRulesError>;
@@ -142,7 +160,11 @@ fn load_with(
     let mut settings =
         settings_from(config.as_deref(), config_file).map_err(PolicyError::Config)?;
     settings.frozen |= freeze_state(freeze_read(Path::new(FREEZE_FILE), MAX_FREEZE_BYTES));
-    Ok(LoadedPolicy { rules, settings })
+    Ok(LoadedPolicy {
+        rules,
+        settings,
+        passwd: Vec::new(),
+    })
 }
 
 fn freeze_state(read: Result<Option<Vec<u8>>, TrustError>) -> bool {
@@ -205,7 +227,7 @@ pub fn settings_from(contents: Option<&[u8]>, file: &Path) -> Result<Settings, S
             .map_err(SettingsError::Invalid)?;
     }
     Ok(Settings {
-        confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value == Value::Bool(true),
+        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == Value::Bool(true),
         frozen: config.get(Setting::Frozen).value == Value::Bool(true),
     })
@@ -236,6 +258,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.settings, Settings::default());
+    }
+
+    #[test]
+    fn public_loader_reaches_passwd_read_before_a_missing_rules_error() {
+        let error = load(
+            Path::new("/xudo-test-missing-rules"),
+            Path::new("/xudo-test-missing-config"),
+        )
+        .unwrap_err();
+        assert_eq!(format!("{error:?}").split('(').next(), Some("Rules"));
+    }
+
+    #[test]
+    fn passwd_attachment_accepts_a_loaded_policy_and_absent_passwd() {
+        let loaded = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &ABSENT_FREEZE,
+        )
+        .unwrap();
+        let attached = attach_passwd(Ok(loaded), Ok(None)).unwrap();
+        assert!(attached.passwd.is_empty());
+    }
+
+    #[test]
+    fn passwd_attachment_accepts_present_passwd_bytes() {
+        let loaded = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &ABSENT_FREEZE,
+        )
+        .unwrap();
+        let bytes = b"agent:x:1000:1000::/:/bin/sh\n".to_vec();
+        let attached = attach_passwd(Ok(loaded), Ok(Some(bytes.clone()))).unwrap();
+        assert_eq!(attached.passwd, bytes);
+    }
+
+    #[test]
+    fn passwd_attachment_propagates_a_passwd_error() {
+        let loaded = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &ABSENT_FREEZE,
+        )
+        .unwrap();
+        let error = settings_from(Some(b"invalid = ["), Path::new("config.toml")).unwrap_err();
+        assert!(attach_passwd(Ok(loaded), Err(PolicyError::Config(error))).is_err());
     }
 
     #[test]

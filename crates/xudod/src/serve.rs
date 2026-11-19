@@ -31,7 +31,9 @@ use crate::mint::{
     AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
     entry_for_classified, publish,
 };
-use crate::policy::{LoadedPolicy, PolicySource, classify, decide, stored_caller};
+use crate::policy::{
+    LoadedPolicy, PolicySource, classify, classify_with_registry, decide, stored_caller,
+};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
 
@@ -337,7 +339,8 @@ fn serve_request(
     };
     policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
 
-    let caller = classify(&identity);
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
     let decision = decide(&policy, &caller, &request);
     let evaluated = Evaluated {
         decision,
@@ -2655,11 +2658,11 @@ mod tests {
 
     use xudo_audit::record::{Decision as AuditDecision, Record};
     use xudo_gate::request::{BoottimeMillis, PendingRequest};
-    use xudo_policy::{DenialCode, RuleFile, Verdict, load_rule_files};
+    use xudo_policy::{DenialCode, HarnessFile, RuleFile, Verdict, load_policy, load_rule_files};
     use xudo_sys::{
         Creds, FakeAuditSink, FakeConnection, FakeEntropy, FakeHygiene, FakePeer, FakeSpool,
-        FakeSyscalls, FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, Spool,
-        SpoolCall, SysError,
+        FakeSyscalls, FixedClock, PeerCred, PidfdInfo, ProcFile, ProcessIds, ReadFailure, Scope,
+        ScopeKind, Spool, SpoolCall, SysError,
     };
     use xudo_wire::{Answer, WIRE_SCHEMA_VERSION};
 
@@ -2672,6 +2675,7 @@ mod tests {
     const GID: u32 = 100;
     const START: u64 = 998_877;
     const NOW: u64 = 10_000;
+    const TEST_BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
 
     #[test]
     fn an_expired_mint_reports_zero_remaining_lifetime() {
@@ -2728,6 +2732,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             }])
             .unwrap(),
             settings: xudo_policy::engine::Settings::default(),
+            passwd: Vec::new(),
         }
     }
 
@@ -8494,6 +8499,46 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    fn registered_harness_scope(host: &mut Host) -> Scope {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+        let registry = xudo_policy::HarnessRegistry::from_files([("codex.toml", HARNESS)]).unwrap();
+        let entry_hash = registry.get("codex").unwrap().hash_hex();
+        let harness_file = HarnessFile {
+            name: b"codex.toml".to_vec(),
+            bytes: HARNESS.as_bytes().to_vec(),
+        };
+        let rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[harness_file],
+        )
+        .unwrap();
+        let mut loaded = policy();
+        loaded.rules = rules;
+        loaded.passwd = b"agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_vec();
+        host.policy.answer = Ok(loaded);
+        Scope {
+            kind: ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: serde_json::json!({
+                "uid": UID,
+                "label": "codex",
+                "way": "service",
+                "registry_entry_hash": entry_hash,
+                "boot_id": TEST_BOOT,
+                "created_at_boottime_ms": 1,
+                "deadline": 20_000,
+                "pid": PID,
+                "starttime": START,
+                "cgroup_id": 44,
+            })
+            .to_string()
+            .into_bytes(),
+        }
+    }
+
     fn shown_entry() -> PendingRequest {
         let policy = policy();
         let request = BrokerRequest::new(
@@ -9013,15 +9058,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn a_user_freeze_marker_denies_an_enrolled_entry_at_mint() {
         let mut host = Host::honest();
+        let scope = registered_harness_scope(&mut host);
         host.freeze_file.publish("frozen-1000", MARKER).unwrap();
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
-                kind: xudo_sys::ScopeKind::Agent,
-                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
-                record: Vec::new(),
-            });
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -9080,21 +9121,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn an_enrolled_entry_with_an_unavailable_live_boot_id_is_not_minted() {
         let mut host = Host::honest();
-        host.policy
-            .answer
-            .as_mut()
-            .unwrap()
-            .settings
-            .confirm_agent_actions = false;
+        let scope = registered_harness_scope(&mut host);
         host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
-                kind: xudo_sys::ScopeKind::Agent,
-                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
-                record: Vec::new(),
-            });
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],

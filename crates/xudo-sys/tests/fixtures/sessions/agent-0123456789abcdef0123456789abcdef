@@ -1,1 +1,1 @@
-{"kind":"agent","uid":1000,"label":"codex","boot_id":"boot-a","created_at_boottime_ms":20,"deadline":200,"pid":42,"starttime":71,"cgroup_id":9001}
+{"uid":1000,"label":"codex","way":"service","registry_entry_hash":"0000000000000000000000000000000000000000000000000000000000000000","boot_id":"boot-a","created_at_boottime_ms":20,"deadline":200,"pid":42,"starttime":71,"cgroup_id":9001}

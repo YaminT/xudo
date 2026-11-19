@@ -22,7 +22,7 @@ use xudo_policy::{
     TestResult,
     engine::Settings,
     fuzz_check::{Finding, FindingKind, FuzzConfig, FuzzReport, fuzz},
-    run_tests,
+    gtfobin_sets, run_tests,
 };
 
 use crate::cli::{CheckArgs, Cli, Format};
@@ -49,12 +49,22 @@ struct OpenUnit {
     message: String,
 }
 
+/// A harness action that violates the H1 guardrails.
+struct HarnessRule {
+    action: String,
+    file: String,
+    line: u32,
+    message: String,
+}
+
 /// Everything one run found.
 struct Report {
     /// A rule that allowlists what the deny-list refuses: the id and the classes.
     errors: Vec<(String, Vec<String>)>,
     /// A systemctl rule whose unit matcher is not a finite list.
     open_units: Vec<OpenUnit>,
+    /// Harness actions that fail H1's safety lint.
+    harness_rules: Vec<HarnessRule>,
     /// One rendered overlap each.
     warnings: Vec<String>,
     /// One line per `path-under` matcher. Also a lint warning.
@@ -82,6 +92,7 @@ impl Report {
             (self.failed() > 0).then_some(ExitCode::TestFailure),
             (!self.errors.is_empty()
                 || !self.open_units.is_empty()
+                || !self.harness_rules.is_empty()
                 || self.fuzz.as_ref().is_some_and(|f| !f.clean()))
             .then_some(ExitCode::LintError),
             (!self.warnings.is_empty()
@@ -117,61 +128,71 @@ pub(crate) fn run(
     } else {
         loaded.rules().overlaps()
     };
-    let (errors, open_units, warnings, path_under, deny_rule_warnings) = if tests_only {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    } else {
-        let named: Vec<_> = loaded
-            .tests()
-            .iter()
-            .filter_map(|test| test.deny_rule.as_ref())
-            .collect();
-        let warnings = loaded
-            .rules()
-            .deny_rules()
-            .iter()
-            .filter(|rule| {
-                !named.iter().any(|id| id == &&rule.id)
-                    && !SHIPPED_PROTECT_DENY_IDS.contains(&rule.id.as_str())
-            })
-            .map(|rule| {
-                format!(
-                    "deny-rule: {} at {}: no test names this rule",
-                    rule.id, rule.source
-                )
-            })
-            .collect();
-        (
-            loaded
+    let (errors, open_units, harness_rules, warnings, path_under, deny_rule_warnings) =
+        if tests_only {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let named: Vec<_> = loaded
+                .tests()
+                .iter()
+                .filter_map(|test| test.deny_rule.as_ref())
+                .collect();
+            let warnings = loaded
                 .rules()
-                .self_denying_actions()
-                .into_iter()
-                .map(|(id, classes)| {
-                    (
-                        id.to_string(),
-                        classes.iter().map(|class| format!("{class:?}")).collect(),
+                .deny_rules()
+                .iter()
+                .filter(|rule| {
+                    !named.iter().any(|id| id == &&rule.id)
+                        && !SHIPPED_PROTECT_DENY_IDS.contains(&rule.id.as_str())
+                })
+                .map(|rule| {
+                    format!(
+                        "deny-rule: {} at {}: no test names this rule",
+                        rule.id, rule.source
                     )
                 })
-                .collect(),
-            loaded
-                .rules()
-                .open_unit_actions()
-                .iter()
-                .map(|lint| OpenUnit {
-                    action: lint.id.to_string(),
-                    file: lint.source.file.clone(),
-                    line: lint.source.line,
-                    message: lint.message(),
-                })
-                .collect(),
-            overlaps.iter().map(ToString::to_string).collect(),
-            path_under_warnings(loaded.rules()),
-            warnings,
-        )
-    };
+                .collect();
+            (
+                loaded
+                    .rules()
+                    .self_denying_actions()
+                    .into_iter()
+                    .map(|(id, classes)| {
+                        (
+                            id.to_string(),
+                            classes.iter().map(|class| format!("{class:?}")).collect(),
+                        )
+                    })
+                    .collect(),
+                loaded
+                    .rules()
+                    .open_unit_actions()
+                    .iter()
+                    .map(|lint| OpenUnit {
+                        action: lint.id.to_string(),
+                        file: lint.source.file.clone(),
+                        line: lint.source.line,
+                        message: lint.message(),
+                    })
+                    .collect(),
+                harness_rule_lints(loaded),
+                overlaps.iter().map(ToString::to_string).collect(),
+                path_under_warnings(loaded.rules()),
+                warnings,
+            )
+        };
     let human = CallerFacts::new(Classification::Human, 1000);
     let report = Report {
         errors,
         open_units,
+        harness_rules,
         warnings,
         path_under,
         deny_rule_warnings,
@@ -193,6 +214,26 @@ pub(crate) fn run(
         }
     }
     status
+}
+
+fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
+    loaded
+        .rules()
+        .harness_lints(
+            loaded.tests(),
+            &gtfobin_sets(
+                include_str!("../../../ci/gtfobins.txt"),
+                include_str!("../../../ci/gtfobins-waivers.txt"),
+            ),
+        )
+        .into_iter()
+        .map(|lint| HarnessRule {
+            action: lint.id.to_string(),
+            file: lint.source.file.clone(),
+            line: lint.source.line,
+            message: lint.message,
+        })
+        .collect()
 }
 
 /// Reports a ruleset load failure through `xudo check`'s lint-error status.
@@ -237,9 +278,15 @@ fn human_report(
     for open in &report.open_units {
         let _ = writeln!(err, "xudo: {}", safe(&open.message));
     }
+    for lint in &report.harness_rules {
+        let _ = writeln!(err, "xudo: {}", safe(&lint.message));
+    }
 
     if !tests_only {
-        if report.errors.is_empty() && report.open_units.is_empty() {
+        if report.errors.is_empty()
+            && report.open_units.is_empty()
+            && report.harness_rules.is_empty()
+        {
             let _ = writeln!(
                 out,
                 "ok: {} action(s) in {} file(s), generation {}",
@@ -449,6 +496,23 @@ fn envelope(report: &Report, status: ExitCode, note: Option<&str>) -> Value {
             ),
         );
     }
+    if !report.harness_rules.is_empty() {
+        lint.insert(
+            "harness_lints".to_owned(),
+            json!(
+                report
+                    .harness_rules
+                    .iter()
+                    .map(|item| json!({
+                        "action": item.action,
+                        "file": item.file,
+                        "line": item.line,
+                        "message": item.message,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     fields.insert("lint".to_owned(), Value::Object(lint));
     fields.insert(
         "tests".to_owned(),
@@ -552,6 +616,38 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn human_report_prints_harness_lint_messages() {
+        let root = std::env::temp_dir().join(format!("xudo-check-harness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loaded = LoadedRules::from_dir(&root).unwrap();
+        let report = Report {
+            errors: Vec::new(),
+            open_units: Vec::new(),
+            harness_rules: vec![HarnessRule {
+                action: "xudo.example".to_owned(),
+                file: "10-a.toml".to_owned(),
+                line: 1,
+                message: "harness scope requires a near-miss deny test".to_owned(),
+            }],
+            warnings: Vec::new(),
+            path_under: Vec::new(),
+            deny_rule_warnings: Vec::new(),
+            notes: Vec::new(),
+            results: Vec::new(),
+            fuzz: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        human_report(&loaded, &report, false, None, &mut out, &mut err);
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("near-miss deny test")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn report() -> FuzzReport {
         let finding = |kind| Finding {
             kind,
@@ -618,6 +714,7 @@ mod tests {
         let mut found = Report {
             errors: Vec::new(),
             open_units: Vec::new(),
+            harness_rules: Vec::new(),
             warnings: Vec::new(),
             path_under: Vec::new(),
             deny_rule_warnings: Vec::new(),

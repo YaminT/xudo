@@ -5,6 +5,10 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- Remove `confirm_agent_actions` from configuration. Existing files that set it now fail with a message to remove the key; agent commands still require the human password path. Harness registration and rule metadata are planned and remain inert.
+
 ### Security
 
 - Let the broker read `/proc/sys/kernel/random/boot_id` by removing

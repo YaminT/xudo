@@ -377,10 +377,7 @@ fn attest_cgroup(
     let parse =
         |bytes: &[u8], name: &str| xudo_gate::record_identity(bytes, name, uid, &boot_id, now);
     match scope_status(cgroups, cgroup.id, uid, &parse) {
-        Ok(Some(scope)) if scope.kind == ScopeKind::Agent => {
-            (CgroupAttestation::AgentScope(scope.clone()), Some(cgroup))
-        }
-        Ok(Some(scope)) => (CgroupAttestation::OtherScope(scope), Some(cgroup)),
+        Ok(Some(scope)) => classify_live_scope(scope, cgroup),
         Ok(None) => {
             let in_xudo_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
             if in_xudo_slice {
@@ -390,6 +387,17 @@ fn attest_cgroup(
             }
         }
         Err(_) => (CgroupAttestation::Unattested, Some(cgroup)),
+    }
+}
+
+fn classify_live_scope(
+    scope: Scope,
+    cgroup: CgroupIdentity,
+) -> (CgroupAttestation, Option<CgroupIdentity>) {
+    if scope.kind == ScopeKind::Agent {
+        (CgroupAttestation::AgentScope(scope), Some(cgroup))
+    } else {
+        (CgroupAttestation::OtherScope(scope), Some(cgroup))
     }
 }
 
@@ -525,6 +533,42 @@ mod tests {
         CgroupCalls, Creds, FakeCall, FakePeer, FakeSyscalls, FixedClock, PeerCall, PeerCred,
         ProcessIds, ScopeFacts,
     };
+
+    #[test]
+    fn a_live_agent_scope_is_retained_as_agent_scope() {
+        let scope = Scope {
+            kind: ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: Vec::new(),
+        };
+        let cgroup = CgroupIdentity {
+            id: 90,
+            path: "/xudo.slice/agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            rung: CgroupRung::ProcFstat,
+            fallback_errno: None,
+        };
+        let (attestation, observed) = classify_live_scope(scope.clone(), cgroup.clone());
+        assert_eq!(attestation, CgroupAttestation::AgentScope(scope));
+        assert_eq!(observed, Some(cgroup));
+    }
+
+    #[test]
+    fn a_live_non_agent_scope_is_retained_as_other_scope() {
+        let scope = Scope {
+            kind: ScopeKind::Watch,
+            name: "watch-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: Vec::new(),
+        };
+        let cgroup = CgroupIdentity {
+            id: 90,
+            path: "/user.slice/example.scope".to_owned(),
+            rung: CgroupRung::ProcFstat,
+            fallback_errno: None,
+        };
+        let (attestation, observed) = classify_live_scope(scope.clone(), cgroup.clone());
+        assert_eq!(attestation, CgroupAttestation::OtherScope(scope));
+        assert_eq!(observed, Some(cgroup));
+    }
 
     use super::*;
 
