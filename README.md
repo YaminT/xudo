@@ -1,6 +1,6 @@
 # xudo
 
-xudo is a Linux privilege broker. It checks commands against root-owned rules and uses the host's `sudo`, `sudo-rs`, or `doas` for privileged execution. This beta uses the human password path for every request.
+xudo is a Linux privilege broker. It checks commands against root-owned rules and uses the host's `sudo`, `sudo-rs`, or `doas` for privileged execution. Every command that runs still goes through the human password path.
 
 > This README is a derived view of [howiwork.md](howiwork.md), the source of truth for product behavior.
 
@@ -44,7 +44,7 @@ ido queue -m "show listeners after review" -- /usr/bin/ss -tulpnH
 
 `explain` shows the policy decision and executes nothing. `exec` ignores `--rules`. The installed broker loads root's `/etc/xudo/rules.d`. The shipped rules do not start or stop a service. To allow that on one host, copy `/usr/share/xudo/examples/20-services-lifecycle.toml` to `/etc/xudo/rules.d/` and replace the placeholder unit names. After installing the package, add your user to the `xudo` group (`sudo usermod -aG xudo YOUR_USER`, then log out and back in). This is a deliberate privilege grant: the group can invoke the installed password-authenticated gate.
 
-Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. `ido queue` stores exact arguments for a human to review and run with `ido`.
+Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. A verified harness request matching an `ask-human` action is stored in the broker's root-held queue and denied for now; Q1c will add the password-gated run flow and the `ido` display. Human-path denials are not copied into the caller's editable `ido` queue.
 
 ## Security status
 
@@ -62,13 +62,15 @@ The audit trail records authorization, not execution outcomes. Pasban runs daily
 
 `xudo explain` loads the selected rules and reports what the policy would decide. For `xudo exec`, the front end sends the request to the root broker over a Unix socket. The broker identifies the connected peer from kernel-provided facts, checks the root-owned rules and deny-list, and records the authorization decision. If permitted, it creates a bounded one-use request. The host's `sudo`, `sudo-rs`, or `doas` performs the uid transition through the password-authenticated gate. The gate independently checks policy and the one-use request before executing the validated program. Errors fail closed.
 
-Every caller is currently classified as unattested. The beta therefore uses the password path for every invocation; no `NOPASSWD` rule is installed by the package.
+The broker can classify a caller as a verified harness only from kernel-attested scope facts and the root-owned registry. No passwordless gate rule is installed by the package; human and unattested callers use the password path, and ask-human harness requests wait in the broker queue.
 
 ## Rule format
 
 Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names.
 
-Harness registrations are planned in root-owned `/etc/xudo/harnesses.d/<label>.toml` files, and actions may name labels with `harness = ["codex"]` plus an `outcome`. This release only parses and checks that metadata; it does not provide passwordless execution. Every command still follows the human password path.
+Harness registrations live in root-owned `/etc/xudo/harnesses.d/<label>.toml` files. An action may name labels with `harness = ["codex"]` and set `outcome = "ask-human"`; a verified matching request is stored by the broker and denied until a human runs the Q1c flow. The `QueueList` broker protocol is present, but the `ido` display and queued execution remain planned. `outcome = "allow"` does not create a passwordless grant in this release.
+
+The root setting `queue_ttl_secs` controls how long an ask-human entry stays live. It defaults to 86400 seconds and is capped at one day; a project config may only shorten it. Shortening the setting also expires older entries at the new deadline.
 
 ```toml
 [[action]]
@@ -90,7 +92,7 @@ The package also ships `rules/00-protect.toml` as an active dpkg conffile. It re
 
 ### What is the difference between `xudo` and `sudo`?
 
-`sudo` is the host's privilege transition. `xudo` checks a named-action policy first, asks a root broker to authorize the request, and sends an approved request through a separate gate. In this beta, every invocation uses the human password path.
+`sudo` is the host's privilege transition. `xudo` checks a named-action policy first, asks a root broker to authorize the request, and sends an approved request through a separate gate. Commands that run use the human password path; an `ask-human` harness request waits in the root-held queue.
 
 ### Can an AI agent run any command with `xudo`?
 
@@ -106,7 +108,7 @@ The policy engine does not depend on a particular agent. This beta does not enro
 
 ### What happens if an agent lies about being an agent?
 
-Agent names and environment variables do not authorize a request. Kernel-attested identity is required for the future passwordless path, which is not in this beta. Today every caller is unattested and uses the password path.
+Agent names and environment variables do not authorize a request. The broker requires kernel-attested scope facts and a matching root-owned registry entry. This release does not install a passwordless gate rule.
 
 ### How is this different from `NOPASSWD: ALL`?
 

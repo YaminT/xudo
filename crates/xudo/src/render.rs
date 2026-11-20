@@ -152,6 +152,9 @@ fn trace_line(step: &TraceStep) -> String {
             };
             format!("confirmation {state}: {reason}")
         }
+        TraceStep::AskHumanQueued { action, source } => {
+            format!("ask-human queued by {action} at {source}")
+        }
     }
 }
 
@@ -528,6 +531,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             TraceStep::ConfirmationDecided {
                 required: false,
                 reason: "r".into(),
+            },
+            TraceStep::AskHumanQueued {
+                action: "xudo.review.test".into(),
+                source: "10-review.toml:1".into(),
             },
         ];
         for step in &steps {

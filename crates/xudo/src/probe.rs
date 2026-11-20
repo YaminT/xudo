@@ -154,7 +154,10 @@ impl InstallProbe for BrokerProbe<'_> {
             Answer::Refused { code, .. } => {
                 return unavailable(format!("the broker refused the probe ({code:?})"));
             }
-            Answer::Pending { .. } | Answer::Watching { .. } | Answer::Done => {
+            Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
+            | Answer::Done => {
                 return unavailable(
                     "the broker returned an answer for an unsupported question".to_owned(),
                 );

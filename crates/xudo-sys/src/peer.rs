@@ -612,6 +612,17 @@ mod tests {
     }
 
     #[test]
+    fn fake_peer_refuses_an_unscripted_uid_map_read() {
+        let fake = FakePeer::new();
+        let error = fake.read_proc(412, ProcFile::UidMap).unwrap_err();
+        assert!(error.to_string().contains("412/uid_map"));
+        assert_eq!(
+            fake.calls(),
+            vec![PeerCall::ReadProc(412, ProcFile::UidMap)]
+        );
+    }
+
+    #[test]
     fn the_effective_uid_is_the_second_field_of_the_uid_line() {
         let status =
             b"Name:\tbash\nUmask:\t0022\nUid:\t1000\t0\t1000\t1000\nGid:\t100\t100\t100\t100\n";

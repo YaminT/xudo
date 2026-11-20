@@ -80,23 +80,28 @@ pub fn classify_with_registry(
     } else {
         match &identity.cgroup_attestation {
             CgroupAttestation::AgentScope(scope) => {
-                let registered = serde_json::from_slice::<xudo_gate::SessionRecord>(&scope.record)
-                    .is_ok_and(|record| {
-                        let resolve = |name: &str| passwd_uid(passwd, name);
-                        registry.attests(
-                            &record.label,
-                            record.way,
-                            &record.registry_entry_hash,
-                            identity.uid,
-                            &resolve,
-                        )
-                    });
-                match (identity.cgroup_id, registered) {
-                    (Some(scope_id), true) => xudo_policy::Classification::EnrolledAgent {
-                        agent_id: format!("scope-{scope_id}"),
-                        session_id: scope.name.clone(),
-                        declared_yolo: false,
-                    },
+                let registered_label =
+                    serde_json::from_slice::<xudo_gate::SessionRecord>(&scope.record)
+                        .ok()
+                        .filter(|record| {
+                            let resolve = |name: &str| passwd_uid(passwd, name);
+                            registry.attests(
+                                &record.label,
+                                record.way,
+                                &record.registry_entry_hash,
+                                identity.uid,
+                                &resolve,
+                            )
+                        })
+                        .map(|record| record.label);
+                match (identity.cgroup_id, registered_label) {
+                    (Some(_scope_id), Some(agent_id)) => {
+                        xudo_policy::Classification::EnrolledAgent {
+                            agent_id,
+                            session_id: scope.name.clone(),
+                            declared_yolo: false,
+                        }
+                    }
                     _ => xudo_policy::Classification::Unattested {
                         reason: "agent scope record does not match the current harness registry"
                             .to_owned(),
@@ -199,6 +204,7 @@ mod tests {
             }])
             .unwrap(),
             settings: Settings::default(),
+            queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: Vec::new(),
         }
     }
@@ -285,8 +291,8 @@ args = [
 
         assert!(matches!(
             facts.classification,
-            xudo_policy::Classification::EnrolledAgent { session_id, .. }
-                if session_id == "agent-0123456789abcdef0123456789abcdef.scope"
+            xudo_policy::Classification::EnrolledAgent { agent_id, session_id, .. }
+                if agent_id == "codex" && session_id == "agent-0123456789abcdef0123456789abcdef.scope"
         ));
     }
 
@@ -337,12 +343,14 @@ args = [
         honest.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "human".to_owned(),
         };
         let mut lying = honest.clone();
         lying.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "enrolled-agent-yolo".to_owned(),
         };
         assert_eq!(

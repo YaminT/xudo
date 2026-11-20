@@ -154,24 +154,19 @@ The program is an absolute path, after
 The command's own status is the process status.
 A policy refusal happens before the command runs.
 .IP
-With
-.BR \-\-queue ,
-a denial that only a person can resolve (human-path-only, or no confirmation
-channel) is also written to the invoking user's
+Human-path denials are not written to the invoking user's
 .BR ido (1)
-queue, exactly as
-.B ido queue
-would, and the id is reported: "queued as #7, run `ido` to execute".
-With
-.B \-\-output json
-the envelope gains
-.BR queued :
-{"id": 7}.
-The exit status is still the denial's: nothing ran, and the verdict is
-unchanged.
-Any other outcome behaves as without the flag and queues nothing.
-If the queue cannot be written, nothing is queued, the failure is reported on
-standard error, and the denial is shown as without the flag.
+queue. A verified harness request matched by an
+.B ask-human
+rule is stored by the broker in its root-held queue. Running that request
+through the password-authenticated gate and listing it through
+.B ido
+are planned for a later step.
+The planned run goes through the same scoped sudo rule as any other xudo
+authorization. Its
+.B timestamp_timeout=0
+setting prevents it from reusing a sudo credential cached by an earlier
+terminal login; the backend tests pin this setting in the generated rule.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
@@ -362,12 +357,12 @@ A missing file is the defaults, not an error.
 A file that does not parse, or that contains an unrecognised key, exits
 .BR 19 .
 The keys are
-.B confirm_agent_actions
-(default true),
 .B confirm_human_path
 (default false),
 .B confirmation_timeout_secs
 (default 0, maximum 600 seconds),
+.B queue_ttl_secs
+(default 86400, maximum 86400; a project setting may only shorten it),
 .B frozen
 (default false),
 .B audit_sink
