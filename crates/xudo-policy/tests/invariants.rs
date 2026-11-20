@@ -237,6 +237,46 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
     ]
 }
 
+/// Builds an action `RuleSet::load` accepts.
+///
+/// A critical tier may not opt out of confirmation. `ask-human` with an empty
+/// harness is a load error, and `confirm = "always"` with a harness is too, so
+/// a generated ask-human rule names the property caller (`claude-code`) and
+/// never confirms always. That is what lets the engine's `AskHuman` arm run.
+fn finish_generated(
+    id: &str,
+    tier: Tier,
+    exe: String,
+    args: Vec<ArgSpec>,
+    mut confirm: ConfirmPolicy,
+    agent_allowed: bool,
+    outcome: Outcome,
+) -> Action {
+    if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
+        confirm = ConfirmPolicy::Always;
+    }
+    let harness = if outcome == Outcome::AskHuman {
+        if confirm == ConfirmPolicy::Always {
+            confirm = ConfirmPolicy::Default;
+        }
+        vec!["claude-code".to_owned()]
+    } else {
+        Vec::new()
+    };
+    Action {
+        id: ActionId::new(id),
+        tier,
+        exe,
+        args,
+        confirm,
+        agent_allowed,
+        env_allow: Vec::new(),
+        harness,
+        outcome,
+        source: Source::new("generated.toml", 1),
+    }
+}
+
 prop_compose! {
     fn arb_action(id: &'static str)(
         tier in arb_tier(),
@@ -246,26 +286,7 @@ prop_compose! {
         agent_allowed in any::<bool>(),
         outcome in arb_outcome(),
     ) -> Action {
-        // A critical tier may not opt out of confirmation; keep the generator
-        // inside what `RuleSet::load` accepts so the properties exercise the
-        // engine rather than the loader.
-        let confirm = if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
-            ConfirmPolicy::Always
-        } else {
-            confirm
-        };
-        Action {
-            id: ActionId::new(id),
-            tier,
-            exe,
-            args,
-            confirm,
-            agent_allowed,
-            env_allow: Vec::new(),
-            harness: Vec::new(),
-            outcome,
-            source: Source::new("generated.toml", 1),
-        }
+        finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
     }
 }
 
@@ -611,6 +632,9 @@ proptest! {
         label in "[a-z][a-z0-9-]{0,31}",
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // Ask-human changes the agent's verdict on purpose. This property is
+        // about a passwordless-shaped allow rule, which must not.
+        prop_assume!(action.outcome == Outcome::Allow);
         let human_before = decide(&action, &argv, false, Vec::new());
         let agent_before = decide(&action, &argv, true, Vec::new());
         let mut with_harness = action;
@@ -639,6 +663,41 @@ proptest! {
         } else {
             prop_assert_eq!(after.verdict, Verdict::Deny);
             prop_assert_eq!(after.denial, Some(DenialCode::AskHuman));
+        }
+    }
+
+    /// Ask-human must not loosen the verdict an enrolled agent had when the
+    /// outcome did not exist. Listed labels queue; every other enrolled label
+    /// stays on the human-path deny. Neither result is `Allow` or
+    /// `AllowWithConfirmation`.
+    #[test]
+    fn an_enrolled_agent_on_an_ask_human_action_is_never_more_permissive(
+        mut action in arb_action("ask-human.bound"),
+        argv in arb_argv(),
+        listed in any::<bool>(),
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        action.outcome = Outcome::Allow;
+        action.harness.clear();
+        let before = decide(&action, &argv, true, Vec::new());
+        action.outcome = Outcome::AskHuman;
+        action.harness = vec![if listed {
+            "claude-code".to_owned()
+        } else {
+            "other-harness".to_owned()
+        }];
+        let after = decide(&action, &argv, true, Vec::new());
+        prop_assert_ne!(after.verdict, Verdict::Allow);
+        prop_assert_ne!(after.verdict, Verdict::AllowWithConfirmation);
+        if before.verdict == Verdict::Deny {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, before.denial);
+        } else if listed {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::AskHuman));
+        } else {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::HumanPathOnly));
         }
     }
 
@@ -790,23 +849,7 @@ fn arb_parts() -> impl Strategy<Value = Parts> {
 }
 
 fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed, outcome): Parts) -> Action {
-    let confirm = if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
-        ConfirmPolicy::Always
-    } else {
-        confirm
-    };
-    Action {
-        id: ActionId::new(id),
-        tier,
-        exe,
-        args,
-        confirm,
-        agent_allowed,
-        env_allow: Vec::new(),
-        harness: Vec::new(),
-        outcome,
-        source: Source::new("generated.toml", 1),
-    }
+    finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
 }
 
 /// One to `max` actions with distinct ids, in declaration order.
@@ -880,7 +923,12 @@ fn severity(decision: &Decision) -> Option<u8> {
         }
         (
             Verdict::Deny,
-            Some(DenialCode::HumanPathOnly | DenialCode::DenyListed | DenialCode::Frozen),
+            Some(
+                DenialCode::HumanPathOnly
+                | DenialCode::DenyListed
+                | DenialCode::Frozen
+                | DenialCode::AskHuman,
+            ),
             _,
         ) => Some(10),
         _ => None,

@@ -9,6 +9,9 @@
 //!   -> gather every action that accepts the same command
 //!   -> agent-path eligibility          (any human-only  -> deny)
 //!   -> COMPILED-IN DENY-LIST           (any class hit   -> deny)
+//!   -> deny rules                      (any match       -> deny)
+//!   -> ask-human                       (listed harness  -> deny, queue)
+//!                                      (other enrolled  -> human-path deny)
 //!   -> confirmation requirement        (the strictest   -> allow-with-confirmation)
 //!   -> allow
 //! ```
@@ -382,29 +385,10 @@ impl<'c> Run<'c> {
             return decision;
         }
 
-        // `ask-human` applies only to a verified harness label explicitly
-        // named by that action. This narrows the broad Q1 roadmap wording:
-        // reviewers and queue routing are attached to the rule's harness list.
-        // Humans and unattested callers keep the ordinary password path.
-        if self.caller.classification.is_enrolled_agent()
-            && let Some(action) = accepting.iter().find(|action| {
-                action.outcome == crate::rule::Outcome::AskHuman
-                    && matches!(
-                        &self.caller.classification,
-                        crate::caller::Classification::EnrolledAgent { agent_id, .. }
-                            if action.harness.iter().any(|label| label == agent_id)
-                    )
-            })
-        {
-            self.trace.push(TraceStep::AskHumanQueued {
-                action: action.id.to_string(),
-                source: action.source.to_string(),
-            });
-            let mut decision = self.deny(DenialCode::AskHuman);
-            decision.action = Some(action.id.clone());
-            decision.rule_source = Some(action.source.clone());
-            return decision;
-        }
+        self = match self.ask_human_decision(accepting) {
+            Ok(decision) => return decision,
+            Err(run) => run,
+        };
 
         let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
         self.trace.push(TraceStep::ConfirmationDecided {
@@ -434,6 +418,52 @@ impl<'c> Run<'c> {
             confirm,
             trace: self.trace,
         }
+    }
+
+    /// Queues a listed harness, or refuses an enrolled agent the action does
+    /// not name.
+    ///
+    /// An enrolled agent who matches an `ask-human` action and is listed on
+    /// none of them used to fall through to `AllowWithConfirmation`, which
+    /// turned the pre-outcome human-path deny into a confirmation. That agent
+    /// is refused with `HumanPathOnly`. `Err(self)` keeps a human, an
+    /// unattested caller, or an agent with no ask-human match on the ordinary
+    /// password path.
+    fn ask_human_decision(mut self, accepting: &[&Action]) -> Result<Decision, Self> {
+        let Some(agent_id) = self.caller.classification.enrolled_agent_id() else {
+            return Err(self);
+        };
+        if let Some(action) = accepting.iter().copied().find(|action| {
+            action.outcome == crate::rule::Outcome::AskHuman
+                && action.harness.iter().any(|label| label == agent_id)
+        }) {
+            self.trace.push(TraceStep::AskHumanQueued {
+                action: action.id.to_string(),
+                source: action.source.to_string(),
+            });
+            let mut decision = self.deny(DenialCode::AskHuman);
+            decision.action = Some(action.id.clone());
+            decision.rule_source = Some(action.source.clone());
+            return Ok(decision);
+        }
+        let unlisted: Vec<&Action> = accepting
+            .iter()
+            .copied()
+            .filter(|action| action.outcome == crate::rule::Outcome::AskHuman)
+            .collect();
+        if unlisted.is_empty() {
+            return Err(self);
+        }
+        for action in &unlisted {
+            self.trace.push(TraceStep::ActionRejected {
+                action: action.id.to_string(),
+                reason: format!(
+                    "{} at {} queues only a harness it names, and {agent_id} is not one of them",
+                    action.id, action.source
+                ),
+            });
+        }
+        Ok(self.deny(DenialCode::HumanPathOnly))
     }
 }
 
@@ -798,12 +828,21 @@ mod tests {
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
         let decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
-        assert!(
-            !decision
-                .trace
-                .iter()
-                .any(|step| matches!(step, TraceStep::AskHumanQueued { .. }))
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.denial, Some(DenialCode::HumanPathOnly));
+        assert_eq!(decision.action, None);
+        let rejected = decision.trace.iter().find_map(|step| match step {
+            TraceStep::ActionRejected { action, reason } => {
+                Some((action.as_str(), reason.as_str()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            rejected,
+            Some((
+                "xudo.svc.restart",
+                "xudo.svc.restart at 20-services.toml:3 queues only a harness it names, and claude-code is not one of them",
+            ))
         );
     }
 
