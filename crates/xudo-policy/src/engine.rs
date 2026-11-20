@@ -382,6 +382,20 @@ impl<'c> Run<'c> {
             return decision;
         }
 
+        // `ask-human` applies only to a kernel-classified enrolled harness.
+        // A human's ordinary request still takes the human password path and
+        // is decided by the same rule. Deny rules above always win.
+        if self.caller.classification.is_enrolled_agent()
+            && let Some(action) = accepting
+                .iter()
+                .find(|action| action.outcome == crate::rule::Outcome::AskHuman)
+        {
+            let mut decision = self.deny(DenialCode::HumanPathOnly);
+            decision.action = Some(action.id.clone());
+            decision.rule_source = Some(action.source.clone());
+            return decision;
+        }
+
         let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
         self.trace.push(TraceStep::ConfirmationDecided {
             required: reason.is_some(),
@@ -719,6 +733,23 @@ mod tests {
             evaluate(&set, &human(), &restart_request(), Settings::default()).verdict,
             Verdict::Allow
         );
+    }
+
+    #[test]
+    fn an_ask_human_rule_queues_only_for_an_enrolled_harness() {
+        let mut ask_human = svc_restart();
+        ask_human.outcome = crate::rule::Outcome::AskHuman;
+        let set = RuleSet::load(vec![ask_human]).unwrap();
+
+        let agent_decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert_eq!(agent_decision.denial, Some(DenialCode::HumanPathOnly));
+        assert_eq!(
+            agent_decision.action,
+            Some(ActionId::new("xudo.svc.restart"))
+        );
+
+        let human_decision = evaluate(&set, &human(), &restart_request(), Settings::default());
+        assert_eq!(human_decision.verdict, Verdict::Allow);
     }
 
     /// A rule permitting `systemctl restart <unit>`.
