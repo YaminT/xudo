@@ -44,6 +44,7 @@ pub mod confirm;
 pub mod identify;
 pub mod mint;
 pub mod policy;
+pub mod queue;
 pub mod record;
 pub mod refusal;
 pub mod serve;
