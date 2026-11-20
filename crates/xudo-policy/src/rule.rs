@@ -163,17 +163,14 @@ pub enum ConfirmPolicy {
     Never,
 }
 
-/// What a matching harness rule would do, once a passwordless grant exists.
-///
-/// Parsed and stored now. It does not change a decision, and a human's verdict
-/// does not depend on it.
+/// What a matching harness rule does when the verified harness requests it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-    /// The planned passwordless outcome for a listed harness. The default.
+    /// Permit the verified harness when all other policy checks pass. The default.
     #[default]
     Allow,
-    /// The planned outcome that asks a reviewer. Not queued yet.
+    /// Deny the current request and submit it to the root-held human review queue.
     AskHuman,
 }
 

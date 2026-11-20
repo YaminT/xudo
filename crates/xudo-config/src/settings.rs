@@ -33,6 +33,8 @@ pub enum Setting {
     ConfirmHumanPath,
     /// How long a pending confirmation waits before it is denied.
     ConfirmationTimeoutSecs,
+    /// Maximum time a root-held ask-human request remains live.
+    QueueTtlSecs,
     /// Whether the agent path is frozen.
     Frozen,
     /// Where audit records go.
@@ -50,9 +52,10 @@ pub enum Setting {
 
 impl Setting {
     /// Every setting, for exhaustive reporting and schema export.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ConfirmHumanPath,
         Self::ConfirmationTimeoutSecs,
+        Self::QueueTtlSecs,
         Self::Frozen,
         Self::AuditSink,
         Self::Color,
@@ -69,6 +72,7 @@ impl Setting {
         match self {
             Self::ConfirmHumanPath => "confirm_human_path",
             Self::ConfirmationTimeoutSecs => "confirmation_timeout_secs",
+            Self::QueueTtlSecs => "queue_ttl_secs",
             Self::Frozen => "frozen",
             Self::AuditSink => "audit_sink",
             Self::Color => "color",
@@ -105,9 +109,11 @@ impl Setting {
                 Value::Bool(current),
                 Value::Bool(candidate),
             ) => *candidate || !*current,
-            (Self::ConfirmationTimeoutSecs, Value::Integer(current), Value::Integer(candidate)) => {
-                candidate <= current
-            }
+            (
+                Self::ConfirmationTimeoutSecs | Self::QueueTtlSecs,
+                Value::Integer(current),
+                Value::Integer(candidate),
+            ) => candidate <= current,
             // No ordering, so no narrowing: equal is the only acceptable
             // "change". Also the fallback for a type mismatch, which a lower
             // layer must not be able to use as an escape hatch.
@@ -222,6 +228,10 @@ impl Default for Settings {
             Setting::ConfirmationTimeoutSecs,
             Tracked::default_value(Value::Integer(0)),
         );
+        values.insert(
+            Setting::QueueTtlSecs,
+            Tracked::default_value(Value::Integer(24 * 60 * 60)),
+        );
         values.insert(Setting::Frozen, Tracked::default_value(Value::Bool(false)));
         values.insert(
             Setting::AuditSink,
@@ -256,10 +266,13 @@ impl Settings {
             std::sync::LazyLock::new(|| Tracked::compiled(Value::Bool(true)));
         static ZERO_TIMEOUT: std::sync::LazyLock<Tracked<Value>> =
             std::sync::LazyLock::new(|| Tracked::compiled(Value::Integer(0)));
+        static DEFAULT_QUEUE_TTL: std::sync::LazyLock<Tracked<Value>> =
+            std::sync::LazyLock::new(|| Tracked::compiled(Value::Integer(24 * 60 * 60)));
         static AUDIT_JOURNALD: std::sync::LazyLock<Tracked<Value>> =
             std::sync::LazyLock::new(|| Tracked::compiled(Value::Text("journald".to_owned())));
         match setting {
             Setting::ConfirmationTimeoutSecs => &ZERO_TIMEOUT,
+            Setting::QueueTtlSecs => &DEFAULT_QUEUE_TTL,
             Setting::AuditSink => &AUDIT_JOURNALD,
             Setting::ConfirmHumanPath | Setting::Frozen | Setting::Color | Setting::UsePty => {
                 &SAFE_TRUE
@@ -753,6 +766,36 @@ mod tests {
     }
 
     #[test]
+    fn a_project_can_only_shorten_the_root_queue_lifetime() {
+        let mut settings = Settings::default();
+        assert!(
+            settings
+                .apply(
+                    Setting::QueueTtlSecs,
+                    Value::Integer(300),
+                    Origin::file(Layer::Project, "project.toml", 1),
+                )
+                .is_ok()
+        );
+        let widened = settings
+            .apply(
+                Setting::QueueTtlSecs,
+                Value::Integer(86_401),
+                Origin::file(Layer::Project, "project.toml", 2),
+            )
+            .unwrap_err();
+        assert!(
+            widened
+                .to_string()
+                .contains("queue_ttl_secs may only narrow")
+                || widened
+                    .to_string()
+                    .contains("may only narrow queue_ttl_secs")
+        );
+        assert!(widened.to_string().contains("86401"));
+    }
+
+    #[test]
     fn values_report_their_type_and_render_themselves() {
         assert_eq!(Value::Bool(true).type_name(), "boolean");
         assert_eq!(Value::Integer(1).type_name(), "integer");
@@ -788,6 +831,10 @@ mod tests {
         assert_eq!(
             empty.get(Setting::AuditSink).value,
             Value::Text("journald".to_owned())
+        );
+        assert_eq!(
+            empty.get(Setting::QueueTtlSecs).value,
+            Value::Integer(86_400)
         );
     }
 

@@ -382,15 +382,25 @@ impl<'c> Run<'c> {
             return decision;
         }
 
-        // `ask-human` applies only to a kernel-classified enrolled harness.
-        // A human's ordinary request still takes the human password path and
-        // is decided by the same rule. Deny rules above always win.
+        // `ask-human` applies only to a verified harness label explicitly
+        // named by that action. This narrows the broad Q1 roadmap wording:
+        // reviewers and queue routing are attached to the rule's harness list.
+        // Humans and unattested callers keep the ordinary password path.
         if self.caller.classification.is_enrolled_agent()
-            && let Some(action) = accepting
-                .iter()
-                .find(|action| action.outcome == crate::rule::Outcome::AskHuman)
+            && let Some(action) = accepting.iter().find(|action| {
+                action.outcome == crate::rule::Outcome::AskHuman
+                    && matches!(
+                        &self.caller.classification,
+                        crate::caller::Classification::EnrolledAgent { agent_id, .. }
+                            if action.harness.iter().any(|label| label == agent_id)
+                    )
+            })
         {
-            let mut decision = self.deny(DenialCode::HumanPathOnly);
+            self.trace.push(TraceStep::AskHumanQueued {
+                action: action.id.to_string(),
+                source: action.source.to_string(),
+            });
+            let mut decision = self.deny(DenialCode::AskHuman);
             decision.action = Some(action.id.clone());
             decision.rule_source = Some(action.source.clone());
             return decision;
@@ -738,11 +748,18 @@ mod tests {
     #[test]
     fn an_ask_human_rule_queues_only_for_an_enrolled_harness() {
         let mut ask_human = svc_restart();
+        ask_human.harness = vec!["claude-code".into()];
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
 
         let agent_decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert_eq!(agent_decision.denial, Some(DenialCode::HumanPathOnly));
+        assert_eq!(agent_decision.denial, Some(DenialCode::AskHuman));
+        assert!(
+            agent_decision
+                .trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::AskHumanQueued { .. }))
+        );
         assert_eq!(
             agent_decision.action,
             Some(ActionId::new("xudo.svc.restart"))
@@ -750,6 +767,44 @@ mod tests {
 
         let human_decision = evaluate(&set, &human(), &restart_request(), Settings::default());
         assert_eq!(human_decision.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn an_unattested_caller_hitting_an_ask_human_rule_keeps_the_password_path() {
+        let mut ask_human = svc_restart();
+        ask_human.harness = vec!["claude-code".into()];
+        ask_human.outcome = crate::rule::Outcome::AskHuman;
+        let set = RuleSet::load(vec![ask_human]).unwrap();
+        let unattested = CallerFacts::new(
+            crate::caller::Classification::Unattested {
+                reason: "no scope".into(),
+            },
+            1000,
+        );
+        let decision = evaluate(&set, &unattested, &restart_request(), Settings::default());
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert!(
+            !decision
+                .trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::AskHumanQueued { .. }))
+        );
+    }
+
+    #[test]
+    fn an_ask_human_rule_only_applies_to_the_harness_labels_it_names() {
+        let mut ask_human = svc_restart();
+        ask_human.harness = vec!["other-harness".into()];
+        ask_human.outcome = crate::rule::Outcome::AskHuman;
+        let set = RuleSet::load(vec![ask_human]).unwrap();
+        let decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
+        assert!(
+            !decision
+                .trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::AskHumanQueued { .. }))
+        );
     }
 
     /// A rule permitting `systemctl restart <unit>`.
@@ -962,10 +1017,12 @@ all = []
                 Matcher::Pattern(crate::matcher::AnchoredPattern::new(".+").unwrap()),
             ),
         ];
+        loose.harness = vec!["claude-code".into()];
+        loose.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![loose]).unwrap();
         let d = evaluate(
             &set,
-            &human(),
+            &agent(),
             &Request::new(
                 "xudo.pkg.install",
                 Argv::new(["-y", "install", "./evil.deb"]),
@@ -973,6 +1030,11 @@ all = []
             Settings::default(),
         );
         assert_eq!(d.denial, Some(DenialCode::DenyListed));
+        assert!(
+            !d.trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::AskHumanQueued { .. }))
+        );
     }
 
     #[test]

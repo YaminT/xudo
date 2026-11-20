@@ -36,6 +36,7 @@ else
     install -d -m 0700 -o root -g root /run/xudo/req
     install -d -m 0700 -o root -g root /run/xudo/confirm
     install -d -m 0700 -o root -g root /var/lib/xudo
+    install -d -m 0700 -o root -g root /var/lib/xudo/queue
     if [ ! -e /var/lib/xudo/audit.jsonl ]; then
         install -m 0600 -o root -g root /dev/null /var/lib/xudo/audit.jsonl
     fi

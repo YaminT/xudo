@@ -230,6 +230,13 @@ fn arb_confirm() -> impl Strategy<Value = ConfirmPolicy> {
     ]
 }
 
+fn arb_outcome() -> impl Strategy<Value = Outcome> {
+    prop_oneof![
+        3 => Just(Outcome::Allow),
+        1 => Just(Outcome::AskHuman),
+    ]
+}
+
 prop_compose! {
     fn arb_action(id: &'static str)(
         tier in arb_tier(),
@@ -237,6 +244,7 @@ prop_compose! {
         args in arb_specs(),
         confirm in arb_confirm(),
         agent_allowed in any::<bool>(),
+        outcome in arb_outcome(),
     ) -> Action {
         // A critical tier may not opt out of confirmation; keep the generator
         // inside what `RuleSet::load` accepts so the properties exercise the
@@ -255,7 +263,7 @@ prop_compose! {
             agent_allowed,
             env_allow: Vec::new(),
             harness: Vec::new(),
-            outcome: Outcome::Allow,
+            outcome,
             source: Source::new("generated.toml", 1),
         }
     }
@@ -615,6 +623,25 @@ proptest! {
         prop_assert_eq!(agent_after.confirm, agent_before.confirm);
     }
 
+    #[test]
+    fn setting_ask_human_never_makes_an_agents_verdict_more_permissive(
+        mut action in arb_action("ask-human.test"),
+        argv in arb_argv(),
+    ) {
+        action.agent_allowed = true;
+        action.confirm = ConfirmPolicy::Default;
+        action.harness = vec!["claude-code".into()];
+        let before = decide(&action, &argv, true, Vec::new());
+        action.outcome = Outcome::AskHuman;
+        let after = decide(&action, &argv, true, Vec::new());
+        if before.verdict == Verdict::Deny {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+        } else {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::AskHuman));
+        }
+    }
+
     /// The generation is a function of the files, never of the order a reader
     /// happened to list them in.
     ///
@@ -749,7 +776,7 @@ fn arb_tokens() -> impl Strategy<Value = Argv> {
 }
 
 /// An action's program, arguments, and requirements, before it has an id.
-type Parts = (String, Vec<ArgSpec>, Tier, ConfirmPolicy, bool);
+type Parts = (String, Vec<ArgSpec>, Tier, ConfirmPolicy, bool, Outcome);
 
 fn arb_parts() -> impl Strategy<Value = Parts> {
     (
@@ -758,10 +785,11 @@ fn arb_parts() -> impl Strategy<Value = Parts> {
         arb_tier(),
         arb_confirm(),
         any::<bool>(),
+        arb_outcome(),
     )
 }
 
-fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed): Parts) -> Action {
+fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed, outcome): Parts) -> Action {
     let confirm = if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
         ConfirmPolicy::Always
     } else {
@@ -776,7 +804,7 @@ fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed): Parts) -> Actio
         agent_allowed,
         env_allow: Vec::new(),
         harness: Vec::new(),
-        outcome: Outcome::Allow,
+        outcome,
         source: Source::new("generated.toml", 1),
     }
 }
@@ -1031,8 +1059,8 @@ proptest! {
         .canonicalize();
         let accepted_by_both = match_argv(&first, &argv).is_ok() && match_argv(&second, &argv).is_ok();
         let set = RuleSet::load(vec![
-            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         let overlaps = set.overlaps();
@@ -1071,8 +1099,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);
@@ -1100,8 +1128,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);

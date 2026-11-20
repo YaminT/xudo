@@ -153,7 +153,7 @@ fn denial(code: DenialCode) -> Decision {
         // M3's channel check respectively — so the record is pinned through
         // the constructor those producers will use. When a producer lands, its
         // decision must render exactly this way or the snapshot moves.
-        DenialCode::PolicyUnloadable | DenialCode::NoConfirmationChannel => {
+        DenialCode::PolicyUnloadable | DenialCode::NoConfirmationChannel | DenialCode::AskHuman => {
             Decision::deny(code, Vec::new(), Vec::new())
         }
         DenialCode::Frozen => decide(

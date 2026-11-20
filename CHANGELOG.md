@@ -7,7 +7,7 @@ All notable changes to xudo are documented here. This project follows
 
 ### Changed
 
-- Remove `confirm_agent_actions` from configuration. Existing files that set it now fail with a message to remove the key; agent commands still require the human password path. Harness registration and rule metadata are planned and remain inert.
+- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. Queue execution through the password-authenticated gate and the `ido` display remain planned for Q1c.
 
 ### Security
 

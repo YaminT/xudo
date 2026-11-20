@@ -1225,6 +1225,7 @@ args = [
                 policy: Ok(LoadedPolicy {
                     rules: rules(),
                     settings: engine::Settings::default(),
+                    queue_ttl_secs: 24 * 60 * 60,
                     passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
                 }),
                 spool: Ok(Rc::clone(spool)),
@@ -1726,6 +1727,7 @@ all = [{ any-arg = ["restart"] }]
         host.policy = Ok(LoadedPolicy {
             rules: changed,
             settings: engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
             passwd: Vec::new(),
         });
         let exit = run(&mut host, &auth());

@@ -433,7 +433,7 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     let service = parse(SERVICE);
     assert_eq!(
         values(&service, "Service", "SystemCallFilter"),
-        ["@system-service", "~@privileged @resources"]
+        ["@system-service openat2", "~@privileged @resources"]
     );
     assert_eq!(value(&service, "Service", "SystemCallErrorNumber"), "EPERM");
     assert_eq!(
@@ -489,6 +489,7 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
             ["d", CONFIRM_DIR, "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
+            ["d", "/var/lib/xudo/queue", "0700", "root", "root", "-", "-"],
             [
                 "f",
                 "/var/lib/xudo/audit.jsonl",
@@ -716,7 +717,11 @@ fn pasban_has_no_network_and_the_same_syscall_filter_as_the_broker() {
     let broker = parse(SERVICE);
     assert_eq!(
         values(&service, "Service", "SystemCallFilter"),
-        values(&broker, "Service", "SystemCallFilter")
+        ["@system-service", "~@privileged @resources"]
+    );
+    assert_eq!(
+        values(&broker, "Service", "SystemCallFilter"),
+        ["@system-service openat2", "~@privileged @resources"]
     );
     assert_eq!(value(&service, "Service", "SystemCallErrorNumber"), "EPERM");
     // One process for xudo and one for journalctl, with room for a thread.

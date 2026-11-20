@@ -436,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn the_auth_gate_cannot_reuse_a_cached_sudo_login() {
+        let snippet = SudoersSnippet::human_only(&sudo()).unwrap();
+        let defaults = snippet
+            .contents
+            .lines()
+            .find(|line| line.starts_with("Defaults!XUDO_AUTH "))
+            .expect("the auth gate has a scoped Defaults line");
+        assert!(
+            defaults
+                .split(',')
+                .any(|setting| setting.trim() == "timestamp_timeout=0")
+        );
+    }
+
+    #[test]
     fn the_defaults_are_scoped_to_xudos_own_commands() {
         // `Defaults!ALIAS`, not a bare `Defaults`: xudo's settings must not leak
         // onto an operator's unrelated rules.

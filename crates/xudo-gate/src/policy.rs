@@ -51,21 +51,10 @@ pub fn user_frozen(uid: u32, read: &MarkerRead<'_>) -> bool {
     freeze_state(read(Path::new(&path), MAX_FREEZE_BYTES))
 }
 
-#[cfg(feature = "fuzzing")]
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// The root-owned freeze marker's data.
 pub struct FreezeRecord {
-    reason: String,
-    uid: u32,
-    time: u64,
-}
-
-#[cfg(not(feature = "fuzzing"))]
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-/// The root-owned freeze marker's data.
-pub(crate) struct FreezeRecord {
     reason: String,
     uid: u32,
     time: u64,
@@ -78,6 +67,8 @@ pub struct LoadedPolicy {
     pub rules: LoadedRuleSet,
     /// Settings derived from the trusted config bytes.
     pub settings: Settings,
+    /// Maximum lifetime, in seconds, of a root-held ask-human entry.
+    pub queue_ttl_secs: u64,
     /// Root-owned account records used to match harness accounts to uids.
     pub passwd: Vec<u8>,
 }
@@ -108,6 +99,12 @@ pub enum PolicyError {
     /// The settings bytes could not be interpreted.
     #[error(transparent)]
     Config(SettingsError),
+}
+
+impl From<SettingsError> for PolicyError {
+    fn from(error: SettingsError) -> Self {
+        Self::Config(error)
+    }
 }
 
 /// Reads the rules and optional settings through the privileged trust walk.
@@ -157,12 +154,14 @@ fn load_with(
     let rules = rules_read(rules_dir).map_err(PolicyError::Rules)?;
     let config =
         config_read(config_file, MAX_CONFIG_BYTES).map_err(PolicyError::ConfigUntrusted)?;
-    let mut settings =
-        settings_from(config.as_deref(), config_file).map_err(PolicyError::Config)?;
+    let parsed = parse_config(config.as_deref(), config_file)?;
+    let mut settings = settings_of(&parsed);
+    let queue_ttl_secs = queue_ttl_seconds(&parsed.get(Setting::QueueTtlSecs).value);
     settings.frozen |= freeze_state(freeze_read(Path::new(FREEZE_FILE), MAX_FREEZE_BYTES));
     Ok(LoadedPolicy {
         rules,
         settings,
+        queue_ttl_secs,
         passwd: Vec::new(),
     })
 }
@@ -196,7 +195,6 @@ fn parse_freeze_record_inner(bytes: &[u8]) -> Result<FreezeRecord, serde_json::E
     serde_json::from_slice(bytes)
 }
 
-#[cfg(feature = "fuzzing")]
 /// Parses one freeze marker, refusing non-object and duplicate-key forms.
 ///
 /// # Errors
@@ -206,17 +204,16 @@ pub fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Err
     parse_freeze_record_inner(bytes)
 }
 
-#[cfg(not(feature = "fuzzing"))]
-pub(crate) fn parse_freeze_record(bytes: &[u8]) -> Result<FreezeRecord, serde_json::Error> {
-    parse_freeze_record_inner(bytes)
-}
-
 /// Derives engine settings from the bytes shared by the gate and broker.
 ///
 /// # Errors
 ///
 /// Returns [`SettingsError`] for invalid UTF-8, malformed TOML or an unknown key.
 pub fn settings_from(contents: Option<&[u8]>, file: &Path) -> Result<Settings, SettingsError> {
+    Ok(settings_of(&parse_config(contents, file)?))
+}
+
+fn parse_config(contents: Option<&[u8]>, file: &Path) -> Result<ConfigSettings, SettingsError> {
     let mut config = ConfigSettings::default();
     if let Some(bytes) = contents {
         let name = file.display().to_string();
@@ -226,11 +223,23 @@ pub fn settings_from(contents: Option<&[u8]>, file: &Path) -> Result<Settings, S
         xudo_config::apply_file(&mut config, Layer::System, &name, text)
             .map_err(SettingsError::Invalid)?;
     }
-    Ok(Settings {
+    Ok(config)
+}
+
+fn settings_of(config: &ConfigSettings) -> Settings {
+    Settings {
         confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == Value::Bool(true),
         frozen: config.get(Setting::Frozen).value == Value::Bool(true),
-    })
+    }
+}
+
+#[inline(never)]
+fn queue_ttl_seconds(value: &Value) -> u64 {
+    match value {
+        Value::Integer(seconds) => *seconds,
+        _ => 24 * 60 * 60,
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +267,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.settings, Settings::default());
+        assert_eq!(loaded.queue_ttl_secs, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn the_root_queue_lifetime_is_loaded_from_the_trusted_config() {
+        let loaded = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(Some(b"queue_ttl_secs = 300\n".to_vec())),
+            &ABSENT_FREEZE,
+        )
+        .unwrap();
+        assert_eq!(loaded.queue_ttl_secs, 300);
+    }
+
+    #[test]
+    fn queue_lifetime_rejects_non_utf8_and_invalid_config() {
+        let non_utf8 = parse_config(Some(&[0xff]), Path::new("config.toml"));
+        assert_eq!(
+            non_utf8.unwrap_err().to_string(),
+            "config.toml is not UTF-8"
+        );
+
+        let invalid = parse_config(
+            Some(b"queue_ttl_secs = \"slow\"\n"),
+            Path::new("config.toml"),
+        );
+        assert!(invalid.unwrap_err().to_string().contains("queue_ttl_secs"));
+        let error = load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(Some(b"queue_ttl_secs = \"slow\"\n".to_vec())),
+            &ABSENT_FREEZE,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("queue_ttl_secs"));
+    }
+
+    #[test]
+    fn queue_lifetime_falls_back_for_a_value_with_the_wrong_shape() {
+        assert_eq!(queue_ttl_seconds(&Value::Bool(false)), 24 * 60 * 60);
     }
 
     #[test]
