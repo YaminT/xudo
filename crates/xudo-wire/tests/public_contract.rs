@@ -58,6 +58,7 @@ fn public_queue_list_responses_keep_their_bounds() {
         schema_version: WIRE_SCHEMA_VERSION,
         answer: Answer::QueueListed {
             entries: vec![entry("ab".repeat(32), None)],
+            next: None,
         },
     };
     assert!(BrokerResponse::parse(response.to_json().as_bytes()).is_ok());
@@ -65,6 +66,7 @@ fn public_queue_list_responses_keep_their_bounds() {
         schema_version: WIRE_SCHEMA_VERSION,
         answer: Answer::QueueListed {
             entries: vec![entry("cd".repeat(32), Some("please review".to_owned()))],
+            next: None,
         },
     };
     assert!(BrokerResponse::parse(with_reason.to_json().as_bytes()).is_ok());
@@ -74,6 +76,7 @@ fn public_queue_list_responses_keep_their_bounds() {
             entries: (0..=xudo_wire::MAX_QUEUE_LIST)
                 .map(|index| entry(format!("{:064x}", index + 1), None))
                 .collect(),
+            next: None,
         },
     };
     assert!(matches!(

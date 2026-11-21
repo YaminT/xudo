@@ -586,6 +586,9 @@ pub fn authorization_record(
             approved.requested_action, approved.requested_rule_source
         ));
     }
+    // Bound to the spool nonce before the verdict is chosen, so a queued run
+    // can require this record and no other allow.
+    evidence.push(format!("nonce={}", approved.nonce));
 
     let decision = if confirmed_by.is_some() {
         AuditDecision::AwaitingConfirmation
@@ -1304,6 +1307,11 @@ all = [
         );
         assert_eq!(record.outcome, Outcome::NotExecuted);
         assert!(record.evidence.contains(&"gate_caller_pid=77".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&format!("nonce={}", approved.nonce))
+        );
         assert!(record.is_sealed());
     }
 

@@ -787,6 +787,8 @@ pub struct FakeSpool {
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
+    replace_error_on_call: Option<(usize, SpoolError)>,
+    replace_calls: std::cell::Cell<usize>,
     replace_error_after_exchange: Option<SpoolError>,
     unreadable_after_replace: bool,
     replaced: std::cell::Cell<bool>,
@@ -867,6 +869,15 @@ impl FakeSpool {
     #[must_use]
     pub fn failing_replace(mut self, error: SpoolError) -> Self {
         self.replace_error = Some(error);
+        self
+    }
+
+    /// Makes the `replace` call at `call` fail, counting from one.
+    ///
+    /// Earlier replaces succeed, so a later step can be the one that refuses.
+    #[must_use]
+    pub fn failing_replace_on_call(mut self, call: usize, error: SpoolError) -> Self {
+        self.replace_error_on_call = Some((call, error));
         self
     }
 
@@ -1000,6 +1011,13 @@ impl Spool for FakeSpool {
     fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
         self.record(SpoolCall::Replace(name.to_vec()));
         self.replaced.set(true);
+        let calls = self.replace_calls.get().saturating_add(1);
+        self.replace_calls.set(calls);
+        if let Some((fail_on, error)) = &self.replace_error_on_call
+            && calls == *fail_on
+        {
+            return Err(error.clone());
+        }
         scripted(self.replace_error.as_ref())?;
         let mut files = self.files.borrow_mut();
         match files.get_mut(name) {
@@ -1322,6 +1340,17 @@ mod tests {
         assert!(fake.replace(b"request", b"pending", b"approved").is_err());
         fake.unlock();
         assert_eq!(fake.files().get(b"request".as_slice()).unwrap(), b"pending");
+        let nth = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_replace_on_call(
+                2,
+                SpoolError::Gone {
+                    name: "request".to_owned(),
+                },
+            );
+        nth.replace(b"request", b"pending", b"once").unwrap();
+        assert_eq!(kind(nth.replace(b"request", b"once", b"twice")), "Gone");
+        assert_eq!(nth.files().get(b"request".as_slice()).unwrap(), b"once");
     }
 
     #[test]

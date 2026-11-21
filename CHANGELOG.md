@@ -7,7 +7,7 @@ All notable changes to xudo are documented here. This project follows
 
 ### Changed
 
-- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. Queue execution through the password-authenticated gate and the `ido` display remain planned for Q1c.
+- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. A human reviewer runs a queued entry with `xudo exec --queued ID`: the broker re-decides the stored argv, the password gate runs it in `/`, and the entry is completed only from that gate's audit record. `ido` lists the root-held queue separately from the agent-editable user queue. The passwordless gate is not in this release.
 
 ### Security
 

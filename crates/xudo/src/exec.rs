@@ -47,6 +47,34 @@ pub struct ExecPlan {
     pub spawn: bool,
 }
 
+/// A claimed queue entry, ready for the password gate.
+///
+/// The working directory is always [`QUEUED_CWD`]. The queue file still holds
+/// the directory the agent named; this run does not use it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QueuedRun {
+    /// `sudo` or `doas`, always spawned so this process can finish the claim.
+    pub plan: ExecPlan,
+    /// The queue id that was claimed.
+    pub id: String,
+    /// Where the child runs. Fixed, never the entry's stored directory.
+    pub cwd: &'static str,
+}
+
+/// Fixed working directory of a queued run.
+pub const QUEUED_CWD: &str = "/";
+
+/// What happened to the claim after the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedFinish {
+    /// The gate's audit record completed the entry.
+    Completed,
+    /// The claim went back to pending. A password refusal does this.
+    Released,
+    /// Complete and release both failed. The claim stays until it expires.
+    Stuck,
+}
+
 /// [`plan`] against this machine's backend and the real broker socket.
 ///
 /// # Errors
@@ -455,6 +483,217 @@ fn handle_status_answer(
         gate: GATE_AUTH,
         spawn: backend == "/usr/bin/doas",
     })
+}
+
+/// Claims `id` and returns the password-gate plan.
+///
+/// The broker re-decides the stored argv against the current rules. A denial
+/// is printed here and the claim is failed by the broker; this function does
+/// not exec. A permitted claim always uses [`GATE_AUTH`] and [`QUEUED_CWD`],
+/// and always spawns, including under sudo, so the caller can complete or
+/// release the claim after the child.
+///
+/// # Errors
+///
+/// The exit status to return when there is nothing to exec.
+pub fn plan_queued(
+    cli: &Cli,
+    id: &str,
+    probe: &dyn Probe,
+    socket: &Path,
+    timeout: Duration,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    if !valid_request_id(id) {
+        let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
+        return Err(ExitCode::Unusable);
+    }
+    let Some(backend) = selected_backend(probe, err) else {
+        return Err(ExitCode::Unusable);
+    };
+    let request = queue_question(Question::QueueClaim { id: id.to_owned() });
+    let response = match ask(socket, timeout, &request) {
+        Ok(response) => response,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            return Err(ExitCode::Unusable);
+        }
+    };
+    queued_plan(cli, id, backend, response, out, err)
+}
+
+/// [`plan_queued`] against this machine and the real broker socket.
+///
+/// # Errors
+///
+/// As [`plan_queued`]. A settings file that cannot be read fails closed first.
+pub fn plan_queued_live(
+    cli: &Cli,
+    id: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    // The duration is the watch wait, which a queued run does not use. The
+    // read itself is the point: an unreadable settings file fails closed.
+    if configured_timeout(cli, err).is_none() {
+        return Err(ExitCode::Unusable);
+    }
+    plan_queued(
+        cli,
+        id,
+        &xudo_sys::HostProbe,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        TIMEOUT,
+        out,
+        err,
+    )
+}
+
+/// Completes the claim from the gate's audit record, or releases it.
+///
+/// A child that started may have been allowed by the gate before it exec'd,
+/// even when the command's own status is non-zero, so completion is tried
+/// first. Anything except [`Answer::Done`] from that completion releases the
+/// claim back to pending (a denied password, a missing gate record). A child
+/// that never started is only released. A storage failure on the broker leaves
+/// the claim until the queue TTL; this returns [`QueuedFinish::Stuck`].
+pub fn finish_queued(
+    id: &str,
+    child_started: bool,
+    socket: &Path,
+    timeout: Duration,
+    err: &mut dyn Write,
+) -> QueuedFinish {
+    if !valid_request_id(id) {
+        let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
+        return QueuedFinish::Stuck;
+    }
+    if child_started && queue_done(id, true, socket, timeout, err) {
+        return QueuedFinish::Completed;
+    }
+    if queue_done(id, false, socket, timeout, err) {
+        QueuedFinish::Released
+    } else {
+        let _ = writeln!(
+            err,
+            "xudo: the queued claim was not released; it stays until it expires"
+        );
+        QueuedFinish::Stuck
+    }
+}
+
+/// [`finish_queued`] against the real broker socket.
+///
+/// The library binary uses this so it does not name the wire crate. An id
+/// that is not 64 lowercase hex characters is refused before any connection.
+pub fn finish_queued_live(id: &str, child_started: bool, err: &mut dyn Write) -> QueuedFinish {
+    finish_queued(
+        id,
+        child_started,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        TIMEOUT,
+        err,
+    )
+}
+
+fn queue_question(question: Question) -> BrokerRequest {
+    BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    }
+}
+
+fn queued_plan(
+    cli: &Cli,
+    id: &str,
+    backend: &'static str,
+    response: BrokerResponse,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    match response.answer {
+        Answer::Refused {
+            code, remediation, ..
+        } => {
+            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            Err(ExitCode::Unusable)
+        }
+        Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
+        | Answer::Done => {
+            let _ = writeln!(
+                err,
+                "xudo: broker returned an answer for an unsupported question"
+            );
+            Err(ExitCode::Unusable)
+        }
+        Answer::Decided { decision, minted } => {
+            if !decision.verdict.is_permitted() {
+                // Not `report_denial`: an ask-human verdict here is a fresh
+                // refusal of this run, not a new submission to the queue.
+                let status = emit(cli, &decision, out);
+                let _ = writeln!(
+                    err,
+                    "xudo: the queued command was refused when it was re-decided"
+                );
+                return Err(status);
+            }
+            let Some(minted) = minted else {
+                let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+                return Err(ExitCode::Unusable);
+            };
+            if minted.gate != GATE_AUTH {
+                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+                return Err(ExitCode::Unusable);
+            }
+            Ok(QueuedRun {
+                plan: ExecPlan {
+                    backend,
+                    gate: GATE_AUTH,
+                    spawn: true,
+                },
+                id: id.to_owned(),
+                cwd: QUEUED_CWD,
+            })
+        }
+    }
+}
+
+/// `complete` asks [`Question::QueueComplete`]; otherwise [`Question::QueueRelease`].
+fn queue_done(
+    id: &str,
+    complete: bool,
+    socket: &Path,
+    timeout: Duration,
+    err: &mut dyn Write,
+) -> bool {
+    let question = if complete {
+        Question::QueueComplete {
+            id: id.to_owned(),
+            audit_seq: 0,
+        }
+    } else {
+        Question::QueueRelease { id: id.to_owned() }
+    };
+    match ask(socket, timeout, &queue_question(question)) {
+        Ok(response) if matches!(response.answer, Answer::Done) => true,
+        Ok(_) => {
+            let _ = writeln!(err, "xudo: the queued run was not completed");
+            false
+        }
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            false
+        }
+    }
 }
 
 /// One request and one response, on one deadline.
@@ -1716,6 +1955,9 @@ mod tests {
             lock_wait: Duration::from_secs(1),
             frame_delay: Duration::ZERO,
             xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
+            root_entries: Vec::new(),
+            root_queue_unavailable: false,
+            root_release: None,
         }
     }
 
@@ -1981,14 +2223,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let held = thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            // Keep the connection open and silent until the client gives up.
-            thread::sleep(Duration::from_millis(500));
-            drop(s);
+            let (stream, _) = listener.accept().unwrap();
+            // The clock starts once the broker is holding a silent socket, so
+            // probing sudo and opening the connection are not part of the
+            // deadline. The peer stays up until the client returns, or for two
+            // seconds if the client waits for the hang-up.
+            let _ = accepted_tx.send(std::time::Instant::now());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            drop(stream);
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let started = std::time::Instant::now();
         let result = plan(
             &cli(),
             &argv(),
@@ -1998,8 +2245,14 @@ mod tests {
             &mut out,
             &mut err,
         );
+        let accepted = accepted_rx.recv_timeout(Duration::from_millis(50)).unwrap();
+        let elapsed = accepted.elapsed();
+        let _ = release_tx.send(());
         assert_eq!(result, Err(ExitCode::Unusable));
-        assert!(started.elapsed() < Duration::from_millis(450));
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "silent broker held the client for {elapsed:?}"
+        );
         held.join().unwrap();
     }
 
@@ -2137,5 +2390,384 @@ mod tests {
             &mut err,
         );
         assert_eq!(status, ExitCode::Unusable);
+    }
+
+    fn queued_id() -> String {
+        "ab".repeat(32)
+    }
+
+    // `serve_many` maps this over owned answers, so the argument is by value.
+    #[allow(clippy::needless_pass_by_value)]
+    fn response(answer: Answer) -> Vec<u8> {
+        json(&answer)
+    }
+
+    fn claim_once(
+        reply: Vec<u8>,
+        probe: &dyn Probe,
+    ) -> (Result<QueuedRun, ExitCode>, String, String, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(listener, reply);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            probe,
+            &socket,
+            PATIENT,
+            &mut out,
+            &mut err,
+        );
+        let request = broker.finish();
+        (
+            result,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            request,
+        )
+    }
+
+    #[test]
+    fn a_queued_entry_runs_only_through_the_password_path() {
+        // The shipped sudoers rule disables the credential cache. A queued run
+        // uses that same rule: the gate is the password helper, never the
+        // passwordless one, and sudo must ask even after an earlier login.
+        let backend = xudo_backend::Backend {
+            exe: "/usr/bin/sudo".to_owned(),
+            kind: xudo_backend::BackendKind::Sudo,
+            version: "Sudo version 1.9.17p2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::from_supported([
+                xudo_backend::Capability::DisableCredentialCache,
+                xudo_backend::Capability::AllocatePty,
+                xudo_backend::Capability::PerCommandDefaults,
+                xudo_backend::Capability::DropInDirectory,
+                xudo_backend::Capability::ValidateNamedFile,
+            ]),
+        };
+        let snippet = xudo_backend::SudoersSnippet::human_only(&backend).unwrap();
+        assert!(!snippet.includes_nopass);
+        assert!(snippet.contents.contains("timestamp_timeout=0"));
+        assert!(!snippet.contents.contains("NOPASSWD"));
+        assert!(
+            !snippet
+                .contents
+                .contains(xudo_backend::snippet::GATE_NOPASS)
+        );
+
+        let (result, _, _err, request) =
+            claim_once(decided(allow(), Some(minted(GATE_AUTH))), &SUDO);
+        let run = result.unwrap();
+        assert_eq!(run.cwd, "/");
+        assert_eq!(run.id, queued_id());
+        assert_eq!(
+            run.plan,
+            ExecPlan {
+                backend: "/usr/bin/sudo",
+                gate: GATE_AUTH,
+                spawn: true,
+            }
+        );
+        let sent = BrokerRequest::parse(&request).unwrap();
+        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+    }
+
+    #[test]
+    fn a_queued_run_spawns_whichever_backend_is_installed() {
+        for (paths, backend) in [
+            (&["/usr/bin/sudo-rs"][..], "/usr/bin/sudo-rs"),
+            (&["/usr/bin/doas"][..], "/usr/bin/doas"),
+        ] {
+            let (result, _, _err, _) =
+                claim_once(decided(allow(), Some(minted(GATE_AUTH))), &Has(paths));
+            let run = result.unwrap();
+            assert_eq!(run.plan.backend, backend);
+            assert!(run.plan.spawn);
+            assert_eq!(run.cwd, "/");
+        }
+    }
+
+    #[test]
+    fn a_queued_claim_refuses_a_bad_id_a_missing_backend_and_a_dead_broker() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        for id in ["", "ab", &"g".repeat(64), &"A".repeat(64)] {
+            assert_eq!(
+                plan_queued(
+                    &cli(),
+                    id,
+                    &SUDO,
+                    Path::new("/no/such/sock"),
+                    PATIENT,
+                    &mut out,
+                    &mut err
+                ),
+                Err(ExitCode::Unusable)
+            );
+        }
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+
+        err.clear();
+        assert_eq!(
+            plan_queued(
+                &cli(),
+                &queued_id(),
+                &Has(&[]),
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut out,
+                &mut err,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("no sudo"));
+
+        err.clear();
+        assert_eq!(
+            plan_queued(
+                &cli(),
+                &queued_id(),
+                &SUDO,
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut out,
+                &mut err,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err).unwrap().contains("unreachable"));
+    }
+
+    #[test]
+    fn a_queued_claim_fails_closed_on_the_wrong_answer() {
+        let refused = BrokerResponse::refused(RefusalCode::RequestUnknown)
+            .to_json()
+            .into_bytes();
+        let (result, _, err, _) = claim_once(refused, &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("refused"), "{err}");
+
+        let decision = Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new());
+        let (result, out, err, _) = claim_once(decided(decision.clone(), None), &SUDO);
+        assert_eq!(result, Err(decision.exit_code()));
+        assert!(!out.is_empty());
+        assert!(err.contains("re-decided"), "{err}");
+        assert!(!err.contains("request submitted"), "{err}");
+        assert!(!err.contains("ido queue"), "{err}");
+
+        let (result, _, err, _) = claim_once(decided(allow(), None), &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("minted no entry"), "{err}");
+
+        let (result, _, err, _) = claim_once(decided(allow(), Some(minted("/tmp/evil"))), &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("unexpected gate"), "{err}");
+
+        for answer in [
+            Answer::Pending {
+                id: queued_id(),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+            Answer::QueueListed {
+                entries: Vec::new(),
+                next: None,
+            },
+            Answer::Done,
+        ] {
+            let (result, _, err, _) = claim_once(response(answer), &SUDO);
+            assert_eq!(result, Err(ExitCode::Unusable));
+            assert!(err.contains("unsupported question"), "{err}");
+        }
+    }
+
+    #[test]
+    fn plan_queued_live_fails_closed_before_and_after_the_settings_read() {
+        let id = queued_id();
+        let dir = tempfile::tempdir().unwrap();
+        let mut unreadable = cli();
+        unreadable.config_file = dir.path().to_path_buf();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_queued_live(&unreadable, &id, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("could not be read")
+        );
+
+        let mut missing = cli();
+        missing.config_file = dir.path().join("missing.toml");
+        err.clear();
+        // A missing settings file is the default timeout, so the call continues
+        // into `plan_queued`. A bad id stops there, on every host, before a
+        // backend probe or the broker socket.
+        assert_eq!(
+            plan_queued_live(&missing, "not-an-id", &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("a queued id is 64 lowercase hex characters"),
+            "{text}"
+        );
+    }
+
+    fn finish_with(
+        replies: Vec<Answer>,
+        child_started: bool,
+    ) -> (QueuedFinish, String, Vec<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker =
+            crate::test_broker::serve_many(listener, replies.into_iter().map(response).collect());
+        let mut err = Vec::new();
+        let finish = finish_queued(&queued_id(), child_started, &socket, PATIENT, &mut err);
+        let report = broker.finish_report();
+        (finish, String::from_utf8(err).unwrap(), report.requests)
+    }
+
+    #[test]
+    fn finish_queued_completes_from_the_gate_or_releases_the_claim() {
+        let (finish, err, requests) = finish_with(vec![Answer::Done], true);
+        assert_eq!(finish, QueuedFinish::Completed, "{err}");
+        assert!(err.is_empty(), "{err}");
+        let sent = BrokerRequest::parse(&requests[0]).unwrap();
+        assert_eq!(
+            sent.question,
+            Question::QueueComplete {
+                id: queued_id(),
+                audit_seq: 0,
+            }
+        );
+
+        let (finish, _, requests) = finish_with(vec![Answer::Done], false);
+        assert_eq!(finish, QueuedFinish::Released);
+        let sent = BrokerRequest::parse(&requests[0]).unwrap();
+        assert_eq!(sent.question, Question::QueueRelease { id: queued_id() });
+
+        let (finish, err, requests) = finish_with(
+            vec![
+                Answer::Refused {
+                    code: RefusalCode::AnswerRejected,
+                    remediation: "no".into(),
+                    detail: None,
+                },
+                Answer::Done,
+            ],
+            true,
+        );
+        assert_eq!(finish, QueuedFinish::Released, "{err}");
+        assert!(err.contains("not completed"), "{err}");
+        assert!(!err.contains("not released"), "{err}");
+        assert_eq!(requests.len(), 2);
+
+        let (finish, err, _) = finish_with(
+            vec![
+                Answer::Decided {
+                    decision: Decision::deny(DenialCode::DenyListed, Vec::new(), Vec::new()),
+                    minted: None,
+                },
+                Answer::Refused {
+                    code: RefusalCode::RequestUnknown,
+                    remediation: "gone".into(),
+                    detail: None,
+                },
+            ],
+            true,
+        );
+        assert_eq!(finish, QueuedFinish::Stuck, "{err}");
+        assert!(err.contains("not released"), "{err}");
+
+        let mut err = Vec::new();
+        assert_eq!(
+            finish_queued("nope", true, Path::new("/no/such/sock"), PATIENT, &mut err),
+            QueuedFinish::Stuck
+        );
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+
+        err.clear();
+        assert_eq!(
+            finish_queued(
+                &queued_id(),
+                true,
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut err
+            ),
+            QueuedFinish::Stuck
+        );
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.contains("unreachable"), "{text}");
+        assert!(text.contains("not released"), "{text}");
+
+        // The live wrapper refuses a bad id before it opens the broker socket.
+        let mut live = Vec::new();
+        assert_eq!(
+            finish_queued_live("nope", false, &mut live),
+            QueuedFinish::Stuck
+        );
+        assert!(
+            String::from_utf8(live)
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+    }
+
+    #[test]
+    fn the_library_reports_a_queued_plan_without_executing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker =
+            crate::test_broker::serve_once(listener, decided(allow(), Some(minted(GATE_AUTH))));
+        let mut cli = Cli::parse_from(["xudo", "exec", "--queued", &queued_id()]);
+        cli.config_file = dir.path().join("missing.toml");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ops = xudo_sys::host_ops();
+        let platform = crate::Platform {
+            ops: ops.as_ref(),
+            probe: &SUDO,
+            host: &xudo_sys::LiveHost,
+            path: None,
+        };
+        let status = crate::cli::run_with_installer_at_socket(
+            &cli,
+            &platform,
+            &xudo_sys::RefusingInstaller,
+            &socket,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(status, ExitCode::Unusable);
+        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+
+        let mut bad = Cli::parse_from(["xudo", "exec", "--queued", "nope"]);
+        bad.config_file = dir.path().join("missing.toml");
+        let status = crate::cli::run_with_installer_at_socket(
+            &bad,
+            &platform,
+            &xudo_sys::RefusingInstaller,
+            &socket,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(status, ExitCode::Unusable);
+        assert!(String::from_utf8(err).unwrap().contains("64 lowercase hex"));
     }
 }

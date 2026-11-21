@@ -83,7 +83,7 @@
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -91,7 +91,9 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, flock, fstat, openat, statat};
 use rustix::io::Errno;
-use xudo_audit::{Record, TAIL_WINDOW, continuation, window_start};
+use xudo_audit::{
+    Chain, ChainReadError, Record, TAIL_WINDOW, TailError, continuation, window_start,
+};
 
 use super::{AuditError, next_record};
 use crate::trust::{Kind, PathFacts, TRUSTED_UID, TrustError, facts_of, open_trusted};
@@ -238,6 +240,132 @@ impl JsonlLog {
                 publish,
             ),
         }
+    }
+
+    /// Reads the chain. A missing file is an empty chain. The file is not created.
+    pub(super) fn read_snapshot(&self) -> Result<Vec<Record>, AuditError> {
+        match &self.dir {
+            LogDir::Walk(dir) => read_walked(dir, &|path| open_trusted(path), TRUSTED_UID),
+            #[cfg(test)]
+            LogDir::Opened { fd, path, owner } => read_opened(fd.as_fd(), path, *owner),
+        }
+    }
+}
+
+/// Largest audit log a snapshot will allocate. A larger file is refused first.
+const MAX_AUDIT_SNAPSHOT: u64 = 8 * 1024 * 1024;
+
+/// [`JsonlLog::read_snapshot`] for a directory reached by `open`.
+fn read_walked(
+    dir: &Path,
+    open: &dyn Fn(&Path) -> Result<OwnedFd, TrustError>,
+    owner: u32,
+) -> Result<Vec<Record>, AuditError> {
+    let fd = open(dir).map_err(AuditError::Untrusted)?;
+    read_opened(fd.as_fd(), dir, owner)
+}
+
+/// Reads `audit.jsonl` in an already-open directory. `ENOENT` is an empty chain.
+fn read_opened(
+    dir: BorrowedFd<'_>,
+    dir_path: &Path,
+    owner: u32,
+) -> Result<Vec<Record>, AuditError> {
+    let path = dir_path.join(AUDIT_FILE_NAME);
+    let name = OsStr::new(AUDIT_FILE_NAME);
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) if errno == Errno::NOENT => return Ok(Vec::new()),
+        Err(errno) => return Err(open_failure(dir, name, &path, errno)),
+    };
+    // Stat and the size bound run before any read, so a failed `fstat` or an
+    // oversized log never allocates the file.
+    prepare_snapshot(audited_fstat(fd.as_fd(), &path), &path, owner)?;
+    parse_snapshot(read_owned(fd, &path), &path)
+}
+
+/// Checks an opened log before its bytes are read.
+///
+/// A failed `fstat` stops here. The caller does not read the descriptor.
+fn prepare_snapshot(
+    stat: Result<rustix::fs::Stat, AuditError>,
+    path: &Path,
+    owner: u32,
+) -> Result<(), AuditError> {
+    let stat = stat?;
+    check_log(&facts_of(&stat), links(&stat), path, owner)?;
+    audit_snapshot_len(stat.st_size)?;
+    Ok(())
+}
+
+/// Parses bytes that [`prepare_snapshot`] has already bounded.
+fn parse_snapshot(
+    bytes: Result<Vec<u8>, AuditError>,
+    path: &Path,
+) -> Result<Vec<Record>, AuditError> {
+    let bytes = bytes?;
+    parse_log_bounded(path, &bytes)
+}
+
+fn audited_fstat(fd: BorrowedFd<'_>, path: &Path) -> Result<rustix::fs::Stat, AuditError> {
+    io_errno("fstat", path, fstat(fd))
+}
+
+fn io_errno<T>(op: &'static str, path: &Path, result: Result<T, Errno>) -> Result<T, AuditError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(errno) => Err(AuditError::Io {
+            op,
+            path: path.display().to_string(),
+            reason: errno.to_string(),
+        }),
+    }
+}
+
+/// The length a snapshot may read. A negative size is refused as too large.
+fn audit_snapshot_len(size: i64) -> Result<u64, AuditError> {
+    let Ok(size) = u64::try_from(size) else {
+        return Err(snapshot_too_large(0));
+    };
+    if size > MAX_AUDIT_SNAPSHOT {
+        return Err(snapshot_too_large(size));
+    }
+    Ok(size)
+}
+
+fn snapshot_too_large(size: u64) -> AuditError {
+    AuditError::TooLarge {
+        size: usize::try_from(size).unwrap_or(usize::MAX),
+        max: usize::try_from(MAX_AUDIT_SNAPSHOT).unwrap_or(usize::MAX),
+    }
+}
+
+fn read_owned(fd: OwnedFd, path: &Path) -> Result<Vec<u8>, AuditError> {
+    let mut file = File::from(fd);
+    let mut bytes = Vec::new();
+    match file.read_to_end(&mut bytes) {
+        Ok(_) => Ok(bytes),
+        Err(error) => Err(AuditError::Io {
+            op: "read",
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// Parses a bounded log. Empty bytes are an empty chain.
+fn parse_log_bounded(path: &Path, bytes: &[u8]) -> Result<Vec<Record>, AuditError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    match Chain::from_jsonl_bytes(bytes) {
+        Ok(chain) => Ok(chain.records().to_vec()),
+        Err(ChainReadError::Malformed { reason, .. }) => Err(AuditError::DamagedTail {
+            path: path.display().to_string(),
+            reason: TailError::NotARecord { reason },
+        }),
+        Err(ChainReadError::Inconsistent(error)) => Err(AuditError::NotChained(error)),
     }
 }
 
@@ -1736,5 +1864,190 @@ mod tests {
         assert_eq!(fake.append(&over).unwrap_err(), refused);
         assert_eq!(read_chain(&dir), fake.records());
         assert_eq!(fake.records().len(), 1);
+    }
+
+    /// Both arms run: a duplicated record is not chained, and a size refusal is.
+    fn is_not_chained(error: &AuditError) -> bool {
+        matches!(error, AuditError::NotChained(_))
+    }
+
+    /// File length when `path` exists. Called for a real file and a missing one.
+    fn snapshot_refuses_overflow_and_does_not_touch_the_system_log(dir: &Path) {
+        let huge = dir.join(AUDIT_FILE_NAME);
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_AUDIT_SNAPSHOT + 1)
+            .unwrap();
+        std::fs::set_permissions(&huge, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            AuditSink::snapshot(&JsonlLog::opened_for_test(dir)).unwrap_err(),
+            snapshot_too_large(MAX_AUDIT_SNAPSHOT + 1)
+        );
+
+        let directory = rustix::fs::open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let read_err = read_owned(directory, dir).unwrap_err();
+        assert!(read_err.to_string().contains("cannot read"), "{read_err}");
+
+        let present = dir.join("len-probe");
+        std::fs::write(&present, b"xy").unwrap();
+        assert_eq!(metadata_len(&present), Some(2));
+        assert_eq!(metadata_len(&dir.join("no-such-len")), None);
+        let system = Path::new(AUDIT_DIR).join(AUDIT_FILE_NAME);
+        let before = metadata_len(&system);
+        let _ = AuditSink::snapshot(&JsonlLog::in_dir(AUDIT_DIR));
+        assert_eq!(metadata_len(&system), before);
+    }
+
+    fn metadata_len(path: &Path) -> Option<u64> {
+        match std::fs::metadata(path) {
+            Ok(meta) => Some(meta.len()),
+            Err(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_parses_a_bounded_log_and_refuses_damage() {
+        let path = Path::new("audit.jsonl");
+        assert!(parse_log_bounded(path, b"").unwrap().is_empty());
+        let record = Record::after(None, Decision::Denied, Vec::new(), "human");
+        let mut one = record.to_jsonl().into_bytes();
+        one.push(b'\n');
+        assert_eq!(parse_log_bounded(path, &one).unwrap(), vec![record.clone()]);
+        let malformed = parse_log_bounded(path, b"not json\n").unwrap_err();
+        assert!(
+            malformed.to_string().contains("not an audit record"),
+            "{malformed}"
+        );
+        let mut duplicated = one.clone();
+        duplicated.extend_from_slice(&one);
+        let inconsistent = parse_log_bounded(path, &duplicated).unwrap_err();
+        assert!(is_not_chained(&inconsistent), "{inconsistent}");
+        assert!(!is_not_chained(&snapshot_too_large(0)));
+        assert_eq!(audit_snapshot_len(0).unwrap(), 0);
+        assert_eq!(audit_snapshot_len(-1).unwrap_err(), snapshot_too_large(0));
+        assert_eq!(
+            audit_snapshot_len(
+                i64::try_from(MAX_AUDIT_SNAPSHOT.saturating_add(1)).unwrap_or(i64::MAX)
+            )
+            .unwrap_err(),
+            snapshot_too_large(MAX_AUDIT_SNAPSHOT + 1)
+        );
+        let stat_err = io_errno::<rustix::fs::Stat>("fstat", path, Err(Errno::IO)).unwrap_err();
+        assert!(stat_err.to_string().contains("fstat"), "{stat_err}");
+        assert_eq!(
+            prepare_snapshot(Err(stat_err.clone()), path, 0).unwrap_err(),
+            stat_err
+        );
+        let dir = scratch("snapshot-check");
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"ok").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = std::fs::metadata(&probe).unwrap().uid();
+        let stat = fstat(std::fs::File::open(&probe).unwrap()).unwrap();
+        assert!(prepare_snapshot(Ok(stat), &probe, owner).is_ok());
+        let read_err = AuditError::Io {
+            op: "read",
+            path: probe.display().to_string(),
+            reason: "io".into(),
+        };
+        assert_eq!(
+            parse_snapshot(Err(read_err.clone()), &probe).unwrap_err(),
+            read_err
+        );
+        assert!(parse_snapshot(Ok(Vec::new()), &probe).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_reads_a_private_log_and_does_not_create_one() {
+        let dir = scratch("snapshot");
+        let owner = std::fs::metadata(&dir).unwrap().uid();
+        let open = |path: &Path| {
+            Ok(rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap())
+        };
+        assert!(read_walked(&dir, &open, owner).unwrap().is_empty());
+        let refused = read_walked(
+            &dir,
+            &|_| {
+                Err(TrustError::NotAbsolute {
+                    at: "refused".to_owned(),
+                })
+            },
+            owner,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            AuditError::Untrusted(TrustError::NotAbsolute {
+                at: "refused".to_owned(),
+            })
+        );
+
+        let log = JsonlLog::opened_for_test(&dir);
+        assert!(AuditSink::snapshot(&log).unwrap().is_empty());
+        let mut writer = JsonlLog::opened_for_test(&dir);
+        let _ = writer.append(&refusal).unwrap();
+        let written = AuditSink::snapshot(&JsonlLog::opened_for_test(&dir)).unwrap();
+        assert_eq!(written.len(), 1);
+        let trail = crate::audit::AuditTrail::new(JsonlLog::opened_for_test(&dir));
+        assert_eq!(AuditSink::snapshot(&trail).unwrap(), written);
+
+        std::fs::write(dir.join(AUDIT_FILE_NAME), b"").unwrap();
+        std::fs::set_permissions(
+            dir.join(AUDIT_FILE_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(
+            AuditSink::snapshot(&JsonlLog::opened_for_test(&dir))
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::write(dir.join(AUDIT_FILE_NAME), b"not json\n").unwrap();
+        std::fs::set_permissions(
+            dir.join(AUDIT_FILE_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(
+            AuditSink::snapshot(&JsonlLog::opened_for_test(&dir))
+                .unwrap_err()
+                .to_string()
+                .contains("not an audit record")
+        );
+
+        std::fs::set_permissions(
+            dir.join(AUDIT_FILE_NAME),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(
+            AuditSink::snapshot(&JsonlLog::opened_for_test(&dir))
+                .unwrap_err()
+                .to_string()
+                .contains("mode")
+        );
+
+        std::fs::remove_file(dir.join(AUDIT_FILE_NAME)).unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.join(AUDIT_FILE_NAME)).unwrap();
+        assert!(
+            AuditSink::snapshot(&JsonlLog::opened_for_test(&dir))
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        std::fs::remove_file(dir.join(AUDIT_FILE_NAME)).unwrap();
+
+        snapshot_refuses_overflow_and_does_not_touch_the_system_log(&dir);
     }
 }

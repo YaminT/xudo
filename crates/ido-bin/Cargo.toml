@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 ido = { path = "../ido", version = "0.1.0-beta.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
 # Raw mode, window size, and the uid, through rustix's safe API, so the
 # workspace-wide `forbid(unsafe_code)` holds here too. Already in the tree
 # through `tempfile` and `terminal_size`; no new crate.

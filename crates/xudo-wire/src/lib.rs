@@ -149,6 +149,28 @@ pub enum Question {
     Thaw,
     /// List the peer's authorized root-held queue entries.
     QueueList,
+    /// Atomically claim one pending entry for a fresh human-path run.
+    QueueClaim {
+        /// The 64-character queue id.
+        id: String,
+    },
+    /// Mark a claimed entry done, bound to the gate's audit record.
+    QueueComplete {
+        /// The 64-character queue id.
+        id: String,
+        /// Sequence of the gate record. Zero searches the trail for a match.
+        audit_seq: u64,
+    },
+    /// Return a claimed entry to pending after a denied run.
+    QueueRelease {
+        /// The 64-character queue id.
+        id: String,
+    },
+    /// A later page of [`Question::QueueList`]. `after` is exclusive.
+    QueueListPage {
+        /// The last id of the previous page, or empty for the first page.
+        after: String,
+    },
 }
 
 impl BrokerRequest {
@@ -269,7 +291,11 @@ impl BrokerRequest {
                 )?;
                 refuse_nul("claimed_classification", claimed_classification)?;
             }
-            Question::Status { id } => check_id(id)?,
+            Question::Status { id }
+            | Question::QueueClaim { id }
+            | Question::QueueRelease { id }
+            | Question::QueueComplete { id, .. } => check_id(id)?,
+            Question::QueueListPage { after } => check_page_cursor(after)?,
             Question::Watch | Question::Pending | Question::Thaw | Question::QueueList => {}
             Question::Answer { id, token, .. } => {
                 check_id(id)?;
@@ -322,6 +348,23 @@ fn bounded(field: &str, value: &str, limit: usize) -> Result<(), RequestError> {
     }
     Ok(())
 }
+fn check_page_cursor(after: &str) -> Result<(), RequestError> {
+    if after.is_empty() {
+        return Ok(());
+    }
+    if after.len() > NONCE_HEX_LEN
+        || !after
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RequestError::Malformed {
+            reason: "queue page cursor must be empty or at most 64 lowercase hex characters"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn check_id(id: &str) -> Result<(), RequestError> {
     if id.len() != NONCE_HEX_LEN
         || !id
@@ -517,6 +560,9 @@ pub enum Answer {
     QueueListed {
         /// Bounded entries visible to this peer.
         entries: Vec<QueueListEntry>,
+        /// Exclusive cursor for the next page. Absent on the last page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
     },
     /// A question completed without a decision.
     Done,
@@ -893,13 +939,20 @@ impl BrokerResponse {
                     });
                 }
             }
-            Answer::QueueListed { entries } => {
+            Answer::QueueListed { entries, next } => {
                 if entries.len() > MAX_QUEUE_LIST
                     || entries.iter().any(|entry| !valid_queue_entry(entry))
                 {
                     return Err(ResponseError::Malformed {
                         reason: "queue list exceeds its bounds or contains an invalid entry"
                             .to_owned(),
+                    });
+                }
+                if let Some(cursor) = next
+                    && check_nonce(cursor).is_err()
+                {
+                    return Err(ResponseError::Malformed {
+                        reason: "queue list cursor is not a queue id".to_owned(),
                     });
                 }
             }
@@ -964,7 +1017,17 @@ fn valid_question_shape(value: &serde_json::Value) -> bool {
     }
     object.iter().any(|(name, payload)| {
         let unit = matches!(name.as_str(), "watch" | "pending" | "thaw" | "queue_list");
-        let data = matches!(name.as_str(), "run" | "status" | "answer" | "freeze");
+        let data = matches!(
+            name.as_str(),
+            "run"
+                | "status"
+                | "answer"
+                | "freeze"
+                | "queue_claim"
+                | "queue_complete"
+                | "queue_release"
+                | "queue_list_page"
+        );
         (unit && payload.is_null()) || (data && payload.is_object())
     })
 }
@@ -986,6 +1049,10 @@ fn question_shape(question: &Question) -> QuestionShape {
         Question::Freeze { .. } => QuestionShape::Variant("freeze", false),
         Question::Thaw => QuestionShape::Variant("thaw", true),
         Question::QueueList => QuestionShape::Variant("queue_list", true),
+        Question::QueueClaim { .. } => QuestionShape::Variant("queue_claim", false),
+        Question::QueueComplete { .. } => QuestionShape::Variant("queue_complete", false),
+        Question::QueueRelease { .. } => QuestionShape::Variant("queue_release", false),
+        Question::QueueListPage { .. } => QuestionShape::Variant("queue_list_page", false),
     }
 }
 
@@ -1215,13 +1282,22 @@ mod tests {
             Question::Watch,
             Question::Pending,
             Question::Answer {
-                id,
+                id: id.clone(),
                 token: "x".into(),
                 approve: true,
             },
             Question::Freeze { reason: "x".into() },
             Question::Thaw,
             Question::QueueList,
+            Question::QueueClaim { id: id.clone() },
+            Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 0,
+            },
+            Question::QueueRelease { id: id.clone() },
+            Question::QueueListPage {
+                after: String::new(),
+            },
         ];
         for question in variants {
             let serialized = serde_json::to_value(&question).unwrap();
@@ -1276,6 +1352,7 @@ mod tests {
             },
             Answer::QueueListed {
                 entries: Vec::new(),
+                next: None,
             },
             Answer::Done,
             Answer::Refused {
@@ -1370,6 +1447,7 @@ mod tests {
                     reason: None,
                     state: "pending".into(),
                 }],
+                next: None,
             },
         };
         assert_eq!(
@@ -1470,12 +1548,83 @@ mod tests {
                 reason: "maintenance".to_owned(),
             },
             Question::Thaw,
+            Question::QueueList,
+            Question::QueueClaim { id: id.clone() },
+            Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 4,
+            },
+            Question::QueueRelease { id },
+            Question::QueueListPage {
+                after: "ab".to_owned(),
+            },
         ] {
             let request = BrokerRequest {
                 schema_version: WIRE_SCHEMA_VERSION,
                 question,
             };
             assert_eq!(request.run_fields(), None);
+        }
+    }
+
+    #[test]
+    fn queue_mutations_reject_a_bad_id_and_a_bad_page_cursor() {
+        let claim = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::QueueClaim { id: "nope".into() },
+        };
+        assert_eq!(
+            BrokerRequest::parse(claim.to_json().as_bytes()).unwrap_err(),
+            RequestError::Malformed {
+                reason: "id must be 64 lowercase hexadecimal characters".to_owned(),
+            }
+        );
+        let page = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::QueueListPage { after: "GG".into() },
+        };
+        assert_eq!(
+            BrokerRequest::parse(page.to_json().as_bytes()).unwrap_err(),
+            RequestError::Malformed {
+                reason: "queue page cursor must be empty or at most 64 lowercase hex characters"
+                    .to_owned(),
+            }
+        );
+        let listed = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::QueueListed {
+                entries: Vec::new(),
+                next: Some("short".into()),
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(listed.to_json().as_bytes()).unwrap_err(),
+            ResponseError::Malformed {
+                reason: "queue list cursor is not a queue id".to_owned(),
+            }
+        );
+        let id = "a".repeat(NONCE_HEX_LEN);
+        for question in [
+            Question::QueueRelease { id: id.clone() },
+            Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 1,
+            },
+            Question::QueueListPage {
+                after: String::new(),
+            },
+            Question::QueueListPage { after: "ab".into() },
+        ] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: question.clone(),
+            };
+            assert_eq!(
+                BrokerRequest::parse(request.to_json().as_bytes())
+                    .unwrap()
+                    .question,
+                question
+            );
         }
     }
 
@@ -2042,6 +2191,7 @@ mod tests {
                     reason: Some("review requested".into()),
                     state: "pending".into(),
                 }],
+                next: None,
             },
             Answer::Done,
             BrokerResponse::refused(RefusalCode::RequestUnknown).answer,

@@ -130,6 +130,10 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
         xudo_wire::Question::Freeze { .. } => "freeze",
         xudo_wire::Question::Thaw => "thaw",
         xudo_wire::Question::QueueList => "queue_list",
+        xudo_wire::Question::QueueClaim { .. } => "queue_claim",
+        xudo_wire::Question::QueueComplete { .. } => "queue_complete",
+        xudo_wire::Question::QueueRelease { .. } => "queue_release",
+        xudo_wire::Question::QueueListPage { .. } => "queue_list_page",
     }
 }
 
@@ -236,6 +240,27 @@ mod tests {
             (xudo_wire::Question::Watch, "watch"),
             (xudo_wire::Question::Pending, "pending"),
             (xudo_wire::Question::QueueList, "queue_list"),
+            (
+                xudo_wire::Question::QueueClaim { id: "b".repeat(64) },
+                "queue_claim",
+            ),
+            (
+                xudo_wire::Question::QueueComplete {
+                    id: "c".repeat(64),
+                    audit_seq: 0,
+                },
+                "queue_complete",
+            ),
+            (
+                xudo_wire::Question::QueueRelease { id: "d".repeat(64) },
+                "queue_release",
+            ),
+            (
+                xudo_wire::Question::QueueListPage {
+                    after: String::new(),
+                },
+                "queue_list_page",
+            ),
             (
                 xudo_wire::Question::Answer {
                     id: "a".repeat(64),

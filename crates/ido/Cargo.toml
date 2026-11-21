@@ -1,6 +1,6 @@
 [package]
 name = "ido"
-description = "Buffered human-run command queue: an agent queues what it cannot or should not run, the human picks and runs it in their own terminal. No root, no broker, no policy engine."
+description = "Buffered human-run command queue: an agent queues what it cannot or should not run, the human picks and runs it in their own terminal. The user-side queue needs no broker. The root-held queue is listed from the broker and runs through xudo exec --queued."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 xudo-audit = { path = "../xudo-audit", version = "0.1.0-beta.1" }
 xudo-config = { path = "../xudo-config", version = "0.1.0-beta.1" }
+xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
