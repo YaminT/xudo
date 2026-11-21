@@ -22,7 +22,7 @@ use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
     AuditError, AuditSink, CgroupCalls, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool,
-    SpoolError, Syscalls, authorize,
+    SpoolError, SysError, Syscalls, authorize,
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
@@ -438,15 +438,44 @@ fn queue_ask_human(
                 );
             }
         };
+    let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
+    let boot_id = entry.boot_id.clone();
+    let pruned =
+        match crate::queue::plan_admission(queue, &entry, entry.queued_at, ttl_ms, &boot_id) {
+            Ok(pruned) => pruned,
+            Err(crate::queue::StoreError::Full) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(RefusalCode::SpoolFull, "queue capacity reached"),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+            Err(error) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+        };
+    // Audit the admission and every prune before anything is deleted or
+    // published. A failed audit leaves the store untouched.
     let record = platform.audit.append(&|previous| {
-        decided(
-            previous,
-            decision,
-            caller,
-            identity,
-            request,
-            &policy.rules.generation,
-            None,
+        crate::record::with_queue_id(
+            decided(
+                previous,
+                decision,
+                caller,
+                identity,
+                request,
+                &policy.rules.generation,
+                None,
+            ),
+            &entry.id,
         )
     });
     if let Err(error) = record {
@@ -458,33 +487,22 @@ fn queue_ask_human(
             Some(request),
         );
     }
-    let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
-    let pruned = match crate::queue::admit(queue, &entry, entry.queued_at, ttl_ms) {
-        Ok(pruned) => pruned,
-        Err(crate::queue::StoreError::Full) => {
-            return refuse(
-                conn,
-                platform.audit,
-                &Refusal::broker(RefusalCode::SpoolFull, "queue capacity reached"),
-                Some(identity),
-                Some(request),
-            );
-        }
-        Err(error) => {
-            return refuse(
-                conn,
-                platform.audit,
-                &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
-                Some(identity),
-                Some(request),
-            );
-        }
-    };
     if !audit_queue_pruned(platform.audit, &pruned) {
         return refuse(
             conn,
             platform.audit,
             &Refusal::broker(RefusalCode::BrokerUnusable, "queue pruning audit failed"),
+            Some(identity),
+            Some(request),
+        );
+    }
+    if let Err(error) =
+        crate::queue::commit_admission(queue, &entry, &pruned, entry.queued_at, ttl_ms, &boot_id)
+    {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
             Some(identity),
             Some(request),
         );
@@ -496,6 +514,19 @@ fn queue_ask_human(
     )
 }
 
+/// The boot id a queue operation may stamp onto an entry.
+///
+/// An unreadable id keeps the syscall error. A value that is not a lowercase
+/// UUID is refused here too, so a seam that returns one cannot publish it.
+fn boot_id_for_queue(read: Result<String, SysError>) -> Result<String, String> {
+    let id = read.map_err(|error| error.to_string())?;
+    if xudo_wire::is_boot_id(&id) {
+        Ok(id)
+    } else {
+        Err("boot id is not a lowercase uuid".to_owned())
+    }
+}
+
 fn queue_entry_from_request(
     platform: &Platform<'_>,
     identity: &PeerIdentity,
@@ -504,6 +535,9 @@ fn queue_entry_from_request(
     caller: &CallerFacts,
     policy: &LoadedPolicy,
 ) -> Result<crate::queue::QueueEntry, String> {
+    // A missing or malformed boot id refuses before a nonce is drawn, so a
+    // refusal does not spend entropy and nothing is queued without a boot id.
+    let boot_id = boot_id_for_queue(platform.syscalls.boot_id())?;
     let id = draw_nonce(platform.entropy).map_err(|error| error.to_string())?;
     let xudo_wire::Question::Run {
         program, argv, cwd, ..
@@ -534,6 +568,8 @@ fn queue_entry_from_request(
     crate::queue::QueueEntry::new(crate::queue::QueueEntry {
         id,
         argv: command,
+        // Agent-supplied and display-only. A queued command is never started
+        // from this path; Q1c reads `/proc/<pid>/cwd` through the pidfd.
         cwd: cwd.clone(),
         harness: agent_id.clone(),
         uid: identity.uid,
@@ -543,6 +579,7 @@ fn queue_entry_from_request(
         expires_at: queued_at.saturating_add(ttl_ms),
         reason: None,
         state: crate::queue::QueueState::Pending,
+        boot_id,
     })
     .map_err(|error| error.to_string())
 }
@@ -604,7 +641,16 @@ fn serve_queue_list(
     };
     let now = platform.clock.boottime_millis();
     let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
-    let pruned = match crate::queue::prune(store, now, ttl_ms) {
+    let Ok(boot_id) = boot_id_for_queue(platform.syscalls.boot_id()) else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "boot id is unavailable"),
+            Some(identity),
+            Some(request),
+        );
+    };
+    let pruned = match crate::queue::prune(store, now, ttl_ms, &boot_id) {
         Ok(ids) => ids,
         Err(error) => {
             return refuse(
@@ -2997,6 +3043,11 @@ mod tests {
         }
     }
 
+    fn with_test_boot(mut host: Host) -> Host {
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        host
+    }
+
     fn ask_human_fixture() -> (Host, PeerIdentity, BrokerRequest) {
         const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
         const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n";
@@ -3018,6 +3069,7 @@ mod tests {
         loaded.queue_ttl_secs = 60;
         loaded.passwd = b"agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_vec();
         let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
         host.policy.answer = Ok(loaded);
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
@@ -3951,6 +4003,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id };
         entry.attested_scope_id = Some(scope_id);
         entry.boot_id = Some(BOOT_ID.to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
         (spool, entry)
@@ -4026,6 +4079,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         approved.attested_scope_id = Some(44);
         approved.boot_id = Some(BOOT_ID.to_owned());
+        approved.attested_harness = Some("codex".to_owned());
         let spool =
             FakeSpool::new().with_file(id.as_bytes().to_vec(), approved.to_json().into_bytes());
         let before = spool.files()[id.as_bytes()].clone();
@@ -4045,6 +4099,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::Human;
         entry.attested_scope_id = None;
         entry.boot_id = None;
+        entry.attested_harness = None;
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
         let before = spool.files()[NONCE.as_bytes()].clone();
@@ -4397,7 +4452,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let entry = shown_entry();
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.confirmations = live_confirmation_store();
         let status_request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -4505,6 +4560,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             id: NONCE.to_owned(),
             argv: vec![b"/usr/bin/true".to_vec()],
             cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
             harness: "codex".to_owned(),
             uid: UID,
             rule_id: "xudo.test.run".to_owned(),
@@ -4518,7 +4574,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             format!("{}.json", record.id).into_bytes(),
             serde_json::to_vec(&record).unwrap(),
         );
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.queue = store;
         let request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -4537,7 +4593,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
         let mut other_owner = record;
         other_owner.uid = UID.saturating_add(1);
-        let mut other_host = Host::honest();
+        let mut other_host = with_test_boot(Host::honest());
         other_host.queue = FakeSpool::new().with_file(
             format!("{}.json", other_owner.id).into_bytes(),
             serde_json::to_vec(&other_owner).unwrap(),
@@ -4566,6 +4622,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             id: format!("{:064x}", index + 1),
             argv: vec![b"/usr/bin/true\x1b[2J".to_vec()],
             cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
             harness: "codex".to_owned(),
             uid: 1001,
             rule_id: "xudo.test.run".to_owned(),
@@ -4629,7 +4686,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Served::Refused(Fault::Broker)
         );
 
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.queue = FakeSpool::new()
             .failing_names_on_call(2, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
@@ -4638,7 +4695,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Served::Refused(Fault::Broker)
         );
 
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.queue =
             FakeSpool::new().failing_lock(SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
@@ -4651,6 +4708,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             id: NONCE.to_owned(),
             argv: vec![b"/usr/bin/true".to_vec()],
             cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
             harness: "codex".to_owned(),
             uid: UID,
             rule_id: "xudo.test.run".to_owned(),
@@ -4660,7 +4718,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             reason: None,
             state: crate::queue::QueueState::Pending,
         };
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.audit = FakeAuditSink::failing("audit unavailable");
         host.queue = FakeSpool::new().with_file(
             format!("{}.json", expired.id),
@@ -4672,7 +4730,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Served::Refused(Fault::Broker)
         );
 
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.queue = FakeSpool::new().with_file(
             format!("{}.json", expired.id),
             serde_json::to_vec(&expired).unwrap(),
@@ -4767,9 +4825,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
         assert!(decision.action.is_some());
 
-        let mut no_randomness = Host::honest();
+        // A readable boot id reaches the nonce. The refusal is the entropy
+        // error, not the boot-id check that returns first.
+        let (mut no_randomness, _, _) = ask_human_fixture();
         no_randomness.entropy = FakeEntropy::new().with(Err(SysError::unsupported("getrandom")));
-        assert!(
+        assert_eq!(
             queue_entry_from_request(
                 &no_randomness.platform(),
                 &identity,
@@ -4778,7 +4838,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &caller,
                 &policy,
             )
-            .is_err()
+            .unwrap_err(),
+            "getrandom is not supported on this platform"
         );
 
         let not_run = BrokerRequest {
@@ -4848,6 +4909,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 id: format!("{index:064x}"),
                 argv: vec![b"/usr/bin/true".to_vec()],
                 cwd: b"/srv".to_vec(),
+                boot_id: TEST_BOOT.to_owned(),
                 harness: "codex".to_owned(),
                 uid: identity.uid,
                 rule_id: "xudo.test.run".to_owned(),
@@ -4922,6 +4984,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             id: "ef".repeat(32),
             argv: vec![b"/usr/bin/true".to_vec()],
             cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
             harness: "codex".to_owned(),
             uid: UID,
             rule_id: "xudo.test.run".to_owned(),
@@ -4960,6 +5023,176 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             ),
             Served::Refused(Fault::Broker)
         );
+        // The stale file was never audited, so it stays. Deleting it would
+        // drop a request with no audit record. The new entry is not published.
+        let left = crate::queue::load_all(&store).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, stale.id);
+    }
+
+    #[test]
+    fn an_admission_audit_failure_publishes_nothing() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_queue_publish_failure_after_the_audit_leaves_the_store_empty() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.queue = FakeSpool::new().failing_publish(SpoolError::Gone {
+            name: "publish".to_owned(),
+        });
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_queued_entry_is_linked_to_its_audit_record_by_id() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_request(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                identity,
+                request,
+            ),
+            Served::Decided
+        );
+        let queued = crate::queue::load_all(&host.queue).unwrap();
+        assert_eq!(queued.len(), 1);
+        let marker = format!("queue_id={}", queued[0].id);
+        let mut linked = false;
+        for record in host.audit.records() {
+            for item in &record.evidence {
+                if item == &marker {
+                    linked = true;
+                }
+            }
+        }
+        assert!(linked);
+    }
+
+    #[test]
+    fn queue_entry_refuses_an_unreadable_or_malformed_boot_id() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.syscalls = FakeSyscalls::new();
+        assert_eq!(
+            queue_entry_from_request(
+                &host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            )
+            .unwrap_err(),
+            "fake: no boot id scripted is not supported on this platform"
+        );
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok("not-a-uuid".to_owned()));
+        assert_eq!(
+            queue_entry_from_request(
+                &host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            )
+            .unwrap_err(),
+            "fake: malformed boot id is not supported on this platform"
+        );
+    }
+
+    #[test]
+    fn boot_id_for_queue_rejects_an_error_and_a_malformed_id() {
+        let missing = SysError::unsupported("fake: no boot id scripted");
+        assert_eq!(
+            boot_id_for_queue(Err(missing)).unwrap_err(),
+            "fake: no boot id scripted is not supported on this platform"
+        );
+        assert_eq!(
+            boot_id_for_queue(Ok("not-a-uuid".to_owned())).unwrap_err(),
+            "boot id is not a lowercase uuid"
+        );
+        assert_eq!(
+            boot_id_for_queue(Ok(TEST_BOOT.to_owned())).unwrap(),
+            TEST_BOOT
+        );
+    }
+
+    #[test]
+    fn queue_list_refuses_an_unreadable_or_malformed_boot_id() {
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let mut host = Host::honest();
+        host.queue = FakeSpool::new();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        // Broker faults stay off the wire. The audit record carries the reason.
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        assert_eq!(refusal_detail(&answer), None);
+        assert!(
+            host.audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("detail=boot id is unavailable")
+        );
+
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok("not-a-uuid".to_owned()));
+        host.queue = FakeSpool::new();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        assert_eq!(refusal_detail(&answer), None);
+        assert!(
+            host.audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("detail=boot id is unavailable")
+        );
     }
 
     #[test]
@@ -4973,6 +5206,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             id: NONCE.to_owned(),
             argv: vec![b"/usr/bin/true".to_vec()],
             cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
             harness: "codex".to_owned(),
             uid: identity.uid,
             rule_id: "xudo.test.run".to_owned(),
@@ -6828,6 +7062,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         let mut scoped_identity = identity.clone();
         scoped_identity.cgroup_id = Some(44);
         let wrong_boot = xudo_sys::FakeSyscalls::new()
@@ -9521,13 +9756,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
     }
 
     /// What the broker stores at mint for a human or an unattested caller.
     fn stored_as(entry: &mut PendingRequest, class: xudo_gate::request::AttestedClass) {
+        match &class {
+            xudo_gate::request::AttestedClass::EnrolledAgent { scope_id } => {
+                entry.attested_scope_id = Some(*scope_id);
+                entry.boot_id = Some(TEST_BOOT.to_owned());
+                entry.attested_harness = Some("codex".to_owned());
+            }
+            xudo_gate::request::AttestedClass::Human
+            | xudo_gate::request::AttestedClass::Unattested => {
+                entry.attested_scope_id = None;
+                entry.boot_id = None;
+                entry.attested_harness = None;
+            }
+        }
         entry.attested_class = class;
-        entry.attested_scope_id = None;
-        entry.boot_id = None;
     }
 
     fn freeze_request() -> BrokerRequest {
@@ -10403,6 +10650,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             attested_class: xudo_gate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -10714,12 +10962,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     fn class_label(class: &xudo_gate::request::AttestedClass) -> &'static str {
-        stored_caller(&PendingRequest {
-            attested_class: class.clone(),
-            ..shown_entry()
-        })
-        .classification
-        .label()
+        let mut entry = shown_entry();
+        stored_as(&mut entry, class.clone());
+        stored_caller(&entry).classification.label()
     }
 
     fn stored_state(spool: &FakeSpool) -> Option<xudo_gate::request::ConfirmationState> {
@@ -10887,7 +11132,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn the_engine_ignores_the_stored_callers_placeholder_names() {
+    fn a_stored_session_name_does_not_change_the_decision() {
         use xudo_policy::Classification;
         let policy = policy();
         let entry = enrolled_entry(NONCE, UID);
@@ -10895,10 +11140,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let baseline = stored_caller(&entry);
         let expected = decide(&policy, &baseline, &request);
         for yolo in [false, true] {
-            for (agent, session) in [("scope-44", "stored"), ("", ""), ("root", "other")] {
+            for session in ["stored", "other-session"] {
                 let mut caller = baseline.clone();
                 caller.classification = Classification::EnrolledAgent {
-                    agent_id: agent.to_owned(),
+                    agent_id: "codex".to_owned(),
                     session_id: session.to_owned(),
                     declared_yolo: yolo,
                 };
@@ -10907,6 +11152,34 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 assert_eq!(got.denial, expected.denial);
             }
         }
+    }
+
+    #[test]
+    fn stored_caller_uses_the_registry_label_and_refuses_a_missing_one() {
+        use xudo_policy::Classification;
+        let mut entry = enrolled_entry(NONCE, UID);
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        entry.attested_harness = None;
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            }
+        );
+        entry.attested_harness = Some(String::new());
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            }
+        );
     }
 
     #[test]

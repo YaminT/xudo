@@ -407,6 +407,7 @@ mod tests {
             attested_class: xudo_gate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -508,6 +509,7 @@ mod tests {
         if let xudo_gate::request::AttestedClass::EnrolledAgent { scope_id } = &class {
             request.attested_scope_id = Some(*scope_id);
             request.boot_id = Some(BOOT.to_owned());
+            request.attested_harness = Some("codex".to_owned());
         }
         request.attested_class = class;
         assert!(mark_shown(&mut request, watcher(), 1_000));
