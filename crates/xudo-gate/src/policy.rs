@@ -238,7 +238,9 @@ fn settings_of(config: &ConfigSettings) -> Settings {
 fn queue_ttl_seconds(value: &Value) -> u64 {
     match value {
         Value::Integer(seconds) => *seconds,
-        _ => 24 * 60 * 60,
+        // A value that is not an integer never reaches this through the TOML
+        // parser. If it does, the shortest lifetime expires every entry.
+        _ => 0,
     }
 }
 
@@ -308,8 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_lifetime_falls_back_for_a_value_with_the_wrong_shape() {
-        assert_eq!(queue_ttl_seconds(&Value::Bool(false)), 24 * 60 * 60);
+    fn a_wrong_typed_queue_lifetime_fails_closed_to_the_shortest_ttl() {
+        assert_eq!(queue_ttl_seconds(&Value::Bool(false)), 0);
+        assert_eq!(queue_ttl_seconds(&Value::Text("slow".to_owned())), 0);
+        assert_eq!(queue_ttl_seconds(&Value::Integer(300)), 300);
     }
 
     #[test]
