@@ -20,6 +20,7 @@ xudo-gate = { path = "../xudo-gate", version = "0.1.0-beta.1" }
 xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 xudo-sys = { path = "../xudo-sys", version = "0.1.0-beta.1" }
 xudo-wire = { path = "../xudo-wire", version = "0.1.0-beta.1" }
+term-sanitize = { path = "../term-sanitize", version = "0.1.0-beta.1" }
 sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true

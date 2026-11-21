@@ -1006,6 +1006,7 @@ args = [
             attested_class: crate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -1225,6 +1226,7 @@ args = [
                 policy: Ok(LoadedPolicy {
                     rules: rules(),
                     settings: engine::Settings::default(),
+                    queue_ttl_secs: 24 * 60 * 60,
                     passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
                 }),
                 spool: Ok(Rc::clone(spool)),
@@ -1443,6 +1445,7 @@ args = [
         agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
         agent.attested_scope_id = Some(90);
         agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        agent.attested_harness = Some("codex".to_owned());
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::MissingAgentFacts;
@@ -1495,6 +1498,7 @@ args = [
         agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
         agent.attested_scope_id = Some(90);
         agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        agent.attested_harness = Some("codex".to_owned());
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::Agent;
@@ -1726,6 +1730,7 @@ all = [{ any-arg = ["restart"] }]
         host.policy = Ok(LoadedPolicy {
             rules: changed,
             settings: engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
             passwd: Vec::new(),
         });
         let exit = run(&mut host, &auth());
@@ -2078,6 +2083,7 @@ all = [{ any-arg = ["restart"] }]
         request.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         request.attested_scope_id = Some(44);
         request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        request.attested_harness = Some("codex".to_owned());
         refused_for_class(request);
     }
 

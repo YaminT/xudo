@@ -312,23 +312,28 @@ pub(crate) fn entry_for_classified(
     let Some((program, argv, claimed_classification)) = request.run_fields() else {
         return Err(MintError::NoAction);
     };
-    let (attested_class, attested_scope_id, boot_id) = match &caller.classification {
-        Classification::Unattested { .. } => (AttestedClass::Unattested, None, None),
-        Classification::Human => (AttestedClass::Human, None, None),
-        Classification::EnrolledAgent { .. } => {
-            let Some(scope_id) = identity.cgroup_id else {
-                return Err(MintError::NoAttestedScope);
-            };
-            let Some(boot_id) = boot_id.filter(|id| is_boot_id(id)) else {
-                return Err(MintError::NoAttestedScope);
-            };
-            (
-                AttestedClass::EnrolledAgent { scope_id },
-                Some(scope_id),
-                Some(boot_id.to_owned()),
-            )
-        }
-    };
+    let (attested_class, attested_scope_id, boot_id, attested_harness) =
+        match &caller.classification {
+            Classification::Unattested { .. } => (AttestedClass::Unattested, None, None, None),
+            Classification::Human => (AttestedClass::Human, None, None, None),
+            Classification::EnrolledAgent { agent_id, .. } => {
+                let Some(scope_id) = identity.cgroup_id else {
+                    return Err(MintError::NoAttestedScope);
+                };
+                let Some(boot_id) = boot_id.filter(|id| is_boot_id(id)) else {
+                    return Err(MintError::NoAttestedScope);
+                };
+                if !xudo_policy::valid_harness_label(agent_id) {
+                    return Err(MintError::NoAttestedScope);
+                }
+                (
+                    AttestedClass::EnrolledAgent { scope_id },
+                    Some(scope_id),
+                    Some(boot_id.to_owned()),
+                    Some(agent_id.clone()),
+                )
+            }
+        };
     Ok(PendingRequest {
         schema_version: REQUEST_SCHEMA_VERSION,
         nonce,
@@ -357,6 +362,7 @@ pub(crate) fn entry_for_classified(
         attested_class,
         attested_scope_id,
         boot_id,
+        attested_harness,
     })
 }
 
@@ -627,6 +633,7 @@ mod tests {
             attested_class: AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -777,6 +784,7 @@ mod tests {
                 attested_class: AttestedClass::Unattested,
                 attested_scope_id: None,
                 boot_id: None,
+                attested_harness: None,
             }
         );
     }
@@ -917,6 +925,36 @@ mod tests {
             entry.boot_id.as_deref(),
             Some("abcdef01-2345-6789-abcd-ef0123456789")
         );
+        assert_eq!(entry.attested_harness.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn an_enrolled_class_without_a_registry_label_is_not_minted() {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = Some(77);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: String::new(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        let minted = entry_for_classified(
+            &permitted(),
+            &AttestedCaller {
+                identity: &peer,
+                facts: &caller,
+                boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            },
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        );
+        assert_eq!(minted, Err(MintError::NoAttestedScope));
     }
 
     #[test]

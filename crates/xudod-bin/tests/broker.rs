@@ -54,6 +54,7 @@ fn refusal_of(answer: &Answer) -> Option<RefusalCode> {
         Answer::Decided { .. }
         | Answer::Pending { .. }
         | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
         | Answer::Done => None,
     }
 }

@@ -116,6 +116,34 @@ pub fn record_identity_registered(
     record_identity(bytes, name, uid, boot_id, now_boottime_ms)
 }
 
+/// The registry label a committed record still attests, if it attests one.
+///
+/// The gate copies this into the caller facts it gives the policy engine. A
+/// record that does not attest returns nothing, and the caller stays
+/// unattested rather than being named `scope-N`.
+pub fn attested_harness_label(
+    bytes: &[u8],
+    uid: u32,
+    registry: &HarnessRegistry,
+    passwd: &str,
+) -> Option<String> {
+    let record: SessionRecord = serde_json::from_slice(bytes).ok()?;
+    if record.uid != uid || !xudo_policy::valid_harness_label(&record.label) {
+        return None;
+    }
+    let resolve = |account: &str| passwd_uid(passwd, account);
+    if !registry.attests(
+        &record.label,
+        record.way,
+        &record.registry_entry_hash,
+        uid,
+        &resolve,
+    ) {
+        return None;
+    }
+    Some(record.label)
+}
+
 fn valid_committed_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix("agent-") else {
         return false;
@@ -154,6 +182,30 @@ mod tests {
         assert_eq!(
             record.as_ref().map(|value| value.label.as_str()),
             Some("codex")
+        );
+    }
+
+    #[test]
+    fn attested_harness_label_is_the_registry_label_only_when_the_record_attests() {
+        const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+        let (bytes, registry) = registered_record(4);
+        assert_eq!(
+            attested_harness_label(bytes.as_bytes(), 1000, &registry, PASSWD).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(attested_harness_label(b"{}", 1000, &registry, PASSWD), None);
+        assert_eq!(
+            attested_harness_label(bytes.as_bytes(), 1001, &registry, PASSWD),
+            None
+        );
+        let uppercase = bytes.replace("\"label\":\"codex\"", "\"label\":\"Codex\"");
+        assert_eq!(
+            attested_harness_label(uppercase.as_bytes(), 1000, &registry, PASSWD),
+            None
+        );
+        assert_eq!(
+            attested_harness_label(RECORD.as_bytes(), 1000, &registry, PASSWD),
+            None
         );
     }
 

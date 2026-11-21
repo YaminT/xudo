@@ -802,6 +802,7 @@ all = [
             attested_class: crate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -1070,6 +1071,7 @@ all = [
         pending.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         pending.attested_scope_id = Some(44);
         pending.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        pending.attested_harness = Some("codex".to_owned());
         let caller = GateCaller {
             pin: CallerPin::new(77, 555),
             facts: CallerFacts::new(

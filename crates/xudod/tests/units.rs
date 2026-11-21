@@ -489,6 +489,7 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
             ["d", CONFIRM_DIR, "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
+            ["d", "/var/lib/xudo/queue", "0700", "root", "root", "-", "-"],
             [
                 "f",
                 "/var/lib/xudo/audit.jsonl",

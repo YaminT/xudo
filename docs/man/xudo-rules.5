@@ -135,17 +135,24 @@ exist for the child.
 .TP
 .B harness
 Labels from the root-owned harness registry. Without this key, an action is
-never eligible for the planned harness path. At this stage the field is
-metadata only: every command still requires the human password path.
+eligible for a verified harness only when the broker's kernel classification
+and root-owned registry agree on that label. A listed label is not proof of
+identity by itself.
 .TP
 .B outcome
-The planned harness outcome,
+The outcome for a verified harness named by
+.B harness :
 .B allow
-or
-.BR ask-human .
-Defaults to
-.BR allow .
-Neither value changes execution in this release.
+uses the normal policy path; this is the default. The
+.B ask-human
+outcome submits the request to the broker's root-held queue and denies the
+current request. For this outcome, the action must list the caller's verified
+harness label; an empty or different list does not queue it. A human-path
+denial is never queued. A command with no matching rule is denied. Queue
+execution through the password-authenticated
+gate and the
+.B ido
+display are planned for a later step.
 .SH TESTS
 A rule file may carry
 .B [[test]]

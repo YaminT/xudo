@@ -17,6 +17,7 @@ fuzz_target!(|data: &[u8]| {
         Question::Run { .. } | Question::Status { .. } | Question::Watch
         | Question::Answer { .. } | Question::Freeze { .. } | Question::Thaw
         | Question::Pending => {}
+        | Question::QueueList => {}
     }
     assert!(data.len() <= MAX_REQUEST_BYTES);
 

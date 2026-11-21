@@ -163,17 +163,14 @@ pub enum ConfirmPolicy {
     Never,
 }
 
-/// What a matching harness rule would do, once a passwordless grant exists.
-///
-/// Parsed and stored now. It does not change a decision, and a human's verdict
-/// does not depend on it.
+/// What a matching harness rule does when the verified harness requests it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-    /// The planned passwordless outcome for a listed harness. The default.
+    /// Permit the verified harness when all other policy checks pass. The default.
     #[default]
     Allow,
-    /// The planned outcome that asks a reviewer. Not queued yet.
+    /// Deny the current request and submit it to the root-held human review queue.
     AskHuman,
 }
 
@@ -220,10 +217,13 @@ pub struct Action {
     /// the child.
     #[serde(default)]
     pub env_allow: Vec<String>,
-    /// Harness labels that may one day run this without a password.
+    /// Harness labels this action names.
     ///
-    /// Absent means never passwordless. A label that is not in the registry
-    /// fails the combined load. The grant itself is not armed.
+    /// For [`Outcome::Allow`], a label is the planned passwordless path and
+    /// no such grant is armed. Absent means never passwordless. For
+    /// [`Outcome::AskHuman`] the list is required: it is the only set of
+    /// enrolled agents the action queues, and an empty or missing list fails
+    /// to load. A label that is not in the registry fails the combined load.
     #[serde(default)]
     pub harness: Vec<String>,
     /// The planned outcome for a listed harness. Default [`Outcome::Allow`].
@@ -413,6 +413,15 @@ pub enum RuleSetError {
         id: String,
         /// The label.
         label: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// `outcome = "ask-human"` with no harness would match nobody and, if the
+    /// engine fell through, would confirm an enrolled agent instead of denying.
+    #[error("action {id} at {at}: outcome \"ask-human\" requires a non-empty harness list")]
+    AskHumanWithoutHarness {
+        /// The offending action.
+        id: String,
         /// Where it is defined.
         at: Source,
     },
@@ -868,6 +877,12 @@ fn validate_action_harness(action: &Action) -> Result<(), RuleSetError> {
             at: action.source.clone(),
         });
     }
+    if action.outcome == Outcome::AskHuman && action.harness.is_empty() {
+        return Err(RuleSetError::AskHumanWithoutHarness {
+            id: action.id.as_str().to_owned(),
+            at: action.source.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -1029,6 +1044,60 @@ harness = [\"codex\"]
         listed.harness = vec!["codex".into(), "codex".into()];
         listed.outcome = Outcome::Allow;
         assert!(RuleSet::load(vec![listed]).is_err());
+    }
+
+    #[test]
+    fn ask_human_without_a_harness_list_fails_to_load() {
+        let mut bare = action("xudo.svc.restart");
+        bare.outcome = Outcome::AskHuman;
+        let error = RuleSet::load(vec![bare]).unwrap_err();
+        let at = Source::new("20-services.toml", 3);
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: at.clone(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "action xudo.svc.restart at {at}: outcome \"ask-human\" requires a non-empty harness list"
+            )
+        );
+
+        let missing = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+outcome = \"ask-human\"
+";
+        let error = RuleSet::from_toml("20.toml", missing).unwrap_err();
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: Source::new("20.toml", 2),
+            }
+        );
+
+        let empty = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+harness = []
+outcome = \"ask-human\"
+";
+        let error = RuleSet::from_toml("20.toml", empty).unwrap_err();
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: Source::new("20.toml", 2),
+            }
+        );
     }
 
     #[test]
