@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::os::unix::process::ExitStatusExt;
+
 /// `PATH` as the caller exported it, handed to the library as data.
 ///
 /// The workspace bans reading the environment because, in a decision path, it
@@ -60,6 +62,40 @@ fn exec(
     exit_status(19)
 }
 
+/// `xudo exec --queued`: claim, spawn the gate in `/`, then complete or release.
+///
+/// Always a child. An in-place exec would replace this process before it could
+/// tell the broker how the run ended, and the stored directory is the agent's.
+fn exec_queued(
+    cli: &xudo::Cli,
+    id: &str,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> std::process::ExitCode {
+    let run = match xudo::exec::plan_queued_live(cli, id, out, err) {
+        Ok(run) => run,
+        Err(status) => return exit_status(status.as_i32()),
+    };
+    #[allow(clippy::disallowed_methods)]
+    let mut command = std::process::Command::new(run.plan.backend);
+    command.arg(run.plan.gate);
+    command.current_dir(run.cwd);
+    match command.status() {
+        Ok(status) => {
+            let _ = xudo::exec::finish_queued_live(&run.id, true, err);
+            let code = status
+                .code()
+                .or(status.signal().and_then(|n| n.checked_add(128)));
+            exit_status(code.unwrap_or(19))
+        }
+        Err(error) => {
+            let _ = writeln!(err, "xudo: cannot run {}: {error}", run.plan.backend);
+            let _ = xudo::exec::finish_queued_live(&run.id, false, err);
+            exit_status(19)
+        }
+    }
+}
+
 fn exit_status(status: i32) -> std::process::ExitCode {
     // Falls back to "xudo is unusable" rather than 0 if the status ever exceeds
     // a u8, so an unexpected value can never be read as success.
@@ -73,7 +109,10 @@ fn main() -> std::process::ExitCode {
     };
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
-    if let xudo::Command::Exec { argv } = &cli.command {
+    if let xudo::Command::Exec { argv, queued } = &cli.command {
+        if let Some(id) = queued {
+            return exec_queued(&cli, id, &mut out, &mut err);
+        }
         return exec(&cli, argv, &mut out, &mut err);
     }
     let status = xudo::run(&cli, &invocation, &mut out, &mut err);

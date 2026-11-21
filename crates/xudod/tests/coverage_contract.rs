@@ -76,6 +76,7 @@ fn dependency_policy_wire_and_spool_paths_are_exercised() {
     let invalid_queue = BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
         answer: Answer::QueueListed {
+            next: None,
             entries: vec![xudo_wire::QueueListEntry {
                 id: "bad".to_owned(),
                 argv: vec!["/usr/bin/true".to_owned()],

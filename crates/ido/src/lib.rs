@@ -10,9 +10,11 @@
 //! `xudo` fights impersonation: the agent owns `xudo`'s stdin, stdout, and
 //! pty, so confirmation needs a root broker and an out-of-band channel. `ido`
 //! sidesteps all of it — the human is already the one running the program.
-//! **`ido` needs no root, no cgroups, no broker, and no policy engine.** It
-//! gates on *consequence*, not privilege: `aws s3 rm` against the prod profile
-//! needs no uid 0 and still deserves a human.
+//! **The user-side queue needs no root, no cgroups, no broker, and no policy
+//! engine.** It gates on *consequence*, not privilege: `aws s3 rm` against the
+//! prod profile needs no uid 0 and still deserves a human. The root-held queue
+//! is a separate list the broker already filtered; `ido` displays it and runs
+//! an entry only as `xudo exec --queued`, which asks for the password.
 //!
 //! # The queue file is untrusted input
 //!
@@ -42,6 +44,7 @@ pub mod error;
 pub mod keys;
 pub mod picker;
 pub mod render;
+pub mod root_queue;
 pub mod run;
 pub mod status;
 pub mod store;
@@ -52,4 +55,8 @@ pub use cli::{
 pub use entry::{Entry, QUEUE_SCHEMA_VERSION};
 pub use error::IdoError;
 pub use picker::Terminal;
+pub use root_queue::{
+    QueuePage, RootView, append_page, parse_queue_page, parse_release_answer,
+    queue_list_page_request, queue_list_request, queue_release_request, queued_exec_command,
+};
 pub use status::Status;

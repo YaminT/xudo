@@ -111,6 +111,15 @@ pub trait AuditSink {
         build: &dyn Fn(Option<&Record>) -> Record,
         check: &dyn Fn(&Record) -> Result<(), AuditError>,
     ) -> Result<AuditReceipt, AuditError>;
+
+    /// Every record on the trail, in order.
+    ///
+    /// A missing log is an empty trail. The read does not create the file.
+    ///
+    /// # Errors
+    ///
+    /// An [`AuditError`] when the log cannot be trusted or read.
+    fn snapshot(&self) -> Result<Vec<Record>, AuditError>;
 }
 
 /// A copy of each record, sent once the log holds it on disk and before the
@@ -287,6 +296,10 @@ impl AuditSink for AuditTrail {
             .write(build, check, &mut publish)
             .map(|record| AuditReceipt::of(&record))
     }
+
+    fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+        self.log.snapshot()
+    }
 }
 
 impl AuditSink for JsonlLog {
@@ -297,6 +310,10 @@ impl AuditSink for JsonlLog {
     ) -> Result<AuditReceipt, AuditError> {
         self.write(build, check, &mut |_| Ok(()))
             .map(|record| AuditReceipt::of(&record))
+    }
+
+    fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+        self.read_snapshot()
     }
 }
 
@@ -378,6 +395,10 @@ impl AuditSink for FakeAuditSink {
         let receipt = AuditReceipt::of(&record);
         self.records.push(record);
         Ok(receipt)
+    }
+
+    fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+        Ok(self.records.clone())
     }
 }
 
@@ -582,6 +603,7 @@ mod tests {
         assert_eq!(authorized.receipt().seq(), Sequence::first());
         assert_eq!(authorized.receipt().decision(), Decision::Allowed);
         assert_eq!(authorized.receipt().hash(), sink.records()[0].hash);
+        assert_eq!(sink.snapshot().unwrap(), sink.records());
         let (approval, receipt) = authorized.into_parts();
         assert_eq!(approval, Grant("/usr/bin/true"));
         assert_eq!(receipt.seq().get(), 1);
