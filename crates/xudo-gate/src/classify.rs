@@ -90,8 +90,11 @@ mod tests {
             90,
             BOOT.to_owned(),
             1000,
+            &registry(),
+            PASSWD,
         );
         assert_eq!(live.attested_class, AttestedClass::Human);
+        assert_eq!(live.facts.classification, Classification::Human);
         assert_eq!(live.scope_id, None);
         assert_eq!(live.boot_id, None);
     }
@@ -314,11 +317,58 @@ mod tests {
         );
         assert_eq!(result.scope_id, Some(90));
         assert_eq!(result.boot_id.as_deref(), Some(BOOT));
-        assert!(matches!(
-            &result.facts.classification,
-            Classification::EnrolledAgent { session_id, .. }
-                if session_id == &format!("{NAME}.scope")
-        ));
+        assert_eq!(
+            result.facts.classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: format!("{NAME}.scope"),
+                declared_yolo: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_scope_without_a_registry_label_is_not_an_enrolled_agent() {
+        let live = super::registered_scope(
+            xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: format!("{NAME}.scope"),
+                record: b"{}".to_vec(),
+            },
+            90,
+            BOOT.to_owned(),
+            1000,
+            &registry(),
+            PASSWD,
+        );
+        assert_eq!(live.attested_class, AttestedClass::Unattested);
+        assert_eq!(live.scope_id, None);
+        assert_eq!(
+            live.facts.classification,
+            Classification::Unattested {
+                reason: "agent scope record does not match the current harness registry".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_watch_kind_scope_stays_on_the_human_path() {
+        let live = super::registered_scope(
+            xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Watch,
+                name: format!("{WATCH_NAME}.scope"),
+                record: record(1000, BOOT, 200),
+            },
+            90,
+            BOOT.to_owned(),
+            1000,
+            &registry(),
+            PASSWD,
+        );
+        assert_eq!(live.attested_class, AttestedClass::Human);
+        assert_eq!(live.facts.classification, Classification::Human);
+        assert_eq!(live.scope_id, None);
+        assert_eq!(live.boot_id, None);
     }
 
     #[test]
@@ -799,7 +849,7 @@ pub fn classify_with_registry(
         crate::record_identity_registered(bytes, name, uid, &boot_id, now, registry, passwd)
     };
     match scope_status(cgroups, cgroup.id, uid, &parse) {
-        Ok(Some(scope)) => registered_scope(scope, cgroup.id, boot_id, uid),
+        Ok(Some(scope)) => registered_scope(scope, cgroup.id, boot_id, uid, registry, passwd),
         Ok(None) => {
             let in_slice = std::path::Path::new(&cgroup.path).starts_with("/xudo.slice");
             if in_slice { unattested() } else { human() }
@@ -808,12 +858,35 @@ pub fn classify_with_registry(
     }
 }
 
-fn registered_scope(scope: Scope, cgroup_id: u64, boot_id: String, uid: u32) -> LiveClass {
+fn registered_scope(
+    scope: Scope,
+    cgroup_id: u64,
+    boot_id: String,
+    uid: u32,
+    registry: &HarnessRegistry,
+    passwd: &str,
+) -> LiveClass {
     if scope.kind == ScopeKind::Agent {
+        let Some(label) =
+            crate::session::attested_harness_label(&scope.record, uid, registry, passwd)
+        else {
+            return LiveClass {
+                facts: CallerFacts::new(
+                    Classification::Unattested {
+                        reason: "agent scope record does not match the current harness registry"
+                            .to_owned(),
+                    },
+                    uid,
+                ),
+                attested_class: AttestedClass::Unattested,
+                scope_id: None,
+                boot_id: None,
+            };
+        };
         LiveClass {
             facts: CallerFacts::new(
                 Classification::EnrolledAgent {
-                    agent_id: format!("scope-{cgroup_id}"),
+                    agent_id: label,
                     session_id: scope.name,
                     declared_yolo: false,
                 },

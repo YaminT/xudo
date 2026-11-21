@@ -36,6 +36,9 @@ pub fn decided(
         evidence.push(format!("claimed_classification={claimed}"));
     }
     evidence.push(format!("generation={}", generation.hex()));
+    if let Some(label) = caller.classification.enrolled_agent_id() {
+        evidence.push(format!("agent_id={label}"));
+    }
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
         evidence.push(format!("deadline_ms={}", entry.deadline.0));
@@ -63,6 +66,17 @@ pub fn decided(
         record = record.with_rule(action.as_str(), source.to_string());
     }
     record
+}
+
+/// Adds the queue id to a decision record and reseals it.
+///
+/// The admission audit is written before the entry is published, so the id
+/// has to be attached here rather than read back from the store.
+#[must_use]
+pub fn with_queue_id(record: Record, queue_id: &str) -> Record {
+    let mut evidence = record.evidence.clone();
+    evidence.push(format!("queue_id={queue_id}"));
+    record.with_evidence(evidence)
 }
 
 fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
@@ -269,6 +283,66 @@ mod tests {
     }
 
     #[test]
+    fn an_enrolled_decision_records_the_registry_label_as_agent_id() {
+        let enrolled = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent.scope".to_owned(),
+                declared_yolo: false,
+            },
+            1000,
+        );
+        let enrolled_record = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &enrolled,
+            &identity(Some(44)),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            enrolled_record
+                .evidence
+                .contains(&"agent_id=codex".to_owned())
+        );
+        let unattested = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            !unattested
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("agent_id="))
+        );
+    }
+
+    #[test]
+    fn with_queue_id_seals_the_entry_id_into_the_admission_record() {
+        let record = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        let linked = with_queue_id(record, &"ab".repeat(32));
+        assert!(
+            linked
+                .evidence
+                .contains(&format!("queue_id={}", "ab".repeat(32)))
+        );
+    }
+
+    #[test]
     fn a_non_run_decision_record_does_not_invent_a_command_or_claim() {
         let request = BrokerRequest {
             schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -319,6 +393,7 @@ mod tests {
             attested_class: xudo_gate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         };
         let record = decided(
             None,

@@ -124,10 +124,11 @@ pub fn classify_with_registry(
     CallerFacts::new(classification, identity.uid)
 }
 
-/// The requester's facts as the broker stored them at mint, from kernel
-/// attestation: the class and the requester's uid, nothing the answering
-/// watcher or freezer is, and nothing the requester claimed. The registry
-/// names are placeholders; they never decide anything.
+/// The requester's facts as the broker stored them at mint.
+///
+/// An enrolled class carries the registry label in `attested_harness`. That
+/// label is what an ask-human rule matches. A missing or invalid label is
+/// unattested: it is never rewritten to a synthetic `scope-N` id.
 pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts {
     use xudo_gate::request::AttestedClass;
     let classification = match &entry.attested_class {
@@ -135,10 +136,17 @@ pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts 
             reason: "stored class at mint".to_owned(),
         },
         AttestedClass::Human => Classification::Human,
-        AttestedClass::EnrolledAgent { scope_id } => Classification::EnrolledAgent {
-            agent_id: format!("scope-{scope_id}"),
-            session_id: "stored".to_owned(),
-            declared_yolo: false,
+        AttestedClass::EnrolledAgent { .. } => match entry.attested_harness.as_deref() {
+            Some(label) if xudo_policy::valid_harness_label(label) => {
+                Classification::EnrolledAgent {
+                    agent_id: label.to_owned(),
+                    session_id: "stored".to_owned(),
+                    declared_yolo: false,
+                }
+            }
+            _ => Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            },
         },
     };
     CallerFacts::new(classification, entry.caller_uid)
@@ -289,11 +297,83 @@ args = [
             "agent:x:1000:1000:agent:/home/agent:/bin/sh\n",
         );
 
-        assert!(matches!(
+        assert_eq!(
             facts.classification,
-            xudo_policy::Classification::EnrolledAgent { agent_id, session_id, .. }
-                if agent_id == "codex" && session_id == "agent-0123456789abcdef0123456789abcdef.scope"
-        ));
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                declared_yolo: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_gate_decision_matches_the_brokers_on_an_ask_human_action() {
+        const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+        const ASK: &str = r#"
+[[action]]
+id = "xudo.pkg.upgrade"
+tier = "diag-read"
+exe = "/usr/bin/true"
+args = [{ name = "verb", matcher = { literal = "upgrade" } }]
+harness = ["codex"]
+outcome = "ask-human"
+"#;
+        let registry = test_registry();
+        let record = test_record(&registry, "codex");
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: record.clone(),
+        });
+        let broker = classify_with_registry(&peer, &registry, PASSWD);
+        let gate_label = xudo_gate::attested_harness_label(&record, peer.uid, &registry, PASSWD);
+        assert_eq!(gate_label.as_deref(), Some("codex"));
+        assert_eq!(
+            broker.classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        let policy = LoadedPolicy {
+            rules: xudo_policy::load_policy(
+                vec![RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: ASK.as_bytes().to_vec(),
+                }],
+                &[xudo_policy::HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+                }],
+            )
+            .unwrap(),
+            settings: Settings::default(),
+            queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
+            passwd: PASSWD.as_bytes().to_vec(),
+        };
+        let request = ask("/usr/bin/true", &["upgrade"]);
+        let broker_decision = decide(&policy, &broker, &request);
+        let gate_caller = CallerFacts::new(broker.classification.clone(), peer.uid);
+        let gate_decision = decide(&policy, &gate_caller, &request);
+        assert_eq!(broker_decision, gate_decision);
+        assert_eq!(broker_decision.denial, Some(DenialCode::AskHuman));
+        assert_eq!(broker_decision.verdict, Verdict::Deny);
+
+        let synthetic = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "scope-77".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let loosened = decide(&policy, &synthetic, &request);
+        assert_eq!(loosened.verdict, Verdict::Deny);
+        assert_eq!(loosened.denial, Some(DenialCode::HumanPathOnly));
     }
 
     #[test]

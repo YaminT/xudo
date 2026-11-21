@@ -1006,6 +1006,7 @@ args = [
             attested_class: crate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -1444,6 +1445,7 @@ args = [
         agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
         agent.attested_scope_id = Some(90);
         agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        agent.attested_harness = Some("codex".to_owned());
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::MissingAgentFacts;
@@ -1496,6 +1498,7 @@ args = [
         agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
         agent.attested_scope_id = Some(90);
         agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        agent.attested_harness = Some("codex".to_owned());
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::Agent;
@@ -2080,6 +2083,7 @@ all = [{ any-arg = ["restart"] }]
         request.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         request.attested_scope_id = Some(44);
         request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        request.attested_harness = Some("codex".to_owned());
         refused_for_class(request);
     }
 
