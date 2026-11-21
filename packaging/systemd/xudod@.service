@@ -57,7 +57,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service openat2
+# openat2 is already in @file-system, which @system-service includes.
+SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 # A filtered call fails rather than killing the broker, so the client still
 # gets a refusal and the journal still gets a record.
