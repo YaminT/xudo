@@ -433,7 +433,7 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     let service = parse(SERVICE);
     assert_eq!(
         values(&service, "Service", "SystemCallFilter"),
-        ["@system-service openat2", "~@privileged @resources"]
+        ["@system-service", "~@privileged @resources"]
     );
     assert_eq!(value(&service, "Service", "SystemCallErrorNumber"), "EPERM");
     assert_eq!(
@@ -717,11 +717,7 @@ fn pasban_has_no_network_and_the_same_syscall_filter_as_the_broker() {
     let broker = parse(SERVICE);
     assert_eq!(
         values(&service, "Service", "SystemCallFilter"),
-        ["@system-service", "~@privileged @resources"]
-    );
-    assert_eq!(
-        values(&broker, "Service", "SystemCallFilter"),
-        ["@system-service openat2", "~@privileged @resources"]
+        values(&broker, "Service", "SystemCallFilter")
     );
     assert_eq!(value(&service, "Service", "SystemCallErrorNumber"), "EPERM");
     // One process for xudo and one for journalctl, with room for a thread.
