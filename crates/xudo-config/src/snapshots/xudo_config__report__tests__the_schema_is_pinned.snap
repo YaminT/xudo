@@ -20,6 +20,14 @@ expression: "Settings::schema()"
     "settable_from_environment": true
   },
   {
+    "key": "queue_ttl_secs",
+    "value_type": "integer",
+    "default": "86400",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
+  },
+  {
     "key": "frozen",
     "value_type": "boolean",
     "default": "false",

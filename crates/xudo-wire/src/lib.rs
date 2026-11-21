@@ -74,6 +74,8 @@ pub const MAX_REASON_BYTES: usize = 1024;
 pub const MAX_PROMPTS: usize = 64;
 /// Maximum UTF-8 bytes in one watcher prompt or remediation.
 pub const MAX_PROMPT_BYTES: usize = 4096;
+/// Maximum entries returned by one `QueueList` response.
+pub const MAX_QUEUE_LIST: usize = 32;
 
 /// The largest request the broker reads, in bytes.
 ///
@@ -114,6 +116,9 @@ pub enum Question {
         program: String,
         /// Operands after the program.
         argv: Vec<String>,
+        /// Caller working directory bytes. Empty only for legacy/test requests.
+        #[serde(default)]
+        cwd: Vec<u8>,
         /// Unauthenticated classification hint for the audit record.
         claimed_classification: String,
     },
@@ -142,6 +147,8 @@ pub enum Question {
     },
     /// Resume confirmation handling.
     Thaw,
+    /// List the peer's authorized root-held queue entries.
+    QueueList,
 }
 
 impl BrokerRequest {
@@ -151,14 +158,28 @@ impl BrokerRequest {
         argv: Vec<String>,
         claimed_classification: impl Into<String>,
     ) -> Self {
+        Self::new_owned(program.into(), argv, claimed_classification.into())
+    }
+
+    fn new_owned(program: String, argv: Vec<String>, claimed_classification: String) -> Self {
         Self {
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::Run {
-                program: program.into(),
+                program,
                 argv,
-                claimed_classification: claimed_classification.into(),
+                cwd: Vec::new(),
+                claimed_classification,
             },
         }
+    }
+
+    /// Adds the caller's exact cwd bytes for possible queue persistence.
+    #[must_use]
+    pub fn with_cwd_bytes(mut self, cwd: Vec<u8>) -> Self {
+        if let Question::Run { cwd: stored, .. } = &mut self.question {
+            *stored = cwd;
+        }
+        self
     }
 
     /// Parses and validates one request.
@@ -214,6 +235,7 @@ impl BrokerRequest {
             Question::Run {
                 program,
                 argv,
+                cwd,
                 claimed_classification,
             } => {
                 bounded("program", program, MAX_PROGRAM_BYTES)?;
@@ -223,6 +245,13 @@ impl BrokerRequest {
                     });
                 }
                 refuse_nul("program", program)?;
+                if !cwd.is_empty()
+                    && (!cwd.starts_with(b"/") || cwd.contains(&0) || cwd.len() > MAX_PROGRAM_BYTES)
+                {
+                    return Err(RequestError::Malformed {
+                        reason: "cwd must be an absolute byte path without NUL".to_owned(),
+                    });
+                }
                 if argv.len() > MAX_ARGV_COUNT {
                     return Err(RequestError::FieldTooLarge {
                         field: "argv count".to_owned(),
@@ -241,7 +270,7 @@ impl BrokerRequest {
                 refuse_nul("claimed_classification", claimed_classification)?;
             }
             Question::Status { id } => check_id(id)?,
-            Question::Watch | Question::Pending | Question::Thaw => {}
+            Question::Watch | Question::Pending | Question::Thaw | Question::QueueList => {}
             Question::Answer { id, token, .. } => {
                 check_id(id)?;
                 bounded("token", token, MAX_TOKEN_BYTES)?;
@@ -272,6 +301,7 @@ impl BrokerRequest {
                 program,
                 argv,
                 claimed_classification,
+                ..
             } => Some((program, argv, claimed_classification)),
             _ => None,
         }
@@ -424,6 +454,34 @@ pub struct WatchPrompt {
     pub expires_in_ms: u64,
 }
 
+/// Display-only item returned by the broker's root-held queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueListEntry {
+    /// Queue identifier.
+    pub id: String,
+    /// Sanitized command including the program at index zero.
+    pub argv: Vec<String>,
+    /// Sanitized working directory.
+    pub cwd: String,
+    /// Root registry label.
+    pub harness: String,
+    /// Kernel-attested requester uid.
+    pub uid: u32,
+    /// Policy action id.
+    pub rule_id: String,
+    /// Policy generation id.
+    pub generation: u64,
+    /// Queue time in `CLOCK_BOOTTIME` milliseconds.
+    pub queued_at: u64,
+    /// Expiry time in `CLOCK_BOOTTIME` milliseconds.
+    pub expires_at: u64,
+    /// Sanitized requester reason.
+    pub reason: Option<String>,
+    /// State text, such as pending or done.
+    pub state: String,
+}
+
 /// What happened to a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -454,6 +512,11 @@ pub enum Answer {
         /// Number of additional pending prompts omitted to fit the response.
         #[serde(default)]
         omitted: usize,
+    },
+    /// Bounded entries the peer may see in the root-held queue.
+    QueueListed {
+        /// Bounded entries visible to this peer.
+        entries: Vec<QueueListEntry>,
     },
     /// A question completed without a decision.
     Done,
@@ -767,9 +830,7 @@ impl BrokerResponse {
                 limit: MAX_RESPONSE_BYTES,
             });
         }
-        let text = std::str::from_utf8(bytes).map_err(|error| ResponseError::NotUtf8 {
-            offset: error.valid_up_to(),
-        })?;
+        let text = response_text(bytes)?;
         let value =
             parse_json_object(text).map_err(|reason| ResponseError::Malformed { reason })?;
         if let Some(found) = value
@@ -809,8 +870,9 @@ impl BrokerResponse {
         match &self.answer {
             Answer::Decided { minted, .. } => {
                 if let Some(minted) = minted {
-                    check_nonce(&minted.nonce)
-                        .map_err(|reason| ResponseError::Malformed { reason })?;
+                    if let Err(reason) = check_nonce(&minted.nonce) {
+                        return Err(ResponseError::Malformed { reason });
+                    }
                     if minted.gate.len() > MAX_PROGRAM_BYTES
                         || !minted.gate.starts_with('/')
                         || minted.gate.contains('\0')
@@ -828,6 +890,16 @@ impl BrokerResponse {
                 if prompts.len() > MAX_PROMPTS || prompts.iter().any(|p| !valid_watch_prompt(p)) {
                     return Err(ResponseError::Malformed {
                         reason: "watch prompt list exceeds its bound".to_owned(),
+                    });
+                }
+            }
+            Answer::QueueListed { entries } => {
+                if entries.len() > MAX_QUEUE_LIST
+                    || entries.iter().any(|entry| !valid_queue_entry(entry))
+                {
+                    return Err(ResponseError::Malformed {
+                        reason: "queue list exceeds its bounds or contains an invalid entry"
+                            .to_owned(),
                     });
                 }
             }
@@ -857,6 +929,7 @@ impl BrokerResponse {
             Answer::Decided { decision, .. } => decision.schema_version,
             Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done
             | Answer::Refused { .. } => ENVELOPE_SCHEMA_VERSION,
         };
@@ -890,7 +963,7 @@ fn valid_question_shape(value: &serde_json::Value) -> bool {
         return false;
     }
     object.iter().any(|(name, payload)| {
-        let unit = matches!(name.as_str(), "watch" | "pending" | "thaw");
+        let unit = matches!(name.as_str(), "watch" | "pending" | "thaw" | "queue_list");
         let data = matches!(name.as_str(), "run" | "status" | "answer" | "freeze");
         (unit && payload.is_null()) || (data && payload.is_object())
     })
@@ -912,6 +985,7 @@ fn question_shape(question: &Question) -> QuestionShape {
         Question::Answer { .. } => QuestionShape::Variant("answer", false),
         Question::Freeze { .. } => QuestionShape::Variant("freeze", false),
         Question::Thaw => QuestionShape::Variant("thaw", true),
+        Question::QueueList => QuestionShape::Variant("queue_list", true),
     }
 }
 
@@ -927,6 +1001,7 @@ fn answer_shape(answer: &Answer) -> AnswerShape {
         Answer::Decided { .. } => AnswerShape::Variant("decided", false),
         Answer::Pending { .. } => AnswerShape::Variant("pending", false),
         Answer::Watching { .. } => AnswerShape::Variant("watching", false),
+        Answer::QueueListed { .. } => AnswerShape::Variant("queue_listed", false),
         Answer::Done => AnswerShape::Variant("done", true),
         Answer::Refused { .. } => AnswerShape::Variant("refused", false),
     }
@@ -946,7 +1021,7 @@ fn valid_answer_shape(value: &serde_json::Value) -> bool {
         matches!(name.as_str(), "done") && payload.is_null()
             || matches!(
                 name.as_str(),
-                "decided" | "pending" | "watching" | "refused"
+                "decided" | "pending" | "watching" | "queue_listed" | "refused"
             ) && payload.is_object()
     })
 }
@@ -980,6 +1055,40 @@ fn valid_watch_prompt(prompt: &WatchPrompt) -> bool {
         && !prompt.classification.contains('\0')
         && prompt.evidence.len() <= MAX_PROMPT_BYTES
         && !prompt.evidence.contains('\0')
+}
+
+fn valid_queue_entry(entry: &QueueListEntry) -> bool {
+    check_nonce(&entry.id).is_ok()
+        && entry.argv.len() <= MAX_ARGV_COUNT + 1
+        && entry
+            .argv
+            .iter()
+            .all(|arg| arg.len() <= MAX_ARGUMENT_BYTES && !arg.contains('\0'))
+        && [
+            entry.cwd.as_str(),
+            entry.harness.as_str(),
+            entry.rule_id.as_str(),
+            entry.state.as_str(),
+        ]
+        .iter()
+        .all(|value| value.len() <= MAX_PROMPT_BYTES && !value.contains('\0'))
+        && valid_queue_reason(entry.reason.as_deref())
+}
+
+fn response_text(bytes: &[u8]) -> Result<&str, ResponseError> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) => Err(ResponseError::NotUtf8 {
+            offset: error.valid_up_to(),
+        }),
+    }
+}
+
+fn valid_queue_reason(reason: Option<&str>) -> bool {
+    match reason {
+        Some(reason) => reason.len() <= MAX_REASON_BYTES && !reason.contains('\0'),
+        None => true,
+    }
 }
 
 /// Returns the rendered JSON, or `fallback` if rendering failed.
@@ -1099,6 +1208,7 @@ mod tests {
             Question::Run {
                 program: "/x".into(),
                 argv: Vec::new(),
+                cwd: Vec::new(),
                 claimed_classification: "x".into(),
             },
             Question::Status { id: id.clone() },
@@ -1111,6 +1221,7 @@ mod tests {
             },
             Question::Freeze { reason: "x".into() },
             Question::Thaw,
+            Question::QueueList,
         ];
         for question in variants {
             let serialized = serde_json::to_value(&question).unwrap();
@@ -1163,6 +1274,9 @@ mod tests {
                 prompts: Vec::new(),
                 omitted: 0,
             },
+            Answer::QueueListed {
+                entries: Vec::new(),
+            },
             Answer::Done,
             Answer::Refused {
                 code: RefusalCode::SpoolFull,
@@ -1187,6 +1301,83 @@ mod tests {
                 assert!(valid_answer_shape(&serde_json::Value::Object(object)));
             }
         }
+    }
+
+    fn run_with(cwd: Vec<u8>, argv: Vec<String>) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Run {
+                program: "/usr/bin/systemctl".to_owned(),
+                argv,
+                cwd,
+                claimed_classification: "unattested".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn run_validation_rejects_bad_cwd_and_oversized_argv_count() {
+        let mut too_long = vec![b'/'];
+        too_long.resize(MAX_PROGRAM_BYTES + 1, b'a');
+        for cwd in [b"relative".to_vec(), b"/a\0b".to_vec(), too_long] {
+            let refused =
+                BrokerRequest::parse(run_with(cwd, Vec::new()).to_json().as_bytes()).unwrap_err();
+            assert_eq!(
+                refused,
+                RequestError::Malformed {
+                    reason: "cwd must be an absolute byte path without NUL".to_owned(),
+                }
+            );
+        }
+
+        let many = vec![String::new(); MAX_ARGV_COUNT + 1];
+        let refused =
+            BrokerRequest::parse(run_with(Vec::new(), many).to_json().as_bytes()).unwrap_err();
+        assert_eq!(
+            refused,
+            RequestError::FieldTooLarge {
+                field: "argv count".to_owned(),
+                limit: MAX_ARGV_COUNT,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cwd_is_only_attached_to_a_run_question() {
+        let thaw = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::Thaw,
+        };
+        let same = thaw.clone().with_cwd_bytes(b"/tmp".to_vec());
+        assert_eq!(same, thaw);
+    }
+
+    #[test]
+    fn queue_list_response_validation_rejects_invalid_entry_fields() {
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::QueueListed {
+                entries: vec![QueueListEntry {
+                    id: "bad".into(),
+                    argv: vec!["/usr/bin/true".into()],
+                    cwd: "/tmp".into(),
+                    harness: "codex".into(),
+                    uid: 1000,
+                    rule_id: "test.run".into(),
+                    generation: 1,
+                    queued_at: 1,
+                    expires_at: 2,
+                    reason: None,
+                    state: "pending".into(),
+                }],
+            },
+        };
+        assert_eq!(
+            BrokerResponse::parse(response.to_json().as_bytes()),
+            Err(ResponseError::Malformed {
+                reason: "queue list exceeds its bounds or contains an invalid entry".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -1228,6 +1419,7 @@ mod tests {
                 Question::Run {
                     program: "/usr/bin/id".to_owned(),
                     argv: Vec::new(),
+                    cwd: Vec::new(),
                     claimed_classification: "x".repeat(MAX_CLASSIFICATION_BYTES + 1),
                 },
                 RefusalCode::RequestMalformed,
@@ -1236,6 +1428,7 @@ mod tests {
                 Question::Run {
                     program: "/usr/bin/id".to_owned(),
                     argv: Vec::new(),
+                    cwd: Vec::new(),
                     claimed_classification: "bad\0hint".to_owned(),
                 },
                 RefusalCode::InteriorNul,
@@ -1392,6 +1585,7 @@ mod tests {
                 Question::Run {
                     program: format!("/{}", "x".repeat(MAX_PROGRAM_BYTES)),
                     argv: Vec::new(),
+                    cwd: Vec::new(),
                     claimed_classification: "x".to_owned(),
                 },
                 "program",
@@ -1400,6 +1594,7 @@ mod tests {
                 Question::Run {
                     program: "/".to_owned(),
                     argv: vec!["x".repeat(MAX_ARGUMENT_BYTES + 1)],
+                    cwd: Vec::new(),
                     claimed_classification: "x".to_owned(),
                 },
                 "argument",
@@ -1408,6 +1603,7 @@ mod tests {
                 Question::Run {
                     program: "/".to_owned(),
                     argv: vec!["x".to_owned(); MAX_ARGV_COUNT + 1],
+                    cwd: Vec::new(),
                     claimed_classification: "x".to_owned(),
                 },
                 "count",
@@ -1443,6 +1639,16 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_run_request_keeps_the_exact_cwd_bytes_for_queue_storage() {
+        let request = BrokerRequest::new("/bin/tool", vec!["arg".to_owned()], "harness")
+            .with_cwd_bytes(vec![b'/', b't', b'm', b'p', 0xff]);
+        assert!(matches!(
+            request.question,
+            Question::Run { cwd, .. } if cwd == [b'/', b't', b'm', b'p', 0xff]
+        ));
     }
 
     #[test]
@@ -1497,6 +1703,7 @@ mod tests {
             Question::Run {
                 program: "/usr/bin/id".to_owned(),
                 argv: vec!["-u".to_owned()],
+                cwd: Vec::new(),
                 claimed_classification: "unattested".to_owned(),
             },
             Question::Status { id: id.clone() },
@@ -1745,6 +1952,34 @@ mod tests {
         assert_ne!(request().to_json(), "{}");
     }
 
+    #[test]
+    fn response_rejects_non_utf8_and_an_invalid_minted_nonce() {
+        assert_eq!(response_text(b"{}"), Ok("{}"));
+        let refused = BrokerResponse::parse(&[0xff]).unwrap_err();
+        assert_eq!(refused, ResponseError::NotUtf8 { offset: 0 });
+        assert!(valid_queue_reason(None));
+        assert!(valid_queue_reason(Some("review requested")));
+        assert!(!valid_queue_reason(Some("bad\0reason")));
+        let response = BrokerResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Decided {
+                decision: Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new()),
+                minted: Some(Minted {
+                    nonce: "invalid".to_owned(),
+                    expires_in_ms: 1,
+                    gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+                }),
+            },
+        };
+        let refused = BrokerResponse::parse(response.to_json().as_bytes()).unwrap_err();
+        assert_eq!(
+            refused,
+            ResponseError::Malformed {
+                reason: "id must be 64 lowercase hexadecimal characters".to_owned(),
+            }
+        );
+    }
+
     fn minted() -> Minted {
         Minted {
             nonce: "ab".repeat(32),
@@ -1763,6 +1998,7 @@ mod tests {
             Answer::Refused { .. }
             | Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -1791,6 +2027,21 @@ mod tests {
                     expires_in_ms: 1_000,
                 }],
                 omitted: 0,
+            },
+            Answer::QueueListed {
+                entries: vec![QueueListEntry {
+                    id: "a".repeat(64),
+                    argv: vec!["/usr/bin/true".into()],
+                    cwd: "/tmp".into(),
+                    harness: "codex".into(),
+                    uid: 1000,
+                    rule_id: "test.run".into(),
+                    generation: 1,
+                    queued_at: 1,
+                    expires_at: 2,
+                    reason: Some("review requested".into()),
+                    state: "pending".into(),
+                }],
             },
             Answer::Done,
             BrokerResponse::refused(RefusalCode::RequestUnknown).answer,

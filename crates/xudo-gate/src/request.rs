@@ -388,19 +388,34 @@ pub struct PendingRequest {
     pub attested_scope_id: Option<u64>,
     /// Kernel boot identifier associated with the scope, when available.
     pub boot_id: Option<String>,
+    /// Registry label copied from the broker's classification at mint.
+    ///
+    /// Present only for an enrolled agent, and only as a valid harness label.
+    /// The confirmation re-decision matches ask-human rules against this label.
+    /// A forged label can change `ask-human` into `human-path-only` or the
+    /// reverse, and both of those are denials.
+    pub attested_harness: Option<String>,
 }
 
 impl PendingRequest {
-    /// Whether the stored class, scope and boot id agree: an enrolled agent
-    /// has its own scope and a valid boot id, anything else has neither.
+    /// Whether the stored class, scope, boot id, and harness label agree.
+    ///
+    /// An enrolled agent has its own scope, a valid boot id, and a valid
+    /// harness label. A human or an unattested caller has none of those.
     pub fn has_consistent_attested_identity(&self) -> bool {
         match &self.attested_class {
             AttestedClass::EnrolledAgent { scope_id } => {
                 self.attested_scope_id == Some(*scope_id)
                     && self.boot_id.as_ref().is_some_and(|id| is_boot_id(id))
+                    && self
+                        .attested_harness
+                        .as_deref()
+                        .is_some_and(xudo_policy::valid_harness_label)
             }
             AttestedClass::Unattested | AttestedClass::Human => {
-                self.attested_scope_id.is_none() && self.boot_id.is_none()
+                self.attested_scope_id.is_none()
+                    && self.boot_id.is_none()
+                    && self.attested_harness.is_none()
             }
         }
     }
@@ -414,8 +429,8 @@ impl PendingRequest {
     /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
     /// deserialize as `None`, as serde defines for `Option` fields. Attested
     /// identity fields must use canonical shapes. That they agree with each
-    /// other (`attested_scope_id` and `boot_id` both present for an enrolled
-    /// agent, both absent otherwise) is checked by `validate`, not here.
+    /// other (scope, boot id, and harness label all present for an enrolled
+    /// agent, all absent otherwise) is checked by `validate`, not here.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
@@ -706,6 +721,7 @@ mod tests {
             attested_class: AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -832,7 +848,27 @@ mod tests {
         entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         assert_eq!(check(&entry), Ok(()));
+    }
+
+    #[test]
+    fn an_enrolled_entry_without_a_registry_label_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+        entry.attested_harness = Some(String::new());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn a_human_class_with_a_harness_label_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::Human;
+        entry.attested_harness = Some("codex".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
     }
 
     #[test]

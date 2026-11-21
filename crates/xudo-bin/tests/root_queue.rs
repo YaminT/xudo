@@ -59,14 +59,19 @@ fn denying_broker() -> std::thread::JoinHandle<()> {
 }
 
 /// The real binary with an empty environment but the scratch home.
-fn xudo(home: &Path, args: &[&str]) -> std::process::Output {
+fn xudo_without_broker(home: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(XUDO);
     cmd.env_clear()
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))
         .args(args);
+    cmd.output().unwrap()
+}
+
+/// The real binary against a broker that denies without creating an entry.
+fn xudo(home: &Path, args: &[&str]) -> std::process::Output {
     let broker = denying_broker();
-    let out = cmd.output().unwrap();
+    let out = xudo_without_broker(home, args);
     broker.join().unwrap();
     let _ = std::fs::remove_file(SOCKET);
     out
@@ -82,16 +87,14 @@ fn queue_lines(home: &Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn exec_queue_writes_the_denied_command_to_the_callers_queue_and_runs_nothing() {
-    if !begin_root_test(
-        "exec_queue_writes_the_denied_command_to_the_callers_queue_and_runs_nothing",
-    ) {
+fn exec_rejects_the_removed_queue_option_before_contacting_the_broker() {
+    if !begin_root_test("exec_rejects_the_removed_queue_option_before_contacting_the_broker") {
         return;
     }
     let home = scratch("bin-queue-on");
     let marker = home.join("ran");
     let marker_text = marker.to_str().unwrap();
-    let out = xudo(
+    let out = xudo_without_broker(
         &home,
         &[
             "exec",
@@ -102,18 +105,12 @@ fn exec_queue_writes_the_denied_command_to_the_callers_queue_and_runs_nothing() 
             "a b",
         ],
     );
-    assert_eq!(out.status.code(), Some(17), "{out:?}");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(!marker.exists(), "the denied command ran");
-    let entries = queue_lines(&home);
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["queued_by"], "xudo", "{entries:?}");
-    assert_eq!(
-        entries[0]["argv"],
-        serde_json::json!(["/usr/bin/touch", marker_text, "a b"]),
-        "{entries:?}"
-    );
+    assert!(queue_lines(&home).is_empty());
+    assert!(!home.join("state").exists());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("queued"),
+        String::from_utf8_lossy(&out.stderr).contains("--queue"),
         "{out:?}"
     );
 }

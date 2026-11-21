@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(response.schema_version, WIRE_SCHEMA_VERSION);
     match &response.answer {
         Answer::Decided { .. } | Answer::Pending { .. } | Answer::Watching { .. }
-        | Answer::Done | Answer::Refused { .. } => {}
+        | Answer::Done | Answer::Refused { .. } | Answer::QueueListed { .. } => {}
     }
     assert!(data.len() <= MAX_RESPONSE_BYTES);
 

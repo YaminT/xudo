@@ -22,7 +22,7 @@ use xudo_audit::record::Record;
 use xudo_policy::{CallerFacts, Decision};
 use xudo_sys::{
     AuditError, AuditSink, CgroupCalls, Clock, Connection, Entropy, Hygiene, PeerCalls, Spool,
-    SpoolError, Syscalls, authorize,
+    SpoolError, SysError, Syscalls, authorize,
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
@@ -68,6 +68,8 @@ pub struct Platform<'a> {
     pub confirmations: Option<&'a dyn Spool>,
     /// `/var/lib/xudo`, used only for the freeze marker.
     pub freeze_file: Option<&'a dyn Spool>,
+    /// `/var/lib/xudo/queue`, the broker-only ask-human store.
+    pub queue: Option<&'a dyn Spool>,
 }
 
 /// How a connection ended.
@@ -322,6 +324,9 @@ fn serve_request(
     identity: PeerIdentity,
     request: BrokerRequest,
 ) -> Served {
+    if matches!(request.question, xudo_wire::Question::QueueList) {
+        return serve_queue_list(conn, platform, &identity, &request);
+    }
     if !matches!(request.question, xudo_wire::Question::Run { .. }) {
         return serve_confirmation_question(conn, platform, spool, &identity, &request);
     }
@@ -360,6 +365,11 @@ fn serve_request(
         request,
         policy,
     } = evaluated;
+    if decision.denial == Some(xudo_policy::DenialCode::AskHuman) {
+        return queue_ask_human(
+            conn, platform, &identity, &request, &decision, &caller, &policy,
+        );
+    }
     if !decision.verdict.is_permitted() {
         // Nothing is enabled by this record, so a sink that cannot take it
         // does not change the answer.
@@ -392,6 +402,337 @@ fn serve_request(
             policy,
         },
     )
+}
+
+fn queue_ask_human(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    decision: &Decision,
+    caller: &CallerFacts,
+    policy: &LoadedPolicy,
+) -> Served {
+    let Some(queue) = platform.queue else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "root-held queue is unavailable",
+            ),
+            Some(identity),
+            Some(request),
+        );
+    };
+    let entry =
+        match queue_entry_from_request(platform, identity, request, decision, caller, policy) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(RefusalCode::BrokerUnusable, error),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+        };
+    let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
+    let boot_id = entry.boot_id.clone();
+    let pruned =
+        match crate::queue::plan_admission(queue, &entry, entry.queued_at, ttl_ms, &boot_id) {
+            Ok(pruned) => pruned,
+            Err(crate::queue::StoreError::Full) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(RefusalCode::SpoolFull, "queue capacity reached"),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+            Err(error) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+        };
+    // Audit the admission and every prune before anything is deleted or
+    // published. A failed audit leaves the store untouched.
+    let record = platform.audit.append(&|previous| {
+        crate::record::with_queue_id(
+            decided(
+                previous,
+                decision,
+                caller,
+                identity,
+                request,
+                &policy.rules.generation,
+                None,
+            ),
+            &entry.id,
+        )
+    });
+    if let Err(error) = record {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+            Some(identity),
+            Some(request),
+        );
+    }
+    if !audit_queue_pruned(platform.audit, &pruned) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "queue pruning audit failed"),
+            Some(identity),
+            Some(request),
+        );
+    }
+    if let Err(error) =
+        crate::queue::commit_admission(queue, &entry, &pruned, entry.queued_at, ttl_ms, &boot_id)
+    {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+            Some(identity),
+            Some(request),
+        );
+    }
+    answer(
+        conn,
+        &BrokerResponse::decided(decision.clone(), None),
+        Served::Decided,
+    )
+}
+
+/// The boot id a queue operation may stamp onto an entry.
+///
+/// An unreadable id keeps the syscall error. A value that is not a lowercase
+/// UUID is refused here too, so a seam that returns one cannot publish it.
+fn boot_id_for_queue(read: Result<String, SysError>) -> Result<String, String> {
+    let id = read.map_err(|error| error.to_string())?;
+    if xudo_wire::is_boot_id(&id) {
+        Ok(id)
+    } else {
+        Err("boot id is not a lowercase uuid".to_owned())
+    }
+}
+
+fn queue_entry_from_request(
+    platform: &Platform<'_>,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    decision: &Decision,
+    caller: &CallerFacts,
+    policy: &LoadedPolicy,
+) -> Result<crate::queue::QueueEntry, String> {
+    // A missing or malformed boot id refuses before a nonce is drawn, so a
+    // refusal does not spend entropy and nothing is queued without a boot id.
+    let boot_id = boot_id_for_queue(platform.syscalls.boot_id())?;
+    let id = draw_nonce(platform.entropy).map_err(|error| error.to_string())?;
+    let xudo_wire::Question::Run {
+        program, argv, cwd, ..
+    } = &request.question
+    else {
+        return Err("ask-human decision was attached to a non-run request".to_owned());
+    };
+    let action_id = decision
+        .action
+        .as_ref()
+        .ok_or_else(|| "ask-human decision has no action".to_owned())?;
+    let action = policy
+        .rules
+        .rules
+        .get(action_id)
+        .ok_or_else(|| "ask-human action is absent from the loaded rules".to_owned())?;
+    let xudo_policy::Classification::EnrolledAgent { agent_id, .. } = &caller.classification else {
+        return Err("ask-human decision is not from an enrolled harness".to_owned());
+    };
+    if !action.harness.iter().any(|label| label == agent_id) {
+        return Err("ask-human action does not name the verified harness".to_owned());
+    }
+    let mut command = Vec::with_capacity(argv.len().saturating_add(1));
+    command.push(program.as_bytes().to_vec());
+    command.extend(argv.iter().map(|arg| arg.as_bytes().to_vec()));
+    let queued_at = platform.clock.boottime_millis();
+    let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
+    crate::queue::QueueEntry::new(crate::queue::QueueEntry {
+        id,
+        argv: command,
+        // Agent-supplied and display-only. A queued command is never started
+        // from this path; Q1c reads `/proc/<pid>/cwd` through the pidfd.
+        cwd: cwd.clone(),
+        harness: agent_id.clone(),
+        uid: identity.uid,
+        rule_id: action_id.to_string(),
+        generation: policy.rules.generation.id(),
+        queued_at,
+        expires_at: queued_at.saturating_add(ttl_ms),
+        reason: None,
+        state: crate::queue::QueueState::Pending,
+        boot_id,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
+    ids.iter().all(|id| {
+        audit
+            .append(&|previous| {
+                xudo_audit::record::Record::after(
+                    previous,
+                    xudo_audit::record::Decision::Denied,
+                    Vec::new(),
+                    "human",
+                )
+                .with_denial("queue_entry_pruned")
+                .with_evidence(vec![format!("queue_id={id}")])
+                .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .is_ok()
+    })
+}
+
+fn serve_queue_list(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+) -> Served {
+    let Some(store) = platform.queue else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "root-held queue is unavailable",
+            ),
+            Some(identity),
+            Some(request),
+        );
+    };
+    let policy = match platform.policy.load() {
+        Ok(policy) => policy,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::from(&error),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
+    let class = match caller.classification {
+        xudo_policy::Classification::Human => crate::queue::PeerClass::Human,
+        xudo_policy::Classification::EnrolledAgent { .. } => crate::queue::PeerClass::EnrolledAgent,
+        xudo_policy::Classification::Unattested { .. } => crate::queue::PeerClass::Unattested,
+    };
+    let now = platform.clock.boottime_millis();
+    let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
+    let Ok(boot_id) = boot_id_for_queue(platform.syscalls.boot_id()) else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "boot id is unavailable"),
+            Some(identity),
+            Some(request),
+        );
+    };
+    let pruned = match crate::queue::prune(store, now, ttl_ms, &boot_id) {
+        Ok(ids) => ids,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    if !audit_queue_pruned(platform.audit, &pruned) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "queue pruning audit failed"),
+            Some(identity),
+            Some(request),
+        );
+    }
+    let entries = match crate::queue::load_all(store) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let visible = visible_queue_list(
+        entries,
+        identity.uid,
+        class,
+        &policy.rules.harnesses,
+        passwd,
+    );
+    let response = BrokerResponse {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        answer: xudo_wire::Answer::QueueListed { entries: visible },
+    };
+    answer(conn, &response, Served::Decided)
+}
+
+fn visible_queue_list(
+    mut entries: Vec<crate::queue::QueueEntry>,
+    uid: u32,
+    class: crate::queue::PeerClass,
+    registry: &xudo_policy::HarnessRegistry,
+    passwd: &str,
+) -> Vec<xudo_wire::QueueListEntry> {
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    entries
+        .into_iter()
+        .filter(|entry| crate::queue::visibility(entry, uid, class, registry, passwd).visible)
+        .take(xudo_wire::MAX_QUEUE_LIST)
+        .map(queue_list_entry)
+        .collect()
+}
+
+fn queue_list_entry(entry: crate::queue::QueueEntry) -> xudo_wire::QueueListEntry {
+    let display = entry.display_fields();
+    xudo_wire::QueueListEntry {
+        id: entry.id,
+        argv: display.argv.into_iter().map(|field| field.text).collect(),
+        cwd: display.cwd.text,
+        harness: display.harness.text,
+        uid: entry.uid,
+        rule_id: entry.rule_id,
+        generation: entry.generation,
+        queued_at: entry.queued_at,
+        expires_at: entry.expires_at,
+        reason: display.reason.map(|field| field.text),
+        state: match entry.state {
+            crate::queue::QueueState::Pending => "pending",
+            crate::queue::QueueState::Claimed => "claimed",
+            crate::queue::QueueState::Done => "done",
+        }
+        .to_owned(),
+    }
 }
 
 fn expire_entries(
@@ -1422,6 +1763,9 @@ fn serve_confirmation_question(
         }
         xudo_wire::Question::Thaw => thaw(platform, identity, &classify(identity), request),
         xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
+        xudo_wire::Question::QueueList => {
+            return serve_queue_list(conn, platform, identity, request);
+        }
     };
     match result {
         Ok(response) => answer(conn, &response, Served::Decided),
@@ -2677,6 +3021,98 @@ mod tests {
     const NOW: u64 = 10_000;
     const TEST_BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
 
+    struct SecondAuditAppendFails {
+        inner: FakeAuditSink,
+        calls: usize,
+    }
+
+    impl AuditSink for SecondAuditAppendFails {
+        fn append_checked(
+            &mut self,
+            build: &dyn Fn(Option<&xudo_audit::record::Record>) -> xudo_audit::record::Record,
+            check: &dyn Fn(&xudo_audit::record::Record) -> Result<(), xudo_sys::AuditError>,
+        ) -> Result<xudo_sys::AuditReceipt, xudo_sys::AuditError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                self.inner.append_checked(build, check)
+            } else {
+                Err(xudo_sys::AuditError::Unavailable {
+                    reason: "second append refused".into(),
+                })
+            }
+        }
+    }
+
+    fn with_test_boot(mut host: Host) -> Host {
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        host
+    }
+
+    fn ask_human_fixture() -> (Host, PeerIdentity, BrokerRequest) {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+        const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n";
+        let harness_file = xudo_policy::HarnessFile {
+            name: b"codex.toml".to_vec(),
+            bytes: HARNESS.as_bytes().to_vec(),
+        };
+        let rules = xudo_policy::load_policy(
+            vec![RuleFile {
+                name: b"10-review.toml".to_vec(),
+                bytes: RULE.as_bytes().to_vec(),
+            }],
+            &[harness_file],
+        )
+        .unwrap();
+        let entry_hash = rules.harnesses.get("codex").unwrap().hash_hex();
+        let mut loaded = policy();
+        loaded.rules = rules;
+        loaded.queue_ttl_secs = 60;
+        loaded.passwd = b"agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_vec();
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        host.policy.answer = Ok(loaded);
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation =
+            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+                kind: xudo_sys::ScopeKind::Agent,
+                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                record: serde_json::json!({
+                    "uid": UID,
+                    "label": "codex",
+                    "way": "service",
+                    "registry_entry_hash": entry_hash,
+                    "boot_id": TEST_BOOT,
+                    "created_at_boottime_ms": 1,
+                    "deadline": 20_000,
+                    "pid": PID,
+                    "starttime": START,
+                    "cgroup_id": 44,
+                })
+                .to_string()
+                .into_bytes(),
+            });
+        let request = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["upgrade".to_owned()],
+            "untrusted hint",
+        )
+        .with_cwd_bytes(b"/srv".to_vec());
+        (host, identity, request)
+    }
+
+    fn queue_decision_context(
+        host: &Host,
+        identity: &PeerIdentity,
+        request: &BrokerRequest,
+    ) -> (LoadedPolicy, CallerFacts, xudo_policy::Decision) {
+        let policy = host.policy.load().unwrap();
+        let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+        let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
+        let decision = decide(&policy, &caller, request);
+        (policy, caller, decision)
+    }
+
     #[test]
     fn an_expired_mint_reports_zero_remaining_lifetime() {
         assert_eq!(remaining_millis(NOW, NOW + 1), 0);
@@ -2732,6 +3168,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             }])
             .unwrap(),
             settings: xudo_policy::engine::Settings::default(),
+            queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: Vec::new(),
         }
     }
@@ -2764,6 +3201,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         confirmations_available: bool,
         freeze_file: FakeSpool,
         freeze_available: bool,
+        queue: FakeSpool,
     }
 
     impl Host {
@@ -2819,6 +3257,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 confirmations_available: true,
                 freeze_file: FakeSpool::new(),
                 freeze_available: true,
+                queue: FakeSpool::new(),
             }
         }
 
@@ -2834,6 +3273,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 audit: &mut self.audit,
                 confirmations: self.confirmations_available.then_some(&self.confirmations),
                 freeze_file: self.freeze_available.then_some(&self.freeze_file),
+                queue: Some(&self.queue),
             }
         }
     }
@@ -2924,6 +3364,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Decided { .. }
             | Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -3562,6 +4003,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id };
         entry.attested_scope_id = Some(scope_id);
         entry.boot_id = Some(BOOT_ID.to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
         (spool, entry)
@@ -3637,6 +4079,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         approved.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         approved.attested_scope_id = Some(44);
         approved.boot_id = Some(BOOT_ID.to_owned());
+        approved.attested_harness = Some("codex".to_owned());
         let spool =
             FakeSpool::new().with_file(id.as_bytes().to_vec(), approved.to_json().into_bytes());
         let before = spool.files()[id.as_bytes()].clone();
@@ -3656,6 +4099,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::Human;
         entry.attested_scope_id = None;
         entry.boot_id = None;
+        entry.attested_harness = None;
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
         let before = spool.files()[NONCE.as_bytes()].clone();
@@ -4008,7 +4452,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let entry = shown_entry();
         let spool =
             FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         host.confirmations = live_confirmation_store();
         let status_request = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -4076,6 +4520,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &unknown),
             Served::Refused(Fault::Client)
         );
+
+        let queue_list = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(queue_list.to_json().into_bytes()));
+        assert_eq!(
+            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &queue_list,),
+            Served::Decided
+        );
     }
 
     #[test]
@@ -4098,6 +4552,722 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             BrokerResponse::parse(&conn.written()).unwrap().answer,
             Answer::Watching { prompts, .. } if prompts.len() == 1
         ));
+    }
+
+    #[test]
+    fn queue_list_returns_only_the_requesters_status_when_the_peer_is_not_a_reviewer() {
+        let record = crate::queue::QueueEntry {
+            id: NONCE.to_owned(),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW,
+            expires_at: NOW + 1000,
+            reason: Some("review this".to_owned()),
+            state: crate::queue::QueueState::Pending,
+        };
+        let store = FakeSpool::new().with_file(
+            format!("{}.json", record.id).into_bytes(),
+            serde_json::to_vec(&record).unwrap(),
+        );
+        let mut host = with_test_boot(Host::honest());
+        host.queue = store;
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let response = serve_with(&mut host, &conn, Ok(&FakeSpool::new()));
+        assert_eq!(response.served, Served::Decided);
+        assert!(
+            matches!(response.answer, Answer::QueueListed { ref entries }
+            if entries.len() == 1
+                && entries[0].id == NONCE
+                && entries[0].argv == ["/usr/bin/true"]
+                && entries[0].reason.as_deref() == Some("review this"))
+        );
+
+        let mut other_owner = record;
+        other_owner.uid = UID.saturating_add(1);
+        let mut other_host = with_test_boot(Host::honest());
+        other_host.queue = FakeSpool::new().with_file(
+            format!("{}.json", other_owner.id).into_bytes(),
+            serde_json::to_vec(&other_owner).unwrap(),
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let response = serve_with(&mut other_host, &conn, Ok(&FakeSpool::new()));
+        assert!(
+            matches!(response.answer, Answer::QueueListed { ref entries } if entries.is_empty()),
+            "{:?}",
+            response.answer
+        );
+    }
+
+    #[test]
+    fn queue_list_reviewer_sees_sanitized_pending_claimed_and_done_entries() {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let registry = xudo_policy::HarnessRegistry::from_files([("codex.toml", HARNESS)]).unwrap();
+        let records: Vec<_> = [
+            crate::queue::QueueState::Done,
+            crate::queue::QueueState::Pending,
+            crate::queue::QueueState::Claimed,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, state)| crate::queue::QueueEntry {
+            id: format!("{:064x}", index + 1),
+            argv: vec![b"/usr/bin/true\x1b[2J".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: 1001,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW,
+            expires_at: NOW + 1000,
+            reason: None,
+            state,
+        })
+        .collect();
+        let visible = visible_queue_list(
+            records.clone(),
+            1000,
+            crate::queue::PeerClass::Human,
+            &registry,
+            "alice:x:1000:1000::/:/bin/sh\n",
+        );
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].state, "done");
+        assert_eq!(visible[1].state, "pending");
+        assert_eq!(visible[2].state, "claimed");
+        assert!(!visible[0].argv[0].contains('\x1b'));
+        assert!(
+            visible_queue_list(
+                records,
+                1000,
+                crate::queue::PeerClass::EnrolledAgent,
+                &registry,
+                "alice:x:1000:1000::/:/bin/sh\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn queue_list_refuses_missing_storage_policy_and_prune_failures() {
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+
+        let mut host = Host::honest();
+        let mut platform = host.platform();
+        platform.queue = None;
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut platform, &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+
+        let mut host = Host::honest();
+        host.policy.answer = Err(xudo_gate::PolicyError::Config(
+            xudo_gate::SettingsError::NotUtf8 {
+                file: "config.toml".into(),
+            },
+        ));
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+
+        let mut host = with_test_boot(Host::honest());
+        host.queue = FakeSpool::new()
+            .failing_names_on_call(2, SpoolError::NotADirectory { at: "queue".into() });
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+
+        let mut host = with_test_boot(Host::honest());
+        host.queue =
+            FakeSpool::new().failing_lock(SpoolError::NotADirectory { at: "queue".into() });
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+
+        let expired = crate::queue::QueueEntry {
+            id: NONCE.to_owned(),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(10_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+        };
+        let mut host = with_test_boot(Host::honest());
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", expired.id),
+            serde_json::to_vec(&expired).unwrap(),
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+
+        let mut host = with_test_boot(Host::honest());
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", expired.id),
+            serde_json::to_vec(&expired).unwrap(),
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Decided
+        );
+        assert_eq!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::QueueListed {
+                entries: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn broker_queues_only_a_verified_listed_ask_human_match() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let response = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            request,
+        );
+        assert_eq!(response, Served::Decided);
+        assert!(matches!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::Decided { decision, minted: None }
+                if decision.denial == Some(xudo_policy::DenialCode::AskHuman)
+        ));
+        let queued = crate::queue::load_all(&host.queue).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].harness, "codex");
+        assert_eq!(
+            queued[0].argv,
+            [b"/usr/bin/apt-get".to_vec(), b"upgrade".to_vec()]
+        );
+        assert_eq!(queued[0].expires_at, queued[0].queued_at + 60_000);
+
+        let (mut host, identity, _) = ask_human_fixture();
+        let unknown = BrokerRequest::new(
+            "/usr/bin/true",
+            vec!["upgrade".to_owned()],
+            "untrusted hint",
+        )
+        .with_cwd_bytes(b"/srv".to_vec());
+        let conn = connection(Ok(unknown.to_json().into_bytes()));
+        let response = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            unknown,
+        );
+        assert_eq!(response, Served::Decided);
+        assert!(matches!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::Decided { decision, minted: None }
+                if decision.denial == Some(xudo_policy::DenialCode::UnknownAction)
+        ));
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn broker_refuses_an_unqueueable_ask_human_request() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let invalid_request = request.with_cwd_bytes(Vec::new());
+        let conn = connection(Ok(invalid_request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &invalid_request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn queue_entry_creation_requires_verified_ask_human_facts() {
+        let (host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        assert!(decision.action.is_some());
+
+        // A readable boot id reaches the nonce. The refusal is the entropy
+        // error, not the boot-id check that returns first.
+        let (mut no_randomness, _, _) = ask_human_fixture();
+        no_randomness.entropy = FakeEntropy::new().with(Err(SysError::unsupported("getrandom")));
+        assert_eq!(
+            queue_entry_from_request(
+                &no_randomness.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            )
+            .unwrap_err(),
+            "getrandom is not supported on this platform"
+        );
+
+        let not_run = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let empty_cwd = request.clone().with_cwd_bytes(Vec::new());
+        let mut no_action = decision.clone();
+        no_action.action = None;
+        let mut missing_action = decision.clone();
+        missing_action.action = Some(xudo_policy::ActionId::new("xudo.missing"));
+        let human = CallerFacts::new(xudo_policy::Classification::Human, UID);
+        let wrong_harness = CallerFacts::new(
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "other".into(),
+                session_id: "session".into(),
+                declared_yolo: false,
+            },
+            UID,
+        );
+        for (candidate, verdict, facts) in [
+            (not_run, decision.clone(), caller.clone()),
+            (empty_cwd, decision.clone(), caller.clone()),
+            (request.clone(), no_action, caller.clone()),
+            (request.clone(), missing_action, caller.clone()),
+            (request.clone(), decision.clone(), human),
+            (request.clone(), decision.clone(), wrong_harness),
+        ] {
+            let (mut candidate_host, _, _) = ask_human_fixture();
+            assert!(
+                queue_entry_from_request(
+                    &candidate_host.platform(),
+                    &identity,
+                    &candidate,
+                    &verdict,
+                    &facts,
+                    &policy,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn broker_refuses_ask_human_when_queue_storage_is_unavailable_or_full() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let mut platform = host.platform();
+        platform.queue = None;
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut platform,
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+
+        let mut full = FakeSpool::new();
+        for index in 0..crate::queue::MAX_PER_UID {
+            let record = crate::queue::QueueEntry {
+                id: format!("{index:064x}"),
+                argv: vec![b"/usr/bin/true".to_vec()],
+                cwd: b"/srv".to_vec(),
+                boot_id: TEST_BOOT.to_owned(),
+                harness: "codex".to_owned(),
+                uid: identity.uid,
+                rule_id: "xudo.test.run".to_owned(),
+                generation: 7,
+                queued_at: NOW,
+                expires_at: NOW + 60_000,
+                reason: None,
+                state: crate::queue::QueueState::Pending,
+            };
+            full = full.with_file(
+                format!("{}.json", record.id),
+                serde_json::to_vec(&record).unwrap(),
+            );
+        }
+        host.queue = full;
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+
+        let (mut host, identity, _) = ask_human_fixture();
+        host.queue = FakeSpool::new().with_file("bad.json", b"{}".to_vec());
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+    }
+
+    #[test]
+    fn broker_refuses_ask_human_when_audit_fails() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+    }
+
+    #[test]
+    fn broker_refuses_queue_admission_when_pruning_audit_fails() {
+        let (host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+        };
+        let store = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        assert!(audit_queue_pruned(
+            &mut FakeAuditSink::new(),
+            std::slice::from_ref(&stale.id),
+        ));
+        let (mut host, _, _) = ask_human_fixture();
+        let mut audit = SecondAuditAppendFails {
+            inner: FakeAuditSink::new(),
+            calls: 0,
+        };
+        let mut platform = host.platform();
+        platform.audit = &mut audit;
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut platform,
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        // The stale file was never audited, so it stays. Deleting it would
+        // drop a request with no audit record. The new entry is not published.
+        let left = crate::queue::load_all(&store).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, stale.id);
+    }
+
+    #[test]
+    fn an_admission_audit_failure_publishes_nothing() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_queue_publish_failure_after_the_audit_leaves_the_store_empty() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.queue = FakeSpool::new().failing_publish(SpoolError::Gone {
+            name: "publish".to_owned(),
+        });
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&host.queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_queued_entry_is_linked_to_its_audit_record_by_id() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_request(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                identity,
+                request,
+            ),
+            Served::Decided
+        );
+        let queued = crate::queue::load_all(&host.queue).unwrap();
+        assert_eq!(queued.len(), 1);
+        let marker = format!("queue_id={}", queued[0].id);
+        let mut linked = false;
+        for record in host.audit.records() {
+            for item in &record.evidence {
+                if item == &marker {
+                    linked = true;
+                }
+            }
+        }
+        assert!(linked);
+    }
+
+    #[test]
+    fn queue_entry_refuses_an_unreadable_or_malformed_boot_id() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        host.syscalls = FakeSyscalls::new();
+        assert_eq!(
+            queue_entry_from_request(
+                &host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            )
+            .unwrap_err(),
+            "fake: no boot id scripted is not supported on this platform"
+        );
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok("not-a-uuid".to_owned()));
+        assert_eq!(
+            queue_entry_from_request(
+                &host.platform(),
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            )
+            .unwrap_err(),
+            "fake: malformed boot id is not supported on this platform"
+        );
+    }
+
+    #[test]
+    fn boot_id_for_queue_rejects_an_error_and_a_malformed_id() {
+        let missing = SysError::unsupported("fake: no boot id scripted");
+        assert_eq!(
+            boot_id_for_queue(Err(missing)).unwrap_err(),
+            "fake: no boot id scripted is not supported on this platform"
+        );
+        assert_eq!(
+            boot_id_for_queue(Ok("not-a-uuid".to_owned())).unwrap_err(),
+            "boot id is not a lowercase uuid"
+        );
+        assert_eq!(
+            boot_id_for_queue(Ok(TEST_BOOT.to_owned())).unwrap(),
+            TEST_BOOT
+        );
+    }
+
+    #[test]
+    fn queue_list_refuses_an_unreadable_or_malformed_boot_id() {
+        let identity = test_identity(PID, START, 0, 0);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let mut host = Host::honest();
+        host.queue = FakeSpool::new();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        // Broker faults stay off the wire. The audit record carries the reason.
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        assert_eq!(refusal_detail(&answer), None);
+        assert!(
+            host.audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("detail=boot id is unavailable")
+        );
+
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok("not-a-uuid".to_owned()));
+        host.queue = FakeSpool::new();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::BrokerUnusable));
+        assert_eq!(refusal_detail(&answer), None);
+        assert!(
+            host.audit.records()[0]
+                .evidence
+                .join(" ")
+                .contains("detail=boot id is unavailable")
+        );
+    }
+
+    #[test]
+    fn queue_list_shows_owner_status_and_only_human_reviewer_details() {
+        let (mut host, identity, _request) = ask_human_fixture();
+        let queue_request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let owner_entry = crate::queue::QueueEntry {
+            id: NONCE.to_owned(),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: identity.uid,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW,
+            expires_at: NOW + 60_000,
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+        };
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", owner_entry.id),
+            serde_json::to_vec(&owner_entry).unwrap(),
+        );
+        let conn = connection(Ok(queue_request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &queue_request),
+            Served::Decided
+        );
+
+        let (mut human_host, mut human_identity, _) = ask_human_fixture();
+        human_identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        let mut loaded = human_host.policy.load().unwrap();
+        loaded.passwd = b"alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_vec();
+        human_host.policy.answer = Ok(loaded);
+        let reviewer_entry = crate::queue::QueueEntry {
+            id: "cd".repeat(32),
+            uid: identity.uid.saturating_add(1),
+            ..owner_entry
+        };
+        human_host.queue = FakeSpool::new().with_file(
+            format!("{}.json", reviewer_entry.id),
+            serde_json::to_vec(&reviewer_entry).unwrap(),
+        );
+        let conn = connection(Ok(queue_request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(
+                &conn,
+                &mut human_host.platform(),
+                &human_identity,
+                &queue_request,
+            ),
+            Served::Decided
+        );
+        assert_eq!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::QueueListed {
+                entries: vec![xudo_wire::QueueListEntry {
+                    id: "cd".repeat(32),
+                    argv: vec!["/usr/bin/true".into()],
+                    cwd: "/srv".into(),
+                    harness: "codex".into(),
+                    uid: identity.uid.saturating_add(1),
+                    rule_id: "xudo.test.run".into(),
+                    generation: 7,
+                    queued_at: NOW,
+                    expires_at: NOW + 60_000,
+                    reason: None,
+                    state: "pending".into(),
+                }]
+            }
+        );
     }
 
     #[test]
@@ -5892,6 +7062,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         let mut scoped_identity = identity.clone();
         scoped_identity.cgroup_id = Some(44);
         let wrong_boot = xudo_sys::FakeSyscalls::new()
@@ -8585,13 +9756,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         entry.attested_class = xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
     }
 
     /// What the broker stores at mint for a human or an unattested caller.
     fn stored_as(entry: &mut PendingRequest, class: xudo_gate::request::AttestedClass) {
+        match &class {
+            xudo_gate::request::AttestedClass::EnrolledAgent { scope_id } => {
+                entry.attested_scope_id = Some(*scope_id);
+                entry.boot_id = Some(TEST_BOOT.to_owned());
+                entry.attested_harness = Some("codex".to_owned());
+            }
+            xudo_gate::request::AttestedClass::Human
+            | xudo_gate::request::AttestedClass::Unattested => {
+                entry.attested_scope_id = None;
+                entry.boot_id = None;
+                entry.attested_harness = None;
+            }
+        }
         entry.attested_class = class;
-        entry.attested_scope_id = None;
-        entry.boot_id = None;
     }
 
     fn freeze_request() -> BrokerRequest {
@@ -8656,6 +9839,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Refused { .. }
             | Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -8666,6 +9850,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Refused { .. }
             | Answer::Decided { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -8676,6 +9861,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Refused { .. }
             | Answer::Decided { .. }
             | Answer::Pending { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -8686,6 +9872,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Answer::Decided { .. }
             | Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }
@@ -9321,12 +10508,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         relative.question = xudo_wire::Question::Run {
             program: "systemctl".to_owned(),
             argv: vec!["restart".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "x".to_owned(),
         };
         let mut nul = valid.clone();
         nul.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart\0--force".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "x".to_owned(),
         };
         let mut not_utf8 =
@@ -9461,6 +10650,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             attested_class: xudo_gate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
         }
     }
 
@@ -9724,6 +10914,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         request.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "\u{1}".repeat(12_000)],
+            cwd: Vec::new(),
             claimed_classification: "x".to_owned(),
         };
         let evaluated = Evaluated {
@@ -9771,12 +10962,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     fn class_label(class: &xudo_gate::request::AttestedClass) -> &'static str {
-        stored_caller(&PendingRequest {
-            attested_class: class.clone(),
-            ..shown_entry()
-        })
-        .classification
-        .label()
+        let mut entry = shown_entry();
+        stored_as(&mut entry, class.clone());
+        stored_caller(&entry).classification.label()
     }
 
     fn stored_state(spool: &FakeSpool) -> Option<xudo_gate::request::ConfirmationState> {
@@ -9944,7 +11132,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn the_engine_ignores_the_stored_callers_placeholder_names() {
+    fn a_stored_session_name_does_not_change_the_decision() {
         use xudo_policy::Classification;
         let policy = policy();
         let entry = enrolled_entry(NONCE, UID);
@@ -9952,10 +11140,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let baseline = stored_caller(&entry);
         let expected = decide(&policy, &baseline, &request);
         for yolo in [false, true] {
-            for (agent, session) in [("scope-44", "stored"), ("", ""), ("root", "other")] {
+            for session in ["stored", "other-session"] {
                 let mut caller = baseline.clone();
                 caller.classification = Classification::EnrolledAgent {
-                    agent_id: agent.to_owned(),
+                    agent_id: "codex".to_owned(),
                     session_id: session.to_owned(),
                     declared_yolo: yolo,
                 };
@@ -9964,6 +11152,34 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 assert_eq!(got.denial, expected.denial);
             }
         }
+    }
+
+    #[test]
+    fn stored_caller_uses_the_registry_label_and_refuses_a_missing_one() {
+        use xudo_policy::Classification;
+        let mut entry = enrolled_entry(NONCE, UID);
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        entry.attested_harness = None;
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            }
+        );
+        entry.attested_harness = Some(String::new());
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            }
+        );
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub enum DenialCode {
     NoConfirmationChannel,
     /// The action is allowed for humans but never on the agent path.
     HumanPathOnly,
+    /// A matching `ask-human` harness rule must be reviewed through the human path.
+    AskHuman,
     /// The program the caller asked to run is not the program the action names.
     ///
     /// Its own code rather than [`Self::ArgvRejected`], because the two send a
@@ -161,6 +163,7 @@ impl DenialCode {
             Self::ConfirmationExpired => 10,
             Self::ConfirmationThrottled => 11,
             Self::DenyRule => 12,
+            Self::AskHuman => 13,
         }
     }
 
@@ -179,6 +182,7 @@ impl DenialCode {
             Self::ConfirmationExpired => "confirmation_expired",
             Self::ConfirmationThrottled => "confirmation_throttled",
             Self::DenyRule => "deny_rule",
+            Self::AskHuman => "ask_human",
         }
     }
 
@@ -215,6 +219,9 @@ impl DenialCode {
             }
             Self::HumanPathOnly => {
                 "this action is never available to an agent; hand it to a person"
+            }
+            Self::AskHuman => {
+                "ask a person to review this request in the root-held queue before it can run"
             }
             Self::ExeMismatch => {
                 "this action runs a different program than the one requested; run `xudo list` \
@@ -327,6 +334,13 @@ pub enum TraceStep {
         /// Why.
         reason: String,
     },
+    /// A matching ask-human rule diverted the verified harness to the reviewer queue.
+    AskHumanQueued {
+        /// The action that requested review.
+        action: String,
+        /// The rule source.
+        source: String,
+    },
 }
 
 /// The complete result of an evaluation.
@@ -429,7 +443,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 12] = [
+    const ALL_CODES: [DenialCode; 13] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -442,6 +456,7 @@ mod tests {
         DenialCode::ConfirmationExpired,
         DenialCode::ConfirmationThrottled,
         DenialCode::DenyRule,
+        DenialCode::AskHuman,
     ];
 
     #[test]
@@ -456,7 +471,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();

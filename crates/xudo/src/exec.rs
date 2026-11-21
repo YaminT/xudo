@@ -1,6 +1,7 @@
 //! `xudo exec`: ask the broker, then let `main` swap this process for the backend.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigVal
 use xudo_policy::{DenialCode, ExitCode};
 use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question};
 
-use crate::cli::{Cli, emit, emit_queued};
+use crate::cli::{Cli, emit};
 
 type StatusPoll<'a> =
     dyn FnMut(Duration, &BrokerRequest) -> Result<Option<BrokerResponse>, ExitCode> + 'a;
@@ -158,7 +159,11 @@ fn plan_paced(
     };
 
     // "unattested" is a hint the broker ignores; it works out who we are itself.
-    let request = BrokerRequest::new(program.clone(), operands.to_vec(), "unattested");
+    let cwd = std::env::current_dir()
+        .map(|path| path.into_os_string().into_vec())
+        .unwrap_or_default();
+    let request =
+        BrokerRequest::new(program.clone(), operands.to_vec(), "unattested").with_cwd_bytes(cwd);
     let response = match ask(socket, timeout, &request) {
         Ok(response) => response,
         Err(why) => {
@@ -207,7 +212,7 @@ fn plan_paced(
                 cli, answer, &id, &request, socket, timeout, backend, err, out,
             ),
         }),
-        Answer::Watching { .. } | Answer::Done => {
+        Answer::Watching { .. } | Answer::QueueListed { .. } | Answer::Done => {
             let _ = writeln!(
                 err,
                 "xudo: broker returned an answer for an unsupported question"
@@ -369,7 +374,10 @@ fn poll_status_with(
                 Answer::Pending { id: status_id, .. } if status_id == id => silent = false,
                 Answer::Pending { .. } => return Err(ExitCode::Unusable),
                 Answer::Decided { .. } => return Ok(Some(response)),
-                Answer::Refused { .. } | Answer::Watching { .. } | Answer::Done => {
+                Answer::Refused { .. }
+                | Answer::Watching { .. }
+                | Answer::QueueListed { .. }
+                | Answer::Done => {
                     return Err(ExitCode::Unusable);
                 }
             },
@@ -466,13 +474,12 @@ pub(crate) fn ask(
     BrokerResponse::parse(&bytes).map_err(|error| error.to_string())
 }
 
-/// Shows a denial, queueing it first when `--queue` asks and a person can
-/// resolve it. The verdict and the exit status are the denial's either way.
+/// Shows a denial. Privileged denials are never written into the caller-owned ido queue.
 fn report_denial(
     cli: &Cli,
     decision: &xudo_policy::Decision,
     argv: &[String],
-    queue: Option<&ido::Host>,
+    _queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -480,58 +487,20 @@ fn report_denial(
         decision.denial,
         Some(DenialCode::HumanPathOnly | DenialCode::NoConfirmationChannel)
     );
-    let queued = match (human_only, queue) {
-        (true, Some(host)) => queue_denied(host, argv, decision, err),
-        _ => None,
-    };
-    let status = emit_queued(cli, decision, queued.map(|q| q.id), out);
-    match queued {
-        Some(q) => {
-            let _ = write!(err, "{}", crate::render::queued_human(q.id, q.already));
-        }
-        None if human_only => {
-            let _ = writeln!(
-                err,
-                "xudo: a human must run this; queue it with:\n  ido queue -- {}",
-                display_quoted(argv)
-            );
-        }
-        None => {}
+    let status = emit(cli, decision, out);
+    if human_only {
+        let _ = writeln!(
+            err,
+            "xudo: a human must run this; review it and run it with:\n  ido queue -- {}",
+            display_quoted(argv)
+        );
+    } else if decision.denial == Some(DenialCode::AskHuman) {
+        let _ = writeln!(
+            err,
+            "xudo: request submitted to the root-held human review queue"
+        );
     }
     status
-}
-
-/// Writes the denied command to the caller's `ido` queue, as `ido queue` would.
-///
-/// `None` on any failure, after saying why: the caller then prints the plain
-/// denial, so a failed write is never read as queued. The command is stored as
-/// the vector it arrived as; the denial code is display-only provenance in the
-/// entry's reason, which `ido` sanitizes wherever it shows it.
-fn queue_denied(
-    host: &ido::Host,
-    argv: &[String],
-    decision: &xudo_policy::Decision,
-    err: &mut dyn Write,
-) -> Option<ido::Enqueued> {
-    let code = decision
-        .denial
-        .map_or_else(String::new, |code| format!("{code:?}"));
-    let reason = format!("xudo denied this ({code}); a human must run it");
-    match ido::enqueue(host, argv.to_vec(), Some(reason)) {
-        Ok(queued) => Some(queued),
-        Err(error) => {
-            let _ = writeln!(
-                err,
-                "xudo: could not queue the command ({}); nothing was queued",
-                term_sanitize::display_str(
-                    &error.to_string(),
-                    term_sanitize::Limits::single_line(200)
-                )
-                .text
-            );
-            None
-        }
-    }
 }
 
 /// The argv as a shell line, for a human to read and paste. Display only.
@@ -1559,6 +1528,7 @@ mod tests {
             std::mem::discriminant(&Question::Run {
                 program: String::new(),
                 argv: Vec::new(),
+                cwd: Vec::new(),
                 claimed_classification: String::new(),
             })
         );
@@ -1765,7 +1735,7 @@ mod tests {
     }
 
     fn queueing_cli(output: &str) -> Cli {
-        Cli::parse_from(["xudo", "--output", output, "exec", "--queue", "--", "x"])
+        Cli::parse_from(["xudo", "--output", output, "exec", "--", "x"])
     }
 
     fn denied(code: DenialCode) -> Vec<u8> {
@@ -1776,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn a_denial_with_queue_writes_one_entry_with_exact_argv() {
+    fn a_privileged_denial_is_never_written_to_the_callers_ido_queue() {
         for code in [DenialCode::HumanPathOnly, DenialCode::NoConfirmationChannel] {
             let dir = tempfile::tempdir().unwrap();
             let host = queue_host(dir.path());
@@ -1794,16 +1764,9 @@ mod tests {
             assert_eq!(result, plain);
             assert!(result.is_err());
             assert!(!out.is_empty());
-            assert!(err.contains("queued as #1, run `ido` to execute"), "{err}");
-            assert!(!err.contains("ido queue --"), "{err}");
-            let entries = queued_entries(&host);
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].argv, args);
-            assert_eq!(entries[0].queued_by.as_deref(), Some("xudo"));
-            assert!(entries[0].via_xudo, "a denied command is xudo-bound");
-            let reason = entries[0].reason.as_deref().unwrap();
-            assert!(reason.contains(&format!("{code:?}")), "{reason}");
-            // The same command again is the same entry, not a second.
+            assert!(!err.contains("queued as"), "{err}");
+            assert!(err.contains("ido queue --"), "{err}");
+            assert!(queued_entries(&host).is_empty());
             let (_, _, err) = against_queueing(
                 denied(code),
                 &SUDO,
@@ -1811,13 +1774,13 @@ mod tests {
                 &queueing_cli("human"),
                 Some(&host),
             );
-            assert!(err.contains("already queued as #1"), "{err}");
-            assert_eq!(queued_entries(&host).len(), 1);
+            assert!(!err.contains("queued as"), "{err}");
+            assert!(queued_entries(&host).is_empty());
         }
     }
 
     #[test]
-    fn a_json_denial_with_queue_carries_the_entry_id() {
+    fn a_json_human_path_denial_has_no_user_queue_id() {
         let dir = tempfile::tempdir().unwrap();
         let host = queue_host(dir.path());
         let (result, out, _) = against_queueing(
@@ -1829,8 +1792,22 @@ mod tests {
         );
         assert_eq!(result, Err(ExitCode::Denied));
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["queued"]["id"], 1);
+        assert!(parsed.get("queued").is_none());
         assert_eq!(parsed["verdict"], "deny");
+    }
+
+    #[test]
+    fn ask_human_reports_submission_to_the_root_held_queue() {
+        let (result, _, err) = against_queueing(
+            denied(DenialCode::AskHuman),
+            &SUDO,
+            &argv(),
+            &queueing_cli("human"),
+            None,
+        );
+        assert_eq!(result, Err(ExitCode::Denied));
+        assert!(err.contains("request submitted to the root-held human review queue"));
+        assert!(!err.contains("ido queue --"));
     }
 
     #[test]
@@ -1850,7 +1827,7 @@ mod tests {
             let (plain, _, _) = against(denied(code), &SUDO, &argv());
             assert!(plain.is_err(), "{plain:?}");
             assert_eq!(result, plain);
-            assert_eq!(queued_entries(&host).len(), 1);
+            assert!(queued_entries(&host).is_empty());
         }
         // An allowed command is planned as without the flag, and queues nothing.
         let dir = tempfile::tempdir().unwrap();
@@ -1902,20 +1879,14 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_argument_is_refused_by_the_parser_and_nothing_is_queued() {
+    fn a_non_utf8_argument_is_refused_by_the_parser_without_queue_flags() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         // `ido`'s `Entry.argv` is `Vec<String>`, so non-UTF-8 bytes cannot be
         // queued byte for byte: the command line parser refuses them first,
         // and nothing lossy ever reaches the queue.
         let bad = OsString::from_vec(b"/usr/bin/tool\xff\xfe".to_vec());
-        let parsed = Cli::try_parse_from([
-            OsString::from("xudo"),
-            "exec".into(),
-            "--queue".into(),
-            "--".into(),
-            bad,
-        ]);
+        let parsed = Cli::try_parse_from([OsString::from("xudo"), "exec".into(), "--".into(), bad]);
         assert!(parsed.is_err());
         // The refusal happens before any queue is opened.
         let dir = tempfile::tempdir().unwrap();
@@ -1923,8 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn control_characters_in_argv_are_queued_exactly() {
-        // Text with every byte `ido` must not reinterpret is stored as given.
+    fn control_characters_in_a_denial_are_not_written_to_a_user_queue() {
         let dir = tempfile::tempdir().unwrap();
         let host = queue_host(dir.path());
         let args: Vec<String> = [
@@ -1946,13 +1916,11 @@ mod tests {
             Some(&host),
         );
         assert_eq!(result, Err(ExitCode::Denied));
-        let entries = queued_entries(&host);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].argv, args);
+        assert!(queued_entries(&host).is_empty());
     }
 
     #[test]
-    fn a_failed_queue_write_fails_closed() {
+    fn a_denial_does_not_try_to_write_a_user_queue() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = queue_host(dir.path());
         host.home = None;
@@ -1965,8 +1933,7 @@ mod tests {
                 Some(&host),
             );
             assert_eq!(result, Err(ExitCode::Denied));
-            assert!(err.contains("could not queue the command"), "{err}");
-            assert!(err.contains("nothing was queued"), "{err}");
+            assert!(!err.contains("could not queue the command"), "{err}");
             assert!(!err.contains("queued as"), "{err}");
             // The denial still tells the agent how to hand it over by hand.
             assert!(err.contains("ido queue --"), "{err}");

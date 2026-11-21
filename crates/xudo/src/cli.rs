@@ -169,12 +169,6 @@ pub enum Command {
         /// The command and its arguments, after `--`. The program is an absolute path.
         #[arg(trailing_var_arg = true, required = true, value_name = "ARGV")]
         argv: Vec<String>,
-
-        /// If the denial is one only a human can resolve (`human-path-only` or
-        /// `no-confirmation-channel`), queue the command for `ido` and report
-        /// its id. Never runs anything and never changes the verdict.
-        #[arg(long)]
-        queue: bool,
     },
 
     /// Lint the ruleset, then run the `[[test]]` tables in its rule files.
@@ -1648,7 +1642,7 @@ mod tests {
             let cli = Cli::try_parse_from(["xudo", "exec", "--", first, "x"]).unwrap();
             assert!(matches!(
                 cli.command,
-                Command::Exec { ref argv, queue: false } if argv == &[first, "x"]
+                Command::Exec { ref argv, .. } if argv == &[first, "x"]
             ));
         }
     }

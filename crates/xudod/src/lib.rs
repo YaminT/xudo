@@ -101,6 +101,7 @@ fn run_with_hygiene(
             let spool = SpoolDir::open(Path::new(xudo_gate::SPOOL_DIR));
             let confirmations = SpoolDir::open(Path::new(crate::CONFIRM_DIR));
             let freeze_file = SpoolDir::open(Path::new("/var/lib/xudo"));
+            let queue_store = SpoolDir::open_beneath(Path::new("/var/lib/xudo/queue"));
             let cgroups = open_cgroups(audit, HostCgroup::open());
             let policy = HostPolicy::system();
             let mut platform = Platform {
@@ -114,6 +115,7 @@ fn run_with_hygiene(
                 audit,
                 confirmations: xudo_sys::as_seam(&confirmations).ok(),
                 freeze_file: xudo_sys::as_seam(&freeze_file).ok(),
+                queue: xudo_sys::as_seam(&queue_store).ok(),
             };
             serve(&conn, &mut platform, xudo_sys::as_seam(&spool)).exit_status()
         }
@@ -235,6 +237,7 @@ mod tests {
             Answer::Decided { .. }
             | Answer::Pending { .. }
             | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
             | Answer::Done => None,
         }
     }

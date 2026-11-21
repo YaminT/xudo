@@ -55,6 +55,7 @@ pub enum LoadError {
 struct File {
     confirm_human_path: Option<bool>,
     confirmation_timeout_secs: Option<u64>,
+    queue_ttl_secs: Option<u64>,
     frozen: Option<bool>,
     audit_sink: Option<String>,
     color: Option<bool>,
@@ -137,7 +138,7 @@ pub fn apply_file_scoped(
 
     // Ordered so a file's errors are reported in a stable order regardless of
     // how the keys were written.
-    let entries: [(Setting, Option<Value>); 6] = [
+    let entries: [(Setting, Option<Value>); 7] = [
         (
             Setting::ConfirmHumanPath,
             parsed.confirm_human_path.map(Value::Bool),
@@ -145,6 +146,10 @@ pub fn apply_file_scoped(
         (
             Setting::ConfirmationTimeoutSecs,
             parsed.confirmation_timeout_secs.map(Value::Integer),
+        ),
+        (
+            Setting::QueueTtlSecs,
+            parsed.queue_ttl_secs.map(Value::Integer),
         ),
         (Setting::Frozen, parsed.frozen.map(Value::Bool)),
         (Setting::AuditSink, parsed.audit_sink.map(Value::Text)),
@@ -507,6 +512,7 @@ mod tests {
                 "confirmation_timeout_secs = 45",
                 Setting::ConfirmationTimeoutSecs,
             ),
+            ("queue_ttl_secs = 3600", Setting::QueueTtlSecs),
             ("frozen = true", Setting::Frozen),
             ("audit_sink = \"journald\"", Setting::AuditSink),
             ("color = false", Setting::Color),

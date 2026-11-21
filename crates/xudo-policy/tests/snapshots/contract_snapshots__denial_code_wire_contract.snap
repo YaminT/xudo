@@ -26,3 +26,5 @@ expression: table
     an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`
 12  deny_rule
     an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person
+13  ask_human
+    ask a person to review this request in the root-held queue before it can run
