@@ -41,6 +41,6 @@ pub mod tail;
 pub use chain::{Chain, ChainError, ChainReadError, LogError, follows, verify, verify_log};
 pub use record::{Approval, Decision, Outcome, Record, Sequence};
 pub use tail::{
-    Continuation, MAX_RECORD_BYTES, TAIL_WINDOW, TailError, continuation, continuation_of,
-    window_start,
+    Continuation, MAX_RECORD_BYTES, ScanError, TAIL_WINDOW, TailError, WindowScan, continuation,
+    continuation_of, judge_window, scan_bounded, window_start,
 };

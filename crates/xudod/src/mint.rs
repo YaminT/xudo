@@ -363,6 +363,7 @@ pub(crate) fn entry_for_classified(
         attested_scope_id,
         boot_id,
         attested_harness,
+        queue_id: None,
     })
 }
 
@@ -634,6 +635,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         }
     }
 
@@ -785,6 +787,7 @@ mod tests {
                 attested_scope_id: None,
                 boot_id: None,
                 attested_harness: None,
+                queue_id: None,
             }
         );
     }

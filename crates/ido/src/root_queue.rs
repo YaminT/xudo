@@ -53,7 +53,10 @@ pub fn queue_list_page_request(after: &str) -> Vec<u8> {
 /// Asks the broker to put a claimed entry back to pending.
 #[must_use]
 pub fn queue_release_request(id: &str) -> Vec<u8> {
-    request(Question::QueueRelease { id: id.to_owned() })
+    request(Question::QueueRelease {
+        id: id.to_owned(),
+        claim_token: String::new(),
+    })
 }
 
 fn request(question: Question) -> Vec<u8> {
@@ -191,7 +194,8 @@ mod tests {
         assert_eq!(
             release.question,
             Question::QueueRelease {
-                id: "ab".repeat(32)
+                id: "ab".repeat(32),
+                claim_token: String::new(),
             }
         );
 

@@ -115,11 +115,41 @@ pub trait AuditSink {
     /// Every record on the trail, in order.
     ///
     /// A missing log is an empty trail. The read does not create the file.
+    /// A log over 8 MiB is refused: verification reads the whole chain, and
+    /// an unbounded read is not a check.
     ///
     /// # Errors
     ///
     /// An [`AuditError`] when the log cannot be trusted or read.
     fn snapshot(&self) -> Result<Vec<Record>, AuditError>;
+
+    /// The newest record for which `accept` is true, without reading an
+    /// unbounded log into one buffer.
+    ///
+    /// The default reads [`Self::snapshot`]. The file log walks backward in
+    /// windows of at most 8 MiB, under the log lock, and drops each window
+    /// after it is searched. A torn last line is not damage.
+    ///
+    /// # Errors
+    ///
+    /// An [`AuditError`] when the log cannot be trusted, locked, or parsed.
+    /// A damaged complete line refuses. Absence of a match is `Ok(None)`.
+    fn find_record(
+        &self,
+        accept: &mut dyn FnMut(&Record) -> bool,
+    ) -> Result<Option<Record>, AuditError> {
+        newest_match(self.snapshot(), accept)
+    }
+}
+
+/// The newest record of `snapshot` that `accept` wants, or the error that
+/// kept the snapshot from being read. Not generic, so the same lines serve
+/// every sink that keeps the default `find_record`.
+fn newest_match(
+    snapshot: Result<Vec<Record>, AuditError>,
+    accept: &mut dyn FnMut(&Record) -> bool,
+) -> Result<Option<Record>, AuditError> {
+    snapshot.map(|records| records.into_iter().rev().find(|record| accept(record)))
 }
 
 /// A copy of each record, sent once the log holds it on disk and before the
@@ -300,6 +330,13 @@ impl AuditSink for AuditTrail {
     fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
         self.log.snapshot()
     }
+
+    fn find_record(
+        &self,
+        accept: &mut dyn FnMut(&Record) -> bool,
+    ) -> Result<Option<Record>, AuditError> {
+        self.log.matching_record(accept)
+    }
 }
 
 impl AuditSink for JsonlLog {
@@ -314,6 +351,13 @@ impl AuditSink for JsonlLog {
 
     fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
         self.read_snapshot()
+    }
+
+    fn find_record(
+        &self,
+        accept: &mut dyn FnMut(&Record) -> bool,
+    ) -> Result<Option<Record>, AuditError> {
+        self.matching_record(accept)
     }
 }
 

@@ -792,6 +792,9 @@ pub struct FakeSpool {
     replace_error_after_exchange: Option<SpoolError>,
     unreadable_after_replace: bool,
     replaced: std::cell::Cell<bool>,
+    /// When set, [`Spool::names`] returns insertion order, as a directory does.
+    directory_order: bool,
+    inserted: RefCell<Vec<Vec<u8>>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -808,7 +811,33 @@ impl FakeSpool {
     }
 
     fn with_file_bytes(self, name: Vec<u8>, bytes: Vec<u8>) -> Self {
+        self.inserted.borrow_mut().push(name.clone());
         self.files.borrow_mut().insert(name, bytes);
+        self
+    }
+
+    fn listed(&self, limit: usize) -> Vec<Vec<u8>> {
+        if self.directory_order {
+            let files = self.files.borrow();
+            return self
+                .inserted
+                .borrow()
+                .iter()
+                .filter(|name| files.contains_key(name.as_slice()))
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        self.files.borrow().keys().take(limit).cloned().collect()
+    }
+
+    /// Lists names in insertion order instead of sorted order.
+    ///
+    /// A real spool returns directory order. Tests that page a queue use this
+    /// so a sort bug is not hidden by [`BTreeMap`].
+    #[must_use]
+    pub fn in_directory_order(mut self) -> Self {
+        self.directory_order = true;
         self
     }
 
@@ -935,7 +964,7 @@ impl Spool for FakeSpool {
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
         self.record(SpoolCall::Names);
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().cloned().collect())
+        Ok(self.listed(usize::MAX))
     }
 
     fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
@@ -948,7 +977,7 @@ impl Spool for FakeSpool {
             }
         }
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().take(limit).cloned().collect())
+        Ok(self.listed(limit))
     }
 
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
@@ -1004,7 +1033,9 @@ impl Spool for FakeSpool {
                 name: name.to_owned(),
             });
         }
-        files.insert(name.as_bytes().to_vec(), bytes.to_vec());
+        let owned = name.as_bytes().to_vec();
+        self.inserted.borrow_mut().push(owned.clone());
+        files.insert(owned, bytes.to_vec());
         Ok(())
     }
 
@@ -1074,6 +1105,25 @@ mod tests {
     fn open_beneath_rejects_a_missing_queue_directory() {
         let path = std::env::temp_dir().join(format!("xudo-missing-queue-{}", std::process::id()));
         assert!(SpoolDir::open_beneath(&path).is_err());
+    }
+
+    #[test]
+    fn a_directory_order_spool_lists_names_as_they_were_inserted() {
+        let spool = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec())
+            .in_directory_order();
+        assert_eq!(spool.names().unwrap(), vec![b"b".to_vec(), b"a".to_vec()]);
+        assert_eq!(spool.names_up_to(1).unwrap(), vec![b"b".to_vec()]);
+        let sorted = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec());
+        assert_eq!(sorted.names().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
+        spool.publish("c", b"3").unwrap();
+        assert_eq!(
+            spool.names().unwrap(),
+            vec![b"b".to_vec(), b"a".to_vec(), b"c".to_vec()]
+        );
     }
 
     #[cfg(feature = "fake")]

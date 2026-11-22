@@ -190,7 +190,17 @@ fn main() -> std::process::ExitCode {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let fetch = fetch_root_queue();
+    let args: Vec<_> = std::env::args_os().collect();
+    // Only the picker and `ido list` show the root-held queue. `ido queue`
+    // is the agent's command and must not ask the broker.
+    let fetch = if ido::command_shows_root_queue(&args) {
+        fetch_root_queue()
+    } else {
+        RootFetch {
+            root_entries: Vec::new(),
+            unavailable: false,
+        }
+    };
     let host = ido::Host {
         home: std::env::home_dir(),
         xdg_config_home: var("XDG_CONFIG_HOME"),
@@ -224,7 +234,7 @@ fn main() -> std::process::ExitCode {
         input: &mut input,
         terminal: &mut open,
     };
-    let code = ido::run_with(std::env::args_os().collect(), &host, &mut io);
+    let code = ido::run_with(args, &host, &mut io);
     let _ = out.flush();
     // An exit status that does not fit a byte is never read as success.
     std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))

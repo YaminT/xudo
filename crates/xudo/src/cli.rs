@@ -398,6 +398,15 @@ pub fn run_with_installer(
     )
 }
 
+/// A queued plan is ready for `sudo`, which this process does not exec.
+/// The library returns the plan so a test can see it, and this process stops.
+fn queued_plan_exit(planned: &Result<exec::QueuedRun, ExitCode>) -> ExitCode {
+    match planned {
+        Ok(_) => ExitCode::Unusable,
+        Err(code) => *code,
+    }
+}
+
 /// `xudo exec`, including a queued claim. The library reports the plan and
 /// does not exec it.
 fn exec_command(
@@ -413,10 +422,20 @@ fn exec_command(
         return ExitCode::Unusable;
     };
     if let Some(id) = queued {
-        return match exec::plan_queued(cli, id, probe, socket, exec::TIMEOUT, out, err) {
-            Ok(_) => ExitCode::Unusable,
-            Err(code) => code,
-        };
+        let stdin = std::io::stdin();
+        let tty = std::io::IsTerminal::is_terminal(&stdin);
+        let mut input = stdin.lock();
+        return queued_plan_exit(&exec::plan_queued(
+            cli,
+            id,
+            probe,
+            socket,
+            exec::TIMEOUT,
+            tty,
+            &mut input,
+            out,
+            err,
+        ));
     }
     exec::plan_with_confirmation_timeout(
         cli,
@@ -4533,6 +4552,22 @@ expect = "deny"
         let cli = Cli::try_parse_from(["xudo", "check"]).unwrap();
         assert_eq!(cli.rules, PathBuf::from(DEFAULT_RULES_DIR));
         assert_eq!(cli.output, Format::Human);
+    }
+
+    #[test]
+    fn queued_plan_exit_maps_a_ready_run_to_unusable_and_keeps_a_refusal() {
+        let ready = exec::QueuedRun {
+            plan: exec::ExecPlan {
+                backend: "/usr/bin/sudo",
+                gate: xudo_backend::snippet::GATE_AUTH,
+                spawn: true,
+            },
+            id: "ab".repeat(32),
+            cwd: exec::QUEUED_CWD,
+            claim_token: "cd".repeat(32),
+        };
+        assert_eq!(queued_plan_exit(&Ok(ready)), ExitCode::Unusable);
+        assert_eq!(queued_plan_exit(&Err(ExitCode::Denied)), ExitCode::Denied);
     }
 
     #[test]

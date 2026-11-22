@@ -14,6 +14,8 @@
 //!
 //! 1. **It is this wire format.** An unknown schema, an unknown key, or a
 //!    missing key is a hard parse failure, never a partially-understood request.
+//!    `queue_id` is the one exception: it is absent on an ordinary human-path
+//!    mint, and a missing key means this request is not a queued run.
 //! 2. **It is live.** Past its deadline, it is refused. Deadlines are in
 //!    boottime milliseconds, so suspend cannot extend one.
 //! 3. **It is this caller's.** The entry names the pid *and* the start time of
@@ -284,6 +286,16 @@ pub enum RequestError {
         /// The entry's file name, which is a valid nonce.
         name: String,
     },
+    /// A queued run whose queue record is not claimed for this nonce.
+    ///
+    /// The spool entry names a queue id. The gate reads that root-owned record
+    /// itself and runs the command only while it is claimed for this nonce.
+    /// Pending, done, failed, missing, or claimed for a different nonce is a
+    /// refusal: a queued command does not become an ordinary human-path run.
+    #[error(
+        "queued run is not claimed for this nonce: the gate runs a queued command only while its queue entry is claimed for the minted nonce"
+    )]
+    QueueNotClaimed,
 }
 
 impl RequestError {
@@ -308,15 +320,19 @@ impl RequestError {
             Self::StaleGeneration { .. } => "request_stale_generation",
             Self::Ambiguous { .. } => "request_ambiguous",
             Self::ForgedNonce { .. } => "request_forged_nonce",
+            Self::QueueNotClaimed => "request_queue_not_claimed",
         }
     }
 }
 
 /// One pending request, as it sits in the spool.
 ///
-/// Every field is required. There are no `serde` defaults and no unknown keys:
-/// a request the gate only partly understands is a request it declines to
-/// understand at all.
+/// Every field except [`Self::queue_id`] is required. There are no other
+/// `serde` defaults and no unknown keys: a request the gate only partly
+/// understands is a request it declines to understand at all. `queue_id` may
+/// be omitted. Absent, the request is an ordinary human-path mint. Present, it
+/// must be 64 lowercase hex and the gate will run it only while that queue
+/// record is claimed for this nonce.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingRequest {
@@ -395,6 +411,13 @@ pub struct PendingRequest {
     /// A forged label can change `ask-human` into `human-path-only` or the
     /// reverse, and both of those are denials.
     pub attested_harness: Option<String>,
+    /// Queue id when this entry was minted for a claimed queued run.
+    ///
+    /// The one optional field. Old entries and ordinary human-path mints omit
+    /// it. When it is present, [`Self::validate`] requires 64 lowercase hex:
+    /// the gate uses it as a file name under the root-owned queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
 }
 
 impl PendingRequest {
@@ -426,8 +449,10 @@ impl PendingRequest {
     ///
     /// [`RequestError::Malformed`] for anything that is not this wire format,
     /// including an unknown key or a missing required key. Optional fields
-    /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
-    /// deserialize as `None`, as serde defines for `Option` fields. Attested
+    /// (`confirmed_by`, `shown_at_ms`, `shown_to`, and `queue_id`) may be
+    /// omitted and deserialize as `None`, as serde defines for `Option`
+    /// fields. `queue_id` is the only field a minted entry may leave out on
+    /// purpose. Attested
     /// identity fields must use canonical shapes. That they agree with each
     /// other (scope, boot id, and harness label all present for an enrolled
     /// agent, all absent otherwise) is checked by `validate`, not here.
@@ -522,6 +547,11 @@ impl PendingRequest {
         }
         if !is_nonce(&self.nonce) {
             return Err(RequestError::MalformedNonce);
+        }
+        if self.queue_id.as_ref().is_some_and(|id| !is_nonce(id)) {
+            return Err(RequestError::Malformed {
+                reason: "queue id is not 64 lowercase hex characters".to_owned(),
+            });
         }
         if self.action.is_empty() {
             return Err(RequestError::NoAction);
@@ -722,6 +752,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         }
     }
 
@@ -750,6 +781,25 @@ mod tests {
     #[test]
     fn a_well_formed_live_entry_for_this_caller_validates() {
         assert_eq!(check(&live()), Ok(()));
+    }
+
+    #[test]
+    fn a_queued_spool_entry_names_its_queue_id_and_a_bad_id_is_refused() {
+        let mut entry = live();
+        let id = "cd".repeat(32);
+        entry.queue_id = Some(id.clone());
+        assert_eq!(check(&entry), Ok(()));
+        let parsed = PendingRequest::parse(&entry.to_json()).unwrap();
+        assert_eq!(parsed.queue_id.as_deref(), Some(id.as_str()));
+        entry.queue_id = Some(String::new());
+        assert_eq!(check(&entry).unwrap_err().code(), "request_malformed");
+        entry.queue_id = None;
+        assert_eq!(check(&entry), Ok(()));
+        assert_eq!(
+            RequestError::QueueNotClaimed.code(),
+            "request_queue_not_claimed"
+        );
+        assert!(RequestError::QueueNotClaimed.to_string().len() > 20);
     }
 
     #[test]
@@ -1680,6 +1730,7 @@ mod tests {
             RequestError::ForgedNonce {
                 name: NONCE.to_owned(),
             },
+            RequestError::QueueNotClaimed,
         ];
 
         let mut codes: Vec<&str> = Vec::new();

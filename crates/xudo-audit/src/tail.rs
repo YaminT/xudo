@@ -182,6 +182,193 @@ pub fn continuation(window: &[u8], whole: bool) -> Result<Continuation, TailErro
     }
 }
 
+/// Why a bounded completion scan stopped.
+///
+/// A completion check walks the log in fixed windows from the end. It must
+/// not treat a torn last line as damage, and it must not allocate the whole
+/// file to find one record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanError {
+    /// A complete line is not a record, or a window holds none.
+    Tail(TailError),
+    /// Records in view do not follow one another.
+    Chain(crate::ChainError),
+    /// A read returned more bytes than that window asked for.
+    Overread {
+        /// How many bytes came back.
+        got: u64,
+        /// How many were asked for.
+        max: u64,
+    },
+    /// The byte source failed. The text is that source's own error.
+    Source(String),
+}
+
+/// What one window of a completion scan decided.
+#[derive(Debug)]
+pub enum WindowScan {
+    /// `accept` matched a record in this window.
+    Found(Record),
+    /// No match. The next, older window ends at `next_end`.
+    ///
+    /// `link` is the first record of this window when it had one, otherwise
+    /// the link carried in. The older window's last record must precede it.
+    Next {
+        /// Exclusive end offset of the next window.
+        next_end: u64,
+        /// The record the older window must lead into.
+        link: Option<Record>,
+    },
+}
+
+/// Scans `bytes`, one window of a log, for a record `accept` wants.
+///
+/// `offset` is the file position of `bytes[0]`. `at_end` is set for the
+/// window that reaches the file's current end: a last line with no newline
+/// is a torn write and is dropped, not parsed. A window that does not start
+/// at offset 0 drops the leading partial line. A whole file that is one
+/// sealed record without a newline is still a record, matching the writer.
+///
+/// # Errors
+///
+/// [`ScanError::Tail`] when a complete line is not a record, or a window that
+/// is not the start of the file holds no newline. [`ScanError::Chain`] when
+/// two records in view do not follow.
+pub fn judge_window(
+    bytes: &[u8],
+    offset: u64,
+    at_end: bool,
+    link: Option<&Record>,
+    accept: &mut dyn FnMut(&Record) -> bool,
+) -> Result<WindowScan, ScanError> {
+    let at_start = offset == 0;
+    let (body, next_end) = window_body(bytes, offset, at_start, at_end)?;
+    let records = complete_records(&body, at_start)?;
+    if let Some(next) = link {
+        let previous = records.last();
+        if previous.is_some() || at_start {
+            crate::follows(previous, next).map_err(ScanError::Chain)?;
+        }
+    }
+    let matched = records.iter().rev().find(|record| accept(record)).cloned();
+    if let Some(record) = matched {
+        return Ok(WindowScan::Found(record));
+    }
+    let carried = records.first().cloned().or_else(|| link.cloned());
+    Ok(WindowScan::Next {
+        next_end,
+        link: carried,
+    })
+}
+
+/// Walks a log of `len` bytes from the end in windows of at most `max`.
+///
+/// `read(start, want)` must return at most `want` bytes from that offset.
+/// Each call asks for at most `max`. The callback's bytes are dropped after
+/// the window is judged, so the whole file is never held.
+///
+/// # Errors
+///
+/// A [`ScanError`] from a window, from a read that returned too much, or from
+/// `read` itself.
+pub fn scan_bounded(
+    len: u64,
+    max: u64,
+    read: &mut dyn FnMut(u64, u64) -> Result<Vec<u8>, ScanError>,
+    accept: &mut dyn FnMut(&Record) -> bool,
+) -> Result<Option<Record>, ScanError> {
+    if max == 0 {
+        return Err(ScanError::Overread { got: 0, max: 0 });
+    }
+    let mut end = len;
+    let mut link: Option<Record> = None;
+    loop {
+        let start = end.saturating_sub(max);
+        let want = end.saturating_sub(start);
+        let bytes = read(start, want)?;
+        let got = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if got > want {
+            return Err(ScanError::Overread { got, max: want });
+        }
+        let at_end = end == len;
+        match judge_window(&bytes, start, at_end, link.as_ref(), accept)? {
+            WindowScan::Found(record) => return Ok(Some(record)),
+            WindowScan::Next {
+                next_end,
+                link: next_link,
+            } => {
+                if start == 0 {
+                    return Ok(None);
+                }
+                end = next_end;
+                link = next_link;
+            }
+        }
+    }
+}
+
+/// The bytes of this window that are complete lines, and where the next
+/// older window must end so a line that straddles the boundary is read whole.
+fn window_body(
+    bytes: &[u8],
+    offset: u64,
+    at_start: bool,
+    at_end: bool,
+) -> Result<(Vec<u8>, u64), ScanError> {
+    let mut start_in = 0usize;
+    if !at_start {
+        let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Err(ScanError::Tail(TailError::Overlong {
+                window: bytes.len(),
+            }));
+        };
+        start_in = newline.saturating_add(1);
+        if start_in >= bytes.len() {
+            // The window is one partial line. A real record fits in the
+            // window, so this is damage, not a boundary to step over.
+            return Err(ScanError::Tail(TailError::Overlong {
+                window: bytes.len(),
+            }));
+        }
+    }
+    let mut end_in = bytes.len();
+    let torn = at_end && bytes.last().is_some_and(|byte| *byte != b'\n');
+    if torn {
+        if let Some(newline) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            end_in = newline.saturating_add(1);
+        }
+    }
+    let next_end = offset.saturating_add(u64::try_from(start_in).unwrap_or(0));
+    let body = bytes.get(start_in..end_in).unwrap_or_default().to_vec();
+    Ok((body, next_end))
+}
+
+/// Parses complete lines. The first line follows nothing only at file start.
+fn complete_records(body: &[u8], at_start: bool) -> Result<Vec<Record>, ScanError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lines: Vec<&[u8]> = if at_start && !body.contains(&b'\n') {
+        vec![body]
+    } else {
+        body.split(|byte| *byte == b'\n').collect()
+    };
+    let mut records = Vec::new();
+    for line in lines {
+        if std::str::from_utf8(line).is_ok_and(is_blank) {
+            continue;
+        }
+        let record = last_record(line).map_err(ScanError::Tail)?;
+        if let Some(prior) = records.last() {
+            crate::follows(Some(prior), &record).map_err(ScanError::Chain)?;
+        } else if at_start {
+            crate::follows(None, &record).map_err(ScanError::Chain)?;
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
 /// Parses the last line, and refuses a record a writer must not follow.
 fn last_record(line: &[u8]) -> Result<Record, TailError> {
     let record: Record = serde_json::from_slice(line).map_err(|source| TailError::NotARecord {
@@ -479,5 +666,212 @@ mod tests {
             assert!(err.to_string().len() > 30, "{err}");
             assert_eq!(err.clone(), err);
         }
+    }
+
+    #[test]
+    fn completion_reads_a_bounded_tail_of_a_large_audit_log() {
+        let max = 1024u64;
+        let mut chain = Chain::new();
+        let mut text = String::new();
+        let mut n = 0usize;
+        while u64::try_from(text.len()).unwrap_or(u64::MAX) <= max.saturating_mul(3) {
+            chain.append(Decision::Allowed, vec![format!("cmd{n}")], "human");
+            text = chain.to_jsonl();
+            n = n.saturating_add(1);
+        }
+        let bytes = text.into_bytes();
+        let mut reads = Vec::new();
+        let log = bytes.clone();
+        let found = scan_bounded(
+            u64::try_from(log.len()).unwrap_or(u64::MAX),
+            max,
+            &mut |start, want| {
+                assert!(want <= max, "a completion read asked for {want}");
+                let from = usize::try_from(start).unwrap_or(0);
+                let take = usize::try_from(want).unwrap_or(0);
+                let end = from.saturating_add(take).min(log.len());
+                let slice = log.get(from..end).unwrap_or_default();
+                reads.push(slice.len());
+                // `take(want + 1)` is the caller's cap. Returning `want` is the
+                // window; one extra byte would be an overread.
+                Ok(slice.to_vec())
+            },
+            &mut |record| record.argv.first().is_some_and(|arg| arg == "cmd0"),
+        )
+        .unwrap();
+        let oldest = chain.records().first().unwrap();
+        assert_eq!(found.as_ref(), Some(oldest));
+        assert!(
+            reads.len() > 1,
+            "a log past one window was read in one piece"
+        );
+        assert!(
+            reads
+                .iter()
+                .all(|len| u64::try_from(*len).unwrap_or(u64::MAX) <= max)
+        );
+        let over = scan_bounded(4, 2, &mut |_, _| Ok(vec![0, 1, 2, 3]), &mut never);
+        assert_eq!(over.unwrap_err(), ScanError::Overread { got: 4, max: 2 });
+        assert_eq!(
+            scan_bounded(0, 0, &mut empty, &mut never).unwrap_err(),
+            ScanError::Overread { got: 0, max: 0 }
+        );
+        let source = scan_bounded(
+            1,
+            8,
+            &mut |_, _| Err(ScanError::Source("disk".to_owned())),
+            &mut never,
+        );
+        assert_eq!(source.unwrap_err(), ScanError::Source("disk".to_owned()));
+        assert_ne!(
+            ScanError::Tail(TailError::Edited { seq: 1 }),
+            ScanError::Source(String::new())
+        );
+    }
+
+    #[test]
+    fn a_half_written_audit_tail_is_not_corruption() {
+        let (_, text) = log_of(2);
+        let mut torn = text.as_bytes().to_vec();
+        torn.extend_from_slice(br#"{"seq":"#);
+        let len = u64::try_from(torn.len()).unwrap_or(u64::MAX);
+        let log = torn.clone();
+        let found = scan_bounded(
+            len,
+            8 * 1024 * 1024,
+            &mut |start, want| {
+                let from = usize::try_from(start).unwrap_or(0);
+                let end = from
+                    .saturating_add(usize::try_from(want).unwrap_or(0))
+                    .min(log.len());
+                Ok(log.get(from..end).unwrap_or_default().to_vec())
+            },
+            &mut |record| record.seq.get() == 2,
+        )
+        .unwrap();
+        assert_eq!(found.unwrap().seq.get(), 2);
+
+        let mut damaged = text.into_bytes();
+        damaged.extend_from_slice(b"not json\n");
+        let broken = damaged.clone();
+        let refused = format!(
+            "{:?}",
+            scan_bounded(
+                u64::try_from(broken.len()).unwrap_or(u64::MAX),
+                8 * 1024 * 1024,
+                &mut |start, want| {
+                    let from = usize::try_from(start).unwrap_or(0);
+                    let end = from
+                        .saturating_add(usize::try_from(want).unwrap_or(0))
+                        .min(broken.len());
+                    Ok(broken.get(from..end).unwrap_or_default().to_vec())
+                },
+                &mut |_| true,
+            )
+            .unwrap_err()
+        );
+        assert!(refused.contains("NotARecord"), "{refused}");
+
+        let (chain, bare) = log_of(1);
+        let no_newline = bare.trim_end_matches('\n').as_bytes().to_vec();
+        let held = no_newline.clone();
+        let one = scan_bounded(
+            u64::try_from(held.len()).unwrap_or(u64::MAX),
+            u64::try_from(held.len()).unwrap_or(1),
+            &mut |start, want| {
+                let from = usize::try_from(start).unwrap_or(0);
+                let end = from
+                    .saturating_add(usize::try_from(want).unwrap_or(0))
+                    .min(held.len());
+                Ok(held.get(from..end).unwrap_or_default().to_vec())
+            },
+            &mut |_| true,
+        )
+        .unwrap();
+        assert_eq!(one.as_ref(), chain.records().first());
+
+        let mid = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx no newline in this window";
+        let missed = judge_window(mid, 10, true, None, &mut |_| true).unwrap_err();
+        assert_eq!(
+            missed,
+            ScanError::Tail(TailError::Overlong { window: mid.len() })
+        );
+        assert!(
+            scan_bounded(3, 8, &mut empty, &mut never)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_window_that_does_not_follow_its_link_is_a_broken_chain() {
+        let (_, text) = log_of(1);
+        let link = crate::Record::after(None, Decision::Denied, vec!["other".into()], "human");
+        let broken = judge_window(text.as_bytes(), 0, true, Some(&link), &mut never);
+        assert_eq!(
+            broken.unwrap_err(),
+            ScanError::Chain(crate::chain::ChainError::OutOfOrder {
+                seq: 1,
+                previous: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_window_of_one_partial_line_is_damage() {
+        let partial = b"partial\n";
+        let broken = judge_window(partial, 8, false, None, &mut never);
+        assert_eq!(
+            broken.unwrap_err(),
+            ScanError::Tail(TailError::Overlong {
+                window: partial.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_middle_window_of_only_a_torn_tail_passes_its_link_on() {
+        let link = crate::Record::after(None, Decision::Denied, vec!["other".into()], "human");
+        let scan = judge_window(b"partial\n{torn", 8, true, Some(&link), &mut never).unwrap();
+        assert_eq!(
+            format!("{scan:?}"),
+            format!(
+                "{:?}",
+                WindowScan::Next {
+                    next_end: 16,
+                    link: Some(link),
+                }
+            )
+        );
+    }
+
+    fn never(_: &Record) -> bool {
+        false
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn empty(_: u64, _: u64) -> Result<Vec<u8>, ScanError> {
+        Ok(Vec::new())
+    }
+
+    #[test]
+    fn a_window_whose_records_do_not_follow_each_other_is_a_broken_chain() {
+        let (_, text) = log_of(1);
+        let any = crate::Record::after(None, Decision::Denied, vec!["any".into()], "human");
+        assert!(!never(&any));
+        let first = text.trim_end();
+        let twice = format!("{first}\n{first}\n");
+        let broken = judge_window(twice.as_bytes(), 0, true, None, &mut never).unwrap_err();
+        assert_eq!(
+            broken,
+            ScanError::Chain(crate::chain::ChainError::OutOfOrder {
+                seq: 1,
+                previous: 1,
+            })
+        );
+        let (_, text) = log_of(2);
+        let second = text.lines().nth(1).unwrap();
+        let headless = judge_window(second.as_bytes(), 0, true, None, &mut never).unwrap_err();
+        assert!(format!("{headless:?}").starts_with("Chain"), "{headless:?}");
     }
 }

@@ -24,6 +24,14 @@ pub const MAX_ARGV_COUNT: usize = 256;
 pub const MAX_REASON_BYTES: usize = 1024;
 /// Maximum directory entries read while counting the queue.
 pub const MAX_FILES_WALKED: usize = MAX_TOTAL + 1;
+/// How long a claim stays exclusive to the peer that took it.
+///
+/// Fifteen minutes, the same bound as a normal request's lifetime. A different
+/// reviewer may recover a claim only after this window, and only when the
+/// audit trail has no gate record for the entry. A claim exactly this old is
+/// still exclusive. A missing `claimed_at`, or a clock that moved backwards,
+/// is not stale.
+pub const CLAIM_LIFETIME_MS: u64 = 15 * 60 * 1000;
 
 /// Applies the root setting. Values longer than one day are clamped, never
 /// allowed to extend the queue's default lifetime.
@@ -100,10 +108,30 @@ pub struct QueueEntry {
     pub state: QueueState,
     /// Nonce of the human-path spool entry minted for a claim.
     ///
-    /// Set only while [`QueueState::Claimed`]. Completion accepts a gate
-    /// record only when that record names this nonce.
+    /// Set only while [`QueueState::Claimed`], and kept after the entry is
+    /// marked done so a pruned record can still be tied to the gate run.
+    /// Completion accepts a gate record only when that record names this nonce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_nonce: Option<String>,
+    /// Uid of the peer that moved the entry to [`QueueState::Claimed`].
+    ///
+    /// Absent on records written before claims recorded an owner, and cleared
+    /// when a claim returns to pending or failed with no gate record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant_uid: Option<u32>,
+    /// Secret the claimant must present to release, fail, or complete.
+    ///
+    /// The same 64 lowercase hex value later bound as [`Self::run_nonce`].
+    /// Another reviewer does not have it. An empty or absent token never
+    /// matches, so a stale recovery is the only way for someone else to settle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    /// Boottime milliseconds when the entry was claimed.
+    ///
+    /// Stale recovery compares this with [`CLAIM_LIFETIME_MS`]. Absent means
+    /// the claim is not stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<u64>,
 }
 
 impl QueueEntry {
@@ -404,6 +432,20 @@ pub enum StoreError {
     /// Completion lacks the gate's audit record for this entry.
     #[error("queue completion requires the gate audit record for this entry")]
     MissingGateAudit,
+    /// The peer is not the claimant, and the claim is not stale.
+    #[error("queue claim belongs to another reviewer")]
+    NotClaimant,
+}
+
+/// Who is settling a claim, and the clock used for the stale-claim window.
+#[derive(Clone, Copy, Debug)]
+pub struct ClaimAct<'a> {
+    /// Uid of the peer asking to bind, release, fail, or complete.
+    pub uid: u32,
+    /// Claim token presented by that peer. Empty never matches a real token.
+    pub token: &'a str,
+    /// Boottime milliseconds. A claim older than [`CLAIM_LIFETIME_MS`] is stale.
+    pub now: u64,
 }
 
 /// Lists and validates all queue records with a strict walk bound.
@@ -565,17 +607,26 @@ pub fn admit(
 
 /// Atomically claims a pending live entry. Two broker processes cannot both win.
 ///
+/// `claim_token` is recorded on the entry. Later release, failure, and
+/// completion accept that token from `claimant_uid`, or a stale recovery.
+///
 /// # Errors
 ///
-/// Returns an error if the entry is invalid, absent, expired, already claimed,
-/// or the locked compare-and-replace fails.
+/// Returns [`StoreError::InvalidEntry`] when `claim_token` is not 64 lowercase
+/// hex characters. Returns an error if the entry is invalid, absent, expired,
+/// already claimed, or the locked compare-and-replace fails.
 pub fn claim(
     store: &dyn xudo_sys::Spool,
     id: &str,
     now: u64,
     ttl: u64,
     boot_id: &str,
+    claimant_uid: u32,
+    claim_token: &str,
 ) -> Result<QueueEntry, StoreError> {
+    if !is_nonce(claim_token) {
+        return Err(StoreError::InvalidEntry);
+    }
     store.lock()?;
     let result = (|| {
         let name = format!("{id}.json");
@@ -588,6 +639,9 @@ pub fn claim(
             return Err(StoreError::NotPending);
         }
         entry.state = QueueState::Claimed;
+        entry.claimant_uid = Some(claimant_uid);
+        entry.claim_token = Some(claim_token.to_owned());
+        entry.claimed_at = Some(now);
         replace_encoded_entry(store, name.as_bytes(), &bytes, serde_json::to_vec(&entry))?;
         Ok(entry)
     })();
@@ -625,6 +679,8 @@ pub struct ReviewerClaim<'a> {
     pub registry: &'a HarnessRegistry,
     /// Passwd contents used to name reviewers.
     pub passwd: &'a str,
+    /// Token recorded on the claim. The same value is later the run nonce.
+    pub claim_token: &'a str,
 }
 
 /// Claims `id` for a reviewer, or refuses without leaving an agent holding it.
@@ -654,8 +710,16 @@ pub fn claim_for_reviewer(
     {
         return Err(ClaimError::NotReviewer);
     }
-    let claimed = claim(store, id, reviewer.now, reviewer.ttl, reviewer.boot_id)
-        .map_err(ClaimError::Store)?;
+    let claimed = claim(
+        store,
+        id,
+        reviewer.now,
+        reviewer.ttl,
+        reviewer.boot_id,
+        reviewer.peer_uid,
+        reviewer.claim_token,
+    )
+    .map_err(ClaimError::Store)?;
     if visibility(
         &claimed,
         reviewer.peer_uid,
@@ -667,7 +731,20 @@ pub fn claim_for_reviewer(
     {
         Ok(claimed)
     } else {
-        release_claim(store, id).map_err(ClaimError::Store)?;
+        // The nonce is still unset, so this release does not lock a spool.
+        // The queue store is passed only to satisfy the signature.
+        release_claim(
+            store,
+            store,
+            id,
+            &ClaimAct {
+                uid: reviewer.peer_uid,
+                token: reviewer.claim_token,
+                now: reviewer.now,
+            },
+            &[],
+        )
+        .map_err(ClaimError::Store)?;
         Err(ClaimError::NotReviewer)
     }
 }
@@ -732,56 +809,79 @@ fn prune_ids(
     Ok(ids)
 }
 
-/// Returns a claimed entry to pending and clears its run nonce.
+/// Returns a claimed entry to pending, or marks it done when a gate record binds.
 ///
-/// A password or gate denial uses this so the reviewer can try again. A
-/// policy denial uses [`fail_claim`] instead.
+/// A password or gate denial uses this so the reviewer can try again, but only
+/// when `records` contains no gate record for the entry. A binding record marks
+/// the entry done and keeps the nonce: the command must not return to pending.
+/// The minted spool file is removed under `requests`' lock before the queue
+/// file changes. `requests` must be the request spool, not the queue store,
+/// except when the nonce is still unset (that path does not lock it).
+///
+/// `act` must be the claimant. A different reviewer is accepted only when the
+/// claim is older than [`CLAIM_LIFETIME_MS`].
 ///
 /// # Errors
 ///
-/// Returns an error if the entry is not claimed, or the locked replace fails.
-pub fn release_claim(store: &dyn xudo_sys::Spool, id: &str) -> Result<QueueEntry, StoreError> {
-    update_claimed(store, id, &mut |entry| {
-        entry.state = QueueState::Pending;
-        entry.run_nonce = None;
-        Ok(())
-    })
+/// Returns [`StoreError::NotClaimant`] when the peer may not settle the claim.
+/// Returns [`StoreError::NotPending`] when the entry is not claimed. A spool
+/// revoke or replace failure leaves the entry claimed.
+pub fn release_claim(
+    store: &dyn xudo_sys::Spool,
+    requests: &dyn xudo_sys::Spool,
+    id: &str,
+    act: &ClaimAct<'_>,
+    records: &[xudo_audit::Record],
+) -> Result<QueueEntry, StoreError> {
+    settle_claim(store, requests, id, act, records, QueueState::Pending)
 }
 
-/// Marks a claimed entry failed. The slot is freed on the next prune.
+/// Marks a claimed entry failed, or done when a gate record already binds.
 ///
 /// Used when the stored command is re-decided and no longer allowed, including
 /// a rules change after queueing and argv that cannot be sent on the wire.
+/// A binding gate record never becomes [`QueueState::Failed`]: the entry is
+/// marked done, same as [`release_claim`]. The spool file is revoked first.
 ///
 /// # Errors
 ///
-/// Returns an error if the entry is not claimed, or the locked replace fails.
-pub fn fail_claim(store: &dyn xudo_sys::Spool, id: &str) -> Result<QueueEntry, StoreError> {
-    update_claimed(store, id, &mut |entry| {
-        entry.state = QueueState::Failed;
-        entry.run_nonce = None;
-        Ok(())
-    })
+/// Returns [`StoreError::NotClaimant`] when the peer may not settle the claim.
+/// Returns [`StoreError::NotPending`] when the entry is not claimed. A spool
+/// revoke or replace failure leaves the entry claimed.
+pub fn fail_claim(
+    store: &dyn xudo_sys::Spool,
+    requests: &dyn xudo_sys::Spool,
+    id: &str,
+    act: &ClaimAct<'_>,
+    records: &[xudo_audit::Record],
+) -> Result<QueueEntry, StoreError> {
+    settle_claim(store, requests, id, act, records, QueueState::Failed)
 }
 
 /// Records the nonce that the human-path mint is about to publish.
 ///
-/// Called before mint. A later mint failure must [`release_claim`].
+/// Called before mint. A later mint failure must [`release_claim`]. Only the
+/// claimant may bind, including after the claim would be stale for someone else.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::InvalidEntry`] when `nonce` is not 64 lowercase hex
-/// characters or a nonce is already bound. Any other claim state is
+/// characters or a nonce is already bound. Returns [`StoreError::NotClaimant`]
+/// when `act` is not the claimant. Any other claim state is
 /// [`StoreError::NotPending`].
 pub fn bind_run_nonce(
     store: &dyn xudo_sys::Spool,
     id: &str,
     nonce: &str,
+    act: &ClaimAct<'_>,
 ) -> Result<QueueEntry, StoreError> {
     if !is_nonce(nonce) {
         return Err(StoreError::InvalidEntry);
     }
     update_claimed(store, id, &mut |entry| {
+        if !same_claimant(entry, act) {
+            return Err(StoreError::NotClaimant);
+        }
         if entry.run_nonce.is_some() {
             return Err(StoreError::InvalidEntry);
         }
@@ -842,29 +942,142 @@ fn argv_bytes_match(stored: &[Vec<u8>], recorded: &[String]) -> bool {
 /// Marks a claimed entry done when `record` is the gate record for it.
 ///
 /// `audit_seq` of zero accepts the binding record's own sequence. Any other
-/// value must equal `record.seq`.
+/// value must equal `record.seq`. The claimant must present the claim token,
+/// or the claim must be stale. A leftover spool file for the nonce is removed
+/// before the queue file is marked done.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::MissingGateAudit`] when the record does not bind.
+/// Returns [`StoreError::NotClaimant`] when the peer may not settle the claim.
 /// Returns [`StoreError::NotPending`] when the entry is not claimed. Lock,
-/// decode, and replace failures refuse as well.
+/// decode, revoke, and replace failures refuse as well. A revoke or replace
+/// failure leaves the entry claimed.
 pub fn complete_after_gate_audit(
     store: &dyn xudo_sys::Spool,
+    requests: &dyn xudo_sys::Spool,
     id: &str,
+    act: &ClaimAct<'_>,
     record: &xudo_audit::Record,
     audit_seq: u64,
 ) -> Result<QueueEntry, StoreError> {
-    update_claimed(store, id, &mut |entry| {
+    store.lock()?;
+    let result = (|| {
+        let (name, previous, mut entry) = load_claimed(store, id)?;
+        if !claimant_may_settle(&entry, act) {
+            return Err(StoreError::NotClaimant);
+        }
         if audit_seq != 0 && record.seq.get() != audit_seq {
             return Err(StoreError::MissingGateAudit);
         }
-        if !gate_record_binds(entry, record) {
+        if !gate_record_binds(&entry, record) {
             return Err(StoreError::MissingGateAudit);
         }
+        let nonce = entry.run_nonce.clone();
         entry.state = QueueState::Done;
-        Ok(())
-    })
+        revoke_spool_nonce(requests, nonce.as_deref())?;
+        replace_encoded_entry(
+            store,
+            name.as_bytes(),
+            &previous,
+            serde_json::to_vec(&entry),
+        )?;
+        Ok(entry)
+    })();
+    store.unlock();
+    result
+}
+
+fn settle_claim(
+    store: &dyn xudo_sys::Spool,
+    requests: &dyn xudo_sys::Spool,
+    id: &str,
+    act: &ClaimAct<'_>,
+    records: &[xudo_audit::Record],
+    when_clear: QueueState,
+) -> Result<QueueEntry, StoreError> {
+    store.lock()?;
+    let result = (|| {
+        let (name, previous, mut entry) = load_claimed(store, id)?;
+        if !claimant_may_settle(&entry, act) {
+            return Err(StoreError::NotClaimant);
+        }
+        let nonce = entry.run_nonce.clone();
+        if records
+            .iter()
+            .any(|record| gate_record_binds(&entry, record))
+        {
+            entry.state = QueueState::Done;
+        } else {
+            entry.state = when_clear;
+            entry.run_nonce = None;
+            entry.claimant_uid = None;
+            entry.claim_token = None;
+            entry.claimed_at = None;
+        }
+        revoke_spool_nonce(requests, nonce.as_deref())?;
+        replace_encoded_entry(
+            store,
+            name.as_bytes(),
+            &previous,
+            serde_json::to_vec(&entry),
+        )?;
+        Ok(entry)
+    })();
+    store.unlock();
+    result
+}
+
+fn load_claimed(
+    store: &dyn xudo_sys::Spool,
+    id: &str,
+) -> Result<(String, Vec<u8>, QueueEntry), StoreError> {
+    let name = format!("{id}.json");
+    let bytes = store.read(name.as_bytes(), MAX_ENTRY_BYTES)?;
+    let entry: QueueEntry = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidEntry)?;
+    entry.validate().map_err(|_| StoreError::InvalidEntry)?;
+    if entry.id != id || entry.state != QueueState::Claimed {
+        return Err(StoreError::NotPending);
+    }
+    Ok((name, bytes, entry))
+}
+
+fn same_claimant(entry: &QueueEntry, act: &ClaimAct<'_>) -> bool {
+    let Some(token) = entry.claim_token.as_deref() else {
+        return false;
+    };
+    entry.claimant_uid == Some(act.uid) && token == act.token && is_nonce(token)
+}
+
+fn claim_is_stale(entry: &QueueEntry, now: u64) -> bool {
+    let Some(claimed_at) = entry.claimed_at else {
+        return false;
+    };
+    now.saturating_sub(claimed_at) > CLAIM_LIFETIME_MS
+}
+
+fn claimant_may_settle(entry: &QueueEntry, act: &ClaimAct<'_>) -> bool {
+    same_claimant(entry, act) || claim_is_stale(entry, act.now)
+}
+
+/// Removes the minted spool file. A missing file is success.
+///
+/// An invalid nonce is refused before the lock, and the queue entry is left
+/// unchanged by the caller. Lock order is the queue lock, then this one.
+fn revoke_spool_nonce(
+    requests: &dyn xudo_sys::Spool,
+    nonce: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(nonce) = nonce else {
+        return Ok(());
+    };
+    if !is_nonce(nonce) {
+        return Err(StoreError::InvalidEntry);
+    }
+    requests.lock()?;
+    let removed = requests.remove(nonce.as_bytes());
+    requests.unlock();
+    removed.map_err(StoreError::from)
 }
 
 fn update_claimed(
@@ -874,14 +1087,7 @@ fn update_claimed(
 ) -> Result<QueueEntry, StoreError> {
     store.lock()?;
     let result = (|| {
-        let name = format!("{id}.json");
-        let bytes = store.read(name.as_bytes(), MAX_ENTRY_BYTES)?;
-        let mut entry: QueueEntry =
-            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidEntry)?;
-        entry.validate().map_err(|_| StoreError::InvalidEntry)?;
-        if entry.id != id || entry.state != QueueState::Claimed {
-            return Err(StoreError::NotPending);
-        }
+        let (name, bytes, mut entry) = load_claimed(store, id)?;
         change(&mut entry)?;
         replace_encoded_entry(store, name.as_bytes(), &bytes, serde_json::to_vec(&entry))?;
         Ok(entry)
@@ -896,6 +1102,56 @@ mod tests {
 
     use super::*;
     use xudo_sys::Spool;
+
+    const TEST_UID: u32 = 1000;
+    const TEST_TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn test_act(now: u64) -> ClaimAct<'static> {
+        ClaimAct {
+            uid: TEST_UID,
+            token: TEST_TOKEN,
+            now,
+        }
+    }
+
+    fn claim(
+        store: &dyn xudo_sys::Spool,
+        id: &str,
+        now: u64,
+        ttl: u64,
+        boot_id: &str,
+    ) -> Result<QueueEntry, StoreError> {
+        super::claim(store, id, now, ttl, boot_id, TEST_UID, TEST_TOKEN)
+    }
+
+    fn release_claim(store: &dyn xudo_sys::Spool, id: &str) -> Result<QueueEntry, StoreError> {
+        let act = test_act(0);
+        super::release_claim(store, store, id, &act, &[])
+    }
+
+    fn fail_claim(store: &dyn xudo_sys::Spool, id: &str) -> Result<QueueEntry, StoreError> {
+        let act = test_act(0);
+        super::fail_claim(store, store, id, &act, &[])
+    }
+
+    fn bind_run_nonce(
+        store: &dyn xudo_sys::Spool,
+        id: &str,
+        nonce: &str,
+    ) -> Result<QueueEntry, StoreError> {
+        let act = test_act(0);
+        super::bind_run_nonce(store, id, nonce, &act)
+    }
+
+    fn complete_after_gate_audit(
+        store: &dyn xudo_sys::Spool,
+        id: &str,
+        record: &xudo_audit::Record,
+        audit_seq: u64,
+    ) -> Result<QueueEntry, StoreError> {
+        let act = test_act(0);
+        super::complete_after_gate_audit(store, store, id, &act, record, audit_seq)
+    }
 
     struct Unserializable;
 
@@ -923,6 +1179,9 @@ mod tests {
             state: QueueState::Pending,
             boot_id: BOOT.to_owned(),
             run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         }
     }
 
@@ -1738,6 +1997,9 @@ mod tests {
             claim(&files, &record.id, 101, 1000, BOOT).unwrap(),
             QueueEntry {
                 state: QueueState::Claimed,
+                claimant_uid: Some(TEST_UID),
+                claim_token: Some(TEST_TOKEN.to_owned()),
+                claimed_at: Some(101),
                 ..record
             }
         );
@@ -1862,9 +2124,14 @@ mod tests {
         let released = release_claim(&store, &record.id).unwrap();
         assert_eq!(released.state, QueueState::Pending);
         assert_eq!(released.run_nonce, None);
+        assert_eq!(released.claimant_uid, None);
+        assert_eq!(released.claim_token, None);
+        assert_eq!(released.claimed_at, None);
         claim(&store, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
         let failed = fail_claim(&store, &record.id).unwrap();
         assert_eq!(failed.state, QueueState::Failed);
+        assert_eq!(failed.run_nonce, None);
+        assert_eq!(failed.claim_token, None);
         assert!(!failed.is_live(101, DEFAULT_TTL_SECS * 1000, BOOT));
         assert_eq!(
             release_claim(&store, &record.id).unwrap_err(),
@@ -2069,6 +2336,7 @@ mod tests {
             peer_class: PeerClass::Human,
             registry,
             passwd,
+            claim_token: TEST_TOKEN,
         }
     }
 
@@ -2119,5 +2387,370 @@ mod tests {
         assert_eq!(load_all(&stuck).unwrap()[0].state, QueueState::Claimed);
         stuck.lock().unwrap();
         stuck.unlock();
+    }
+
+    fn store_of(entry: &QueueEntry) -> xudo_sys::FakeSpool {
+        xudo_sys::FakeSpool::new().with_file(
+            format!("{}.json", entry.id),
+            serde_json::to_vec(entry).unwrap(),
+        )
+    }
+
+    fn claimed_pair(id: u64) -> (xudo_sys::FakeSpool, xudo_sys::FakeSpool, String) {
+        let store = xudo_sys::FakeSpool::new();
+        let record = entry(id);
+        admit(&store, &record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&store, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        let nonce = "cd".repeat(32);
+        bind_run_nonce(&store, &record.id, &nonce).unwrap();
+        let requests = xudo_sys::FakeSpool::new();
+        requests.publish(&nonce, b"minted").unwrap();
+        (store, requests, nonce)
+    }
+
+    fn foreign(token: &str, now: u64) -> ClaimAct<'_> {
+        ClaimAct {
+            uid: TEST_UID.saturating_add(1),
+            token,
+            now,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn release_by_another_reviewer_mid_run_is_refused() {
+        assert_eq!(
+            StoreError::NotClaimant.to_string(),
+            "queue claim belongs to another reviewer"
+        );
+        let foreign_token = "ef".repeat(32);
+        let act = test_act(101);
+        let (store, requests, nonce) = claimed_pair(90);
+        let id = load_all(&store).unwrap()[0].id.clone();
+        let fresh = foreign(&foreign_token, 101);
+        assert_eq!(
+            super::release_claim(&store, &requests, &id, &fresh, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        assert_eq!(load_all(&store).unwrap()[0].state, QueueState::Claimed);
+        assert!(requests.files().contains_key(nonce.as_bytes()));
+        let wrong_token = "11".repeat(32);
+        let wrong = ClaimAct {
+            uid: TEST_UID,
+            token: &wrong_token,
+            now: 101,
+        };
+        assert_eq!(
+            super::fail_claim(&store, &requests, &id, &wrong, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        let exact = foreign(&foreign_token, 101_u64.saturating_add(CLAIM_LIFETIME_MS));
+        assert_eq!(
+            super::release_claim(&store, &requests, &id, &exact, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        let backwards = foreign(&foreign_token, 100);
+        assert_eq!(
+            super::release_claim(&store, &requests, &id, &backwards, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        let mut missing_clock = load_all(&store).unwrap().remove(0);
+        missing_clock.claimed_at = None;
+        let clockless = store_of(&missing_clock);
+        let later = foreign(&foreign_token, u64::MAX);
+        assert_eq!(
+            super::release_claim(&clockless, &requests, &missing_clock.id, &later, &[])
+                .unwrap_err(),
+            StoreError::NotClaimant
+        );
+        let mut bad_token = load_all(&store).unwrap().remove(0);
+        bad_token.claim_token = Some("not-a-nonce".into());
+        let planted = store_of(&bad_token);
+        let invalid = ClaimAct {
+            uid: TEST_UID,
+            token: "not-a-nonce",
+            now: 101,
+        };
+        assert_eq!(
+            super::release_claim(&planted, &requests, &bad_token.id, &invalid, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        let mut no_owner = entry(91);
+        no_owner.state = QueueState::Claimed;
+        let ownerless = store_of(&no_owner);
+        assert_eq!(
+            super::release_claim(&ownerless, &requests, &no_owner.id, &act, &[]).unwrap_err(),
+            StoreError::NotClaimant
+        );
+        assert_eq!(
+            super::claim(
+                &xudo_sys::FakeSpool::new(),
+                &entry(1).id,
+                101,
+                1000,
+                BOOT,
+                TEST_UID,
+                "short"
+            )
+            .unwrap_err(),
+            StoreError::InvalidEntry
+        );
+        let unbound = xudo_sys::FakeSpool::new();
+        let record = entry(92);
+        admit(&unbound, &record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&unbound, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        let stale_binder = foreign(
+            &foreign_token,
+            101_u64.saturating_add(CLAIM_LIFETIME_MS).saturating_add(1),
+        );
+        assert_eq!(
+            super::bind_run_nonce(&unbound, &record.id, &"ab".repeat(32), &stale_binder)
+                .unwrap_err(),
+            StoreError::NotClaimant
+        );
+        assert!(load_all(&unbound).unwrap()[0].run_nonce.is_none());
+
+        let mut broken_nonce = load_all(&store).unwrap().remove(0);
+        broken_nonce.run_nonce = Some("not-a-nonce".into());
+        let broken = store_of(&broken_nonce);
+        assert_eq!(
+            super::release_claim(&broken, &requests, &broken_nonce.id, &act, &[]).unwrap_err(),
+            StoreError::InvalidEntry
+        );
+        assert_eq!(load_all(&broken).unwrap()[0].state, QueueState::Claimed);
+
+        let revoke_lock = xudo_sys::FakeSpool::new()
+            .with_file(nonce.as_bytes().to_vec(), b"minted".to_vec())
+            .failing_lock(xudo_sys::SpoolError::NotADirectory { at: "req".into() });
+        assert_eq!(
+            super::release_claim(&store, &revoke_lock, &id, &act, &[]).unwrap_err(),
+            StoreError::Spool(xudo_sys::SpoolError::NotADirectory { at: "req".into() })
+        );
+        assert_eq!(load_all(&store).unwrap()[0].state, QueueState::Claimed);
+        let revoke_remove = xudo_sys::FakeSpool::new()
+            .with_file(nonce.as_bytes().to_vec(), b"minted".to_vec())
+            .failing_remove(xudo_sys::SpoolError::Io {
+                operation: "unlink".into(),
+                at: "req".into(),
+                code: None,
+                reason: "scripted".into(),
+            });
+        assert!(
+            super::release_claim(&store, &revoke_remove, &id, &act, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("unlink")
+        );
+        assert!(requests.files().contains_key(nonce.as_bytes()));
+
+        let error = xudo_sys::SpoolError::Io {
+            operation: "replace".into(),
+            at: "queue".into(),
+            code: None,
+            reason: "scripted".into(),
+        };
+        let stuck = xudo_sys::FakeSpool::new().failing_replace_on_call(3, error.clone());
+        let stuck_record = entry(93);
+        admit(&stuck, &stuck_record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&stuck, &stuck_record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        let stuck_nonce = "22".repeat(32);
+        bind_run_nonce(&stuck, &stuck_record.id, &stuck_nonce).unwrap();
+        let stuck_requests = xudo_sys::FakeSpool::new();
+        stuck_requests.publish(&stuck_nonce, b"minted").unwrap();
+        assert_eq!(
+            super::release_claim(&stuck, &stuck_requests, &stuck_record.id, &act, &[]).unwrap_err(),
+            StoreError::Spool(error)
+        );
+        assert_eq!(load_all(&stuck).unwrap()[0].state, QueueState::Claimed);
+        assert!(!stuck_requests.files().contains_key(stuck_nonce.as_bytes()));
+
+        let stale = foreign(
+            &foreign_token,
+            101_u64.saturating_add(CLAIM_LIFETIME_MS).saturating_add(1),
+        );
+        let released = super::release_claim(&store, &requests, &id, &stale, &[]).unwrap();
+        assert_eq!(released.state, QueueState::Pending);
+        assert_eq!(released.run_nonce, None);
+        assert_eq!(released.claimant_uid, None);
+        assert!(!requests.files().contains_key(nonce.as_bytes()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn release_after_a_gate_record_exists_marks_done_not_pending() {
+        let foreign_token = "ef".repeat(32);
+        let (store, requests, _nonce) = claimed_pair(94);
+        let stored = load_all(&store).unwrap().remove(0);
+        let denied =
+            xudo_audit::Record::after(None, xudo_audit::Decision::Denied, Vec::new(), "human");
+        let act = test_act(101);
+        let still = super::release_claim(
+            &store,
+            &requests,
+            &stored.id,
+            &act,
+            std::slice::from_ref(&denied),
+        );
+        // A non-binding record must not be what stops the release. Rebuild a
+        // fresh pair for that check so the binding case below keeps its file.
+        assert!(still.is_ok());
+        assert_eq!(still.unwrap().state, QueueState::Pending);
+
+        let (store, requests, nonce) = claimed_pair(95);
+        let stored = load_all(&store).unwrap().remove(0);
+        let bound = gate_record_for(&stored);
+        let act = test_act(101);
+        let done = super::release_claim(
+            &store,
+            &requests,
+            &stored.id,
+            &act,
+            std::slice::from_ref(&bound),
+        )
+        .unwrap();
+        assert_eq!(done.state, QueueState::Done);
+        assert_eq!(done.run_nonce.as_deref(), Some(nonce.as_str()));
+        assert_eq!(done.claimant_uid, Some(TEST_UID));
+        assert!(!requests.files().contains_key(nonce.as_bytes()));
+        assert!(!done.is_live(101, DEFAULT_TTL_SECS * 1000, BOOT));
+
+        let (store, requests, nonce) = claimed_pair(96);
+        let stored = load_all(&store).unwrap().remove(0);
+        let bound = gate_record_for(&stored);
+        let failed = super::fail_claim(
+            &store,
+            &requests,
+            &stored.id,
+            &act,
+            std::slice::from_ref(&bound),
+        )
+        .unwrap();
+        assert_eq!(failed.state, QueueState::Done);
+        assert_eq!(failed.run_nonce.as_deref(), Some(nonce.as_str()));
+        assert!(!requests.files().contains_key(nonce.as_bytes()));
+
+        let (store, requests, nonce) = claimed_pair(97);
+        let stored = load_all(&store).unwrap().remove(0);
+        let stale = foreign(
+            &foreign_token,
+            101_u64.saturating_add(CLAIM_LIFETIME_MS).saturating_add(1),
+        );
+        let bound = gate_record_for(&stored);
+        let done = super::release_claim(
+            &store,
+            &requests,
+            &stored.id,
+            &stale,
+            std::slice::from_ref(&bound),
+        )
+        .unwrap();
+        assert_eq!(done.state, QueueState::Done);
+        assert_eq!(done.run_nonce.as_deref(), Some(nonce.as_str()));
+
+        let (store, requests, _nonce) = claimed_pair(98);
+        let stored = load_all(&store).unwrap().remove(0);
+        let fresh = foreign(&foreign_token, 101);
+        let bound = gate_record_for(&stored);
+        assert_eq!(
+            super::complete_after_gate_audit(&store, &requests, &stored.id, &fresh, &bound, 0)
+                .unwrap_err(),
+            StoreError::NotClaimant
+        );
+        assert_eq!(load_all(&store).unwrap()[0].state, QueueState::Claimed);
+        let stale = foreign(
+            &foreign_token,
+            101_u64.saturating_add(CLAIM_LIFETIME_MS).saturating_add(1),
+        );
+        let done =
+            super::complete_after_gate_audit(&store, &requests, &stored.id, &stale, &bound, 0)
+                .unwrap();
+        assert_eq!(done.state, QueueState::Done);
+
+        let mut value = serde_json::to_value(entry(99)).unwrap();
+        value.as_object_mut().unwrap().remove("run_nonce");
+        value.as_object_mut().unwrap().remove("claimant_uid");
+        value.as_object_mut().unwrap().remove("claim_token");
+        value.as_object_mut().unwrap().remove("claimed_at");
+        let parsed: QueueEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.claimant_uid, None);
+        assert_eq!(parsed.claim_token, None);
+        assert_eq!(parsed.claimed_at, None);
+        assert_eq!(parsed.run_nonce, None);
+        let claimed_text = serde_json::to_vec(&done).unwrap();
+        let claimed_text = String::from_utf8(claimed_text).unwrap();
+        assert!(claimed_text.contains("claimant_uid"));
+        let pending_text = String::from_utf8(serde_json::to_vec(&entry(1)).unwrap()).unwrap();
+        assert!(!pending_text.contains("claimant_uid"));
+    }
+
+    #[test]
+    fn a_lock_or_load_failure_refuses_before_the_claim_changes() {
+        let error = xudo_sys::SpoolError::NotADirectory { at: "queue".into() };
+        let registry = HarnessRegistry::empty();
+        let reviewer = ReviewerClaim {
+            now: 101,
+            ttl: 1000,
+            boot_id: BOOT,
+            peer_uid: TEST_UID,
+            peer_class: PeerClass::Human,
+            registry: &registry,
+            passwd: "",
+            claim_token: TEST_TOKEN,
+        };
+        let missing = entry(70).id;
+        assert_eq!(
+            super::claim_for_reviewer(
+                &xudo_sys::FakeSpool::new().failing_names(error.clone()),
+                &missing,
+                &reviewer,
+            ),
+            Err(ClaimError::Store(StoreError::Spool(error.clone())))
+        );
+        let act = test_act(0);
+        assert_eq!(
+            super::release_claim(
+                &xudo_sys::FakeSpool::new().failing_lock(error.clone()),
+                &xudo_sys::FakeSpool::new(),
+                &missing,
+                &act,
+                &[],
+            ),
+            Err(StoreError::Spool(error.clone()))
+        );
+        assert_eq!(
+            super::bind_run_nonce(
+                &xudo_sys::FakeSpool::new().failing_lock(error.clone()),
+                &missing,
+                &"cd".repeat(32),
+                &act,
+            ),
+            Err(StoreError::Spool(error.clone()))
+        );
+        assert_eq!(
+            super::bind_run_nonce(
+                &xudo_sys::FakeSpool::new(),
+                &missing,
+                &"cd".repeat(32),
+                &act,
+            ),
+            Err(StoreError::Spool(xudo_sys::SpoolError::Unreadable {
+                name: format!("{missing}.json"),
+                reason: "fake: no such entry".into(),
+            }))
+        );
+
+        let store = xudo_sys::FakeSpool::new();
+        let record = entry(71);
+        admit(&store, &record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&store, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        bind_run_nonce(&store, &record.id, &"cd".repeat(32)).unwrap();
+        let stored = load_all(&store).unwrap().remove(0);
+        let binding = gate_record_for(&stored);
+        let requests = xudo_sys::FakeSpool::new().failing_lock(error.clone());
+        assert_eq!(
+            super::complete_after_gate_audit(&store, &requests, &record.id, &act, &binding, 0),
+            Err(StoreError::Spool(error))
+        );
+        assert_eq!(load_all(&store).unwrap()[0].state, QueueState::Claimed);
     }
 }

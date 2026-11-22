@@ -82,7 +82,7 @@ fn exec_queued(
     command.current_dir(run.cwd);
     match command.status() {
         Ok(status) => {
-            let _ = xudo::exec::finish_queued_live(&run.id, true, err);
+            let _ = xudo::exec::finish_queued_live(&run.id, true, &run.claim_token, err);
             let code = status
                 .code()
                 .or(status.signal().and_then(|n| n.checked_add(128)));
@@ -90,7 +90,7 @@ fn exec_queued(
         }
         Err(error) => {
             let _ = writeln!(err, "xudo: cannot run {}: {error}", run.plan.backend);
-            let _ = xudo::exec::finish_queued_live(&run.id, false, err);
+            let _ = xudo::exec::finish_queued_live(&run.id, false, &run.claim_token, err);
             exit_status(19)
         }
     }
