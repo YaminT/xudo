@@ -16,6 +16,7 @@ use term_sanitize::{Clean, Finding, Limits, display_str, flag_command_name};
 
 use crate::consequence::assess;
 use crate::entry::Entry;
+use crate::root_queue::RootView;
 use crate::status::{Status, run_order, status_of};
 
 /// Width budget for one rendered field, before the caller's own clamp.
@@ -184,7 +185,10 @@ pub fn list(queue: &[Entry], now_unix: u64) -> String {
     if queue.is_empty() {
         return "ido: nothing queued\n".to_owned();
     }
-    let mut out = format!("ido: {} queued\n", queue.len());
+    let mut out = format!(
+        "ido: {} queued\nwritten by the agent, editable by it\n",
+        queue.len()
+    );
     let mut current_group: Option<&str> = None;
     let ordered = run_order(queue)
         .into_iter()
@@ -223,15 +227,83 @@ pub fn list(queue: &[Entry], now_unix: u64) -> String {
     out
 }
 
-/// The queue as JSON, for scripts.
+/// The user-side list, then the root-held queue as its own section.
 ///
-/// The argv is exact — this is the machine interface — and the whole document
-/// is ASCII: every non-ASCII character is written as a `\u` escape, so a
-/// bidirectional override or a lookalike cannot act on a terminal that the
-/// JSON happens to be printed to.
+/// An empty user queue with nothing from the broker still reads as nothing
+/// queued. A broker that could not be asked is unavailable, which is not the
+/// same as an empty root-held queue.
 #[must_use]
-pub fn json(queue: &[Entry], now_unix: u64) -> String {
-    let entries: Vec<serde_json::Value> = run_order(queue)
+pub fn list_with_root(
+    queue: &[Entry],
+    now_unix: u64,
+    root: &[RootView],
+    unavailable: bool,
+) -> String {
+    if queue.is_empty() && root.is_empty() && !unavailable {
+        return "ido: nothing queued\n".to_owned();
+    }
+    let mut out = if queue.is_empty() {
+        "ido: 0 queued\nwritten by the agent, editable by it\n".to_owned()
+    } else {
+        list(queue, now_unix)
+    };
+    if !root.is_empty() {
+        out.push_str("\nroot-held queue (the agent cannot edit this)\n");
+        for entry in root {
+            let _ = writeln!(
+                out,
+                "  {} {} harness {} argv {}",
+                field(&entry.id, 64).text,
+                field(&entry.state, 20).text,
+                field(&entry.harness, 40).text,
+                argv_line(&entry.argv, FIELD_COLS).text
+            );
+        }
+    }
+    if unavailable {
+        out.push_str("ido: the root-held queue is unavailable\n");
+    }
+    out
+}
+
+/// [`json`] as the `user` array, plus the root-held queue.
+///
+/// Always one object: `user` is the array [`json`] prints, `root_held` is the
+/// broker's list (empty when it returned nothing), and
+/// `root_queue_unavailable` says the broker could not be asked. Callers that
+/// need a sentence for that put it on stderr. The user-side array stays the
+/// machine interface for one person's queue.
+#[must_use]
+pub fn json_with_root(
+    queue: &[Entry],
+    now_unix: u64,
+    root: &[RootView],
+    unavailable: bool,
+) -> String {
+    let user = user_values(queue, now_unix);
+    let held: Vec<serde_json::Value> = root
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "argv": entry.argv,
+                "harness": entry.harness,
+                "state": entry.state,
+            })
+        })
+        .collect();
+    let value = json!({
+        "user": user,
+        "root_held": held,
+        "root_queue_unavailable": unavailable,
+    });
+    let mut text = ascii_only(&value.to_string());
+    text.push('\n');
+    text
+}
+
+fn user_values(queue: &[Entry], now_unix: u64) -> Vec<serde_json::Value> {
+    run_order(queue)
         .into_iter()
         .filter_map(|id| queue.iter().find(|e| e.id == id))
         .map(|entry| {
@@ -252,7 +324,18 @@ pub fn json(queue: &[Entry], now_unix: u64) -> String {
                 "detail": status.detail(),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// The queue as JSON, for scripts.
+///
+/// The argv is exact — this is the machine interface — and the whole document
+/// is ASCII: every non-ASCII character is written as a `\u` escape, so a
+/// bidirectional override or a lookalike cannot act on a terminal that the
+/// JSON happens to be printed to.
+#[must_use]
+pub fn json(queue: &[Entry], now_unix: u64) -> String {
+    let entries = user_values(queue, now_unix);
     let mut text = ascii_only(&serde_json::Value::Array(entries).to_string());
     text.push('\n');
     text
@@ -452,6 +535,62 @@ mod tests {
         assert_eq!(parsed[0]["argv"][1], "\u{202E}x", "exact bytes survive");
         assert_eq!(parsed[0]["reason"], "caf\u{e9}");
         assert_eq!(parsed[0]["status"], "ready");
+    }
+
+    #[test]
+    fn the_root_held_queue_is_a_separate_sanitized_section() {
+        use crate::root_queue::RootView;
+        let user = entry(1, &["echo", "mine"]);
+        let root = RootView {
+            id: "ab".repeat(32),
+            argv: vec![
+                "/usr/bin/apt-get".into(),
+                "$(rm)".into(),
+                "\u{1b}[31mx".into(),
+            ],
+            harness: "codex\u{1b}[2J".into(),
+            state: "pending".into(),
+        };
+        assert_eq!(
+            list_with_root(&[], 1000, &[], false),
+            "ido: nothing queued\n"
+        );
+        let only_root = list_with_root(&[], 1000, std::slice::from_ref(&root), false);
+        assert!(
+            only_root.contains("ido: 0 queued\nwritten by the agent, editable by it\n"),
+            "{only_root}"
+        );
+        assert!(only_root.contains("root-held queue"), "{only_root}");
+        assert!(!only_root.contains('\u{1b}'), "{only_root}");
+        let both = list_with_root(
+            std::slice::from_ref(&user),
+            1000,
+            std::slice::from_ref(&root),
+            true,
+        );
+        assert!(both.contains("#1"), "{both}");
+        assert!(both.contains("unavailable"), "{both}");
+        let offline = list_with_root(&[], 1000, &[], true);
+        assert!(offline.contains("0 queued"), "{offline}");
+        assert!(offline.contains("unavailable"), "{offline}");
+        assert!(!offline.contains("root-held queue ("), "{offline}");
+
+        let user_json = json(std::slice::from_ref(&user), 1000);
+        let user_array: serde_json::Value = serde_json::from_str(&user_json).unwrap();
+        let same = json_with_root(std::slice::from_ref(&user), 1000, &[], false);
+        let same_value: serde_json::Value = serde_json::from_str(&same).unwrap();
+        assert_eq!(same_value["user"], user_array);
+        assert_eq!(same_value["root_held"], serde_json::json!([]));
+        assert_eq!(same_value["root_queue_unavailable"], false);
+        let offline_json = json_with_root(std::slice::from_ref(&user), 1000, &[], true);
+        let offline_value: serde_json::Value = serde_json::from_str(&offline_json).unwrap();
+        assert_eq!(offline_value["user"], user_array);
+        assert_eq!(offline_value["root_held"], serde_json::json!([]));
+        assert_eq!(offline_value["root_queue_unavailable"], true);
+        let extended = json_with_root(&[], 1000, std::slice::from_ref(&root), true);
+        assert!(extended.is_ascii(), "{extended}");
+        assert!(extended.contains("root_held"), "{extended}");
+        assert!(!extended.contains('\u{1b}'), "{extended}");
     }
 
     #[test]

@@ -42,6 +42,9 @@ pub fn decided(
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
         evidence.push(format!("deadline_ms={}", entry.deadline.0));
+        if let Some(id) = &entry.queue_id {
+            evidence.push(format!("queue_id={id}"));
+        }
     }
     if let Some(id) = deciding_deny_rule_id(decision) {
         evidence.push(format!("deny_rule_id={id}"));
@@ -130,6 +133,10 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
         xudo_wire::Question::Freeze { .. } => "freeze",
         xudo_wire::Question::Thaw => "thaw",
         xudo_wire::Question::QueueList => "queue_list",
+        xudo_wire::Question::QueueClaim { .. } => "queue_claim",
+        xudo_wire::Question::QueueComplete { .. } => "queue_complete",
+        xudo_wire::Question::QueueRelease { .. } => "queue_release",
+        xudo_wire::Question::QueueListPage { .. } => "queue_list_page",
     }
 }
 
@@ -236,6 +243,31 @@ mod tests {
             (xudo_wire::Question::Watch, "watch"),
             (xudo_wire::Question::Pending, "pending"),
             (xudo_wire::Question::QueueList, "queue_list"),
+            (
+                xudo_wire::Question::QueueClaim { id: "b".repeat(64) },
+                "queue_claim",
+            ),
+            (
+                xudo_wire::Question::QueueComplete {
+                    id: "c".repeat(64),
+                    audit_seq: 0,
+                    claim_token: String::new(),
+                },
+                "queue_complete",
+            ),
+            (
+                xudo_wire::Question::QueueRelease {
+                    id: "d".repeat(64),
+                    claim_token: String::new(),
+                },
+                "queue_release",
+            ),
+            (
+                xudo_wire::Question::QueueListPage {
+                    after: String::new(),
+                },
+                "queue_list_page",
+            ),
             (
                 xudo_wire::Question::Answer {
                     id: "a".repeat(64),
@@ -394,6 +426,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         };
         let record = decided(
             None,
@@ -435,6 +468,22 @@ mod tests {
         }
         assert_eq!(record.deny_list_version, deny_list_version());
         assert_eq!(record.outcome, Outcome::NotExecuted);
+        let mut linked = entry.clone();
+        linked.queue_id = Some("cd".repeat(32));
+        let linked_record = decided(
+            None,
+            &permitted(Verdict::Allow),
+            &caller(),
+            &identity(Some(77)),
+            &request(),
+            &generation(),
+            Some(&linked),
+        );
+        assert!(
+            linked_record
+                .evidence
+                .contains(&format!("queue_id={}", "cd".repeat(32)))
+        );
         assert!(record.is_sealed());
     }
 

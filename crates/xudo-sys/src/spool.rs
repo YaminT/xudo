@@ -212,17 +212,22 @@ pub trait Spool {
     /// component.
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError>;
 
-    /// Removes one entry. A name that is already gone is not an error: the
-    /// gate may have consumed it a moment ago.
+    /// Removes one entry and reports whether this call unlinked it.
+    ///
+    /// `Ok(true)` means the name was there and is now gone. `Ok(false)` means
+    /// it was already gone: the gate may have consumed it a moment ago, or a
+    /// mint never published it. Callers that must not treat those two the
+    /// same way branch on the bool. A missing name is still not an I/O error.
     ///
     /// This is the broker's tidying, and the opposite of [`Self::consume`] on
-    /// exactly that point: here a missing name is the outcome that was wanted.
+    /// exactly that point: here a missing name is `Ok(false)`, not
+    /// [`SpoolError::Gone`].
     ///
     /// # Errors
     ///
     /// [`SpoolError::Io`] if it exists and cannot be removed, and
     /// [`SpoolError::InvalidName`] for a name that is not one component.
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError>;
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError>;
 
     /// Takes one entry, so that it can be acted on at most once.
     ///
@@ -597,8 +602,8 @@ impl Spool for SpoolDir {
         contents_from(read, bytes, display, limit)
     }
 
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
-        self.unlink_entry(name).map(|_| ())
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError> {
+        self.unlink_entry(name)
     }
 
     fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
@@ -787,9 +792,16 @@ pub struct FakeSpool {
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
+    replace_error_on_call: Option<(usize, SpoolError)>,
+    replace_calls: std::cell::Cell<usize>,
     replace_error_after_exchange: Option<SpoolError>,
     unreadable_after_replace: bool,
     replaced: std::cell::Cell<bool>,
+    /// When set, a published file is gone at once: the gate consumed it.
+    consumed_on_publish: bool,
+    /// When set, [`Spool::names`] returns insertion order, as a directory does.
+    directory_order: bool,
+    inserted: RefCell<Vec<Vec<u8>>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -806,7 +818,41 @@ impl FakeSpool {
     }
 
     fn with_file_bytes(self, name: Vec<u8>, bytes: Vec<u8>) -> Self {
+        self.inserted.borrow_mut().push(name.clone());
         self.files.borrow_mut().insert(name, bytes);
+        self
+    }
+
+    /// A spool whose published files are consumed at once, as when the gate
+    /// wins the race against the broker's revoke.
+    #[must_use]
+    pub fn with_consumed_on_publish(mut self) -> Self {
+        self.consumed_on_publish = true;
+        self
+    }
+
+    fn listed(&self, limit: usize) -> Vec<Vec<u8>> {
+        if self.directory_order {
+            let files = self.files.borrow();
+            return self
+                .inserted
+                .borrow()
+                .iter()
+                .filter(|name| files.contains_key(name.as_slice()))
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        self.files.borrow().keys().take(limit).cloned().collect()
+    }
+
+    /// Lists names in insertion order instead of sorted order.
+    ///
+    /// A real spool returns directory order. Tests that page a queue use this
+    /// so a sort bug is not hidden by [`BTreeMap`].
+    #[must_use]
+    pub fn in_directory_order(mut self) -> Self {
+        self.directory_order = true;
         self
     }
 
@@ -870,6 +916,15 @@ impl FakeSpool {
         self
     }
 
+    /// Makes the `replace` call at `call` fail, counting from one.
+    ///
+    /// Earlier replaces succeed, so a later step can be the one that refuses.
+    #[must_use]
+    pub fn failing_replace_on_call(mut self, call: usize, error: SpoolError) -> Self {
+        self.replace_error_on_call = Some((call, error));
+        self
+    }
+
     /// Makes [`Spool::replace`] fail after the new bytes are in place, as the
     /// real spool can when its last unlink or its swap back fails.
     #[must_use]
@@ -889,6 +944,15 @@ impl FakeSpool {
     /// Every file, by name.
     pub fn files(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.files.borrow().clone()
+    }
+
+    /// Removes `name` if it is present, as a gate consume that lands before
+    /// the broker's own [`Spool::remove`].
+    ///
+    /// Returns whether a file was there. The broker then sees [`Spool::remove`]
+    /// answer `Ok(false)`.
+    pub fn take_entry(&self, name: &[u8]) -> bool {
+        self.files.borrow_mut().remove(name).is_some()
     }
 
     /// Every call received so far, in order.
@@ -924,7 +988,7 @@ impl Spool for FakeSpool {
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
         self.record(SpoolCall::Names);
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().cloned().collect())
+        Ok(self.listed(usize::MAX))
     }
 
     fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
@@ -937,7 +1001,7 @@ impl Spool for FakeSpool {
             }
         }
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().take(limit).cloned().collect())
+        Ok(self.listed(limit))
     }
 
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
@@ -966,11 +1030,10 @@ impl Spool for FakeSpool {
         }
     }
 
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError> {
         self.record(SpoolCall::Remove(name.to_vec()));
         scripted(self.remove_error.as_ref())?;
-        self.files.borrow_mut().remove(name);
-        Ok(())
+        Ok(self.files.borrow_mut().remove(name).is_some())
     }
 
     fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
@@ -993,13 +1056,25 @@ impl Spool for FakeSpool {
                 name: name.to_owned(),
             });
         }
-        files.insert(name.as_bytes().to_vec(), bytes.to_vec());
+        let owned = name.as_bytes().to_vec();
+        self.inserted.borrow_mut().push(owned.clone());
+        files.insert(owned.clone(), bytes.to_vec());
+        if self.consumed_on_publish {
+            files.remove(&owned);
+        }
         Ok(())
     }
 
     fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
         self.record(SpoolCall::Replace(name.to_vec()));
         self.replaced.set(true);
+        let calls = self.replace_calls.get().saturating_add(1);
+        self.replace_calls.set(calls);
+        if let Some((fail_on, error)) = &self.replace_error_on_call
+            && calls == *fail_on
+        {
+            return Err(error.clone());
+        }
         scripted(self.replace_error.as_ref())?;
         let mut files = self.files.borrow_mut();
         match files.get_mut(name) {
@@ -1056,6 +1131,25 @@ mod tests {
     fn open_beneath_rejects_a_missing_queue_directory() {
         let path = std::env::temp_dir().join(format!("xudo-missing-queue-{}", std::process::id()));
         assert!(SpoolDir::open_beneath(&path).is_err());
+    }
+
+    #[test]
+    fn a_directory_order_spool_lists_names_as_they_were_inserted() {
+        let spool = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec())
+            .in_directory_order();
+        assert_eq!(spool.names().unwrap(), vec![b"b".to_vec(), b"a".to_vec()]);
+        assert_eq!(spool.names_up_to(1).unwrap(), vec![b"b".to_vec()]);
+        let sorted = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec());
+        assert_eq!(sorted.names().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
+        spool.publish("c", b"3").unwrap();
+        assert_eq!(
+            spool.names().unwrap(),
+            vec![b"b".to_vec(), b"a".to_vec(), b"c".to_vec()]
+        );
     }
 
     #[cfg(feature = "fake")]
@@ -1322,6 +1416,17 @@ mod tests {
         assert!(fake.replace(b"request", b"pending", b"approved").is_err());
         fake.unlock();
         assert_eq!(fake.files().get(b"request".as_slice()).unwrap(), b"pending");
+        let nth = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_replace_on_call(
+                2,
+                SpoolError::Gone {
+                    name: "request".to_owned(),
+                },
+            );
+        nth.replace(b"request", b"pending", b"once").unwrap();
+        assert_eq!(kind(nth.replace(b"request", b"once", b"twice")), "Gone");
+        assert_eq!(nth.files().get(b"request".as_slice()).unwrap(), b"once");
     }
 
     #[test]
@@ -1625,9 +1730,9 @@ mod tests {
         // broker listed may be gone by the time it is removed.
         let (spool, dir) = spool("remove");
         spool.publish("abc", b"x").unwrap();
-        spool.remove(b"abc").unwrap();
+        assert!(spool.remove(b"abc").unwrap());
         assert!(!dir.join("abc").exists());
-        spool.remove(b"abc").unwrap();
+        assert!(!spool.remove(b"abc").unwrap());
         // A directory is not an entry and is not removed as one.
         std::fs::create_dir(dir.join("d")).unwrap();
         let err = spool.remove(b"d").unwrap_err();
@@ -1796,8 +1901,8 @@ mod tests {
                 .to_string()
                 .contains("no such entry")
         );
-        fake.remove(b"a").unwrap();
-        fake.remove(b"a").unwrap();
+        assert!(fake.remove(b"a").unwrap());
+        assert!(!fake.remove(b"a").unwrap());
         // Consuming takes an entry once, and a missing one is gone, as the
         // directory says.
         fake.consume(b"b").unwrap();
@@ -1807,6 +1912,9 @@ mod tests {
                 name: "b".to_owned()
             }
         );
+        fake.publish("taken", b"x").unwrap();
+        assert!(fake.take_entry(b"taken"));
+        assert!(!fake.take_entry(b"taken"));
         fake.publish("c", b"3").unwrap();
         assert_eq!(
             fake.publish("c", b"4").unwrap_err(),
@@ -1831,6 +1939,7 @@ mod tests {
                 SpoolCall::Remove(b"a".to_vec()),
                 SpoolCall::Consume(b"b".to_vec()),
                 SpoolCall::Consume(b"b".to_vec()),
+                SpoolCall::Publish("taken".to_owned()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Unlock,

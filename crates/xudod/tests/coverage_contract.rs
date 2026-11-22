@@ -70,12 +70,15 @@ fn dependency_policy_wire_and_spool_paths_are_exercised() {
             nonce: "invalid".to_owned(),
             expires_in_ms: 1,
             gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+            claim_token: None,
+            harness: None,
         }),
     );
     assert!(BrokerResponse::parse(invalid_minted.to_json().as_bytes()).is_err());
     let invalid_queue = BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
         answer: Answer::QueueListed {
+            next: None,
             entries: vec![xudo_wire::QueueListEntry {
                 id: "bad".to_owned(),
                 argv: vec!["/usr/bin/true".to_owned()],

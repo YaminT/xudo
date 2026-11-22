@@ -258,6 +258,7 @@ dependencies = [
  "thiserror",
  "xudo-audit",
  "xudo-config",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -268,6 +269,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "xudo-audit",
+ "xudo-wire",
 ]
 
 [[package]]

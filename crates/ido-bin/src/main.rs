@@ -102,10 +102,105 @@ fn queued_by() -> Option<String> {
     var("CLAUDECODE").map(|_| "claude-code".to_owned())
 }
 
+/// One page of the root-held queue, or the fact that the broker could not be asked.
+struct RootFetch {
+    root_entries: Vec<ido::RootView>,
+    unavailable: bool,
+}
+
+/// Reads every page. A failure discards a partial list: showing half of it
+/// would look like the rest did not exist.
+fn fetch_root_queue() -> RootFetch {
+    let mut entries = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..64 {
+        let request = match &after {
+            None => ido::queue_list_request(),
+            Some(cursor) => ido::queue_list_page_request(cursor),
+        };
+        let Ok(bytes) = exchange(&request) else {
+            return RootFetch {
+                root_entries: Vec::new(),
+                unavailable: true,
+            };
+        };
+        let Ok(page) = ido::parse_queue_page(&bytes) else {
+            return RootFetch {
+                root_entries: Vec::new(),
+                unavailable: true,
+            };
+        };
+        let Some(next) = ido::append_page(&mut entries, page) else {
+            return RootFetch {
+                root_entries: entries,
+                unavailable: false,
+            };
+        };
+        after = Some(next);
+    }
+    RootFetch {
+        root_entries: entries,
+        unavailable: false,
+    }
+}
+
+fn exchange(request: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream =
+        UnixStream::connect(xudo_wire::BROKER_SOCKET).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(request)
+        .map_err(|error| error.to_string())?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| error.to_string())?;
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if buf.len() > xudo_wire::MAX_RESPONSE_BYTES {
+            return Err("the broker's queue list was too large".to_owned());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Some(bytes) = chunk.get(..read) {
+                    buf.extend_from_slice(bytes);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(buf)
+}
+
+fn send_release(id: &str) -> Result<(), String> {
+    let bytes = exchange(&ido::queue_release_request(id))?;
+    ido::parse_release_answer(&bytes)
+}
+
 fn main() -> std::process::ExitCode {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let args: Vec<_> = std::env::args_os().collect();
+    // Only the picker and `ido list` show the root-held queue. `ido queue`
+    // is the agent's command and must not ask the broker.
+    let fetch = if ido::command_shows_root_queue(&args) {
+        fetch_root_queue()
+    } else {
+        RootFetch {
+            root_entries: Vec::new(),
+            unavailable: false,
+        }
+    };
     let host = ido::Host {
         home: std::env::home_dir(),
         xdg_config_home: var("XDG_CONFIG_HOME"),
@@ -123,6 +218,9 @@ fn main() -> std::process::ExitCode {
         lock_wait: Duration::from_secs(2),
         frame_delay: Duration::from_millis(120),
         xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
+        root_entries: fetch.root_entries,
+        root_queue_unavailable: fetch.unavailable,
+        root_release: Some(send_release),
     };
 
     let mut out = std::io::stdout().lock();
@@ -136,7 +234,7 @@ fn main() -> std::process::ExitCode {
         input: &mut input,
         terminal: &mut open,
     };
-    let code = ido::run_with(std::env::args_os().collect(), &host, &mut io);
+    let code = ido::run_with(args, &host, &mut io);
     let _ = out.flush();
     // An exit status that does not fit a byte is never read as success.
     std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))

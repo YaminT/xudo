@@ -408,6 +408,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         }
     }
 

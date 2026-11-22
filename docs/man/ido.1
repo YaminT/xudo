@@ -1,4 +1,4 @@
-.TH IDO 1 "2026-10-14" "ido 0.1.0-beta.2" "User Commands"
+.TH IDO 1 "2026-11-21" "ido 0.1.0-beta.2" "User Commands"
 .SH NAME
 ido \- a queue of commands an agent asked you to run
 .SH SYNOPSIS
@@ -138,8 +138,36 @@ refused.
 .TP
 .B list
 Prints the queue.
+The user-side list is labelled
+.B written by the agent, editable by it
+because the agent can rewrite that file.
+The broker's root-held queue, when this process can ask the broker, is printed
+under its own heading. Every field the agent wrote is sanitized before it is
+shown. A root-held entry is not run by pressing a key: the picker shows the
+sanitized argv and the harness label, and runs it only after the word
+.B run
+as
+.B xudo exec \-\-queued
+.IR id ,
+in
+.BR / ,
+never through a shell and never in the directory the agent stored.
+The broker refuses a claim or a release from the harness that owns the entry.
+If the broker cannot be asked, the text list says the root-held queue is
+unavailable.
 .B \-\-json
-prints the exact argv of each entry, as ASCII JSON.
+is always one JSON object with
+.BR user ,
+.BR root_held ,
+and
+.BR root_queue_unavailable .
+.B user
+is the JSON array of the user-side queue.
+.B root_held
+is an array, empty when the broker returned nothing.
+.B root_queue_unavailable
+is true when the broker could not be asked, and that notice is written to
+standard error. The object prints the exact argv of each entry, as ASCII JSON.
 .TP
 .B run
 Runs entries in order and stops at the first failure.

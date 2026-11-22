@@ -217,6 +217,7 @@ fn write_entry(round: u64) -> String {
         attested_scope_id: None,
         boot_id: None,
         attested_harness: None,
+        queue_id: None,
     };
     root_file(
         &format!("{SPOOL_DIR}/{nonce}"),
