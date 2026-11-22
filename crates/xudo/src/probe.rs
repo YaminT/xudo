@@ -252,6 +252,8 @@ mod tests {
             nonce: "0".repeat(64),
             expires_in_ms: 1,
             gate: gate.into(),
+            claim_token: None,
+            harness: None,
         }
     }
 

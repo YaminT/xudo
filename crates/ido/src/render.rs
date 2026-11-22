@@ -266,13 +266,13 @@ pub fn list_with_root(
     out
 }
 
-/// [`json`], plus the root-held queue when the broker returned entries.
+/// [`json`] as the `user` array, plus the root-held queue.
 ///
-/// An empty root list stays the user-queue array, including when the broker
-/// could not be asked. Callers that need to say the queue was unavailable put
-/// that on stderr, so `ido list --json` remains a JSON array for existing
-/// scripts. A non-empty root list is an object with `user`, `root_held`, and
-/// `root_queue_unavailable`.
+/// Always one object: `user` is the array [`json`] prints, `root_held` is the
+/// broker's list (empty when it returned nothing), and
+/// `root_queue_unavailable` says the broker could not be asked. Callers that
+/// need a sentence for that put it on stderr. The user-side array stays the
+/// machine interface for one person's queue.
 #[must_use]
 pub fn json_with_root(
     queue: &[Entry],
@@ -280,9 +280,6 @@ pub fn json_with_root(
     root: &[RootView],
     unavailable: bool,
 ) -> String {
-    if root.is_empty() {
-        return json(queue, now_unix);
-    }
     let user = user_values(queue, now_unix);
     let held: Vec<serde_json::Value> = root
         .iter()
@@ -578,10 +575,18 @@ mod tests {
         assert!(offline.contains("unavailable"), "{offline}");
         assert!(!offline.contains("root-held queue ("), "{offline}");
 
+        let user_json = json(std::slice::from_ref(&user), 1000);
+        let user_array: serde_json::Value = serde_json::from_str(&user_json).unwrap();
         let same = json_with_root(std::slice::from_ref(&user), 1000, &[], false);
-        assert_eq!(same, json(std::slice::from_ref(&user), 1000));
+        let same_value: serde_json::Value = serde_json::from_str(&same).unwrap();
+        assert_eq!(same_value["user"], user_array);
+        assert_eq!(same_value["root_held"], serde_json::json!([]));
+        assert_eq!(same_value["root_queue_unavailable"], false);
         let offline_json = json_with_root(std::slice::from_ref(&user), 1000, &[], true);
-        assert_eq!(offline_json, json(std::slice::from_ref(&user), 1000));
+        let offline_value: serde_json::Value = serde_json::from_str(&offline_json).unwrap();
+        assert_eq!(offline_value["user"], user_array);
+        assert_eq!(offline_value["root_held"], serde_json::json!([]));
+        assert_eq!(offline_value["root_queue_unavailable"], true);
         let extended = json_with_root(&[], 1000, std::slice::from_ref(&root), true);
         assert!(extended.is_ascii(), "{extended}");
         assert!(extended.contains("root_held"), "{extended}");

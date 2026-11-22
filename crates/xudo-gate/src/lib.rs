@@ -43,12 +43,13 @@
 //! | Module | Answers |
 //! |---|---|
 //! | [`request`] | Is this spool entry a live request from *this* caller? |
+//! | [`queue_claim`] | Is a queued run still claimed for this nonce? |
 //! | [`mod@decide`] | Does root's ruleset permit it, and what exactly may run? |
 //! | [`mod@env`] | What environment does the child get? (a fixed one, built here) |
 //! | [`status`] | How is the child's fate reported back faithfully? |
 //! | [`mod@run`] | In what order does the gate do all of it, and what stops it? |
 //!
-//! The first four are pure. The syscalls that surround them — `close_range`,
+//! The first five are pure. The syscalls that surround them — `close_range`,
 //! the `statfs` check on `/proc`, the trust walk, `execveat` — live in
 //! `xudo-sys` behind its traits, which is what lets every refusal below be
 //! reached by a test on a developer's laptop without root. [`mod@run`] is the
@@ -77,6 +78,7 @@ pub mod fuzzing {
     pub use crate::session::{SessionRecord, parse_session_record};
 }
 pub use policy::{MAX_CONFIG_BYTES, PolicyError, SettingsError, settings_from};
+pub mod queue_claim;
 pub mod request;
 pub mod run;
 pub mod session;

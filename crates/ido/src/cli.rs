@@ -230,6 +230,23 @@ struct DropArgs {
     stale: bool,
 }
 
+/// Whether this invocation shows the broker's root-held queue.
+///
+/// The picker (no subcommand) and `ido list` show it. `ido queue` is the
+/// agent's own command and does not, and neither do run, add, drop, log,
+/// config, or celebrate. A parse error does not show it either, so the binary
+/// must not ask the broker before it knows the command.
+#[must_use]
+pub fn command_shows_root_queue(args: &[OsString]) -> bool {
+    if invoked_as_celebration(args) {
+        return false;
+    }
+    let Ok(cli) = Cli::try_parse_from(args.iter().cloned()) else {
+        return false;
+    };
+    cli.command.is_none() || matches!(cli.command, Some(Command::List { .. }))
+}
+
 /// Runs `ido` with `args` (including the program name) and returns the exit
 /// status.
 pub fn run_with(args: Vec<OsString>, host: &Host, io: &mut Io<'_>) -> i32 {
@@ -476,8 +493,8 @@ fn add(path: Option<&Path>, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoErro
 
 fn list(json: bool, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
     let queue = store(host)?.load()?;
-    // The text list says this on stdout. JSON stdout stays an array when the
-    // root list is empty, so the same sentence goes to stderr.
+    // The text list says this on stdout. JSON is always the object, so the
+    // same sentence goes to stderr and does not change that shape.
     if json && host.root_entries.is_empty() && host.root_queue_unavailable {
         let _ = writeln!(io.err, "ido: the root-held queue is unavailable");
     }
@@ -1067,7 +1084,9 @@ mod tests {
         );
         let json = ido(&h, &["list", "--json"]);
         let parsed: serde_json::Value = serde_json::from_str(&json.out).unwrap();
-        assert_eq!(parsed[0]["argv"][3], "rg");
+        assert_eq!(parsed["user"][0]["argv"][3], "rg");
+        assert_eq!(parsed["root_held"], serde_json::json!([]));
+        assert_eq!(parsed["root_queue_unavailable"], false);
 
         // Without a terminal, bare `ido` lists and runs nothing.
         let bare = ido(&h, &[]);
@@ -1718,7 +1737,9 @@ mod tests {
             json_off.err
         );
         let parsed_off: serde_json::Value = serde_json::from_str(&json_off.out).unwrap();
-        assert!(parsed_off.is_array(), "{}", json_off.out);
+        assert!(parsed_off["user"].is_array(), "{}", json_off.out);
+        assert_eq!(parsed_off["root_held"], serde_json::json!([]));
+        assert_eq!(parsed_off["root_queue_unavailable"], true);
         assert!(missing.out.contains("#1"), "{}", missing.out);
         assert!(
             !missing.out.contains("root-held queue (the agent"),
@@ -1880,6 +1901,37 @@ mod tests {
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
         text.push_str("{\"tampered\":true}\n");
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn the_root_queue_is_fetched_only_for_the_commands_that_show_it() {
+        let shows = [
+            vec!["ido".into()],
+            vec!["ido".into(), "list".into()],
+            vec!["ido".into(), "list".into(), "--json".into()],
+        ];
+        for args in shows {
+            assert!(command_shows_root_queue(&args), "{args:?}");
+        }
+        let hides = [
+            vec![
+                "ido".into(),
+                "queue".into(),
+                "--".into(),
+                "/bin/true".into(),
+            ],
+            vec!["ido".into(), "add".into()],
+            vec!["ido".into(), "run".into(), "--all".into()],
+            vec!["ido".into(), "drop".into(), "--all".into()],
+            vec!["ido".into(), "log".into()],
+            vec!["ido".into(), "config".into(), "list".into()],
+            vec!["ido".into(), "celebrate".into()],
+            vec!["willyoumarryme".into()],
+            vec!["ido".into(), "--nope".into()],
+        ];
+        for args in hides {
+            assert!(!command_shows_root_queue(&args), "{args:?}");
+        }
     }
 
     #[test]

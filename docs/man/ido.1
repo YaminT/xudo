@@ -156,14 +156,18 @@ The broker refuses a claim or a release from the harness that owns the entry.
 If the broker cannot be asked, the text list says the root-held queue is
 unavailable.
 .B \-\-json
-stays a JSON array of the user-side queue when the root-held list is empty,
-including when the broker cannot be asked, and writes that notice to standard
-error. A non-empty root-held list is a JSON object with
+is always one JSON object with
 .BR user ,
 .BR root_held ,
 and
 .BR root_queue_unavailable .
-Either form prints the exact argv of each entry, as ASCII JSON.
+.B user
+is the JSON array of the user-side queue.
+.B root_held
+is an array, empty when the broker returned nothing.
+.B root_queue_unavailable
+is true when the broker could not be asked, and that notice is written to
+standard error. The object prints the exact argv of each entry, as ASCII JSON.
 .TP
 .B run
 Runs entries in order and stops at the first failure.

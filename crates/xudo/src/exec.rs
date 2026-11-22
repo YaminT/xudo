@@ -1,6 +1,6 @@
 //! `xudo exec`: ask the broker, then let `main` swap this process for the backend.
 
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -59,6 +59,8 @@ pub struct QueuedRun {
     pub id: String,
     /// Where the child runs. Fixed, never the entry's stored directory.
     pub cwd: &'static str,
+    /// The token the claimant must present to complete or release.
+    pub claim_token: String,
 }
 
 /// Fixed working directory of a queued run.
@@ -496,17 +498,29 @@ fn handle_status_answer(
 /// # Errors
 ///
 /// The exit status to return when there is nothing to exec.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_queued(
     cli: &Cli,
     id: &str,
     probe: &dyn Probe,
     socket: &Path,
     timeout: Duration,
+    tty: bool,
+    input: &mut dyn BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<QueuedRun, ExitCode> {
     if !valid_request_id(id) {
         let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
+        return Err(ExitCode::Unusable);
+    }
+    // A non-terminal cannot show the command or take the confirmation word.
+    // Refuse before the claim so no spool entry is minted.
+    if !tty {
+        let _ = writeln!(
+            err,
+            "xudo: a queued run needs a terminal to show the command and confirm it"
+        );
         return Err(ExitCode::Unusable);
     }
     let Some(backend) = selected_backend(probe, err) else {
@@ -523,7 +537,7 @@ pub fn plan_queued(
             return Err(ExitCode::Unusable);
         }
     };
-    queued_plan(cli, id, backend, response, out, err)
+    queued_plan(cli, id, backend, response, socket, timeout, input, out, err)
 }
 
 /// [`plan_queued`] against this machine and the real broker socket.
@@ -542,12 +556,17 @@ pub fn plan_queued_live(
     if configured_timeout(cli, err).is_none() {
         return Err(ExitCode::Unusable);
     }
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    let mut input = stdin.lock();
     plan_queued(
         cli,
         id,
         &xudo_sys::HostProbe,
         Path::new(xudo_wire::BROKER_SOCKET),
         TIMEOUT,
+        tty,
+        &mut input,
         out,
         err,
     )
@@ -564,6 +583,7 @@ pub fn plan_queued_live(
 pub fn finish_queued(
     id: &str,
     child_started: bool,
+    claim_token: &str,
     socket: &Path,
     timeout: Duration,
     err: &mut dyn Write,
@@ -572,10 +592,10 @@ pub fn finish_queued(
         let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
         return QueuedFinish::Stuck;
     }
-    if child_started && queue_done(id, true, socket, timeout, err) {
+    if child_started && queue_done(id, true, claim_token, socket, timeout, err) {
         return QueuedFinish::Completed;
     }
-    if queue_done(id, false, socket, timeout, err) {
+    if queue_done(id, false, claim_token, socket, timeout, err) {
         QueuedFinish::Released
     } else {
         let _ = writeln!(
@@ -590,10 +610,16 @@ pub fn finish_queued(
 ///
 /// The library binary uses this so it does not name the wire crate. An id
 /// that is not 64 lowercase hex characters is refused before any connection.
-pub fn finish_queued_live(id: &str, child_started: bool, err: &mut dyn Write) -> QueuedFinish {
+pub fn finish_queued_live(
+    id: &str,
+    child_started: bool,
+    claim_token: &str,
+    err: &mut dyn Write,
+) -> QueuedFinish {
     finish_queued(
         id,
         child_started,
+        claim_token,
         Path::new(xudo_wire::BROKER_SOCKET),
         TIMEOUT,
         err,
@@ -607,11 +633,15 @@ fn queue_question(question: Question) -> BrokerRequest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queued_plan(
     cli: &Cli,
     id: &str,
     backend: &'static str,
     response: BrokerResponse,
+    socket: &Path,
+    timeout: Duration,
+    input: &mut dyn BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<QueuedRun, ExitCode> {
@@ -651,6 +681,12 @@ fn queued_plan(
                 let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
                 return Err(ExitCode::Unusable);
             }
+            let claim_token = claim_secret(&minted);
+            if !confirm_queued(id, &decision, minted.harness.as_deref(), input, err) {
+                let _ = writeln!(err, "xudo: confirmation was not run; releasing the claim");
+                let _ = queue_done(id, false, &claim_token, socket, timeout, err);
+                return Err(ExitCode::Unusable);
+            }
             Ok(QueuedRun {
                 plan: ExecPlan {
                     backend,
@@ -659,15 +695,55 @@ fn queued_plan(
                 },
                 id: id.to_owned(),
                 cwd: QUEUED_CWD,
+                claim_token,
             })
         }
     }
+}
+
+/// The secret recorded on the claim. The mint returns it beside the nonce.
+fn claim_secret(minted: &xudo_wire::Minted) -> String {
+    match minted.claim_token.as_deref() {
+        Some(token) if !token.is_empty() => token.to_owned(),
+        Some(_) | None => minted.nonce.clone(),
+    }
+}
+
+/// Prints the sanitized command and requires the confirm word on `input`.
+fn confirm_queued(
+    id: &str,
+    decision: &xudo_policy::Decision,
+    harness: Option<&str>,
+    input: &mut dyn BufRead,
+    err: &mut dyn Write,
+) -> bool {
+    let limits = term_sanitize::Limits {
+        max_cols: 4096,
+        max_lines: 1,
+    };
+    let shown: Vec<String> = decision
+        .resolved_command()
+        .iter()
+        .map(|arg| term_sanitize::display_str(arg, limits).text)
+        .collect();
+    let command = shown.join(" ");
+    let label = harness.unwrap_or("");
+    let _ = writeln!(err, "xudo: queued {id} harness {label}");
+    let _ = writeln!(err, "xudo: command: {command}");
+    let _ = write!(err, "type {} and press enter: ", ido::picker::CONFIRM_WORD);
+    let _ = err.flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim_end_matches(['\r', '\n']) == ido::picker::CONFIRM_WORD
 }
 
 /// `complete` asks [`Question::QueueComplete`]; otherwise [`Question::QueueRelease`].
 fn queue_done(
     id: &str,
     complete: bool,
+    claim_token: &str,
     socket: &Path,
     timeout: Duration,
     err: &mut dyn Write,
@@ -676,9 +752,13 @@ fn queue_done(
         Question::QueueComplete {
             id: id.to_owned(),
             audit_seq: 0,
+            claim_token: claim_token.to_owned(),
         }
     } else {
-        Question::QueueRelease { id: id.to_owned() }
+        Question::QueueRelease {
+            id: id.to_owned(),
+            claim_token: claim_token.to_owned(),
+        }
     };
     match ask(socket, timeout, &queue_question(question)) {
         Ok(response) if matches!(response.answer, Answer::Done) => true,
@@ -819,6 +899,8 @@ mod tests {
             nonce: "0".repeat(64),
             expires_in_ms: 1,
             gate: gate.into(),
+            claim_token: None,
+            harness: None,
         }
     }
 
@@ -1378,6 +1460,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1415,6 +1499,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1455,11 +1541,15 @@ mod tests {
                 nonce: id.clone(),
                 expires_in_ms: 1,
                 gate: "/other".into(),
+                claim_token: None,
+                harness: None,
             },
             Minted {
                 nonce: "b".repeat(64),
                 expires_in_ms: 1,
                 gate: GATE_AUTH.into(),
+                claim_token: None,
+                harness: None,
             },
         ] {
             let status = BrokerResponse {
@@ -1470,6 +1560,8 @@ mod tests {
                         nonce: id.clone(),
                         expires_in_ms: 1,
                         gate: GATE_AUTH.into(),
+                        claim_token: None,
+                        harness: None,
                     }),
                 },
             };
@@ -1512,6 +1604,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1548,6 +1642,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1589,6 +1685,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1644,6 +1742,8 @@ mod tests {
                     nonce: "c".repeat(64),
                     expires_in_ms: 1,
                     gate: "/usr/libexec/xudo/other-gate".into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1716,6 +1816,8 @@ mod tests {
             nonce: id.clone(),
             expires_in_ms: 30_000,
             gate: GATE_AUTH.into(),
+            claim_token: None,
+            harness: None,
         };
         let approved_status = decided(allow(), Some(matching_mint.clone()));
         let consumed_run = decided(allow(), Some(matching_mint));
@@ -2411,12 +2513,15 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let broker = crate::test_broker::serve_once(listener, reply);
         let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut input = std::io::Cursor::new(b"run\n");
         let result = plan_queued(
             &cli(),
             &queued_id(),
             probe,
             &socket,
             PATIENT,
+            true,
+            &mut input,
             &mut out,
             &mut err,
         );
@@ -2499,6 +2604,8 @@ mod tests {
                     &SUDO,
                     Path::new("/no/such/sock"),
                     PATIENT,
+                    true,
+                    &mut std::io::Cursor::new(b"run\n"),
                     &mut out,
                     &mut err
                 ),
@@ -2519,6 +2626,8 @@ mod tests {
                 &Has(&[]),
                 Path::new("/no/such/sock"),
                 PATIENT,
+                true,
+                &mut std::io::Cursor::new(b"run\n"),
                 &mut out,
                 &mut err,
             ),
@@ -2534,6 +2643,8 @@ mod tests {
                 &SUDO,
                 Path::new("/no/such/sock"),
                 PATIENT,
+                true,
+                &mut std::io::Cursor::new(b"run\n"),
                 &mut out,
                 &mut err,
             ),
@@ -2632,12 +2743,13 @@ mod tests {
         let broker =
             crate::test_broker::serve_many(listener, replies.into_iter().map(response).collect());
         let mut err = Vec::new();
-        let finish = finish_queued(&queued_id(), child_started, &socket, PATIENT, &mut err);
+        let finish = finish_queued(&queued_id(), child_started, "", &socket, PATIENT, &mut err);
         let report = broker.finish_report();
         (finish, String::from_utf8(err).unwrap(), report.requests)
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn finish_queued_completes_from_the_gate_or_releases_the_claim() {
         let (finish, err, requests) = finish_with(vec![Answer::Done], true);
         assert_eq!(finish, QueuedFinish::Completed, "{err}");
@@ -2648,13 +2760,20 @@ mod tests {
             Question::QueueComplete {
                 id: queued_id(),
                 audit_seq: 0,
+                claim_token: String::new(),
             }
         );
 
         let (finish, _, requests) = finish_with(vec![Answer::Done], false);
         assert_eq!(finish, QueuedFinish::Released);
         let sent = BrokerRequest::parse(&requests[0]).unwrap();
-        assert_eq!(sent.question, Question::QueueRelease { id: queued_id() });
+        assert_eq!(
+            sent.question,
+            Question::QueueRelease {
+                id: queued_id(),
+                claim_token: String::new(),
+            }
+        );
 
         let (finish, err, requests) = finish_with(
             vec![
@@ -2691,7 +2810,14 @@ mod tests {
 
         let mut err = Vec::new();
         assert_eq!(
-            finish_queued("nope", true, Path::new("/no/such/sock"), PATIENT, &mut err),
+            finish_queued(
+                "nope",
+                true,
+                "",
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut err,
+            ),
             QueuedFinish::Stuck
         );
         assert!(
@@ -2705,6 +2831,7 @@ mod tests {
             finish_queued(
                 &queued_id(),
                 true,
+                "cd".repeat(32).as_str(),
                 Path::new("/no/such/sock"),
                 PATIENT,
                 &mut err
@@ -2718,7 +2845,7 @@ mod tests {
         // The live wrapper refuses a bad id before it opens the broker socket.
         let mut live = Vec::new();
         assert_eq!(
-            finish_queued_live("nope", false, &mut live),
+            finish_queued_live("nope", false, "", &mut live),
             QueuedFinish::Stuck
         );
         assert!(
@@ -2730,11 +2857,10 @@ mod tests {
 
     #[test]
     fn the_library_reports_a_queued_plan_without_executing_it() {
+        // The library path reads the process terminal. A test has none, so the
+        // claim is refused before any broker connection.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let broker =
-            crate::test_broker::serve_once(listener, decided(allow(), Some(minted(GATE_AUTH))));
         let mut cli = Cli::parse_from(["xudo", "exec", "--queued", &queued_id()]);
         cli.config_file = dir.path().join("missing.toml");
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -2754,8 +2880,8 @@ mod tests {
             &mut err,
         );
         assert_eq!(status, ExitCode::Unusable);
-        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
-        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+        let text = String::from_utf8(err.clone()).unwrap();
+        assert!(text.contains("needs a terminal"), "{text}");
 
         let mut bad = Cli::parse_from(["xudo", "exec", "--queued", "nope"]);
         bad.config_file = dir.path().join("missing.toml");
@@ -2769,5 +2895,165 @@ mod tests {
         );
         assert_eq!(status, ExitCode::Unusable);
         assert!(String::from_utf8(err).unwrap().contains("64 lowercase hex"));
+    }
+
+    #[test]
+    fn xudo_exec_queued_shows_the_argv_and_asks_before_running() {
+        let mut decision = allow();
+        decision.resolved_exe = Some("/usr/bin/apt-get".to_owned());
+        decision.resolved_argv = vec!["\u{1b}[31mupgrade".to_owned()];
+        let token = "cd".repeat(32);
+        let mut issued = minted(GATE_AUTH);
+        issued.claim_token = Some(token.clone());
+        issued.harness = Some("codex".to_owned());
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(listener, decided(decision, Some(issued)));
+        let mut input = std::io::Cursor::new(b"run\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        let run = result.unwrap();
+        assert_eq!(run.claim_token, token);
+        assert!(run.plan.spawn);
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains(&queued_id()), "{shown}");
+        assert!(shown.contains("harness codex"), "{shown}");
+        assert!(shown.contains("upgrade"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(shown.contains("type run and press enter"), "{shown}");
+        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+
+        let mut empty = minted(GATE_AUTH);
+        empty.claim_token = Some(String::new());
+        assert_eq!(claim_secret(&empty), empty.nonce);
+        empty.claim_token = Some(token.clone());
+        assert_eq!(claim_secret(&empty), token);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn xudo_exec_queued_refuses_without_a_terminal() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            Path::new("/no/such/sock"),
+            PATIENT,
+            false,
+            &mut std::io::Cursor::new(b"run\n"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("needs a terminal"), "{shown}");
+        assert!(!shown.contains("unreachable"), "{shown}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                decided(allow(), Some(minted(GATE_AUTH))),
+                json(&Answer::Done),
+            ],
+        );
+        let mut input = std::io::Cursor::new(b"no\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("releasing the claim"), "{shown}");
+        let requests = broker.finish_report().requests;
+        assert_eq!(requests.len(), 2);
+        let release = BrokerRequest::parse(&requests[1]).unwrap();
+        assert_eq!(
+            release.question,
+            Question::QueueRelease {
+                id: queued_id(),
+                claim_token: "0".repeat(64),
+            }
+        );
+
+        // A confirmation read that fails releases the claim and does not spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                decided(allow(), Some(minted(GATE_AUTH))),
+                json(&Answer::Done),
+            ],
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut closed = ClosedInput;
+        let mut buf = [0u8; 1];
+        let read = std::io::Read::read(&mut closed, &mut buf);
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        std::io::BufRead::consume(&mut closed, 1);
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut closed,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("releasing the claim"), "{shown}");
+        let requests = broker.finish_report().requests;
+        assert_eq!(requests.len(), 2);
+    }
+
+    /// `read_line` fails. Used so that arm is taken on every platform.
+    struct ClosedInput;
+
+    impl std::io::Read for ClosedInput {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+    }
+
+    impl std::io::BufRead for ClosedInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
     }
 }

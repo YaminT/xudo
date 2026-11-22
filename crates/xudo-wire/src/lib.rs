@@ -160,11 +160,21 @@ pub enum Question {
         id: String,
         /// Sequence of the gate record. Zero searches the trail for a match.
         audit_seq: u64,
+        /// Token returned when the entry was claimed. Empty only for a stale recovery.
+        #[serde(default, skip_serializing_if = "str::is_empty")]
+        claim_token: String,
     },
     /// Return a claimed entry to pending after a denied run.
+    ///
+    /// A fresh claim accepts only the peer that holds `claim_token`. An empty
+    /// token never matches, so another reviewer can use it only once the claim
+    /// is stale and the audit trail has no gate record for the entry.
     QueueRelease {
         /// The 64-character queue id.
         id: String,
+        /// Token returned when the entry was claimed. Empty only for a stale recovery.
+        #[serde(default, skip_serializing_if = "str::is_empty")]
+        claim_token: String,
     },
     /// A later page of [`Question::QueueList`]. `after` is exclusive.
     QueueListPage {
@@ -291,10 +301,14 @@ impl BrokerRequest {
                 )?;
                 refuse_nul("claimed_classification", claimed_classification)?;
             }
-            Question::Status { id }
-            | Question::QueueClaim { id }
-            | Question::QueueRelease { id }
-            | Question::QueueComplete { id, .. } => check_id(id)?,
+            Question::Status { id } | Question::QueueClaim { id } => check_id(id)?,
+            Question::QueueRelease { id, claim_token }
+            | Question::QueueComplete {
+                id, claim_token, ..
+            } => {
+                check_id(id)?;
+                check_claim_token(claim_token)?;
+            }
             Question::QueueListPage { after } => check_page_cursor(after)?,
             Question::Watch | Question::Pending | Question::Thaw | Question::QueueList => {}
             Question::Answer { id, token, .. } => {
@@ -360,6 +374,22 @@ fn check_page_cursor(after: &str) -> Result<(), RequestError> {
         return Err(RequestError::Malformed {
             reason: "queue page cursor must be empty or at most 64 lowercase hex characters"
                 .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn check_claim_token(token: &str) -> Result<(), RequestError> {
+    if token.is_empty() {
+        return Ok(());
+    }
+    if token.len() != NONCE_HEX_LEN
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RequestError::Malformed {
+            reason: "claim token must be empty or 64 lowercase hexadecimal characters".to_owned(),
         });
     }
     Ok(())
@@ -526,6 +556,11 @@ pub struct QueueListEntry {
 }
 
 /// What happened to a request.
+///
+/// `Decided` holds the policy decision and any minted spool entry. Those
+/// fields are large on purpose; boxing them would touch every caller without
+/// changing the wire. The other answers stay short.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Answer {
@@ -592,6 +627,14 @@ pub struct Minted {
     /// The gate to run, by absolute path, through the backend (`sudo` or
     /// `doas`) and with no arguments at all.
     pub gate: String,
+    /// Claim token for a queued run. Equal to [`Self::nonce`] when the broker
+    /// minted the entry for a queue claim. Absent for an ordinary human-path mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    /// Harness label of a queued command, for the reviewer to read before sudo.
+    /// Absent for an ordinary human-path mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 }
 
 /// Why the broker refused a request without a decision.
@@ -1293,8 +1336,12 @@ mod tests {
             Question::QueueComplete {
                 id: id.clone(),
                 audit_seq: 0,
+                claim_token: String::new(),
             },
-            Question::QueueRelease { id: id.clone() },
+            Question::QueueRelease {
+                id: id.clone(),
+                claim_token: String::new(),
+            },
             Question::QueueListPage {
                 after: String::new(),
             },
@@ -1553,8 +1600,12 @@ mod tests {
             Question::QueueComplete {
                 id: id.clone(),
                 audit_seq: 4,
+                claim_token: String::new(),
             },
-            Question::QueueRelease { id },
+            Question::QueueRelease {
+                id,
+                claim_token: String::new(),
+            },
             Question::QueueListPage {
                 after: "ab".to_owned(),
             },
@@ -1568,6 +1619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queue_mutations_reject_a_bad_id_and_a_bad_page_cursor() {
         let claim = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
@@ -1579,6 +1631,28 @@ mod tests {
                 reason: "id must be 64 lowercase hexadecimal characters".to_owned(),
             }
         );
+        for question in [
+            Question::QueueRelease {
+                id: "nope".into(),
+                claim_token: String::new(),
+            },
+            Question::QueueComplete {
+                id: "nope".into(),
+                audit_seq: 0,
+                claim_token: String::new(),
+            },
+        ] {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert_eq!(
+                BrokerRequest::parse(request.to_json().as_bytes()).unwrap_err(),
+                RequestError::Malformed {
+                    reason: "id must be 64 lowercase hexadecimal characters".to_owned(),
+                }
+            );
+        }
         let page = BrokerRequest {
             schema_version: WIRE_SCHEMA_VERSION,
             question: Question::QueueListPage { after: "GG".into() },
@@ -1605,10 +1679,14 @@ mod tests {
         );
         let id = "a".repeat(NONCE_HEX_LEN);
         for question in [
-            Question::QueueRelease { id: id.clone() },
+            Question::QueueRelease {
+                id: id.clone(),
+                claim_token: String::new(),
+            },
             Question::QueueComplete {
                 id: id.clone(),
                 audit_seq: 1,
+                claim_token: String::new(),
             },
             Question::QueueListPage {
                 after: String::new(),
@@ -1626,6 +1704,53 @@ mod tests {
                 question
             );
         }
+        let bad_token = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::QueueRelease {
+                id: id.clone(),
+                claim_token: "GG".into(),
+            },
+        };
+        assert_eq!(
+            BrokerRequest::parse(bad_token.to_json().as_bytes()).unwrap_err(),
+            RequestError::Malformed {
+                reason: "claim token must be empty or 64 lowercase hexadecimal characters"
+                    .to_owned(),
+            }
+        );
+        let upper = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::QueueRelease {
+                id: id.clone(),
+                claim_token: "A".repeat(NONCE_HEX_LEN),
+            },
+        };
+        assert_eq!(
+            BrokerRequest::parse(upper.to_json().as_bytes()).unwrap_err(),
+            RequestError::Malformed {
+                reason: "claim token must be empty or 64 lowercase hexadecimal characters"
+                    .to_owned(),
+            }
+        );
+        let token = "ab".repeat(32);
+        let good = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 0,
+                claim_token: token.clone(),
+            },
+        };
+        assert_eq!(
+            BrokerRequest::parse(good.to_json().as_bytes())
+                .unwrap()
+                .question,
+            Question::QueueComplete {
+                id,
+                audit_seq: 0,
+                claim_token: token,
+            }
+        );
     }
 
     #[test]
@@ -2117,6 +2242,8 @@ mod tests {
                     nonce: "invalid".to_owned(),
                     expires_in_ms: 1,
                     gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -2134,6 +2261,8 @@ mod tests {
             nonce: "ab".repeat(32),
             expires_in_ms: 900_000,
             gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+            claim_token: None,
+            harness: None,
         }
     }
 
@@ -2228,6 +2357,8 @@ mod tests {
                 nonce: "ABC".to_owned(),
                 expires_in_ms: 1,
                 gate: "/bin/id".to_owned(),
+                claim_token: None,
+                harness: None,
             }),
         );
         assert_eq!(
@@ -2247,6 +2378,8 @@ mod tests {
                     nonce: "a".repeat(64),
                     expires_in_ms: 1,
                     gate,
+                    claim_token: None,
+                    harness: None,
                 }),
             );
             assert_eq!(
