@@ -797,6 +797,8 @@ pub struct FakeSpool {
     replace_error_after_exchange: Option<SpoolError>,
     unreadable_after_replace: bool,
     replaced: std::cell::Cell<bool>,
+    /// When set, a published file is gone at once: the gate consumed it.
+    consumed_on_publish: bool,
     /// When set, [`Spool::names`] returns insertion order, as a directory does.
     directory_order: bool,
     inserted: RefCell<Vec<Vec<u8>>>,
@@ -818,6 +820,14 @@ impl FakeSpool {
     fn with_file_bytes(self, name: Vec<u8>, bytes: Vec<u8>) -> Self {
         self.inserted.borrow_mut().push(name.clone());
         self.files.borrow_mut().insert(name, bytes);
+        self
+    }
+
+    /// A spool whose published files are consumed at once, as when the gate
+    /// wins the race against the broker's revoke.
+    #[must_use]
+    pub fn with_consumed_on_publish(mut self) -> Self {
+        self.consumed_on_publish = true;
         self
     }
 
@@ -1048,7 +1058,10 @@ impl Spool for FakeSpool {
         }
         let owned = name.as_bytes().to_vec();
         self.inserted.borrow_mut().push(owned.clone());
-        files.insert(owned, bytes.to_vec());
+        files.insert(owned.clone(), bytes.to_vec());
+        if self.consumed_on_publish {
+            files.remove(&owned);
+        }
         Ok(())
     }
 

@@ -1211,10 +1211,24 @@ fn serve_queue_claim(
             store,
             id,
             &act,
-            crate::queue::SpoolPublication::Undelivered,
+            spool_publication_after(served),
         );
     }
     served
+}
+
+/// Whether the spool entry may already be live after `served`.
+///
+/// `publish` is the last step of a mint that can fail, so an answer that
+/// could not be written (`Undelivered`) comes AFTER the entry was published:
+/// a descendant of the claimant can find it by pid and consume it before the
+/// broker revokes it. Only a mint that failed earlier never published.
+fn spool_publication_after(served: Served) -> crate::queue::SpoolPublication {
+    if served == Served::Undelivered {
+        crate::queue::SpoolPublication::Published
+    } else {
+        crate::queue::SpoolPublication::Undelivered
+    }
 }
 
 fn load_queue_entry(store: &dyn Spool, id: &str) -> Result<crate::queue::QueueEntry, Refusal> {
@@ -12644,6 +12658,44 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let stored = &stored_queue(&host)[0];
         assert_eq!(stored.state, crate::queue::QueueState::Pending);
         assert_eq!(stored.run_nonce, None);
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_written_after_the_gate_consumed_the_entry_is_not_pending() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()))
+            .with_write_error(SysError::unsupported("peer gone"));
+        let spool = FakeSpool::new().with_consumed_on_publish();
+        let served = serve_queue_claim(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            &entry.id,
+        );
+        assert_eq!(served, Served::Undelivered);
+        let stored = &stored_queue(&host)[0];
+        assert_ne!(
+            stored.state,
+            crate::queue::QueueState::Pending,
+            "the gate consumed the entry: it must never run again"
+        );
+    }
+
+    #[test]
+    fn only_an_undelivered_answer_means_the_entry_was_published() {
+        assert_eq!(
+            spool_publication_after(Served::Undelivered),
+            crate::queue::SpoolPublication::Published
+        );
+        assert_eq!(
+            spool_publication_after(Served::Refused(Fault::Broker)),
+            crate::queue::SpoolPublication::Undelivered
+        );
     }
 
     fn with_audit<'a>(host: &'a Host, audit: &'a mut dyn AuditSink) -> Platform<'a> {
