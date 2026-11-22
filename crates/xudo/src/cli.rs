@@ -423,7 +423,11 @@ fn exec_command(
     };
     if let Some(id) = queued {
         let stdin = std::io::stdin();
-        let tty = std::io::IsTerminal::is_terminal(&stdin);
+        let stderr = std::io::stderr();
+        let tty = exec::queued_terminal(
+            std::io::IsTerminal::is_terminal(&stdin),
+            std::io::IsTerminal::is_terminal(&stderr),
+        );
         let mut input = stdin.lock();
         return queued_plan_exit(&exec::plan_queued(
             cli,
