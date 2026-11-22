@@ -498,6 +498,9 @@ fn handle_status_answer(
 /// # Errors
 ///
 /// The exit status to return when there is nothing to exec.
+///
+/// `tty` is true only when both stdin and stderr are terminals. The confirm
+/// word is read from stdin and the prompt is written to stderr.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_queued(
     cli: &Cli,
@@ -557,7 +560,8 @@ pub fn plan_queued_live(
         return Err(ExitCode::Unusable);
     }
     let stdin = std::io::stdin();
-    let tty = stdin.is_terminal();
+    let stderr = std::io::stderr();
+    let tty = queued_terminal(stdin.is_terminal(), stderr.is_terminal());
     let mut input = stdin.lock();
     plan_queued(
         cli,
@@ -572,14 +576,17 @@ pub fn plan_queued_live(
     )
 }
 
-/// Completes the claim from the gate's audit record, or releases it.
+/// Completes the claim from the gate's audit record, or asks the broker to
+/// release it.
 ///
 /// A child that started may have been allowed by the gate before it exec'd,
 /// even when the command's own status is non-zero, so completion is tried
-/// first. Anything except [`Answer::Done`] from that completion releases the
-/// claim back to pending (a denied password, a missing gate record). A child
-/// that never started is only released. A storage failure on the broker leaves
-/// the claim until the queue TTL; this returns [`QueuedFinish::Stuck`].
+/// first. Anything except [`Answer::Done`] from that completion sends a
+/// release. The broker keeps the entry terminal when a gate record binds, or
+/// when the spool file was already consumed, instead of returning it to
+/// pending. A child that never started is only released. A storage failure on
+/// the broker leaves the claim until the queue TTL; this returns
+/// [`QueuedFinish::Stuck`].
 pub fn finish_queued(
     id: &str,
     child_started: bool,
@@ -624,6 +631,16 @@ pub fn finish_queued_live(
         TIMEOUT,
         err,
     )
+}
+
+/// Both streams must be terminals.
+///
+/// The flags are arguments so each one is evaluated. A short-circuit `&&`
+/// would skip the stderr check wherever stdin is not a terminal, and that
+/// line would be uncovered on CI.
+#[must_use]
+pub(crate) fn queued_terminal(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
 }
 
 fn queue_question(question: Question) -> BrokerRequest {
@@ -727,7 +744,7 @@ fn confirm_queued(
         .map(|arg| term_sanitize::display_str(arg, limits).text)
         .collect();
     let command = shown.join(" ");
-    let label = harness.unwrap_or("");
+    let label = term_sanitize::display_str(harness.unwrap_or(""), limits).text;
     let _ = writeln!(err, "xudo: queued {id} harness {label}");
     let _ = writeln!(err, "xudo: command: {command}");
     let _ = write!(err, "type {} and press enter: ", ido::picker::CONFIRM_WORD);
@@ -2940,6 +2957,39 @@ mod tests {
         assert_eq!(claim_secret(&empty), empty.nonce);
         empty.claim_token = Some(token.clone());
         assert_eq!(claim_secret(&empty), token);
+
+        let mut hostile = allow();
+        hostile.resolved_exe = Some("/usr/bin/true".to_owned());
+        hostile.resolved_argv = vec!["ok".to_owned()];
+        let mut input = std::io::Cursor::new(b"run\n");
+        let mut err = Vec::new();
+        let label = "co\u{202e}dex\u{1b}[31m";
+        assert!(confirm_queued(
+            &queued_id(),
+            &hostile,
+            Some(label),
+            &mut input,
+            &mut err
+        ));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("harness"), "{shown}");
+        assert!(!shown.contains('\u{202e}'), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(!confirm_queued(
+            &queued_id(),
+            &hostile,
+            None,
+            &mut std::io::Cursor::new(b"no\n"),
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn queued_terminal_requires_stdin_and_stderr() {
+        assert!(queued_terminal(true, true));
+        assert!(!queued_terminal(true, false));
+        assert!(!queued_terminal(false, true));
+        assert!(!queued_terminal(false, false));
     }
 
     #[test]

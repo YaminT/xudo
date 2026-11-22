@@ -419,7 +419,10 @@ fn prune_and_publish<S: Spool + ?Sized>(
                     this_uid = this_uid.saturating_add(usize::from(same_uid));
                 }
             }
-            Existing::Stale => spool.remove(&name).map_err(MintError::Spool)?,
+            Existing::Stale => {
+                // Already gone is success: a stale grant may have been consumed.
+                let _removed = spool.remove(&name).map_err(MintError::Spool)?;
+            }
             Existing::ConfirmationThrottled => return Err(MintError::ConfirmationThrottled),
             Existing::Foreign => {}
         }
