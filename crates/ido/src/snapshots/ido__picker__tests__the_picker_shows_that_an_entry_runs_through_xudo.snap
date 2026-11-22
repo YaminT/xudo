@@ -2,7 +2,7 @@
 source: crates/ido/src/picker.rs
 expression: "p.frame(120, 24)"
 ---
-ido — 2 queued
+ido — 2 queued · written by the agent, editable by it
 
 ▸ [ ] #1 ready   systemctl restart nginx
       needs root: runs through `xudo exec` (policy, deny-list, audit; asks your password) · queued just now

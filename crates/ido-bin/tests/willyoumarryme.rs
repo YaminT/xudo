@@ -109,7 +109,8 @@ impl TempHome {
 
     fn read_queue(&self) -> Vec<serde_json::Value> {
         let listed = self.run_ok(&["list", "--json"]);
-        serde_json::from_slice::<Vec<serde_json::Value>>(&listed.stdout).unwrap()
+        let parsed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        parsed["user"].as_array().unwrap().clone()
     }
 
     fn read_log(&self) -> Vec<xudo_audit::Record> {

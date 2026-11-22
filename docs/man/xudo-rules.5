@@ -148,11 +148,13 @@ uses the normal policy path; this is the default. The
 outcome submits the request to the broker's root-held queue and denies the
 current request. For this outcome, the action must list the caller's verified
 harness label; an empty or different list does not queue it. A human-path
-denial is never queued. A command with no matching rule is denied. Queue
-execution through the password-authenticated
-gate and the
+denial is never queued. A command with no matching rule is denied. A human
+reviewer runs the queued entry with
+.B xudo exec \-\-queued
+through the password-authenticated gate, and
 .B ido
-display are planned for a later step.
+lists it separately from the user-side queue. The passwordless gate is not
+installed.
 .SH TESTS
 A rule file may carry
 .B [[test]]

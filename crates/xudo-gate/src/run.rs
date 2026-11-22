@@ -108,6 +108,7 @@ use crate::decide::{
     exec_failure_record, refusal_record,
 };
 use crate::policy::{LoadedPolicy, PolicyError};
+use crate::queue_claim::{self, QUEUE_DIR, QueueClaim};
 use crate::request::{
     BoottimeMillis, CallerPin, PendingRequest, RequestError, SPOOL_DIR, is_nonce,
 };
@@ -196,6 +197,16 @@ pub trait GateHost {
     /// [`SpoolError`] when it fails the walk or is not a private root-owned
     /// directory.
     fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError>;
+    /// Opens the root-owned queue through the trust walk.
+    ///
+    /// The gate reads one record and does not write. An open that fails the
+    /// walk is a spool failure, distinct from a record that is not claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`SpoolError`] when the directory fails the walk or is not a private
+    /// root-owned directory.
+    fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError>;
     /// Where programs are opened.
     fn programs(&self) -> &dyn Programs;
     /// The audit trail.
@@ -262,6 +273,10 @@ impl GateHost for SystemHost {
         SpoolDir::open(Path::new(SPOOL_DIR)).map(into_spool)
     }
 
+    fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError> {
+        SpoolDir::open_beneath(Path::new(QUEUE_DIR)).map(into_queue)
+    }
+
     fn programs(&self) -> &dyn Programs {
         &HostPrograms
     }
@@ -283,6 +298,20 @@ fn into_source<S: ProcSource + 'static>(source: S) -> Box<dyn ProcSource> {
 /// A spool as the trait object the host hands out. See [`into_source`].
 fn into_spool<S: Spool + 'static>(spool: S) -> Box<dyn RequestSpool> {
     Box::new(SpoolEntries(spool))
+}
+
+/// A queue directory as the read-only view the host hands out. See [`into_source`].
+fn into_queue<S: Spool + 'static>(spool: S) -> Box<dyn QueueClaim> {
+    Box::new(QueueDir(spool))
+}
+
+/// A queue directory seen only through [`QueueClaim`].
+struct QueueDir<S>(S);
+
+impl<S: Spool> QueueClaim for QueueDir<S> {
+    fn read(&self, name: &str) -> Result<Vec<u8>, SpoolError> {
+        self.0.read(name.as_bytes(), MAX_ENTRY_BYTES)
+    }
 }
 
 /// What the gate does to the spool, and nothing more: list it, read one entry,
@@ -506,6 +535,29 @@ fn annotate(record: Record, extra: &[String]) -> Record {
     record.with_evidence(evidence)
 }
 
+/// Refuses a queued run whose queue record is not claimed for this nonce.
+///
+/// An entry with no queue id is an ordinary human-path mint and is not looked
+/// up. Opening the queue directory is a spool failure. A missing, unreadable,
+/// or non-matching record is [`RequestError::QueueNotClaimed`]: the request
+/// must not fall through and run as a normal human-path command.
+fn require_queued_claim(host: &dyn GateHost, entry: &PendingRequest) -> Result<(), Refusal> {
+    let Some(id) = entry.queue_id.as_deref() else {
+        return Ok(());
+    };
+    let queue = stage(Stage::Spool, host.open_queue())?;
+    let name = queue_claim::queue_file_name(id);
+    let held = match queue.read(&name) {
+        Ok(bytes) => queue_claim::queued_claim_holds(&bytes, &entry.nonce),
+        Err(_) => false,
+    };
+    if held {
+        Ok(())
+    } else {
+        Err(Refusal::Request(RequestError::QueueNotClaimed))
+    }
+}
+
 /// The steps, in order. `Err` is how the gate ends; there is no `Ok`, because
 /// a successful exec does not return.
 fn proceed(
@@ -577,8 +629,17 @@ fn proceed(
         settings,
         password_confirms: entry.password_confirms(),
     };
-    let approved = decide(&loaded.rules.rules, &caller, pending.as_ref(), context)?;
+    // A missing spool entry is refused here. `decide` refuses the same case,
+    // and after it succeeds the entry is always present, so a later check
+    // must not keep a branch that cannot run.
+    let Some(pending_entry) = pending else {
+        return Err(Refusal::NoPendingRequest {
+            pid: caller.pin.pid,
+        });
+    };
+    let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
     progress.evidence.push(entry.confirmation().to_owned());
+    require_queued_claim(host, &pending_entry)?;
 
     // Consumed before anything runs: the entry is used at most once, and a
     // second gate that read it too fails here, on the unlink, and runs nothing.
@@ -596,12 +657,10 @@ fn proceed(
         program.identity().1
     ));
 
-    let confirmed_by = pending.as_ref().and_then(|found| {
-        found
-            .confirmed_by
-            .as_ref()
-            .map(crate::request::WatcherPin::audit_text)
-    });
+    let confirmed_by = pending_entry
+        .confirmed_by
+        .as_ref()
+        .map(crate::request::WatcherPin::audit_text);
     let evidence = progress.evidence.clone();
     let build = |previous: Option<&Record>, approval: &Approved| {
         annotate(
@@ -1007,6 +1066,7 @@ args = [
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         }
     }
 
@@ -1042,6 +1102,16 @@ args = [
         /// Whether a second gate takes each entry the moment this one has read
         /// it, so that this one's own consume is the loser's.
         rival: bool,
+    }
+
+    struct SharedQueue {
+        spool: Rc<FakeSpool>,
+    }
+
+    impl QueueClaim for SharedQueue {
+        fn read(&self, name: &str) -> Result<Vec<u8>, SpoolError> {
+            self.spool.read(name.as_bytes(), MAX_ENTRY_BYTES)
+        }
     }
 
     impl RequestSpool for SharedSpool {
@@ -1083,6 +1153,8 @@ args = [
         proc: Result<MapSource, SysError>,
         policy: Result<LoadedPolicy, PolicyError>,
         spool: Result<Rc<FakeSpool>, SpoolError>,
+        /// The root-owned queue, separate from the request spool.
+        queue: Result<Rc<FakeSpool>, SpoolError>,
         rival: bool,
         programs: FakePrograms,
         audit: FakeAuditSink,
@@ -1230,6 +1302,7 @@ args = [
                     passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
                 }),
                 spool: Ok(Rc::clone(spool)),
+                queue: Ok(Rc::new(FakeSpool::new())),
                 rival: false,
                 programs: FakePrograms::serving(path, owner),
                 audit: FakeAuditSink::new(),
@@ -1295,6 +1368,11 @@ args = [
                 }) as Box<dyn RequestSpool>
             })
         }
+        fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError> {
+            self.queue
+                .clone()
+                .map(|spool| Box::new(SharedQueue { spool }) as Box<dyn QueueClaim>)
+        }
         fn programs(&self) -> &dyn Programs {
             &self.programs
         }
@@ -1333,6 +1411,68 @@ args = [
     }
 
     // ---- the happy path, and everything it must do in order --------------
+
+    #[test]
+    fn the_gate_refuses_a_queued_run_whose_entry_is_not_claimed() {
+        let id = "c".repeat(64);
+        let mut entry = ours();
+        entry.queue_id = Some(id.clone());
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+
+        host.queue = Ok(Rc::new(FakeSpool::new().with_file(
+            format!("{id}.json"),
+            format!(r#"{{"state":"pending","run_nonce":"{NONCE_A}"}}"#),
+        )));
+        host.audit = FakeAuditSink::new();
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+
+        host.queue = Ok(Rc::new(FakeSpool::new().with_file(
+            format!("{id}.json"),
+            format!(r#"{{"state":"claimed","run_nonce":"{NONCE_B}"}}"#),
+        )));
+        host.audit = FakeAuditSink::new();
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+
+        host.queue = Ok(Rc::new(
+            FakeSpool::new().with_file(format!("{id}.json"), b"no".to_vec()),
+        ));
+        host.audit = FakeAuditSink::new();
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+
+        host.queue = Err(SpoolError::NotADirectory {
+            at: "queue".to_owned(),
+        });
+        host.audit = FakeAuditSink::new();
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "gate_failed_spool");
+    }
+
+    #[test]
+    fn a_queued_run_whose_entry_is_claimed_for_this_nonce_reaches_exec() {
+        let id = "c".repeat(64);
+        let mut entry = ours();
+        entry.queue_id = Some(id.clone());
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.queue = Ok(Rc::new(FakeSpool::new().with_file(
+            format!("{id}.json"),
+            format!(r#"{{"state":"claimed","run_nonce":"{NONCE_A}","argv":[]}}"#),
+        )));
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 19);
+        assert!(
+            exit.message.contains("gate_failed_exec"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+    }
 
     #[test]
     fn an_approved_entry_is_consumed_recorded_and_then_executed_from_the_validated_descriptor() {
@@ -2645,6 +2785,7 @@ all = [{ any-arg = ["restart"] }]
         // never a panic: unreadable counts as frozen.
         let _ = host.user_frozen(u32::MAX);
         assert!(host.open_spool().is_err());
+        assert!(host.open_queue().is_err());
         assert!(
             host.programs()
                 .open(Path::new("/definitely/not/a/program"))
@@ -2676,6 +2817,9 @@ all = [{ any-arg = ["restart"] }]
         let spool = into_spool(FakeSpool::new().with_file("n", "x"));
         assert_eq!(spool.names().unwrap(), vec![b"n".to_vec()]);
         assert_eq!(spool.read("n").unwrap(), b"x");
+        let queue = into_queue(FakeSpool::new().with_file("n.json", "x"));
+        assert_eq!(queue.read("n.json").unwrap(), b"x");
+        assert!(queue.read("missing").is_err());
     }
 
     #[test]

@@ -68,7 +68,17 @@ pub struct Host {
     /// Absolute path of the `xudo` front-end that runs a root-marked entry.
     /// Never searched for on `PATH`; the binary passes [`XUDO_FRONT_END`].
     pub xudo_front_end: PathBuf,
+    /// Root-held entries the broker already filtered for this human.
+    pub root_entries: Vec<crate::root_queue::RootView>,
+    /// The broker could not be asked. That is not an empty root-held queue.
+    pub root_queue_unavailable: bool,
+    /// Sends a release to the broker. The binary installs this; tests that
+    /// never release leave it empty.
+    pub root_release: Option<RootRelease>,
 }
+
+/// Asks the broker to release one root-held entry.
+pub type RootRelease = fn(&str) -> Result<(), String>;
 
 /// Where the `xudo` front-end is installed.
 pub const XUDO_FRONT_END: &str = "/usr/bin/xudo";
@@ -218,6 +228,23 @@ struct DropArgs {
     /// Everything older than the retention window.
     #[arg(long)]
     stale: bool,
+}
+
+/// Whether this invocation shows the broker's root-held queue.
+///
+/// The picker (no subcommand) and `ido list` show it. `ido queue` is the
+/// agent's own command and does not, and neither do run, add, drop, log,
+/// config, or celebrate. A parse error does not show it either, so the binary
+/// must not ask the broker before it knows the command.
+#[must_use]
+pub fn command_shows_root_queue(args: &[OsString]) -> bool {
+    if invoked_as_celebration(args) {
+        return false;
+    }
+    let Ok(cli) = Cli::try_parse_from(args.iter().cloned()) else {
+        return false;
+    };
+    cli.command.is_none() || matches!(cli.command, Some(Command::List { .. }))
 }
 
 /// Runs `ido` with `args` (including the program name) and returns the exit
@@ -466,10 +493,25 @@ fn add(path: Option<&Path>, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoErro
 
 fn list(json: bool, host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
     let queue = store(host)?.load()?;
+    // The text list says this on stdout. JSON is always the object, so the
+    // same sentence goes to stderr and does not change that shape.
+    if json && host.root_entries.is_empty() && host.root_queue_unavailable {
+        let _ = writeln!(io.err, "ido: the root-held queue is unavailable");
+    }
     let text = if json {
-        render::json(&queue, host.now_unix)
+        render::json_with_root(
+            &queue,
+            host.now_unix,
+            &host.root_entries,
+            host.root_queue_unavailable,
+        )
     } else {
-        render::list(&queue, host.now_unix)
+        render::list_with_root(
+            &queue,
+            host.now_unix,
+            &host.root_entries,
+            host.root_queue_unavailable,
+        )
     };
     let _ = write!(io.out, "{text}");
     Ok(0)
@@ -524,14 +566,24 @@ fn picker_or_list(host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
     let mut message: Option<String> = None;
     loop {
         let queue = store.load()?;
-        if queue.is_empty() {
+        if queue.is_empty() && host.root_entries.is_empty() {
             if let Some(m) = message.take() {
                 let _ = writeln!(io.out, "ido: {m}");
             }
-            let _ = writeln!(io.out, "ido: nothing queued");
+            let _ = write!(
+                io.out,
+                "{}",
+                render::list_with_root(
+                    &queue,
+                    host.now_unix,
+                    &host.root_entries,
+                    host.root_queue_unavailable
+                )
+            );
             return Ok(0);
         }
-        let mut picker = Picker::new(queue, host.now_unix, color(host));
+        let mut picker =
+            Picker::new(queue, host.now_unix, color(host)).with_root(host.root_entries.clone());
         if let Some(m) = message.take() {
             picker = picker.with_message(m);
         }
@@ -547,7 +599,44 @@ fn picker_or_list(host: &Host, io: &mut Io<'_>) -> Result<i32, IdoError> {
                 message = Some(format!("dropped {}", ids_text(&ids)));
             }
             Action::Run(ids) => return run_selected(&store, &ids, host, &[], io),
+            Action::RunRoot(id) => return run_root_entry(host, &id, io),
+            Action::ReleaseRoot(id) => {
+                // The picker draws on the alternate screen, which restore
+                // discards. The result has to land on the normal stdout too.
+                let text = release_root(host, &id);
+                let _ = writeln!(io.out, "ido: {text}");
+                message = Some(text);
+            }
             Action::Quit | Action::Continue => return Ok(0),
+        }
+    }
+}
+
+fn release_root(host: &Host, id: &str) -> String {
+    match host.root_release {
+        Some(send) => match send(id) {
+            Ok(()) => format!("asked the broker to release {id}"),
+            Err(error) => format!("the broker refused the release: {error}"),
+        },
+        None => "the root-held queue cannot be released from here".to_owned(),
+    }
+}
+
+fn run_root_entry(host: &Host, id: &str, io: &mut Io<'_>) -> Result<i32, IdoError> {
+    let mut command = crate::root_queue::queued_exec_command(&host.xudo_front_end, id);
+    match command.status() {
+        Ok(status) => {
+            let code = crate::root_queue::child_exit(status);
+            let _ = writeln!(io.out, "ido: xudo exec --queued {id} exited {code}");
+            Ok(code)
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io.err,
+                "ido: cannot run {}: {error}",
+                host.xudo_front_end.display()
+            );
+            Err(IdoError::Refused(error.to_string()))
         }
     }
 }
@@ -789,7 +878,7 @@ mod tests {
 
     use std::io::Cursor;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
 
@@ -821,6 +910,9 @@ mod tests {
             lock_wait: Duration::from_millis(20),
             frame_delay: Duration::ZERO,
             xudo_front_end: PathBuf::from(XUDO_FRONT_END),
+            root_entries: Vec::new(),
+            root_queue_unavailable: false,
+            root_release: None,
         }
     }
 
@@ -992,7 +1084,9 @@ mod tests {
         );
         let json = ido(&h, &["list", "--json"]);
         let parsed: serde_json::Value = serde_json::from_str(&json.out).unwrap();
-        assert_eq!(parsed[0]["argv"][3], "rg");
+        assert_eq!(parsed["user"][0]["argv"][3], "rg");
+        assert_eq!(parsed["root_held"], serde_json::json!([]));
+        assert_eq!(parsed["root_queue_unavailable"], false);
 
         // Without a terminal, bare `ido` lists and runs nothing.
         let bare = ido(&h, &[]);
@@ -1552,6 +1646,185 @@ mod tests {
         assert!(ido(&nowhere, &["add"]).err.contains("no current directory"));
     }
 
+    std::thread_local! {
+        static RELEASED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // The installed callback returns `Result`, so this double does too.
+    #[allow(clippy::unnecessary_wraps)]
+    fn release_ok(id: &str) -> Result<(), String> {
+        RELEASED.with(|released| released.borrow_mut().push(id.to_owned()));
+        Ok(())
+    }
+
+    fn release_err(id: &str) -> Result<(), String> {
+        Err(format!("not a reviewer of {id}"))
+    }
+
+    fn one_script(input: &[u8]) -> Vec<Scripted> {
+        vec![Scripted {
+            inputs: vec![input.to_vec()],
+            fail_restore: false,
+        }]
+    }
+
+    fn release_then_quit() -> Vec<Scripted> {
+        vec![
+            Scripted {
+                inputs: vec![b"dy".to_vec()],
+                fail_restore: false,
+            },
+            Scripted {
+                inputs: vec![b"q".to_vec()],
+                fail_restore: false,
+            },
+        ]
+    }
+
+    fn root_view(id: &str, argv: &[&str], harness: &str) -> crate::root_queue::RootView {
+        crate::root_queue::RootView {
+            id: id.to_owned(),
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            harness: harness.to_owned(),
+            state: "pending".to_owned(),
+        }
+    }
+
+    #[test]
+    fn ido_lists_the_root_held_queue_separately_and_sanitized() {
+        let h = host("root-list");
+        ido(&h, &["queue", "--", "echo", "mine"]);
+        let id = "ab".repeat(32);
+        let mut listed = h.clone();
+        listed.root_entries = vec![root_view(
+            &id,
+            &["/usr/bin/apt-get", "upgrade", "$(rm)", "\u{1b}[31mhidden"],
+            "codex\u{1b}[2J",
+        )];
+        let text = ido(&listed, &["list"]);
+        assert!(
+            text.out.contains("written by the agent, editable by it"),
+            "{}",
+            text.out
+        );
+        assert!(text.out.contains("#1"), "{}", text.out);
+        assert!(
+            text.out
+                .contains("root-held queue (the agent cannot edit this)"),
+            "{}",
+            text.out
+        );
+        assert!(text.out.contains(&id), "{}", text.out);
+        assert!(text.out.contains("harness codex"), "{}", text.out);
+        assert!(text.out.contains("$(rm)"), "{}", text.out);
+        assert!(!text.out.contains('\u{1b}'), "{}", text.out);
+        let user = text.out.split("root-held queue").next().unwrap();
+        assert!(!user.contains(&id), "{user}");
+
+        let mut offline = listed.clone();
+        offline.root_entries.clear();
+        offline.root_queue_unavailable = true;
+        let missing = ido(&offline, &["list"]);
+        assert!(
+            missing.out.contains("root-held queue is unavailable"),
+            "{}",
+            missing.out
+        );
+        let json_off = ido(&offline, &["list", "--json"]);
+        assert!(
+            json_off.err.contains("the root-held queue is unavailable"),
+            "{}",
+            json_off.err
+        );
+        let parsed_off: serde_json::Value = serde_json::from_str(&json_off.out).unwrap();
+        assert!(parsed_off["user"].is_array(), "{}", json_off.out);
+        assert_eq!(parsed_off["root_held"], serde_json::json!([]));
+        assert_eq!(parsed_off["root_queue_unavailable"], true);
+        assert!(missing.out.contains("#1"), "{}", missing.out);
+        assert!(
+            !missing.out.contains("root-held queue (the agent"),
+            "{}",
+            missing.out
+        );
+
+        let json = ido(&listed, &["list", "--json"]);
+        let parsed: serde_json::Value = serde_json::from_str(&json.out).unwrap();
+        assert_eq!(parsed["user"][0]["argv"][0], "echo");
+        assert_eq!(parsed["root_held"][0]["id"], id);
+        assert!(json.out.is_ascii(), "{}", json.out);
+
+        let bare = ido(&listed, &[]);
+        assert!(bare.out.contains("root-held queue"), "{}", bare.out);
+        assert!(
+            bare.out.contains("written by the agent, editable by it"),
+            "{}",
+            bare.out
+        );
+    }
+
+    #[test]
+    fn a_root_held_entry_runs_and_releases_only_through_the_broker() {
+        let id = "cd".repeat(32);
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp/ido-root-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("xudo");
+        let record = dir.join("argv");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display(),
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut h = tty(host("root-run"));
+        h.xudo_front_end = script;
+        h.root_entries = vec![root_view(&id, &["/usr/bin/apt-get", "$(danger)"], "codex")];
+        h.root_release = Some(release_ok);
+        RELEASED.with(|released| released.borrow_mut().clear());
+        let ran = ido_with(&h, &[], "", one_script(b"\rrun\r"));
+        assert_eq!(ran.code, 0, "{}{}", ran.out, ran.err);
+        assert!(ran.out.contains("exited 0"), "{}", ran.out);
+        let logged = std::fs::read_to_string(&record).unwrap();
+        assert!(logged.starts_with("/\n"), "{logged}");
+        assert!(!logged.contains("apt-get"), "{logged}");
+        assert!(!logged.contains("danger"), "{logged}");
+
+        let mut refused = h.clone();
+        refused.xudo_front_end = PathBuf::from("/nonexistent/xudo");
+        refused.root_release = Some(release_err);
+        let failed = ido_with(&refused, &[], "", one_script(b"\rrun\r"));
+        assert_eq!(failed.code, 2, "{}", failed.err);
+        assert!(failed.err.contains("cannot run"), "{}", failed.err);
+
+        let mut plain = tty(host("root-release"));
+        plain.root_entries = vec![root_view(&id, &["/usr/bin/true"], "codex")];
+        plain.root_release = None;
+        let kept = ido_with(&plain, &[], "", release_then_quit());
+        assert_eq!(kept.code, 0, "{}", kept.err);
+        assert!(kept.out.contains("cannot be released"), "{}", kept.out);
+
+        let mut asked = plain.clone();
+        asked.root_release = Some(release_ok);
+        let released = ido_with(&asked, &[], "", release_then_quit());
+        assert!(
+            released.out.contains("asked the broker to release"),
+            "{}",
+            released.out
+        );
+        let seen = RELEASED.with(|released| released.borrow().clone());
+        assert_eq!(seen, vec![id.clone()]);
+
+        asked.root_release = Some(release_err);
+        let denied = ido_with(&asked, &[], "", release_then_quit());
+        assert!(denied.out.contains("not a reviewer"), "{}", denied.out);
+    }
+
     #[test]
     fn the_picker_runs_what_was_selected() {
         let h = tty(host("picker-run"));
@@ -1628,6 +1901,37 @@ mod tests {
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
         text.push_str("{\"tampered\":true}\n");
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn the_root_queue_is_fetched_only_for_the_commands_that_show_it() {
+        let shows = [
+            vec!["ido".into()],
+            vec!["ido".into(), "list".into()],
+            vec!["ido".into(), "list".into(), "--json".into()],
+        ];
+        for args in shows {
+            assert!(command_shows_root_queue(&args), "{args:?}");
+        }
+        let hides = [
+            vec![
+                "ido".into(),
+                "queue".into(),
+                "--".into(),
+                "/bin/true".into(),
+            ],
+            vec!["ido".into(), "add".into()],
+            vec!["ido".into(), "run".into(), "--all".into()],
+            vec!["ido".into(), "drop".into(), "--all".into()],
+            vec!["ido".into(), "log".into()],
+            vec!["ido".into(), "config".into(), "list".into()],
+            vec!["ido".into(), "celebrate".into()],
+            vec!["willyoumarryme".into()],
+            vec!["ido".into(), "--nope".into()],
+        ];
+        for args in hides {
+            assert!(!command_shows_root_queue(&args), "{args:?}");
+        }
     }
 
     #[test]

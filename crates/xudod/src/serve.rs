@@ -324,9 +324,6 @@ fn serve_request(
     identity: PeerIdentity,
     request: BrokerRequest,
 ) -> Served {
-    if matches!(request.question, xudo_wire::Question::QueueList) {
-        return serve_queue_list(conn, platform, &identity, &request);
-    }
     if !matches!(request.question, xudo_wire::Question::Run { .. }) {
         return serve_confirmation_question(conn, platform, spool, &identity, &request);
     }
@@ -404,6 +401,7 @@ fn serve_request(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn queue_ask_human(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
@@ -438,6 +436,15 @@ fn queue_ask_human(
                 );
             }
         };
+    if let Err(refusal) = audited_queue(platform.audit, queue) {
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        );
+    }
     let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
     let boot_id = entry.boot_id.clone();
     let pruned =
@@ -563,13 +570,16 @@ fn queue_entry_from_request(
     let mut command = Vec::with_capacity(argv.len().saturating_add(1));
     command.push(program.as_bytes().to_vec());
     command.extend(argv.iter().map(|arg| arg.as_bytes().to_vec()));
+    // The same canonical form the engine stores on the gate record. A trailing
+    // `--` that separates nothing is dropped here, so completion can match.
+    let command = crate::queue::canonical_command(&command);
     let queued_at = platform.clock.boottime_millis();
     let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
     crate::queue::QueueEntry::new(crate::queue::QueueEntry {
         id,
         argv: command,
         // Agent-supplied and display-only. A queued command is never started
-        // from this path; Q1c reads `/proc/<pid>/cwd` through the pidfd.
+        // from this path; the reviewer path uses the fixed directory `/`.
         cwd: cwd.clone(),
         harness: agent_id.clone(),
         uid: identity.uid,
@@ -579,6 +589,10 @@ fn queue_entry_from_request(
         expires_at: queued_at.saturating_add(ttl_ms),
         reason: None,
         state: crate::queue::QueueState::Pending,
+        run_nonce: None,
+        claimant_uid: None,
+        claim_token: None,
+        claimed_at: None,
         boot_id,
     })
     .map_err(|error| error.to_string())
@@ -602,14 +616,52 @@ fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
     })
 }
 
-fn serve_queue_list(
+fn audit_queue_listed(
+    audit: &mut dyn AuditSink,
+    peer_uid: u32,
+    after: &str,
+    count: usize,
+    next: Option<&str>,
+) -> bool {
+    audit
+        .append(&|previous| {
+            xudo_audit::record::Record::after(
+                previous,
+                xudo_audit::record::Decision::Denied,
+                Vec::new(),
+                "human",
+            )
+            .with_denial("queue_listed")
+            .with_evidence(vec![
+                format!("peer_uid={peer_uid}"),
+                format!("after={after}"),
+                format!("count={count}"),
+                format!("next={}", next.unwrap_or("")),
+            ])
+            .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+        })
+        .is_ok()
+}
+
+struct QueueReady<'a> {
+    store: &'a dyn Spool,
+    policy: LoadedPolicy,
+    class: crate::queue::PeerClass,
+    caller: CallerFacts,
+    now: u64,
+    ttl_ms: u64,
+    boot_id: String,
+    passwd: String,
+}
+
+fn prepare_queue<'a>(
     conn: &dyn Connection,
-    platform: &mut Platform<'_>,
+    platform: &mut Platform<'a>,
     identity: &PeerIdentity,
     request: &BrokerRequest,
-) -> Served {
+) -> Result<QueueReady<'a>, Served> {
     let Some(store) = platform.queue else {
-        return refuse(
+        return Err(refuse(
             conn,
             platform.audit,
             &Refusal::broker(
@@ -618,51 +670,154 @@ fn serve_queue_list(
             ),
             Some(identity),
             Some(request),
-        );
+        ));
     };
     let policy = match platform.policy.load() {
         Ok(policy) => policy,
         Err(error) => {
-            return refuse(
+            return Err(refuse(
                 conn,
                 platform.audit,
                 &Refusal::from(&error),
                 Some(identity),
                 Some(request),
-            );
+            ));
         }
     };
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
-    let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
-    let class = match caller.classification {
-        xudo_policy::Classification::Human => crate::queue::PeerClass::Human,
-        xudo_policy::Classification::EnrolledAgent { .. } => crate::queue::PeerClass::EnrolledAgent,
-        xudo_policy::Classification::Unattested { .. } => crate::queue::PeerClass::Unattested,
-    };
+    let passwd = std::str::from_utf8(&policy.passwd)
+        .unwrap_or_default()
+        .to_owned();
+    let caller = classify_with_registry(identity, &policy.rules.harnesses, &passwd);
+    let class = peer_class(&caller);
     let now = platform.clock.boottime_millis();
     let ttl_ms = crate::queue::effective_ttl(Some(policy.queue_ttl_secs)).saturating_mul(1000);
     let Ok(boot_id) = boot_id_for_queue(platform.syscalls.boot_id()) else {
-        return refuse(
+        return Err(refuse(
             conn,
             platform.audit,
             &Refusal::broker(RefusalCode::BrokerUnusable, "boot id is unavailable"),
             Some(identity),
             Some(request),
-        );
+        ));
     };
-    let pruned = match crate::queue::prune(store, now, ttl_ms, &boot_id) {
-        Ok(ids) => ids,
-        Err(error) => {
-            return refuse(
-                conn,
-                platform.audit,
-                &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
-                Some(identity),
-                Some(request),
-            );
+    Ok(QueueReady {
+        store,
+        policy,
+        class,
+        caller,
+        now,
+        ttl_ms,
+        boot_id,
+        passwd,
+    })
+}
+
+fn peer_class(caller: &CallerFacts) -> crate::queue::PeerClass {
+    match &caller.classification {
+        xudo_policy::Classification::Human => crate::queue::PeerClass::Human,
+        xudo_policy::Classification::EnrolledAgent { .. } => crate::queue::PeerClass::EnrolledAgent,
+        xudo_policy::Classification::Unattested { .. } => crate::queue::PeerClass::Unattested,
+    }
+}
+
+fn queue_store_refusal(error: &crate::queue::StoreError) -> Refusal {
+    match error {
+        crate::queue::StoreError::NotPending => {
+            Refusal::client(RefusalCode::RequestUnknown, error.to_string())
         }
+        crate::queue::StoreError::MissingGateAudit | crate::queue::StoreError::NotClaimant => {
+            Refusal::client(RefusalCode::AnswerRejected, error.to_string())
+        }
+        other => Refusal::broker(RefusalCode::BrokerUnusable, other.to_string()),
+    }
+}
+
+fn queue_transition_code(state: crate::queue::QueueState) -> &'static str {
+    match state {
+        crate::queue::QueueState::Done => "queue_completed",
+        crate::queue::QueueState::Failed => "queue_failed",
+        crate::queue::QueueState::Pending => "queue_released",
+        crate::queue::QueueState::Unknown => "queue_outcome_unknown",
+        crate::queue::QueueState::Claimed => "queue_claimed",
+    }
+}
+
+/// Loads the queue and audits every file [`crate::queue::load_report`] skipped.
+///
+/// An empty skip list writes nothing. A failed append refuses the operation:
+/// the broker does not act on a store whose damage was not recorded. The
+/// queue lock is not held here.
+fn audited_queue(
+    audit: &mut dyn AuditSink,
+    store: &dyn Spool,
+) -> Result<Vec<crate::queue::QueueEntry>, Refusal> {
+    let loaded = crate::queue::load_report(store).map_err(|error| queue_store_refusal(&error))?;
+    if !crate::queue::audit_rejected(audit, &loaded.rejected) {
+        return Err(Refusal::broker(
+            RefusalCode::BrokerUnusable,
+            "queue rejection could not be recorded",
+        ));
+    }
+    Ok(loaded.entries)
+}
+
+fn audit_queue_transition(
+    audit: &mut dyn AuditSink,
+    id: &str,
+    state: crate::queue::QueueState,
+) -> bool {
+    let code = queue_transition_code(state);
+    audit
+        .append(&|previous| {
+            xudo_audit::record::Record::after(
+                previous,
+                xudo_audit::record::Decision::Denied,
+                Vec::new(),
+                "human",
+            )
+            .with_denial(code)
+            .with_evidence(vec![format!("queue_id={id}")])
+            .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+        })
+        .is_ok()
+}
+
+fn queue_claim_refusal(error: &crate::queue::ClaimError) -> Refusal {
+    match error {
+        crate::queue::ClaimError::NotReviewer => Refusal::client(
+            RefusalCode::ChannelUntrusted,
+            "only a human reviewer other than the owner can run a queued command",
+        ),
+        crate::queue::ClaimError::Store(error) => queue_store_refusal(error),
+    }
+}
+
+fn serve_queue_list(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+) -> Served {
+    let ready = match prepare_queue(conn, platform, identity, request) {
+        Ok(ready) => ready,
+        Err(served) => return served,
     };
-    if !audit_queue_pruned(platform.audit, &pruned) {
+    let planned =
+        match crate::queue::plan_prune(ready.store, ready.now, ready.ttl_ms, &ready.boot_id) {
+            Ok(ids) => ids,
+            Err(error) => {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &queue_store_refusal(&error),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+        };
+    // Audit the prune set before any name is removed. A failed audit leaves
+    // the store untouched.
+    if !audit_queue_pruned(platform.audit, &planned) {
         return refuse(
             conn,
             platform.audit,
@@ -671,13 +826,28 @@ fn serve_queue_list(
             Some(request),
         );
     }
-    let entries = match crate::queue::load_all(store) {
+    if let Err(error) = crate::queue::commit_prune(
+        ready.store,
+        &planned,
+        ready.now,
+        ready.ttl_ms,
+        &ready.boot_id,
+    ) {
+        return refuse(
+            conn,
+            platform.audit,
+            &queue_store_refusal(&error),
+            Some(identity),
+            Some(request),
+        );
+    }
+    let entries = match audited_queue(platform.audit, ready.store) {
         Ok(entries) => entries,
-        Err(error) => {
+        Err(refusal) => {
             return refuse(
                 conn,
                 platform.audit,
-                &Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()),
+                &refusal,
                 Some(identity),
                 Some(request),
             );
@@ -686,13 +856,33 @@ fn serve_queue_list(
     let visible = visible_queue_list(
         entries,
         identity.uid,
-        class,
-        &policy.rules.harnesses,
-        passwd,
+        ready.class,
+        &ready.policy.rules.harnesses,
+        &ready.passwd,
     );
+    let after = queue_list_after(&request.question);
+    let (page, next) = page_listed(visible, after);
+    if !audit_queue_listed(
+        platform.audit,
+        identity.uid,
+        after,
+        page.len(),
+        next.as_deref(),
+    ) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(RefusalCode::BrokerUnusable, "queue list audit failed"),
+            Some(identity),
+            Some(request),
+        );
+    }
     let response = BrokerResponse {
         schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
-        answer: xudo_wire::Answer::QueueListed { entries: visible },
+        answer: xudo_wire::Answer::QueueListed {
+            entries: page,
+            next,
+        },
     };
     answer(conn, &response, Served::Decided)
 }
@@ -708,7 +898,6 @@ fn visible_queue_list(
     entries
         .into_iter()
         .filter(|entry| crate::queue::visibility(entry, uid, class, registry, passwd).visible)
-        .take(xudo_wire::MAX_QUEUE_LIST)
         .map(queue_list_entry)
         .collect()
 }
@@ -726,12 +915,621 @@ fn queue_list_entry(entry: crate::queue::QueueEntry) -> xudo_wire::QueueListEntr
         queued_at: entry.queued_at,
         expires_at: entry.expires_at,
         reason: display.reason.map(|field| field.text),
-        state: match entry.state {
-            crate::queue::QueueState::Pending => "pending",
-            crate::queue::QueueState::Claimed => "claimed",
-            crate::queue::QueueState::Done => "done",
+        state: entry.state.as_str().to_owned(),
+    }
+}
+
+fn queue_list_after(question: &xudo_wire::Question) -> &str {
+    match question {
+        xudo_wire::Question::QueueListPage { after } => after.as_str(),
+        _ => "",
+    }
+}
+
+fn next_cursor(page: &[xudo_wire::QueueListEntry], more: bool) -> Option<String> {
+    if !more {
+        return None;
+    }
+    page.last().map(|entry| entry.id.clone())
+}
+
+fn page_listed(
+    mut entries: Vec<xudo_wire::QueueListEntry>,
+    after: &str,
+) -> (Vec<xudo_wire::QueueListEntry>, Option<String>) {
+    // The spool lists names in directory order. Paging by id only works on a
+    // sorted page, so sort here rather than trusting the caller.
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut rest = entries
+        .into_iter()
+        .skip_while(|entry| entry.id.as_str() <= after);
+    let mut page = Vec::new();
+    for entry in rest.by_ref().take(xudo_wire::MAX_QUEUE_LIST) {
+        page.push(entry);
+    }
+    let more = rest.next().is_some();
+    let next = next_cursor(&page, more);
+    (page, next)
+}
+
+fn command_utf8(argv: &[Vec<u8>]) -> Result<Vec<String>, ()> {
+    let mut owned = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match std::str::from_utf8(arg) {
+            Ok(text) => owned.push(text.to_owned()),
+            Err(_) => return Err(()),
         }
-        .to_owned(),
+    }
+    Ok(owned)
+}
+
+fn split_command(command: &[String]) -> Result<(String, Vec<String>), ()> {
+    let Some((program, rest)) = command.split_first() else {
+        return Err(());
+    };
+    Ok((program.clone(), rest.to_vec()))
+}
+
+/// The command a claim may mint.
+///
+/// A non-allow is returned unchanged so the caller can fail the claim with
+/// that decision. An allow whose stored argv is not UTF-8 cannot be placed on
+/// a wire `Run`, so it becomes [`xudo_policy::DenialCode::ArgvRejected`].
+fn queued_command(
+    decision: &xudo_policy::Decision,
+    argv: &[Vec<u8>],
+) -> Result<(String, Vec<String>), Box<xudo_policy::Decision>> {
+    if decision.verdict != xudo_policy::Verdict::Allow {
+        return Err(Box::new(decision.clone()));
+    }
+    let Ok(command) = command_utf8(argv) else {
+        return Err(Box::new(xudo_policy::Decision::deny(
+            xudo_policy::DenialCode::ArgvRejected,
+            Vec::new(),
+            Vec::new(),
+        )));
+    };
+    split_command(&command).map_err(|()| {
+        Box::new(xudo_policy::Decision::deny(
+            xudo_policy::DenialCode::ArgvRejected,
+            Vec::new(),
+            Vec::new(),
+        ))
+    })
+}
+
+/// The fresh human-path request for a claimed entry.
+///
+/// The working directory is the fixed `/`. The agent-supplied directory on
+/// the queue record is display-only and is not copied here.
+fn synthetic_queued_run(program: String, argv: Vec<String>) -> BrokerRequest {
+    BrokerRequest::new(program, argv, "human").with_cwd_bytes(b"/".to_vec())
+}
+
+fn reviewed_entry(
+    store: &dyn Spool,
+    id: &str,
+    uid: u32,
+    class: crate::queue::PeerClass,
+    registry: &xudo_policy::HarnessRegistry,
+    passwd: &str,
+) -> Result<crate::queue::QueueEntry, crate::queue::ClaimError> {
+    let entries = crate::queue::load_all(store).map_err(crate::queue::ClaimError::Store)?;
+    let Some(entry) = entries.into_iter().find(|entry| entry.id == id) else {
+        return Err(crate::queue::ClaimError::Store(
+            crate::queue::StoreError::NotPending,
+        ));
+    };
+    if crate::queue::visibility(&entry, uid, class, registry, passwd).reviewer {
+        Ok(entry)
+    } else {
+        Err(crate::queue::ClaimError::NotReviewer)
+    }
+}
+
+#[cfg(test)]
+fn binding_record<'a>(
+    entry: &crate::queue::QueueEntry,
+    records: &'a [Record],
+    audit_seq: u64,
+) -> Option<&'a Record> {
+    if audit_seq == 0 {
+        records
+            .iter()
+            .rev()
+            .find(|record| crate::queue::gate_record_binds(entry, record))
+    } else {
+        records.iter().find(|record| {
+            record.seq.get() == audit_seq && crate::queue::gate_record_binds(entry, record)
+        })
+    }
+}
+
+/// Claims one entry for a fresh human-path run.
+///
+/// The nonce is drawn before the claim and stored as the claim token, so one
+/// entropy read is both the secret a reviewer must present and the run nonce.
+/// A policy denial marks the claim failed. A broker failure after the claim
+/// releases it only when the audit trail has no gate record for it, and revokes
+/// any spool entry minted for the nonce. The synthetic run uses `/`, never the
+/// agent-supplied directory stored on the entry.
+#[allow(clippy::too_many_lines)]
+fn serve_queue_claim(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    id: &str,
+) -> Served {
+    let ready = match prepare_queue(conn, platform, identity, request) {
+        Ok(ready) => ready,
+        Err(served) => return served,
+    };
+    if let Err(refusal) = audited_queue(platform.audit, ready.store) {
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        );
+    }
+    let nonce = match draw_nonce(platform.entropy) {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::broker(
+                    RefusalCode::BrokerUnusable,
+                    format!("cannot draw a nonce: {error}"),
+                ),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let claimed = match crate::queue::claim_for_reviewer(
+        ready.store,
+        id,
+        &crate::queue::ReviewerClaim {
+            now: ready.now,
+            ttl: ready.ttl_ms,
+            boot_id: &ready.boot_id,
+            peer_uid: identity.uid,
+            peer_class: ready.class,
+            registry: &ready.policy.rules.harnesses,
+            passwd: &ready.passwd,
+            claim_token: &nonce,
+        },
+    ) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &queue_claim_refusal(&error),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let act = crate::queue::ClaimAct {
+        uid: identity.uid,
+        token: &nonce,
+        now: ready.now,
+    };
+    if !audit_queue_transition(platform.audit, id, crate::queue::QueueState::Claimed) {
+        let _ = release_claimed(
+            platform.audit,
+            spool,
+            ready.store,
+            id,
+            &act,
+            crate::queue::SpoolPublication::Undelivered,
+        );
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "queue claim could not be recorded",
+            ),
+            Some(identity),
+            Some(request),
+        );
+    }
+    let settings = ready.policy.settings;
+    let harness = claimed.harness.clone();
+    let decision = crate::queue::redecide_for_run(
+        &claimed,
+        &ready.policy.rules,
+        &ready.caller,
+        settings,
+        ready.now,
+        ready.ttl_ms,
+        &ready.boot_id,
+    );
+    let (program, argv) = match queued_command(&decision, &claimed.argv) {
+        Ok(parts) => parts,
+        Err(denial) => {
+            return fail_claimed(
+                conn,
+                platform,
+                spool,
+                ready.store,
+                id,
+                &act,
+                identity,
+                request,
+                *denial,
+            );
+        }
+    };
+    if let Err(error) = crate::queue::bind_run_nonce(ready.store, id, &nonce, &act) {
+        let _ = release_claimed(
+            platform.audit,
+            spool,
+            ready.store,
+            id,
+            &act,
+            crate::queue::SpoolPublication::Undelivered,
+        );
+        return refuse(
+            conn,
+            platform.audit,
+            &queue_store_refusal(&error),
+            Some(identity),
+            Some(request),
+        );
+    }
+    let synthetic = synthetic_queued_run(program, argv);
+    let store = ready.store;
+    let evaluated = Evaluated {
+        decision,
+        caller: ready.caller,
+        identity: identity.clone(),
+        request: synthetic,
+        policy: ready.policy,
+    };
+    let served = mint_with_nonce(
+        conn,
+        platform,
+        spool,
+        evaluated,
+        nonce.clone(),
+        Some(QueuedMint {
+            id,
+            harness: &harness,
+        }),
+    );
+    if served != Served::Minted {
+        let _ = release_claimed(
+            platform.audit,
+            spool,
+            store,
+            id,
+            &act,
+            spool_publication_after(served),
+        );
+    }
+    served
+}
+
+/// Whether the spool entry may already be live after `served`.
+///
+/// `publish` is the last step of a mint that can fail, so an answer that
+/// could not be written (`Undelivered`) comes AFTER the entry was published:
+/// a descendant of the claimant can find it by pid and consume it before the
+/// broker revokes it. Only a mint that failed earlier never published.
+fn spool_publication_after(served: Served) -> crate::queue::SpoolPublication {
+    if served == Served::Undelivered {
+        crate::queue::SpoolPublication::Published
+    } else {
+        crate::queue::SpoolPublication::Undelivered
+    }
+}
+
+fn load_queue_entry(store: &dyn Spool, id: &str) -> Result<crate::queue::QueueEntry, Refusal> {
+    let entries = crate::queue::load_all(store).map_err(|error| queue_store_refusal(&error))?;
+    entries
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| queue_store_refusal(&crate::queue::StoreError::NotPending))
+}
+
+/// The gate record that binds `entry`, if the bounded trail has one.
+///
+/// `audit_seq` of zero accepts any binding record. A snapshot that would
+/// refuse a long log is not used: the sink walks a bounded tail.
+fn gate_records(
+    audit: &dyn AuditSink,
+    entry: &crate::queue::QueueEntry,
+    audit_seq: u64,
+) -> Result<Vec<Record>, Refusal> {
+    let found = audit
+        .find_record(&mut |record| {
+            let seq_matches = audit_seq == 0 || record.seq.get() == audit_seq;
+            seq_matches && crate::queue::gate_record_binds(entry, record)
+        })
+        .map_err(|error| Refusal::broker(RefusalCode::BrokerUnusable, error.to_string()))?;
+    Ok(found.into_iter().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_claimed(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    store: &dyn Spool,
+    id: &str,
+    act: &crate::queue::ClaimAct<'_>,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    denial: xudo_policy::Decision,
+) -> Served {
+    if let Err(refusal) = audited_queue(platform.audit, store) {
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        );
+    }
+    let entry = match load_queue_entry(store, id) {
+        Ok(entry) => entry,
+        Err(refusal) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let records = match gate_records(platform.audit, &entry, 0) {
+        Ok(records) => records,
+        Err(refusal) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &refusal,
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    // The nonce is not bound yet: this denial is before mint. A missing spool
+    // file is not a gate consume.
+    let mut reread = crate::queue::empty_audit_reread;
+    let failed = match crate::queue::fail_claim(
+        store,
+        spool,
+        id,
+        act,
+        &records,
+        crate::queue::SpoolPublication::Undelivered,
+        &mut reread,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &queue_store_refusal(&error),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    if !audit_queue_transition(platform.audit, id, failed.state) {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::broker(
+                RefusalCode::BrokerUnusable,
+                "queue failure could not be recorded",
+            ),
+            Some(identity),
+            Some(request),
+        );
+    }
+    answer(
+        conn,
+        &BrokerResponse::decided(denial, None),
+        Served::Decided,
+    )
+}
+
+fn release_claimed(
+    audit: &mut dyn AuditSink,
+    requests: &dyn Spool,
+    store: &dyn Spool,
+    id: &str,
+    act: &crate::queue::ClaimAct<'_>,
+    publication: crate::queue::SpoolPublication,
+) -> Result<crate::queue::QueueEntry, Refusal> {
+    audited_queue(audit, store)?;
+    let current = load_queue_entry(store, id)?;
+    let records = gate_records(audit, &current, 0)?;
+    // The closure borrows the audit only for the reread. It ends before the
+    // transition below is appended. The reread runs after revoke, under the
+    // queue lock, and only when a published spool file was already gone.
+    let entry = {
+        let mut reread = |entry: &crate::queue::QueueEntry| {
+            gate_records(audit, entry, 0).map_err(|_| crate::queue::StoreError::AuditUnread)
+        };
+        crate::queue::release_claim(store, requests, id, act, &records, publication, &mut reread)
+            .map_err(|error| queue_store_refusal(&error))?
+    };
+    if !audit_queue_transition(audit, id, entry.state) {
+        return Err(Refusal::broker(
+            RefusalCode::BrokerUnusable,
+            "queue release could not be recorded",
+        ));
+    }
+    Ok(entry)
+}
+
+fn presented_token(request: &BrokerRequest) -> &str {
+    match &request.question {
+        xudo_wire::Question::QueueRelease { claim_token, .. }
+        | xudo_wire::Question::QueueComplete { claim_token, .. } => claim_token,
+        _ => "",
+    }
+}
+
+fn serve_queue_complete(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    id: &str,
+    audit_seq: u64,
+) -> Served {
+    let ready = match prepare_queue(conn, platform, identity, request) {
+        Ok(ready) => ready,
+        Err(served) => return served,
+    };
+    if let Err(refusal) = audited_queue(platform.audit, ready.store) {
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        );
+    }
+    let entry = match reviewed_entry(
+        ready.store,
+        id,
+        identity.uid,
+        ready.class,
+        &ready.policy.rules.harnesses,
+        &ready.passwd,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &queue_claim_refusal(&error),
+                Some(identity),
+                Some(request),
+            );
+        }
+    };
+    let records = match gate_records(platform.audit, &entry, audit_seq) {
+        Ok(records) => records,
+        Err(error) => {
+            return refuse(conn, platform.audit, &error, Some(identity), Some(request));
+        }
+    };
+    let Some(record) = records.first() else {
+        return refuse(
+            conn,
+            platform.audit,
+            &Refusal::client(
+                RefusalCode::AnswerRejected,
+                "queue completion requires the gate audit record for this entry",
+            ),
+            Some(identity),
+            Some(request),
+        );
+    };
+    let act = crate::queue::ClaimAct {
+        uid: identity.uid,
+        token: presented_token(request),
+        now: ready.now,
+    };
+    match crate::queue::complete_after_gate_audit(ready.store, spool, id, &act, record, audit_seq) {
+        Ok(done_entry) => {
+            if !audit_queue_transition(platform.audit, id, done_entry.state) {
+                return refuse(
+                    conn,
+                    platform.audit,
+                    &Refusal::broker(
+                        RefusalCode::BrokerUnusable,
+                        "queue completion could not be recorded",
+                    ),
+                    Some(identity),
+                    Some(request),
+                );
+            }
+            answer(conn, &done(), Served::Decided)
+        }
+        Err(error) => refuse(
+            conn,
+            platform.audit,
+            &queue_store_refusal(&error),
+            Some(identity),
+            Some(request),
+        ),
+    }
+}
+
+fn serve_queue_release(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    id: &str,
+) -> Served {
+    let ready = match prepare_queue(conn, platform, identity, request) {
+        Ok(ready) => ready,
+        Err(served) => return served,
+    };
+    if let Err(refusal) = audited_queue(platform.audit, ready.store) {
+        return refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        );
+    }
+    if let Err(error) = reviewed_entry(
+        ready.store,
+        id,
+        identity.uid,
+        ready.class,
+        &ready.policy.rules.harnesses,
+        &ready.passwd,
+    ) {
+        return refuse(
+            conn,
+            platform.audit,
+            &queue_claim_refusal(&error),
+            Some(identity),
+            Some(request),
+        );
+    }
+    let act = crate::queue::ClaimAct {
+        uid: identity.uid,
+        token: presented_token(request),
+        now: ready.now,
+    };
+    match release_claimed(
+        platform.audit,
+        spool,
+        ready.store,
+        id,
+        &act,
+        crate::queue::SpoolPublication::Published,
+    ) {
+        Ok(_) => answer(conn, &done(), Served::Decided),
+        Err(refusal) => refuse(
+            conn,
+            platform.audit,
+            &refusal,
+            Some(identity),
+            Some(request),
+        ),
     }
 }
 
@@ -1198,6 +1996,8 @@ fn answer_minted(
             platform.clock.boottime_millis(),
         ),
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+        claim_token: None,
+        harness: None,
     };
     answer(
         conn,
@@ -1763,8 +2563,17 @@ fn serve_confirmation_question(
         }
         xudo_wire::Question::Thaw => thaw(platform, identity, &classify(identity), request),
         xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
-        xudo_wire::Question::QueueList => {
+        xudo_wire::Question::QueueList | xudo_wire::Question::QueueListPage { .. } => {
             return serve_queue_list(conn, platform, identity, request);
+        }
+        xudo_wire::Question::QueueClaim { id } => {
+            return serve_queue_claim(conn, platform, spool, identity, request, id);
+        }
+        xudo_wire::Question::QueueComplete { id, audit_seq, .. } => {
+            return serve_queue_complete(conn, platform, spool, identity, request, id, *audit_seq);
+        }
+        xudo_wire::Question::QueueRelease { id, .. } => {
+            return serve_queue_release(conn, platform, spool, identity, request, id);
         }
     };
     match result {
@@ -2244,6 +3053,8 @@ fn status(
                         .0
                         .saturating_sub(platform.clock.boottime_millis()),
                     gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+                    claim_token: None,
+                    harness: None,
                 })
             } else {
                 None
@@ -2752,9 +3563,34 @@ fn mint(
             );
         }
     };
+    mint_with_nonce(conn, platform, spool, evaluated, nonce, None)
+}
+
+/// A queued claim's id and harness, carried onto the minted spool and the answer.
+#[derive(Clone, Copy)]
+struct QueuedMint<'a> {
+    id: &'a str,
+    harness: &'a str,
+}
+
+/// Mints `evaluated` under a nonce the caller already drew.
+///
+/// A queued claim binds this nonce on the queue record before calling here,
+/// so the gate record and the queue entry name the same run. `queue` is set
+/// only for that path; an ordinary human-path mint passes [`None`].
+fn mint_with_nonce(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    evaluated: Evaluated,
+    nonce: String,
+    queue: Option<QueuedMint<'_>>,
+) -> Served {
+    let queue_id = queue.map(|item| item.id);
+    let harness_label = queue.map(|item| item.harness);
     let now = platform.clock.boottime_millis();
     let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
-    let entry = match mint_entry(platform, &evaluated, deadline, nonce) {
+    let mut entry = match mint_entry(platform, &evaluated, deadline, nonce) {
         Ok(entry) => entry,
         Err(refusal) => {
             return refuse(
@@ -2766,6 +3602,9 @@ fn mint(
             );
         }
     };
+    if let Some(id) = queue_id {
+        entry.queue_id = Some(id.to_owned());
+    }
     let Evaluated {
         decision,
         caller,
@@ -2825,9 +3664,11 @@ fn mint(
     }
 
     let minted = Minted {
-        nonce,
+        nonce: nonce.clone(),
         expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
         gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+        claim_token: queue_id.map(|_| nonce.clone()),
+        harness: harness_label.map(str::to_owned),
     };
     let response = minted_response(&authorized.approval().0, decision, minted);
     answer(conn, &response, Served::Minted)
@@ -3027,6 +3868,10 @@ mod tests {
     }
 
     impl AuditSink for SecondAuditAppendFails {
+        fn snapshot(&self) -> Result<Vec<xudo_audit::record::Record>, xudo_sys::AuditError> {
+            self.inner.snapshot()
+        }
+
         fn append_checked(
             &mut self,
             build: &dyn Fn(Option<&xudo_audit::record::Record>) -> xudo_audit::record::Record,
@@ -4569,6 +5414,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             expires_at: NOW + 1000,
             reason: Some("review this".to_owned()),
             state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         };
         let store = FakeSpool::new().with_file(
             format!("{}.json", record.id).into_bytes(),
@@ -4584,7 +5433,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let response = serve_with(&mut host, &conn, Ok(&FakeSpool::new()));
         assert_eq!(response.served, Served::Decided);
         assert!(
-            matches!(response.answer, Answer::QueueListed { ref entries }
+            matches!(response.answer, Answer::QueueListed { ref entries, .. }
             if entries.len() == 1
                 && entries[0].id == NONCE
                 && entries[0].argv == ["/usr/bin/true"]
@@ -4601,7 +5450,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let conn = connection(Ok(request.to_json().into_bytes()));
         let response = serve_with(&mut other_host, &conn, Ok(&FakeSpool::new()));
         assert!(
-            matches!(response.answer, Answer::QueueListed { ref entries } if entries.is_empty()),
+            matches!(response.answer, Answer::QueueListed { ref entries, .. } if entries.is_empty()),
             "{:?}",
             response.answer
         );
@@ -4631,6 +5480,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             expires_at: NOW + 1000,
             reason: None,
             state,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         })
         .collect();
         let visible = visible_queue_list(
@@ -4717,6 +5570,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             expires_at: NOW.saturating_sub(1),
             reason: None,
             state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         };
         let mut host = with_test_boot(Host::honest());
         host.audit = FakeAuditSink::failing("audit unavailable");
@@ -4724,6 +5581,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             format!("{}.json", expired.id),
             serde_json::to_vec(&expired).unwrap(),
         );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(
+            host.queue
+                .files()
+                .contains_key(format!("{}.json", expired.id).as_bytes()),
+            "a failed prune audit must leave the entry in place"
+        );
+
+        let mut host = with_test_boot(Host::honest());
+        host.queue = FakeSpool::new()
+            .failing_names_on_call(3, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
             serve_queue_list(&conn, &mut host.platform(), &identity, &request),
@@ -4743,7 +5615,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(
             BrokerResponse::parse(&conn.written()).unwrap().answer,
             Answer::QueueListed {
-                entries: Vec::new()
+                entries: Vec::new(),
+                next: None,
             }
         );
     }
@@ -4918,6 +5791,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 expires_at: NOW + 60_000,
                 reason: None,
                 state: crate::queue::QueueState::Pending,
+                run_nonce: None,
+                claimant_uid: None,
+                claim_token: None,
+                claimed_at: None,
             };
             full = full.with_file(
                 format!("{}.json", record.id),
@@ -4939,6 +5816,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             Served::Refused(Fault::Broker)
         );
 
+        // One corrupt file is recorded and skipped. It does not refuse the
+        // rest of the queue, so this ask-human still lands.
         let (mut host, identity, _) = ask_human_fixture();
         host.queue = FakeSpool::new().with_file("bad.json", b"{}".to_vec());
         let conn = connection(Ok(request.to_json().into_bytes()));
@@ -4952,8 +5831,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &caller,
                 &policy,
             ),
-            Served::Refused(Fault::Broker)
+            Served::Decided
         );
+        assert_eq!(crate::queue::load_all(&host.queue).unwrap().len(), 1);
+        assert!(host.audit.records().iter().any(|record| {
+            record.denial.as_deref() == Some("queue_entry_rejected")
+                && record.evidence.iter().any(|line| line == "name=bad.json")
+                && record
+                    .evidence
+                    .iter()
+                    .any(|line| line == "reason=invalid_json")
+        }));
     }
 
     #[test]
@@ -4993,6 +5881,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             expires_at: NOW.saturating_sub(1),
             reason: None,
             state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         };
         let store = FakeSpool::new().with_file(
             format!("{}.json", stale.id),
@@ -5028,6 +5920,142 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let left = crate::queue::load_all(&store).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, stale.id);
+        assert_eq!(audit.snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_queue_refuses_admission_before_anything_is_written() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let store =
+            FakeSpool::new().failing_names(SpoolError::NotADirectory { at: "queue".into() });
+        let mut platform = host.platform();
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut platform,
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+    }
+
+    #[test]
+    fn a_queue_lock_failure_refuses_admission_as_unusable() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let store = FakeSpool::new().failing_lock(SpoolError::NotADirectory { at: "queue".into() });
+        let mut platform = host.platform();
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            queue_ask_human(
+                &conn,
+                &mut platform,
+                &identity,
+                &request,
+                &decision,
+                &caller,
+                &policy,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert!(crate::queue::load_all(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failing_a_claim_whose_entry_vanished_refuses() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let store = FakeSpool::new();
+        let act = crate::queue::ClaimAct {
+            uid: UID,
+            token: "t",
+            now: NOW,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            fail_claimed(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &store,
+                &"ab".repeat(32),
+                &act,
+                &identity,
+                &request,
+                Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
+            ),
+            Served::Refused(Fault::Client)
+        );
+    }
+
+    #[test]
+    fn queue_readers_refuse_an_unreadable_store() {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let store =
+            FakeSpool::new().failing_names(SpoolError::NotADirectory { at: "queue".into() });
+        let id = "ab".repeat(32);
+        assert!(load_queue_entry(&store, &id).is_err());
+        let registry = xudo_policy::HarnessRegistry::from_files([("codex.toml", HARNESS)]).unwrap();
+        assert!(
+            reviewed_entry(
+                &store,
+                &id,
+                UID,
+                crate::queue::PeerClass::Human,
+                &registry,
+                "alice:x:1000:1000::/home/alice:/bin/sh\n",
+            )
+            .is_err()
+        );
+        let act = crate::queue::ClaimAct {
+            uid: UID,
+            token: "t",
+            now: NOW,
+        };
+        let refusal = release_claimed(
+            &mut FakeAuditSink::new(),
+            &FakeSpool::new(),
+            &store,
+            &id,
+            &act,
+            crate::queue::SpoolPublication::Undelivered,
+        )
+        .unwrap_err();
+        assert!(!format!("{refusal:?}").is_empty());
+    }
+
+    #[test]
+    fn failing_a_claim_on_an_unreadable_queue_refuses() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let store =
+            FakeSpool::new().failing_names(SpoolError::NotADirectory { at: "queue".into() });
+        let act = crate::queue::ClaimAct {
+            uid: UID,
+            token: "t",
+            now: NOW,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            fail_claimed(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &store,
+                &"ab".repeat(32),
+                &act,
+                &identity,
+                &request,
+                Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
+            ),
+            Served::Refused(Fault::Broker)
+        );
     }
 
     #[test]
@@ -5215,6 +6243,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             expires_at: NOW + 60_000,
             reason: None,
             state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
         };
         host.queue = FakeSpool::new().with_file(
             format!("{}.json", owner_entry.id),
@@ -5253,6 +6285,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(
             BrokerResponse::parse(&conn.written()).unwrap().answer,
             Answer::QueueListed {
+                next: None,
                 entries: vec![xudo_wire::QueueListEntry {
                     id: "cd".repeat(32),
                     argv: vec!["/usr/bin/true".into()],
@@ -9333,7 +10366,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             self.inner.read(name, limit)
         }
 
-        fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
+        fn remove(&self, name: &[u8]) -> Result<bool, SpoolError> {
             self.inner.remove(name)
         }
 
@@ -9361,7 +10394,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(spool.names_up_to(1).unwrap(), vec![b"1.json".to_vec()]);
         assert_eq!(spool.names_up_to(MAX_CONFIRM_UIDS).unwrap().len(), 1);
         assert_eq!(spool.names_up_to(MAX_CONFIRM_UIDS).unwrap().len(), 1);
-        spool.remove(b"1.json").unwrap();
+        assert!(spool.remove(b"1.json").unwrap());
+        assert!(!spool.remove(b"1.json").unwrap());
         spool.publish("2.json", b"used").unwrap();
         spool.consume(b"2.json").unwrap();
         assert!(spool.files().is_empty());
@@ -10162,6 +11196,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 nonce: NONCE.to_owned(),
                 expires_in_ms: REQUEST_TTL_MILLIS,
                 gate: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+                claim_token: None,
+                harness: None,
             })
         );
 
@@ -10651,6 +11687,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            queue_id: None,
         }
     }
 
@@ -11354,5 +12391,1847 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 }
             }
         }
+    }
+
+    fn human_reviewer() -> (Host, PeerIdentity) {
+        let (mut host, mut identity, _) = ask_human_fixture();
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        let mut loaded = host.policy.load().unwrap();
+        loaded.passwd = b"alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_vec();
+        host.policy.answer = Ok(loaded);
+        (host, identity)
+    }
+
+    fn review_entry(host: &Host, uid: u32, id: &str) -> crate::queue::QueueEntry {
+        crate::queue::QueueEntry {
+            id: id.to_owned(),
+            argv: vec![b"/usr/bin/apt-get".to_vec(), b"upgrade".to_vec()],
+            cwd: b"/home/agent/evil".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid,
+            rule_id: "xudo.queue.review".to_owned(),
+            generation: host.policy.load().unwrap().rules.generation.id(),
+            queued_at: NOW,
+            expires_at: NOW + 60_000,
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        }
+    }
+
+    fn plant_queue(host: &mut Host, entry: &crate::queue::QueueEntry) {
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", entry.id),
+            serde_json::to_vec(entry).unwrap(),
+        );
+    }
+
+    fn stored_queue(host: &Host) -> Vec<crate::queue::QueueEntry> {
+        crate::queue::load_all(&host.queue).unwrap()
+    }
+
+    fn claim_request(id: &str) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueClaim { id: id.to_owned() },
+        }
+    }
+
+    fn release_request(id: &str) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueRelease {
+                id: id.to_owned(),
+                claim_token: String::new(),
+            },
+        }
+    }
+
+    fn complete_request(id: &str, audit_seq: u64) -> BrokerRequest {
+        complete_request_with(id, audit_seq, "")
+    }
+
+    fn complete_request_with(id: &str, audit_seq: u64, claim_token: &str) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueComplete {
+                id: id.to_owned(),
+                audit_seq,
+                claim_token: claim_token.to_owned(),
+            },
+        }
+    }
+
+    /// Both arms: a run question yields its cwd bytes, anything else does not.
+    fn run_cwd(question: &xudo_wire::Question) -> Option<&[u8]> {
+        match question {
+            xudo_wire::Question::Run { cwd, .. } => Some(cwd.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn denial_of(answer: &Answer) -> Option<DenialCode> {
+        match answer {
+            Answer::Decided { decision, .. } => decision.denial,
+            _ => None,
+        }
+    }
+
+    fn gate_of(answer: &Answer) -> Option<&str> {
+        match answer {
+            Answer::Decided {
+                minted: Some(minted),
+                ..
+            } => Some(minted.gate.as_str()),
+            _ => None,
+        }
+    }
+
+    fn nonce_of(answer: &Answer) -> Option<&str> {
+        match answer {
+            Answer::Decided {
+                minted: Some(minted),
+                ..
+            } => Some(minted.nonce.as_str()),
+            _ => None,
+        }
+    }
+
+    fn listed(answer: &Answer) -> Option<(&[xudo_wire::QueueListEntry], Option<&str>)> {
+        match answer {
+            Answer::QueueListed { entries, next } => Some((entries, next.as_deref())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queued_command_keeps_a_denial_and_rejects_non_utf8_allows() {
+        let denied = Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new());
+        assert_eq!(
+            queued_command(&denied, &[b"/bin/true".to_vec()])
+                .unwrap_err()
+                .denial,
+            Some(DenialCode::AskHuman)
+        );
+        let mut allow = denied;
+        allow.verdict = Verdict::Allow;
+        allow.denial = None;
+        assert_eq!(
+            queued_command(&allow, &[b"/usr/bin/apt-get".to_vec(), b"upgrade".to_vec()]).unwrap(),
+            ("/usr/bin/apt-get".to_owned(), vec!["upgrade".to_owned()])
+        );
+        assert_eq!(
+            queued_command(&allow, &[vec![0xff]]).unwrap_err().denial,
+            Some(DenialCode::ArgvRejected)
+        );
+        assert_eq!(
+            queued_command(&allow, &[]).unwrap_err().denial,
+            Some(DenialCode::ArgvRejected)
+        );
+        assert_eq!(
+            command_utf8(&[b"ok".to_vec()]).unwrap(),
+            vec!["ok".to_owned()]
+        );
+        assert_eq!(command_utf8(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(command_utf8(&[vec![0xff]]).unwrap_err(), ());
+        let request = synthetic_queued_run("/usr/bin/apt-get".into(), vec!["upgrade".into()]);
+        assert_eq!(run_cwd(&request.question), Some(b"/".as_slice()));
+        assert_eq!(run_cwd(&xudo_wire::Question::Watch), None);
+        assert!(denial_of(&Answer::Done).is_none());
+        assert!(gate_of(&Answer::Done).is_none());
+        assert!(nonce_of(&Answer::Done).is_none());
+        assert!(listed(&Answer::Done).is_none());
+        assert_eq!(queue_list_after(&xudo_wire::Question::Watch), "");
+        assert_eq!(
+            queue_list_after(&xudo_wire::Question::QueueListPage { after: "ab".into() }),
+            "ab"
+        );
+        assert_eq!(next_cursor(&[], true), None);
+        assert_eq!(next_cursor(&[], false), None);
+        let page = vec![xudo_wire::QueueListEntry {
+            id: "aa".repeat(32),
+            argv: vec!["/bin/true".into()],
+            cwd: "/".into(),
+            harness: "codex".into(),
+            uid: 1,
+            rule_id: "rule".into(),
+            generation: 1,
+            queued_at: 1,
+            expires_at: 2,
+            reason: None,
+            state: "pending".into(),
+        }];
+        assert_eq!(next_cursor(&page, false), None);
+        assert_eq!(
+            next_cursor(&page, true).as_deref(),
+            Some(page[0].id.as_str())
+        );
+        assert_eq!(
+            queue_store_refusal(&crate::queue::StoreError::NotPending).code,
+            RefusalCode::RequestUnknown
+        );
+        assert_eq!(
+            queue_store_refusal(&crate::queue::StoreError::MissingGateAudit).code,
+            RefusalCode::AnswerRejected
+        );
+        assert_eq!(
+            queue_store_refusal(&crate::queue::StoreError::NotClaimant).code,
+            RefusalCode::AnswerRejected
+        );
+        assert_eq!(split_command(&[]).unwrap_err(), ());
+        let command = vec!["/bin/true".into(), "a".into()];
+        assert_eq!(
+            split_command(&command).unwrap(),
+            ("/bin/true".into(), vec!["a".into()])
+        );
+        assert_eq!(
+            queue_transition_code(crate::queue::QueueState::Done),
+            "queue_completed"
+        );
+        assert_eq!(
+            queue_transition_code(crate::queue::QueueState::Failed),
+            "queue_failed"
+        );
+        assert_eq!(
+            queue_transition_code(crate::queue::QueueState::Pending),
+            "queue_released"
+        );
+        assert_eq!(
+            queue_transition_code(crate::queue::QueueState::Claimed),
+            "queue_claimed"
+        );
+        assert_eq!(
+            queue_transition_code(crate::queue::QueueState::Unknown),
+            "queue_outcome_unknown"
+        );
+        assert_eq!(
+            presented_token(&xudo_wire::BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: xudo_wire::Question::QueueList,
+            }),
+            ""
+        );
+        assert_eq!(presented_token(&complete_request_with("ab", 0, "cd")), "cd");
+        assert_eq!(
+            presented_token(&BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question: xudo_wire::Question::QueueRelease {
+                    id: "ab".into(),
+                    claim_token: "ef".into(),
+                },
+            }),
+            "ef"
+        );
+        assert_eq!(
+            queue_store_refusal(&crate::queue::StoreError::InvalidEntry).code,
+            RefusalCode::BrokerUnusable
+        );
+        let (page, next) = page_listed(Vec::new(), "");
+        assert!(page.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn an_undelivered_mint_revokes_its_spool_entry() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()))
+            .with_write_error(SysError::unsupported("peer gone"));
+        let spool = FakeSpool::new();
+        let served = serve_queue_claim(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            &entry.id,
+        );
+        assert_eq!(served, Served::Undelivered);
+        assert!(spool.files().is_empty(), "the minted nonce must be revoked");
+        let stored = &stored_queue(&host)[0];
+        assert_eq!(stored.state, crate::queue::QueueState::Pending);
+        assert_eq!(stored.run_nonce, None);
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_written_after_the_gate_consumed_the_entry_is_not_pending() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()))
+            .with_write_error(SysError::unsupported("peer gone"));
+        let spool = FakeSpool::new().with_consumed_on_publish();
+        let served = serve_queue_claim(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            &identity,
+            &request,
+            &entry.id,
+        );
+        assert_eq!(served, Served::Undelivered);
+        let stored = &stored_queue(&host)[0];
+        assert_ne!(
+            stored.state,
+            crate::queue::QueueState::Pending,
+            "the gate consumed the entry: it must never run again"
+        );
+    }
+
+    #[test]
+    fn only_an_undelivered_answer_means_the_entry_was_published() {
+        assert_eq!(
+            spool_publication_after(Served::Undelivered),
+            crate::queue::SpoolPublication::Published
+        );
+        assert_eq!(
+            spool_publication_after(Served::Refused(Fault::Broker)),
+            crate::queue::SpoolPublication::Undelivered
+        );
+    }
+
+    fn with_audit<'a>(host: &'a Host, audit: &'a mut dyn AuditSink) -> Platform<'a> {
+        Platform {
+            hygiene: &host.hygiene,
+            syscalls: &host.syscalls,
+            cgroups: None,
+            peers: &host.peers,
+            clock: &host.clock,
+            entropy: &host.entropy,
+            policy: &host.policy,
+            audit,
+            confirmations: host.confirmations_available.then_some(&host.confirmations),
+            freeze_file: host.freeze_available.then_some(&host.freeze_file),
+            queue: Some(&host.queue),
+        }
+    }
+
+    fn denied_install(host: &Host, identity: &PeerIdentity, id: &str) -> crate::queue::QueueEntry {
+        let mut entry = review_entry(host, identity.uid + 1, id);
+        entry.argv = vec![b"/usr/bin/apt-get".to_vec(), b"install".to_vec()];
+        entry
+    }
+
+    #[test]
+    fn a_claim_whose_audit_cannot_be_written_is_released() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.audit = FakeAuditSink::failing("full");
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+            Some(RefusalCode::BrokerUnusable)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_denied_claim_refuses_when_the_failure_cannot_be_finished() {
+        let (mut host, identity) = human_reviewer();
+        let entry = denied_install(&host, &identity, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.queue = host.queue.failing_read_after_replace();
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        let raw = host.queue.files().into_values().next().unwrap();
+        let stored: crate::queue::QueueEntry = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(stored.state, crate::queue::QueueState::Claimed);
+
+        let (mut host, identity) = human_reviewer();
+        let entry = denied_install(&host, &identity, &"cd".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let mut sink = SnapshotFails {
+            inner: FakeAuditSink::new(),
+        };
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut with_audit(&host, &mut sink),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+
+        let (mut host, identity) = human_reviewer();
+        let entry = denied_install(&host, &identity, &"ef".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.queue = host.queue.failing_replace_on_call(
+            2,
+            SpoolError::Gone {
+                name: "fail".into(),
+            },
+        );
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+
+        let (mut host, identity) = human_reviewer();
+        let entry = denied_install(&host, &identity, &"11".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let mut sink = SecondAuditAppendFails {
+            inner: FakeAuditSink::new(),
+            calls: 0,
+        };
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut with_audit(&host, &mut sink),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+            Some(RefusalCode::BrokerUnusable)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Failed
+        );
+    }
+
+    #[test]
+    fn completion_refuses_when_the_done_transition_cannot_be_recorded() {
+        let (host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        let nonce = "cd".repeat(32);
+        entry.run_nonce = Some(nonce.clone());
+        entry.claimant_uid = Some(identity.uid);
+        entry.claim_token = Some(nonce.clone());
+        entry.claimed_at = Some(NOW);
+        let argv = vec!["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()];
+        let mut seed = FakeAuditSink::new();
+        let _ = seed
+            .append(&|previous| {
+                Record::after(previous, AuditDecision::Allowed, argv.clone(), "human")
+                    .with_evidence(vec![
+                        format!("nonce={nonce}"),
+                        "confirmation=password (sudo's own prompt, on the -auth name)".into(),
+                    ])
+                    .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .unwrap();
+        let mut sink = CompletionAuditFails {
+            records: seed.records().to_vec(),
+        };
+        let mut host = host;
+        plant_queue(&mut host, &entry);
+        let request = complete_request_with(&entry.id, 0, &nonce);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut with_audit(&host, &mut sink),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                0,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+            Some(RefusalCode::BrokerUnusable)
+        );
+        assert_eq!(stored_queue(&host)[0].state, crate::queue::QueueState::Done);
+    }
+
+    #[test]
+    fn an_agent_cannot_claim_its_own_entry() {
+        let (mut host, identity, _) = ask_human_fixture();
+        let entry = review_entry(&host, identity.uid, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let served = serve_queue_claim(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &request,
+            &entry.id,
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(refusal_of(&answer), Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+
+        let (mut owner_host, owner) = human_reviewer();
+        let agent_entry = review_entry(&owner_host, owner.uid, &"cd".repeat(32));
+        plant_queue(&mut owner_host, &agent_entry);
+        let request = claim_request(&agent_entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut owner_host.platform(),
+                &FakeSpool::new(),
+                &owner,
+                &request,
+                &agent_entry.id,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            stored_queue(&owner_host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+        let request = release_request(&agent_entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_release(
+                &conn,
+                &mut owner_host.platform(),
+                &FakeSpool::new(),
+                &owner,
+                &request,
+                &agent_entry.id
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            stored_queue(&owner_host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+    }
+
+    #[test]
+    fn a_queued_entry_is_re_decided_at_run_time() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.argv = vec![b"/usr/bin/apt-get".to_vec(), b"install".to_vec()];
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Decided
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert!(gate_of(&answer).is_none());
+        assert_ne!(denial_of(&answer), Some(DenialCode::AskHuman));
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Failed
+        );
+        assert!(stored_queue(&host)[0].run_nonce.is_none());
+    }
+
+    #[test]
+    fn a_rules_change_after_queueing_denies_the_run() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.generation = entry.generation.wrapping_add(1);
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Decided
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert!(gate_of(&answer).is_none());
+        assert_eq!(denial_of(&answer), Some(DenialCode::AskHuman));
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Failed
+        );
+    }
+
+    #[test]
+    fn a_queued_run_never_uses_the_agent_cwd() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        assert_eq!(entry.cwd, b"/home/agent/evil");
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let confirm = FakeSpool::new();
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &confirm,
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Minted
+        );
+        assert_eq!(stored_queue(&host)[0].cwd, b"/home/agent/evil");
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        let pending: PendingRequest =
+            serde_json::from_slice(confirm.files().values().next().unwrap()).unwrap();
+        assert_eq!(pending.program, "/usr/bin/apt-get");
+        assert_eq!(pending.argv, vec!["upgrade".to_owned()]);
+        assert_eq!(
+            stored_queue(&host)[0].run_nonce.as_deref(),
+            nonce_of(&answer)
+        );
+    }
+
+    #[test]
+    fn releasing_a_claim_refuses_when_the_entry_or_the_trail_cannot_be_read() {
+        let (mut host, identity) = human_reviewer();
+        let act = crate::queue::ClaimAct {
+            uid: identity.uid,
+            token: "token",
+            now: NOW,
+        };
+        let missing = release_claimed(
+            &mut host.audit,
+            &FakeSpool::new(),
+            &host.queue,
+            &"aa".repeat(32),
+            &act,
+            crate::queue::SpoolPublication::Published,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing:?}").contains("not pending and live"),
+            "{missing:?}"
+        );
+
+        let entry = review_entry(&host, identity.uid, &"bb".repeat(32));
+        plant_queue(&mut host, &entry);
+        let mut sink = SnapshotFails {
+            inner: FakeAuditSink::new(),
+        };
+        let unread = release_claimed(
+            &mut sink,
+            &FakeSpool::new(),
+            &host.queue,
+            &entry.id,
+            &act,
+            crate::queue::SpoolPublication::Published,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unread:?}").contains("snapshot refused"),
+            "{unread:?}"
+        );
+    }
+
+    fn password_authorization(nonce: &str, argv: &[String]) -> Record {
+        let program = argv.first().cloned().unwrap_or_default();
+        let operands: Vec<String> = argv.iter().skip(1).cloned().collect();
+        let approved = xudo_gate::Approved {
+            program,
+            argv: operands.clone(),
+            exec_argv: operands.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+            environment: Vec::new(),
+            action: "xudo.queue.review".into(),
+            rule_source: "10-review.toml:1".into(),
+            requested_action: "xudo.queue.review".into(),
+            requested_rule_source: "10-review.toml:1".into(),
+            nonce: nonce.to_owned(),
+        };
+        let record = xudo_gate::authorization_record(
+            None,
+            &approved,
+            &xudo_gate::GateCaller::unidentified(1),
+            None,
+        );
+        let mut evidence = record.evidence.clone();
+        evidence.push("confirmation=password (sudo's own prompt, on the -auth name)".to_owned());
+        record.with_evidence(evidence)
+    }
+
+    /// The gate consumes the spool file during the broker's first audit read.
+    struct ConsumingAudit {
+        inner: FakeAuditSink,
+        spool: std::rc::Rc<FakeSpool>,
+        nonce: String,
+        record: Record,
+        finds: Cell<usize>,
+        fail_reread: bool,
+    }
+
+    impl AuditSink for ConsumingAudit {
+        fn append_checked(
+            &mut self,
+            build: &dyn Fn(Option<&Record>) -> Record,
+            check: &dyn Fn(&Record) -> Result<(), AuditError>,
+        ) -> Result<xudo_sys::AuditReceipt, AuditError> {
+            self.inner.append_checked(build, check)
+        }
+
+        fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+            self.inner.snapshot()
+        }
+
+        fn find_record(
+            &self,
+            accept: &mut dyn FnMut(&Record) -> bool,
+        ) -> Result<Option<Record>, AuditError> {
+            let nth = self.finds.get().saturating_add(1);
+            self.finds.set(nth);
+            if nth == 1 {
+                assert!(self.spool.take_entry(self.nonce.as_bytes()));
+                return Ok(None);
+            }
+            if self.fail_reread {
+                return Err(AuditError::Unavailable {
+                    reason: "reread refused".into(),
+                });
+            }
+            if accept(&self.record) {
+                Ok(Some(self.record.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn claimed_for_release(
+        host: &mut Host,
+        owner: u32,
+        claimant: u32,
+    ) -> (crate::queue::QueueEntry, String) {
+        let nonce = "cd".repeat(32);
+        let mut entry = review_entry(host, owner, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        entry.run_nonce = Some(nonce.clone());
+        entry.claimant_uid = Some(claimant);
+        entry.claim_token = Some(nonce.clone());
+        entry.claimed_at = Some(NOW);
+        plant_queue(host, &entry);
+        (entry, nonce)
+    }
+
+    #[test]
+    fn a_release_racing_a_gate_consume_never_returns_a_ran_entry_to_pending() {
+        let (mut host, identity) = human_reviewer();
+        let (entry, nonce) = claimed_for_release(&mut host, identity.uid + 1, identity.uid);
+        let requests = std::rc::Rc::new(FakeSpool::new());
+        requests.publish(&nonce, b"grant").unwrap();
+        let record = password_authorization(
+            &nonce,
+            &["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()],
+        );
+        let mut sink = ConsumingAudit {
+            inner: FakeAuditSink::new(),
+            spool: std::rc::Rc::clone(&requests),
+            nonce: nonce.clone(),
+            record: record.clone(),
+            finds: Cell::new(0),
+            fail_reread: false,
+        };
+        let act = crate::queue::ClaimAct {
+            uid: identity.uid,
+            token: &nonce,
+            now: NOW,
+        };
+        let released = release_claimed(
+            &mut sink,
+            requests.as_ref(),
+            &host.queue,
+            &entry.id,
+            &act,
+            crate::queue::SpoolPublication::Published,
+        )
+        .unwrap();
+        assert_eq!(released.state, crate::queue::QueueState::Done);
+        assert_ne!(released.state, crate::queue::QueueState::Pending);
+        assert!(!released.is_live(NOW, 60_000, TEST_BOOT));
+        assert_eq!(stored_queue(&host)[0].state, crate::queue::QueueState::Done);
+        assert!(!requests.files().contains_key(nonce.as_bytes()));
+        assert!(
+            sink.snapshot()
+                .unwrap()
+                .iter()
+                .any(|saved| { saved.denial.as_deref() == Some("queue_completed") })
+        );
+        assert_eq!(sink.find_record(&mut |_| false).unwrap(), None);
+        assert_eq!(
+            sink.find_record(&mut |saved| saved.argv == record.argv)
+                .unwrap()
+                .as_ref()
+                .map(|saved| saved.seq.get()),
+            Some(record.seq.get())
+        );
+        assert!(!requests.take_entry(nonce.as_bytes()));
+    }
+
+    #[test]
+    fn a_release_whose_reread_fails_leaves_the_claim() {
+        let (mut host, identity) = human_reviewer();
+        let (entry, nonce) = claimed_for_release(&mut host, identity.uid + 1, identity.uid);
+        let requests = std::rc::Rc::new(FakeSpool::new());
+        requests.publish(&nonce, b"grant").unwrap();
+        let record = password_authorization(
+            &nonce,
+            &["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()],
+        );
+        let mut sink = ConsumingAudit {
+            inner: FakeAuditSink::new(),
+            spool: std::rc::Rc::clone(&requests),
+            nonce: nonce.clone(),
+            record,
+            finds: Cell::new(0),
+            fail_reread: true,
+        };
+        let act = crate::queue::ClaimAct {
+            uid: identity.uid,
+            token: &nonce,
+            now: NOW,
+        };
+        let unread = release_claimed(
+            &mut sink,
+            requests.as_ref(),
+            &host.queue,
+            &entry.id,
+            &act,
+            crate::queue::SpoolPublication::Published,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unread:?}").contains("could not be reread"),
+            "{unread:?}"
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+        assert!(
+            sink.append(&|previous| {
+                Record::after(previous, AuditDecision::Denied, Vec::new(), "human")
+            })
+            .is_ok()
+        );
+        assert!(sink.snapshot().is_ok());
+    }
+
+    #[test]
+    fn a_trailing_double_dash_is_canonical_when_the_request_is_queued() {
+        let (mut host, identity, _) = ask_human_fixture();
+        let dashed = BrokerRequest::new(
+            "/usr/bin/apt-get",
+            vec!["upgrade".to_owned(), "--".to_owned()],
+            "untrusted hint",
+        )
+        .with_cwd_bytes(b"/srv".to_vec());
+        let conn = connection(Ok(dashed.to_json().into_bytes()));
+        assert_eq!(
+            serve_request(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                identity,
+                dashed,
+            ),
+            Served::Decided
+        );
+        let queued = crate::queue::load_all(&host.queue).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].argv,
+            [b"/usr/bin/apt-get".to_vec(), b"upgrade".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_bad_queue_file_is_audited_and_the_rest_still_lists() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.queue.publish("bad.json", b"not json").unwrap();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Decided
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        let (entries, _) = listed(&answer).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, entry.id);
+        let rejected: Vec<_> = host
+            .audit
+            .records()
+            .iter()
+            .filter(|record| record.denial.as_deref() == Some("queue_entry_rejected"))
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        assert!(
+            rejected[0]
+                .evidence
+                .iter()
+                .any(|line| line == "name=bad.json")
+        );
+        assert!(
+            rejected[0]
+                .evidence
+                .iter()
+                .any(|line| line == "reason=invalid_json")
+        );
+
+        let mut failing = FakeAuditSink::failing("full");
+        let broken = FakeSpool::new().with_file("bad.json", b"not json".to_vec());
+        let refusal = audited_queue(&mut failing, &broken).unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("could not be recorded"),
+            "{refusal:?}"
+        );
+        let unreadable = FakeSpool::new()
+            .failing_names(xudo_sys::SpoolError::NotADirectory { at: "queue".into() });
+        assert!(audited_queue(&mut FakeAuditSink::new(), &unreadable).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_claim_is_released_or_failed_when_the_run_is_denied() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.entropy = FakeEntropy::new().with(Err(SysError::unsupported("no entropy")));
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+        assert!(stored_queue(&host)[0].run_nonce.is_none());
+
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"cd".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.queue = host.queue.failing_replace_on_call(
+            2,
+            SpoolError::Gone {
+                name: "bind".into(),
+            },
+        );
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ef".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let confirm = FakeSpool::new().failing_publish(SpoolError::Gone {
+            name: "mint".into(),
+        });
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &confirm,
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+
+        let (mut host, identity) = human_reviewer();
+        let mut missing = review_entry(&host, identity.uid + 1, &"11".repeat(32));
+        missing.expires_at = NOW.saturating_sub(1);
+        plant_queue(&mut host, &missing);
+        let request = claim_request(&missing.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &missing.id,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+            Some(RefusalCode::RequestUnknown)
+        );
+        // A refused claim still draws its nonce. The next claim needs a fresh draw.
+        host.entropy = FakeEntropy::new().with(Ok(vec![0xab; 32]));
+        let mut previous = review_entry(&host, identity.uid + 1, &"22".repeat(32));
+        previous.boot_id = "11111111-2222-3333-4444-555555555555".into();
+        plant_queue(&mut host, &previous);
+        let request = claim_request(&previous.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            refusal_of(
+                &BrokerResponse::parse(&{
+                    let _ = serve_queue_claim(
+                        &conn,
+                        &mut host.platform(),
+                        &FakeSpool::new(),
+                        &identity,
+                        &request,
+                        &previous.id,
+                    );
+                    conn.written()
+                })
+                .unwrap()
+                .answer
+            ),
+            Some(RefusalCode::RequestUnknown)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completion_requires_the_gates_audit_record_for_that_entry() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+            ),
+            Served::Minted
+        );
+        let nonce = stored_queue(&host)[0].run_nonce.clone().unwrap();
+        let request = complete_request(&entry.id, 0);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                0,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer),
+            Some(RefusalCode::AnswerRejected)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+
+        let argv = vec!["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()];
+        let nonce_line = format!("nonce={nonce}");
+        let _ = host
+            .audit
+            .append(&|previous| {
+                Record::after(previous, AuditDecision::Allowed, argv.clone(), "human")
+                    .with_evidence(vec![
+                        nonce_line.clone(),
+                        "confirmation=password (sudo's own prompt, on the -auth name)".into(),
+                    ])
+                    .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .unwrap();
+        let seq = host.audit.records().last().unwrap().seq.get();
+        let request = complete_request(&entry.id, 99);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                99,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+        let request = complete_request_with(&entry.id, seq, &nonce);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                seq,
+            ),
+            Served::Decided
+        );
+        assert_eq!(
+            BrokerResponse::parse(&conn.written()).unwrap().answer,
+            Answer::Done
+        );
+        assert_eq!(stored_queue(&host)[0].state, crate::queue::QueueState::Done);
+
+        let (mut host, agent, _) = ask_human_fixture();
+        let mut claimed = review_entry(&host, agent.uid + 1, &"cd".repeat(32));
+        claimed.state = crate::queue::QueueState::Claimed;
+        claimed.run_nonce = Some("ab".repeat(32));
+        plant_queue(&mut host, &claimed);
+        let request = complete_request(&claimed.id, 0);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &agent,
+                &request,
+                &claimed.id,
+                0,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+        let request = release_request(&claimed.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_release(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &agent,
+                &request,
+                &claimed.id
+            ),
+            Served::Refused(Fault::Client)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+    }
+
+    #[test]
+    fn a_reviewer_release_returns_a_claimed_entry_to_pending() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        entry.run_nonce = Some("cd".repeat(32));
+        entry.claimant_uid = Some(identity.uid);
+        entry.claim_token = Some("cd".repeat(32));
+        entry.claimed_at = Some(NOW);
+        plant_queue(&mut host, &entry);
+        // The grant is still on the spool: the reviewer is releasing before
+        // the gate consumes it, so the entry may return to pending.
+        let requests = FakeSpool::new();
+        let nonce = "cd".repeat(32);
+        requests.publish(&nonce, b"grant").unwrap();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueRelease {
+                id: entry.id.clone(),
+                claim_token: nonce.clone(),
+            },
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_release(
+                &conn,
+                &mut host.platform(),
+                &requests,
+                &identity,
+                &request,
+                &entry.id
+            ),
+            Served::Decided
+        );
+        assert!(!requests.files().contains_key(nonce.as_bytes()));
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Pending
+        );
+        assert!(stored_queue(&host)[0].run_nonce.is_none());
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            refusal_of(
+                &BrokerResponse::parse(&{
+                    let _ = serve_queue_release(
+                        &conn,
+                        &mut host.platform(),
+                        &FakeSpool::new(),
+                        &identity,
+                        &request,
+                        &entry.id,
+                    );
+                    conn.written()
+                })
+                .unwrap()
+                .answer
+            ),
+            Some(RefusalCode::RequestUnknown)
+        );
+    }
+
+    #[test]
+    fn queue_list_paging_shows_every_reviewable_entry() {
+        let (mut host, mut identity) = human_reviewer();
+        let claude = xudo_policy::HarnessFile {
+            name: b"claude.toml".to_vec(),
+            bytes: b"label = \"claude\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+        };
+        let mut loaded = host.policy.load().unwrap();
+        let rules = load_policy(
+            vec![RuleFile {
+                name: b"10-review.toml".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+            }],
+            &[
+                HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+                },
+                claude,
+            ],
+        )
+        .unwrap();
+        loaded.rules = rules;
+        host.policy.answer = Ok(loaded);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        let mut spool = FakeSpool::new();
+        for index in 1..=33 {
+            let mut entry = review_entry(&host, 2001, &format!("{index:064x}"));
+            if index == 33 {
+                entry.uid = 2002;
+                entry.harness = "claude".to_owned();
+            }
+            spool = spool.with_file(
+                format!("{}.json", entry.id),
+                serde_json::to_vec(&entry).unwrap(),
+            );
+        }
+        host.queue = spool;
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Decided
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        let (entries, next) = listed(&answer).unwrap();
+        assert_eq!(entries.len(), xudo_wire::MAX_QUEUE_LIST);
+        assert!(!entries.iter().any(|entry| entry.harness == "claude"));
+        let cursor = next.unwrap().to_owned();
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueListPage { after: cursor },
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Decided
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        let (entries, next) = listed(&answer).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].harness, "claude");
+        assert_eq!(entries[0].uid, 2002);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn queue_list_paging_shows_every_entry_over_an_unsorted_spool() {
+        let (mut host, mut identity) = human_reviewer();
+        let mut loaded = host.policy.load().unwrap();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-review.toml".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+            }],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+            }],
+        )
+        .unwrap();
+        host.policy.answer = Ok(loaded);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        let mut order: Vec<u64> = (1..=40).collect();
+        order.reverse();
+        let mut spool = FakeSpool::new();
+        for index in order {
+            let entry = review_entry(&host, 2001, &format!("{index:064x}"));
+            spool = spool.with_file(
+                format!("{}.json", entry.id),
+                serde_json::to_vec(&entry).unwrap(),
+            );
+        }
+        host.queue = spool.in_directory_order();
+        let mut seen = Vec::new();
+        let mut after = String::new();
+        for _ in 0..4 {
+            let request = if after.is_empty() {
+                BrokerRequest {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    question: xudo_wire::Question::QueueList,
+                }
+            } else {
+                BrokerRequest {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    question: xudo_wire::Question::QueueListPage {
+                        after: after.clone(),
+                    },
+                }
+            };
+            let conn = connection(Ok(request.to_json().into_bytes()));
+            assert_eq!(
+                serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+                Served::Decided
+            );
+            let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+            let (entries, next) = listed(&answer).unwrap();
+            assert!(!entries.is_empty());
+            assert!(entries.len() <= xudo_wire::MAX_QUEUE_LIST);
+            seen.extend(entries.iter().map(|entry| entry.id.clone()));
+            if let Some(cursor) = next {
+                after = cursor.to_owned();
+            } else {
+                after.clear();
+                break;
+            }
+        }
+        let mut expected: Vec<String> = (1..=40).map(|index| format!("{index:064x}")).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn queue_list_is_audited() {
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Decided
+        );
+        let listed = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_listed"))
+            .unwrap();
+        let evidence = listed.evidence.join(" ");
+        assert!(evidence.contains(&format!("peer_uid={}", identity.uid)));
+        assert!(evidence.contains("after="));
+        assert!(evidence.contains("count=1"));
+        assert!(evidence.contains("next="));
+
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"cd".repeat(32));
+        plant_queue(&mut host, &entry);
+        host.audit = FakeAuditSink::failing("audit unavailable");
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(stored_queue(&host).len(), 1);
+        assert!(
+            host.audit.records().is_empty(),
+            "a failed list audit writes nothing and still keeps the entry"
+        );
+    }
+
+    #[test]
+    fn queue_questions_are_dispatched_and_refuse_when_the_boot_id_is_unreadable() {
+        let (mut host, identity) = human_reviewer();
+        host.syscalls = FakeSyscalls::new();
+        let id = "ab".repeat(32);
+        for request in [
+            claim_request(&id),
+            release_request(&id),
+            complete_request(&id, 0),
+        ] {
+            let conn = connection(Ok(request.to_json().into_bytes()));
+            assert_eq!(
+                serve_confirmation_question(
+                    &conn,
+                    &mut host.platform(),
+                    &FakeSpool::new(),
+                    &identity,
+                    &request,
+                ),
+                Served::Refused(Fault::Broker)
+            );
+            assert!(
+                host.audit
+                    .records()
+                    .last()
+                    .unwrap()
+                    .evidence
+                    .join(" ")
+                    .contains("detail=boot id is unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_queue_entry_cannot_be_claimed_or_finished() {
+        let (mut host, identity) = human_reviewer();
+        let id = "ab".repeat(32);
+        let claim = claim_request(&id);
+        let conn = connection(Ok(claim.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &claim,
+                &id,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        let release = release_request(&id);
+        let conn = connection(Ok(release.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_release(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &release,
+                &id
+            ),
+            Served::Refused(Fault::Client)
+        );
+        let complete = complete_request(&id, 0);
+        let conn = connection(Ok(complete.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &complete,
+                &id,
+                0,
+            ),
+            Served::Refused(Fault::Client)
+        );
+        host.queue =
+            FakeSpool::new().failing_names(SpoolError::NotADirectory { at: "queue".into() });
+        let conn = connection(Ok(claim.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_claim(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &claim,
+                &id,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        let conn = connection(Ok(release.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_release(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &release,
+                &id
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        let conn = connection(Ok(complete.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &complete,
+                &id,
+                0
+            ),
+            Served::Refused(Fault::Broker)
+        );
+    }
+
+    #[test]
+    fn completion_refuses_when_the_binding_record_cannot_be_stored() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        let nonce = "cd".repeat(32);
+        entry.run_nonce = Some(nonce.clone());
+        entry.claimant_uid = Some(identity.uid);
+        entry.claim_token = Some(nonce.clone());
+        entry.claimed_at = Some(NOW);
+        let argv = vec!["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()];
+        let _ = host
+            .audit
+            .append(&|previous| {
+                Record::after(previous, AuditDecision::Allowed, argv.clone(), "human")
+                    .with_evidence(vec![
+                        format!("nonce={nonce}"),
+                        "confirmation=password (sudo's own prompt, on the -auth name)".into(),
+                    ])
+                    .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .unwrap();
+        host.queue = FakeSpool::new()
+            .with_file(
+                format!("{}.json", entry.id),
+                serde_json::to_vec(&entry).unwrap(),
+            )
+            .failing_replace(SpoolError::Gone {
+                name: "done".into(),
+            });
+        let request = complete_request_with(&entry.id, 0, &nonce);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                0,
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+    }
+
+    #[test]
+    fn binding_record_accepts_only_a_matching_gate_record() {
+        let (host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        entry.run_nonce = Some("cd".repeat(32));
+        let argv = vec!["/usr/bin/apt-get".into(), "upgrade".into()];
+        let binding = Record::after(None, AuditDecision::Allowed, argv, "human")
+            .with_evidence(vec![
+                format!("nonce={}", entry.run_nonce.as_deref().unwrap()),
+                "confirmation=password".into(),
+            ])
+            .with_outcome(xudo_audit::record::Outcome::NotExecuted);
+        assert!(binding_record(&entry, std::slice::from_ref(&binding), 0).is_some());
+        assert!(
+            binding_record(&entry, std::slice::from_ref(&binding), binding.seq.get()).is_some()
+        );
+        assert!(binding_record(&entry, std::slice::from_ref(&binding), 99).is_none());
+        let unbound = binding.clone().with_evidence(vec!["nonce=no".into()]);
+        assert!(binding_record(&entry, &[unbound], binding.seq.get()).is_none());
+        assert!(binding_record(&entry, &[], 0).is_none());
+    }
+
+    struct CompletionAuditFails {
+        records: Vec<Record>,
+    }
+
+    impl AuditSink for CompletionAuditFails {
+        fn append_checked(
+            &mut self,
+            _build: &dyn Fn(Option<&Record>) -> Record,
+            _check: &dyn Fn(&Record) -> Result<(), AuditError>,
+        ) -> Result<xudo_sys::AuditReceipt, AuditError> {
+            Err(AuditError::Unavailable {
+                reason: "completion append refused".into(),
+            })
+        }
+
+        fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+            Ok(self.records.clone())
+        }
+    }
+
+    struct SnapshotFails {
+        inner: FakeAuditSink,
+    }
+
+    impl AuditSink for SnapshotFails {
+        fn append_checked(
+            &mut self,
+            build: &dyn Fn(Option<&Record>) -> Record,
+            check: &dyn Fn(&Record) -> Result<(), AuditError>,
+        ) -> Result<xudo_sys::AuditReceipt, AuditError> {
+            self.inner.append_checked(build, check)
+        }
+
+        fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+            Err(AuditError::Unavailable {
+                reason: "snapshot refused".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn queue_complete_refuses_when_the_audit_snapshot_fails() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        entry.run_nonce = Some("cd".repeat(32));
+        plant_queue(&mut host, &entry);
+        let mut sink = SnapshotFails {
+            inner: FakeAuditSink::new(),
+        };
+        let request = complete_request(&entry.id, 0);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let mut platform = Platform {
+            hygiene: &host.hygiene,
+            syscalls: &host.syscalls,
+            cgroups: None,
+            peers: &host.peers,
+            clock: &host.clock,
+            entropy: &host.entropy,
+            policy: &host.policy,
+            audit: &mut sink,
+            confirmations: None,
+            freeze_file: None,
+            queue: Some(&host.queue),
+        };
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut platform,
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                0
+            ),
+            Served::Refused(Fault::Broker)
+        );
+        assert_eq!(
+            stored_queue(&host)[0].state,
+            crate::queue::QueueState::Claimed
+        );
+        assert_eq!(sink.inner.records().len(), 1);
+        assert!(sink.snapshot().is_err());
+    }
+
+    /// `snapshot` refuses a log past the old whole-file limit. Completion uses
+    /// the bounded finder, so the same trail still marks the entry done.
+    struct OverLimit {
+        inner: FakeAuditSink,
+    }
+
+    impl AuditSink for OverLimit {
+        fn append_checked(
+            &mut self,
+            build: &dyn Fn(Option<&Record>) -> Record,
+            check: &dyn Fn(&Record) -> Result<(), AuditError>,
+        ) -> Result<xudo_sys::AuditReceipt, AuditError> {
+            self.inner.append_checked(build, check)
+        }
+
+        fn snapshot(&self) -> Result<Vec<Record>, AuditError> {
+            Err(AuditError::TooLarge {
+                size: 8 * 1024 * 1024 + 1,
+                max: 8 * 1024 * 1024,
+            })
+        }
+
+        fn find_record(
+            &self,
+            accept: &mut dyn FnMut(&Record) -> bool,
+        ) -> Result<Option<Record>, AuditError> {
+            Ok(self
+                .inner
+                .records()
+                .iter()
+                .rev()
+                .find(|record| accept(record))
+                .cloned())
+        }
+    }
+
+    #[test]
+    fn a_log_over_the_old_limit_still_completes() {
+        let (mut host, identity) = human_reviewer();
+        let mut entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        entry.state = crate::queue::QueueState::Claimed;
+        let nonce = "cd".repeat(32);
+        entry.run_nonce = Some(nonce.clone());
+        entry.claimant_uid = Some(identity.uid);
+        entry.claim_token = Some(nonce.clone());
+        entry.claimed_at = Some(NOW);
+        plant_queue(&mut host, &entry);
+        let argv = vec!["/usr/bin/apt-get".to_owned(), "upgrade".to_owned()];
+        let mut sink = OverLimit {
+            inner: FakeAuditSink::new(),
+        };
+        let _ = sink
+            .inner
+            .append(&|previous| {
+                Record::after(previous, AuditDecision::Allowed, argv.clone(), "human")
+                    .with_evidence(vec![
+                        format!("nonce={nonce}"),
+                        "confirmation=password (sudo's own prompt, on the -auth name)".into(),
+                    ])
+                    .with_outcome(xudo_audit::record::Outcome::NotExecuted)
+            })
+            .unwrap();
+        assert!(sink.snapshot().is_err());
+        let request = complete_request_with(&entry.id, 0, &nonce);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let mut platform = Platform {
+            hygiene: &host.hygiene,
+            syscalls: &host.syscalls,
+            cgroups: None,
+            peers: &host.peers,
+            clock: &host.clock,
+            entropy: &host.entropy,
+            policy: &host.policy,
+            audit: &mut sink,
+            confirmations: None,
+            freeze_file: None,
+            queue: Some(&host.queue),
+        };
+        assert_eq!(
+            serve_queue_complete(
+                &conn,
+                &mut platform,
+                &FakeSpool::new(),
+                &identity,
+                &request,
+                &entry.id,
+                0,
+            ),
+            Served::Decided
+        );
+        assert_eq!(stored_queue(&host)[0].state, crate::queue::QueueState::Done);
     }
 }

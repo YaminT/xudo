@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-13" "xudo 0.1.0-beta.2" "User Commands"
+.TH XUDO 1 "2026-11-21" "xudo 0.1.0-beta.2" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -25,10 +25,13 @@ xudo \- decide whether a privileged command runs as root
 .br
 .B xudo exec
 .RB [ options ]
-.RB [ \-\-queue ]
 .B \-\-
 .I program
 .RI [ arg ...]
+.br
+.B xudo exec
+.B \-\-queued
+.I id
 .br
 .B xudo check
 .RB [ \-\-tests\-only "\||\|" \-\-fuzz
@@ -158,15 +161,21 @@ Human-path denials are not written to the invoking user's
 .BR ido (1)
 queue. A verified harness request matched by an
 .B ask-human
-rule is stored by the broker in its root-held queue. Running that request
-through the password-authenticated gate and listing it through
-.B ido
-are planned for a later step.
-The planned run goes through the same scoped sudo rule as any other xudo
-authorization. Its
+rule is stored by the broker in its root-held queue.
+.B xudo exec \-\-queued
+.I id
+claims that entry for a fresh decision against the current rules. The stored
+working directory is not used; the command runs in
+.BR / .
+Only a human reviewer who does not own the entry can claim it. The run uses
+the same scoped sudo rule as any other xudo authorization, so sudo asks for
+the password. Its
 .B timestamp_timeout=0
 setting prevents it from reusing a sudo credential cached by an earlier
 terminal login; the backend tests pin this setting in the generated rule.
+The entry is marked done only after the gate's audit record for that run.
+A denied password releases the claim back to pending. A rules change after
+queueing denies the run. The passwordless gate is not installed.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.

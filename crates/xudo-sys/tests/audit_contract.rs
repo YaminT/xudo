@@ -92,6 +92,8 @@ fn the_broker_and_the_gate_write_one_chain_and_the_receipt_names_the_record() {
     let (program, seq) = execute(authorized);
     assert_eq!((program.as_str(), seq), ("/usr/bin/systemctl", 2));
     verify(trail.records()).unwrap();
+    let newest = trail.find_record(&mut |_| true).unwrap().unwrap();
+    assert_eq!(newest.seq.get(), 2);
     assert_eq!(
         trail.records()[1].action.as_deref(),
         Some("xudo.svc.restart")

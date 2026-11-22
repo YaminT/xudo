@@ -166,8 +166,21 @@ pub enum Command {
 
     /// Run a command as root, if the broker permits it. Asks for your password.
     Exec {
+        /// Run one root-held queue entry. The broker re-decides it, then sudo asks.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with = "argv",
+            required_unless_present = "argv"
+        )]
+        queued: Option<String>,
+
         /// The command and its arguments, after `--`. The program is an absolute path.
-        #[arg(trailing_var_arg = true, required = true, value_name = "ARGV")]
+        #[arg(
+            trailing_var_arg = true,
+            required_unless_present = "queued",
+            value_name = "ARGV"
+        )]
         argv: Vec<String>,
     },
 
@@ -385,6 +398,64 @@ pub fn run_with_installer(
     )
 }
 
+/// A queued plan is ready for `sudo`, which this process does not exec.
+/// The library returns the plan so a test can see it, and this process stops.
+fn queued_plan_exit(planned: &Result<exec::QueuedRun, ExitCode>) -> ExitCode {
+    match planned {
+        Ok(_) => ExitCode::Unusable,
+        Err(code) => *code,
+    }
+}
+
+/// `xudo exec`, including a queued claim. The library reports the plan and
+/// does not exec it.
+fn exec_command(
+    cli: &Cli,
+    argv: &[String],
+    queued: Option<&str>,
+    probe: &dyn Probe,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some(wait) = exec::configured_timeout(cli, err) else {
+        return ExitCode::Unusable;
+    };
+    if let Some(id) = queued {
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        let tty = exec::queued_terminal(
+            std::io::IsTerminal::is_terminal(&stdin),
+            std::io::IsTerminal::is_terminal(&stderr),
+        );
+        let mut input = stdin.lock();
+        return queued_plan_exit(&exec::plan_queued(
+            cli,
+            id,
+            probe,
+            socket,
+            exec::TIMEOUT,
+            tty,
+            &mut input,
+            out,
+            err,
+        ));
+    }
+    exec::plan_with_confirmation_timeout(
+        cli,
+        argv,
+        probe,
+        socket,
+        exec::TIMEOUT,
+        wait,
+        None,
+        out,
+        err,
+    )
+    .err()
+    .unwrap_or(ExitCode::Unusable)
+}
+
 /// [`run_with_installer`], with the broker socket supplied by the caller.
 pub fn run_with_installer_at_socket(
     cli: &Cli,
@@ -449,23 +520,8 @@ pub fn run_with_installer_at_socket(
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
         // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
-        Command::Exec { argv, .. } => {
-            let Some(wait) = exec::configured_timeout(cli, err) else {
-                return ExitCode::Unusable;
-            };
-            exec::plan_with_confirmation_timeout(
-                cli,
-                argv,
-                probe,
-                Path::new(xudo_wire::BROKER_SOCKET),
-                exec::TIMEOUT,
-                wait,
-                None,
-                out,
-                err,
-            )
-            .err()
-            .unwrap_or(ExitCode::Unusable)
+        Command::Exec { argv, queued } => {
+            exec_command(cli, argv, queued.as_deref(), probe, socket, out, err)
         }
         Command::Check(args) => check::dispatch(cli, loaded.as_ref(), args, out, err),
         Command::List { tier } => {
@@ -1637,8 +1693,20 @@ mod tests {
     }
 
     #[test]
+    fn exec_rejects_the_removed_queue_flag_and_accepts_queued() {
+        assert!(Cli::try_parse_from(["xudo", "exec", "--queue", "ab"]).is_err());
+        assert!(Cli::try_parse_from(["xudo", "exec"]).is_err());
+        assert!(Cli::try_parse_from(["xudo", "exec", "--queued", "ab", "--", "true"]).is_err());
+        let queued = Cli::try_parse_from(["xudo", "exec", "--queued", "ab"]).unwrap();
+        assert!(matches!(
+            queued.command,
+            Command::Exec { queued: Some(ref id), ref argv, .. } if id == "ab" && argv.is_empty()
+        ));
+    }
+
+    #[test]
     fn an_option_looking_exec_argv_is_data_after_the_separator() {
-        for first in ["--queue", "--config-file"] {
+        for first in ["--queue", "--queued", "--config-file"] {
             let cli = Cli::try_parse_from(["xudo", "exec", "--", first, "x"]).unwrap();
             assert!(matches!(
                 cli.command,
@@ -4488,6 +4556,22 @@ expect = "deny"
         let cli = Cli::try_parse_from(["xudo", "check"]).unwrap();
         assert_eq!(cli.rules, PathBuf::from(DEFAULT_RULES_DIR));
         assert_eq!(cli.output, Format::Human);
+    }
+
+    #[test]
+    fn queued_plan_exit_maps_a_ready_run_to_unusable_and_keeps_a_refusal() {
+        let ready = exec::QueuedRun {
+            plan: exec::ExecPlan {
+                backend: "/usr/bin/sudo",
+                gate: xudo_backend::snippet::GATE_AUTH,
+                spawn: true,
+            },
+            id: "ab".repeat(32),
+            cwd: exec::QUEUED_CWD,
+            claim_token: "cd".repeat(32),
+        };
+        assert_eq!(queued_plan_exit(&Ok(ready)), ExitCode::Unusable);
+        assert_eq!(queued_plan_exit(&Err(ExitCode::Denied)), ExitCode::Denied);
     }
 
     #[test]
