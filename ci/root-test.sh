@@ -82,8 +82,14 @@ take_machine_lock root-test
 # unprivileged suite out of a root run.
 # SYS_RESOURCE is needed for the gate to restore a hard limit to the value
 # visible on PID 1 when sudo passes a lower hard limit through.
+# SYS_ADMIN is needed for `root_remove_path`, which bind-mounts a directory
+# inside the tree to prove the walk does not cross a mount. The container is
+# throwaway and holds a copy of the checkout. Docker's default AppArmor profile
+# denies mount(2) even with the capability, so the profile is lifted too.
 docker run --rm -i \
     --cap-add SYS_RESOURCE \
+    --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
     -v "$root:/src:ro" \
     -v xudo-linux-cargo:/cache/cargo \
     -v xudo-linux-target:/cache/target \
