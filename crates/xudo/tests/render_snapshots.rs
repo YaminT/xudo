@@ -80,7 +80,7 @@ program = ["apt-get"]
 all = [{ any-arg = ["protect-deny"] }]
 "#;
 
-const ALL_CODES: [DenialCode; 12] = [
+const ALL_CODES: [DenialCode; 13] = [
     DenialCode::UnknownAction,
     DenialCode::ArgvRejected,
     DenialCode::DenyListed,
@@ -92,6 +92,7 @@ const ALL_CODES: [DenialCode; 12] = [
     DenialCode::ConfirmationRefused,
     DenialCode::ConfirmationExpired,
     DenialCode::ConfirmationThrottled,
+    DenialCode::OperationRefused,
     DenialCode::DenyRule,
 ];
 
@@ -189,7 +190,8 @@ fn denial(code: DenialCode) -> Decision {
         ),
         DenialCode::ConfirmationRefused
         | DenialCode::ConfirmationExpired
-        | DenialCode::ConfirmationThrottled => Decision::deny(code, Vec::new(), Vec::new()),
+        | DenialCode::ConfirmationThrottled
+        | DenialCode::OperationRefused => Decision::deny(code, Vec::new(), Vec::new()),
         DenialCode::DenyRule => decide(
             &human_caller(),
             &Request::for_program(

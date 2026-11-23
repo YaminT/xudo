@@ -1,0 +1,10 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+DENY
+  reason    operation_refused
+
+  trace
+
+  next      no remove-path rule permits this target, or the target is not a safe relative path under it; run `xudo list` and ask an administrator to add a rule; do not retry a path outside the tree

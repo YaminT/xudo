@@ -327,12 +327,13 @@ impl RequestError {
 
 /// One pending request, as it sits in the spool.
 ///
-/// Every field except [`Self::queue_id`] is required. There are no other
-/// `serde` defaults and no unknown keys: a request the gate only partly
-/// understands is a request it declines to understand at all. `queue_id` may
-/// be omitted. Absent, the request is an ordinary human-path mint. Present, it
-/// must be 64 lowercase hex and the gate will run it only while that queue
-/// record is claimed for this nonce.
+/// Every field except [`Self::queue_id`] and [`Self::operation`] is required.
+/// There are no other `serde` defaults and no unknown keys: a request the gate
+/// only partly understands is a request it declines to understand at all.
+/// `queue_id` may be omitted. Absent, the request is an ordinary human-path
+/// mint. Present, it must be 64 lowercase hex and the gate will run it only
+/// while that queue record is claimed for this nonce. `operation` may be
+/// omitted. Present, the gate runs that typed operation instead of exec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingRequest {
@@ -418,6 +419,22 @@ pub struct PendingRequest {
     /// the gate uses it as a file name under the root-owned queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_id: Option<String>,
+    /// A typed operation. Absent on an exec request. Present, the gate walks
+    /// the tree itself and does not exec [`Self::program`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<RequestedOp>,
+}
+
+/// A typed operation the broker minted and the gate re-decides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedOp {
+    /// `remove-path` on this step.
+    pub op: String,
+    /// Absolute target bytes.
+    pub target: Vec<u8>,
+    /// List the paths and unlink nothing.
+    pub dry_run: bool,
 }
 
 impl PendingRequest {
@@ -530,6 +547,7 @@ impl PendingRequest {
     /// # Errors
     ///
     /// The first fact that does not hold, as the matching [`RequestError`].
+    #[allow(clippy::too_many_lines)]
     pub fn validate(
         &self,
         caller: CallerPin,
@@ -560,6 +578,19 @@ impl PendingRequest {
             return Err(RequestError::NotAbsoluteProgram {
                 program: self.program.clone(),
             });
+        }
+        if let Some(op) = &self.operation {
+            let target_ok = op.op == "remove-path"
+                && self.program == xudo_wire::OPERATION_PROGRAM
+                && !op.target.is_empty()
+                && op.target.len() <= xudo_wire::MAX_PROGRAM_BYTES
+                && !op.target.contains(&0)
+                && op.target.starts_with(b"/");
+            if !target_ok {
+                return Err(RequestError::Malformed {
+                    reason: "operation is not a remove-path under an absolute target".to_owned(),
+                });
+            }
         }
         self.refuse_interior_nul()?;
         let watcher_valid = self.confirmed_by.as_ref().is_some_and(|watcher| {
@@ -753,11 +784,40 @@ mod tests {
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         }
     }
 
     fn check(request: &PendingRequest) -> Result<(), RequestError> {
         request.validate(pin(), 7, BoottimeMillis(100))
+    }
+
+    #[test]
+    fn an_operation_entry_must_name_remove_path_and_the_marker_program() {
+        let mut bad = live();
+        bad.operation = Some(RequestedOp {
+            op: "write-file".into(),
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: false,
+        });
+        let err = check(&bad).unwrap_err();
+        assert!(format!("{err:?}").contains("Malformed"), "{err:?}");
+        let mut ok = live();
+        ok.program = xudo_wire::OPERATION_PROGRAM.to_owned();
+        ok.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: true,
+        });
+        assert_eq!(check(&ok), Ok(()));
+        let mut relative = ok.clone();
+        relative.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"relative".to_vec(),
+            dry_run: false,
+        });
+        let err = check(&relative).unwrap_err();
+        assert!(format!("{err:?}").contains("Malformed"), "{err:?}");
     }
 
     fn approved() -> PendingRequest {

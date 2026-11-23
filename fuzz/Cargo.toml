@@ -103,3 +103,10 @@ path = "fuzz_targets/check_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "remove_path_target"
+path = "fuzz_targets/remove_path_target.rs"
+test = false
+doc = false
+bench = false

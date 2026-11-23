@@ -25,7 +25,8 @@ fuzz_target!(|data: &[u8]| {
         | Question::QueueClaim { .. }
         | Question::QueueComplete { .. }
         | Question::QueueRelease { .. }
-        | Question::QueueListPage { .. } => {}
+        | Question::QueueListPage { .. }
+        | Question::RemovePath { .. } => {}
     }
     assert!(data.len() <= MAX_REQUEST_BYTES);
 

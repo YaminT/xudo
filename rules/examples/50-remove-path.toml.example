@@ -1,0 +1,34 @@
+# EXAMPLE. Not a shipped rule.
+#
+# The loader reads only names ending in `.toml` in the rules directory, and the
+# package installs this file under /usr/share/xudo/examples, so it is never
+# loaded by accident. To let an operator remove a build tree:
+#
+#   cp /usr/share/xudo/examples/50-remove-path.toml /etc/xudo/rules.d/
+#
+# Then replace `under` with the tree this host should expose. The directory
+# itself is never removed. Every ancestor, from `/` down to `under`, must be
+# owned by root and must not be writable by group or other. The walk refuses
+# a symlink component, a mount point, and another filesystem.
+#
+# Omit `owners` to allow any uid except root. A listed name that is not in
+# the passwd text the broker reads fails closed:
+#
+#   owners = ["agent", "www-data"]
+#
+# `harness` is parsed and checked against /etc/xudo/harnesses.d. It is not a
+# grant. Leave it out until that file exists. Harness use is planned. This
+# release runs the operation only through the password path:
+#
+#   harness = ["codex"]
+#
+# Then: xudo op remove-path /srv/app/build/cache
+#       xudo op remove-path --dry-run /srv/app/build/cache
+
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 8
+max-entries = 10000

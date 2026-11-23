@@ -41,5 +41,7 @@ pub mod rules;
 mod test_broker;
 pub mod watch;
 
-pub use cli::{Cli, Command, Format, Invocation, Platform, run, run_with, run_with_installer};
+pub use cli::{
+    Cli, Command, Format, Invocation, OpCommand, Platform, run, run_with, run_with_installer,
+};
 pub use rules::{LoadError, LoadedRules};

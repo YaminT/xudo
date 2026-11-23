@@ -1386,7 +1386,7 @@ fn applies_sysctl_file(bytes: &[u8]) -> bool {
 }
 
 /// Returns `true` when `path` is at or beneath any protected prefix.
-fn touches_protected_path(path: &[u8]) -> bool {
+pub(crate) fn touches_protected_path(path: &[u8]) -> bool {
     if !path.starts_with(b"/") {
         return false;
     }
