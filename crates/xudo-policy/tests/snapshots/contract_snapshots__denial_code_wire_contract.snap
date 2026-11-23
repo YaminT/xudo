@@ -28,3 +28,5 @@ expression: table
     an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person
 13  ask_human
     ask a person to review this request in the root-held queue before it can run
+14  operation_refused
+    no remove-path rule permits this target, or the target is not a safe relative path under it; run `xudo list` and ask an administrator to add a rule; do not retry a path outside the tree

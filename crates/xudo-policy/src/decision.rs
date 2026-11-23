@@ -145,6 +145,13 @@ pub enum DenialCode {
     ConfirmationThrottled,
     /// A root-authored deny rule matched this command.
     DenyRule,
+    /// A typed operation was refused: no rule covers the target, or the target
+    /// is not a safe path under that rule.
+    ///
+    /// Its own code rather than [`Self::ArgvRejected`], because an operation
+    /// has no argv. Folding it into an action denial would send the caller to
+    /// `xudo explain -- <argv>` for a request that was never a command.
+    OperationRefused,
 }
 
 impl DenialCode {
@@ -164,6 +171,7 @@ impl DenialCode {
             Self::ConfirmationThrottled => 11,
             Self::DenyRule => 12,
             Self::AskHuman => 13,
+            Self::OperationRefused => 14,
         }
     }
 
@@ -183,6 +191,7 @@ impl DenialCode {
             Self::ConfirmationThrottled => "confirmation_throttled",
             Self::DenyRule => "deny_rule",
             Self::AskHuman => "ask_human",
+            Self::OperationRefused => "operation_refused",
         }
     }
 
@@ -236,6 +245,9 @@ impl DenialCode {
             }
             Self::DenyRule => {
                 "an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person"
+            }
+            Self::OperationRefused => {
+                "no remove-path rule permits this target, or the target is not a safe relative path under it; run `xudo list` and ask an administrator to add a rule; do not retry a path outside the tree"
             }
         }
     }
@@ -341,6 +353,14 @@ pub enum TraceStep {
         /// The rule source.
         source: String,
     },
+    /// A typed operation matched. The password path still applies; a harness
+    /// label on the rule is not a grant.
+    OperationMatched {
+        /// The operation id.
+        action: String,
+        /// Where the rule is defined.
+        source: String,
+    },
 }
 
 /// The complete result of an evaluation.
@@ -443,7 +463,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 13] = [
+    const ALL_CODES: [DenialCode; 14] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -457,6 +477,7 @@ mod tests {
         DenialCode::ConfirmationThrottled,
         DenialCode::DenyRule,
         DenialCode::AskHuman,
+        DenialCode::OperationRefused,
     ];
 
     #[test]
@@ -471,7 +492,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();

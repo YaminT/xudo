@@ -810,6 +810,147 @@ pub(crate) fn ask(
     BrokerResponse::parse(&bytes).map_err(|error| error.to_string())
 }
 
+/// The broker question for `xudo op remove-path`.
+///
+/// # Errors
+///
+/// The target is empty, relative, contains a NUL, or is longer than the wire
+/// allows. Nothing is asked.
+pub fn remove_path_request(target: &[u8], dry_run: bool) -> Result<BrokerRequest, &'static str> {
+    if target.is_empty()
+        || !target.starts_with(b"/")
+        || target.contains(&0)
+        || target.len() > xudo_wire::MAX_PROGRAM_BYTES
+    {
+        return Err("target must be an absolute path without NUL");
+    }
+    Ok(BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question: Question::RemovePath {
+            target: target.to_vec(),
+            dry_run,
+            claimed_classification: "unattested".to_owned(),
+        },
+    })
+}
+
+/// Turns a broker answer into the password-gate plan.
+///
+/// # Errors
+///
+/// A refusal, a denial, a missing mint, an unexpected gate, or an answer that
+/// belongs to another question.
+pub fn remove_plan_from_answer(
+    cli: &Cli,
+    target: &[u8],
+    response: &BrokerResponse,
+    probe: &dyn Probe,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    match &response.answer {
+        Answer::Refused {
+            code, remediation, ..
+        } => {
+            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            Err(ExitCode::Unusable)
+        }
+        Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
+        | Answer::Done => {
+            let _ = writeln!(
+                err,
+                "xudo: broker returned an answer for an unsupported question"
+            );
+            Err(ExitCode::Unusable)
+        }
+        Answer::Decided { decision, minted } => {
+            if !decision.verdict.is_permitted() {
+                let shown = vec![target.escape_ascii().to_string()];
+                return Err(report_denial(cli, decision, &shown, None, out, err));
+            }
+            let Some(minted) = minted else {
+                let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+                return Err(ExitCode::Unusable);
+            };
+            if minted.gate != GATE_AUTH {
+                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+                return Err(ExitCode::Unusable);
+            }
+            let Some(backend) = selected_backend(probe, err) else {
+                return Err(ExitCode::Unusable);
+            };
+            Ok(ExecPlan {
+                backend,
+                gate: GATE_AUTH,
+                spawn: backend == "/usr/bin/doas",
+            })
+        }
+    }
+}
+
+/// Asks the broker to mint a remove-path and returns the plan. Does not exec.
+///
+/// # Errors
+///
+/// As [`remove_path_request`] and [`remove_plan_from_answer`], plus an
+/// unreachable broker.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_remove_path(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    probe: &dyn Probe,
+    socket: &Path,
+    timeout: Duration,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    let request = match remove_path_request(target, dry_run) {
+        Ok(request) => request,
+        Err(reason) => {
+            let _ = writeln!(err, "xudo: {reason}");
+            return Err(ExitCode::Unusable);
+        }
+    };
+    let response = match ask(socket, timeout, &request) {
+        Ok(response) => response,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            return Err(ExitCode::Unusable);
+        }
+    };
+    remove_plan_from_answer(cli, target, &response, probe, out, err)
+}
+
+/// [`plan_remove_path`] against this machine's backend and the real broker socket.
+///
+/// # Errors
+///
+/// As [`plan_remove_path`].
+pub fn plan_remove_live(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    plan_remove_path(
+        cli,
+        target,
+        dry_run,
+        &xudo_sys::HostProbe,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        TIMEOUT,
+        out,
+        err,
+    )
+}
+
 /// Shows a denial. Privileged denials are never written into the caller-owned ido queue.
 fn report_denial(
     cli: &Cli,
@@ -3082,6 +3223,285 @@ mod tests {
         assert!(shown.contains("releasing the claim"), "{shown}");
         let requests = broker.finish_report().requests;
         assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn remove_path_request_rejects_a_bad_target_and_accepts_an_absolute_one() {
+        let long = vec![b'a'; 4097];
+        for target in [b"".as_slice(), b"cache", b"/srv/\0cache", long.as_slice()] {
+            assert_eq!(
+                remove_path_request(target, false).unwrap_err(),
+                "target must be an absolute path without NUL"
+            );
+        }
+        let mut exact = vec![b'/'];
+        exact.resize(xudo_wire::MAX_PROGRAM_BYTES, b'a');
+        assert_eq!(exact.len(), xudo_wire::MAX_PROGRAM_BYTES);
+        assert!(remove_path_request(&exact, false).is_ok());
+        let mut over = exact;
+        over.push(b'a');
+        assert_eq!(
+            remove_path_request(&over, false).unwrap_err(),
+            "target must be an absolute path without NUL"
+        );
+
+        let raw = b"/srv/app/build/cache\xff";
+        let request = remove_path_request(raw, true).unwrap();
+        assert_eq!(
+            request.question,
+            Question::RemovePath {
+                target: raw.to_vec(),
+                dry_run: true,
+                claimed_classification: "unattested".to_owned(),
+            }
+        );
+        let parsed = BrokerRequest::parse(request.to_json().as_bytes()).unwrap();
+        assert_eq!(
+            parsed.remove_fields().map(|(target, dry, _)| (target, dry)),
+            Some((raw.as_slice(), true))
+        );
+    }
+
+    fn remove_response(answer: Answer) -> BrokerResponse {
+        BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn remove_plan_from_answer_covers_every_broker_answer() {
+        let target = b"/srv/app/build/cache";
+        let cli = cli();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        let refused = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Refused {
+                code: RefusalCode::RequestMalformed,
+                remediation: "no".into(),
+                detail: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(refused, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("broker refused")
+        );
+
+        for answer in [
+            Answer::Pending {
+                id: "a".repeat(64),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+            Answer::QueueListed {
+                entries: Vec::new(),
+                next: None,
+            },
+            Answer::Done,
+        ] {
+            err.clear();
+            let result = remove_plan_from_answer(
+                &cli,
+                target,
+                &remove_response(answer),
+                &SUDO,
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(result, Err(ExitCode::Unusable));
+            assert!(
+                String::from_utf8(err.clone())
+                    .unwrap()
+                    .contains("unsupported question")
+            );
+        }
+
+        err.clear();
+        out.clear();
+        let denied = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: Decision::deny(DenialCode::OperationRefused, Vec::new(), Vec::new()),
+                minted: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(denied, Err(ExitCode::Denied));
+        let shown = String::from_utf8(out.clone()).unwrap();
+        assert!(shown.contains("operation_refused"), "{shown}");
+
+        err.clear();
+        let missing = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(missing, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("minted no entry")
+        );
+
+        err.clear();
+        let wrong = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted("/usr/libexec/xudo/xudo-gate-nopass")),
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(wrong, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("unexpected gate")
+        );
+
+        err.clear();
+        let no_backend = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &Has(&[]),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(no_backend, Err(ExitCode::Unusable));
+        assert!(String::from_utf8(err.clone()).unwrap().contains("no sudo"));
+
+        err.clear();
+        let sudo = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(sudo.backend, "/usr/bin/sudo");
+        assert_eq!(sudo.gate, GATE_AUTH);
+        assert!(!sudo.spawn);
+
+        let doas = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &Has(&["/usr/bin/doas"]),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(doas.backend, "/usr/bin/doas");
+        assert!(doas.spawn);
+    }
+
+    #[test]
+    fn plan_remove_path_says_doctor_when_the_broker_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let missing = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache",
+            true,
+            &SUDO,
+            &dir.path().join("none.sock"),
+            TIMEOUT,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(missing, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("xudo doctor")
+        );
+
+        err.clear();
+        let relative = plan_remove_path(
+            &cli(),
+            b"cache",
+            false,
+            &SUDO,
+            Path::new("/no/such/sock"),
+            TIMEOUT,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(relative, Err(ExitCode::Unusable));
+        assert!(String::from_utf8(err).unwrap().contains("absolute path"));
+
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker =
+            crate::test_broker::serve_once(listener, decided(allow(), Some(minted(GATE_AUTH))));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let plan = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache\xff",
+            true,
+            &SUDO,
+            &socket,
+            PATIENT,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(plan.gate, GATE_AUTH);
+        assert!(!plan.spawn);
+        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(
+            sent.question,
+            Question::RemovePath {
+                target: b"/srv/app/build/cache\xff".to_vec(),
+                dry_run: true,
+                claimed_classification: "unattested".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_remove_live_refuses_a_relative_target_before_the_socket() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_remove_live(&cli(), b"relative", false, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err).unwrap().contains("absolute path"));
     }
 
     /// `read_line` fails. Used so that arm is taken on every platform.

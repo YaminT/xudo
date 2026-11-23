@@ -1,0 +1,545 @@
+//! A typed operation the gate runs itself.
+//!
+//! The password gate is the only invocation [`crate::run`] accepts, so this
+//! path never execs and never consults a harness label. The broker's verdict
+//! is not an input: the grant comes from root's rules and the passwd file the
+//! trust walk already read.
+
+use xudo_audit::record::{Decision as AuditDecision, Outcome, Record};
+use xudo_policy::{CallerFacts, OwnerPolicy, RuleSet, engine::Settings};
+use xudo_sys::{RemoveError, RemoveOwnerPolicy, RemoveReport, RemoveRequest};
+use xudo_wire::OPERATION_PROGRAM;
+
+use crate::decide::{GateCaller, Refusal, Severity, Stage};
+use crate::request::PendingRequest;
+
+/// What the walk is allowed to do, plus the fields the audit record cites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OperationWork {
+    /// The walk's request.
+    pub(crate) request: RemoveRequest,
+    /// The operation id.
+    pub(crate) id: String,
+    /// `file:line` of the rule.
+    pub(crate) source: String,
+    /// The tree, for the record. The same bytes as [`RemoveRequest::under`].
+    pub(crate) under: Vec<u8>,
+    /// The absolute target the caller asked for.
+    pub(crate) target: Vec<u8>,
+}
+
+/// Re-decide `pending` and build the walk request.
+///
+/// # Errors
+///
+/// A missing password proof, a program that is not the operation marker, an
+/// unknown op, or a policy denial. Nothing has been removed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_remove(
+    rules: &RuleSet,
+    caller: &CallerFacts,
+    pending: &PendingRequest,
+    op_name: &str,
+    target: &[u8],
+    dry_run: bool,
+    settings: Settings,
+    passwd: &str,
+    password_confirms: bool,
+) -> Result<OperationWork, Refusal> {
+    if !password_confirms {
+        return Err(Refusal::Failed {
+            stage: Stage::Invocation,
+            reason: "remove-path runs only through the password gate".to_owned(),
+        });
+    }
+    if pending.program != OPERATION_PROGRAM || op_name != "remove-path" {
+        return Err(Refusal::Failed {
+            stage: Stage::Invocation,
+            reason: "the spool entry is not a remove-path operation".to_owned(),
+        });
+    }
+    let grant = match xudo_policy::judge_remove_path(rules, caller, target, settings, passwd) {
+        Ok(grant) => grant,
+        Err(decision) => return Err(Refusal::Policy(decision)),
+    };
+    Ok(OperationWork {
+        request: RemoveRequest {
+            under: grant.under.clone(),
+            relative: grant.relative,
+            recursive: grant.recursive,
+            max_depth: grant.max_depth,
+            max_entries: grant.max_entries,
+            owners: walk_owners(grant.owners),
+            dry_run,
+        },
+        id: grant.id.to_string(),
+        source: grant.source.to_string(),
+        under: grant.under,
+        target: target.to_vec(),
+    })
+}
+
+fn walk_owners(owners: OwnerPolicy) -> RemoveOwnerPolicy {
+    match owners {
+        OwnerPolicy::AnyButRoot => RemoveOwnerPolicy::AnyButRoot,
+        OwnerPolicy::Only(ids) => RemoveOwnerPolicy::Only(ids),
+    }
+}
+
+/// Evidence for the one record of a finished walk.
+pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Vec<String> {
+    let severity = if report.dry_run {
+        Severity::Low
+    } else {
+        Severity::Normal
+    };
+    let mut evidence = vec![
+        "op=remove-path".to_owned(),
+        format!("tree={}", work.under.escape_ascii()),
+        format!("target={}", work.target.escape_ascii()),
+        format!("count={}", report.removed.len()),
+        format!("bytes={}", report.bytes),
+        format!("dry_run={}", report.dry_run),
+        format!("severity={}", severity.label()),
+        format!("partial={}", report.partial),
+        format!("paths_sha256={}", hex_digest(&report.digest)),
+    ];
+    for path in xudo_sys::remove::audit_path_head(&report.removed) {
+        evidence.push(format!("path={}", path.escape_ascii()));
+    }
+    evidence
+}
+
+/// The audit record written after the walk. A dry run did not exec and did
+/// not unlink. A real removal is recorded as an exit so a later query can
+/// see that privileged names were deleted.
+pub(crate) fn remove_record(
+    previous: Option<&Record>,
+    caller: &GateCaller,
+    work: &OperationWork,
+    report: &RemoveReport,
+) -> Record {
+    let argv = vec![
+        OPERATION_PROGRAM.to_owned(),
+        work.target.escape_ascii().to_string(),
+    ];
+    let outcome = if report.dry_run {
+        Outcome::NotExecuted
+    } else {
+        Outcome::Exited {
+            code: i32::from(report.partial),
+        }
+    };
+    Record::after(
+        previous,
+        AuditDecision::Allowed,
+        argv,
+        caller.facts.classification.label(),
+    )
+    .with_rule(&work.id, &work.source)
+    .with_evidence(remove_evidence(work, report))
+    .with_outcome(outcome)
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0 => '0',
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        10 => 'a',
+        11 => 'b',
+        12 => 'c',
+        13 => 'd',
+        14 => 'e',
+        _ => 'f',
+    }
+}
+
+/// A walk error before any name was removed. The caller has already consumed
+/// the spool entry.
+pub(crate) fn walk_refusal(error: &RemoveError) -> Refusal {
+    Refusal::Failed {
+        stage: Stage::Exec,
+        reason: error.to_string(),
+    }
+}
+
+/// Whether a policy denial from this path is `DenialCode::OperationRefused`.
+#[cfg(test)]
+pub(crate) fn is_operation_refusal(refusal: &Refusal) -> bool {
+    match refusal {
+        Refusal::Policy(decision) => {
+            decision.denial == Some(xudo_policy::DenialCode::OperationRefused)
+        }
+        Refusal::NoPendingRequest { .. }
+        | Refusal::Request(_)
+        | Refusal::ConfirmationMissing(_)
+        | Refusal::Failed { .. } => false,
+    }
+}
+
+/// Exit status of a finished walk. Partial is 1. A complete walk, including a
+/// dry run, is 0.
+pub(crate) fn operation_status(report: &RemoveReport) -> i32 {
+    i32::from(report.partial)
+}
+
+/// The line the gate prints after a walk. Not a refusal.
+pub(crate) fn operation_message(report: &RemoveReport) -> String {
+    if report.dry_run {
+        format!("xudo-gate: dry-run listed {} paths", report.removed.len())
+    } else if report.partial {
+        format!(
+            "xudo-gate: partial remove of {} paths",
+            report.removed.len()
+        )
+    } else {
+        format!("xudo-gate: removed {} paths", report.removed.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use xudo_policy::{
+        CallerFacts, Classification, Decision, DenialCode, RuleSet, Verdict, engine::Settings,
+    };
+    use xudo_sys::{RemoveError, RemoveOwnerPolicy, RemoveReport};
+
+    use super::*;
+    use crate::decide::GateCaller;
+    use crate::request::{
+        AttestedClass, BoottimeMillis, CallerPin, PendingRequest, RequestError, RequestedOp,
+    };
+
+    const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+
+    fn rules(text: &str) -> RuleSet {
+        RuleSet::from_toml("50-remove-path.toml", text).unwrap()
+    }
+
+    fn sample() -> RuleSet {
+        rules(
+            r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#,
+        )
+    }
+
+    fn named_owners() -> RuleSet {
+        rules(
+            r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = false
+max-depth = 2
+max-entries = 3
+owners = ["agent"]
+"#,
+        )
+    }
+
+    fn human() -> CallerFacts {
+        CallerFacts::new(Classification::Human, 1000)
+    }
+
+    fn pending(program: &str, op: &str) -> PendingRequest {
+        PendingRequest {
+            schema_version: crate::request::REQUEST_SCHEMA_VERSION,
+            nonce: "ab".repeat(32),
+            caller_pid: 1,
+            caller_starttime: 2,
+            action: "web.clean-build".into(),
+            program: program.into(),
+            argv: Vec::new(),
+            generation: 1,
+            deadline: BoottimeMillis(9),
+            confirmed: false,
+            confirmed_by: None,
+            state: crate::request::ConfirmationState::Pending,
+            caller_uid: 1000,
+            caller_sid: 1,
+            caller_tty: 1,
+            needs_watch: false,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: "0".repeat(64),
+            claimed_classification: "unattested".into(),
+            attested_class: AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
+            attested_harness: None,
+            queue_id: None,
+            operation: Some(RequestedOp {
+                op: op.into(),
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+            }),
+        }
+    }
+
+    fn prepare<'a>(
+        rules: &'a RuleSet,
+        pending: &'a PendingRequest,
+        password: bool,
+    ) -> Result<OperationWork, Refusal> {
+        let op = pending.operation.as_ref().unwrap();
+        prepare_remove(
+            rules,
+            &human(),
+            pending,
+            &op.op,
+            &op.target,
+            op.dry_run,
+            Settings::default(),
+            PASSWD,
+            password,
+        )
+    }
+
+    #[test]
+    fn prepare_remove_grants_any_owner_but_root_on_the_password_path() {
+        let work = prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        assert_eq!(work.id, "web.clean-build");
+        assert_eq!(work.request.relative, b"cache");
+        assert_eq!(work.request.owners, RemoveOwnerPolicy::AnyButRoot);
+        assert!(!work.request.dry_run);
+    }
+
+    #[test]
+    fn prepare_remove_resolves_a_listed_owner() {
+        let work = prepare(
+            &named_owners(),
+            &pending(OPERATION_PROGRAM, "remove-path"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(work.request.owners, RemoveOwnerPolicy::Only(vec![1000]));
+    }
+
+    #[test]
+    fn prepare_remove_refuses_without_the_password_proof() {
+        let error =
+            prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), false).unwrap_err();
+        assert_eq!(
+            error,
+            Refusal::Failed {
+                stage: Stage::Invocation,
+                reason: "remove-path runs only through the password gate".into(),
+            }
+        );
+        assert!(!is_operation_refusal(&error));
+    }
+
+    #[test]
+    fn prepare_remove_refuses_a_marker_mismatch_and_an_unknown_op() {
+        let wrong_program =
+            prepare(&sample(), &pending("/bin/true", "remove-path"), true).unwrap_err();
+        assert_eq!(
+            wrong_program,
+            Refusal::Failed {
+                stage: Stage::Invocation,
+                reason: "the spool entry is not a remove-path operation".into(),
+            }
+        );
+        let wrong_op =
+            prepare(&sample(), &pending(OPERATION_PROGRAM, "write-file"), true).unwrap_err();
+        assert_eq!(wrong_op, wrong_program);
+    }
+
+    #[test]
+    fn prepare_remove_refuses_a_target_outside_the_tree() {
+        let mut entry = pending(OPERATION_PROGRAM, "remove-path");
+        entry.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"/etc/passwd".to_vec(),
+            dry_run: false,
+        });
+        let error = prepare(&sample(), &entry, true).unwrap_err();
+        assert!(is_operation_refusal(&error));
+        assert_eq!(denial_of(&error), Some(DenialCode::OperationRefused));
+        assert_eq!(verdict_of(&error), Some(Verdict::Deny));
+        let frozen = Refusal::Policy(Box::new(Decision::deny(
+            DenialCode::Frozen,
+            Vec::new(),
+            Vec::new(),
+        )));
+        assert!(!is_operation_refusal(&frozen));
+        assert_eq!(denial_of(&frozen), Some(DenialCode::Frozen));
+        assert_eq!(verdict_of(&frozen), Some(Verdict::Deny));
+        let mut bare = Decision::deny(DenialCode::Frozen, Vec::new(), Vec::new());
+        bare.denial = None;
+        bare.verdict = Verdict::Allow;
+        let bare = Refusal::Policy(Box::new(bare));
+        assert!(!is_operation_refusal(&bare));
+        assert_eq!(denial_of(&bare), None);
+        assert_eq!(verdict_of(&bare), Some(Verdict::Allow));
+    }
+
+    fn denial_of(refusal: &Refusal) -> Option<DenialCode> {
+        match refusal {
+            Refusal::Policy(decision) => decision.denial,
+            Refusal::NoPendingRequest { .. }
+            | Refusal::Request(_)
+            | Refusal::ConfirmationMissing(_)
+            | Refusal::Failed { .. } => None,
+        }
+    }
+
+    fn verdict_of(refusal: &Refusal) -> Option<Verdict> {
+        match refusal {
+            Refusal::Policy(decision) => Some(decision.verdict),
+            Refusal::NoPendingRequest { .. }
+            | Refusal::Request(_)
+            | Refusal::ConfirmationMissing(_)
+            | Refusal::Failed { .. } => None,
+        }
+    }
+
+    fn report(paths: &[&[u8]], dry_run: bool, partial: bool) -> RemoveReport {
+        let removed = paths.iter().map(|path| path.to_vec()).collect::<Vec<_>>();
+        RemoveReport {
+            digest: xudo_sys::removal_digest(&removed),
+            removed,
+            bytes: 4,
+            partial,
+            dry_run,
+        }
+    }
+
+    fn caller() -> GateCaller {
+        GateCaller {
+            pin: CallerPin::new(1, 2),
+            facts: human(),
+            attested_class: AttestedClass::Unattested,
+            attested_scope_id: None,
+            boot_id: None,
+        }
+    }
+
+    #[test]
+    fn a_dry_run_record_is_low_severity_and_a_real_removal_names_every_path_or_its_hash() {
+        let work = prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        let dry = remove_record(
+            None,
+            &caller(),
+            &work,
+            &report(&[b"/srv/app/build/cache"], true, false),
+        );
+        assert_eq!(dry.outcome.kind(), "not_executed");
+        assert!(dry.evidence.iter().any(|line| line == "severity=low"));
+        assert!(dry.evidence.iter().any(|line| line == "dry_run=true"));
+        assert_eq!(dry.action.as_deref(), Some("web.clean-build"));
+
+        let mut many = Vec::new();
+        for index in 0..70u8 {
+            many.push(format!("/srv/app/build/f{index}").into_bytes());
+        }
+        let full = report_owned(&many, false, true);
+        let head = report_owned(
+            &many.iter().take(64).cloned().collect::<Vec<_>>(),
+            false,
+            true,
+        );
+        let real = remove_record(None, &caller(), &work, &full);
+        assert_eq!(real.outcome.kind(), "exited");
+        let paths = real
+            .evidence
+            .iter()
+            .filter(|line| line.starts_with("path="))
+            .count();
+        assert_eq!(paths, 64);
+        let full_hash = real
+            .evidence
+            .iter()
+            .find(|line| line.starts_with("paths_sha256="))
+            .unwrap()
+            .clone();
+        let head_record = remove_record(None, &caller(), &work, &head);
+        let head_hash = head_record
+            .evidence
+            .iter()
+            .find(|line| line.starts_with("paths_sha256="))
+            .unwrap();
+        assert_ne!(full_hash.as_str(), head_hash);
+        assert!(real.evidence.iter().any(|line| line == "severity=normal"));
+        assert!(real.evidence.iter().any(|line| line == "partial=true"));
+        assert_eq!(operation_status(&full), 1);
+        assert_eq!(operation_status(&head), 1);
+        let complete = report(&[b"/srv/app/build/cache"], false, false);
+        assert_eq!(operation_status(&complete), 0);
+        assert!(operation_message(&complete).contains("removed 1"));
+        assert!(operation_message(&report(&[b"/a"], true, false)).contains("dry-run"));
+        assert!(operation_message(&full).contains("partial"));
+        let refusal = walk_refusal(&RemoveError::AncestorRefused);
+        assert_eq!(
+            refusal,
+            Refusal::Failed {
+                stage: Stage::Exec,
+                reason: RemoveError::AncestorRefused.to_string(),
+            }
+        );
+        let request = Refusal::Request(RequestError::NoAction);
+        let missing = Refusal::NoPendingRequest { pid: 1 };
+        let confirm = Refusal::ConfirmationMissing(Box::new(Decision::deny(
+            DenialCode::Frozen,
+            Vec::new(),
+            Vec::new(),
+        )));
+        let failed = Refusal::Failed {
+            stage: Stage::Audit,
+            reason: "audit".to_owned(),
+        };
+        for case in [&request, &missing, &confirm, &failed, &refusal] {
+            assert!(!is_operation_refusal(case));
+            assert_eq!(denial_of(case), None);
+            assert_eq!(verdict_of(case), None);
+        }
+    }
+
+    fn report_owned(paths: &[Vec<u8>], dry_run: bool, partial: bool) -> RemoveReport {
+        RemoveReport {
+            digest: xudo_sys::removal_digest(paths),
+            removed: paths.to_vec(),
+            bytes: 1,
+            partial,
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn hex_digits_cover_every_nibble() {
+        let digest = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(4);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        assert_eq!(
+            hex_digest(&bytes),
+            "0123456789abcdef".repeat(2) + &"0123456789abcdef".repeat(2)
+        );
+    }
+}

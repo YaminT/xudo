@@ -109,6 +109,8 @@ pub struct GateContext {
 /// How loudly a refusal should be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
+    /// A dry-run operation: listed, nothing removed.
+    Low,
     /// An ordinary refusal: a policy denial, a race, an expiry.
     Normal,
     /// A refusal that only happens when someone is trying something.
@@ -119,6 +121,7 @@ impl Severity {
     /// The label recorded in the audit trail.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Low => "low",
             Self::Normal => "normal",
             Self::High => "high",
         }
@@ -807,6 +810,7 @@ all = [
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         }
     }
 
@@ -1231,6 +1235,7 @@ all = [
 
     #[test]
     fn severity_labels_are_the_strings_an_alert_matches_on() {
+        assert_eq!(Severity::Low.label(), "low");
         assert_eq!(Severity::Normal.label(), "normal");
         assert_eq!(Severity::High.label(), "high");
     }

@@ -99,6 +99,7 @@ fn entry() -> PendingRequest {
         boot_id: None,
         attested_harness: None,
         queue_id: None,
+        operation: None,
     }
 }
 

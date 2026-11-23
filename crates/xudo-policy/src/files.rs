@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::deny_rule::{DenyClause, DenyRule};
 use crate::harness::{HarnessError, HarnessRegistry};
 use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
+use crate::operation::{OpKind, Operation};
 use crate::rule::{Action, ConfirmPolicy, Outcome, RuleSet, RuleSetError, Tier};
 use crate::rule_test::RuleTest;
 
@@ -223,6 +224,7 @@ pub fn load_policy(
     hasher.update(GENERATION_DOMAIN);
     let mut actions: Vec<Action> = Vec::new();
     let mut deny_rules: Vec<DenyRule> = Vec::new();
+    let mut operations: Vec<Operation> = Vec::new();
     let mut tests: Vec<RuleTest> = Vec::new();
 
     for file in &files {
@@ -240,9 +242,15 @@ pub fn load_policy(
 
         let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
 
-        // A file with no actions or deny rules is not policy, so it is not
-        // hashed: a file of tests alone must not move the generation.
-        if !parsed.actions().is_empty() || !parsed.deny_rules().is_empty() {
+        // A file with no actions, deny rules, or operations is not policy, so
+        // it is not hashed: a file of tests alone must not move the generation.
+        // The operations frame is written only when the file has operations, so
+        // an action-only file keeps the generation it had before operations
+        // existed.
+        if !parsed.actions().is_empty()
+            || !parsed.deny_rules().is_empty()
+            || !parsed.operations().is_empty()
+        {
             framed(&mut hasher, &file.name);
             for action in parsed.actions() {
                 framed(&mut hasher, &policy_form(action));
@@ -253,6 +261,12 @@ pub fn load_policy(
             for form in deny_forms {
                 framed(&mut hasher, &form);
             }
+            if !parsed.operations().is_empty() {
+                framed(&mut hasher, b"operations-v1");
+                for operation in parsed.operations() {
+                    framed(&mut hasher, &policy_form_operation(operation));
+                }
+            }
             // Closes the file, so the last action of one cannot be read as the
             // first of the next.
             framed(&mut hasher, b"");
@@ -260,6 +274,7 @@ pub fn load_policy(
 
         actions.extend(parsed.actions().iter().cloned());
         deny_rules.extend(parsed.deny_rules().iter().cloned());
+        operations.extend(parsed.operations().iter().cloned());
         tests.extend(file_tests);
         if tests.len() > MAX_TESTS {
             return Err(RuleFilesError::TooManyTests { limit: MAX_TESTS });
@@ -278,6 +293,18 @@ pub fn load_policy(
             }
         }
     }
+    for operation in &operations {
+        for label in &operation.harness {
+            if registry.get(label).is_none() {
+                return Err(RuleSetError::UnknownHarness {
+                    id: operation.id.as_str().to_owned(),
+                    label: label.clone(),
+                    at: operation.source.clone(),
+                }
+                .into());
+            }
+        }
+    }
 
     // Hashed only when present, so a ruleset with no harness files keeps the
     // generation it had before the registry existed.
@@ -289,7 +316,7 @@ pub fn load_policy(
     }
 
     Ok(LoadedRuleSet {
-        rules: RuleSet::load_with_deny_rules(actions, deny_rules)?,
+        rules: RuleSet::load_all(actions, deny_rules, operations)?,
         generation: Generation(hasher.finalize().into()),
         tests,
         harnesses: registry,
@@ -424,6 +451,48 @@ fn policy_form(action: &Action) -> Vec<u8> {
     if *outcome != Outcome::Allow {
         put(&mut out, b"outcome");
         put(&mut out, outcome.as_str().as_bytes());
+    }
+    out
+}
+
+/// Canonical form of one operation. Every field that can change a decision is
+/// included. `source` is provenance. An empty harness list is still encoded,
+/// because this frame did not exist before operations did, so there is no old
+/// digest to preserve inside it.
+fn policy_form_operation(operation: &Operation) -> Vec<u8> {
+    let Operation {
+        id,
+        op,
+        under,
+        recursive,
+        max_depth,
+        max_entries,
+        owners,
+        harness,
+        source: _,
+    } = operation;
+    let mut out = Vec::new();
+    put(&mut out, id.as_str().as_bytes());
+    match op {
+        OpKind::RemovePath => put(&mut out, b"remove-path"),
+    }
+    put(&mut out, under.as_bytes());
+    out.push(u8::from(*recursive));
+    put(&mut out, &max_depth.to_be_bytes());
+    put(&mut out, &max_entries.to_be_bytes());
+    match owners {
+        None => put(&mut out, b"owners-any-but-root"),
+        Some(names) => {
+            put(&mut out, b"owners");
+            put_len(&mut out, names.len());
+            for name in names {
+                put(&mut out, name.as_bytes());
+            }
+        }
+    }
+    put_len(&mut out, harness.len());
+    for label in harness {
+        put(&mut out, label.as_bytes());
     }
     out
 }
@@ -627,6 +696,64 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         // the rules are identical.
         assert_ne!(base, renamed);
         assert_ne!(base, edited);
+    }
+
+    #[test]
+    fn an_operation_is_hashed_and_a_test_file_is_not() {
+        let action = generation(vec![file("10-a.toml", ONE_ACTION)]);
+        let with_test = generation(vec![file(
+            "10-a.toml",
+            &format!(
+                "{ONE_ACTION}\n[[test]]\nargv = [\"/usr/bin/systemctl\", \"restart\", \"nginx.service\"]\nexpect = \"allow\"\n"
+            ),
+        )]);
+        assert_eq!(action, with_test);
+        let operation = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 8
+max-entries = 10
+"#;
+        let only = generation(vec![file("50-remove.toml", operation)]);
+        let changed = generation(vec![file(
+            "50-remove.toml",
+            &operation.replace("max-entries = 10", "max-entries = 11"),
+        )]);
+        assert_ne!(only, changed);
+        assert_ne!(only, action);
+        let alongside = generation(vec![
+            file("10-a.toml", ONE_ACTION),
+            file("50-remove.toml", operation),
+        ]);
+        assert_ne!(alongside, action);
+    }
+
+    #[test]
+    fn an_operation_owner_and_harness_change_the_generation() {
+        let base = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\n";
+        let harnesses = [harness_file("codex", "agent", 4)];
+        let of = |text: &str| {
+            load_policy(vec![file("50-remove.toml", text)], &harnesses)
+                .unwrap()
+                .generation
+        };
+        let plain = of(base);
+        let owned = of(&format!("{base}owners = [\"agent\"]\n"));
+        let other = of(&format!("{base}owners = [\"agent\", \"www-data\"]\n"));
+        let labelled = of(&format!("{base}harness = [\"codex\"]\n"));
+        assert_ne!(plain, owned);
+        assert_ne!(owned, other);
+        assert_ne!(plain, labelled);
+    }
+
+    #[test]
+    fn an_operation_naming_an_unknown_harness_does_not_load() {
+        let text = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"ghost\"]\n";
+        let err = load_rule_files(vec![file("50-remove.toml", text)]).unwrap_err();
+        assert!(format!("{err:?}").contains("UnknownHarness"), "{err:?}");
     }
 
     #[test]

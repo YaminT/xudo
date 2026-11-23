@@ -96,6 +96,9 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 // A response carries a decision about a request, so it is never the smaller.
 const _: () = assert!(MAX_RESPONSE_BYTES > MAX_REQUEST_BYTES);
 
+/// Marker program stored on a typed-operation spool entry. Never executed.
+pub const OPERATION_PROGRAM: &str = "/usr/libexec/xudo/xudo-op";
+
 /// What the front-end asks. Every connection carries exactly one question.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +183,18 @@ pub enum Question {
     QueueListPage {
         /// The last id of the previous page, or empty for the first page.
         after: String,
+    },
+    /// Remove one path under a `remove-path` rule. Password path only.
+    ///
+    /// The broker mints a spool entry. The gate walks the tree itself and does
+    /// not exec [`OPERATION_PROGRAM`].
+    RemovePath {
+        /// Absolute target bytes. No NUL. At most [`MAX_PROGRAM_BYTES`].
+        target: Vec<u8>,
+        /// List the paths and unlink nothing.
+        dry_run: bool,
+        /// Unauthenticated classification hint for the audit record.
+        claimed_classification: String,
     },
 }
 
@@ -330,6 +345,29 @@ impl BrokerRequest {
                     });
                 }
             }
+            Question::RemovePath {
+                target,
+                claimed_classification,
+                ..
+            } => {
+                if target.is_empty() || !target.starts_with(b"/") || target.contains(&0) {
+                    return Err(RequestError::Malformed {
+                        reason: "target must be an absolute path without NUL".to_owned(),
+                    });
+                }
+                if target.len() > MAX_PROGRAM_BYTES {
+                    return Err(RequestError::FieldTooLarge {
+                        field: "target".to_owned(),
+                        limit: MAX_PROGRAM_BYTES,
+                    });
+                }
+                bounded(
+                    "claimed_classification",
+                    claimed_classification,
+                    MAX_CLASSIFICATION_BYTES,
+                )?;
+                refuse_nul("claimed_classification", claimed_classification)?;
+            }
         }
         Ok(())
     }
@@ -343,6 +381,18 @@ impl BrokerRequest {
                 claimed_classification,
                 ..
             } => Some((program, argv, claimed_classification)),
+            _ => None,
+        }
+    }
+
+    /// Remove-path fields, if this is that question.
+    pub fn remove_fields(&self) -> Option<(&[u8], bool, &str)> {
+        match &self.question {
+            Question::RemovePath {
+                target,
+                dry_run,
+                claimed_classification,
+            } => Some((target, *dry_run, claimed_classification)),
             _ => None,
         }
     }
@@ -1070,6 +1120,7 @@ fn valid_question_shape(value: &serde_json::Value) -> bool {
                 | "queue_complete"
                 | "queue_release"
                 | "queue_list_page"
+                | "remove_path"
         );
         (unit && payload.is_null()) || (data && payload.is_object())
     })
@@ -1096,6 +1147,7 @@ fn question_shape(question: &Question) -> QuestionShape {
         Question::QueueComplete { .. } => QuestionShape::Variant("queue_complete", false),
         Question::QueueRelease { .. } => QuestionShape::Variant("queue_release", false),
         Question::QueueListPage { .. } => QuestionShape::Variant("queue_list_page", false),
+        Question::RemovePath { .. } => QuestionShape::Variant("remove_path", false),
     }
 }
 
@@ -1344,6 +1396,11 @@ mod tests {
             },
             Question::QueueListPage {
                 after: String::new(),
+            },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: true,
+                claimed_classification: "x".into(),
             },
         ];
         for question in variants {
@@ -1609,13 +1666,82 @@ mod tests {
             Question::QueueListPage {
                 after: "ab".to_owned(),
             },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+                claimed_classification: "unattested".into(),
+            },
         ] {
             let request = BrokerRequest {
                 schema_version: WIRE_SCHEMA_VERSION,
                 question,
             };
             assert_eq!(request.run_fields(), None);
+            if let Question::RemovePath {
+                target, dry_run, ..
+            } = &request.question
+            {
+                assert_eq!(
+                    request.remove_fields(),
+                    Some((target.as_slice(), *dry_run, "unattested"))
+                );
+            } else {
+                assert_eq!(request.remove_fields(), None);
+            }
         }
+    }
+
+    #[test]
+    fn a_remove_path_question_rejects_a_bad_target() {
+        let cases = [
+            Question::RemovePath {
+                target: Vec::new(),
+                dry_run: false,
+                claimed_classification: "x".into(),
+            },
+            Question::RemovePath {
+                target: b"relative".to_vec(),
+                dry_run: false,
+                claimed_classification: "x".into(),
+            },
+            Question::RemovePath {
+                target: b"/has\0nul".to_vec(),
+                dry_run: true,
+                claimed_classification: "x".into(),
+            },
+            Question::RemovePath {
+                target: vec![b'/'; MAX_PROGRAM_BYTES + 1],
+                dry_run: false,
+                claimed_classification: "x".into(),
+            },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+                claimed_classification: "\0".into(),
+            },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+                claimed_classification: "x".repeat(MAX_CLASSIFICATION_BYTES + 1),
+            },
+        ];
+        for question in cases {
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            assert!(BrokerRequest::parse(request.to_json().as_bytes()).is_err());
+        }
+        let ok = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: true,
+                claimed_classification: "unattested".into(),
+            },
+        };
+        let parsed = BrokerRequest::parse(ok.to_json().as_bytes()).unwrap();
+        assert_eq!(parsed, ok);
     }
 
     #[test]

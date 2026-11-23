@@ -69,6 +69,7 @@ pub(crate) fn keep_lane_short_ttl_marker_linked() {
 pub mod classify;
 pub mod decide;
 pub mod env;
+mod operate;
 pub mod policy;
 
 /// Parser entry points exposed only to the separate fuzz crate.
