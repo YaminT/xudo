@@ -5,6 +5,14 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `xudo op remove-path <target>` removes a path under an `[[operation]]` rule
+  through the password-authenticated gate. `--dry-run` lists the paths and
+  removes nothing. A `harness` label on the rule is parsed and checked against
+  the registry and is not a grant. Harness use of this operation is planned.
+  The passwordless gate is not in this release.
+
 ### Changed
 
 - Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. A human reviewer runs a queued entry with `xudo exec --queued ID`: the broker re-decides the stored argv, the password gate runs it in `/`, and the entry is completed only from that gate's audit record. `ido` lists the root-held queue separately from the agent-editable user queue. The passwordless gate is not in this release.
@@ -13,6 +21,7 @@ All notable changes to xudo are documented here. This project follows
 ### Security
 
 - `xudo freeze` and `xudo thaw` now classify the caller against the real harness registry. They used an empty one, so an enrolled agent counted as unattested and could lift its owner's freeze. Tests `an_enrolled_agent_cannot_thaw_its_owners_freeze_through_the_broker`, `an_enrolled_agent_cannot_freeze_or_thaw_others`.
+- The doas rule `xudo install` writes no longer says `persist`: an OpenDoas built with timestamp support cached the password for later runs of `xudo exec`. Test `doas_snippet_never_enables_credential_persistence`.
 - A queued claim records the reviewer uid and a claim token. Another reviewer cannot release, fail, or complete a fresh claim; after 15 minutes they may recover a stale claim, and only if the audit trail has no gate record for that nonce. A release or failure revokes the minted spool entry. The gate refuses a queued run whose queue record is not currently claimed for that nonce. Completion searches a bounded tail of the audit log under the log lock.
 - Let the broker read `/proc/sys/kernel/random/boot_id` by removing
   `ProcSubset=pid` from its unit. Keep `ProtectKernelTunables=yes`; the unit

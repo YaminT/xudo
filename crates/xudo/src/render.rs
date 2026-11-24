@@ -155,6 +155,9 @@ fn trace_line(step: &TraceStep) -> String {
         TraceStep::AskHumanQueued { action, source } => {
             format!("ask-human queued by {action} at {source}")
         }
+        TraceStep::OperationMatched { action, source } => {
+            format!("matched operation {action} at {source}")
+        }
     }
 }
 
@@ -535,6 +538,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             TraceStep::AskHumanQueued {
                 action: "xudo.review.test".into(),
                 source: "10-review.toml:1".into(),
+            },
+            TraceStep::OperationMatched {
+                action: "web.clean-build".into(),
+                source: "50-remove-path.toml:1".into(),
             },
         ];
         for step in &steps {

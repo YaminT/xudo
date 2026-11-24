@@ -86,7 +86,6 @@
 //! more line: move the log aside. That line is fixed. Nothing from the log,
 //! the spool, the ruleset or the environment reaches either line.
 
-use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -211,6 +210,16 @@ pub trait GateHost {
     fn programs(&self) -> &dyn Programs;
     /// The audit trail.
     fn audit(&mut self) -> &mut dyn AuditSink;
+    /// Runs a typed remove-path. The host opens nothing until this is called.
+    ///
+    /// # Errors
+    ///
+    /// [`xudo_sys::RemoveError`] when the walk removes nothing. A partial walk
+    /// is `Ok` with [`xudo_sys::RemoveReport::partial`] set.
+    fn remove_path(
+        &mut self,
+        request: &xudo_sys::RemoveRequest,
+    ) -> Result<xudo_sys::RemoveReport, xudo_sys::RemoveError>;
 }
 
 /// The real host: the running kernel, the real `/proc`, `/etc/xudo/rules.d`,
@@ -283,6 +292,13 @@ impl GateHost for SystemHost {
 
     fn audit(&mut self) -> &mut dyn AuditSink {
         &mut self.audit
+    }
+
+    fn remove_path(
+        &mut self,
+        request: &xudo_sys::RemoveRequest,
+    ) -> Result<xudo_sys::RemoveReport, xudo_sys::RemoveError> {
+        xudo_sys::remove_path_on_host(request)
     }
 }
 
@@ -467,13 +483,17 @@ struct Progress {
     /// record is a second append; either one is enough to warn the operator.
     /// The sentence is static.
     audit_notice: Option<&'static str>,
+    /// Entries a remove-path walk already removed when its final audit
+    /// record failed: the work is done, so the exit must not say "refused".
+    removed_unrecorded: Option<usize>,
 }
 
 /// Runs the gate.
 ///
-/// Returns only when the gate did **not** exec: a successful exec replaces the
-/// process, so what comes back is always a refusal, already written to the
-/// audit trail where that was possible.
+/// Returns when the gate did **not** exec. A successful exec replaces the
+/// process. A finished remove-path returns here: the walk already wrote its
+/// one audit record, and this function does not write another. A refusal is
+/// written to the audit trail where that was possible.
 pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
     #[cfg(feature = "lane-short-ttl")]
     crate::keep_lane_short_ttl_marker_linked();
@@ -482,16 +502,33 @@ pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
         gate_pid: host.hygiene().pid(),
         ..Progress::default()
     };
-    let Err(refusal) = proceed(host, args, &mut progress);
+    match proceed(host, args, &mut progress) {
+        Ok(report) => GateExit {
+            status: crate::operate::operation_status(&report),
+            message: crate::operate::operation_message(&report),
+        },
+        Err(refusal) => finish_refusal(host, &refusal, &progress),
+    }
+}
+
+/// Writes the refusal and builds the exit line.
+fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) -> GateExit {
     // The authorization append and the refusal append are different calls.
     // Either one reporting damage is enough, and the sentence is the same,
     // so the operator sees it once.
-    let notice = record(host, &refusal, &progress).or(progress.audit_notice);
-    let mut message = format!(
-        "xudo-gate: refused ({}, severity {})",
-        refusal.code(),
-        refusal.severity().label()
-    );
+    let notice = record(host, refusal, progress).or(progress.audit_notice);
+    let mut message = match progress.removed_unrecorded {
+        Some(count) => format!(
+            "xudo-gate: removed {count} entries; the audit record failed ({}, severity {})",
+            refusal.code(),
+            refusal.severity().label()
+        ),
+        None => format!(
+            "xudo-gate: refused ({}, severity {})",
+            refusal.code(),
+            refusal.severity().label()
+        ),
+    };
     if let Some(line) = notice {
         message.push('\n');
         message.push_str("xudo-gate: ");
@@ -558,13 +595,15 @@ fn require_queued_claim(host: &dyn GateHost, entry: &PendingRequest) -> Result<(
     }
 }
 
-/// The steps, in order. `Err` is how the gate ends; there is no `Ok`, because
-/// a successful exec does not return.
+/// The steps, in order. `Ok` is a finished remove-path. `Err` is every other
+/// ending, including a successful exec, which does not return to the caller
+/// of [`run`] on the real host and is a refusal here when the exec fails.
+#[allow(clippy::too_many_lines)]
 fn proceed(
     host: &mut dyn GateHost,
     args: &[OsString],
     progress: &mut Progress,
-) -> Result<Infallible, Refusal> {
+) -> Result<xudo_sys::RemoveReport, Refusal> {
     stage(
         Stage::Descriptors,
         host.syscalls().mark_cloexec_from(FIRST_INHERITED_FD),
@@ -637,6 +676,21 @@ fn proceed(
             pid: caller.pin.pid,
         });
     };
+    crate::decide::validate_pending_identity(&pending_entry, &caller, &context)?;
+    // A typed operation never opens the marker program and never execs.
+    // The password name was already required by `accept_invocation`.
+    if let Some(requested) = pending_entry.operation.as_ref() {
+        return run_typed_operation(
+            host,
+            &loaded,
+            &caller,
+            &pending_entry,
+            requested,
+            &context,
+            &*spool,
+            progress,
+        );
+    }
     let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
     progress.evidence.push(entry.confirmation().to_owned());
     require_queued_claim(host, &pending_entry)?;
@@ -684,6 +738,78 @@ fn proceed(
     ));
 
     Err(execute(host, &authorized, &program))
+}
+
+/// Re-decides a remove-path, consumes the spool entry, walks, then writes the
+/// one audit record. Policy and password failures do not consume. A walk
+/// error after consume is a refusal: nothing was removed. An audit error
+/// after a removal is also a refusal, and the names are already gone.
+#[allow(clippy::too_many_arguments)]
+fn run_typed_operation(
+    host: &mut dyn GateHost,
+    loaded: &LoadedPolicy,
+    caller: &GateCaller,
+    pending: &PendingRequest,
+    requested: &crate::request::RequestedOp,
+    context: &GateContext,
+    spool: &dyn RequestSpool,
+    progress: &mut Progress,
+) -> Result<xudo_sys::RemoveReport, Refusal> {
+    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or("");
+    let mut work = crate::operate::prepare_remove(
+        &loaded.rules.rules,
+        &caller.facts,
+        pending,
+        &requested.op,
+        &requested.target,
+        requested.dry_run,
+        context.settings,
+        passwd,
+        context.password_confirms,
+    )?;
+    progress.evidence.push(format!(
+        "op=remove-path target={}",
+        requested.target.escape_ascii()
+    ));
+    stage(Stage::Spool, spool.consume(&pending.nonce))?;
+    // Fatal signals may still terminate the gate between this record and an
+    // unlink; no safe signal-deferral API is available in this crate. The
+    // intent remains a durable trace of what the walk was about to do.
+    let mut planned_request = work.request.clone();
+    planned_request.dry_run = true;
+    let planned = match host.remove_path(&planned_request) {
+        Ok(report) => report,
+        Err(error) => return Err(crate::operate::walk_refusal(&error)),
+    };
+    let intent = host
+        .audit()
+        .append(&|previous| crate::operate::intent_record(previous, caller, &work, &planned))
+        .map_err(|error| {
+            progress.audit_notice = error.damaged_log_notice();
+            Refusal::Failed {
+                stage: Stage::Audit,
+                reason: error.to_string(),
+            }
+        })?;
+    work.intent_sequence = Some(intent.seq().get());
+    let report = match host.remove_path(&work.request) {
+        Ok(report) => report,
+        Err(error) => return Err(crate::operate::walk_refusal(&error)),
+    };
+    let recorded_caller = caller.clone();
+    let recorded_work = work.clone();
+    let recorded_report = report.clone();
+    if let Err(error) = host.audit().append(&|previous| {
+        crate::operate::remove_record(previous, &recorded_caller, &recorded_work, &recorded_report)
+    }) {
+        progress.audit_notice = error.damaged_log_notice();
+        progress.removed_unrecorded = Some(report.removed.len());
+        return Err(Refusal::Failed {
+            stage: Stage::Audit,
+            reason: error.to_string(),
+        });
+    }
+    Ok(report)
 }
 
 fn load_policy_or_refuse(host: &dyn GateHost) -> Result<LoadedPolicy, Refusal> {
@@ -1067,6 +1193,7 @@ args = [
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         }
     }
 
@@ -1164,6 +1291,10 @@ args = [
         user_freezes: Vec<u32>,
         /// The uids the gate asked about.
         freeze_asked: std::cell::RefCell<Vec<u32>>,
+        /// The in-memory tree a remove-path walks.
+        remove: xudo_sys::FakeRemoveFs,
+        /// Make the fake unlink seam assert that a durable intent exists.
+        assert_intent_before_unlink: bool,
     }
 
     #[test]
@@ -1310,6 +1441,8 @@ args = [
                 spool_opened: Cell::new(false),
                 user_freezes: Vec::new(),
                 freeze_asked: std::cell::RefCell::new(Vec::new()),
+                remove: xudo_sys::FakeRemoveFs::new(),
+                assert_intent_before_unlink: false,
             }
         }
     }
@@ -1378,6 +1511,20 @@ args = [
         }
         fn audit(&mut self) -> &mut dyn AuditSink {
             &mut self.audit
+        }
+        fn remove_path(
+            &mut self,
+            request: &xudo_sys::RemoveRequest,
+        ) -> Result<xudo_sys::RemoveReport, xudo_sys::RemoveError> {
+            if self.assert_intent_before_unlink && !request.dry_run {
+                assert!(
+                    self.audit
+                        .records()
+                        .iter()
+                        .any(|record| { has_line(&record.evidence, "op=remove-path-intent") })
+                );
+            }
+            xudo_sys::remove_path(&mut self.remove, request)
         }
     }
 
@@ -1993,6 +2140,26 @@ all = [{ any-arg = ["restart"] }]
     }
 
     // ---- consuming --------------------------------------------------------
+
+    #[test]
+    fn a_remove_path_entry_taken_by_a_rival_gate_removes_nothing() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.rival = true;
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 19, "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert_eq!(
+            denial_codes(&host),
+            vec![Some("gate_failed_spool".to_owned())]
+        );
+    }
 
     #[test]
     fn an_entry_that_was_already_gone_when_the_gate_consumed_it_runs_nothing() {
@@ -2808,6 +2975,20 @@ all = [{ any-arg = ["restart"] }]
         // The audit trail is the system's. Handed out, never written to: a
         // test must not leave a record in a real log if it is run as root.
         let _trail = host.audit();
+        let missing = xudo_sys::RemoveRequest {
+            under: b"/no/such/xudo-t1-remove".to_vec(),
+            relative: b"cache".to_vec(),
+            recursive: false,
+            max_depth: 2,
+            max_entries: 1,
+            owners: xudo_sys::RemoveOwnerPolicy::AnyButRoot,
+            dry_run: true,
+        };
+        let error = host.remove_path(&missing).unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(error, xudo_sys::RemoveError::AncestorRefused);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(error, xudo_sys::RemoveError::Unsupported);
     }
 
     #[test]
@@ -2853,5 +3034,311 @@ all = [{ any-arg = ["restart"] }]
         let refusal = execute(&host, &authorized, &program);
         assert_eq!(refusal.code(), "gate_failed_exec");
         assert_eq!(exec_calls(&host), 0);
+    }
+
+    const REMOVE_RULE: &str = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#;
+
+    fn remove_policy(text: &str) -> LoadedPolicy {
+        LoadedPolicy {
+            rules: load_policy(
+                vec![RuleFile {
+                    name: b"50-remove.toml".to_vec(),
+                    bytes: text.as_bytes().to_vec(),
+                }],
+                &[],
+            )
+            .unwrap(),
+            settings: engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
+            passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
+        }
+    }
+
+    fn remove_entry(text: &str, target: &[u8], dry_run: bool) -> PendingRequest {
+        let mut entry = ours();
+        entry.program = xudo_wire::OPERATION_PROGRAM.to_owned();
+        entry.argv = vec![target.escape_ascii().to_string()];
+        entry.action = "web.clean-build".to_owned();
+        entry.generation = remove_policy(text).rules.generation.id();
+        entry.operation = Some(crate::request::RequestedOp {
+            op: "remove-path".to_owned(),
+            target: target.to_vec(),
+            dry_run,
+        });
+        entry
+    }
+
+    fn plant_tree(host: &mut FakeHost) {
+        use xudo_sys::remove::NodeKind;
+        let fs = &mut host.remove;
+        fs.add(&[], b"srv", NodeKind::Dir, 0, 0o755, 0);
+        fs.add(&[b"srv"], b"app", NodeKind::Dir, 0, 0o755, 0);
+        fs.add(&[b"srv", b"app"], b"build", NodeKind::Dir, 0, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build"],
+            b"cache",
+            NodeKind::File,
+            1000,
+            0o644,
+            4,
+        );
+    }
+
+    fn assert_remove_entry_refused(entry: PendingRequest) {
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+    }
+
+    #[test]
+    fn an_expired_remove_path_entry_is_refused_by_the_gate() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.deadline = crate::request::BoottimeMillis(NOW);
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn a_stale_generation_remove_path_entry_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.generation = entry.generation.saturating_add(1);
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn an_entry_minted_under_another_operation_rule_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.action = "other.clean-build".to_owned();
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn a_remove_path_entry_for_another_attested_identity_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 91 };
+        entry.attested_scope_id = Some(91);
+        entry.boot_id = Some("01234567-89ab-cdef-0123-456789abcdef".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn a_password_gate_removes_a_path_and_does_not_exec() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert_eq!(exit.status, 0, "{exit:?}");
+        assert!(exit.message.contains("removed 1"));
+        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        let records = host.audit.records();
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[0].evidence, "planned_count=1"));
+        assert_eq!(records[1].decision, AuditDecision::Allowed);
+        assert!(has_line(&records[1].evidence, "op=remove-path"));
+        assert!(has_line(&records[1].evidence, "intent_seq=1"));
+        assert!(has_line(&records[1].evidence, "severity=normal"));
+        assert_eq!(records[1].outcome.kind(), "exited");
+    }
+
+    #[test]
+    fn a_killed_walk_leaves_an_intent_record() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.remove.fail_at("unlinkat", 0, 5);
+        host.assert_intent_before_unlink = true;
+        let _ = run(&mut host, &auth());
+        assert!(host.audit.records().iter().any(|record| {
+            has_line(&record.evidence, "op=remove-path-intent")
+                && has_line(&record.evidence, "planned_count=1")
+        }));
+        assert!(host.remove.unlinked().is_empty());
+    }
+
+    #[test]
+    fn dry_run_removes_nothing() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", true),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        assert_eq!(exec_calls(&host), 0);
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(host.remove.unlinked().is_empty());
+        let records = host.audit.records();
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[0].evidence, "planned_count=1"));
+        assert!(has_line(&records[1].evidence, "severity=low"));
+        assert!(has_line(&records[1].evidence, "dry_run=true"));
+        assert!(has_line(&records[1].evidence, "intent_seq=1"));
+        assert_eq!(records[1].outcome.kind(), "not_executed");
+    }
+
+    #[test]
+    fn a_target_outside_the_tree_is_not_consumed() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/etc/passwd", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 0);
+        assert!(consumed(&spool).is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(exit.message.contains("operation_refused"), "{exit:?}");
+        assert_eq!(
+            denial_codes(&host),
+            vec![Some("operation_refused".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stops_at_max_entries_and_reports_partial() {
+        use xudo_sys::remove::NodeKind;
+        let rule = REMOVE_RULE.replace("max-entries = 10", "max-entries = 1");
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(&rule, b"/srv/app/build/box", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(&rule));
+        plant_tree(&mut host);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"box",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        host.remove.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"a",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        host.remove.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"b",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 1, "{exit:?}");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(exit.message.contains("partial"));
+        let records = host.audit.records();
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert_eq!(records[1].decision, AuditDecision::Allowed);
+        assert!(has_line(&records[1].evidence, "partial=true"));
+        let left = [&b"a"[..], &b"b"[..]]
+            .iter()
+            .filter(|name| {
+                host.remove
+                    .exists(&[b"srv", b"app", b"build", b"box", name])
+            })
+            .count();
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn a_walk_that_cannot_start_is_a_refusal_after_the_entry_is_consumed() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        // No tree is planted: the walk cannot open its first component.
+        let exit = run(&mut host, &auth());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(exit.message.contains("refused"), "{exit:?}");
+    }
+
+    #[test]
+    fn an_audit_failure_before_intent_stops_before_unlink() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.audit = FakeAuditSink::failing("sink closed");
+        let exit = run(&mut host, &auth());
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(exit.message.contains("refused"), "{exit:?}");
+        assert_ne!(exit.status, 0);
+    }
+
+    #[test]
+    fn a_final_audit_failure_after_the_walk_preserves_the_intent_record() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.audit = FakeAuditSink::failing_after(
+            1,
+            AuditError::Unavailable {
+                reason: "sink closed after walk".into(),
+            },
+        );
+        let exit = run(&mut host, &auth());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(!exit.message.contains("refused"), "{exit:?}");
+        assert!(
+            exit.message
+                .contains("removed 1 entries; the audit record failed"),
+            "{exit:?}"
+        );
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        let records = host.audit.records();
+        assert_eq!(records.len(), 1);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
     }
 }

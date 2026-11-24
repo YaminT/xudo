@@ -82,8 +82,11 @@ take_machine_lock root-test
 # unprivileged suite out of a root run.
 # SYS_RESOURCE is needed for the gate to restore a hard limit to the value
 # visible on PID 1 when sudo passes a lower hard limit through.
+# A tmpfs mounted by Docker at a dedicated remove-path test tree exercises mount-point
+# refusal without granting tests the authority to mount arbitrary filesystems.
 docker run --rm -i \
     --cap-add SYS_RESOURCE \
+    --tmpfs /var/lib/xudo-t1-remove-mount:rw,noexec,nosuid,nodev,mode=0755 \
     -v "$root:/src:ro" \
     -v xudo-linux-cargo:/cache/cargo \
     -v xudo-linux-target:/cache/target \

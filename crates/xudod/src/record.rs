@@ -108,7 +108,11 @@ pub fn refused(
     }
     if let Some(request) = request {
         evidence.push(format!("question={}", question_kind(&request.question)));
-        if let Some((_, _, claimed)) = request.run_fields() {
+        let claimed = request
+            .run_fields()
+            .map(|(_, _, claimed)| claimed)
+            .or_else(|| request.remove_fields().map(|(_, _, claimed)| claimed));
+        if let Some(claimed) = claimed {
             evidence.push(format!("claimed_classification={claimed}"));
         }
     }
@@ -137,6 +141,7 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
         xudo_wire::Question::QueueComplete { .. } => "queue_complete",
         xudo_wire::Question::QueueRelease { .. } => "queue_release",
         xudo_wire::Question::QueueListPage { .. } => "queue_list_page",
+        xudo_wire::Question::RemovePath { .. } => "remove_path",
     }
 }
 
@@ -162,6 +167,12 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
 
 /// The request's command as one argv, program first, exactly as asked.
 fn command_of(request: &BrokerRequest) -> Vec<String> {
+    if let Some((target, _, _)) = request.remove_fields() {
+        return vec![
+            xudo_wire::OPERATION_PROGRAM.to_owned(),
+            target.escape_ascii().to_string(),
+        ];
+    }
     request
         .run_fields()
         .map_or_else(Vec::new, |(program, argv, _)| {
@@ -283,6 +294,14 @@ mod tests {
                 "freeze",
             ),
             (xudo_wire::Question::Thaw, "thaw"),
+            (
+                xudo_wire::Question::RemovePath {
+                    target: b"/srv/app/build/cache".to_vec(),
+                    dry_run: false,
+                    claimed_classification: "unattested".to_owned(),
+                },
+                "remove_path",
+            ),
         ] {
             let request = BrokerRequest {
                 schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -427,6 +446,7 @@ mod tests {
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         };
         let record = decided(
             None,
