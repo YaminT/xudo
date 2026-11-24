@@ -77,8 +77,8 @@ pub use files::{
     is_rule_file_name, load_policy, load_rule_files,
 };
 pub use harness::{
-    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, parse_harness_file, passwd_uid,
-    uid_from_passwd_read, valid_account_name, valid_harness_label,
+    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, passwd_uid, uid_from_passwd_read,
+    valid_account_name, valid_harness_label,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use operation::{
