@@ -12,6 +12,7 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- `xudo freeze` and `xudo thaw` now classify the caller against the real harness registry. They used an empty one, so an enrolled agent counted as unattested and could lift its owner's freeze. Tests `an_enrolled_agent_cannot_thaw_its_owners_freeze_through_the_broker`, `an_enrolled_agent_cannot_freeze_or_thaw_others`.
 - A queued claim records the reviewer uid and a claim token. Another reviewer cannot release, fail, or complete a fresh claim; after 15 minutes they may recover a stale claim, and only if the audit trail has no gate record for that nonce. A release or failure revokes the minted spool entry. The gate refuses a queued run whose queue record is not currently claimed for that nonce. Completion searches a bounded tail of the audit log under the log lock.
 - Let the broker read `/proc/sys/kernel/random/boot_id` by removing
   `ProcSubset=pid` from its unit. Keep `ProtectKernelTunables=yes`; the unit
