@@ -182,8 +182,33 @@ impl HarnessRegistry {
             let entry = parse_harness_file(&name, &text)?;
             insert_harness_entry(&mut entries, &name, entry)?;
         }
+        refuse_reviewer_overlap(&entries)?;
         Ok(Self { entries })
     }
+}
+
+/// A reviewer decides what a harness's agents queue, so no reviewer may be a
+/// harness account or user, of this entry or of any other: an agent that could
+/// act as its own reviewer would approve itself.
+fn refuse_reviewer_overlap(entries: &BTreeMap<String, HarnessEntry>) -> Result<(), HarnessError> {
+    let agents: BTreeSet<&str> = entries
+        .values()
+        .flat_map(|entry| entry.account.iter().chain(entry.users.iter()))
+        .map(String::as_str)
+        .collect();
+    for entry in entries.values() {
+        if let Some(reviewer) = entry
+            .reviewers
+            .iter()
+            .find(|reviewer| agents.contains(reviewer.as_str()))
+        {
+            return Err(HarnessError::ReviewerIsHarnessAccount {
+                label: entry.label.clone(),
+                reviewer: reviewer.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn insert_harness_entry(
@@ -233,6 +258,16 @@ pub enum HarnessError {
         label: String,
         /// The second file.
         file: String,
+    },
+    /// A reviewer is also the account or a user of some harness.
+    #[error(
+        "harness {label}: reviewer {reviewer} is a harness account or user; reviewers must be disjoint from every harness's account and users"
+    )]
+    ReviewerIsHarnessAccount {
+        /// The harness that lists the reviewer.
+        label: String,
+        /// The reviewer.
+        reviewer: String,
     },
 }
 
@@ -465,9 +500,70 @@ max-sessions = 4
 label = "claude"
 way = "session"
 users = ["alice", "bob"]
-reviewers = ["alice"]
+reviewers = ["carol"]
 max-sessions = 1
 "#;
+
+    fn overlap_error(files: &[(&str, &str)]) -> HarnessError {
+        HarnessRegistry::from_files(files.iter().copied()).unwrap_err()
+    }
+
+    #[test]
+    fn a_reviewer_that_is_a_harness_account_fails_to_load() {
+        let text = SERVICE.replace(r#"["alice"]"#, r#"["alice", "agent"]"#);
+        let error = overlap_error(&[("codex.toml", &text)]);
+        assert_eq!(
+            error,
+            HarnessError::ReviewerIsHarnessAccount {
+                label: "codex".to_owned(),
+                reviewer: "agent".to_owned(),
+            }
+        );
+        assert!(error.to_string().contains("disjoint"));
+    }
+
+    #[test]
+    fn a_reviewer_that_is_a_harness_user_fails_to_load() {
+        let text = SESSION.replace(r#"["carol"]"#, r#"["bob"]"#);
+        let error = overlap_error(&[("claude.toml", &text)]);
+        assert_eq!(
+            error,
+            HarnessError::ReviewerIsHarnessAccount {
+                label: "claude".to_owned(),
+                reviewer: "bob".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_reviewer_overlapping_another_harness_fails_to_load() {
+        // alice reviews codex but is a user of claude.
+        let error = overlap_error(&[("codex.toml", SERVICE), ("claude.toml", SESSION)]);
+        assert_eq!(
+            error,
+            HarnessError::ReviewerIsHarnessAccount {
+                label: "codex".to_owned(),
+                reviewer: "alice".to_owned(),
+            }
+        );
+        let other = SESSION.replace(r#"["carol"]"#, r#"["agent"]"#);
+        let error = overlap_error(&[("codex.toml", SERVICE), ("claude.toml", &other)]);
+        assert!(matches!(
+            error,
+            HarnessError::ReviewerIsHarnessAccount { ref reviewer, .. } if reviewer == "agent"
+        ));
+    }
+
+    #[test]
+    fn disjoint_reviewers_load_across_harnesses() {
+        let service = SERVICE.replace(r#"["alice"]"#, r#"["carol"]"#);
+        let registry = HarnessRegistry::from_files([
+            ("codex.toml", service.as_str()),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
+        assert_eq!(registry.entries().count(), 2);
+    }
 
     fn service() -> HarnessEntry {
         parse_harness_file("codex.toml", SERVICE).unwrap()
@@ -595,8 +691,12 @@ max-sessions = 1
         assert!(!valid_account_name(""));
         assert!(!valid_account_name("1abc"));
         assert!(valid_account_name("_x"));
-        let ok = HarnessRegistry::from_files([("codex.toml", SERVICE), ("claude.toml", SESSION)])
-            .unwrap();
+        let service = SERVICE.replace("[\"alice\"]", "[\"carol\"]");
+        let ok = HarnessRegistry::from_files([
+            ("codex.toml", service.as_str()),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
         assert!(ok.get("codex").is_some());
         assert_eq!(ok.entries().count(), 2);
         assert!(HarnessRegistry::empty().is_empty());

@@ -20,6 +20,7 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- A harness registry whose reviewer is the account or a user of any harness (its own or another's) now fails to load. Such a reviewer could approve what its own agent queued. Tests `a_reviewer_that_is_a_harness_account_fails_to_load`, `a_reviewer_that_is_a_harness_user_fails_to_load`, `a_reviewer_overlapping_another_harness_fails_to_load`.
 - `xudo freeze` and `xudo thaw` now classify the caller against the real harness registry. They used an empty one, so an enrolled agent counted as unattested and could lift its owner's freeze. Tests `an_enrolled_agent_cannot_thaw_its_owners_freeze_through_the_broker`, `an_enrolled_agent_cannot_freeze_or_thaw_others`.
 - The doas rule `xudo install` writes no longer says `persist`: an OpenDoas built with timestamp support cached the password for later runs of `xudo exec`. Test `doas_snippet_never_enables_credential_persistence`.
 - A queued claim records the reviewer uid and a claim token. Another reviewer cannot release, fail, or complete a fresh claim; after 15 minutes they may recover a stale claim, and only if the audit trail has no gate record for that nonce. A release or failure revokes the minted spool entry. The gate refuses a queued run whose queue record is not currently claimed for that nonce. Completion searches a bounded tail of the audit log under the log lock.
