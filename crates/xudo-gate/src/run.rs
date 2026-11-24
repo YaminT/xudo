@@ -640,7 +640,7 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
-    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or_default();
+    let passwd = loaded.passwd.as_str();
     let caller = caller_for(
         host,
         matched.as_ref(),
@@ -755,7 +755,7 @@ fn run_typed_operation(
     spool: &dyn RequestSpool,
     progress: &mut Progress,
 ) -> Result<xudo_sys::RemoveReport, Refusal> {
-    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or("");
+    let passwd = loaded.passwd.as_str();
     let mut work = crate::operate::prepare_remove(
         &loaded.rules.rules,
         &caller.facts,
@@ -1430,7 +1430,7 @@ args = [
                     rules: rules(),
                     settings: engine::Settings::default(),
                     queue_ttl_secs: 24 * 60 * 60,
-                    passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
+                    passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
                 }),
                 spool: Ok(Rc::clone(spool)),
                 queue: Ok(Rc::new(FakeSpool::new())),
@@ -2018,7 +2018,7 @@ all = [{ any-arg = ["restart"] }]
             rules: changed,
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
-            passwd: Vec::new(),
+            passwd: String::new(),
         });
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_stale_generation");
@@ -3058,7 +3058,7 @@ max-entries = 10
             .unwrap(),
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
-            passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
+            passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
         }
     }
 

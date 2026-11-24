@@ -70,7 +70,7 @@ pub struct LoadedPolicy {
     /// Maximum lifetime, in seconds, of a root-held ask-human entry.
     pub queue_ttl_secs: u64,
     /// Root-owned account records used to match harness accounts to uids.
-    pub passwd: Vec<u8>,
+    pub passwd: String,
 }
 
 /// Why settings bytes could not be interpreted.
@@ -136,8 +136,10 @@ fn attach_passwd(
     passwd: Result<Option<Vec<u8>>, PolicyError>,
 ) -> Result<LoadedPolicy, PolicyError> {
     let mut loaded = loaded?;
-    let passwd = passwd?.filter(|bytes| !bytes.is_empty() && std::str::from_utf8(bytes).is_ok());
-    loaded.passwd = passwd.ok_or(PolicyError::PasswdUnusable)?;
+    loaded.passwd = passwd?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|text| !text.is_empty())
+        .ok_or(PolicyError::PasswdUnusable)?;
     Ok(loaded)
 }
 
@@ -167,7 +169,7 @@ fn load_with(
         rules,
         settings,
         queue_ttl_secs,
-        passwd: Vec::new(),
+        passwd: String::new(),
     })
 }
 
@@ -364,7 +366,6 @@ mod tests {
                 error.to_string(),
                 "the account database is missing, empty, or not UTF-8"
             );
-            assert!(error.to_string().contains("account database"));
         }
     }
 
@@ -380,7 +381,7 @@ mod tests {
         .unwrap();
         let bytes = b"agent:x:1000:1000::/:/bin/sh\n".to_vec();
         let attached = attach_passwd(Ok(loaded), Ok(Some(bytes.clone()))).unwrap();
-        assert_eq!(attached.passwd, bytes);
+        assert_eq!(attached.passwd.as_bytes(), bytes);
     }
 
     #[test]

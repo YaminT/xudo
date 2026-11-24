@@ -220,7 +220,7 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(output.stdout.trim(), "0");
     assert!(!entry_exists(&nonce));
 
-    // A user's thaw needs a caller the broker positively classes as human. In
+    // An unattested caller cannot thaw at all. In
     // this container the peer's cgroup cannot be read, so the user is
     // unattested and the thaw is refused (fail closed); root's marker stands.
     let as_user = |args: &[&str]| {

@@ -258,15 +258,20 @@ backoff strike; a human's pending request is left alone.
 Lift the caller's own freeze and resume that scope. A user's thaw removes only
 the marker for their own uid: root's global freeze stays in force, and so does
 every other user's, until root lifts it. Root's thaw lifts the global freeze
-and every user's marker. A non-root thaw is accepted only from a caller the
-kernel positively classes as a human: an attested agent, an unattested caller,
-and a peer in another user namespace cannot thaw. If the harness registry or
-/etc/passwd cannot be read, freeze and thaw both refuse, so a broken registry
-also locks the human out; nothing runs while the policy fails to load, and root
-can
+and every user's marker. A non-root thaw is refused for an attested agent, an unattested caller, a
+peer in another user namespace, and any caller whose uid is the account or a
+user of a registered harness: being outside an agent scope does not prove a
+human, because an agent can start a process outside its scope as its own uid.
+Those users run
+.B sudo xudo thaw
+instead, which reaches the broker as root. If the harness registry or
+/etc/passwd cannot be read (one non-UTF-8 byte in /etc/passwd is enough), every
+xudo request refuses, so a broken registry also locks the human out; this only
+withholds, and root can
 .B touch /var/lib/xudo/frozen
-to freeze or remove it to thaw. A thaw that needs a password proof arrives with
-the passwordless gate. Run it as the user who froze; do not run it as
+to freeze or remove it to thaw. A thaw that needs a password proof for ordinary
+users arrives with the passwordless gate. A user who is not a harness uid runs
+it as themselves; do not run it as
 .B sudo
 to clear a user's freeze unless root's global freeze should go as well.
 .TP
