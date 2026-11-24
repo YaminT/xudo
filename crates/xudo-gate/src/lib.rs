@@ -43,12 +43,13 @@
 //! | Module | Answers |
 //! |---|---|
 //! | [`request`] | Is this spool entry a live request from *this* caller? |
+//! | [`queue_claim`] | Is a queued run still claimed for this nonce? |
 //! | [`mod@decide`] | Does root's ruleset permit it, and what exactly may run? |
 //! | [`mod@env`] | What environment does the child get? (a fixed one, built here) |
 //! | [`status`] | How is the child's fate reported back faithfully? |
 //! | [`mod@run`] | In what order does the gate do all of it, and what stops it? |
 //!
-//! The first four are pure. The syscalls that surround them — `close_range`,
+//! The first five are pure. The syscalls that surround them — `close_range`,
 //! the `statfs` check on `/proc`, the trust walk, `execveat` — live in
 //! `xudo-sys` behind its traits, which is what lets every refusal below be
 //! reached by a test on a developer's laptop without root. [`mod@run`] is the
@@ -65,8 +66,10 @@ pub(crate) fn keep_lane_short_ttl_marker_linked() {
     std::hint::black_box(XUDO_GATE_LANE_SHORT_TTL_MARKER);
 }
 
+pub mod classify;
 pub mod decide;
 pub mod env;
+mod operate;
 pub mod policy;
 
 /// Parser entry points exposed only to the separate fuzz crate.
@@ -76,6 +79,7 @@ pub mod fuzzing {
     pub use crate::session::{SessionRecord, parse_session_record};
 }
 pub use policy::{MAX_CONFIG_BYTES, PolicyError, SettingsError, settings_from};
+pub mod queue_claim;
 pub mod request;
 pub mod run;
 pub mod session;
@@ -89,5 +93,8 @@ pub use decide::{
 pub use env::child_environment;
 pub use request::{PendingRequest, RequestError, SPOOL_DIR};
 pub use run::{GateExit, GateHost, SystemHost, run};
-pub use session::{SessionKind, SessionRecord, parse_session_record, record_identity};
+pub use session::{
+    SessionRecord, attested_harness_label, parse_session_record, record_identity,
+    record_identity_registered,
+};
 pub use status::Termination;

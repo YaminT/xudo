@@ -53,9 +53,9 @@ pub enum LoadError {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    confirm_agent_actions: Option<bool>,
     confirm_human_path: Option<bool>,
     confirmation_timeout_secs: Option<u64>,
+    queue_ttl_secs: Option<u64>,
     frozen: Option<bool>,
     audit_sink: Option<String>,
     color: Option<bool>,
@@ -103,6 +103,13 @@ pub fn apply_file_scoped(
         reason: e.to_string(),
     })?;
     let lines = key_lines(contents, document.get_ref());
+    if lines.contains_key("confirm_agent_actions") {
+        return Err(LoadError::Parse {
+            file: file.to_owned(),
+            reason: "confirm_agent_actions was removed; agent actions remain on the human path"
+                .to_owned(),
+        });
+    }
     let parsed: File = toml::from_str(contents).map_err(|e| LoadError::Parse {
         file: file.to_owned(),
         reason: e.to_string(),
@@ -133,16 +140,16 @@ pub fn apply_file_scoped(
     // how the keys were written.
     let entries: [(Setting, Option<Value>); 7] = [
         (
-            Setting::ConfirmAgentActions,
-            parsed.confirm_agent_actions.map(Value::Bool),
-        ),
-        (
             Setting::ConfirmHumanPath,
             parsed.confirm_human_path.map(Value::Bool),
         ),
         (
             Setting::ConfirmationTimeoutSecs,
             parsed.confirmation_timeout_secs.map(Value::Integer),
+        ),
+        (
+            Setting::QueueTtlSecs,
+            parsed.queue_ttl_secs.map(Value::Integer),
         ),
         (Setting::Frozen, parsed.frozen.map(Value::Bool)),
         (Setting::AuditSink, parsed.audit_sink.map(Value::Text)),
@@ -221,6 +228,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.get(Setting::Color).value, Value::Bool(false));
+    }
+
+    #[test]
+    fn no_config_layer_can_set_harness() {
+        for layer in Layer::ALL {
+            let mut settings = Settings::default();
+            let error = apply_file(
+                &mut settings,
+                layer,
+                "config.toml",
+                "harness = [\"codex\"]\n",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{layer:?}: {error}"
+            );
+            assert_eq!(settings, Settings::default());
+        }
+    }
+
+    #[test]
+    fn an_old_confirm_agent_actions_key_has_a_clear_removal_error() {
+        let mut settings = Settings::default();
+        let error = apply_file(
+            &mut settings,
+            Layer::System,
+            "/etc/xudo/config.toml",
+            "confirm_agent_actions = false\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("confirm_agent_actions was removed")
+        );
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]
@@ -328,10 +372,16 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("confirm_agent_action"), "{err}");
         // And nothing was applied.
-        assert_eq!(
-            settings.get(Setting::ConfirmAgentActions).value,
-            Value::Bool(true)
-        );
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn no_config_layer_can_set_a_deny_rule() {
+        let mut settings = Settings::default();
+        let err =
+            apply_file(&mut settings, Layer::System, "config.toml", "deny = []\n").unwrap_err();
+        assert!(err.to_string().contains("deny"), "{err}");
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]
@@ -363,11 +413,18 @@ mod tests {
         // The rule that keeps a checked-in file honest, reported with enough
         // detail to fix it.
         let mut settings = Settings::default();
+        settings
+            .apply(
+                Setting::ConfirmHumanPath,
+                Value::Bool(true),
+                Origin::layer(Layer::System),
+            )
+            .unwrap();
         let err = apply_file(
             &mut settings,
             Layer::Project,
             ".xudo/policy.toml",
-            "# our project\nconfirm_agent_actions = false\n",
+            "# our project\nconfirm_human_path = false\n",
         )
         .unwrap_err();
         let message = err.to_string();
@@ -446,16 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_can_actually_be_set_from_a_file() {
+    fn every_configurable_setting_can_actually_be_set_from_a_file() {
         // Guards against a setting being added to the enum and never wired into
         // the file struct, which would make it silently unconfigurable.
         let cases = [
-            ("confirm_agent_actions = true", Setting::ConfirmAgentActions),
             ("confirm_human_path = true", Setting::ConfirmHumanPath),
             (
                 "confirmation_timeout_secs = 45",
                 Setting::ConfirmationTimeoutSecs,
             ),
+            ("queue_ttl_secs = 3600", Setting::QueueTtlSecs),
             ("frozen = true", Setting::Frozen),
             ("audit_sink = \"journald\"", Setting::AuditSink),
             ("color = false", Setting::Color),

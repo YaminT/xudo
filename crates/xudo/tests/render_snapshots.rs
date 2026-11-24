@@ -66,9 +66,21 @@ id = "xudo.oops.shell"
 tier = "diag-read"
 exe = "/bin/sh"
 args = [{ name = "flag", matcher = { literal = "-c" } }]
+
+[[action]]
+id = "xudo.pkg.protected"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "verb", matcher = { literal = "protect-deny" } }]
+
+[[deny]]
+id = "xudo.protect.test"
+reason = "protected by the test fixture"
+program = ["apt-get"]
+all = [{ any-arg = ["protect-deny"] }]
 "#;
 
-const ALL_CODES: [DenialCode; 11] = [
+const ALL_CODES: [DenialCode; 13] = [
     DenialCode::UnknownAction,
     DenialCode::ArgvRejected,
     DenialCode::DenyListed,
@@ -80,6 +92,8 @@ const ALL_CODES: [DenialCode; 11] = [
     DenialCode::ConfirmationRefused,
     DenialCode::ConfirmationExpired,
     DenialCode::ConfirmationThrottled,
+    DenialCode::OperationRefused,
+    DenialCode::DenyRule,
 ];
 
 const ALL_REASONS: [ConfirmReason; 3] = [
@@ -140,7 +154,7 @@ fn denial(code: DenialCode) -> Decision {
         // M3's channel check respectively — so the record is pinned through
         // the constructor those producers will use. When a producer lands, its
         // decision must render exactly this way or the snapshot moves.
-        DenialCode::PolicyUnloadable | DenialCode::NoConfirmationChannel => {
+        DenialCode::PolicyUnloadable | DenialCode::NoConfirmationChannel | DenialCode::AskHuman => {
             Decision::deny(code, Vec::new(), Vec::new())
         }
         DenialCode::Frozen => decide(
@@ -176,7 +190,17 @@ fn denial(code: DenialCode) -> Decision {
         ),
         DenialCode::ConfirmationRefused
         | DenialCode::ConfirmationExpired
-        | DenialCode::ConfirmationThrottled => Decision::deny(code, Vec::new(), Vec::new()),
+        | DenialCode::ConfirmationThrottled
+        | DenialCode::OperationRefused => Decision::deny(code, Vec::new(), Vec::new()),
+        DenialCode::DenyRule => decide(
+            &human_caller(),
+            &Request::for_program(
+                "xudo.pkg.protected",
+                "/usr/bin/apt-get",
+                Argv::new(["protect-deny"]),
+            ),
+            Settings::default(),
+        ),
     }
 }
 

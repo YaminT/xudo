@@ -57,5 +57,9 @@ required-features = ["root-tests"]
 name = "root_race"
 required-features = ["root-tests"]
 
+[[test]]
+name = "root_invocation_refusals"
+required-features = ["root-tests"]
+
 [lints]
 workspace = true

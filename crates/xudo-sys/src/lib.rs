@@ -60,6 +60,7 @@ pub mod proc;
 pub mod procfs;
 pub mod program;
 pub mod provenance;
+pub mod remove;
 pub mod source;
 pub mod spool;
 pub mod syscall;
@@ -105,14 +106,20 @@ pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, 
 pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
+#[cfg(any(test, feature = "fake"))]
+pub use remove::FakeRemoveFs;
+pub use remove::{
+    OwnerPolicy as RemoveOwnerPolicy, RemoveError, RemoveReport, RemoveRequest, removal_digest,
+    remove_path, remove_path_on_host,
+};
 pub use source::{DirSource, MapSource, ProcSource};
 #[cfg(any(test, feature = "fake"))]
 pub use spool::{FakeSpool, SpoolCall};
 pub use spool::{Spool, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
 pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
 pub use trust::{
-    PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_rules, open_trusted,
-    read_trusted_dir, verify_path,
+    PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_policy, load_trusted_rules,
+    open_trusted, read_trusted_dir, verify_path,
 };
 pub use trusted_file::read_trusted_file;
 

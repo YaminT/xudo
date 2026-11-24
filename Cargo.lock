@@ -258,6 +258,7 @@ dependencies = [
  "thiserror",
  "xudo-audit",
  "xudo-config",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -268,6 +269,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "xudo-audit",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -815,7 +817,6 @@ version = "0.1.0-beta.2"
 dependencies = [
  "assert_cmd",
  "clap",
- "ido",
  "predicates",
  "rustix",
  "serde_json",
@@ -848,6 +849,7 @@ dependencies = [
  "xudo-config",
  "xudo-policy",
  "xudo-sys",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -898,6 +900,7 @@ dependencies = [
  "xudo-policy",
  "xudo-sys-raw",
  "xudo-tests",
+ "xudo-wire",
 ]
 
 [[package]]
@@ -937,6 +940,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "term-sanitize",
  "thiserror",
  "xudo-audit",
  "xudo-backend",

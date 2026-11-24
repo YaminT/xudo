@@ -31,6 +31,7 @@ pub use xudo_sys_raw::{
 };
 
 use crate::error::SysError;
+use xudo_wire::is_boot_id;
 
 /// The system calls that need `unsafe`, as a seam.
 pub trait Syscalls {
@@ -257,7 +258,7 @@ fn parse_boot_id(read: std::io::Result<Vec<u8>>) -> Result<String, SysError> {
         reason: "the live boot id was not UTF-8".to_owned(),
     })?;
     let id = text.trim_end_matches('\n');
-    if !valid_boot_id(id) {
+    if !is_boot_id(id) {
         return Err(SysError::Os {
             operation: "read kernel boot id".to_owned(),
             code: None,
@@ -265,18 +266,6 @@ fn parse_boot_id(read: std::io::Result<Vec<u8>>) -> Result<String, SysError> {
         });
     }
     Ok(id.to_owned())
-}
-
-fn valid_boot_id(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                *byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -466,7 +455,7 @@ impl Syscalls for FakeSyscalls {
     fn boot_id(&self) -> Result<String, SysError> {
         self.record(FakeCall::BootId);
         self.boot_id.clone().and_then(|id| {
-            if valid_boot_id(&id) {
+            if is_boot_id(&id) {
                 Ok(id)
             } else {
                 Err(SysError::unsupported("fake: malformed boot id"))
@@ -559,9 +548,23 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn an_uppercase_boot_id_is_refused_everywhere() {
+        let uppercase = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+        assert!(!is_boot_id(uppercase));
+        assert!(parse_boot_id(Ok(format!("{uppercase}\n").into_bytes())).is_err());
+        assert!(
+            FakeSyscalls::new()
+                .with_boot_id(Ok(uppercase.to_owned()))
+                .boot_id()
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn host_reads_the_live_boot_id_through_the_fixed_kernel_path() {
         let id = HostSyscalls.boot_id().unwrap();
-        assert!(valid_boot_id(&id));
+        assert!(is_boot_id(&id));
     }
 
     #[test]

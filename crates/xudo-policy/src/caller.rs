@@ -70,6 +70,17 @@ impl Classification {
         matches!(self, Self::EnrolledAgent { .. })
     }
 
+    /// The registry label of an enrolled agent, when this caller is one.
+    ///
+    /// The engine compares this to an action's `harness` list. A human or an
+    /// unattested caller has no label, so an ask-human rule cannot select them.
+    pub fn enrolled_agent_id(&self) -> Option<&str> {
+        match self {
+            Self::EnrolledAgent { agent_id, .. } => Some(agent_id.as_str()),
+            Self::Human | Self::Unattested { .. } => None,
+        }
+    }
+
     /// Returns `true` when this caller must authenticate with a password.
     ///
     /// Note the asymmetry: everything that is not a proven agent authenticates.
@@ -227,6 +238,20 @@ mod tests {
                 reason: String::new()
             }
             .declared_yolo()
+        );
+    }
+
+    #[test]
+    fn enrolled_agent_id_is_the_registry_label_and_nothing_else() {
+        assert_eq!(agent(false).enrolled_agent_id(), Some("claude-code"));
+        assert_eq!(agent(true).enrolled_agent_id(), Some("claude-code"));
+        assert_eq!(Classification::Human.enrolled_agent_id(), None);
+        assert_eq!(
+            Classification::Unattested {
+                reason: "no scope".into(),
+            }
+            .enrolled_agent_id(),
+            None
         );
     }
 

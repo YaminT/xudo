@@ -1,0 +1,54 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::json(&decision)"
+---
+{
+  "schema_version": 2,
+  "verdict": "deny",
+  "denial": "deny_rule",
+  "remediation": "an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person",
+  "action": null,
+  "rule_source": {
+    "file": "snapshot-fixture.toml",
+    "line": 48
+  },
+  "resolved_exe": null,
+  "resolved_argv": [
+    "protect-deny"
+  ],
+  "confirm": "not_required",
+  "trace": [
+    {
+      "canonicalized": {
+        "before": "protect-deny",
+        "after": "protect-deny"
+      }
+    },
+    {
+      "action_matched": {
+        "action": "xudo.pkg.protected",
+        "source": "snapshot-fixture.toml:42"
+      }
+    },
+    {
+      "deny_list_evaluated": {
+        "version": 7,
+        "matched": []
+      }
+    },
+    {
+      "deny_rules_evaluated": {
+        "matched": [
+          {
+            "id": "xudo.protect.test",
+            "source": {
+              "file": "snapshot-fixture.toml",
+              "line": 48
+            },
+            "reason": "protected by the test fixture"
+          }
+        ]
+      }
+    }
+  ]
+}

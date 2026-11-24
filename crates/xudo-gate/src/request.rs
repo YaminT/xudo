@@ -14,6 +14,8 @@
 //!
 //! 1. **It is this wire format.** An unknown schema, an unknown key, or a
 //!    missing key is a hard parse failure, never a partially-understood request.
+//!    `queue_id` is the one exception: it is absent on an ordinary human-path
+//!    mint, and a missing key means this request is not a queued run.
 //! 2. **It is live.** Past its deadline, it is refused. Deadlines are in
 //!    boottime milliseconds, so suspend cannot extend one.
 //! 3. **It is this caller's.** The entry names the pid *and* the start time of
@@ -284,6 +286,16 @@ pub enum RequestError {
         /// The entry's file name, which is a valid nonce.
         name: String,
     },
+    /// A queued run whose queue record is not claimed for this nonce.
+    ///
+    /// The spool entry names a queue id. The gate reads that root-owned record
+    /// itself and runs the command only while it is claimed for this nonce.
+    /// Pending, done, failed, missing, or claimed for a different nonce is a
+    /// refusal: a queued command does not become an ordinary human-path run.
+    #[error(
+        "queued run is not claimed for this nonce: the gate runs a queued command only while its queue entry is claimed for the minted nonce"
+    )]
+    QueueNotClaimed,
 }
 
 impl RequestError {
@@ -308,15 +320,20 @@ impl RequestError {
             Self::StaleGeneration { .. } => "request_stale_generation",
             Self::Ambiguous { .. } => "request_ambiguous",
             Self::ForgedNonce { .. } => "request_forged_nonce",
+            Self::QueueNotClaimed => "request_queue_not_claimed",
         }
     }
 }
 
 /// One pending request, as it sits in the spool.
 ///
-/// Every field is required. There are no `serde` defaults and no unknown keys:
-/// a request the gate only partly understands is a request it declines to
-/// understand at all.
+/// Every field except [`Self::queue_id`] and [`Self::operation`] is required.
+/// There are no other `serde` defaults and no unknown keys: a request the gate
+/// only partly understands is a request it declines to understand at all.
+/// `queue_id` may be omitted. Absent, the request is an ordinary human-path
+/// mint. Present, it must be 64 lowercase hex and the gate will run it only
+/// while that queue record is claimed for this nonce. `operation` may be
+/// omitted. Present, the gate runs that typed operation instead of exec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingRequest {
@@ -388,19 +405,57 @@ pub struct PendingRequest {
     pub attested_scope_id: Option<u64>,
     /// Kernel boot identifier associated with the scope, when available.
     pub boot_id: Option<String>,
+    /// Registry label copied from the broker's classification at mint.
+    ///
+    /// Present only for an enrolled agent, and only as a valid harness label.
+    /// The confirmation re-decision matches ask-human rules against this label.
+    /// A forged label can change `ask-human` into `human-path-only` or the
+    /// reverse, and both of those are denials.
+    pub attested_harness: Option<String>,
+    /// Queue id when this entry was minted for a claimed queued run.
+    ///
+    /// The one optional field. Old entries and ordinary human-path mints omit
+    /// it. When it is present, [`Self::validate`] requires 64 lowercase hex:
+    /// the gate uses it as a file name under the root-owned queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    /// A typed operation. Absent on an exec request. Present, the gate walks
+    /// the tree itself and does not exec [`Self::program`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<RequestedOp>,
+}
+
+/// A typed operation the broker minted and the gate re-decides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedOp {
+    /// `remove-path` on this step.
+    pub op: String,
+    /// Absolute target bytes.
+    pub target: Vec<u8>,
+    /// List the paths and unlink nothing.
+    pub dry_run: bool,
 }
 
 impl PendingRequest {
-    /// Whether the stored class, scope and boot id agree: an enrolled agent
-    /// has its own scope and a valid boot id, anything else has neither.
+    /// Whether the stored class, scope, boot id, and harness label agree.
+    ///
+    /// An enrolled agent has its own scope, a valid boot id, and a valid
+    /// harness label. A human or an unattested caller has none of those.
     pub fn has_consistent_attested_identity(&self) -> bool {
         match &self.attested_class {
             AttestedClass::EnrolledAgent { scope_id } => {
                 self.attested_scope_id == Some(*scope_id)
                     && self.boot_id.as_ref().is_some_and(|id| is_boot_id(id))
+                    && self
+                        .attested_harness
+                        .as_deref()
+                        .is_some_and(xudo_policy::valid_harness_label)
             }
             AttestedClass::Unattested | AttestedClass::Human => {
-                self.attested_scope_id.is_none() && self.boot_id.is_none()
+                self.attested_scope_id.is_none()
+                    && self.boot_id.is_none()
+                    && self.attested_harness.is_none()
             }
         }
     }
@@ -411,11 +466,13 @@ impl PendingRequest {
     ///
     /// [`RequestError::Malformed`] for anything that is not this wire format,
     /// including an unknown key or a missing required key. Optional fields
-    /// (`confirmed_by`, `shown_at_ms`, and `shown_to`) may be omitted and
-    /// deserialize as `None`, as serde defines for `Option` fields. Attested
+    /// (`confirmed_by`, `shown_at_ms`, `shown_to`, and `queue_id`) may be
+    /// omitted and deserialize as `None`, as serde defines for `Option`
+    /// fields. `queue_id` is the only field a minted entry may leave out on
+    /// purpose. Attested
     /// identity fields must use canonical shapes. That they agree with each
-    /// other (`attested_scope_id` and `boot_id` both present for an enrolled
-    /// agent, both absent otherwise) is checked by `validate`, not here.
+    /// other (scope, boot id, and harness label all present for an enrolled
+    /// agent, all absent otherwise) is checked by `validate`, not here.
     pub fn parse(text: &str) -> Result<Self, RequestError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| RequestError::Malformed {
@@ -490,6 +547,7 @@ impl PendingRequest {
     /// # Errors
     ///
     /// The first fact that does not hold, as the matching [`RequestError`].
+    #[allow(clippy::too_many_lines)]
     pub fn validate(
         &self,
         caller: CallerPin,
@@ -508,6 +566,11 @@ impl PendingRequest {
         if !is_nonce(&self.nonce) {
             return Err(RequestError::MalformedNonce);
         }
+        if self.queue_id.as_ref().is_some_and(|id| !is_nonce(id)) {
+            return Err(RequestError::Malformed {
+                reason: "queue id is not 64 lowercase hex characters".to_owned(),
+            });
+        }
         if self.action.is_empty() {
             return Err(RequestError::NoAction);
         }
@@ -515,6 +578,19 @@ impl PendingRequest {
             return Err(RequestError::NotAbsoluteProgram {
                 program: self.program.clone(),
             });
+        }
+        if let Some(op) = &self.operation {
+            let target_ok = op.op == "remove-path"
+                && self.program == xudo_wire::OPERATION_PROGRAM
+                && !op.target.is_empty()
+                && op.target.len() <= xudo_wire::MAX_PROGRAM_BYTES
+                && !op.target.contains(&0)
+                && op.target.starts_with(b"/");
+            if !target_ok {
+                return Err(RequestError::Malformed {
+                    reason: "operation is not a remove-path under an absolute target".to_owned(),
+                });
+            }
         }
         self.refuse_interior_nul()?;
         let watcher_valid = self.confirmed_by.as_ref().is_some_and(|watcher| {
@@ -595,11 +671,10 @@ impl PendingRequest {
         boot_id: Option<&str>,
     ) -> bool {
         match &self.attested_class {
-            AttestedClass::Unattested => {
-                class == &AttestedClass::Unattested && scope_id.is_none() && boot_id.is_none()
-            }
-            AttestedClass::Human => {
-                class == &AttestedClass::Human && scope_id.is_none() && boot_id.is_none()
+            AttestedClass::Unattested | AttestedClass::Human => {
+                matches!(class, AttestedClass::Unattested | AttestedClass::Human)
+                    && scope_id.is_none()
+                    && boot_id.is_none()
             }
             AttestedClass::EnrolledAgent { scope_id: saved } => {
                 class == &AttestedClass::EnrolledAgent { scope_id: *saved }
@@ -659,16 +734,7 @@ pub fn is_nonce(candidate: &str) -> bool {
 }
 
 /// Whether `candidate` is a canonical lowercase UUID boot id.
-pub fn is_boot_id(candidate: &str) -> bool {
-    candidate.len() == 36
-        && candidate.bytes().enumerate().all(|(offset, byte)| {
-            if matches!(offset, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        })
-}
+pub use xudo_wire::is_boot_id;
 
 /// Whether a request fingerprint is lowercase SHA-256 hex.
 fn is_fingerprint(candidate: &str) -> bool {
@@ -716,11 +782,42 @@ mod tests {
             attested_class: AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
+            queue_id: None,
+            operation: None,
         }
     }
 
     fn check(request: &PendingRequest) -> Result<(), RequestError> {
         request.validate(pin(), 7, BoottimeMillis(100))
+    }
+
+    #[test]
+    fn an_operation_entry_must_name_remove_path_and_the_marker_program() {
+        let mut bad = live();
+        bad.operation = Some(RequestedOp {
+            op: "write-file".into(),
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: false,
+        });
+        let err = check(&bad).unwrap_err();
+        assert!(format!("{err:?}").contains("Malformed"), "{err:?}");
+        let mut ok = live();
+        ok.program = xudo_wire::OPERATION_PROGRAM.to_owned();
+        ok.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: true,
+        });
+        assert_eq!(check(&ok), Ok(()));
+        let mut relative = ok.clone();
+        relative.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"relative".to_vec(),
+            dry_run: false,
+        });
+        let err = check(&relative).unwrap_err();
+        assert!(format!("{err:?}").contains("Malformed"), "{err:?}");
     }
 
     fn approved() -> PendingRequest {
@@ -744,6 +841,25 @@ mod tests {
     #[test]
     fn a_well_formed_live_entry_for_this_caller_validates() {
         assert_eq!(check(&live()), Ok(()));
+    }
+
+    #[test]
+    fn a_queued_spool_entry_names_its_queue_id_and_a_bad_id_is_refused() {
+        let mut entry = live();
+        let id = "cd".repeat(32);
+        entry.queue_id = Some(id.clone());
+        assert_eq!(check(&entry), Ok(()));
+        let parsed = PendingRequest::parse(&entry.to_json()).unwrap();
+        assert_eq!(parsed.queue_id.as_deref(), Some(id.as_str()));
+        entry.queue_id = Some(String::new());
+        assert_eq!(check(&entry).unwrap_err().code(), "request_malformed");
+        entry.queue_id = None;
+        assert_eq!(check(&entry), Ok(()));
+        assert_eq!(
+            RequestError::QueueNotClaimed.code(),
+            "request_queue_not_claimed"
+        );
+        assert!(RequestError::QueueNotClaimed.to_string().len() > 20);
     }
 
     #[test]
@@ -842,7 +958,27 @@ mod tests {
         entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
         entry.attested_scope_id = Some(44);
         entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
         assert_eq!(check(&entry), Ok(()));
+    }
+
+    #[test]
+    fn an_enrolled_entry_without_a_registry_label_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        entry.attested_scope_id = Some(44);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+        entry.attested_harness = Some(String::new());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
+    }
+
+    #[test]
+    fn a_human_class_with_a_harness_label_is_refused() {
+        let mut entry = live();
+        entry.attested_class = AttestedClass::Human;
+        entry.attested_harness = Some("codex".to_owned());
+        assert_eq!(check(&entry), Err(RequestError::InvalidAttestedIdentity));
     }
 
     #[test]
@@ -879,14 +1015,19 @@ mod tests {
     }
 
     #[test]
-    fn a_human_entry_matches_only_a_live_human_with_no_scope_or_boot() {
+    fn a_human_entry_matches_the_auth_bucket_with_no_scope_or_boot() {
         let mut request = live();
         request.attested_class = AttestedClass::Human;
         let boot = "abcdef01-2345-6789-abcd-ef0123456789";
         assert!(request.live_attested_identity_matches(&AttestedClass::Human, None, None));
+        assert!(!request.live_attested_identity_matches(
+            &AttestedClass::EnrolledAgent { scope_id: 44 },
+            None,
+            None,
+        ));
         assert!(!request.live_attested_identity_matches(&AttestedClass::Human, Some(44), None));
         assert!(!request.live_attested_identity_matches(&AttestedClass::Human, None, Some(boot)));
-        assert!(!request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
+        assert!(request.live_attested_identity_matches(&AttestedClass::Unattested, None, None));
     }
 
     #[test]
@@ -1649,6 +1790,7 @@ mod tests {
             RequestError::ForgedNonce {
                 name: NONCE.to_owned(),
             },
+            RequestError::QueueNotClaimed,
         ];
 
         let mut codes: Vec<&str> = Vec::new();

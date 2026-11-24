@@ -27,7 +27,9 @@ use crate::argv::Arg;
 use crate::deny::{
     LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl, unit_literal_is_refused,
 };
+use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
 use crate::matcher::{ArgSpec, Matcher};
+use crate::operation::{Operation, check_operation};
 use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
@@ -145,18 +147,42 @@ impl Tier {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfirmPolicy {
-    /// Follow the global `confirm_agent_actions` setting. The default.
+    /// Confirm an enrolled agent, and not a human. The default.
+    ///
+    /// No configuration key turns this off. A harness label on the action is
+    /// the planned passwordless path, and no such grant is armed yet.
     #[default]
     Default,
-    /// Always confirm, for every caller, regardless of settings.
+    /// Always confirm, for every caller.
     Always,
-    /// Never confirm.
+    /// Ask for no confirmation from this action, on the human path.
     ///
-    /// Honoured only in combination with a root-authored `trust.d` record and a
-    /// per-invocation `--unattended` flag, both enforced by the broker. On its
-    /// own this is a request, not a grant — which is why there is no global
-    /// boolean that turns confirmation off.
+    /// This is not a passwordless grant: a rule that lists no `harness` is
+    /// never passwordless. An agent-specific confirmation for `never` rules is
+    /// part of the passwordless step still to come. It does not lift a
+    /// stricter overlapping action. A critical action cannot set it.
     Never,
+}
+
+/// What a matching harness rule does when the verified harness requests it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// Permit the verified harness when all other policy checks pass. The default.
+    #[default]
+    Allow,
+    /// Deny the current request and submit it to the root-held human review queue.
+    AskHuman,
+}
+
+impl Outcome {
+    /// The word a rule file uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::AskHuman => "ask-human",
+        }
+    }
 }
 
 /// A single allowlisted action.
@@ -192,6 +218,18 @@ pub struct Action {
     /// the child.
     #[serde(default)]
     pub env_allow: Vec<String>,
+    /// Harness labels this action names.
+    ///
+    /// For [`Outcome::Allow`], a label is the planned passwordless path and
+    /// no such grant is armed. Absent means never passwordless. For
+    /// [`Outcome::AskHuman`] the list is required: it is the only set of
+    /// enrolled agents the action queues, and an empty or missing list fails
+    /// to load. A label that is not in the registry fails the combined load.
+    #[serde(default)]
+    pub harness: Vec<String>,
+    /// The planned outcome for a listed harness. Default [`Outcome::Allow`].
+    #[serde(default)]
+    pub outcome: Outcome,
     /// Where this action was defined.
     ///
     /// Assigned by the loader, never by the rule file: provenance a rule can
@@ -200,12 +238,31 @@ pub struct Action {
     pub source: Source,
 }
 
+impl Action {
+    /// Whether this action would be passwordless for `label`, once that grant
+    /// is armed.
+    ///
+    /// True only when `label` is listed and [`Outcome::Allow`] is set. The
+    /// engine does not consult this. A rule with no `harness` key is never
+    /// passwordless.
+    pub fn passwordless_for(&self, label: &str) -> bool {
+        self.outcome == Outcome::Allow && self.harness.iter().any(|item| item == label)
+    }
+}
+
 /// One rule file's contents.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
     #[serde(default)]
     action: Vec<Action>,
+    #[serde(default)]
+    deny: Vec<DenyRule>,
+    /// Typed operations. Kept beside actions: an operation is policy, and it
+    /// is hashed and enforced. It is not an action and it is not executed by
+    /// name through `execve`.
+    #[serde(default)]
+    operation: Vec<Operation>,
     /// Executable tests. Kept apart from `action` on purpose: a test is not
     /// policy and never reaches the compiled ruleset.
     #[serde(default)]
@@ -260,8 +317,8 @@ fn line_of_id(contents: &str, id: &str) -> u32 {
 /// Why a ruleset was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuleSetError {
-    /// Two actions share an id.
-    #[error("duplicate action id {id} at {second} (first defined at {first})")]
+    /// Two actions or deny rules share an id.
+    #[error("duplicate rule id {id} at {second} (first defined at {first})")]
     DuplicateId {
         /// The repeated id.
         id: String,
@@ -324,12 +381,76 @@ pub enum RuleSetError {
         /// Where it is defined.
         at: Source,
     },
+    /// A harness rule also says every caller must confirm.
+    ///
+    /// That combination cannot be a passwordless grant, so it is refused at
+    /// load rather than linted after the ruleset exists.
+    #[error("action {id} at {at}: a harness rule cannot set confirm = \"always\"")]
+    HarnessConfirmsAlways {
+        /// The offending action.
+        id: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// A harness label is not `[a-z0-9-]{1,32}`.
+    #[error("action {id} at {at}: harness label {label:?} is not [a-z0-9-]{{1,32}}")]
+    BadHarnessLabel {
+        /// The offending action.
+        id: String,
+        /// The label.
+        label: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// One action lists the same harness twice.
+    #[error("action {id} at {at}: harness label {label:?} is listed twice")]
+    DuplicateHarnessLabel {
+        /// The offending action.
+        id: String,
+        /// The label.
+        label: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// A harness label is not in the registry this load was given.
+    #[error("{kind} {id} at {at}: harness label {label:?} is not in the registry")]
+    UnknownHarness {
+        /// Whether this is an action or typed operation.
+        kind: &'static str,
+        /// The offending action or operation.
+        id: String,
+        /// The label.
+        label: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// `outcome = "ask-human"` with no harness would match nobody and, if the
+    /// engine fell through, would confirm an enrolled agent instead of denying.
+    #[error("action {id} at {at}: outcome \"ask-human\" requires a non-empty harness list")]
+    AskHumanWithoutHarness {
+        /// The offending action.
+        id: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// An operation rule failed its load-time checks.
+    #[error("operation {id} at {at}: {reason}")]
+    OperationInvalid {
+        /// The offending operation.
+        id: String,
+        /// Where it is defined.
+        at: Source,
+        /// What was wrong.
+        reason: String,
+    },
 }
 
 /// A validated set of allowlisted actions.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RuleSet {
     actions: Vec<Action>,
+    deny_rules: Vec<DenyRule>,
+    operations: Vec<Operation>,
 }
 
 /// A systemctl action whose unit position can name any unit.
@@ -397,6 +518,84 @@ fn matcher_accepts_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
         .any(|verb| matcher.accepts(&Arg::new(verb.to_vec())))
 }
 
+fn check_operations(
+    actions: &[Action],
+    deny_rules: &[DenyRule],
+    operations: &[Operation],
+) -> Result<(), RuleSetError> {
+    for (index, operation) in operations.iter().enumerate() {
+        if let Some(prior) = actions.iter().find(|action| action.id == operation.id) {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(prior) = deny_rules.iter().find(|deny| deny.id == operation.id) {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(prior) = operations
+            .iter()
+            .take(index)
+            .find(|other| other.id == operation.id)
+        {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(other) = operations.iter().find(|other| {
+            other.id != operation.id
+                && (operation
+                    .under
+                    .as_bytes()
+                    .strip_prefix(other.under.as_bytes())
+                    .is_some_and(|rest| rest.starts_with(b"/"))
+                    || other
+                        .under
+                        .as_bytes()
+                        .strip_prefix(operation.under.as_bytes())
+                        .is_some_and(|rest| rest.starts_with(b"/")))
+        }) {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason: format!(
+                    "nested under trees are not allowed ({} and {})",
+                    operation.under, other.under
+                ),
+            });
+        }
+        if let Err(reason) = check_operation(operation) {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason,
+            });
+        }
+        if let Some(prior) = operations
+            .iter()
+            .take(index)
+            .find(|other| other.under == operation.under)
+        {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason: format!(
+                    "under {} is already the tree of {}",
+                    operation.under, prior.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl RuleSet {
     /// Validates and takes ownership of a list of actions.
     ///
@@ -405,6 +604,63 @@ impl RuleSet {
     /// Returns the first [`RuleSetError`] found. Loading is all-or-nothing: a
     /// partially-loaded ruleset is a ruleset whose contents nobody reviewed.
     pub fn load(actions: Vec<Action>) -> Result<Self, RuleSetError> {
+        Self::load_with_deny_rules(actions, Vec::new())
+    }
+
+    /// Validates a complete ruleset, including operator-authored deny rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation error; no partial ruleset is returned.
+    pub fn load_with_deny_rules(
+        actions: Vec<Action>,
+        deny_rules: Vec<DenyRule>,
+    ) -> Result<Self, RuleSetError> {
+        Self::load_all(actions, deny_rules, Vec::new())
+    }
+
+    /// [`Self::load_with_deny_rules`] plus typed operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation error; no partial ruleset is returned.
+    pub fn load_all(
+        actions: Vec<Action>,
+        deny_rules: Vec<DenyRule>,
+        operations: Vec<Operation>,
+    ) -> Result<Self, RuleSetError> {
+        if deny_rules.len() > MAX_DENY_RULES {
+            return Err(RuleSetError::Parse {
+                file: "<ruleset>".into(),
+                reason: format!("more than {MAX_DENY_RULES} deny rules"),
+            });
+        }
+        for (index, deny) in deny_rules.iter().enumerate() {
+            if let Err(reason) = deny.validate() {
+                return Err(RuleSetError::Parse {
+                    file: deny.source.file.clone(),
+                    reason: format!("deny rule {} at {}: {reason}", deny.id, deny.source),
+                });
+            }
+            if let Some(prior) = deny_rules
+                .iter()
+                .take(index)
+                .find(|other| other.id == deny.id)
+            {
+                return Err(RuleSetError::DuplicateId {
+                    id: deny.id.as_str().to_owned(),
+                    first: prior.source.clone(),
+                    second: deny.source.clone(),
+                });
+            }
+            if let Some(action) = actions.iter().find(|action| action.id == deny.id) {
+                return Err(RuleSetError::DuplicateId {
+                    id: deny.id.as_str().to_owned(),
+                    first: action.source.clone(),
+                    second: deny.source.clone(),
+                });
+            }
+        }
         for (index, action) in actions.iter().enumerate() {
             if let Some(prior) = actions
                 .iter()
@@ -460,9 +716,17 @@ impl RuleSet {
                     at: action.source.clone(),
                 });
             }
+
+            validate_action_harness(action)?;
         }
 
-        Ok(Self { actions })
+        check_operations(&actions, &deny_rules, &operations)?;
+
+        Ok(Self {
+            actions,
+            deny_rules,
+            operations,
+        })
     }
 
     /// Parses one rule file and validates it.
@@ -505,6 +769,22 @@ impl RuleSet {
                 action
             })
             .collect();
+        let deny_rules = parsed
+            .deny
+            .into_iter()
+            .map(|mut deny| {
+                deny.source = Source::new(file, line_of_id(contents, deny.id.as_str()));
+                deny
+            })
+            .collect();
+        let operations = parsed
+            .operation
+            .into_iter()
+            .map(|mut operation| {
+                operation.source = Source::new(file, line_of_id(contents, operation.id.as_str()));
+                operation
+            })
+            .collect();
         if parsed.test.len() > MAX_TESTS_PER_FILE {
             return Err(RuleSetError::TooManyTests {
                 file: file.to_owned(),
@@ -525,7 +805,7 @@ impl RuleSet {
                 test
             })
             .collect();
-        Ok((Self::load(actions)?, tests))
+        Ok((Self::load_all(actions, deny_rules, operations)?, tests))
     }
 
     /// Looks up an action by id.
@@ -536,6 +816,16 @@ impl RuleSet {
     /// Every action, in declaration order.
     pub fn actions(&self) -> &[Action] {
         &self.actions
+    }
+
+    /// Every configured deny rule, in declaration order.
+    pub fn deny_rules(&self) -> &[DenyRule] {
+        &self.deny_rules
+    }
+
+    /// Every typed operation, in declaration order.
+    pub fn operations(&self) -> &[Operation] {
+        &self.operations
     }
 
     /// Every allowlisted executable that the compiled-in deny-list refuses.
@@ -629,6 +919,193 @@ impl RuleSet {
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
+
+    /// Lint errors for harness rules. A ruleset with no harness labels has none.
+    ///
+    /// `confirm = "always"` is a load error, not a lint. These are the cases
+    /// that still load and that `xudo check` must refuse: a `path-under` or
+    /// `pattern` matcher, `agent-allowed = false`, a `GTFOBins` program with no
+    /// waiver, and no near-miss `deny` test.
+    pub fn harness_lints<'a>(
+        &'a self,
+        tests: &'a [RuleTest],
+        gtfobins: &GtfobinSets,
+    ) -> Vec<HarnessLint<'a>> {
+        let mut found = Vec::new();
+        for action in &self.actions {
+            if action.harness.is_empty() {
+                continue;
+            }
+            if action
+                .args
+                .iter()
+                .any(|spec| matches!(spec.matcher, Matcher::PathUnder { .. }))
+            {
+                found.push(HarnessLint::new(
+                    action,
+                    "a harness rule cannot use a path-under matcher",
+                ));
+            }
+            if action
+                .args
+                .iter()
+                .any(|spec| matches!(spec.matcher, Matcher::Pattern(_)))
+            {
+                found.push(HarnessLint::new(
+                    action,
+                    "a harness rule cannot use a pattern matcher",
+                ));
+            }
+            if !action.agent_allowed {
+                found.push(HarnessLint::new(
+                    action,
+                    "a harness rule cannot set agent-allowed = false",
+                ));
+            }
+            if gtfobins.blocks(&action.exe) {
+                found.push(HarnessLint::new(
+                    action,
+                    "a harness rule names a GTFOBins program with no waiver",
+                ));
+            }
+            if !harness_near_miss(action, tests) {
+                found.push(HarnessLint::new(
+                    action,
+                    "a harness rule needs a near-miss deny test for its program",
+                ));
+            }
+        }
+        found
+    }
+}
+
+fn validate_action_harness(action: &Action) -> Result<(), RuleSetError> {
+    let mut seen_labels = std::collections::BTreeSet::new();
+    for label in &action.harness {
+        if !crate::harness::valid_harness_label(label) {
+            return Err(RuleSetError::BadHarnessLabel {
+                id: action.id.as_str().to_owned(),
+                label: label.clone(),
+                at: action.source.clone(),
+            });
+        }
+        if !seen_labels.insert(label.as_str()) {
+            return Err(RuleSetError::DuplicateHarnessLabel {
+                id: action.id.as_str().to_owned(),
+                label: label.clone(),
+                at: action.source.clone(),
+            });
+        }
+    }
+    if action.confirm == ConfirmPolicy::Always && !action.harness.is_empty() {
+        return Err(RuleSetError::HarnessConfirmsAlways {
+            id: action.id.as_str().to_owned(),
+            at: action.source.clone(),
+        });
+    }
+    if action.outcome == Outcome::AskHuman && action.harness.is_empty() {
+        return Err(RuleSetError::AskHumanWithoutHarness {
+            id: action.id.as_str().to_owned(),
+            at: action.source.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The `GTFOBins` basenames and the absolute paths that have a valid waiver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GtfobinSets {
+    basenames: std::collections::BTreeSet<String>,
+    waived_paths: std::collections::BTreeSet<String>,
+}
+
+impl GtfobinSets {
+    /// Whether `exe` is a listed `GTFOBins` program that no waiver covers.
+    pub fn blocks(&self, exe: &str) -> bool {
+        let Some(base) = exe.rsplit('/').next().filter(|base| !base.is_empty()) else {
+            return false;
+        };
+        self.basenames.contains(base) && !self.waived_paths.contains(exe)
+    }
+}
+
+/// Reads the two text lists `xudo check` ships.
+///
+/// A basename line is one name. A waiver line is
+/// `path|technique|rationale`, and it counts only when the path is absolute,
+/// the technique is at least 20 characters, and the rationale is at least 80.
+pub fn gtfobin_sets(basenames: &str, waivers: &str) -> GtfobinSets {
+    let basenames = basenames
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    let waived_paths = waivers.lines().filter_map(waiver_path).collect();
+    GtfobinSets {
+        basenames,
+        waived_paths,
+    }
+}
+
+fn waiver_path(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut parts = line.splitn(3, '|');
+    let path = parts.next().unwrap_or_default();
+    let technique = parts.next()?;
+    let rationale = parts.next()?;
+    if !path.starts_with('/') || technique.chars().count() < 20 || rationale.chars().count() < 80 {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
+/// Whether `tests` contains a near-miss denial of `action`.
+///
+/// A near miss is a `deny` test whose program is this action's executable,
+/// pinned to this action or unpinned, and whose operands this action rejects.
+pub fn harness_near_miss(action: &Action, tests: &[RuleTest]) -> bool {
+    tests.iter().any(|test| {
+        if test.expect != crate::rule_test::Expectation::Deny {
+            return false;
+        }
+        let Some(program) = test.argv.first() else {
+            return false;
+        };
+        if program != &action.exe {
+            return false;
+        }
+        if test.action.as_ref().is_some_and(|id| id != &action.id) {
+            return false;
+        }
+        let operands: Vec<&str> = test.argv.iter().skip(1).map(String::as_str).collect();
+        let argv = crate::argv::Argv::new(operands).canonicalize();
+        crate::matcher::match_argv(&action.args, &argv).is_err()
+    })
+}
+
+/// One harness-rule lint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessLint<'a> {
+    /// The action.
+    pub id: &'a ActionId,
+    /// Where it is defined.
+    pub source: &'a Source,
+    /// The sentence `xudo check` prints.
+    pub message: String,
+}
+
+impl<'a> HarnessLint<'a> {
+    fn new(action: &'a Action, reason: &str) -> Self {
+        Self {
+            id: &action.id,
+            source: &action.source,
+            message: format!("{reason}: {} at {}", action.id, action.source),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -647,7 +1124,395 @@ mod tests {
             confirm: ConfirmPolicy::Default,
             agent_allowed: true,
             env_allow: Vec::new(),
+            harness: Vec::new(),
+            outcome: Outcome::Allow,
             source: Source::new("20-services.toml", 3),
+        }
+    }
+
+    #[test]
+    fn a_harness_rule_with_confirm_always_fails_to_load() {
+        let mut always = action("xudo.svc.restart");
+        always.confirm = ConfirmPolicy::Always;
+        always.harness = vec!["codex".into()];
+        let error = RuleSet::load(vec![always]).unwrap_err();
+        assert!(error.to_string().contains("confirm"), "{error}");
+        let text = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+confirm = \"always\"
+harness = [\"codex\"]
+";
+        let error = RuleSet::from_toml("20.toml", text).unwrap_err();
+        assert!(error.to_string().contains("confirm"), "{error}");
+    }
+
+    #[test]
+    fn passwordless_for_is_true_only_for_a_listed_allow_outcome() {
+        let mut listed = action("xudo.svc.restart");
+        assert!(!listed.passwordless_for("codex"));
+        listed.harness = vec!["codex".into()];
+        listed.outcome = Outcome::Allow;
+        assert!(listed.passwordless_for("codex"));
+        assert!(!listed.passwordless_for("claude"));
+        assert_eq!(listed.outcome.as_str(), "allow");
+        listed.outcome = Outcome::AskHuman;
+        assert_eq!(listed.outcome.as_str(), "ask-human");
+        assert!(!listed.passwordless_for("codex"));
+        for label in ["1codex", "-codex"] {
+            listed.harness = vec![label.into()];
+            assert!(RuleSet::load(vec![listed.clone()]).is_err(), "{label}");
+        }
+        listed.harness = vec!["nope!".into()];
+        assert!(RuleSet::load(vec![listed.clone()]).is_err());
+        listed.harness = vec!["codex".into(), "codex".into()];
+        listed.outcome = Outcome::Allow;
+        assert!(RuleSet::load(vec![listed]).is_err());
+    }
+
+    #[test]
+    fn ask_human_without_a_harness_list_fails_to_load() {
+        let mut bare = action("xudo.svc.restart");
+        bare.outcome = Outcome::AskHuman;
+        let error = RuleSet::load(vec![bare]).unwrap_err();
+        let at = Source::new("20-services.toml", 3);
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: at.clone(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "action xudo.svc.restart at {at}: outcome \"ask-human\" requires a non-empty harness list"
+            )
+        );
+
+        let missing = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+outcome = \"ask-human\"
+";
+        let error = RuleSet::from_toml("20.toml", missing).unwrap_err();
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: Source::new("20.toml", 2),
+            }
+        );
+
+        let empty = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+harness = []
+outcome = \"ask-human\"
+";
+        let error = RuleSet::from_toml("20.toml", empty).unwrap_err();
+        assert_eq!(
+            error,
+            RuleSetError::AskHumanWithoutHarness {
+                id: "xudo.svc.restart".into(),
+                at: Source::new("20.toml", 2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_rule_without_harness_is_never_passwordless() {
+        let rule = action("xudo.svc.restart");
+        assert!(rule.harness.is_empty());
+        assert!(!rule.passwordless_for("codex"));
+        assert!(!rule.passwordless_for(""));
+    }
+
+    #[test]
+    fn harness_lints_cover_each_refused_shape_and_a_near_miss_clears_that_one() {
+        let mut broad = action("xudo.svc.restart");
+        broad.harness = vec!["codex".into()];
+        broad.agent_allowed = false;
+        broad.args = vec![
+            ArgSpec::one(
+                "path",
+                Matcher::PathUnder {
+                    prefix: "/tmp".into(),
+                },
+            ),
+            ArgSpec::one("pat", Matcher::Pattern(AnchoredPattern::new("a+").unwrap())),
+        ];
+        broad.exe = "/usr/bin/apt-get".into();
+        let set = RuleSet::load(vec![broad]).unwrap();
+        let sets = gtfobin_sets(
+            "apt-get\n# comment\n\nsystemctl\n",
+            "# waiver\n/usr/bin/systemctl|short|no\n/usr/bin/apt-get|a technique long enough here|this rationale is deliberately long enough to count as a reviewed waiver for the test fixture only and nothing else\n",
+        );
+        let lints = set.harness_lints(&[], &sets);
+        let text = lints
+            .iter()
+            .map(|lint| lint.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("path-under"), "{text}");
+        assert!(text.contains("pattern"), "{text}");
+        assert!(text.contains("agent-allowed"), "{text}");
+        assert!(text.contains("near-miss"), "{text}");
+        assert!(!text.contains("GTFOBins"), "{text}");
+
+        let unwaived = gtfobin_sets("apt-get\n", "/usr/bin/apt-get|too short|also short\n");
+        assert!(unwaived.blocks("/usr/bin/apt-get"));
+        assert!(!unwaived.blocks("/usr/bin/true"));
+        assert!(!unwaived.blocks(""));
+        assert!(!unwaived.blocks("/"));
+        assert!(!GtfobinSets::default().blocks("/usr/bin/apt-get"));
+        assert!(gtfobin_sets("apt-get\n", "not a waiver\nonly|one\n").blocks("/usr/bin/apt-get"));
+        let lints = set.harness_lints(&[], &unwaived);
+        assert!(lints.iter().any(|lint| lint.message.contains("GTFOBins")));
+
+        harness_near_miss_cases(&set, &unwaived);
+    }
+
+    #[test]
+    fn a_well_shaped_harness_action_is_linted_for_its_missing_near_miss() {
+        let mut action = action("xudo.svc.restart");
+        action.harness = vec!["codex".into()];
+        let set = RuleSet::load(vec![action]).unwrap();
+        let lints = set.harness_lints(&[], &GtfobinSets::default());
+        assert_eq!(lints.len(), 1);
+        assert!(lints.iter().any(|lint| lint.message.contains("near-miss")));
+    }
+
+    #[test]
+    fn harness_lint_skips_actions_without_harness_labels() {
+        let human_action = action("xudo.svc.human");
+        let mut harness_action = action("xudo.svc.harness");
+        harness_action.harness = vec!["codex".into()];
+        let set = RuleSet::load(vec![human_action, harness_action]).unwrap();
+        let lints = set.harness_lints(&[], &GtfobinSets::default());
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints
+                .iter()
+                .filter(|lint| lint.id.as_str() == "xudo.svc.harness")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn waiver_paths_require_complete_absolute_evidence() {
+        let rationale =
+            "this rationale is deliberately long enough to count as reviewed evidence for a waiver";
+        assert_eq!(waiver_path(""), None);
+        assert_eq!(waiver_path("# comment"), None);
+        assert_eq!(waiver_path("relative"), None);
+        assert_eq!(
+            waiver_path("/usr/bin/tool|technique long enough to satisfy this check"),
+            None
+        );
+        assert_eq!(
+            waiver_path(&format!(
+                "relative|technique long enough to satisfy this check|{rationale}"
+            )),
+            None
+        );
+        assert_eq!(
+            waiver_path(&format!("/usr/bin/tool|short|{rationale}")),
+            None
+        );
+        assert_eq!(
+            waiver_path("/usr/bin/tool|technique long enough to satisfy this check|short"),
+            None
+        );
+        assert_eq!(
+            waiver_path(&format!(
+                "/usr/bin/tool|technique long enough to satisfy this check|{rationale}"
+            )),
+            Some("/usr/bin/tool".to_owned())
+        );
+    }
+
+    fn harness_near_miss_cases(set: &RuleSet, unwaived: &GtfobinSets) {
+        use crate::rule_test::{Expectation, RuleTest};
+
+        let miss = RuleTest {
+            argv: vec!["/usr/bin/apt-get".into(), "nope".into()],
+            expect: Expectation::Deny,
+            action: None,
+            deny_rule: None,
+            reason: None,
+            source: Source::new("20-services.toml", 9),
+        };
+        let misses = [miss];
+        let cleared = set.harness_lints(&misses, unwaived);
+        assert!(
+            !cleared
+                .iter()
+                .any(|lint| lint.message.contains("near-miss"))
+        );
+        let pinned_other = RuleTest {
+            argv: vec!["/usr/bin/true".into()],
+            expect: Expectation::Deny,
+            action: Some(ActionId::new("other")),
+            deny_rule: None,
+            reason: None,
+            source: Source::new("20-services.toml", 10),
+        };
+        assert!(!harness_near_miss(
+            set.actions().first().unwrap(),
+            &[pinned_other]
+        ));
+        let wrong_pin = RuleTest {
+            argv: vec!["/usr/bin/apt-get".into(), "nope".into()],
+            expect: Expectation::Deny,
+            action: Some(ActionId::new("other")),
+            deny_rule: None,
+            reason: None,
+            source: Source::new("20-services.toml", 11),
+        };
+        assert!(!harness_near_miss(
+            set.actions().first().unwrap(),
+            &[wrong_pin]
+        ));
+        let same_pin = RuleTest {
+            argv: vec!["/usr/bin/apt-get".into(), "nope".into()],
+            expect: Expectation::Deny,
+            action: Some(ActionId::new("xudo.svc.restart")),
+            deny_rule: None,
+            reason: None,
+            source: Source::new("20-services.toml", 13),
+        };
+        assert!(harness_near_miss(
+            set.actions().first().unwrap(),
+            &[same_pin]
+        ));
+        let empty = RuleTest {
+            argv: Vec::new(),
+            expect: Expectation::Deny,
+            action: None,
+            deny_rule: None,
+            reason: None,
+            source: Source::new("20-services.toml", 12),
+        };
+        assert!(!harness_near_miss(set.actions().first().unwrap(), &[empty]));
+        let allow = RuleTest {
+            argv: vec!["/usr/bin/apt-get".into()],
+            expect: Expectation::Allow,
+            action: None,
+            deny_rule: None,
+            reason: None,
+            source: Source::new("t.toml", 1),
+        };
+        assert!(!harness_near_miss(&action("x"), &[allow]));
+        let mut exact = action("xudo.svc.exact");
+        exact.harness = vec!["codex".into()];
+        exact.exe = "/usr/bin/true".into();
+        exact.args = vec![ArgSpec::one("verb", Matcher::Literal("restart".into()))];
+        let exact_set = RuleSet::load(vec![exact]).unwrap();
+        let hit = RuleTest {
+            argv: vec!["/usr/bin/true".into(), "restart".into()],
+            expect: Expectation::Deny,
+            action: None,
+            deny_rule: None,
+            reason: None,
+            source: Source::new("t.toml", 2),
+        };
+        assert!(!harness_near_miss(
+            exact_set.actions().first().unwrap(),
+            &[hit]
+        ));
+    }
+
+    const DENY_RULE: &str = r#"
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"] }, { any-deb-name = ["xudo"] }]
+"#;
+
+    #[test]
+    fn a_deny_rule_with_an_unknown_key_fails_the_file() {
+        let text = DENY_RULE.replace(
+            "reason = \"protected package\"",
+            "reason = \"protected package\"\nallow = true",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+        let text = DENY_RULE.replace(
+            "any-arg = [\"remove\"]",
+            "any-arg = [\"remove\"]\npattern = \".*\"",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_deny_rule_cannot_declare_its_source() {
+        let text = DENY_RULE.replace(
+            "reason = \"protected package\"",
+            "reason = \"protected package\"\nsource = { file = \"evil\", line = 1 }",
+        );
+        assert!(RuleSet::from_toml("trusted.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_program_with_a_slash_is_refused() {
+        let text = DENY_RULE.replace(
+            "program = [\"apt-get\"]",
+            "program = [\"/usr/bin/apt-get\"]",
+        );
+        assert!(RuleSet::from_toml("deny.toml", &text).is_err());
+    }
+
+    #[test]
+    fn a_deny_id_equal_to_an_action_id_is_refused() {
+        let action_text = r#"[[action]]
+id = "xudo.protect.pkg-remove"
+tier = "diag-read"
+exe = "/usr/bin/apt-get"
+"#;
+        assert!(
+            RuleSet::from_toml("collision.toml", &format!("{action_text}{DENY_RULE}")).is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_deny_ids_are_refused() {
+        assert!(RuleSet::from_toml("duplicate.toml", &format!("{DENY_RULE}{DENY_RULE}")).is_err());
+    }
+
+    #[test]
+    fn a_ruleset_over_the_deny_rule_bound_is_refused() {
+        let rules = (0..=MAX_DENY_RULES)
+            .map(|index| DenyRule {
+                id: ActionId::new(format!("xudo.protect.{index}")),
+                reason: "protected package".into(),
+                program: vec!["apt-get".into()],
+                all: Vec::new(),
+                source: Source::new("many.toml", 1),
+            })
+            .collect();
+        assert!(RuleSet::load_with_deny_rules(Vec::new(), rules).is_err());
+    }
+
+    #[test]
+    fn deny_clauses_require_exactly_one_known_matcher() {
+        for clause in [
+            "{}",
+            "{ any-arg = [], any-deb-name = [] }",
+            "{ any-package = [] }",
+        ] {
+            let text = DENY_RULE.replace("{ any-arg = [\"remove\"] }", clause);
+            assert!(
+                RuleSet::from_toml("clause.toml", &text).is_err(),
+                "{clause}"
+            );
         }
     }
 

@@ -14,13 +14,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::deny_rule::DenyRuleMatch;
 use crate::rule::{ActionId, Source};
 
 /// Schema version of the decision envelope.
 ///
 /// Bump on any change to the serialized shape so a consumer can refuse an
 /// envelope it does not understand rather than misread one.
-pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 2;
 
 /// What the engine decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +126,8 @@ pub enum DenialCode {
     NoConfirmationChannel,
     /// The action is allowed for humans but never on the agent path.
     HumanPathOnly,
+    /// A matching `ask-human` harness rule must be reviewed through the human path.
+    AskHuman,
     /// The program the caller asked to run is not the program the action names.
     ///
     /// Its own code rather than [`Self::ArgvRejected`], because the two send a
@@ -140,6 +143,15 @@ pub enum DenialCode {
     ConfirmationExpired,
     /// A duplicate or backoff-limited confirmation request was throttled.
     ConfirmationThrottled,
+    /// A root-authored deny rule matched this command.
+    DenyRule,
+    /// A typed operation was refused: no rule covers the target, or the target
+    /// is not a safe path under that rule.
+    ///
+    /// Its own code rather than [`Self::ArgvRejected`], because an operation
+    /// has no argv. Folding it into an action denial would send the caller to
+    /// `xudo explain -- <argv>` for a request that was never a command.
+    OperationRefused,
 }
 
 impl DenialCode {
@@ -157,6 +169,9 @@ impl DenialCode {
             Self::ConfirmationRefused => 9,
             Self::ConfirmationExpired => 10,
             Self::ConfirmationThrottled => 11,
+            Self::DenyRule => 12,
+            Self::AskHuman => 13,
+            Self::OperationRefused => 14,
         }
     }
 
@@ -174,6 +189,9 @@ impl DenialCode {
             Self::ConfirmationRefused => "confirmation_refused",
             Self::ConfirmationExpired => "confirmation_expired",
             Self::ConfirmationThrottled => "confirmation_throttled",
+            Self::DenyRule => "deny_rule",
+            Self::AskHuman => "ask_human",
+            Self::OperationRefused => "operation_refused",
         }
     }
 
@@ -211,6 +229,9 @@ impl DenialCode {
             Self::HumanPathOnly => {
                 "this action is never available to an agent; hand it to a person"
             }
+            Self::AskHuman => {
+                "ask a person to review this request in the root-held queue before it can run"
+            }
             Self::ExeMismatch => {
                 "this action runs a different program than the one requested; run `xudo list` \
                  to find the action that names this program"
@@ -221,6 +242,12 @@ impl DenialCode {
             }
             Self::ConfirmationThrottled => {
                 "an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`"
+            }
+            Self::DenyRule => {
+                "an administrator's rule forbids this command for every caller; do not retry or look for a variant; if it must run, hand it to a person"
+            }
+            Self::OperationRefused => {
+                "no remove-path rule permits this target, or the target is not a safe relative path under it; run `xudo list` and ask an administrator to add a rule; do not retry a path outside the tree"
             }
         }
     }
@@ -307,12 +334,32 @@ pub enum TraceStep {
         /// Which capability classes matched, if any.
         matched: Vec<String>,
     },
+    /// Configurable deny rules were evaluated after the compiled-in list.
+    DenyRulesEvaluated {
+        /// Every matching configured rule, in declaration order.
+        matched: Vec<DenyRuleMatch>,
+    },
     /// The confirmation requirement was decided.
     ConfirmationDecided {
         /// The requirement.
         required: bool,
         /// Why.
         reason: String,
+    },
+    /// A matching ask-human rule diverted the verified harness to the reviewer queue.
+    AskHumanQueued {
+        /// The action that requested review.
+        action: String,
+        /// The rule source.
+        source: String,
+    },
+    /// A typed operation matched. The password path still applies; a harness
+    /// label on the rule is not a grant.
+    OperationMatched {
+        /// The operation id.
+        action: String,
+        /// Where the rule is defined.
+        source: String,
     },
 }
 
@@ -416,7 +463,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_CODES: [DenialCode; 11] = [
+    const ALL_CODES: [DenialCode; 14] = [
         DenialCode::UnknownAction,
         DenialCode::ArgvRejected,
         DenialCode::DenyListed,
@@ -428,6 +475,9 @@ mod tests {
         DenialCode::ConfirmationRefused,
         DenialCode::ConfirmationExpired,
         DenialCode::ConfirmationThrottled,
+        DenialCode::DenyRule,
+        DenialCode::AskHuman,
+        DenialCode::OperationRefused,
     ];
 
     #[test]
@@ -442,7 +492,7 @@ mod tests {
         // The wire contract. If this test needs editing, a deployed agent's
         // error handling has just silently changed meaning.
         let numeric: Vec<u32> = ALL_CODES.iter().map(|c| c.as_u32()).collect();
-        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(numeric, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
 
         let mut names: Vec<&str> = ALL_CODES.iter().map(|c| c.as_str()).collect();
         names.sort_unstable();

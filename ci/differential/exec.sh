@@ -25,7 +25,7 @@ fi
 if command -v apk >/dev/null; then apk add -q socat expect coreutils; else apt-get install -y -qq socat expect >/dev/null; fi
 
 # The product's files, where the product looks for them.
-install -d -m755 /usr/libexec/xudo /etc/xudo /etc/xudo/rules.d
+install -d -m755 /usr/libexec/xudo /etc/xudo /etc/xudo/rules.d /etc/xudo/harnesses.d
 install -m755 "$bins/xudod" "$bins/xudo-gate" /usr/libexec/xudo/
 ln -f /usr/libexec/xudo/xudo-gate /usr/libexec/xudo/xudo-gate-auth
 install -m644 /rules/*.toml /harness/harness-rules.toml /etc/xudo/rules.d/

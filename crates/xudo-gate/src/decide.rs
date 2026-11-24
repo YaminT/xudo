@@ -109,6 +109,8 @@ pub struct GateContext {
 /// How loudly a refusal should be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
+    /// A dry-run operation: listed, nothing removed.
+    Low,
     /// An ordinary refusal: a policy denial, a race, an expiry.
     Normal,
     /// A refusal that only happens when someone is trying something.
@@ -119,6 +121,7 @@ impl Severity {
     /// The label recorded in the audit trail.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Low => "low",
             Self::Normal => "normal",
             Self::High => "high",
         }
@@ -174,7 +177,7 @@ pub enum Stage {
     Descriptors,
     /// Replace closed standard streams with `/dev/null`.
     Streams,
-    /// Set umask `022` and the working directory to `/`.
+    /// Reset every resource limit from PID 1, then set umask `022` and cwd `/`.
     CallerState,
     /// Forbid gaining privilege by exec.
     Privileges,
@@ -206,7 +209,7 @@ impl Stage {
         match self {
             Self::Descriptors => "mark its inherited descriptors close-on-exec",
             Self::Streams => "settle its standard streams",
-            Self::CallerState => "reset its umask and working directory",
+            Self::CallerState => "reset its resource limits and caller state",
             Self::Privileges => "forbid new privileges",
             Self::Invocation => "accept this invocation",
             Self::Procfs => "verify /proc",
@@ -391,16 +394,7 @@ pub fn decide(
             pid: caller.pin.pid,
         });
     };
-    pending.validate(caller.pin, context.generation, context.now)?;
-    // Every state, not only `Consumed`: an entry for a class the gate cannot
-    // attest is refused whatever its state, so no path depends on state alone.
-    if !pending.live_attested_identity_matches(
-        &caller.attested_class,
-        caller.attested_scope_id,
-        caller.boot_id.as_deref(),
-    ) {
-        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
-    }
+    validate_pending_identity(pending, caller, &context)?;
 
     let action_id = ActionId::new(pending.action.clone());
     let request = Request::for_program(
@@ -476,6 +470,24 @@ pub fn decide(
     })
 }
 
+/// Validate common spool-entry invariants on every gate path, including typed
+/// operations which do not pass through the ordinary action decision.
+pub(crate) fn validate_pending_identity(
+    pending: &PendingRequest,
+    caller: &GateCaller,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    pending.validate(caller.pin, context.generation, context.now)?;
+    if !pending.live_attested_identity_matches(
+        &caller.attested_class,
+        caller.attested_scope_id,
+        caller.boot_id.as_deref(),
+    ) {
+        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
+    }
+    Ok(())
+}
+
 fn confirmation_satisfied(pending: &PendingRequest, context: &GateContext) -> bool {
     if context.settings.confirm_human_path {
         pending.confirmed && context.password_confirms
@@ -531,6 +543,11 @@ pub fn refusal_record(
                 .collect::<String>()
         ));
     }
+    if let Refusal::Policy(decision) | Refusal::ConfirmationMissing(decision) = refusal
+        && let Some(id) = deciding_deny_rule_id(decision)
+    {
+        evidence.push(format!("deny_rule_id={id}"));
+    }
 
     Record::after(
         previous,
@@ -541,6 +558,15 @@ pub fn refusal_record(
     .with_denial(refusal.code())
     .with_evidence(evidence)
     .with_outcome(Outcome::NotExecuted)
+}
+
+fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
+    decision.trace.iter().find_map(|step| match step {
+        xudo_policy::TraceStep::DenyRulesEvaluated { matched } => {
+            matched.first().map(|rule| rule.id.as_str())
+        }
+        _ => None,
+    })
 }
 
 /// The audit record for an authorization, before the child runs.
@@ -572,6 +598,9 @@ pub fn authorization_record(
             approved.requested_action, approved.requested_rule_source
         ));
     }
+    // Bound to the spool nonce before the verdict is chosen, so a queued run
+    // can require this record and no other allow.
+    evidence.push(format!("nonce={}", approved.nonce));
 
     let decision = if confirmed_by.is_some() {
         AuditDecision::AwaitingConfirmation
@@ -699,6 +728,33 @@ args = [
         .unwrap()
     }
 
+    fn package_protection_rules() -> RuleSet {
+        RuleSet::from_toml(
+            "00-protect.toml",
+            r#"
+[[action]]
+id = "xudo.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [
+  { name = "verb", matcher = { literal = "remove" } },
+  { name = "separator", matcher = { literal = "--" } },
+  { name = "pkg", matcher = { name = "deb-name-literal" }, repeat = { between = { min = 1, max = 10 } } },
+]
+
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [
+  { any-arg = ["remove", "purge", "autoremove", "autopurge"] },
+  { any-deb-name = ["xudo", "sudo"] },
+]
+"#,
+        )
+        .unwrap()
+    }
+
     fn agent(pid: u32) -> GateCaller {
         GateCaller {
             pin: CallerPin::new(pid, 555),
@@ -761,6 +817,9 @@ args = [
             attested_class: crate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
+            queue_id: None,
+            operation: None,
         }
     }
 
@@ -807,6 +866,70 @@ args = [
         assert_eq!(approved.rule_source, "test-rules.toml:3");
         assert_eq!(approved.nonce, NONCE);
         assert_eq!(approved.environment, child_environment());
+    }
+
+    #[test]
+    fn the_gate_refuses_what_a_deny_rule_matches() {
+        let mut pending = request(77, "xudo.pkg.remove", &["remove", "--", "xudo"]);
+        pending.program = "/usr/bin/apt-get".to_owned();
+        let refusal = decide(
+            &package_protection_rules(),
+            &human(77),
+            Some(&pending),
+            context(),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "deny_rule");
+        let decision = refused_decision(&refusal).unwrap();
+        assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        assert!(
+            decision.trace.iter().any(|step| matches!(step,
+                xudo_policy::TraceStep::DenyRulesEvaluated { matched }
+                    if matched.iter().any(|rule| rule.id.as_str() == "xudo.protect.pkg-remove")
+            )),
+            "the gate's decision did not cite the shipped rule: {:?}",
+            decision.trace
+        );
+        let record = refusal_record(None, &refusal, &human(77), Some(&pending));
+        assert!(
+            record
+                .evidence
+                .contains(&"deny_rule_id=xudo.protect.pkg-remove".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_confirmation_refusal_record_carries_no_deny_rule_id() {
+        let refusal = Refusal::ConfirmationMissing(Box::new(Decision::deny(
+            DenialCode::ArgvRejected,
+            vec!["x".to_owned()],
+            Vec::new(),
+        )));
+        let record = refusal_record(None, &refusal, &human(77), None);
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("deny_rule_id=")),
+            "a confirmation refusal has no deciding deny rule: {:?}",
+            record.evidence
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_added_after_mint_makes_the_entry_stale() {
+        let mut pending = request(77, "xudo.pkg.remove", &["remove", "--", "xudo"]);
+        pending.program = "/usr/bin/apt-get".to_owned();
+        let mut after_rule_change = context();
+        after_rule_change.generation = GENERATION.saturating_add(1);
+        let refusal = decide(
+            &package_protection_rules(),
+            &human(77),
+            Some(&pending),
+            after_rule_change,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "request_stale_generation");
     }
 
     #[test]
@@ -965,6 +1088,7 @@ args = [
         pending.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 44 };
         pending.attested_scope_id = Some(44);
         pending.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        pending.attested_harness = Some("codex".to_owned());
         let caller = GateCaller {
             pin: CallerPin::new(77, 555),
             facts: CallerFacts::new(
@@ -1120,6 +1244,7 @@ args = [
 
     #[test]
     fn severity_labels_are_the_strings_an_alert_matches_on() {
+        assert_eq!(Severity::Low.label(), "low");
         assert_eq!(Severity::Normal.label(), "normal");
         assert_eq!(Severity::High.label(), "high");
     }
@@ -1197,6 +1322,11 @@ args = [
         );
         assert_eq!(record.outcome, Outcome::NotExecuted);
         assert!(record.evidence.contains(&"gate_caller_pid=77".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&format!("nonce={}", approved.nonce))
+        );
         assert!(record.is_sealed());
     }
 

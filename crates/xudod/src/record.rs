@@ -36,9 +36,18 @@ pub fn decided(
         evidence.push(format!("claimed_classification={claimed}"));
     }
     evidence.push(format!("generation={}", generation.hex()));
+    if let Some(label) = caller.classification.enrolled_agent_id() {
+        evidence.push(format!("agent_id={label}"));
+    }
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
         evidence.push(format!("deadline_ms={}", entry.deadline.0));
+        if let Some(id) = &entry.queue_id {
+            evidence.push(format!("queue_id={id}"));
+        }
+    }
+    if let Some(id) = deciding_deny_rule_id(decision) {
+        evidence.push(format!("deny_rule_id={id}"));
     }
 
     // A minted entry is recorded as the gate will read it, which is what
@@ -62,6 +71,26 @@ pub fn decided(
     record
 }
 
+/// Adds the queue id to a decision record and reseals it.
+///
+/// The admission audit is written before the entry is published, so the id
+/// has to be attached here rather than read back from the store.
+#[must_use]
+pub fn with_queue_id(record: Record, queue_id: &str) -> Record {
+    let mut evidence = record.evidence.clone();
+    evidence.push(format!("queue_id={queue_id}"));
+    record.with_evidence(evidence)
+}
+
+fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
+    decision.trace.iter().find_map(|step| match step {
+        xudo_policy::TraceStep::DenyRulesEvaluated { matched } => {
+            matched.first().map(|rule| rule.id.as_str())
+        }
+        _ => None,
+    })
+}
+
 /// The record of a refusal.
 pub fn refused(
     previous: Option<&Record>,
@@ -79,7 +108,11 @@ pub fn refused(
     }
     if let Some(request) = request {
         evidence.push(format!("question={}", question_kind(&request.question)));
-        if let Some((_, _, claimed)) = request.run_fields() {
+        let claimed = request
+            .run_fields()
+            .map(|(_, _, claimed)| claimed)
+            .or_else(|| request.remove_fields().map(|(_, _, claimed)| claimed));
+        if let Some(claimed) = claimed {
             evidence.push(format!("claimed_classification={claimed}"));
         }
     }
@@ -103,6 +136,12 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
         xudo_wire::Question::Answer { .. } => "answer",
         xudo_wire::Question::Freeze { .. } => "freeze",
         xudo_wire::Question::Thaw => "thaw",
+        xudo_wire::Question::QueueList => "queue_list",
+        xudo_wire::Question::QueueClaim { .. } => "queue_claim",
+        xudo_wire::Question::QueueComplete { .. } => "queue_complete",
+        xudo_wire::Question::QueueRelease { .. } => "queue_release",
+        xudo_wire::Question::QueueListPage { .. } => "queue_list_page",
+        xudo_wire::Question::RemovePath { .. } => "remove_path",
     }
 }
 
@@ -128,6 +167,12 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
 
 /// The request's command as one argv, program first, exactly as asked.
 fn command_of(request: &BrokerRequest) -> Vec<String> {
+    if let Some((target, _, _)) = request.remove_fields() {
+        return vec![
+            xudo_wire::OPERATION_PROGRAM.to_owned(),
+            target.escape_ascii().to_string(),
+        ];
+    }
     request
         .run_fields()
         .map_or_else(Vec::new, |(program, argv, _)| {
@@ -169,6 +214,8 @@ mod tests {
             diverged: false,
             pinned: true,
             cgroup_id,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
         }
     }
@@ -198,6 +245,7 @@ mod tests {
                 xudo_wire::Question::Run {
                     program: "/bin/id".to_owned(),
                     argv: Vec::new(),
+                    cwd: Vec::new(),
                     claimed_classification: "x".to_owned(),
                 },
                 "run",
@@ -205,6 +253,32 @@ mod tests {
             (xudo_wire::Question::Status { id: "a".repeat(64) }, "status"),
             (xudo_wire::Question::Watch, "watch"),
             (xudo_wire::Question::Pending, "pending"),
+            (xudo_wire::Question::QueueList, "queue_list"),
+            (
+                xudo_wire::Question::QueueClaim { id: "b".repeat(64) },
+                "queue_claim",
+            ),
+            (
+                xudo_wire::Question::QueueComplete {
+                    id: "c".repeat(64),
+                    audit_seq: 0,
+                    claim_token: String::new(),
+                },
+                "queue_complete",
+            ),
+            (
+                xudo_wire::Question::QueueRelease {
+                    id: "d".repeat(64),
+                    claim_token: String::new(),
+                },
+                "queue_release",
+            ),
+            (
+                xudo_wire::Question::QueueListPage {
+                    after: String::new(),
+                },
+                "queue_list_page",
+            ),
             (
                 xudo_wire::Question::Answer {
                     id: "a".repeat(64),
@@ -220,6 +294,14 @@ mod tests {
                 "freeze",
             ),
             (xudo_wire::Question::Thaw, "thaw"),
+            (
+                xudo_wire::Question::RemovePath {
+                    target: b"/srv/app/build/cache".to_vec(),
+                    dry_run: false,
+                    claimed_classification: "unattested".to_owned(),
+                },
+                "remove_path",
+            ),
         ] {
             let request = BrokerRequest {
                 schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
@@ -249,6 +331,66 @@ mod tests {
         decision.action = Some(ActionId::new("xudo.svc.restart"));
         decision.rule_source = Some(Source::new("20-services.toml", 3));
         decision
+    }
+
+    #[test]
+    fn an_enrolled_decision_records_the_registry_label_as_agent_id() {
+        let enrolled = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent.scope".to_owned(),
+                declared_yolo: false,
+            },
+            1000,
+        );
+        let enrolled_record = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &enrolled,
+            &identity(Some(44)),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            enrolled_record
+                .evidence
+                .contains(&"agent_id=codex".to_owned())
+        );
+        let unattested = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            !unattested
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("agent_id="))
+        );
+    }
+
+    #[test]
+    fn with_queue_id_seals_the_entry_id_into_the_admission_record() {
+        let record = decided(
+            None,
+            &permitted(Verdict::Deny),
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        let linked = with_queue_id(record, &"ab".repeat(32));
+        assert!(
+            linked
+                .evidence
+                .contains(&format!("queue_id={}", "ab".repeat(32)))
+        );
     }
 
     #[test]
@@ -302,6 +444,9 @@ mod tests {
             attested_class: xudo_gate::request::AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
+            queue_id: None,
+            operation: None,
         };
         let record = decided(
             None,
@@ -343,6 +488,22 @@ mod tests {
         }
         assert_eq!(record.deny_list_version, deny_list_version());
         assert_eq!(record.outcome, Outcome::NotExecuted);
+        let mut linked = entry.clone();
+        linked.queue_id = Some("cd".repeat(32));
+        let linked_record = decided(
+            None,
+            &permitted(Verdict::Allow),
+            &caller(),
+            &identity(Some(77)),
+            &request(),
+            &generation(),
+            Some(&linked),
+        );
+        assert!(
+            linked_record
+                .evidence
+                .contains(&format!("queue_id={}", "cd".repeat(32)))
+        );
         assert!(record.is_sealed());
     }
 
@@ -379,6 +540,35 @@ mod tests {
         assert_eq!(record.decision, AuditDecision::Denied);
         assert_eq!(record.denial.as_deref(), Some("argv_rejected"));
         assert_eq!(record.action, None);
+    }
+
+    #[test]
+    fn a_deny_rule_denial_records_the_deciding_rule_id() {
+        let mut denial = Decision::deny(DenialCode::DenyRule, vec!["x".to_owned()], Vec::new());
+        denial
+            .trace
+            .push(xudo_policy::TraceStep::DenyRulesEvaluated {
+                matched: vec![xudo_policy::DenyRuleMatch {
+                    id: ActionId::from("xudo.protect.pkg-remove"),
+                    source: Source::new("00-protect.toml", 6),
+                    reason: "protected package".to_owned(),
+                }],
+            });
+        let record = decided(
+            None,
+            &denial,
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(
+            record
+                .evidence
+                .contains(&"deny_rule_id=xudo.protect.pkg-remove".to_owned())
+        );
+        assert!(record.is_sealed());
     }
 
     #[test]

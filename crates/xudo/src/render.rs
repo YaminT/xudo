@@ -72,7 +72,15 @@ pub fn human(decision: &Decision) -> String {
         let _ = writeln!(out, "  action    {action}");
     }
     if let Some(source) = &decision.rule_source {
-        let _ = writeln!(out, "  rule      {source}");
+        if let Some(rule) = deciding_deny_rule(decision) {
+            let _ = writeln!(
+                out,
+                "  rule      {} ({}): {}",
+                rule.id, rule.source, rule.reason
+            );
+        } else {
+            let _ = writeln!(out, "  rule      {source}");
+        }
     }
     if let Some(code) = decision.denial {
         let _ = writeln!(out, "  reason    {}", code.as_str());
@@ -91,6 +99,16 @@ pub fn human(decision: &Decision) -> String {
     }
 
     out
+}
+
+fn deciding_deny_rule(decision: &Decision) -> Option<&xudo_policy::DenyRuleMatch> {
+    if decision.denial != Some(xudo_policy::DenialCode::DenyRule) {
+        return None;
+    }
+    decision.trace.iter().find_map(|step| match step {
+        TraceStep::DenyRulesEvaluated { matched } => matched.first(),
+        _ => None,
+    })
 }
 
 /// One trace step, as a single line.
@@ -112,6 +130,20 @@ fn trace_line(step: &TraceStep) -> String {
                 format!("deny-list v{version}: {}", matched.join("; "))
             }
         }
+        TraceStep::DenyRulesEvaluated { matched } => {
+            if matched.is_empty() {
+                "deny-rules: no configured rule matched".to_owned()
+            } else {
+                format!(
+                    "deny-rules: {}",
+                    matched
+                        .iter()
+                        .map(|rule| format!("{} ({}): {}", rule.id, rule.source, rule.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        }
         TraceStep::ConfirmationDecided { required, reason } => {
             let state = if *required {
                 "required"
@@ -119,6 +151,12 @@ fn trace_line(step: &TraceStep) -> String {
                 "not required"
             };
             format!("confirmation {state}: {reason}")
+        }
+        TraceStep::AskHumanQueued { action, source } => {
+            format!("ask-human queued by {action} at {source}")
+        }
+        TraceStep::OperationMatched { action, source } => {
+            format!("matched operation {action} at {source}")
         }
     }
 }
@@ -380,7 +418,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let decision = decide(&["restart", "nginx.service"], false);
         let text = json(&decision);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert_eq!(parsed["verdict"], "allow");
         assert_eq!(parsed["action"], "xudo.svc.restart");
         assert!(parsed["trace"].is_array());
@@ -415,7 +456,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["verdict"], "deny");
         assert_eq!(parsed["denial"], "policy_unloadable");
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert!(
             parsed["remediation"]
                 .as_str()
@@ -473,6 +517,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 version: 1,
                 matched: vec!["SpawnsShell: /bin/sh".into()],
             },
+            TraceStep::DenyRulesEvaluated {
+                matched: Vec::new(),
+            },
+            TraceStep::DenyRulesEvaluated {
+                matched: vec![xudo_policy::DenyRuleMatch {
+                    id: xudo_policy::ActionId::new("xudo.protect.test"),
+                    source: xudo_policy::Source::new("00-protect.toml", 3),
+                    reason: "protected package".into(),
+                }],
+            },
             TraceStep::ConfirmationDecided {
                 required: true,
                 reason: "r".into(),
@@ -480,6 +534,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             TraceStep::ConfirmationDecided {
                 required: false,
                 reason: "r".into(),
+            },
+            TraceStep::AskHumanQueued {
+                action: "xudo.review.test".into(),
+                source: "10-review.toml:1".into(),
+            },
+            TraceStep::OperationMatched {
+                action: "web.clean-build".into(),
+                source: "50-remove-path.toml:1".into(),
             },
         ];
         for step in &steps {

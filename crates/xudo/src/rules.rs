@@ -23,12 +23,53 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use xudo_policy::load_rule_files;
 use xudo_policy::{
-    RuleFile, RuleFilesError, RuleSet, RuleTest, is_rule_file_name, load_rule_files,
+    HarnessFile, HarnessRegistry, RuleFile, RuleFilesError, RuleSet, RuleTest, is_rule_file_name,
+    load_policy,
 };
 
 /// The default location of the root-owned rule files.
 pub const DEFAULT_RULES_DIR: &str = "/etc/xudo/rules.d";
+/// The default location of the root-owned harness registry.
+pub const DEFAULT_HARNESSES_DIR: &str = "/etc/xudo/harnesses.d";
+
+/// Protect rules shipped with the package and checked by `doctor` and `check`.
+pub const SHIPPED_PROTECT_DENY_IDS: &[&str] = &[
+    "xudo.protect.pkg-remove",
+    "xudo.protect.pkg-install-removal",
+    "xudo.protect.dpkg-remove",
+];
+
+/// Notes for shipped deny-rule programs that no loaded action currently uses.
+pub(crate) fn inert_shipped_deny_notes(rules: &RuleSet) -> Vec<String> {
+    SHIPPED_PROTECT_DENY_IDS
+        .iter()
+        .filter_map(|id| {
+            rules
+                .deny_rules()
+                .iter()
+                .find(|rule| rule.id.as_str() == *id)
+        })
+        .flat_map(|rule| {
+            rule.program
+                .iter()
+                .filter(|program| {
+                    !rules
+                        .actions()
+                        .iter()
+                        .any(|action| action.exe.rsplit('/').next() == Some(program.as_str()))
+                })
+                .map(|program| {
+                    format!(
+                        "{} for {program} is inert today; no loaded action runs that program",
+                        rule.id
+                    )
+                })
+        })
+        .collect()
+}
 
 /// A loaded ruleset, with the provenance needed to talk about it.
 #[derive(Clone, Debug)]
@@ -37,6 +78,7 @@ pub struct LoadedRules {
     files: Vec<PathBuf>,
     generation: String,
     tests: Vec<RuleTest>,
+    harnesses: HarnessRegistry,
 }
 
 impl LoadedRules {
@@ -65,6 +107,11 @@ impl LoadedRules {
     /// ruleset and its generation are the same with or without them.
     pub fn tests(&self) -> &[RuleTest] {
         &self.tests
+    }
+
+    /// The root-authored harness registry loaded beside the rules.
+    pub fn harnesses(&self) -> &HarnessRegistry {
+        &self.harnesses
     }
 
     /// Loads every rule file under `dir`.
@@ -110,12 +157,43 @@ impl LoadedRules {
             });
         }
 
-        let loaded = load_rule_files(files)?;
+        let harness_dir = dir.parent().unwrap_or(dir).join("harnesses.d");
+        let mut harness_files = Vec::new();
+        match std::fs::read_dir(&harness_dir) {
+            Ok(entries) => {
+                let mut entries: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| (entry.path(), entry.file_name()))
+                    .filter(|(_, name)| name.as_bytes().ends_with(b".toml"))
+                    .collect();
+                entries.sort();
+                for (path, name) in entries {
+                    let bytes = std::fs::read(&path).map_err(|error| LoadError::Read {
+                        file: path.display().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                    harness_files.push(HarnessFile {
+                        name: name.as_bytes().to_vec(),
+                        bytes,
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LoadError::Directory {
+                    dir: harness_dir.display().to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+
+        let loaded = load_policy(files, &harness_files)?;
         Ok(Self {
             rules: loaded.rules,
             files: entries.into_iter().map(|(path, _)| path).collect(),
             generation: loaded.generation.hex(),
             tests: loaded.tests,
+            harnesses: loaded.harnesses,
         })
     }
 }
@@ -228,6 +306,8 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         let loaded = fx.load().unwrap();
         assert_eq!(loaded.rules().len(), 2);
         assert_eq!(loaded.files().len(), 2);
+        assert!(loaded.tests().is_empty());
+        assert!(loaded.harnesses().is_empty());
         // 10- before 20-, which is the convention operators expect.
         assert!(
             loaded
@@ -308,6 +388,55 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
+    fn a_front_end_loads_registered_harnesses_and_ignores_other_files() {
+        let parent = test_tmp_root().join("front-end-harnesses");
+        let _ = std::fs::remove_dir_all(&parent);
+        let fx = Fixture {
+            dir: parent.join("rules.d"),
+        };
+        std::fs::create_dir_all(&fx.dir).unwrap();
+        let harnesses = parent.join("harnesses.d");
+        std::fs::create_dir_all(&harnesses).unwrap();
+        std::fs::write(
+            harnesses.join("codex.toml"),
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 2\n",
+        ).unwrap();
+        std::fs::write(harnesses.join("README"), "ignored").unwrap();
+        let loaded = fx.load().unwrap();
+        assert!(loaded.harnesses().get("codex").is_some());
+        assert_eq!(loaded.tests().len(), 0);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn a_registry_symlink_to_a_missing_file_is_a_read_error() {
+        use std::os::unix::fs::symlink;
+
+        let parent = test_tmp_root().join("harness-read-error");
+        let _ = std::fs::remove_dir_all(&parent);
+        let rules = parent.join("rules.d");
+        let harnesses = parent.join("harnesses.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&harnesses).unwrap();
+        symlink(parent.join("missing"), harnesses.join("codex.toml")).unwrap();
+        let error = LoadedRules::from_dir(&rules).unwrap_err();
+        assert_eq!(format!("{error:?}").split('{').next(), Some("Read "));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn a_non_directory_registry_path_is_a_directory_error() {
+        let parent = test_tmp_root().join("harness-directory-error");
+        let _ = std::fs::remove_dir_all(&parent);
+        let rules = parent.join("rules.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(parent.join("harnesses.d"), "not a directory").unwrap();
+        let error = LoadedRules::from_dir(&rules).unwrap_err();
+        assert_eq!(format!("{error:?}").split('{').next(), Some("Directory "));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn a_missing_directory_is_an_error_naming_the_path() {
         let missing = test_tmp_root().join("definitely-not-here");
         let err = LoadedRules::from_dir(&missing).unwrap_err();
@@ -351,7 +480,7 @@ nopasswd = true
             .write("10-a.toml", ONE_ACTION)
             .write("20-b.toml", ONE_ACTION);
         let err = fx.load().unwrap_err();
-        assert!(err.to_string().contains("duplicate action id"), "{err}");
+        assert!(err.to_string().contains("duplicate rule id"), "{err}");
     }
 
     #[test]

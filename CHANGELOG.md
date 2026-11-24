@@ -5,14 +5,53 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `xudo op remove-path <target>` removes a path under an `[[operation]]` rule
+  through the password-authenticated gate. `--dry-run` lists the paths and
+  removes nothing. A `harness` label on the rule is parsed and checked against
+  the registry and is not a grant. Harness use of this operation is planned.
+  The passwordless gate is not in this release.
+
+### Changed
+
+- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. A human reviewer runs a queued entry with `xudo exec --queued ID`: the broker re-decides the stored argv, the password gate runs it in `/`, and the entry is completed only from that gate's audit record. `ido` lists the root-held queue separately from the agent-editable user queue. The passwordless gate is not in this release.
+- `ido list --json` always prints one JSON object with `user` (the previous user-queue array), `root_held`, and `root_queue_unavailable`, including when the root-held list is empty.
+
 ### Security
+
+- `xudo freeze` and `xudo thaw` now classify the caller against the real harness registry. They used an empty one, so an enrolled agent counted as unattested and could lift its owner's freeze. Tests `an_enrolled_agent_cannot_thaw_its_owners_freeze_through_the_broker`, `an_enrolled_agent_cannot_freeze_or_thaw_others`.
+- The doas rule `xudo install` writes no longer says `persist`: an OpenDoas built with timestamp support cached the password for later runs of `xudo exec`. Test `doas_snippet_never_enables_credential_persistence`.
+- A queued claim records the reviewer uid and a claim token. Another reviewer cannot release, fail, or complete a fresh claim; after 15 minutes they may recover a stale claim, and only if the audit trail has no gate record for that nonce. A release or failure revokes the minted spool entry. The gate refuses a queued run whose queue record is not currently claimed for that nonce. Completion searches a bounded tail of the audit log under the log lock.
+- Let the broker read `/proc/sys/kernel/random/boot_id` by removing
+  `ProcSubset=pid` from its unit. Keep `ProtectKernelTunables=yes`; the unit
+  remains at the configured 1.2 systemd exposure ceiling. Use the same strict
+  lowercase boot-id validator in the syscall seam and broker paths.
+
+- Reset every resource limit from PID 1 before the gate reads policy, consumes
+  a request, writes an audit record, or runs a command. Cap the soft open-file
+  limit at 1024 and disable core dumps. In a container or PID namespace, PID 1
+  is that namespace's init, and using its limits is acceptable. The refusal
+  record after a failed reset is still written under caller limits; CPU time or
+  signals can tear that one record. Blocking signals around audit append and
+  cut-back remains unavailable through a safe API.
+- Bound the macOS `cross` and `gate` CI jobs to eight minutes; Ubuntu gate
+  jobs retain their existing timeout and no retries were added.
+- Ship active `00-protect.toml` rules that refuse removal of xudo, sudo,
+  sudo-rs, AppArmor, audit, firewall, logging, time-sync, and SSH server
+  packages through the shipped `apt-get remove` action. Its other clauses are
+  tripwires for broader operator actions. The policy loader still rejects deny
+  rules for programs with no loaded action, so apt and dpkg tripwires are tested
+  with broad test-only operator actions until those executables have shipped actions.
+- Protect `/usr/bin/xudo`, `/usr/bin/ido`, and `/usr/libexec/xudo/xudod` from
+  xudo-mediated writes; bump the compiled deny-list version to 7.
 
 - `path-under` is lexical only. Nothing in xudo enforces containment for
   argument paths. Never use it for a program that opens the path as root.
   A rule that allowlists `rm` of a home directory accepts a path the agent
   planted as a symlink and deletes whatever that symlink points at. The
   compiled-in deny-list now refuses that class of tool
-  (`ChangesPathMetadataOrExistence`, deny-list version 6): `rm`, `rmdir`,
+  (`ChangesPathMetadataOrExistence`, deny-list version 7): `rm`, `rmdir`,
   `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
   `touch`, `mkdir`, `mkfifo`, `rename`, and `prename`, including a copy or
   hardlink that keeps the name and a `busybox` applet. `mknod` joins

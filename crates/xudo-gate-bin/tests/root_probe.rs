@@ -439,6 +439,9 @@ fn write_entry_for(
         attested_class: xudo_gate::request::AttestedClass::Unattested,
         attested_scope_id: None,
         boot_id: None,
+        attested_harness: None,
+        queue_id: None,
+        operation: None,
     };
     let path = format!("{SPOOL_DIR}/{nonce}");
     root_file(&path, entry.to_json().as_bytes(), 0o600);

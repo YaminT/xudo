@@ -1,6 +1,7 @@
 //! `xudo exec`: ask the broker, then let `main` swap this process for the backend.
 
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigVal
 use xudo_policy::{DenialCode, ExitCode};
 use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question};
 
-use crate::cli::{Cli, emit, emit_queued};
+use crate::cli::{Cli, emit};
 
 type StatusPoll<'a> =
     dyn FnMut(Duration, &BrokerRequest) -> Result<Option<BrokerResponse>, ExitCode> + 'a;
@@ -44,6 +45,36 @@ pub struct ExecPlan {
     /// so the pinned process would be the gate itself; the gate only looks at
     /// its ancestors. sudo forks, so it stays an in-place exec.
     pub spawn: bool,
+}
+
+/// A claimed queue entry, ready for the password gate.
+///
+/// The working directory is always [`QUEUED_CWD`]. The queue file still holds
+/// the directory the agent named; this run does not use it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QueuedRun {
+    /// `sudo` or `doas`, always spawned so this process can finish the claim.
+    pub plan: ExecPlan,
+    /// The queue id that was claimed.
+    pub id: String,
+    /// Where the child runs. Fixed, never the entry's stored directory.
+    pub cwd: &'static str,
+    /// The token the claimant must present to complete or release.
+    pub claim_token: String,
+}
+
+/// Fixed working directory of a queued run.
+pub const QUEUED_CWD: &str = "/";
+
+/// What happened to the claim after the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedFinish {
+    /// The gate's audit record completed the entry.
+    Completed,
+    /// The claim went back to pending. A password refusal does this.
+    Released,
+    /// Complete and release both failed. The claim stays until it expires.
+    Stuck,
 }
 
 /// [`plan`] against this machine's backend and the real broker socket.
@@ -144,7 +175,7 @@ fn plan_paced(
     socket: &Path,
     timeout: Duration,
     wait: Duration,
-    mut pace: Option<&mut Pace<'_>>,
+    pace: Option<&mut Pace<'_>>,
     queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -158,7 +189,11 @@ fn plan_paced(
     };
 
     // "unattested" is a hint the broker ignores; it works out who we are itself.
-    let request = BrokerRequest::new(program.clone(), operands.to_vec(), "unattested");
+    let cwd = std::env::current_dir()
+        .map(|path| path.into_os_string().into_vec())
+        .unwrap_or_default();
+    let request =
+        BrokerRequest::new(program.clone(), operands.to_vec(), "unattested").with_cwd_bytes(cwd);
     let response = match ask(socket, timeout, &request) {
         Ok(response) => response,
         Err(why) => {
@@ -177,37 +212,15 @@ fn plan_paced(
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
             Err(ExitCode::Unusable)
         }
-        Answer::Pending { id, expires_in_ms } => pending_or_wait(
+        Answer::Pending { id, expires_in_ms } => await_approval(
             cli,
-            &id,
-            expires_in_ms,
-            wait,
+            (&id, expires_in_ms, wait),
+            pace,
+            (&request, socket, timeout, backend),
             out,
             err,
-            &mut |wait, status_request| {
-                let mut status = |remaining| {
-                    ask(
-                        socket,
-                        timeout.min(remaining).min(Duration::from_millis(500)),
-                        status_request,
-                    )
-                };
-                if let Some(pace) = pace.as_deref_mut() {
-                    return poll_status_with(&id, wait, &mut status, pace.elapsed, pace.sleep);
-                }
-                let started = Instant::now();
-                let mut elapsed = || started.elapsed();
-                let mut sleep = std::thread::sleep;
-                poll_status_with(&id, wait, &mut status, &mut elapsed, &mut sleep)
-            },
-        )
-        .and_then(|answer| match answer {
-            None => Err(ExitCode::NotConfirmed),
-            Some(answer) => handle_status_answer(
-                cli, answer, &id, &request, socket, timeout, backend, err, out,
-            ),
-        }),
-        Answer::Watching { .. } | Answer::Done => {
+        ),
+        Answer::Watching { .. } | Answer::QueueListed { .. } | Answer::Done => {
             let _ = writeln!(
                 err,
                 "xudo: broker returned an answer for an unsupported question"
@@ -280,6 +293,49 @@ fn timeout_from_value(value: &ConfigValue, err: &mut dyn Write) -> Option<Durati
             None
         }
     }
+}
+
+/// Waits for the human to decide a pending request, then claims the approval
+/// by asking the same question again. Shared by `xudo` and `xudo op`.
+#[allow(clippy::too_many_arguments)]
+fn await_approval(
+    cli: &Cli,
+    (id, expires_in_ms, wait): (&str, u64, Duration),
+    mut pace: Option<&mut Pace<'_>>,
+    (request, socket, timeout, backend): (&BrokerRequest, &Path, Duration, &'static str),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    pending_or_wait(
+        cli,
+        id,
+        expires_in_ms,
+        wait,
+        out,
+        err,
+        &mut |wait, status_request| {
+            let mut status = |remaining| {
+                ask(
+                    socket,
+                    timeout.min(remaining).min(Duration::from_millis(500)),
+                    status_request,
+                )
+            };
+            if let Some(pace) = pace.as_deref_mut() {
+                return poll_status_with(id, wait, &mut status, pace.elapsed, pace.sleep);
+            }
+            let started = Instant::now();
+            let mut elapsed = || started.elapsed();
+            let mut sleep = std::thread::sleep;
+            poll_status_with(id, wait, &mut status, &mut elapsed, &mut sleep)
+        },
+    )
+    .and_then(|answer| match answer {
+        None => Err(ExitCode::NotConfirmed),
+        Some(answer) => {
+            handle_status_answer(cli, answer, id, request, socket, timeout, backend, err, out)
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,7 +425,10 @@ fn poll_status_with(
                 Answer::Pending { id: status_id, .. } if status_id == id => silent = false,
                 Answer::Pending { .. } => return Err(ExitCode::Unusable),
                 Answer::Decided { .. } => return Ok(Some(response)),
-                Answer::Refused { .. } | Answer::Watching { .. } | Answer::Done => {
+                Answer::Refused { .. }
+                | Answer::Watching { .. }
+                | Answer::QueueListed { .. }
+                | Answer::Done => {
                     return Err(ExitCode::Unusable);
                 }
             },
@@ -449,6 +508,312 @@ fn handle_status_answer(
     })
 }
 
+/// Claims `id` and returns the password-gate plan.
+///
+/// The broker re-decides the stored argv against the current rules. A denial
+/// is printed here and the claim is failed by the broker; this function does
+/// not exec. A permitted claim always uses [`GATE_AUTH`] and [`QUEUED_CWD`],
+/// and always spawns, including under sudo, so the caller can complete or
+/// release the claim after the child.
+///
+/// # Errors
+///
+/// The exit status to return when there is nothing to exec.
+///
+/// `tty` is true only when both stdin and stderr are terminals. The confirm
+/// word is read from stdin and the prompt is written to stderr.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_queued(
+    cli: &Cli,
+    id: &str,
+    probe: &dyn Probe,
+    socket: &Path,
+    timeout: Duration,
+    tty: bool,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    if !valid_request_id(id) {
+        let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
+        return Err(ExitCode::Unusable);
+    }
+    // A non-terminal cannot show the command or take the confirmation word.
+    // Refuse before the claim so no spool entry is minted.
+    if !tty {
+        let _ = writeln!(
+            err,
+            "xudo: a queued run needs a terminal to show the command and confirm it"
+        );
+        return Err(ExitCode::Unusable);
+    }
+    let Some(backend) = selected_backend(probe, err) else {
+        return Err(ExitCode::Unusable);
+    };
+    let request = queue_question(Question::QueueClaim { id: id.to_owned() });
+    let response = match ask(socket, timeout, &request) {
+        Ok(response) => response,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            return Err(ExitCode::Unusable);
+        }
+    };
+    queued_plan(cli, id, backend, response, socket, timeout, input, out, err)
+}
+
+/// [`plan_queued`] against this machine and the real broker socket.
+///
+/// # Errors
+///
+/// As [`plan_queued`]. A settings file that cannot be read fails closed first.
+pub fn plan_queued_live(
+    cli: &Cli,
+    id: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    // The duration is the watch wait, which a queued run does not use. The
+    // read itself is the point: an unreadable settings file fails closed.
+    if configured_timeout(cli, err).is_none() {
+        return Err(ExitCode::Unusable);
+    }
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let tty = queued_terminal(stdin.is_terminal(), stderr.is_terminal());
+    let mut input = stdin.lock();
+    plan_queued(
+        cli,
+        id,
+        &xudo_sys::HostProbe,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        TIMEOUT,
+        tty,
+        &mut input,
+        out,
+        err,
+    )
+}
+
+/// Completes the claim from the gate's audit record, or asks the broker to
+/// release it.
+///
+/// A child that started may have been allowed by the gate before it exec'd,
+/// even when the command's own status is non-zero, so completion is tried
+/// first. Anything except [`Answer::Done`] from that completion sends a
+/// release. The broker keeps the entry terminal when a gate record binds, or
+/// when the spool file was already consumed, instead of returning it to
+/// pending. A child that never started is only released. A storage failure on
+/// the broker leaves the claim until the queue TTL; this returns
+/// [`QueuedFinish::Stuck`].
+pub fn finish_queued(
+    id: &str,
+    child_started: bool,
+    claim_token: &str,
+    socket: &Path,
+    timeout: Duration,
+    err: &mut dyn Write,
+) -> QueuedFinish {
+    if !valid_request_id(id) {
+        let _ = writeln!(err, "xudo: a queued id is 64 lowercase hex characters");
+        return QueuedFinish::Stuck;
+    }
+    if child_started && queue_done(id, true, claim_token, socket, timeout, err) {
+        return QueuedFinish::Completed;
+    }
+    if queue_done(id, false, claim_token, socket, timeout, err) {
+        QueuedFinish::Released
+    } else {
+        let _ = writeln!(
+            err,
+            "xudo: the queued claim was not released; it stays until it expires"
+        );
+        QueuedFinish::Stuck
+    }
+}
+
+/// [`finish_queued`] against the real broker socket.
+///
+/// The library binary uses this so it does not name the wire crate. An id
+/// that is not 64 lowercase hex characters is refused before any connection.
+pub fn finish_queued_live(
+    id: &str,
+    child_started: bool,
+    claim_token: &str,
+    err: &mut dyn Write,
+) -> QueuedFinish {
+    finish_queued(
+        id,
+        child_started,
+        claim_token,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        TIMEOUT,
+        err,
+    )
+}
+
+/// Both streams must be terminals.
+///
+/// The flags are arguments so each one is evaluated. A short-circuit `&&`
+/// would skip the stderr check wherever stdin is not a terminal, and that
+/// line would be uncovered on CI.
+#[must_use]
+pub(crate) fn queued_terminal(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
+}
+
+fn queue_question(question: Question) -> BrokerRequest {
+    BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queued_plan(
+    cli: &Cli,
+    id: &str,
+    backend: &'static str,
+    response: BrokerResponse,
+    socket: &Path,
+    timeout: Duration,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<QueuedRun, ExitCode> {
+    match response.answer {
+        Answer::Refused {
+            code, remediation, ..
+        } => {
+            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            Err(ExitCode::Unusable)
+        }
+        Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
+        | Answer::Done => {
+            let _ = writeln!(
+                err,
+                "xudo: broker returned an answer for an unsupported question"
+            );
+            Err(ExitCode::Unusable)
+        }
+        Answer::Decided { decision, minted } => {
+            if !decision.verdict.is_permitted() {
+                // Not `report_denial`: an ask-human verdict here is a fresh
+                // refusal of this run, not a new submission to the queue.
+                let status = emit(cli, &decision, out);
+                let _ = writeln!(
+                    err,
+                    "xudo: the queued command was refused when it was re-decided"
+                );
+                return Err(status);
+            }
+            let Some(minted) = minted else {
+                let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+                return Err(ExitCode::Unusable);
+            };
+            if minted.gate != GATE_AUTH {
+                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+                return Err(ExitCode::Unusable);
+            }
+            let claim_token = claim_secret(&minted);
+            if !confirm_queued(id, &decision, minted.harness.as_deref(), input, err) {
+                let _ = writeln!(err, "xudo: confirmation was not run; releasing the claim");
+                let _ = queue_done(id, false, &claim_token, socket, timeout, err);
+                return Err(ExitCode::Unusable);
+            }
+            Ok(QueuedRun {
+                plan: ExecPlan {
+                    backend,
+                    gate: GATE_AUTH,
+                    spawn: true,
+                },
+                id: id.to_owned(),
+                cwd: QUEUED_CWD,
+                claim_token,
+            })
+        }
+    }
+}
+
+/// The secret recorded on the claim. The mint returns it beside the nonce.
+fn claim_secret(minted: &xudo_wire::Minted) -> String {
+    match minted.claim_token.as_deref() {
+        Some(token) if !token.is_empty() => token.to_owned(),
+        Some(_) | None => minted.nonce.clone(),
+    }
+}
+
+/// Prints the sanitized command and requires the confirm word on `input`.
+fn confirm_queued(
+    id: &str,
+    decision: &xudo_policy::Decision,
+    harness: Option<&str>,
+    input: &mut dyn BufRead,
+    err: &mut dyn Write,
+) -> bool {
+    let limits = term_sanitize::Limits {
+        max_cols: 4096,
+        max_lines: 1,
+    };
+    let shown: Vec<String> = decision
+        .resolved_command()
+        .iter()
+        .map(|arg| term_sanitize::display_str(arg, limits).text)
+        .collect();
+    let command = shown.join(" ");
+    let label = term_sanitize::display_str(harness.unwrap_or(""), limits).text;
+    let _ = writeln!(err, "xudo: queued {id} harness {label}");
+    let _ = writeln!(err, "xudo: command: {command}");
+    let _ = write!(err, "type {} and press enter: ", ido::picker::CONFIRM_WORD);
+    let _ = err.flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim_end_matches(['\r', '\n']) == ido::picker::CONFIRM_WORD
+}
+
+/// `complete` asks [`Question::QueueComplete`]; otherwise [`Question::QueueRelease`].
+fn queue_done(
+    id: &str,
+    complete: bool,
+    claim_token: &str,
+    socket: &Path,
+    timeout: Duration,
+    err: &mut dyn Write,
+) -> bool {
+    let question = if complete {
+        Question::QueueComplete {
+            id: id.to_owned(),
+            audit_seq: 0,
+            claim_token: claim_token.to_owned(),
+        }
+    } else {
+        Question::QueueRelease {
+            id: id.to_owned(),
+            claim_token: claim_token.to_owned(),
+        }
+    };
+    match ask(socket, timeout, &queue_question(question)) {
+        Ok(response) if matches!(response.answer, Answer::Done) => true,
+        Ok(_) => {
+            let _ = writeln!(err, "xudo: the queued run was not completed");
+            false
+        }
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            false
+        }
+    }
+}
+
 /// One request and one response, on one deadline.
 ///
 /// Connect, the write, and the read share `timeout`. A signal retries the
@@ -466,13 +831,196 @@ pub(crate) fn ask(
     BrokerResponse::parse(&bytes).map_err(|error| error.to_string())
 }
 
-/// Shows a denial, queueing it first when `--queue` asks and a person can
-/// resolve it. The verdict and the exit status are the denial's either way.
+/// The broker question for `xudo op remove-path`.
+///
+/// # Errors
+///
+/// The target is empty, relative, contains a NUL, or is longer than the wire
+/// allows. Nothing is asked.
+pub fn remove_path_request(target: &[u8], dry_run: bool) -> Result<BrokerRequest, &'static str> {
+    if target.is_empty()
+        || !target.starts_with(b"/")
+        || target.contains(&0)
+        || target.len() > xudo_wire::MAX_PROGRAM_BYTES
+    {
+        return Err("target must be an absolute path without NUL");
+    }
+    Ok(BrokerRequest {
+        schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+        question: Question::RemovePath {
+            target: target.to_vec(),
+            dry_run,
+            claimed_classification: "unattested".to_owned(),
+        },
+    })
+}
+
+/// Turns a broker answer into the password-gate plan.
+///
+/// # Errors
+///
+/// A refusal, a denial, a missing mint, an unexpected gate, or an answer that
+/// belongs to another question.
+pub fn remove_plan_from_answer(
+    cli: &Cli,
+    target: &[u8],
+    response: &BrokerResponse,
+    probe: &dyn Probe,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    match &response.answer {
+        Answer::Refused {
+            code, remediation, ..
+        } => {
+            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            Err(ExitCode::Unusable)
+        }
+        Answer::Pending { .. }
+        | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
+        | Answer::Done => {
+            let _ = writeln!(
+                err,
+                "xudo: broker returned an answer for an unsupported question"
+            );
+            Err(ExitCode::Unusable)
+        }
+        Answer::Decided { decision, minted } => {
+            if !decision.verdict.is_permitted() {
+                let shown = vec![target.escape_ascii().to_string()];
+                return Err(report_denial(cli, decision, &shown, None, out, err));
+            }
+            let Some(minted) = minted else {
+                let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
+                return Err(ExitCode::Unusable);
+            };
+            if minted.gate != GATE_AUTH {
+                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+                return Err(ExitCode::Unusable);
+            }
+            let Some(backend) = selected_backend(probe, err) else {
+                return Err(ExitCode::Unusable);
+            };
+            Ok(ExecPlan {
+                backend,
+                gate: GATE_AUTH,
+                spawn: backend == "/usr/bin/doas",
+            })
+        }
+    }
+}
+
+/// Asks the broker to mint a remove-path and returns the plan. Does not exec.
+///
+/// # Errors
+///
+/// As [`remove_path_request`] and [`remove_plan_from_answer`], plus an
+/// unreachable broker.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_remove_path(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    probe: &dyn Probe,
+    socket: &Path,
+    (timeout, wait): (Duration, Duration),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    plan_remove_paced(
+        cli,
+        target,
+        dry_run,
+        probe,
+        socket,
+        (timeout, wait),
+        None,
+        out,
+        err,
+    )
+}
+
+/// [`plan_remove_path`] with the approval wait paced by `pace`, or by the
+/// real clock when it is `None`.
+#[allow(clippy::too_many_arguments)]
+fn plan_remove_paced(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    probe: &dyn Probe,
+    socket: &Path,
+    (timeout, wait): (Duration, Duration),
+    pace: Option<&mut Pace<'_>>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    let request = match remove_path_request(target, dry_run) {
+        Ok(request) => request,
+        Err(reason) => {
+            let _ = writeln!(err, "xudo: {reason}");
+            return Err(ExitCode::Unusable);
+        }
+    };
+    let response = match ask(socket, timeout, &request) {
+        Ok(response) => response,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "xudo: the broker is unreachable ({why}); run `xudo doctor`"
+            );
+            return Err(ExitCode::Unusable);
+        }
+    };
+    if let Answer::Pending { id, expires_in_ms } = &response.answer {
+        let Some(backend) = selected_backend(probe, err) else {
+            return Err(ExitCode::Unusable);
+        };
+        return await_approval(
+            cli,
+            (id, *expires_in_ms, wait),
+            pace,
+            (&request, socket, timeout, backend),
+            out,
+            err,
+        );
+    }
+    remove_plan_from_answer(cli, target, &response, probe, out, err)
+}
+
+/// [`plan_remove_path`] against this machine's backend and the real broker socket.
+///
+/// # Errors
+///
+/// As [`plan_remove_path`].
+pub fn plan_remove_live(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    let Some(wait) = configured_timeout(cli, err) else {
+        return Err(ExitCode::Unusable);
+    };
+    plan_remove_path(
+        cli,
+        target,
+        dry_run,
+        &xudo_sys::HostProbe,
+        Path::new(xudo_wire::BROKER_SOCKET),
+        (TIMEOUT, wait),
+        out,
+        err,
+    )
+}
+
+/// Shows a denial. Privileged denials are never written into the caller-owned ido queue.
 fn report_denial(
     cli: &Cli,
     decision: &xudo_policy::Decision,
     argv: &[String],
-    queue: Option<&ido::Host>,
+    _queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -480,58 +1028,20 @@ fn report_denial(
         decision.denial,
         Some(DenialCode::HumanPathOnly | DenialCode::NoConfirmationChannel)
     );
-    let queued = match (human_only, queue) {
-        (true, Some(host)) => queue_denied(host, argv, decision, err),
-        _ => None,
-    };
-    let status = emit_queued(cli, decision, queued.map(|q| q.id), out);
-    match queued {
-        Some(q) => {
-            let _ = write!(err, "{}", crate::render::queued_human(q.id, q.already));
-        }
-        None if human_only => {
-            let _ = writeln!(
-                err,
-                "xudo: a human must run this; queue it with:\n  ido queue -- {}",
-                display_quoted(argv)
-            );
-        }
-        None => {}
+    let status = emit(cli, decision, out);
+    if human_only {
+        let _ = writeln!(
+            err,
+            "xudo: a human must run this; review it and run it with:\n  ido queue -- {}",
+            display_quoted(argv)
+        );
+    } else if decision.denial == Some(DenialCode::AskHuman) {
+        let _ = writeln!(
+            err,
+            "xudo: request submitted to the root-held human review queue"
+        );
     }
     status
-}
-
-/// Writes the denied command to the caller's `ido` queue, as `ido queue` would.
-///
-/// `None` on any failure, after saying why: the caller then prints the plain
-/// denial, so a failed write is never read as queued. The command is stored as
-/// the vector it arrived as; the denial code is display-only provenance in the
-/// entry's reason, which `ido` sanitizes wherever it shows it.
-fn queue_denied(
-    host: &ido::Host,
-    argv: &[String],
-    decision: &xudo_policy::Decision,
-    err: &mut dyn Write,
-) -> Option<ido::Enqueued> {
-    let code = decision
-        .denial
-        .map_or_else(String::new, |code| format!("{code:?}"));
-    let reason = format!("xudo denied this ({code}); a human must run it");
-    match ido::enqueue(host, argv.to_vec(), Some(reason)) {
-        Ok(queued) => Some(queued),
-        Err(error) => {
-            let _ = writeln!(
-                err,
-                "xudo: could not queue the command ({}); nothing was queued",
-                term_sanitize::display_str(
-                    &error.to_string(),
-                    term_sanitize::Limits::single_line(200)
-                )
-                .text
-            );
-            None
-        }
-    }
 }
 
 /// The argv as a shell line, for a human to read and paste. Display only.
@@ -611,6 +1121,8 @@ mod tests {
             nonce: "0".repeat(64),
             expires_in_ms: 1,
             gate: gate.into(),
+            claim_token: None,
+            harness: None,
         }
     }
 
@@ -1170,6 +1682,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1207,6 +1721,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1247,11 +1763,15 @@ mod tests {
                 nonce: id.clone(),
                 expires_in_ms: 1,
                 gate: "/other".into(),
+                claim_token: None,
+                harness: None,
             },
             Minted {
                 nonce: "b".repeat(64),
                 expires_in_ms: 1,
                 gate: GATE_AUTH.into(),
+                claim_token: None,
+                harness: None,
             },
         ] {
             let status = BrokerResponse {
@@ -1262,6 +1782,8 @@ mod tests {
                         nonce: id.clone(),
                         expires_in_ms: 1,
                         gate: GATE_AUTH.into(),
+                        claim_token: None,
+                        harness: None,
                     }),
                 },
             };
@@ -1304,6 +1826,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1340,6 +1864,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1381,6 +1907,8 @@ mod tests {
                     nonce: id.clone(),
                     expires_in_ms: 1,
                     gate: GATE_AUTH.into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1436,6 +1964,8 @@ mod tests {
                     nonce: "c".repeat(64),
                     expires_in_ms: 1,
                     gate: "/usr/libexec/xudo/other-gate".into(),
+                    claim_token: None,
+                    harness: None,
                 }),
             },
         };
@@ -1508,6 +2038,8 @@ mod tests {
             nonce: id.clone(),
             expires_in_ms: 30_000,
             gate: GATE_AUTH.into(),
+            claim_token: None,
+            harness: None,
         };
         let approved_status = decided(allow(), Some(matching_mint.clone()));
         let consumed_run = decided(allow(), Some(matching_mint));
@@ -1559,6 +2091,7 @@ mod tests {
             std::mem::discriminant(&Question::Run {
                 program: String::new(),
                 argv: Vec::new(),
+                cwd: Vec::new(),
                 claimed_classification: String::new(),
             })
         );
@@ -1678,8 +2211,10 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
-            for byte in reply {
-                if stream.write_all(&[byte]).is_err() {
+            // Cycle the bytes so the loop ends only when the client hangs up:
+            // the `break` is reached on every run, however slow the machine.
+            for byte in reply.iter().cycle() {
+                if stream.write_all(&[*byte]).is_err() {
                     break;
                 }
                 thread::sleep(Duration::from_millis(30));
@@ -1746,6 +2281,9 @@ mod tests {
             lock_wait: Duration::from_secs(1),
             frame_delay: Duration::ZERO,
             xudo_front_end: std::path::PathBuf::from(ido::XUDO_FRONT_END),
+            root_entries: Vec::new(),
+            root_queue_unavailable: false,
+            root_release: None,
         }
     }
 
@@ -1765,7 +2303,7 @@ mod tests {
     }
 
     fn queueing_cli(output: &str) -> Cli {
-        Cli::parse_from(["xudo", "--output", output, "exec", "--queue", "--", "x"])
+        Cli::parse_from(["xudo", "--output", output, "exec", "--", "x"])
     }
 
     fn denied(code: DenialCode) -> Vec<u8> {
@@ -1776,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_denial_with_queue_writes_one_entry_with_exact_argv() {
+    fn a_privileged_denial_is_never_written_to_the_callers_ido_queue() {
         for code in [DenialCode::HumanPathOnly, DenialCode::NoConfirmationChannel] {
             let dir = tempfile::tempdir().unwrap();
             let host = queue_host(dir.path());
@@ -1794,16 +2332,9 @@ mod tests {
             assert_eq!(result, plain);
             assert!(result.is_err());
             assert!(!out.is_empty());
-            assert!(err.contains("queued as #1, run `ido` to execute"), "{err}");
-            assert!(!err.contains("ido queue --"), "{err}");
-            let entries = queued_entries(&host);
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].argv, args);
-            assert_eq!(entries[0].queued_by.as_deref(), Some("xudo"));
-            assert!(entries[0].via_xudo, "a denied command is xudo-bound");
-            let reason = entries[0].reason.as_deref().unwrap();
-            assert!(reason.contains(&format!("{code:?}")), "{reason}");
-            // The same command again is the same entry, not a second.
+            assert!(!err.contains("queued as"), "{err}");
+            assert!(err.contains("ido queue --"), "{err}");
+            assert!(queued_entries(&host).is_empty());
             let (_, _, err) = against_queueing(
                 denied(code),
                 &SUDO,
@@ -1811,13 +2342,13 @@ mod tests {
                 &queueing_cli("human"),
                 Some(&host),
             );
-            assert!(err.contains("already queued as #1"), "{err}");
-            assert_eq!(queued_entries(&host).len(), 1);
+            assert!(!err.contains("queued as"), "{err}");
+            assert!(queued_entries(&host).is_empty());
         }
     }
 
     #[test]
-    fn a_json_denial_with_queue_carries_the_entry_id() {
+    fn a_json_human_path_denial_has_no_user_queue_id() {
         let dir = tempfile::tempdir().unwrap();
         let host = queue_host(dir.path());
         let (result, out, _) = against_queueing(
@@ -1829,8 +2360,22 @@ mod tests {
         );
         assert_eq!(result, Err(ExitCode::Denied));
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["queued"]["id"], 1);
+        assert!(parsed.get("queued").is_none());
         assert_eq!(parsed["verdict"], "deny");
+    }
+
+    #[test]
+    fn ask_human_reports_submission_to_the_root_held_queue() {
+        let (result, _, err) = against_queueing(
+            denied(DenialCode::AskHuman),
+            &SUDO,
+            &argv(),
+            &queueing_cli("human"),
+            None,
+        );
+        assert_eq!(result, Err(ExitCode::Denied));
+        assert!(err.contains("request submitted to the root-held human review queue"));
+        assert!(!err.contains("ido queue --"));
     }
 
     #[test]
@@ -1850,7 +2395,7 @@ mod tests {
             let (plain, _, _) = against(denied(code), &SUDO, &argv());
             assert!(plain.is_err(), "{plain:?}");
             assert_eq!(result, plain);
-            assert_eq!(queued_entries(&host).len(), 1);
+            assert!(queued_entries(&host).is_empty());
         }
         // An allowed command is planned as without the flag, and queues nothing.
         let dir = tempfile::tempdir().unwrap();
@@ -1902,20 +2447,14 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_argument_is_refused_by_the_parser_and_nothing_is_queued() {
+    fn a_non_utf8_argument_is_refused_by_the_parser_without_queue_flags() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         // `ido`'s `Entry.argv` is `Vec<String>`, so non-UTF-8 bytes cannot be
         // queued byte for byte: the command line parser refuses them first,
         // and nothing lossy ever reaches the queue.
         let bad = OsString::from_vec(b"/usr/bin/tool\xff\xfe".to_vec());
-        let parsed = Cli::try_parse_from([
-            OsString::from("xudo"),
-            "exec".into(),
-            "--queue".into(),
-            "--".into(),
-            bad,
-        ]);
+        let parsed = Cli::try_parse_from([OsString::from("xudo"), "exec".into(), "--".into(), bad]);
         assert!(parsed.is_err());
         // The refusal happens before any queue is opened.
         let dir = tempfile::tempdir().unwrap();
@@ -1923,8 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn control_characters_in_argv_are_queued_exactly() {
-        // Text with every byte `ido` must not reinterpret is stored as given.
+    fn control_characters_in_a_denial_are_not_written_to_a_user_queue() {
         let dir = tempfile::tempdir().unwrap();
         let host = queue_host(dir.path());
         let args: Vec<String> = [
@@ -1946,13 +2484,11 @@ mod tests {
             Some(&host),
         );
         assert_eq!(result, Err(ExitCode::Denied));
-        let entries = queued_entries(&host);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].argv, args);
+        assert!(queued_entries(&host).is_empty());
     }
 
     #[test]
-    fn a_failed_queue_write_fails_closed() {
+    fn a_denial_does_not_try_to_write_a_user_queue() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = queue_host(dir.path());
         host.home = None;
@@ -1965,8 +2501,7 @@ mod tests {
                 Some(&host),
             );
             assert_eq!(result, Err(ExitCode::Denied));
-            assert!(err.contains("could not queue the command"), "{err}");
-            assert!(err.contains("nothing was queued"), "{err}");
+            assert!(!err.contains("could not queue the command"), "{err}");
             assert!(!err.contains("queued as"), "{err}");
             // The denial still tells the agent how to hand it over by hand.
             assert!(err.contains("ido queue --"), "{err}");
@@ -2014,14 +2549,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let held = thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            // Keep the connection open and silent until the client gives up.
-            thread::sleep(Duration::from_millis(500));
-            drop(s);
+            let (stream, _) = listener.accept().unwrap();
+            // The clock starts once the broker is holding a silent socket, so
+            // probing sudo and opening the connection are not part of the
+            // deadline. The peer stays up until the client returns, or for two
+            // seconds if the client waits for the hang-up.
+            let _ = accepted_tx.send(std::time::Instant::now());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            drop(stream);
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let started = std::time::Instant::now();
         let result = plan(
             &cli(),
             &argv(),
@@ -2031,8 +2571,14 @@ mod tests {
             &mut out,
             &mut err,
         );
+        let accepted = accepted_rx.recv_timeout(Duration::from_millis(50)).unwrap();
+        let elapsed = accepted.elapsed();
+        let _ = release_tx.send(());
         assert_eq!(result, Err(ExitCode::Unusable));
-        assert!(started.elapsed() < Duration::from_millis(450));
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "silent broker held the client for {elapsed:?}"
+        );
         held.join().unwrap();
     }
 
@@ -2170,5 +2716,986 @@ mod tests {
             &mut err,
         );
         assert_eq!(status, ExitCode::Unusable);
+    }
+
+    fn queued_id() -> String {
+        "ab".repeat(32)
+    }
+
+    // `serve_many` maps this over owned answers, so the argument is by value.
+    #[allow(clippy::needless_pass_by_value)]
+    fn response(answer: Answer) -> Vec<u8> {
+        json(&answer)
+    }
+
+    fn claim_once(
+        reply: Vec<u8>,
+        probe: &dyn Probe,
+    ) -> (Result<QueuedRun, ExitCode>, String, String, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(listener, reply);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut input = std::io::Cursor::new(b"run\n");
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            probe,
+            &socket,
+            PATIENT,
+            true,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        let request = broker.finish();
+        (
+            result,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            request,
+        )
+    }
+
+    #[test]
+    fn a_queued_entry_runs_only_through_the_password_path() {
+        // The shipped sudoers rule disables the credential cache. A queued run
+        // uses that same rule: the gate is the password helper, never the
+        // passwordless one, and sudo must ask even after an earlier login.
+        let backend = xudo_backend::Backend {
+            exe: "/usr/bin/sudo".to_owned(),
+            kind: xudo_backend::BackendKind::Sudo,
+            version: "Sudo version 1.9.17p2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::from_supported([
+                xudo_backend::Capability::DisableCredentialCache,
+                xudo_backend::Capability::AllocatePty,
+                xudo_backend::Capability::PerCommandDefaults,
+                xudo_backend::Capability::DropInDirectory,
+                xudo_backend::Capability::ValidateNamedFile,
+            ]),
+        };
+        let snippet = xudo_backend::SudoersSnippet::human_only(&backend).unwrap();
+        assert!(!snippet.includes_nopass);
+        assert!(snippet.contents.contains("timestamp_timeout=0"));
+        assert!(!snippet.contents.contains("NOPASSWD"));
+        assert!(
+            !snippet
+                .contents
+                .contains(xudo_backend::snippet::GATE_NOPASS)
+        );
+
+        let (result, _, _err, request) =
+            claim_once(decided(allow(), Some(minted(GATE_AUTH))), &SUDO);
+        let run = result.unwrap();
+        assert_eq!(run.cwd, "/");
+        assert_eq!(run.id, queued_id());
+        assert_eq!(
+            run.plan,
+            ExecPlan {
+                backend: "/usr/bin/sudo",
+                gate: GATE_AUTH,
+                spawn: true,
+            }
+        );
+        let sent = BrokerRequest::parse(&request).unwrap();
+        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+    }
+
+    #[test]
+    fn a_queued_run_spawns_whichever_backend_is_installed() {
+        for (paths, backend) in [
+            (&["/usr/bin/sudo-rs"][..], "/usr/bin/sudo-rs"),
+            (&["/usr/bin/doas"][..], "/usr/bin/doas"),
+        ] {
+            let (result, _, _err, _) =
+                claim_once(decided(allow(), Some(minted(GATE_AUTH))), &Has(paths));
+            let run = result.unwrap();
+            assert_eq!(run.plan.backend, backend);
+            assert!(run.plan.spawn);
+            assert_eq!(run.cwd, "/");
+        }
+    }
+
+    #[test]
+    fn a_queued_claim_refuses_a_bad_id_a_missing_backend_and_a_dead_broker() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        for id in ["", "ab", &"g".repeat(64), &"A".repeat(64)] {
+            assert_eq!(
+                plan_queued(
+                    &cli(),
+                    id,
+                    &SUDO,
+                    Path::new("/no/such/sock"),
+                    PATIENT,
+                    true,
+                    &mut std::io::Cursor::new(b"run\n"),
+                    &mut out,
+                    &mut err
+                ),
+                Err(ExitCode::Unusable)
+            );
+        }
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+
+        err.clear();
+        assert_eq!(
+            plan_queued(
+                &cli(),
+                &queued_id(),
+                &Has(&[]),
+                Path::new("/no/such/sock"),
+                PATIENT,
+                true,
+                &mut std::io::Cursor::new(b"run\n"),
+                &mut out,
+                &mut err,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err.clone()).unwrap().contains("no sudo"));
+
+        err.clear();
+        assert_eq!(
+            plan_queued(
+                &cli(),
+                &queued_id(),
+                &SUDO,
+                Path::new("/no/such/sock"),
+                PATIENT,
+                true,
+                &mut std::io::Cursor::new(b"run\n"),
+                &mut out,
+                &mut err,
+            ),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err).unwrap().contains("unreachable"));
+    }
+
+    #[test]
+    fn a_queued_claim_fails_closed_on_the_wrong_answer() {
+        let refused = BrokerResponse::refused(RefusalCode::RequestUnknown)
+            .to_json()
+            .into_bytes();
+        let (result, _, err, _) = claim_once(refused, &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("refused"), "{err}");
+
+        let decision = Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new());
+        let (result, out, err, _) = claim_once(decided(decision.clone(), None), &SUDO);
+        assert_eq!(result, Err(decision.exit_code()));
+        assert!(!out.is_empty());
+        assert!(err.contains("re-decided"), "{err}");
+        assert!(!err.contains("request submitted"), "{err}");
+        assert!(!err.contains("ido queue"), "{err}");
+
+        let (result, _, err, _) = claim_once(decided(allow(), None), &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("minted no entry"), "{err}");
+
+        let (result, _, err, _) = claim_once(decided(allow(), Some(minted("/tmp/evil"))), &SUDO);
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("unexpected gate"), "{err}");
+
+        for answer in [
+            Answer::Pending {
+                id: queued_id(),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+            Answer::QueueListed {
+                entries: Vec::new(),
+                next: None,
+            },
+            Answer::Done,
+        ] {
+            let (result, _, err, _) = claim_once(response(answer), &SUDO);
+            assert_eq!(result, Err(ExitCode::Unusable));
+            assert!(err.contains("unsupported question"), "{err}");
+        }
+    }
+
+    #[test]
+    fn plan_queued_live_fails_closed_before_and_after_the_settings_read() {
+        let id = queued_id();
+        let dir = tempfile::tempdir().unwrap();
+        let mut unreadable = cli();
+        unreadable.config_file = dir.path().to_path_buf();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_queued_live(&unreadable, &id, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("could not be read")
+        );
+
+        let mut missing = cli();
+        missing.config_file = dir.path().join("missing.toml");
+        err.clear();
+        // A missing settings file is the default timeout, so the call continues
+        // into `plan_queued`. A bad id stops there, on every host, before a
+        // backend probe or the broker socket.
+        assert_eq!(
+            plan_queued_live(&missing, "not-an-id", &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("a queued id is 64 lowercase hex characters"),
+            "{text}"
+        );
+    }
+
+    fn finish_with(
+        replies: Vec<Answer>,
+        child_started: bool,
+    ) -> (QueuedFinish, String, Vec<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker =
+            crate::test_broker::serve_many(listener, replies.into_iter().map(response).collect());
+        let mut err = Vec::new();
+        let finish = finish_queued(&queued_id(), child_started, "", &socket, PATIENT, &mut err);
+        let report = broker.finish_report();
+        (finish, String::from_utf8(err).unwrap(), report.requests)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn finish_queued_completes_from_the_gate_or_releases_the_claim() {
+        let (finish, err, requests) = finish_with(vec![Answer::Done], true);
+        assert_eq!(finish, QueuedFinish::Completed, "{err}");
+        assert!(err.is_empty(), "{err}");
+        let sent = BrokerRequest::parse(&requests[0]).unwrap();
+        assert_eq!(
+            sent.question,
+            Question::QueueComplete {
+                id: queued_id(),
+                audit_seq: 0,
+                claim_token: String::new(),
+            }
+        );
+
+        let (finish, _, requests) = finish_with(vec![Answer::Done], false);
+        assert_eq!(finish, QueuedFinish::Released);
+        let sent = BrokerRequest::parse(&requests[0]).unwrap();
+        assert_eq!(
+            sent.question,
+            Question::QueueRelease {
+                id: queued_id(),
+                claim_token: String::new(),
+            }
+        );
+
+        let (finish, err, requests) = finish_with(
+            vec![
+                Answer::Refused {
+                    code: RefusalCode::AnswerRejected,
+                    remediation: "no".into(),
+                    detail: None,
+                },
+                Answer::Done,
+            ],
+            true,
+        );
+        assert_eq!(finish, QueuedFinish::Released, "{err}");
+        assert!(err.contains("not completed"), "{err}");
+        assert!(!err.contains("not released"), "{err}");
+        assert_eq!(requests.len(), 2);
+
+        let (finish, err, _) = finish_with(
+            vec![
+                Answer::Decided {
+                    decision: Decision::deny(DenialCode::DenyListed, Vec::new(), Vec::new()),
+                    minted: None,
+                },
+                Answer::Refused {
+                    code: RefusalCode::RequestUnknown,
+                    remediation: "gone".into(),
+                    detail: None,
+                },
+            ],
+            true,
+        );
+        assert_eq!(finish, QueuedFinish::Stuck, "{err}");
+        assert!(err.contains("not released"), "{err}");
+
+        let mut err = Vec::new();
+        assert_eq!(
+            finish_queued(
+                "nope",
+                true,
+                "",
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut err,
+            ),
+            QueuedFinish::Stuck
+        );
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+
+        err.clear();
+        assert_eq!(
+            finish_queued(
+                &queued_id(),
+                true,
+                "cd".repeat(32).as_str(),
+                Path::new("/no/such/sock"),
+                PATIENT,
+                &mut err
+            ),
+            QueuedFinish::Stuck
+        );
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.contains("unreachable"), "{text}");
+        assert!(text.contains("not released"), "{text}");
+
+        // The live wrapper refuses a bad id before it opens the broker socket.
+        let mut live = Vec::new();
+        assert_eq!(
+            finish_queued_live("nope", false, "", &mut live),
+            QueuedFinish::Stuck
+        );
+        assert!(
+            String::from_utf8(live)
+                .unwrap()
+                .contains("64 lowercase hex")
+        );
+    }
+
+    #[test]
+    fn the_library_reports_a_queued_plan_without_executing_it() {
+        // The library path reads the process terminal. A test has none, so the
+        // claim is refused before any broker connection.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let mut cli = Cli::parse_from(["xudo", "exec", "--queued", &queued_id()]);
+        cli.config_file = dir.path().join("missing.toml");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ops = xudo_sys::host_ops();
+        let platform = crate::Platform {
+            ops: ops.as_ref(),
+            probe: &SUDO,
+            host: &xudo_sys::LiveHost,
+            path: None,
+        };
+        let status = crate::cli::run_with_installer_at_socket(
+            &cli,
+            &platform,
+            &xudo_sys::RefusingInstaller,
+            &socket,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(status, ExitCode::Unusable);
+        let text = String::from_utf8(err.clone()).unwrap();
+        assert!(text.contains("needs a terminal"), "{text}");
+
+        let mut bad = Cli::parse_from(["xudo", "exec", "--queued", "nope"]);
+        bad.config_file = dir.path().join("missing.toml");
+        let status = crate::cli::run_with_installer_at_socket(
+            &bad,
+            &platform,
+            &xudo_sys::RefusingInstaller,
+            &socket,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(status, ExitCode::Unusable);
+        assert!(String::from_utf8(err).unwrap().contains("64 lowercase hex"));
+    }
+
+    #[test]
+    fn xudo_exec_queued_shows_the_argv_and_asks_before_running() {
+        let mut decision = allow();
+        decision.resolved_exe = Some("/usr/bin/apt-get".to_owned());
+        decision.resolved_argv = vec!["\u{1b}[31mupgrade".to_owned()];
+        let token = "cd".repeat(32);
+        let mut issued = minted(GATE_AUTH);
+        issued.claim_token = Some(token.clone());
+        issued.harness = Some("codex".to_owned());
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(listener, decided(decision, Some(issued)));
+        let mut input = std::io::Cursor::new(b"run\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        let run = result.unwrap();
+        assert_eq!(run.claim_token, token);
+        assert!(run.plan.spawn);
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains(&queued_id()), "{shown}");
+        assert!(shown.contains("harness codex"), "{shown}");
+        assert!(shown.contains("upgrade"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(shown.contains("type run and press enter"), "{shown}");
+        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(sent.question, Question::QueueClaim { id: queued_id() });
+
+        let mut empty = minted(GATE_AUTH);
+        empty.claim_token = Some(String::new());
+        assert_eq!(claim_secret(&empty), empty.nonce);
+        empty.claim_token = Some(token.clone());
+        assert_eq!(claim_secret(&empty), token);
+
+        let mut hostile = allow();
+        hostile.resolved_exe = Some("/usr/bin/true".to_owned());
+        hostile.resolved_argv = vec!["ok".to_owned()];
+        let mut input = std::io::Cursor::new(b"run\n");
+        let mut err = Vec::new();
+        let label = "co\u{202e}dex\u{1b}[31m";
+        assert!(confirm_queued(
+            &queued_id(),
+            &hostile,
+            Some(label),
+            &mut input,
+            &mut err
+        ));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("harness"), "{shown}");
+        assert!(!shown.contains('\u{202e}'), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(!confirm_queued(
+            &queued_id(),
+            &hostile,
+            None,
+            &mut std::io::Cursor::new(b"no\n"),
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn queued_terminal_requires_stdin_and_stderr() {
+        assert!(queued_terminal(true, true));
+        assert!(!queued_terminal(true, false));
+        assert!(!queued_terminal(false, true));
+        assert!(!queued_terminal(false, false));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn xudo_exec_queued_refuses_without_a_terminal() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            Path::new("/no/such/sock"),
+            PATIENT,
+            false,
+            &mut std::io::Cursor::new(b"run\n"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("needs a terminal"), "{shown}");
+        assert!(!shown.contains("unreachable"), "{shown}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                decided(allow(), Some(minted(GATE_AUTH))),
+                json(&Answer::Done),
+            ],
+        );
+        let mut input = std::io::Cursor::new(b"no\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("releasing the claim"), "{shown}");
+        let requests = broker.finish_report().requests;
+        assert_eq!(requests.len(), 2);
+        let release = BrokerRequest::parse(&requests[1]).unwrap();
+        assert_eq!(
+            release.question,
+            Question::QueueRelease {
+                id: queued_id(),
+                claim_token: "0".repeat(64),
+            }
+        );
+
+        // A confirmation read that fails releases the claim and does not spawn.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                decided(allow(), Some(minted(GATE_AUTH))),
+                json(&Answer::Done),
+            ],
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut closed = ClosedInput;
+        let mut buf = [0u8; 1];
+        let read = std::io::Read::read(&mut closed, &mut buf);
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        std::io::BufRead::consume(&mut closed, 1);
+        let result = plan_queued(
+            &cli(),
+            &queued_id(),
+            &SUDO,
+            &socket,
+            PATIENT,
+            true,
+            &mut closed,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(result, Err(ExitCode::Unusable));
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("releasing the claim"), "{shown}");
+        let requests = broker.finish_report().requests;
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn remove_path_request_rejects_a_bad_target_and_accepts_an_absolute_one() {
+        let long = vec![b'a'; 4097];
+        for target in [b"".as_slice(), b"cache", b"/srv/\0cache", long.as_slice()] {
+            assert_eq!(
+                remove_path_request(target, false).unwrap_err(),
+                "target must be an absolute path without NUL"
+            );
+        }
+        let mut exact = vec![b'/'];
+        exact.resize(xudo_wire::MAX_PROGRAM_BYTES, b'a');
+        assert_eq!(exact.len(), xudo_wire::MAX_PROGRAM_BYTES);
+        assert!(remove_path_request(&exact, false).is_ok());
+        let mut over = exact;
+        over.push(b'a');
+        assert_eq!(
+            remove_path_request(&over, false).unwrap_err(),
+            "target must be an absolute path without NUL"
+        );
+
+        let raw = b"/srv/app/build/cache\xff";
+        let request = remove_path_request(raw, true).unwrap();
+        assert_eq!(
+            request.question,
+            Question::RemovePath {
+                target: raw.to_vec(),
+                dry_run: true,
+                claimed_classification: "unattested".to_owned(),
+            }
+        );
+        let parsed = BrokerRequest::parse(request.to_json().as_bytes()).unwrap();
+        assert_eq!(
+            parsed.remove_fields().map(|(target, dry, _)| (target, dry)),
+            Some((raw.as_slice(), true))
+        );
+    }
+
+    fn remove_response(answer: Answer) -> BrokerResponse {
+        BrokerResponse {
+            schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+            answer,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn remove_plan_from_answer_covers_every_broker_answer() {
+        let target = b"/srv/app/build/cache";
+        let cli = cli();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        let refused = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Refused {
+                code: RefusalCode::RequestMalformed,
+                remediation: "no".into(),
+                detail: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(refused, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("broker refused")
+        );
+
+        for answer in [
+            Answer::Pending {
+                id: "a".repeat(64),
+                expires_in_ms: 1,
+            },
+            Answer::Watching {
+                prompts: Vec::new(),
+                omitted: 0,
+            },
+            Answer::QueueListed {
+                entries: Vec::new(),
+                next: None,
+            },
+            Answer::Done,
+        ] {
+            err.clear();
+            let result = remove_plan_from_answer(
+                &cli,
+                target,
+                &remove_response(answer),
+                &SUDO,
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(result, Err(ExitCode::Unusable));
+            assert!(
+                String::from_utf8(err.clone())
+                    .unwrap()
+                    .contains("unsupported question")
+            );
+        }
+
+        err.clear();
+        out.clear();
+        let denied = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: Decision::deny(DenialCode::OperationRefused, Vec::new(), Vec::new()),
+                minted: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(denied, Err(ExitCode::Denied));
+        let shown = String::from_utf8(out.clone()).unwrap();
+        assert!(shown.contains("operation_refused"), "{shown}");
+
+        err.clear();
+        let missing = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: None,
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(missing, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("minted no entry")
+        );
+
+        err.clear();
+        let wrong = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted("/usr/libexec/xudo/xudo-gate-nopass")),
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(wrong, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("unexpected gate")
+        );
+
+        err.clear();
+        let no_backend = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &Has(&[]),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(no_backend, Err(ExitCode::Unusable));
+        assert!(String::from_utf8(err.clone()).unwrap().contains("no sudo"));
+
+        err.clear();
+        let sudo = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(sudo.backend, "/usr/bin/sudo");
+        assert_eq!(sudo.gate, GATE_AUTH);
+        assert!(!sudo.spawn);
+
+        let doas = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_AUTH)),
+            }),
+            &Has(&["/usr/bin/doas"]),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(doas.backend, "/usr/bin/doas");
+        assert!(doas.spawn);
+    }
+
+    #[test]
+    fn plan_remove_path_says_doctor_when_the_broker_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let missing = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache",
+            true,
+            &SUDO,
+            &dir.path().join("none.sock"),
+            (TIMEOUT, Duration::ZERO),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(missing, Err(ExitCode::Unusable));
+        assert!(
+            String::from_utf8(err.clone())
+                .unwrap()
+                .contains("xudo doctor")
+        );
+
+        err.clear();
+        let relative = plan_remove_path(
+            &cli(),
+            b"cache",
+            false,
+            &SUDO,
+            Path::new("/no/such/sock"),
+            (TIMEOUT, Duration::ZERO),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(relative, Err(ExitCode::Unusable));
+        assert!(String::from_utf8(err).unwrap().contains("absolute path"));
+
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker =
+            crate::test_broker::serve_once(listener, decided(allow(), Some(minted(GATE_AUTH))));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let plan = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache\xff",
+            true,
+            &SUDO,
+            &socket,
+            (PATIENT, Duration::ZERO),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(plan.gate, GATE_AUTH);
+        assert!(!plan.spawn);
+        let sent = BrokerRequest::parse(&broker.finish()).unwrap();
+        assert_eq!(
+            sent.question,
+            Question::RemovePath {
+                target: b"/srv/app/build/cache\xff".to_vec(),
+                dry_run: true,
+                claimed_classification: "unattested".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn remove_path_waits_for_the_human_when_confirm_human_path_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let id = "e".repeat(64);
+        let mint = Minted {
+            nonce: id.clone(),
+            expires_in_ms: 30_000,
+            gate: GATE_AUTH.into(),
+            claim_token: None,
+            harness: None,
+        };
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                json(&Answer::Pending {
+                    id: id.clone(),
+                    expires_in_ms: 30_000,
+                }),
+                decided(allow(), Some(mint.clone())),
+                decided(allow(), Some(mint)),
+            ],
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let virtual_now = std::cell::Cell::new(Duration::ZERO);
+        let mut elapsed = || virtual_now.get();
+        let mut sleep = |slept: Duration| virtual_now.set(virtual_now.get() + slept);
+        let plan = plan_remove_paced(
+            &cli(),
+            b"/srv/app/build/cache",
+            false,
+            &SUDO,
+            &socket,
+            (PATIENT, Duration::from_secs(2)),
+            Some(&mut Pace {
+                elapsed: &mut elapsed,
+                sleep: &mut sleep,
+            }),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(plan.gate, GATE_AUTH);
+        let report = broker.finish_report();
+        let requests = report
+            .requests
+            .iter()
+            .map(|request| BrokerRequest::parse(request).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[2]);
+        assert_eq!(
+            requests[0].question,
+            remove_path_request(b"/srv/app/build/cache", false)
+                .unwrap()
+                .question
+        );
+        assert_eq!(
+            std::mem::discriminant(&requests[1].question),
+            std::mem::discriminant(&Question::Status { id: String::new() })
+        );
+
+        // No backend: a pending answer stops before it waits for anything.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(
+            listener,
+            json(&Answer::Pending {
+                id,
+                expires_in_ms: 30_000,
+            }),
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let none = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache",
+            false,
+            &Has(&[]),
+            &socket,
+            (PATIENT, Duration::from_secs(2)),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(none, Err(ExitCode::Unusable));
+        drop(broker.finish());
+    }
+
+    #[test]
+    fn plan_remove_live_refuses_a_relative_target_before_the_socket() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_remove_live(&cli(), b"relative", false, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(String::from_utf8(err).unwrap().contains("absolute path"));
+    }
+
+    #[test]
+    fn plan_remove_live_refuses_a_settings_path_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = cli();
+        cli.config_file = dir.path().to_path_buf();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_remove_live(&cli, b"/srv/app/build/cache", false, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("settings file could not be read")
+        );
+    }
+
+    /// `read_line` fails. Used so that arm is taken on every platform.
+    struct ClosedInput;
+
+    impl std::io::Read for ClosedInput {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+    }
+
+    impl std::io::BufRead for ClosedInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed",
+            ))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
     }
 }

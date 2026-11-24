@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "deny_listed",
   "remediation": "this is permanently denied by a compiled-in rule and no configuration can allow it; do not retry, and do not look for a variant that slips past",
@@ -29,10 +29,15 @@ expression: "render::json(&decision)"
     },
     {
       "deny_list_evaluated": {
-        "version": 6,
+        "version": 7,
         "matched": [
           "SpawnsShell: executable sh"
         ]
+      }
+    },
+    {
+      "deny_rules_evaluated": {
+        "matched": []
       }
     }
   ]

@@ -18,10 +18,12 @@ fn stale_confirmation_claim(text: &str) -> bool {
 
 fn stale_telemetry_claim(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("strace")
-        && (lower.contains("does not exist")
-            || lower.contains("doesn't exist")
-            || lower.contains("planned"))
+    lower.split(['.', '!', '?']).any(|sentence| {
+        sentence.contains("strace")
+            && (sentence.contains("does not exist")
+                || sentence.contains("doesn't exist")
+                || sentence.contains("planned"))
+    })
 }
 
 /// Public prose with markup and line breaks collapsed, so a claim split by

@@ -267,7 +267,7 @@ impl DoasSnippet {
         // is doas's equivalent of sudo's `""`. Note that omitting `args`
         // entirely would mean "any arguments" — the inverse — which is why it is
         // written explicitly.
-        let rule = format!("permit persist :{XUDO_GROUP} as root cmd {GATE_AUTH} args\n");
+        let rule = format!("permit :{XUDO_GROUP} as root cmd {GATE_AUTH} args\n");
 
         let body = format!(
             "# Managed by xudo. Do not edit between the markers.\n\
@@ -278,8 +278,9 @@ impl DoasSnippet {
              # arguments. Omitting `args` would mean ANY arguments, which is the inverse\n\
              # of what is wanted, so it is written explicitly.\n\
              #\n\
-             # xudo does not rely on `persist`: `OpenDoas` disables it unless built\n\
-             # --with-timestamp, so every invocation is assumed to prompt.\n\
+             # No `persist`: on an OpenDoas built --with-timestamp it would cache the\n\
+             # password, so one prompt would cover later runs. Without it every\n\
+             # invocation prompts.\n\
              {rule}",
             kind = backend.kind.label(),
             version = backend.version,
@@ -436,6 +437,21 @@ mod tests {
     }
 
     #[test]
+    fn the_auth_gate_cannot_reuse_a_cached_sudo_login() {
+        let snippet = SudoersSnippet::human_only(&sudo()).unwrap();
+        let defaults = snippet
+            .contents
+            .lines()
+            .find(|line| line.starts_with("Defaults!XUDO_AUTH "))
+            .expect("the auth gate has a scoped Defaults line");
+        assert!(
+            defaults
+                .split(',')
+                .any(|setting| setting.trim() == "timestamp_timeout=0")
+        );
+    }
+
+    #[test]
     fn the_defaults_are_scoped_to_xudos_own_commands() {
         // `Defaults!ALIAS`, not a bare `Defaults`: xudo's settings must not leak
         // onto an operator's unrelated rules.
@@ -581,6 +597,24 @@ mod tests {
         assert!(rule.contains(&format!("cmd {GATE_AUTH}")), "{rule}");
         assert!(rule.contains(&format!(":{XUDO_GROUP}")), "{rule}");
         assert!(!rule.contains(GATE_NOPASS));
+    }
+
+    #[test]
+    fn doas_snippet_never_enables_credential_persistence() {
+        // A `--with-timestamp` OpenDoas caches the password for a rule that
+        // says `persist`, so one prompt would cover later runs.
+        for drop_in in [true, false] {
+            let snippet = DoasSnippet::human_only(&doas(drop_in)).unwrap();
+            for line in snippet.contents.lines().filter(|l| !l.starts_with('#')) {
+                assert!(!line.split_whitespace().any(|w| w == "persist"), "{line}");
+            }
+            let rule = snippet
+                .contents
+                .lines()
+                .find(|l| l.starts_with("permit"))
+                .unwrap();
+            assert!(rule.starts_with("permit :"), "{rule}");
+        }
     }
 
     #[test]

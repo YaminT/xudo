@@ -49,6 +49,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "deny_rule_eval"
+path = "fuzz_targets/deny_rule_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wire_request"
 path = "fuzz_targets/wire_request.rs"
 test = false
@@ -93,6 +100,13 @@ bench = false
 [[bin]]
 name = "check_fuzz"
 path = "fuzz_targets/check_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remove_path_target"
+path = "fuzz_targets/remove_path_target.rs"
 test = false
 doc = false
 bench = false

@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 use crate::entry::Entry;
 use crate::keys::{Key, decode};
 use crate::render::{self, Row};
+use crate::root_queue::RootView;
 use crate::status::{Status, run_order, status_of};
 
 /// The word a typed confirmation must match exactly.
@@ -61,6 +62,10 @@ pub enum Action {
     Run(Vec<u64>),
     /// Drop these ids.
     Drop(Vec<u64>),
+    /// Run one root-held entry through `xudo exec --queued`.
+    RunRoot(String),
+    /// Ask the broker to release one root-held entry.
+    ReleaseRoot(String),
 }
 
 /// What the keyboard is currently doing.
@@ -80,12 +85,26 @@ enum Mode {
         /// What will be dropped.
         ids: Vec<u64>,
     },
+    /// The root-held argv and harness are on screen; `run` confirms.
+    ConfirmRoot {
+        /// The queue id.
+        id: String,
+        /// What has been typed so far.
+        typed: String,
+    },
+    /// Answering y/n to a root-held release.
+    ConfirmRelease {
+        /// The queue id.
+        id: String,
+    },
 }
 
 /// The picker's state.
 #[derive(Clone, Debug)]
 pub struct Picker {
     queue: Vec<Entry>,
+    /// Root-held entries, after the user-side list. The agent cannot edit them.
+    root: Vec<RootView>,
     order: Vec<u64>,
     cursor: usize,
     selected: BTreeSet<u64>,
@@ -103,6 +122,7 @@ impl Picker {
         let order = run_order(&queue);
         Self {
             queue,
+            root: Vec::new(),
             order,
             cursor: 0,
             selected: BTreeSet::new(),
@@ -112,6 +132,13 @@ impl Picker {
             now: now_unix,
             color,
         }
+    }
+
+    /// Shows the broker's root-held queue under the user-side list.
+    #[must_use]
+    pub fn with_root(mut self, root: Vec<RootView>) -> Self {
+        self.root = root;
+        self
     }
 
     /// Starts with a message on the status line.
@@ -156,6 +183,15 @@ impl Picker {
                     Action::Continue
                 }
             }
+            Mode::ConfirmRoot { id, typed } => self.confirm_root(key, id, typed),
+            Mode::ConfirmRelease { id } => {
+                if key == Key::Char('y') {
+                    Action::ReleaseRoot(id)
+                } else {
+                    self.message = Some("kept; the root-held entry stays queued".to_owned());
+                    Action::Continue
+                }
+            }
         }
     }
 
@@ -166,7 +202,7 @@ impl Picker {
                 self.message = None;
             }
             Key::Down | Key::Char('j') => {
-                if self.cursor.saturating_add(1) < self.order.len() {
+                if self.cursor.saturating_add(1) < self.span() {
                     self.cursor = self.cursor.saturating_add(1);
                 }
                 self.message = None;
@@ -206,7 +242,59 @@ impl Picker {
         Action::Continue
     }
 
+    fn confirm_root(&mut self, key: Key, id: String, mut typed: String) -> Action {
+        // Gone between the prompt and the key: do not run an id we no longer show.
+        if !self.root.iter().any(|entry| entry.id == id) {
+            self.message = Some("that root-held entry is gone".to_owned());
+            return Action::Continue;
+        }
+        match key {
+            Key::Esc | Key::CtrlC => {
+                self.message = Some("cancelled; nothing ran".to_owned());
+                return Action::Continue;
+            }
+            Key::Enter if typed == CONFIRM_WORD => return Action::RunRoot(id),
+            Key::Enter => {
+                typed.clear();
+                self.message = Some(format!(
+                    "type {CONFIRM_WORD} exactly and press enter, or esc to cancel"
+                ));
+            }
+            Key::Backspace => {
+                typed.pop();
+            }
+            Key::Char(c) if typed.chars().count() < 16 => typed.push(c),
+            Key::Space if typed.chars().count() < 16 => typed.push(' '),
+            _ => {}
+        }
+        self.mode = Mode::ConfirmRoot { id, typed };
+        Action::Continue
+    }
+
+    fn span(&self) -> usize {
+        self.order.len().saturating_add(self.root.len())
+    }
+
+    fn root_current(&self) -> Option<&RootView> {
+        self.cursor
+            .checked_sub(self.order.len())
+            .and_then(|index| self.root.get(index))
+    }
+
+    /// A root-held row is not part of the user-side selection.
+    fn refuse_root_selection(&mut self) -> bool {
+        if self.root_current().is_some() {
+            self.message = Some("a root-held entry is not selected with space".to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
     fn toggle(&mut self) {
+        if self.refuse_root_selection() {
+            return;
+        }
         let Some(entry) = self.current() else {
             return;
         };
@@ -227,6 +315,9 @@ impl Picker {
     }
 
     fn select_group(&mut self) {
+        if self.refuse_root_selection() {
+            return;
+        }
         let Some(entry) = self.current() else {
             return;
         };
@@ -252,6 +343,14 @@ impl Picker {
     }
 
     fn start_drop(&mut self) {
+        if self.selected.is_empty()
+            && let Some(root) = self.root_current()
+        {
+            self.mode = Mode::ConfirmRelease {
+                id: root.id.clone(),
+            };
+            return;
+        }
         let ids = if self.selected.is_empty() {
             self.current().map(|e| vec![e.id]).unwrap_or_default()
         } else {
@@ -263,6 +362,15 @@ impl Picker {
     }
 
     fn start_run(&mut self) -> Action {
+        if self.selected.is_empty()
+            && let Some(root) = self.root_current()
+        {
+            self.mode = Mode::ConfirmRoot {
+                id: root.id.clone(),
+                typed: String::new(),
+            };
+            return Action::Continue;
+        }
         let ids = self.selected();
         if ids.is_empty() {
             self.message =
@@ -289,7 +397,10 @@ impl Picker {
         let cols = cols.max(20);
         let rows = rows.max(8);
 
-        let mut header = format!("ido \u{2014} {} queued", self.queue.len());
+        let mut header = format!(
+            "ido \u{2014} {} queued \u{b7} written by the agent, editable by it",
+            self.queue.len()
+        );
         if !self.selected.is_empty() {
             let _ = write!(header, " \u{b7} {} selected", self.selected.len());
         }
@@ -356,7 +467,39 @@ impl Picker {
             block.extend(self.entry_lines(entry, &row, index == self.cursor));
             blocks.push(block);
         }
+        for (index, entry) in self.root.iter().enumerate() {
+            let mut block = Vec::new();
+            if index == 0 {
+                block.push(Line::plain(
+                    "  root-held queue \u{2014} the agent cannot edit these".to_owned(),
+                ));
+            }
+            let at_cursor = self
+                .root_current()
+                .is_some_and(|current| current.id == entry.id);
+            block.push(Self::root_line(entry, at_cursor));
+            blocks.push(block);
+        }
         blocks
+    }
+
+    fn root_line(entry: &RootView, at_cursor: bool) -> Line {
+        let pointer = if at_cursor { '\u{25B8}' } else { ' ' };
+        let argv = render::argv_line(&entry.argv, render::FIELD_COLS);
+        let harness = render::field(&entry.harness, 40);
+        Line {
+            text: format!(
+                "{pointer} root {} harness {} argv {}",
+                render::field(&entry.id, 64).text,
+                harness.text,
+                argv.text
+            ),
+            style: if at_cursor {
+                Style::Cursor
+            } else {
+                Style::Plain
+            },
+        }
     }
 
     fn entry_lines(&self, entry: &Entry, row: &Row, at_cursor: bool) -> Vec<Line> {
@@ -398,6 +541,25 @@ impl Picker {
     }
 
     fn preview_lines(&self) -> Vec<Line> {
+        if let Some(root) = self.root_current() {
+            return vec![
+                Line::plain(format!(
+                    "\u{2500}\u{2500} root-held {} \u{2500}\u{2500}",
+                    render::field(&root.id, 64).text
+                )),
+                Line::plain(format!(
+                    "  harness {}",
+                    render::field(&root.harness, 40).text
+                )),
+                Line::plain(format!(
+                    "  argv {}",
+                    render::argv_line(&root.argv, render::FIELD_COLS).text
+                )),
+                Line::plain(
+                    "  runs in / through `xudo exec --queued`; no shell is involved".to_owned(),
+                ),
+            ];
+        }
         let Some(entry) = self.current() else {
             return Vec::new();
         };
@@ -448,6 +610,21 @@ impl Picker {
                     list.join(" ")
                 ))
             }
+            Mode::ConfirmRoot { id, typed } => {
+                let shown = self.root.iter().find(|entry| entry.id == *id);
+                let argv = shown.map_or_else(String::new, |entry| {
+                    render::argv_line(&entry.argv, render::FIELD_COLS).text
+                });
+                let harness =
+                    shown.map_or_else(String::new, |entry| render::field(&entry.harness, 40).text);
+                Line::warn(format!(
+                    "root-held {id} harness {harness} argv {argv}; type {CONFIRM_WORD} \
+                     and press enter (esc cancels): {typed}"
+                ))
+            }
+            Mode::ConfirmRelease { id } => Line::warn(format!(
+                "release root-held {id}? y releases, any other key keeps"
+            )),
         };
         let message = Line::plain(self.message.clone().unwrap_or_default());
         vec![message, prompt]
@@ -555,6 +732,9 @@ pub fn pick(terminal: &mut dyn Terminal, picker: &mut Picker) -> std::io::Result
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::entry::QUEUE_SCHEMA_VERSION;
@@ -827,6 +1007,141 @@ mod tests {
         );
         assert!(p.selected().is_empty());
         assert!(p.frame(80, 24).contains("0 queued"));
+    }
+
+    fn recorded_invocation(id: &str) -> String {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/ido-queued-exec");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("xudo");
+        let record = dir.join("argv");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                record.display(),
+                record.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = crate::root_queue::queued_exec_command(&script, id);
+        let invoked: Vec<&str> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(invoked, ["exec", "--queued", id]);
+        assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
+        assert!(!invoked.iter().any(|arg| arg.contains("rm")));
+        assert!(command.status().unwrap().success());
+        std::fs::read_to_string(&record).unwrap()
+    }
+
+    fn root(id: &str, argv: &[&str], harness: &str) -> RootView {
+        RootView {
+            id: id.to_owned(),
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            harness: harness.to_owned(),
+            state: "pending".to_owned(),
+        }
+    }
+
+    #[test]
+    fn ido_never_runs_an_entry_without_showing_its_argv() {
+        let id = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let argv = ["/usr/bin/apt-get", "upgrade", "$(rm)", "\u{1b}[31mhidden"];
+        let mut picker = Picker::new(vec![entry(1, &["true"])], 1000, false).with_root(vec![
+            root(&id, &argv, "codex\u{1b}[2J"),
+            root(&other, &["/usr/bin/true"], "claude"),
+        ]);
+        assert_eq!(picker.handle(Key::Down), Action::Continue);
+        // Preview is a browse key. It must be toggled before confirm, or `p`
+        // is typed into the confirmation word and the argv pane never opens.
+        assert_eq!(picker.handle(Key::Char('p')), Action::Continue);
+        let preview = picker.frame(400, 40);
+        assert!(preview.contains("runs in /"), "{preview}");
+        assert!(preview.contains("harness codex"), "{preview}");
+        assert!(preview.contains("$(rm)"), "{preview}");
+        assert!(!preview.contains('\u{1b}'), "{preview}");
+        assert_eq!(picker.handle(Key::Enter), Action::Continue);
+        let frame = picker.frame(400, 40);
+        assert!(frame.contains("harness codex"), "{frame}");
+        assert!(frame.contains("argv"), "{frame}");
+        assert!(frame.contains("$(rm)"), "{frame}");
+        assert!(!frame.contains('\u{1b}'), "{frame}");
+        assert!(frame.contains("type run"), "{frame}");
+        assert!(
+            frame.contains("written by the agent, editable by it"),
+            "{frame}"
+        );
+        let saved = picker.root.clone();
+        picker.root.clear();
+        let missing = picker.frame(400, 24);
+        assert!(missing.contains("harness  argv"), "{missing}");
+        picker.root = saved;
+        assert!(frame.contains("the agent cannot edit these"), "{frame}");
+        assert!(frame.contains("claude"), "{frame}");
+        assert_eq!(keys(&mut picker, &typed("yes")), Action::Continue);
+        assert_eq!(picker.handle(Key::Enter), Action::Continue);
+        assert!(picker.frame(400, 24).contains("type run exactly"));
+        // A space while the word is still short is part of the confirmation.
+        assert_eq!(picker.handle(Key::Space), Action::Continue);
+        keys(&mut picker, &[Key::Char('a'); 20]);
+        keys(&mut picker, &[Key::Space, Key::Unknown, Key::Backspace]);
+        assert_eq!(picker.handle(Key::Esc), Action::Continue);
+        assert!(picker.frame(200, 24).contains("cancelled; nothing ran"));
+
+        assert_eq!(picker.handle(Key::Enter), Action::Continue);
+        assert_eq!(keys(&mut picker, &typed("run")), Action::Continue);
+        assert_eq!(picker.handle(Key::Enter), Action::RunRoot(id.clone()));
+
+        let logged = recorded_invocation(&id);
+        assert!(logged.starts_with("/\n"), "{logged}");
+        assert!(logged.contains("exec\n--queued\n"), "{logged}");
+        assert!(!logged.contains("apt-get"), "{logged}");
+
+        assert_eq!(picker.handle(Key::Char('d')), Action::Continue);
+        let release_prompt = picker.frame(200, 24);
+        assert!(
+            release_prompt.contains("release root-held"),
+            "{release_prompt}"
+        );
+        assert!(release_prompt.contains(&id), "{release_prompt}");
+        assert_eq!(picker.handle(Key::Char('n')), Action::Continue);
+        assert!(picker.frame(200, 24).contains("stays queued"));
+        assert_eq!(picker.handle(Key::Char('d')), Action::Continue);
+        assert_eq!(
+            picker.handle(Key::Char('y')),
+            Action::ReleaseRoot(id.clone())
+        );
+
+        keys(&mut picker, &[Key::Up, Key::Space, Key::Down]);
+        assert_eq!(picker.handle(Key::Enter), Action::Run(vec![1]));
+        // The user row is still selected, so enter would run it again. Clear
+        // that selection before confirming the other root-held row.
+        assert_eq!(picker.handle(Key::Up), Action::Continue);
+        assert_eq!(picker.handle(Key::Space), Action::Continue);
+        assert!(picker.selected().is_empty());
+        assert_eq!(picker.handle(Key::Down), Action::Continue);
+        assert_eq!(picker.handle(Key::Down), Action::Continue);
+        assert_eq!(picker.handle(Key::Space), Action::Continue);
+        assert!(picker.frame(200, 24).contains("not selected with space"));
+        assert_eq!(picker.handle(Key::Char('g')), Action::Continue);
+        let stayed = picker.cursor;
+        assert_eq!(picker.handle(Key::Down), Action::Continue);
+        assert_eq!(picker.cursor, stayed);
+
+        assert_eq!(picker.handle(Key::Enter), Action::Continue);
+        picker.root.clear();
+        assert_eq!(picker.handle(Key::Char('x')), Action::Continue);
+        assert!(
+            picker
+                .frame(200, 24)
+                .contains("that root-held entry is gone")
+        );
     }
 
     #[test]

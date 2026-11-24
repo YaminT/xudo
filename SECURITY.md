@@ -17,9 +17,9 @@ not prove a human: a same-uid agent can run `script -qc 'xudo watch'`. This
 limits only that extra. A cgroup scope for agents, not in this release, is
 needed to separate the agent from the human.
 
-The doas rule `xudo install` writes is `permit persist`. On an OpenDoas built
-with timestamp support, one password then covers about five minutes, unlike the
-sudo rule, which sets `timestamp_timeout=0`. The package depends on sudo.
+The doas rule `xudo install` writes has no `persist`, so every run prompts even on an OpenDoas built
+with timestamp support. doas does not give its command a new pty, so a command that uses the
+terminal can reach the parent's tty. The package depends on sudo.
 
 `v0.1.0-beta.1` had three issues that `v0.1.0-beta.2` fixed. The shipped
 service rule accepted `systemctl` start, stop, and restart of power, reboot,
@@ -30,11 +30,23 @@ fixes, and what an operator who kept an old rule file should do, are in
 [CHANGELOG.md](CHANGELOG.md).
 
 With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
-`confirm = "always"` is satisfied by the password alone. A member of the
-`xudo` group who passes the password can remove packages through it,
-including xudo, sudo, apparmor, auditd, nftables, ufw and rsyslog. That was
-already true in `v0.1.0-beta.1` and is not changed here. A package-name
-tripwire for those is a later change.
+`confirm = "always"` is satisfied by the password alone. The shipped active
+`00-protect.toml` deny rules refuse removal of xudo, sudo, sudo-rs, AppArmor,
+auditd, firewall, logging, time-sync, and openssh-server packages through the
+shipped `apt-get remove` action. Its purge, autoremove, autopurge,
+`install pkg-`, and dpkg clauses are tripwires for operator actions that accept
+those spellings. These
+checks protect xudo-mediated paths only. They cannot prevent a host-side apt or
+dpkg command, a root shell, or an indirect transaction such as installing
+`sudo-ldap` that removes a conflicting package. Removing `openssh-client` can
+remove `openssh-server`; removing `libip4tc2` or `libxtables12` can remove
+`iptables`; removing `libnftables1` can remove `nftables`; removing `python3`
+can remove `ufw` or `firewalld`; and removing `init-system-helpers` can remove
+xudo. `xudo doctor` warns when a shipped deny-rule id is missing or inert.
+Rules for programs with no loaded action load as inactive and cannot allow
+anything; `xudo check` and `doctor` say "inert today" until an operator action
+names that program. The apt and dpkg package protections are tested against
+later operator actions as well as the shipped apt-get action.
 
 The shipped `xudo.time.set-ntp` rule accepts `timedatectl set-ntp false`,
 which has the same effect as stopping the time-sync unit. The tripwire
@@ -59,9 +71,20 @@ left half-written. The caller can steer that length through argv. A signal
 sudo relays, or the pty hanging up when the user kills sudo, is enough to
 deliver it. That route predates this fix. The impact is availability: xudo
 stays down until an operator moves the log aside. Blocking signals around
-the write and the cut-back is a later change. This change does not reset
-the caller's resource limits. When the gate's own append fails because the
-log is damaged or the cut-back did not land, stderr gains one fixed line
+the write and the cut-back remains unavailable through a safe API: rustix's
+signal-mask call is `unsafe`, and the published unsafe-block budget was not
+changed. A record crossing a page boundary therefore remains vulnerable to
+a fatal non-core-dump signal. The gate now resets every Linux resource limit
+from PID 1's values before it handles a request, caps the soft open-file limit
+at 1024, and disables core dumps. It reads `/proc/1/limits` through a pinned
+descriptor verified as procfs and refuses if the file, any value, or any
+`setrlimit` call fails. In a container or PID namespace, PID 1 is that
+namespace's init; copying its limits is acceptable because those limits are
+the baseline the namespace provides. If the resource-limit reset fails, the
+refusal audit record is written under the caller's limits. A caller's CPU-time
+limit or a delivered signal can still tear that one record. When the gate's
+own append fails because the log is damaged or the cut-back did not land,
+stderr gains one fixed line
 telling the operator to move the log aside. The line has no path and no
 bytes from the log. The exit status is unchanged. The broker's refusal
 message still carries the error text.
@@ -116,7 +139,7 @@ one you know you lack.
   A symlink inside the prefix is a path the rule never named. `rm`, `rmdir`,
   `unlink`, `chmod`, `chown`, `chgrp`, `chattr`, `setfacl`, `setfattr`,
   `touch`, `mkdir`, `mkfifo`, `rename`, and `prename` are the compiled-in
-  class `ChangesPathMetadataOrExistence` (deny-list version 6), including a
+  class `ChangesPathMetadataOrExistence` (deny-list version 7), including a
   copy or hardlink that keeps the name and a `busybox` applet. `mknod` is
   `DeviceOrFilesystem`. `setcap` is `PrivilegeTool`. `xudo check` warns on
   every `path-under` use and exits 20.

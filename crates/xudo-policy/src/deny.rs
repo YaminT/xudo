@@ -57,7 +57,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    6
+    7
 }
 
 /// A class of capability that is never permitted as root.
@@ -478,6 +478,9 @@ const SCHEDULERS: &[&[u8]] = &[
 /// Ordered longest-prefix-irrelevant: a match on any of these is fatal, so the
 /// order is only for readability.
 const PROTECTED_PREFIXES: &[&[u8]] = &[
+    b"/usr/bin/xudo",
+    b"/usr/bin/ido",
+    b"/usr/bin/willyoumarryme",
     b"/etc/xudo",
     b"/usr/libexec/xudo",
     b"/var/log/xudo",
@@ -1385,7 +1388,7 @@ fn applies_sysctl_file(bytes: &[u8]) -> bool {
 }
 
 /// Returns `true` when `path` is at or beneath any protected prefix.
-fn touches_protected_path(path: &[u8]) -> bool {
+pub(crate) fn touches_protected_path(path: &[u8]) -> bool {
     if !path.starts_with(b"/") {
         return false;
     }
@@ -1394,6 +1397,18 @@ fn touches_protected_path(path: &[u8]) -> bool {
             || path
                 .strip_prefix(*prefix)
                 .is_some_and(|rest| rest.starts_with(b"/"))
+    })
+}
+
+/// Returns `true` when `path` contains a protected prefix as a descendant.
+pub(crate) fn contains_protected_path(path: &[u8]) -> bool {
+    if !path.starts_with(b"/") {
+        return false;
+    }
+    PROTECTED_PREFIXES.iter().any(|prefix| {
+        prefix
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with(b"/"))
     })
 }
 
@@ -1408,6 +1423,10 @@ fn touches_protected_path(path: &[u8]) -> bool {
 ///
 /// Returns every class that matched, sorted and deduplicated, so an audit
 /// record names all of them rather than whichever happened to be checked first.
+///
+/// Protected paths use a component boundary after each exact prefix. The
+/// historical `/usr/bin//xudo` spelling therefore does not match the
+/// `/usr/bin/xudo` prefix; this string-level limit is documented and unchanged.
 pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let name = basename(exe);
     let mut findings = deny_by_executable(name);
@@ -1705,7 +1724,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 6);
+        assert_eq!(deny_list_version(), 7);
     }
 
     #[test]
@@ -1928,6 +1947,9 @@ mod tests {
             "/etc/apt/sources.list.d/evil.list",
             "/var/log/xudo/audit.jsonl",
             "/var/lib/xudo/audit.jsonl",
+            "/usr/bin/xudo",
+            "/usr/bin/ido",
+            "/usr/bin/willyoumarryme",
         ] {
             assert!(
                 classes("/usr/bin/true", &[path]).contains(&CapabilityClass::SelfModification),
@@ -1940,9 +1962,21 @@ mod tests {
     fn a_protected_prefix_matches_the_directory_itself_and_its_children() {
         assert!(touches_protected_path(b"/etc/xudo"));
         assert!(touches_protected_path(b"/etc/xudo/config.toml"));
+        assert!(touches_protected_path(b"/usr/bin/xudo"));
+        assert!(touches_protected_path(b"/usr/bin/ido"));
+        assert!(touches_protected_path(b"/usr/bin/willyoumarryme"));
         // The prefix-match bug: a sibling whose name merely starts the same.
         assert!(!touches_protected_path(b"/etc/xudoxyz"));
+        assert!(!touches_protected_path(b"/usr/bin/xudo-helper"));
         assert!(!touches_protected_path(b"etc/xudo"));
+    }
+
+    #[test]
+    fn a_path_ancestor_of_a_protected_prefix_is_detected_component_wise() {
+        assert!(contains_protected_path(b"/var"));
+        assert!(contains_protected_path(b"/var/lib"));
+        assert!(!contains_protected_path(b"/var-lib"));
+        assert!(!contains_protected_path(b"var"));
     }
 
     #[test]

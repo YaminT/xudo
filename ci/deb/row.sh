@@ -42,12 +42,28 @@ grep -Fq 'sudo usermod -aG xudo <you>' /tmp/apt.log || fail "first install notic
 grep -Fq 'xudo doctor --fix' /tmp/apt.log || fail "first install notice omitted doctor instructions"
 grep -Fq 'Without systemd' /tmp/apt.log || fail "first install notice omitted systemd/journald requirement"
 dpkg -s xudo | grep -q '^Status: install ok installed' || fail "not installed"
+# Parsing probes only: never change the container's installed package set.
+# These preserve apt's long-option case folding, dpkg's short-option clusters,
+# and its architecture-qualified trailing removal marker as tested spellings.
+apt -s --auto-remove remove xudo >/tmp/apt-auto-remove.log || fail "apt --auto-remove remove spelling"
+apt-get -s --AUTO-REMOVE remove xudo >/tmp/apt-option-case.log || fail "apt-get case-folded option spelling"
+apt-get -s auto-remove xudo >/tmp/apt-get-auto-remove.log || fail "apt-get auto-remove verb alias"
+if dpkg --no-act -rP xudo >/tmp/dpkg-rp.log 2>&1; then
+    fail "dpkg accepted conflicting -rP actions"
+fi
+grep -Fq 'conflicting actions -P (--purge) and -r (--remove)' /tmp/dpkg-rp.log || fail "dpkg did not parse the -rP conflict"
+dpkg --no-act -Gr xudo >/tmp/dpkg-gr.log 2>&1 || fail "dpkg -Gr cluster spelling"
+arch=$(dpkg --print-architecture)
+apt-get -s install "xudo:${arch}-" >/tmp/apt-arch-remove.log || fail "apt package:arch- removal spelling"
+grep -Fq 'Remv xudo' /tmp/apt-arch-remove.log || fail "apt package:arch- did not select removal"
 doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq 'sudoers xudo managed rule at /etc/sudoers.d/xudo' || fail "doctor did not report xudo's installed sudoers rule"
 # /usr/share/xudo is not excluded by Ubuntu's path-exclude=/usr/share/doc/*.
 # The example must be on every image.
 example=/usr/share/xudo/examples/20-services-lifecycle.toml
 [ -f "$example" ] || fail "lifecycle example not installed"
+[ -f /etc/xudo/rules.d/00-protect.toml ] || fail "shipped protect rules not installed"
+[ -n "$(dpkg-query -W -f='${Conffiles}' xudo | grep -F '/etc/xudo/rules.d/00-protect.toml' || true)" ] || fail "shipped protect rules are not a conffile"
 [ ! -e /etc/xudo/rules.d/20-services-lifecycle.toml ] || fail "lifecycle example installed as a rule"
 rules_count=$(find /etc/xudo/rules.d -maxdepth 1 -type f -name '*.toml' | wc -l)
 matching_count=$(printf '%s\n' "$doctor_out" | grep -c 'rule package .*: matches shipped' || true)

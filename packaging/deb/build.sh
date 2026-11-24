@@ -32,7 +32,7 @@ stage=$out/stage
 rm -rf "$stage"
 mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/libexec/xudo" \
     "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" \
-    "$stage/etc/xudo/rules.d" \
+    "$stage/etc/xudo/rules.d" "$stage/etc/xudo/harnesses.d" \
     "$stage/usr/share/doc/xudo" "$stage/usr/share/man/man1" "$stage/usr/share/man/man5"
 mkdir -p "$stage/usr/share/xudo"
 
@@ -56,6 +56,8 @@ fi
 mkdir -p "$stage/usr/share/xudo/examples"
 install -m 0644 "$root/rules/examples/20-services-lifecycle.toml.example" \
     "$stage/usr/share/xudo/examples/20-services-lifecycle.toml"
+install -m 0644 "$root/rules/examples/50-remove-path.toml.example" \
+    "$stage/usr/share/xudo/examples/50-remove-path.toml"
 mkdir -p "$stage/usr/share/lintian/overrides"
 install -m 0644 "$root/packaging/deb/lintian-overrides" "$stage/usr/share/lintian/overrides/xudo"
 install -m 0644 "$root/README.md" "$root/SECURITY.md" "$root/packaging/deb/copyright" \

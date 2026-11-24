@@ -48,9 +48,16 @@ use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, fchmod, flock, fstat,
     openat, renameat_with, unlinkat,
 };
+#[cfg(target_os = "linux")]
+use rustix::fs::{ResolveFlags, openat2};
 
 use crate::mounts::{HostMounts, MountView};
 use crate::trust::{TRUSTED_UID, TrustError, open_trusted_with};
+
+#[cfg(target_os = "linux")]
+const RESOLVE_ENTRY: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_SYMLINKS)
+    .union(ResolveFlags::NO_MAGICLINKS);
 
 /// Where the broker writes a new entry before renaming it into place.
 ///
@@ -205,17 +212,22 @@ pub trait Spool {
     /// component.
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError>;
 
-    /// Removes one entry. A name that is already gone is not an error: the
-    /// gate may have consumed it a moment ago.
+    /// Removes one entry and reports whether this call unlinked it.
+    ///
+    /// `Ok(true)` means the name was there and is now gone. `Ok(false)` means
+    /// it was already gone: the gate may have consumed it a moment ago, or a
+    /// mint never published it. Callers that must not treat those two the
+    /// same way branch on the bool. A missing name is still not an I/O error.
     ///
     /// This is the broker's tidying, and the opposite of [`Self::consume`] on
-    /// exactly that point: here a missing name is the outcome that was wanted.
+    /// exactly that point: here a missing name is `Ok(false)`, not
+    /// [`SpoolError::Gone`].
     ///
     /// # Errors
     ///
     /// [`SpoolError::Io`] if it exists and cannot be removed, and
     /// [`SpoolError::InvalidName`] for a name that is not one component.
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError>;
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError>;
 
     /// Takes one entry, so that it can be acted on at most once.
     ///
@@ -261,6 +273,7 @@ pub struct SpoolDir {
     dir: OwnedFd,
     path: PathBuf,
     owner: u32,
+    resolve_beneath: bool,
 }
 
 impl SpoolDir {
@@ -274,19 +287,64 @@ impl SpoolDir {
     /// [`SpoolError::NotADirectory`], [`SpoolError::NotOwned`], or
     /// [`SpoolError::Exposed`].
     pub fn open(path: &Path) -> Result<Self, SpoolError> {
-        Self::open_with(path, &HostMounts::proc())
+        Self::open_with(path, &HostMounts::proc(), false)
+    }
+
+    /// Opens the broker-only persistent queue with `openat2` path resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same trust and private-directory errors as [`Self::open`].
+    pub fn open_beneath(path: &Path) -> Result<Self, SpoolError> {
+        Self::open_with(path, &HostMounts::proc(), true)
+    }
+
+    /// Opens a private temporary spool for integration tests. Not present in
+    /// production builds; the real broker must use [`Self::open`]'s trust walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Io`] if opening or inspecting the descriptor
+    /// fails, or the normal spool ownership and mode errors.
+    #[cfg(feature = "fake")]
+    pub fn open_test_directory(path: &Path) -> Result<Self, SpoolError> {
+        let dir = match rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(dir) => dir,
+            Err(error) => return Err(test_directory_open_error(path, error)),
+        };
+        let fd: OwnedFd = dir;
+        let owner = owner_from_stat(fstat(&fd));
+        Self::from_dir_with(fd, path, owner, cfg!(target_os = "linux"))
     }
 
     /// [`Self::open`], with the mount table as a parameter.
-    fn open_with(path: &Path, view: &dyn MountView) -> Result<Self, SpoolError> {
+    fn open_with(
+        path: &Path,
+        view: &dyn MountView,
+        resolve_beneath: bool,
+    ) -> Result<Self, SpoolError> {
         let dir = open_trusted_with(path, TRUSTED_UID, view)?;
-        Self::from_dir(dir, path, TRUSTED_UID)
+        Self::from_dir_with(dir, path, TRUSTED_UID, resolve_beneath)
     }
 
     /// The descriptor half of [`Self::open`], for a directory already open.
     ///
     /// `owner` is [`TRUSTED_UID`] outside this module's tests.
+    #[cfg(test)]
     fn from_dir(dir: OwnedFd, path: &Path, owner: u32) -> Result<Self, SpoolError> {
+        Self::from_dir_with(dir, path, owner, false)
+    }
+
+    fn from_dir_with(
+        dir: OwnedFd,
+        path: &Path,
+        owner: u32,
+        resolve_beneath: bool,
+    ) -> Result<Self, SpoolError> {
         let at = path.display().to_string();
         // The descriptor is open, so `fstat` cannot fail on it; if it somehow
         // did, the stand-in facts describe something no check accepts.
@@ -310,7 +368,22 @@ impl SpoolDir {
             dir,
             path: path.to_path_buf(),
             owner,
+            resolve_beneath,
         })
+    }
+
+    fn open_entry(&self, name: &OsStr, flags: OFlags, mode: Mode) -> rustix::io::Result<OwnedFd> {
+        if self.resolve_beneath {
+            #[cfg(target_os = "linux")]
+            {
+                return openat2(&self.dir, name, flags, mode, RESOLVE_ENTRY);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(rustix::io::Errno::NOSYS);
+            }
+        }
+        openat(&self.dir, name, flags, mode)
     }
 
     /// Shapes a failed call on the spool.
@@ -390,6 +463,21 @@ impl SpoolDir {
     }
 }
 
+#[cfg(any(test, feature = "fake"))]
+fn owner_from_stat(result: rustix::io::Result<Stat>) -> u32 {
+    result.map_or(u32::MAX, |stat| stat.st_uid)
+}
+
+#[cfg(any(test, feature = "fake"))]
+fn test_directory_open_error(path: &Path, error: rustix::io::Errno) -> SpoolError {
+    SpoolError::Io {
+        operation: "open test spool".to_owned(),
+        at: path.display().to_string(),
+        code: Some(error.raw_os_error()),
+        reason: error.to_string(),
+    }
+}
+
 /// The permission bits in a stat, masked to `0o7777`.
 ///
 /// `st_mode` is a `u32` on Linux and a `u16` on macOS, so the widening is a
@@ -431,14 +519,17 @@ fn plain(name: &[u8]) -> Result<&OsStr, SpoolError> {
 /// `limit` of them do. `.` and `..` are dropped before the count, so a
 /// directory of exactly `limit` entries comes back whole. An error among the
 /// first `limit` is the error; one beyond them is never reached.
+/// Whether a directory entry is something other than `.` or `..`. An error
+/// is kept, so that it reaches the caller.
+fn is_real_name(name: &rustix::io::Result<Vec<u8>>) -> bool {
+    !matches!(name, Ok(name) if name == b"." || name == b"..")
+}
+
 fn first_names(
     entries: impl Iterator<Item = rustix::io::Result<Vec<u8>>>,
     limit: usize,
 ) -> rustix::io::Result<Vec<Vec<u8>>> {
-    entries
-        .filter(|name| !matches!(name, Ok(name) if name == b"." || name == b".."))
-        .take(limit)
-        .collect()
+    entries.filter(is_real_name).take(limit).collect()
 }
 
 /// Reads the outcome of a bounded read as an entry's contents.
@@ -490,7 +581,8 @@ impl Spool for SpoolDir {
         let component = plain(name)?;
         let display = name.as_bstr().to_string();
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        let opened = openat(&self.dir, component, flags, Mode::empty())
+        let opened = self
+            .open_entry(component, flags, Mode::empty())
             .and_then(|fd| fstat(&fd).map(|stat| (fd, stat)));
         let (fd, stat) = match opened {
             Ok(opened) => opened,
@@ -510,8 +602,8 @@ impl Spool for SpoolDir {
         contents_from(read, bytes, display, limit)
     }
 
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
-        self.unlink_entry(name).map(|_| ())
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError> {
+        self.unlink_entry(name)
     }
 
     fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
@@ -528,13 +620,14 @@ impl Spool for SpoolDir {
         plain(name.as_bytes())?;
         let temp = format!("{TEMP_PREFIX}{name}");
         let private = Mode::RUSR | Mode::WUSR;
-        let created = openat(
-            &self.dir,
-            temp.as_str(),
+        let created = match self.open_entry(
+            OsStr::new(temp.as_str()),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             private,
-        )
-        .map_err(|errno| self.failure("create", &errno.into()))?;
+        ) {
+            Ok(fd) => fd,
+            Err(errno) => return Err(self.failure("create", &errno.into())),
+        };
         // The mode is set again on the descriptor because the one passed to
         // `openat` is filtered by the umask; `fchmod` is not.
         let published = fchmod(&created, private)
@@ -575,16 +668,21 @@ impl SpoolDir {
     ) -> Result<(), SpoolError> {
         let component = plain(name)?;
         let display = name.as_bstr().to_string();
-        let current = openat(
-            &self.dir,
-            component,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .and_then(|fd| fstat(&fd).map(|stat| (fd, stat)))
-        .map_err(|errno| SpoolError::Gone {
-            name: errno.to_string(),
-        })?;
+        let current = match self
+            .open_entry(
+                component,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .and_then(|fd| fstat(&fd).map(|stat| (fd, stat)))
+        {
+            Ok(current) => current,
+            Err(errno) => {
+                return Err(SpoolError::Gone {
+                    name: errno.to_string(),
+                });
+            }
+        };
         let current_bytes = self.read(name, 32 * 1024)?;
         if current_bytes != expected {
             return Err(SpoolError::Gone { name: display });
@@ -592,13 +690,14 @@ impl SpoolDir {
         let current_inode = current.1.st_ino;
         let temp = format!("{TEMP_PREFIX}replace-{display}");
         let private = Mode::RUSR | Mode::WUSR;
-        let created = openat(
-            &self.dir,
-            temp.as_str(),
+        let created = match self.open_entry(
+            OsStr::new(temp.as_str()),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             private,
-        )
-        .map_err(|errno| self.failure("create replacement", &errno.into()))?;
+        ) {
+            Ok(fd) => fd,
+            Err(errno) => return Err(self.failure("create replacement", &errno.into())),
+        };
         let result = fchmod(&created, private)
             .map(|()| created)
             .map_err(std::io::Error::from)
@@ -607,19 +706,19 @@ impl SpoolDir {
                 before_exchange();
                 renameat_with(
                     &self.dir,
-                    temp.as_str(),
+                    OsStr::new(temp.as_str()),
                     &self.dir,
                     component,
                     RenameFlags::EXCHANGE,
                 )
                 .map_err(std::io::Error::from)?;
-                let displaced = openat(
-                    &self.dir,
-                    temp.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )
-                .and_then(|fd| fstat(&fd).map(|stat| stat.st_ino));
+                let displaced = self
+                    .open_entry(
+                        OsStr::new(temp.as_str()),
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                        Mode::empty(),
+                    )
+                    .and_then(|fd| fstat(&fd).map(|stat| stat.st_ino));
                 if !matches!(displaced, Ok(inode) if inode == current_inode) {
                     // The exchange requires the destination to exist, so a gate
                     // that consumed it cannot be undone by this replacement.
@@ -686,14 +785,23 @@ pub struct FakeSpool {
     calls: RefCell<Vec<SpoolCall>>,
     lock_error: Option<SpoolError>,
     names_error: Option<SpoolError>,
+    names_error_on_call: Option<(usize, SpoolError)>,
+    names_calls: std::cell::Cell<usize>,
     unreadable: BTreeSet<Vec<u8>>,
     remove_error: Option<SpoolError>,
     consume_error: Option<SpoolError>,
     publish_error: Option<SpoolError>,
     replace_error: Option<SpoolError>,
+    replace_error_on_call: Option<(usize, SpoolError)>,
+    replace_calls: std::cell::Cell<usize>,
     replace_error_after_exchange: Option<SpoolError>,
     unreadable_after_replace: bool,
     replaced: std::cell::Cell<bool>,
+    /// When set, a published file is gone at once: the gate consumed it.
+    consumed_on_publish: bool,
+    /// When set, [`Spool::names`] returns insertion order, as a directory does.
+    directory_order: bool,
+    inserted: RefCell<Vec<Vec<u8>>>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -706,7 +814,45 @@ impl FakeSpool {
     /// Adds a file.
     #[must_use]
     pub fn with_file(self, name: impl Into<Vec<u8>>, bytes: impl Into<Vec<u8>>) -> Self {
-        self.files.borrow_mut().insert(name.into(), bytes.into());
+        self.with_file_bytes(name.into(), bytes.into())
+    }
+
+    fn with_file_bytes(self, name: Vec<u8>, bytes: Vec<u8>) -> Self {
+        self.inserted.borrow_mut().push(name.clone());
+        self.files.borrow_mut().insert(name, bytes);
+        self
+    }
+
+    /// A spool whose published files are consumed at once, as when the gate
+    /// wins the race against the broker's revoke.
+    #[must_use]
+    pub fn with_consumed_on_publish(mut self) -> Self {
+        self.consumed_on_publish = true;
+        self
+    }
+
+    fn listed(&self, limit: usize) -> Vec<Vec<u8>> {
+        if self.directory_order {
+            let files = self.files.borrow();
+            return self
+                .inserted
+                .borrow()
+                .iter()
+                .filter(|name| files.contains_key(name.as_slice()))
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        self.files.borrow().keys().take(limit).cloned().collect()
+    }
+
+    /// Lists names in insertion order instead of sorted order.
+    ///
+    /// A real spool returns directory order. Tests that page a queue use this
+    /// so a sort bug is not hidden by [`BTreeMap`].
+    #[must_use]
+    pub fn in_directory_order(mut self) -> Self {
+        self.directory_order = true;
         self
     }
 
@@ -724,10 +870,21 @@ impl FakeSpool {
         self
     }
 
+    /// Makes the `names_up_to` call at `call` fail, counting from one.
+    #[must_use]
+    pub fn failing_names_on_call(mut self, call: usize, error: SpoolError) -> Self {
+        self.names_error_on_call = Some((call, error));
+        self
+    }
+
     /// Makes [`Spool::read`] of `name` fail as an unreadable entry.
     #[must_use]
-    pub fn failing_read(mut self, name: impl Into<Vec<u8>>) -> Self {
-        self.unreadable.insert(name.into());
+    pub fn failing_read(self, name: impl Into<Vec<u8>>) -> Self {
+        self.fail_read_bytes(name.into())
+    }
+
+    fn fail_read_bytes(mut self, name: Vec<u8>) -> Self {
+        self.unreadable.insert(name);
         self
     }
 
@@ -759,6 +916,15 @@ impl FakeSpool {
         self
     }
 
+    /// Makes the `replace` call at `call` fail, counting from one.
+    ///
+    /// Earlier replaces succeed, so a later step can be the one that refuses.
+    #[must_use]
+    pub fn failing_replace_on_call(mut self, call: usize, error: SpoolError) -> Self {
+        self.replace_error_on_call = Some((call, error));
+        self
+    }
+
     /// Makes [`Spool::replace`] fail after the new bytes are in place, as the
     /// real spool can when its last unlink or its swap back fails.
     #[must_use]
@@ -778,6 +944,15 @@ impl FakeSpool {
     /// Every file, by name.
     pub fn files(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.files.borrow().clone()
+    }
+
+    /// Removes `name` if it is present, as a gate consume that lands before
+    /// the broker's own [`Spool::remove`].
+    ///
+    /// Returns whether a file was there. The broker then sees [`Spool::remove`]
+    /// answer `Ok(false)`.
+    pub fn take_entry(&self, name: &[u8]) -> bool {
+        self.files.borrow_mut().remove(name).is_some()
     }
 
     /// Every call received so far, in order.
@@ -813,13 +988,20 @@ impl Spool for FakeSpool {
     fn names(&self) -> Result<Vec<Vec<u8>>, SpoolError> {
         self.record(SpoolCall::Names);
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().cloned().collect())
+        Ok(self.listed(usize::MAX))
     }
 
     fn names_up_to(&self, limit: usize) -> Result<Vec<Vec<u8>>, SpoolError> {
         self.record(SpoolCall::NamesUpTo(limit));
+        let calls = self.names_calls.get().saturating_add(1);
+        self.names_calls.set(calls);
+        if let Some((fail_on, error)) = &self.names_error_on_call {
+            if calls == *fail_on {
+                return Err(error.clone());
+            }
+        }
         scripted(self.names_error.as_ref())?;
-        Ok(self.files.borrow().keys().take(limit).cloned().collect())
+        Ok(self.listed(limit))
     }
 
     fn read(&self, name: &[u8], limit: usize) -> Result<Vec<u8>, SpoolError> {
@@ -848,11 +1030,10 @@ impl Spool for FakeSpool {
         }
     }
 
-    fn remove(&self, name: &[u8]) -> Result<(), SpoolError> {
+    fn remove(&self, name: &[u8]) -> Result<bool, SpoolError> {
         self.record(SpoolCall::Remove(name.to_vec()));
         scripted(self.remove_error.as_ref())?;
-        self.files.borrow_mut().remove(name);
-        Ok(())
+        Ok(self.files.borrow_mut().remove(name).is_some())
     }
 
     fn consume(&self, name: &[u8]) -> Result<(), SpoolError> {
@@ -875,13 +1056,25 @@ impl Spool for FakeSpool {
                 name: name.to_owned(),
             });
         }
-        files.insert(name.as_bytes().to_vec(), bytes.to_vec());
+        let owned = name.as_bytes().to_vec();
+        self.inserted.borrow_mut().push(owned.clone());
+        files.insert(owned.clone(), bytes.to_vec());
+        if self.consumed_on_publish {
+            files.remove(&owned);
+        }
         Ok(())
     }
 
     fn replace(&self, name: &[u8], expected: &[u8], bytes: &[u8]) -> Result<(), SpoolError> {
         self.record(SpoolCall::Replace(name.to_vec()));
         self.replaced.set(true);
+        let calls = self.replace_calls.get().saturating_add(1);
+        self.replace_calls.set(calls);
+        if let Some((fail_on, error)) = &self.replace_error_on_call
+            && calls == *fail_on
+        {
+            return Err(error.clone());
+        }
         scripted(self.replace_error.as_ref())?;
         let mut files = self.files.borrow_mut();
         match files.get_mut(name) {
@@ -917,6 +1110,65 @@ mod tests {
     use rustix::io::Errno;
 
     use super::*;
+
+    #[test]
+    fn stat_owner_uses_the_uid_or_the_impossible_error_sentinel() {
+        let path = std::env::temp_dir();
+        let fd = rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let expected = std::fs::metadata(&path).unwrap().uid();
+        assert_eq!(owner_from_stat(fstat(&fd)), expected);
+        assert_eq!(owner_from_stat(Err(Errno::IO)), u32::MAX);
+        let error = test_directory_open_error(Path::new("queue"), Errno::NOENT);
+        assert_eq!(kind(Err(error)), "Io");
+    }
+
+    #[test]
+    fn open_beneath_rejects_a_missing_queue_directory() {
+        let path = std::env::temp_dir().join(format!("xudo-missing-queue-{}", std::process::id()));
+        assert!(SpoolDir::open_beneath(&path).is_err());
+    }
+
+    #[test]
+    fn a_directory_order_spool_lists_names_as_they_were_inserted() {
+        let spool = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec())
+            .in_directory_order();
+        assert_eq!(spool.names().unwrap(), vec![b"b".to_vec(), b"a".to_vec()]);
+        assert_eq!(spool.names_up_to(1).unwrap(), vec![b"b".to_vec()]);
+        let sorted = FakeSpool::new()
+            .with_file(b"b".to_vec(), b"1".to_vec())
+            .with_file(b"a".to_vec(), b"2".to_vec());
+        assert_eq!(sorted.names().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
+        spool.publish("c", b"3").unwrap();
+        assert_eq!(
+            spool.names().unwrap(),
+            vec![b"b".to_vec(), b"a".to_vec(), b"c".to_vec()]
+        );
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn test_directory_open_failure_preserves_the_io_reason() {
+        let path = std::env::temp_dir().join(format!("xudo-missing-spool-{}", std::process::id()));
+        let result = SpoolDir::open_test_directory(&path);
+        assert!(
+            matches!(result, Err(SpoolError::Io { operation, .. }) if operation == "open test spool")
+        );
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn test_directory_open_accepts_a_private_owned_directory() {
+        let (dir, _) = scratch("test-open");
+        assert!(SpoolDir::open_test_directory(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use crate::mounts::fake::FakeMounts;
 
     /// A fresh `0700` directory under the workspace `target/`, never `/tmp`,
@@ -947,19 +1199,25 @@ mod tests {
     #[test]
     fn the_real_spool_must_be_root_owned_private_and_reached_through_trusted_components() {
         // A checkout is not root's, so the walk refuses it.
-        let err = SpoolDir::open_with(Path::new(env!("CARGO_MANIFEST_DIR")), &FakeMounts::ext4())
-            .unwrap_err();
+        let err = SpoolDir::open_with(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &FakeMounts::ext4(),
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not root"), "{err}");
         // A spool that does not exist is refused by the walk, by name.
         let err = SpoolDir::open_with(
             Path::new("/usr/definitely-not-a-spool"),
             &FakeMounts::ext4(),
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("cannot be inspected"), "{err}");
         // /usr/bin passes the walk on every host — root-owned, nothing
         // writable — and is still refused: 0755 lets everyone list it.
-        let err = SpoolDir::open_with(Path::new("/usr/bin"), &FakeMounts::ext4()).unwrap_err();
+        let err =
+            SpoolDir::open_with(Path::new("/usr/bin"), &FakeMounts::ext4(), false).unwrap_err();
         assert_eq!(
             err,
             SpoolError::Exposed {
@@ -1031,6 +1289,7 @@ mod tests {
         let err = SpoolDir::open_with(
             &Path::new(ROOT_OWNED_LINK).join("xudo-req"),
             &FakeMounts::ext4(),
+            false,
         )
         .unwrap_err();
         assert_eq!(err, SpoolError::Untrusted(link_refusal()));
@@ -1157,6 +1416,36 @@ mod tests {
         assert!(fake.replace(b"request", b"pending", b"approved").is_err());
         fake.unlock();
         assert_eq!(fake.files().get(b"request".as_slice()).unwrap(), b"pending");
+        let nth = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_replace_on_call(
+                2,
+                SpoolError::Gone {
+                    name: "request".to_owned(),
+                },
+            );
+        nth.replace(b"request", b"pending", b"once").unwrap();
+        assert_eq!(kind(nth.replace(b"request", b"once", b"twice")), "Gone");
+        assert_eq!(nth.files().get(b"request".as_slice()).unwrap(), b"once");
+    }
+
+    #[test]
+    fn fake_replace_can_fail_after_exchanging_the_entry() {
+        let fake = FakeSpool::new()
+            .with_file("request", b"pending".to_vec())
+            .failing_replace_after_exchange(SpoolError::Io {
+                operation: "unlink temp".to_owned(),
+                at: "request".to_owned(),
+                code: None,
+                reason: "scripted failure".to_owned(),
+            });
+        fake.lock().unwrap();
+        assert!(fake.replace(b"request", b"pending", b"approved").is_err());
+        fake.unlock();
+        assert_eq!(
+            fake.files().get(b"request".as_slice()).unwrap(),
+            b"approved"
+        );
     }
 
     #[test]
@@ -1308,6 +1597,26 @@ mod tests {
         assert_eq!(first_names(failing(5), 4).unwrap().len(), 4);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_beneath_spool_publishes_and_reads_but_refuses_a_symlinked_entry() {
+        let (dir, owner) = scratch("beneath");
+        let spool = SpoolDir::from_dir_with(open_dir(&dir), &dir, owner, true).unwrap();
+        spool.publish("entry", b"payload").unwrap();
+        assert_eq!(spool.read(b"entry", 64).unwrap(), b"payload");
+        // RESOLVE_NO_SYMLINKS: an entry that is a link to a real file is refused.
+        std::os::unix::fs::symlink(dir.join("entry"), dir.join("link")).unwrap();
+        assert!(spool.read(b"link", 64).is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_beneath_spool_fails_closed_where_openat2_does_not_exist() {
+        let (dir, owner) = scratch("beneath");
+        let spool = SpoolDir::from_dir_with(open_dir(&dir), &dir, owner, true).unwrap();
+        assert!(spool.publish("entry", b"payload").is_err());
+    }
+
     #[test]
     fn a_planted_temporary_file_or_link_is_never_written_through() {
         // O_EXCL|O_NOFOLLOW: whatever already holds the temporary name — a
@@ -1392,6 +1701,7 @@ mod tests {
             dir: fd,
             path: dir.clone(),
             owner: owner.wrapping_add(1),
+            resolve_beneath: false,
         };
         let err = foreign.read(b"e", 64).unwrap_err();
         assert!(
@@ -1420,9 +1730,9 @@ mod tests {
         // broker listed may be gone by the time it is removed.
         let (spool, dir) = spool("remove");
         spool.publish("abc", b"x").unwrap();
-        spool.remove(b"abc").unwrap();
+        assert!(spool.remove(b"abc").unwrap());
         assert!(!dir.join("abc").exists());
-        spool.remove(b"abc").unwrap();
+        assert!(!spool.remove(b"abc").unwrap());
         // A directory is not an entry and is not removed as one.
         std::fs::create_dir(dir.join("d")).unwrap();
         let err = spool.remove(b"d").unwrap_err();
@@ -1497,6 +1807,16 @@ mod tests {
         // reading a file this process opened does not fail either; these
         // shape what they would report if they did.
         let (spool, _dir) = spool("failures");
+        let listing = spool.checked::<Vec<Vec<u8>>>("read the directory", Err(Errno::IO));
+        assert_eq!(
+            listing.unwrap_err(),
+            SpoolError::Io {
+                operation: "read the directory".to_owned(),
+                at: spool.path.display().to_string(),
+                code: Some(Errno::IO.raw_os_error()),
+                reason: std::io::Error::from(Errno::IO).to_string(),
+            }
+        );
         let err = spool.checked::<()>("flock", Err(Errno::NOLCK)).unwrap_err();
         assert_eq!(
             err,
@@ -1581,8 +1901,8 @@ mod tests {
                 .to_string()
                 .contains("no such entry")
         );
-        fake.remove(b"a").unwrap();
-        fake.remove(b"a").unwrap();
+        assert!(fake.remove(b"a").unwrap());
+        assert!(!fake.remove(b"a").unwrap());
         // Consuming takes an entry once, and a missing one is gone, as the
         // directory says.
         fake.consume(b"b").unwrap();
@@ -1592,6 +1912,9 @@ mod tests {
                 name: "b".to_owned()
             }
         );
+        fake.publish("taken", b"x").unwrap();
+        assert!(fake.take_entry(b"taken"));
+        assert!(!fake.take_entry(b"taken"));
         fake.publish("c", b"3").unwrap();
         assert_eq!(
             fake.publish("c", b"4").unwrap_err(),
@@ -1616,6 +1939,7 @@ mod tests {
                 SpoolCall::Remove(b"a".to_vec()),
                 SpoolCall::Consume(b"b".to_vec()),
                 SpoolCall::Consume(b"b".to_vec()),
+                SpoolCall::Publish("taken".to_owned()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Publish("c".to_owned()),
                 SpoolCall::Unlock,
@@ -1645,6 +1969,14 @@ mod tests {
                 SpoolCall::NamesUpTo(0),
             ]
         );
+    }
+
+    #[test]
+    fn the_fake_can_fail_a_later_bounded_directory_scan() {
+        let error = SpoolError::NotADirectory { at: "queue".into() };
+        let fake = FakeSpool::new().failing_names_on_call(2, error.clone());
+        assert_eq!(fake.names_up_to(4), Ok(Vec::new()));
+        assert_eq!(fake.names_up_to(4), Err(error));
     }
 
     #[test]

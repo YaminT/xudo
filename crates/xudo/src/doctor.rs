@@ -62,6 +62,7 @@ use xudo_sys::{HostRunner, KernelSupport, Runner, SysError, TrustError, TrustedF
 use crate::cli::Platform;
 use crate::render;
 use crate::rules::{LoadError, LoadedRules};
+use crate::rules::{SHIPPED_PROTECT_DENY_IDS, inert_shipped_deny_notes};
 
 /// The version of the `doctor --json` envelope.
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -153,6 +154,12 @@ pub struct RulesetReport {
     pub trust: TrustReport,
     /// Whether each loaded rule matches dpkg's shipped conffile checksum.
     pub package_drift: RuleDriftReport,
+    /// Shipped deny-rule ids that are absent from the loaded ruleset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_shipped_deny_rules: Vec<&'static str>,
+    /// Shipped deny rules whose program has no loaded action yet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inert_shipped_deny_rules: Vec<String>,
     /// Set when the rules loaded and no systemctl action accepts a lifecycle
     /// or power verb.
     ///
@@ -234,6 +241,8 @@ pub struct SnippetReport {
 pub struct LoadedSummary {
     /// How many actions.
     pub actions: usize,
+    /// How many configured deny rules.
+    pub deny_rules: usize,
     /// How many files.
     pub files: usize,
     /// The policy generation, all 64 hex characters.
@@ -429,12 +438,33 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
         dir: rules.display().to_string(),
         loaded: loaded.ok().map(|loaded| LoadedSummary {
             actions: loaded.rules().len(),
+            deny_rules: loaded.rules().deny_rules().len(),
             files: loaded.files().len(),
             generation: loaded.generation().to_owned(),
         }),
         load_error: loaded.err().map(ToString::to_string),
         trust,
         package_drift,
+        missing_shipped_deny_rules: loaded
+            .ok()
+            .map(|loaded| {
+                SHIPPED_PROTECT_DENY_IDS
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        !loaded.rules().deny_rules().iter().any(|rule| {
+                            rule.id.as_str() == *id
+                                && !rule.program.is_empty()
+                                && !rule.all.is_empty()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        inert_shipped_deny_rules: loaded
+            .ok()
+            .map(|loaded| inert_shipped_deny_notes(loaded.rules()))
+            .unwrap_or_default(),
         lifecycle_note: loaded.ok().and_then(|loaded| {
             crate::lifecycle_note::missing(loaded.rules()).then_some(crate::lifecycle_note::TEXT)
         }),
@@ -816,17 +846,7 @@ pub(crate) fn human(report: &Report) -> String {
     line("rules dir", &safe(&report.ruleset.dir));
     line(
         "ruleset",
-        &report.ruleset.loaded.as_ref().map_or_else(
-            || "NOT LOADED (run `xudo check` for the parse error)".to_owned(),
-            |loaded| {
-                format!(
-                    "{} action(s), {} file(s), generation {}",
-                    loaded.actions,
-                    loaded.files,
-                    loaded.generation.get(..12).unwrap_or_default()
-                )
-            },
-        ),
+        &loaded_ruleset_label(report.ruleset.loaded.as_ref()),
     );
     line("rules trust", &trust_line(&report.ruleset.trust));
     for row in &report.ruleset.package_drift.files {
@@ -837,6 +857,12 @@ pub(crate) fn human(report: &Report) -> String {
     }
     if let Some(reason) = &report.ruleset.package_drift.unavailable {
         line("rule package", &format!("unknown: {}", safe(reason)));
+    }
+    for id in &report.ruleset.missing_shipped_deny_rules {
+        line("protect rule", &format!("missing shipped deny rule {id}"));
+    }
+    for id in &report.ruleset.inert_shipped_deny_rules {
+        line("protect rule", id);
     }
     if report.backend.implementation == Some(BackendKind::Doas) {
         line("sudoers xudo", "does not apply to the doas backend");
@@ -908,6 +934,21 @@ pub(crate) fn human(report: &Report) -> String {
          security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+fn loaded_ruleset_label(loaded: Option<&LoadedSummary>) -> String {
+    loaded.map_or_else(
+        || "NOT LOADED (run `xudo check` for the parse error)".to_owned(),
+        |loaded| {
+            format!(
+                "{} action(s), {} deny rule(s), {} file(s), generation {}",
+                loaded.actions,
+                loaded.deny_rules,
+                loaded.files,
+                loaded.generation.get(..12).unwrap_or_default()
+            )
+        },
+    )
 }
 
 /// Puts the lifecycle note and any open-unit lints before the rules-trust row.
@@ -1938,6 +1979,97 @@ mod tests {
         )
         .unwrap();
         LoadedRules::from_dir(&dir).unwrap()
+    }
+
+    #[test]
+    fn doctor_warns_when_a_shipped_deny_rule_is_missing() {
+        let loaded = fixture_rules("missing-protect-deny");
+        let report = gathered(
+            &clean_host(),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        assert_eq!(
+            report.ruleset.missing_shipped_deny_rules,
+            [
+                "xudo.protect.pkg-remove",
+                "xudo.protect.pkg-install-removal",
+                "xudo.protect.dpkg-remove",
+            ]
+        );
+        let text = human(&report);
+        assert!(text.contains("protect rule missing shipped deny rule xudo.protect.pkg-remove"));
+    }
+
+    fn fixture_with_protect_rule(name: &str, clauses: &str) -> LoadedRules {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join(format!("doctor-protect-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("10-actions.toml"), "[[action]]\nid = \"xudo.svc.restart\"\ntier = \"svc-control\"\nexe = \"/usr/bin/systemctl\"\nargs = [{ name = \"verb\", matcher = { literal = \"daemon-reload\" } }]\n").unwrap();
+        std::fs::write(dir.join("20-protect.toml"), format!("[[deny]]\nid = \"xudo.protect.pkg-remove\"\nreason = \"protect core packages\"\nprogram = [\"apt-get\"]\nall = {clauses}\n")).unwrap();
+        LoadedRules::from_dir(&dir).unwrap()
+    }
+
+    #[test]
+    fn doctor_reports_a_shipped_rule_as_inert_until_an_action_uses_it() {
+        let loaded = fixture_with_protect_rule("inert-rule", "[{ any-arg = [\"remove\"] }]");
+        let report = gathered(
+            &clean_host(),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        assert!(
+            !report
+                .ruleset
+                .missing_shipped_deny_rules
+                .contains(&"xudo.protect.pkg-remove")
+        );
+        assert_eq!(
+            report.ruleset.inert_shipped_deny_rules,
+            [
+                "xudo.protect.pkg-remove for apt-get is inert today; no loaded action runs that program"
+            ]
+        );
+        assert!(human(&report).contains("xudo.protect.pkg-remove for apt-get is inert today"));
+    }
+
+    #[test]
+    fn doctor_reports_a_shipped_rule_with_empty_clauses_as_missing() {
+        let loaded = fixture_with_protect_rule("empty-rule", "[]");
+        let report = gathered(
+            &clean_host(),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        assert!(
+            report
+                .ruleset
+                .missing_shipped_deny_rules
+                .contains(&"xudo.protect.pkg-remove")
+        );
     }
 
     /// Nothing wrong, everything readable, and the caller already in `xudo`.

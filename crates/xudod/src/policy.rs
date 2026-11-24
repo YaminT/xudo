@@ -8,10 +8,12 @@
 
 use std::path::PathBuf;
 
-use xudo_policy::{Arg, Argv, CallerFacts, Classification, Decision, evaluate_command};
+use xudo_policy::{
+    Arg, Argv, CallerFacts, Classification, Decision, HarnessRegistry, evaluate_command, passwd_uid,
+};
 use xudo_wire::BrokerRequest;
 
-use crate::identify::PeerIdentity;
+use crate::identify::{CgroupAttestation, PeerIdentity};
 
 pub use xudo_gate::policy::{LoadedPolicy, PolicyError};
 /// The largest settings file the broker will accept, in bytes.
@@ -56,36 +58,77 @@ impl PolicySource for HostPolicy {
     }
 }
 
-/// How the broker classifies the peer: `Unattested`, always, in M2b.
-///
-/// There is no cgroup classification until M4, so no caller can be an
-/// enrolled agent, and unattested routes to the human path with a password —
-/// misclassification here can only withhold capability. The reason records
-/// how the peer was identified, for the audit trail.
+/// Classifies the peer from the cgroup result derived while its kernel pidfd
+/// was held. Process names and caller-controlled environment are audit hints
+/// only and are never inputs here.
 pub fn classify(identity: &PeerIdentity) -> CallerFacts {
-    let pin = if identity.pinned {
-        "pinned by pidfd"
-    } else {
-        "unpinned"
-    };
-    CallerFacts::new(
-        Classification::Unattested {
-            reason: format!(
-                "no cgroup classification until M4; identified via {} as pid {} started at {} \
-                 ({pin})",
-                identity.rung.mechanism(),
-                identity.pid,
-                identity.starttime,
-            ),
-        },
-        identity.uid,
-    )
+    classify_with_registry(identity, &HarnessRegistry::empty(), "")
 }
 
-/// The requester's facts as the broker stored them at mint, from kernel
-/// attestation: the class and the requester's uid, nothing the answering
-/// watcher or freezer is, and nothing the requester claimed. The registry
-/// names are placeholders; they never decide anything.
+/// Classifies an identity only when its live root record still matches the
+/// current root registry and the account database maps its configured name to
+/// the peer uid.
+pub fn classify_with_registry(
+    identity: &PeerIdentity,
+    registry: &HarnessRegistry,
+    passwd: &str,
+) -> CallerFacts {
+    let classification = if identity.diverged {
+        xudo_policy::Classification::Unattested {
+            reason: "the peer's identity namespace diverges from the broker's".to_owned(),
+        }
+    } else {
+        match &identity.cgroup_attestation {
+            CgroupAttestation::AgentScope(scope) => {
+                let registered_label =
+                    serde_json::from_slice::<xudo_gate::SessionRecord>(&scope.record)
+                        .ok()
+                        .filter(|record| {
+                            let resolve = |name: &str| passwd_uid(passwd, name);
+                            registry.attests(
+                                &record.label,
+                                record.way,
+                                &record.registry_entry_hash,
+                                identity.uid,
+                                &resolve,
+                            )
+                        })
+                        .map(|record| record.label);
+                match (identity.cgroup_id, registered_label) {
+                    (Some(_scope_id), Some(agent_id)) => {
+                        xudo_policy::Classification::EnrolledAgent {
+                            agent_id,
+                            session_id: scope.name.clone(),
+                            declared_yolo: false,
+                        }
+                    }
+                    _ => xudo_policy::Classification::Unattested {
+                        reason: "agent scope record does not match the current harness registry"
+                            .to_owned(),
+                    },
+                }
+            }
+            CgroupAttestation::Outside | CgroupAttestation::OtherScope(_) => {
+                xudo_policy::Classification::Human
+            }
+            CgroupAttestation::Recordless
+            | CgroupAttestation::Unattested
+            | CgroupAttestation::NotChecked => xudo_policy::Classification::Unattested {
+                reason: format!(
+                    "cgroup facts were not sufficient at {}",
+                    identity.rung.mechanism()
+                ),
+            },
+        }
+    };
+    CallerFacts::new(classification, identity.uid)
+}
+
+/// The requester's facts as the broker stored them at mint.
+///
+/// An enrolled class carries the registry label in `attested_harness`. That
+/// label is what an ask-human rule matches. A missing or invalid label is
+/// unattested: it is never rewritten to a synthetic `scope-N` id.
 pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts {
     use xudo_gate::request::AttestedClass;
     let classification = match &entry.attested_class {
@@ -93,10 +136,17 @@ pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts 
             reason: "stored class at mint".to_owned(),
         },
         AttestedClass::Human => Classification::Human,
-        AttestedClass::EnrolledAgent { scope_id } => Classification::EnrolledAgent {
-            agent_id: format!("scope-{scope_id}"),
-            session_id: "stored".to_owned(),
-            declared_yolo: false,
+        AttestedClass::EnrolledAgent { .. } => match entry.attested_harness.as_deref() {
+            Some(label) if xudo_policy::valid_harness_label(label) => {
+                Classification::EnrolledAgent {
+                    agent_id: label.to_owned(),
+                    session_id: "stored".to_owned(),
+                    declared_yolo: false,
+                }
+            }
+            _ => Classification::Unattested {
+                reason: "stored enrolled class has no registry label".to_owned(),
+            },
         },
     };
     CallerFacts::new(classification, entry.caller_uid)
@@ -120,6 +170,26 @@ pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerReque
     )
 }
 
+/// The decision for a remove-path question.
+///
+/// A question that is not a remove-path is refused as a bad argv. The
+/// operation table is the only rule consulted.
+pub fn decide_remove(
+    policy: &LoadedPolicy,
+    caller: &CallerFacts,
+    request: &BrokerRequest,
+) -> Decision {
+    let Some((target, _, _)) = request.remove_fields() else {
+        return Decision::deny(
+            xudo_policy::DenialCode::ArgvRejected,
+            Vec::new(),
+            Vec::new(),
+        );
+    };
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or("");
+    xudo_policy::evaluate_remove_path(&policy.rules.rules, caller, target, policy.settings, passwd)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -127,6 +197,8 @@ mod tests {
     use proptest::prelude::*;
     use std::path::Path;
     use xudo_policy::{DenialCode, RuleFile, Verdict, engine::Settings, load_rule_files};
+    #[cfg(target_os = "linux")]
+    use xudo_sys::load_trusted_rules;
     use xudo_sys::{Attestation, TrustError, TrustedRulesError};
 
     use super::*;
@@ -135,12 +207,10 @@ mod tests {
     proptest! {
         #[test]
         fn shared_loader_handles_absent_and_present_settings(
-            agent in proptest::option::of(any::<bool>()),
             human in proptest::option::of(any::<bool>()),
             frozen in proptest::option::of(any::<bool>()),
         ) {
             let mut rows = Vec::new();
-            if let Some(value) = agent { rows.push(format!("confirm_agent_actions = {value}")); }
             if let Some(value) = human { rows.push(format!("confirm_human_path = {value}")); }
             if let Some(value) = frozen { rows.push(format!("frozen = {value}")); }
             let bytes = rows.join("\n");
@@ -148,10 +218,41 @@ mod tests {
                 (!rows.is_empty()).then_some(bytes.as_bytes()),
                 Path::new("/etc/xudo/config.toml"),
             ).unwrap();
-            prop_assert_eq!(loaded.confirm_agent_actions, agent.unwrap_or(Settings::default().confirm_agent_actions));
+            prop_assert!(loaded.confirm_agent_actions);
             prop_assert_eq!(loaded.confirm_human_path, human.unwrap_or(Settings::default().confirm_human_path));
             prop_assert_eq!(loaded.frozen, frozen.unwrap_or(Settings::default().frozen));
         }
+    }
+
+    #[test]
+    fn decide_remove_uses_the_operation_table_and_refuses_a_run_question() {
+        let policy = policy_of(
+            r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#,
+        );
+        let caller = CallerFacts::new(Classification::Human, 1000);
+        let mut request = BrokerRequest::new("/bin/true", Vec::new(), "human");
+        request.question = xudo_wire::Question::RemovePath {
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: false,
+            claimed_classification: "human".to_owned(),
+        };
+        let allowed = decide_remove(&policy, &caller, &request);
+        assert_eq!(allowed.verdict, Verdict::Allow);
+        assert_eq!(
+            allowed.action.as_ref().map(xudo_policy::ActionId::as_str),
+            Some("web.clean-build")
+        );
+        let run = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        let denied = decide_remove(&policy, &caller, &run);
+        assert_eq!(denied.denial, Some(DenialCode::ArgvRejected));
     }
 
     fn policy_of(toml: &str) -> LoadedPolicy {
@@ -162,6 +263,8 @@ mod tests {
             }])
             .unwrap(),
             settings: Settings::default(),
+            queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
+            passwd: Vec::new(),
         }
     }
 
@@ -188,8 +291,26 @@ args = [
             diverged: false,
             pinned,
             cgroup_id: None,
+            cgroup_attestation: CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
         }
+    }
+
+    fn test_registry() -> xudo_policy::HarnessRegistry {
+        xudo_policy::HarnessRegistry::from_files([(
+            "codex.toml",
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
+        )])
+        .unwrap()
+    }
+
+    fn test_record(registry: &xudo_policy::HarnessRegistry, label: &str) -> Vec<u8> {
+        let hash = registry.get("codex").unwrap().hash_hex();
+        format!(
+            r#"{{"uid":1000,"label":"{label}","way":"service","registry_entry_hash":"{hash}","boot_id":"abcdef01-2345-6789-abcd-ef0123456789","created_at_boottime_ms":20,"deadline":200,"pid":4242,"starttime":998877,"cgroup_id":77}}"#
+        )
+        .into_bytes()
     }
 
     fn ask(program: &str, argv: &[&str]) -> BrokerRequest {
@@ -201,24 +322,128 @@ args = [
     }
 
     #[test]
-    fn every_peer_is_unattested_in_m2b_and_keeps_its_connect_time_uid() {
-        for pinned in [true, false] {
-            let facts = classify(&identity(pinned));
-            assert_eq!(facts.classification.label(), "unattested");
-            assert!(facts.classification.requires_password());
-            assert_eq!(facts.uid, 1000);
-            let reason = format!("{:?}", facts.classification);
-            assert!(reason.contains("SO_PEERPIDFD + PIDFD_GET_INFO"), "{reason}");
-            assert!(reason.contains("pid 4242 started at 998877"), "{reason}");
-            assert!(
-                reason.contains(if pinned {
-                    "pinned by pidfd"
-                } else {
-                    "unpinned"
-                }),
-                "{reason}"
-            );
-        }
+    fn claudecode_env_and_agent_comm_without_a_scope_is_human() {
+        let mut peer = identity(true);
+        peer.cgroup_attestation = CgroupAttestation::Outside;
+        let facts = classify(&peer);
+        assert_eq!(facts.classification.label(), "human");
+        assert!(facts.classification.requires_password());
+        assert_eq!(facts.uid, 1000);
+    }
+
+    #[test]
+    fn a_broker_agent_uses_the_attested_scope_name_as_its_session_id() {
+        let registry = test_registry();
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: test_record(&registry, "codex"),
+        });
+
+        let facts = classify_with_registry(
+            &peer,
+            &registry,
+            "agent:x:1000:1000:agent:/home/agent:/bin/sh\n",
+        );
+
+        assert_eq!(
+            facts.classification,
+            xudo_policy::Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                declared_yolo: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_gate_decision_matches_the_brokers_on_an_ask_human_action() {
+        const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+        const ASK: &str = r#"
+[[action]]
+id = "xudo.pkg.upgrade"
+tier = "diag-read"
+exe = "/usr/bin/true"
+args = [{ name = "verb", matcher = { literal = "upgrade" } }]
+harness = ["codex"]
+outcome = "ask-human"
+"#;
+        let registry = test_registry();
+        let record = test_record(&registry, "codex");
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: record.clone(),
+        });
+        let broker = classify_with_registry(&peer, &registry, PASSWD);
+        let gate_label = xudo_gate::attested_harness_label(&record, peer.uid, &registry, PASSWD);
+        assert_eq!(gate_label.as_deref(), Some("codex"));
+        assert_eq!(
+            broker.classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        let policy = LoadedPolicy {
+            rules: xudo_policy::load_policy(
+                vec![RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: ASK.as_bytes().to_vec(),
+                }],
+                &[xudo_policy::HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n".to_vec(),
+                }],
+            )
+            .unwrap(),
+            settings: Settings::default(),
+            queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
+            passwd: PASSWD.as_bytes().to_vec(),
+        };
+        let request = ask("/usr/bin/true", &["upgrade"]);
+        let broker_decision = decide(&policy, &broker, &request);
+        let gate_caller = CallerFacts::new(broker.classification.clone(), peer.uid);
+        let gate_decision = decide(&policy, &gate_caller, &request);
+        assert_eq!(broker_decision, gate_decision);
+        assert_eq!(broker_decision.denial, Some(DenialCode::AskHuman));
+        assert_eq!(broker_decision.verdict, Verdict::Deny);
+
+        let synthetic = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "scope-77".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let loosened = decide(&policy, &synthetic, &request);
+        assert_eq!(loosened.verdict, Verdict::Deny);
+        assert_eq!(loosened.denial, Some(DenialCode::HumanPathOnly));
+    }
+
+    #[test]
+    fn an_unregistered_same_uid_process_is_not_a_harness() {
+        let registry = test_registry();
+        let mut peer = identity(true);
+        peer.cgroup_id = Some(77);
+        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: test_record(&registry, "removed"),
+        });
+        let facts = classify_with_registry(
+            &peer,
+            &registry,
+            "agent:x:1000:1000:agent:/home/agent:/bin/sh\n",
+        );
+        assert!(!facts.classification.is_enrolled_agent());
+        assert!(facts.classification.requires_password());
     }
 
     #[test]
@@ -249,12 +474,14 @@ args = [
         honest.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "human".to_owned(),
         };
         let mut lying = honest.clone();
         lying.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
             argv: vec!["restart".to_owned(), "nginx.service".to_owned()],
+            cwd: Vec::new(),
             claimed_classification: "enrolled-agent-yolo".to_owned(),
         };
         assert_eq!(
@@ -312,16 +539,16 @@ args = [
     }
 
     #[test]
-    fn a_settings_file_is_honoured_as_the_front_end_honours_it() {
+    fn a_settings_file_keeps_agent_actions_on_the_human_path() {
         let settings = xudo_gate::settings_from(
-            Some(b"confirm_agent_actions = false\nfrozen = true\n"),
+            Some(b"confirm_human_path = false\nfrozen = true\n"),
             Path::new("/etc/xudo/config.toml"),
         )
         .unwrap();
         assert_eq!(
             settings,
             Settings {
-                confirm_agent_actions: false,
+                confirm_agent_actions: true,
                 confirm_human_path: false,
                 frozen: true,
             }
@@ -359,24 +586,15 @@ args = [
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_the_host_policy_loads_through_the_trust_walk() {
-        // /usr/bin is root's on every host and holds no rule files, so it
-        // loads as an empty ruleset; an absent settings file in it is the
-        // defaults.
+    fn on_linux_the_host_policy_loads_an_absent_registry_as_empty() {
+        // `/usr/bin` is root-owned and contains no rule files. With no
+        // adjacent registry, there are no root-registered harnesses.
+        assert!(load_trusted_rules(Path::new("/usr/bin")).is_ok());
         let loaded = HostPolicy::new("/usr/bin", "/usr/bin/xudo-surely-absent.toml")
             .load()
             .unwrap();
         assert!(loaded.rules.rules.is_empty());
-        assert_eq!(
-            loaded.settings.confirm_agent_actions,
-            Settings::default().confirm_agent_actions
-        );
-        assert_eq!(
-            loaded.settings.confirm_human_path,
-            Settings::default().confirm_human_path
-        );
-        // A missing `/var/lib/xudo` cannot establish absence of the marker.
-        assert!(loaded.settings.frozen);
+        assert!(loaded.rules.harnesses.is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -389,9 +607,10 @@ args = [
         assert!(err.to_string().contains("not root"), "{err}");
 
         let err = HostPolicy::new("/usr/bin", "/dev/null").load().unwrap_err();
+        assert!(err.to_string().contains("/dev/null"), "{err}");
         assert!(
             err.to_string()
-                .starts_with("the settings file cannot be read"),
+                .contains("not a directory or a regular file"),
             "{err}"
         );
     }

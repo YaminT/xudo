@@ -29,18 +29,12 @@ use crate::layer::{Layer, Origin, Tracked};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Setting {
-    /// Whether an enrolled agent's actions are confirmed by a human.
-    ///
-    /// Defaults to `true`. It has no effect in this release (no caller is a
-    /// verified harness), and the design replaces it: root's rules alone
-    /// decide what a verified harness runs. Removed with the agent path.
-    ConfirmAgentActions,
-    /// Optional extra check on the human path, off by default: a rule that
-    /// requires confirmation also needs an approval in `xudo watch`. Never
-    /// part of the agent path.
+    /// Require an out-of-band human watch approval on the human path.
     ConfirmHumanPath,
     /// How long a pending confirmation waits before it is denied.
     ConfirmationTimeoutSecs,
+    /// Maximum time a root-held ask-human request remains live.
+    QueueTtlSecs,
     /// Whether the agent path is frozen.
     Frozen,
     /// Where audit records go.
@@ -59,9 +53,9 @@ pub enum Setting {
 impl Setting {
     /// Every setting, for exhaustive reporting and schema export.
     pub const ALL: [Self; 7] = [
-        Self::ConfirmAgentActions,
         Self::ConfirmHumanPath,
         Self::ConfirmationTimeoutSecs,
+        Self::QueueTtlSecs,
         Self::Frozen,
         Self::AuditSink,
         Self::Color,
@@ -76,9 +70,9 @@ impl Setting {
     /// The key as it appears in a configuration file.
     pub fn key(self) -> &'static str {
         match self {
-            Self::ConfirmAgentActions => "confirm_agent_actions",
             Self::ConfirmHumanPath => "confirm_human_path",
             Self::ConfirmationTimeoutSecs => "confirmation_timeout_secs",
+            Self::QueueTtlSecs => "queue_ttl_secs",
             Self::Frozen => "frozen",
             Self::AuditSink => "audit_sink",
             Self::Color => "color",
@@ -111,13 +105,15 @@ impl Setting {
     pub fn narrows(self, current: &Value, candidate: &Value) -> bool {
         match (self, current, candidate) {
             (
-                Self::ConfirmAgentActions | Self::ConfirmHumanPath | Self::Frozen,
+                Self::ConfirmHumanPath | Self::Frozen,
                 Value::Bool(current),
                 Value::Bool(candidate),
             ) => *candidate || !*current,
-            (Self::ConfirmationTimeoutSecs, Value::Integer(current), Value::Integer(candidate)) => {
-                candidate <= current
-            }
+            (
+                Self::ConfirmationTimeoutSecs | Self::QueueTtlSecs,
+                Value::Integer(current),
+                Value::Integer(candidate),
+            ) => candidate <= current,
             // No ordering, so no narrowing: equal is the only acceptable
             // "change". Also the fallback for a type mismatch, which a lower
             // layer must not be able to use as an escape hatch.
@@ -220,14 +216,10 @@ pub struct Settings {
 impl Default for Settings {
     /// The built-in defaults.
     ///
-    /// `confirm_agent_actions` starts `true`, the fail-closed value for a setting
-    /// the design removes (see [`Setting::ConfirmAgentActions`]).
+    /// Agent confirmation is not configurable; only human-path confirmation
+    /// and presentation settings are represented here.
     fn default() -> Self {
         let mut values = BTreeMap::new();
-        values.insert(
-            Setting::ConfirmAgentActions,
-            Tracked::default_value(Value::Bool(true)),
-        );
         values.insert(
             Setting::ConfirmHumanPath,
             Tracked::default_value(Value::Bool(false)),
@@ -235,6 +227,10 @@ impl Default for Settings {
         values.insert(
             Setting::ConfirmationTimeoutSecs,
             Tracked::default_value(Value::Integer(0)),
+        );
+        values.insert(
+            Setting::QueueTtlSecs,
+            Tracked::default_value(Value::Integer(24 * 60 * 60)),
         );
         values.insert(Setting::Frozen, Tracked::default_value(Value::Bool(false)));
         values.insert(
@@ -268,8 +264,20 @@ impl Settings {
     fn fallback(setting: Setting) -> &'static Tracked<Value> {
         static SAFE_TRUE: std::sync::LazyLock<Tracked<Value>> =
             std::sync::LazyLock::new(|| Tracked::compiled(Value::Bool(true)));
-        let _ = setting;
-        &SAFE_TRUE
+        static ZERO_TIMEOUT: std::sync::LazyLock<Tracked<Value>> =
+            std::sync::LazyLock::new(|| Tracked::compiled(Value::Integer(0)));
+        static DEFAULT_QUEUE_TTL: std::sync::LazyLock<Tracked<Value>> =
+            std::sync::LazyLock::new(|| Tracked::compiled(Value::Integer(24 * 60 * 60)));
+        static AUDIT_JOURNALD: std::sync::LazyLock<Tracked<Value>> =
+            std::sync::LazyLock::new(|| Tracked::compiled(Value::Text("journald".to_owned())));
+        match setting {
+            Setting::ConfirmationTimeoutSecs => &ZERO_TIMEOUT,
+            Setting::QueueTtlSecs => &DEFAULT_QUEUE_TTL,
+            Setting::AuditSink => &AUDIT_JOURNALD,
+            Setting::ConfirmHumanPath | Setting::Frozen | Setting::Color | Setting::UsePty => {
+                &SAFE_TRUE
+            }
+        }
     }
 
     /// Applies one value from one layer.
@@ -401,17 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_is_on_by_default_and_says_it_is_a_default() {
-        // The project's headline promise, so it is the default rather than
-        // something an installer has to remember to set.
-        let settings = Settings::default();
-        let confirm = settings.get(Setting::ConfirmAgentActions);
-        assert_eq!(confirm.value, Value::Bool(true));
-        assert_eq!(confirm.origin.layer, Layer::BuiltInDefault);
-        assert_eq!(confirm.origin.to_string(), "<default>");
-    }
-
-    #[test]
     fn a_project_layer_cannot_turn_confirm_human_path_off() {
         let mut settings = Settings::default();
         assert_eq!(
@@ -455,11 +452,7 @@ mod tests {
         // the process it spawns, so a safety default readable from it is not a
         // default at all.
         let mut settings = Settings::default();
-        for setting in [
-            Setting::ConfirmAgentActions,
-            Setting::Frozen,
-            Setting::AuditSink,
-        ] {
+        for setting in [Setting::Frozen, Setting::AuditSink] {
             let value = settings.get(setting).value.clone();
             let err = settings
                 .apply(setting, value, Origin::layer(Layer::Environment))
@@ -497,20 +490,20 @@ mod tests {
         let mut settings = Settings::default();
         // Start from a system layer that turned it off.
         settings
-            .apply(Setting::ConfirmAgentActions, Value::Bool(false), system(4))
+            .apply(Setting::ConfirmHumanPath, Value::Bool(false), system(4))
             .unwrap();
         // The project layer may turn it back on.
         settings
-            .apply(Setting::ConfirmAgentActions, Value::Bool(true), project(1))
+            .apply(Setting::ConfirmHumanPath, Value::Bool(true), project(1))
             .unwrap();
         assert_eq!(
-            settings.get(Setting::ConfirmAgentActions).value,
+            settings.get(Setting::ConfirmHumanPath).value,
             Value::Bool(true)
         );
 
         // And now it may not turn it off again.
         let err = settings
-            .apply(Setting::ConfirmAgentActions, Value::Bool(false), project(2))
+            .apply(Setting::ConfirmHumanPath, Value::Bool(false), project(2))
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("may only narrow"), "{message}");
@@ -625,12 +618,12 @@ mod tests {
         // first; this asserts both refuse.
         let mut settings = Settings::default();
         let err = settings
-            .apply(Setting::ConfirmAgentActions, Value::Integer(0), project(1))
+            .apply(Setting::ConfirmHumanPath, Value::Integer(0), project(1))
             .unwrap_err();
         assert!(err.to_string().contains("expects a boolean"), "{err}");
 
         // And directly: an integer is not a narrowing of a boolean.
-        assert!(!Setting::ConfirmAgentActions.narrows(&Value::Bool(true), &Value::Integer(0)));
+        assert!(!Setting::ConfirmHumanPath.narrows(&Value::Bool(true), &Value::Integer(0)));
     }
 
     #[test]
@@ -731,12 +724,11 @@ mod tests {
         }
         let color = schema.iter().find(|e| e.key == "color").unwrap();
         assert!(color.settable_from_environment);
-        let confirm = schema
-            .iter()
-            .find(|e| e.key == "confirm_agent_actions")
-            .unwrap();
-        assert!(!confirm.settable_from_environment);
-        assert_eq!(confirm.default, "true");
+        assert!(
+            !schema
+                .iter()
+                .any(|entry| entry.key == "confirm_agent_actions")
+        );
         let pty = schema.iter().find(|e| e.key == "use_pty").unwrap();
         assert!(!pty.configurable);
     }
@@ -749,7 +741,7 @@ mod tests {
             serde_json::from_str::<Vec<SchemaEntry>>(&json).unwrap(),
             schema
         );
-        assert!(json.contains("confirm_agent_actions"));
+        assert!(!json.contains("confirm_agent_actions"));
     }
 
     #[test]
@@ -771,6 +763,36 @@ mod tests {
         for setting in Setting::ALL {
             assert!(format!("{setting:?}").len() > 3);
         }
+    }
+
+    #[test]
+    fn a_project_can_only_shorten_the_root_queue_lifetime() {
+        let mut settings = Settings::default();
+        assert!(
+            settings
+                .apply(
+                    Setting::QueueTtlSecs,
+                    Value::Integer(300),
+                    Origin::file(Layer::Project, "project.toml", 1),
+                )
+                .is_ok()
+        );
+        let widened = settings
+            .apply(
+                Setting::QueueTtlSecs,
+                Value::Integer(86_401),
+                Origin::file(Layer::Project, "project.toml", 2),
+            )
+            .unwrap_err();
+        assert!(
+            widened
+                .to_string()
+                .contains("queue_ttl_secs may only narrow")
+                || widened
+                    .to_string()
+                    .contains("may only narrow queue_ttl_secs")
+        );
+        assert!(widened.to_string().contains("86401"));
     }
 
     #[test]
@@ -796,9 +818,24 @@ mod tests {
         let empty = Settings {
             values: BTreeMap::new(),
         };
-        let fallback = empty.get(Setting::ConfirmAgentActions);
-        assert_eq!(fallback.value, Value::Bool(true));
+        let fallback = empty.get(Setting::ConfirmationTimeoutSecs);
+        assert_eq!(fallback.value, Value::Integer(0));
         assert_eq!(fallback.origin.layer, Layer::Compiled);
+        assert_eq!(
+            empty.get(Setting::ConfirmHumanPath).value,
+            Value::Bool(true)
+        );
+        assert_eq!(empty.get(Setting::Frozen).value, Value::Bool(true));
+        assert_eq!(empty.get(Setting::Color).value, Value::Bool(true));
+        assert_eq!(empty.get(Setting::UsePty).value, Value::Bool(true));
+        assert_eq!(
+            empty.get(Setting::AuditSink).value,
+            Value::Text("journald".to_owned())
+        );
+        assert_eq!(
+            empty.get(Setting::QueueTtlSecs).value,
+            Value::Integer(86_400)
+        );
     }
 
     #[test]
@@ -809,6 +846,6 @@ mod tests {
         b.apply(Setting::Color, Value::Bool(false), system(1))
             .unwrap();
         assert_ne!(a, b);
-        assert!(format!("{a:?}").contains("ConfirmAgentActions"));
+        assert!(format!("{a:?}").contains("ConfirmHumanPath"));
     }
 }

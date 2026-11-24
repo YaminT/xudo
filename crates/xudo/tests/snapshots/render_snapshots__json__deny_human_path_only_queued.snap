@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json_queued(&decision, Some(7))"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "human_path_only",
   "remediation": "this action is never available to an agent; hand it to a person",

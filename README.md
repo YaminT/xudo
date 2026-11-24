@@ -46,7 +46,9 @@ ido queue -m "show listeners after review" -- /usr/bin/ss -tulpnH
 
 `explain` shows the policy decision and executes nothing. `exec` ignores `--rules`. The installed broker loads root's `/etc/xudo/rules.d`. The shipped rules do not start or stop a service. To allow that on one host, copy `/usr/share/xudo/examples/20-services-lifecycle.toml` to `/etc/xudo/rules.d/` and replace the placeholder unit names. After installing the package, add your user to the `xudo` group (`sudo usermod -aG xudo YOUR_USER`, then log out and back in). This is a deliberate privilege grant: the group can invoke the installed password-authenticated gate.
 
-Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. `ido queue` stores exact arguments for a human to review and run with `ido`.
+Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. A verified harness request matching an `ask-human` action is stored in the broker's root-held queue. A human reviewer runs it with `xudo exec --queued ID`: the broker re-decides the stored argv, sudo asks for the password, and the command runs in `/`. `ido` lists that queue separately from the user-side queue, which stays labelled as written by the agent and editable by it. Human-path denials are not copied into the caller's editable `ido` queue. The passwordless gate is not in this release.
+
+`xudo op remove-path /srv/app/build/cache` removes that path when an `[[operation]]` rule names the tree. It does not run `rm`. `--dry-run` lists the paths and removes nothing. The example is `rules/examples/50-remove-path.toml.example`, installed as `/usr/share/xudo/examples/50-remove-path.toml`. Copy it into `/etc/xudo/rules.d/` and set `under` to a tree whose ancestors are root-owned and not writable by group or other. The rule's `harness` list is parsed and checked against the registry and is not a grant. Harness use of this operation is planned. This release runs it only on the password path.
 
 ## Status
 
@@ -60,9 +62,17 @@ Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service
 
 Details and limits: [SECURITY.md](SECURITY.md). The default build has no network code; `just telemetry` runs the strace no-telemetry check in CI.
 
+The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular file, so stock Ubuntu 26.04 verifies. It reports `installed, but NOT VERIFIED` on doas and on a multicall-coreutils system with no regular probe program, such as Alpine.
+
+The audit trail records authorization, not execution outcomes. Pasban runs daily as root. It verifies the audit chain and compares journal copies with the file by hash. It detects removed tails, cut-and-continued files, and forged chains the journal never saw. It does not prevent privileged tampering or prove that a command completed.
+
 ## Rule format
 
-Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names.
+Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names. An `[[operation]]` rule names work xudo performs itself. `remove-path` is the shipped operation, and it runs on the password path. The example at `rules/examples/50-remove-path.toml.example` is not loaded until an operator copies it into `rules.d`.
+
+Harness registrations live in root-owned `/etc/xudo/harnesses.d/<label>.toml` files. An action may name labels with `harness = ["codex"]` and set `outcome = "ask-human"`; a verified matching request is stored by the broker. A human reviewer, and not the entry's owner, claims it with `xudo exec --queued ID`. The broker re-decides the stored bytes against the current rules and, only if they still match, asks for the password through the `-auth` gate. `ido` shows that queue separately from the agent-editable list. `outcome = "allow"` does not create a passwordless grant in this release. The passwordless gate is not installed.
+
+The root setting `queue_ttl_secs` controls how long an ask-human entry stays live. It defaults to 86400 seconds and is capped at one day; a project config may only shorten it. Shortening the setting also expires older entries at the new deadline.
 
 ```toml
 [[action]]
@@ -78,11 +88,13 @@ args = [
 
 There are no argument globs. Each argument is constrained by position. The shipped rules are the TOML files under [rules/](rules/). The lifecycle example is not one of them.
 
+The package also ships `rules/00-protect.toml` as an active dpkg conffile. It refuses removal of `xudo`, `sudo`, `sudo-rs`, AppArmor, audit, firewall, logging, time-sync, and SSH server packages through the shipped `apt-get remove` action. Its purge, autoremove, auto-remove, autopurge, trailing-hyphen install, and dpkg clauses also protect later operator actions that name `apt`, `apt-get`, or `dpkg`; `xudo check` and `xudo doctor` report when one of those deny rules is inert because no loaded action runs its program. These rules protect xudo-mediated commands only. They cannot stop the host's own package tools or dependency/conflict transactions that indirectly remove packages. For example, removing `openssh-client` can remove `openssh-server`; removing `libip4tc2`, `libxtables12`, `libnftables1`, `python3`, or `init-system-helpers` can remove `iptables`, `nftables`, `ufw`, `firewalld`, or xudo. Installing `sudo-ldap` can also remove a conflicting package. `xudo doctor` reports if a shipped protect rule is missing or inert. The compiled-in path checks also protect `/usr/bin/xudo`, `/usr/bin/ido`, `/usr/bin/willyoumarryme`, and xudo's private files from xudo-mediated writes.
+
 ## FAQ
 
 ### What is the difference between `xudo` and `sudo`?
 
-`sudo` is the host's privilege transition. `xudo` checks a named-action policy first, asks a root broker to authorize the request, and sends an approved request through a separate gate. In this beta, every invocation uses the human password path.
+`sudo` is the host's privilege transition. `xudo` checks a named-action policy first, asks a root broker to authorize the request, and sends an approved request through a separate gate. Commands that run use the human password path. An `ask-human` harness request waits in the root-held queue until a human reviewer runs `xudo exec --queued ID`, which asks for the password again.
 
 ### Can an AI agent run any command with `xudo`?
 

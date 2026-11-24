@@ -25,7 +25,7 @@ use xudo_policy::{
     evaluate_command, load_rule_files,
     matcher::{AnchoredPattern, ArgSpec, Repeat, match_argv},
     overlap::Extent,
-    rule::ConfirmPolicy,
+    rule::{ConfirmPolicy, Outcome},
 };
 
 /// An argv built from a mixed alphabet: plausible operands, flag shapes,
@@ -47,6 +47,112 @@ fn arb_argv() -> impl Strategy<Value = Argv> {
         "[a-z.=/-]{0,12}".prop_map(|s| Arg::from(s.as_str())),
     ];
     prop::collection::vec(token, 0..8).prop_map(Argv::new)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 64 }))]
+
+    #[test]
+    fn adding_an_arbitrary_deny_rule_never_turns_a_deny_into_an_allow(member in "[a-z*?^$]{1,8}", argv in arb_argv()) {
+        let before = RuleSet::from_toml("before.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}")).unwrap();
+        let extra_rule = format!("[[deny]]\nid = \"xudo.protect.another\"\nreason = \"another protected package\"\nprogram = [\"apt-get\"]\nall = [{{ any-arg = [{member:?}] }}]\n");
+        let after = RuleSet::from_toml("after.toml", &format!("{DENY_ACTION}{DENY_RULE_TEXT}{extra_rule}")).unwrap();
+        let mut args = vec!["remove", "xudo"];
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
+        for who in both_callers() {
+            let old = decide_deny_test(&before, &who, &args);
+            let new = decide_deny_test(&after, &who, &args);
+            prop_assert!(!old.verdict.is_permitted());
+            prop_assert!(!new.verdict.is_permitted());
+        }
+    }
+
+    #[test]
+    fn a_deny_rule_never_changes_the_verdict_of_a_command_it_does_not_match(argv in arb_argv()) {
+        prop_assume!(!argv.as_slice().iter().any(|arg| arg.as_bytes() == b"remove" || arg.as_bytes() == b"xudo"));
+        let who = caller(false, Vec::new());
+        let mut args = vec!["install"];
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
+        let old = decide_deny_test(&deny_test_rules(false), &who, &args);
+        let new = decide_deny_test(&deny_test_rules(true), &who, &args);
+        prop_assert_eq!(new.verdict, old.verdict);
+        prop_assert_eq!(new.denial, old.denial);
+    }
+
+    #[test]
+    fn deny_rules_in_any_file_order_give_the_same_decisions(reverse in any::<bool>(), argv in arb_argv()) {
+        let first = "[[deny]]\nid = \"xudo.protect.first\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = [{ any-arg = [\"remove\"] }]\n";
+        let second = "[[deny]]\nid = \"xudo.protect.second\"\nreason = \"protected system\"\nprogram = [\"apt-get\"]\nall = [{ any-deb-name = [\"xudo\"] }]\n";
+        let action_file = RuleFile { name: b"00-actions.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() };
+        let first_file = RuleFile { name: b"10-first.toml".to_vec(), bytes: first.as_bytes().to_vec() };
+        let second_file = RuleFile { name: b"20-second.toml".to_vec(), bytes: second.as_bytes().to_vec() };
+        let mut files_a = vec![action_file.clone(), first_file.clone(), second_file.clone()];
+        let mut files_b = vec![action_file, second_file, first_file];
+        if reverse { files_a.reverse(); files_b.reverse(); }
+        let a = load_rule_files(files_a).unwrap();
+        let b = load_rule_files(files_b).unwrap();
+        let who = caller(false, Vec::new());
+        let mut args = vec!["remove", "xudo"];
+        args.extend(argv.as_slice().iter().map(|arg| std::str::from_utf8(arg.as_bytes()).unwrap_or("non-utf8")));
+        let x = decide_deny_test(&a.rules, &who, &args);
+        let y = decide_deny_test(&b.rules, &who, &args);
+        prop_assert_eq!(x.verdict, y.verdict);
+        prop_assert_eq!(x.denial, y.denial);
+        prop_assert_eq!(a.generation, b.generation);
+    }
+
+    #[test]
+    fn appending_an_arbitrary_argument_never_unmatches_a_deny_rule(extra in arb_argv()) {
+        let rules = deny_test_rules(true);
+        let rule = &rules.deny_rules()[0];
+        let before = Argv::new(["remove", "xudo"]);
+        let mut after_args = before.as_slice().to_vec();
+        after_args.extend(extra.as_slice().iter().cloned());
+        let after = Argv::new(after_args);
+        prop_assert!(rule.matches(b"/usr/bin/apt-get", &before));
+        prop_assert!(rule.matches(b"/usr/bin/apt-get", &after));
+    }
+
+    #[test]
+    fn a_matching_deny_rule_denies_every_caller_class(_unit in Just(())) {
+        let rules = deny_test_rules(true);
+        for who in both_callers() {
+            let decision = decide_deny_test(&rules, &who, &["remove", "xudo"]);
+            prop_assert_eq!(decision.verdict, Verdict::Deny);
+            prop_assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        }
+    }
+
+    #[test]
+    fn deny_rules_win_over_every_overlapping_rule(_unit in Just(())) {
+        let extra_action = DENY_ACTION.replace("xudo.pkg.remove", "xudo.pkg.remove.overlap");
+        let text = format!("{DENY_ACTION}{extra_action}{DENY_RULE_TEXT}");
+        let rules = RuleSet::from_toml("overlap.toml", &text).unwrap();
+        let decision = decide_deny_test(&rules, &caller(false, Vec::new()), &["remove", "xudo"]);
+        prop_assert_eq!(decision.denial, Some(DenialCode::DenyRule));
+        prop_assert!(decision.action.is_none());
+    }
+
+    #[test]
+    fn adding_a_deny_rule_changes_the_generation(_unit in Just(())) {
+        let with_rule = format!("{DENY_ACTION}{DENY_RULE_TEXT}");
+        let plain = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() }]).unwrap();
+        let changed = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: with_rule.into_bytes() }]).unwrap();
+        let without = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: DENY_ACTION.as_bytes().to_vec() }]).unwrap();
+        prop_assert_eq!(plain.generation, without.generation);
+        prop_assert_ne!(plain.generation, changed.generation);
+    }
+
+    #[test]
+    fn a_test_naming_a_deny_rule_never_changes_the_generation(_unit in Just(())) {
+        let plain_text = format!("{DENY_ACTION}{DENY_RULE_TEXT}");
+        let test_text = format!("{plain_text}\n[[test]]\nargv = [\"/usr/bin/apt-get\", \"remove\", \"xudo\"]\nexpect = \"deny\"\ndeny-rule = \"xudo.protect.pkg-remove\"\n");
+        let plain = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: plain_text.into_bytes() }]).unwrap();
+        let changed = load_rule_files(vec![RuleFile { name: b"rules.toml".to_vec(), bytes: test_text.into_bytes() }]).unwrap();
+        prop_assert_eq!(plain.generation, changed.generation);
+        prop_assert_eq!(changed.tests.len(), 1);
+        prop_assert_eq!(changed.tests[0].deny_rule.as_ref().map(ActionId::as_str), Some("xudo.protect.pkg-remove"));
+    }
 }
 
 fn arb_specs() -> impl Strategy<Value = Vec<ArgSpec>> {
@@ -124,6 +230,53 @@ fn arb_confirm() -> impl Strategy<Value = ConfirmPolicy> {
     ]
 }
 
+fn arb_outcome() -> impl Strategy<Value = Outcome> {
+    prop_oneof![
+        3 => Just(Outcome::Allow),
+        1 => Just(Outcome::AskHuman),
+    ]
+}
+
+/// Builds an action `RuleSet::load` accepts.
+///
+/// A critical tier may not opt out of confirmation. `ask-human` with an empty
+/// harness is a load error, and `confirm = "always"` with a harness is too, so
+/// a generated ask-human rule names the property caller (`claude-code`) and
+/// never confirms always. That is what lets the engine's `AskHuman` arm run.
+fn finish_generated(
+    id: &str,
+    tier: Tier,
+    exe: String,
+    args: Vec<ArgSpec>,
+    mut confirm: ConfirmPolicy,
+    agent_allowed: bool,
+    outcome: Outcome,
+) -> Action {
+    if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
+        confirm = ConfirmPolicy::Always;
+    }
+    let harness = if outcome == Outcome::AskHuman {
+        if confirm == ConfirmPolicy::Always {
+            confirm = ConfirmPolicy::Default;
+        }
+        vec!["claude-code".to_owned()]
+    } else {
+        Vec::new()
+    };
+    Action {
+        id: ActionId::new(id),
+        tier,
+        exe,
+        args,
+        confirm,
+        agent_allowed,
+        env_allow: Vec::new(),
+        harness,
+        outcome,
+        source: Source::new("generated.toml", 1),
+    }
+}
+
 prop_compose! {
     fn arb_action(id: &'static str)(
         tier in arb_tier(),
@@ -131,25 +284,9 @@ prop_compose! {
         args in arb_specs(),
         confirm in arb_confirm(),
         agent_allowed in any::<bool>(),
+        outcome in arb_outcome(),
     ) -> Action {
-        // A critical tier may not opt out of confirmation; keep the generator
-        // inside what `RuleSet::load` accepts so the properties exercise the
-        // engine rather than the loader.
-        let confirm = if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
-            ConfirmPolicy::Always
-        } else {
-            confirm
-        };
-        Action {
-            id: ActionId::new(id),
-            tier,
-            exe,
-            args,
-            confirm,
-            agent_allowed,
-            env_allow: Vec::new(),
-            source: Source::new("generated.toml", 1),
-        }
+        finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
     }
 }
 
@@ -470,6 +607,100 @@ proptest! {
         }
     }
 
+    #[test]
+    fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
+        action in arb_action("h1.test"),
+        argv in arb_argv(),
+        label in "[a-z][a-z0-9-]{0,31}",
+        ask_human in any::<bool>(),
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        let before = decide(&action, &argv, false, Vec::new());
+        let mut with_harness = action;
+        with_harness.harness = vec![label];
+        with_harness.outcome = if ask_human { Outcome::AskHuman } else { Outcome::Allow };
+        let after = decide(&with_harness, &argv, false, Vec::new());
+        prop_assert_eq!(after.verdict, before.verdict);
+        prop_assert_eq!(after.confirm, before.confirm);
+        prop_assert_eq!(after.denial, before.denial);
+    }
+
+    #[test]
+    fn every_harness_action_auth_can_run_too(
+        action in arb_action("h1.test"),
+        argv in arb_argv(),
+        label in "[a-z][a-z0-9-]{0,31}",
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // Ask-human changes the agent's verdict on purpose. This property is
+        // about a passwordless-shaped allow rule, which must not.
+        prop_assume!(action.outcome == Outcome::Allow);
+        let human_before = decide(&action, &argv, false, Vec::new());
+        let agent_before = decide(&action, &argv, true, Vec::new());
+        let mut with_harness = action;
+        with_harness.harness = vec![label];
+        with_harness.outcome = Outcome::Allow;
+        let human_after = decide(&with_harness, &argv, false, Vec::new());
+        let agent_after = decide(&with_harness, &argv, true, Vec::new());
+        prop_assert_eq!(human_after.verdict, human_before.verdict);
+        prop_assert_eq!(agent_after.verdict, agent_before.verdict);
+        prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+    }
+
+    #[test]
+    fn setting_ask_human_never_makes_an_agents_verdict_more_permissive(
+        mut action in arb_action("ask-human.test"),
+        argv in arb_argv(),
+    ) {
+        action.agent_allowed = true;
+        action.confirm = ConfirmPolicy::Default;
+        action.harness = vec!["claude-code".into()];
+        let before = decide(&action, &argv, true, Vec::new());
+        action.outcome = Outcome::AskHuman;
+        let after = decide(&action, &argv, true, Vec::new());
+        if before.verdict == Verdict::Deny {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+        } else {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::AskHuman));
+        }
+    }
+
+    /// Ask-human must not loosen the verdict an enrolled agent had when the
+    /// outcome did not exist. Listed labels queue; every other enrolled label
+    /// stays on the human-path deny. Neither result is `Allow` or
+    /// `AllowWithConfirmation`.
+    #[test]
+    fn an_enrolled_agent_on_an_ask_human_action_is_never_more_permissive(
+        mut action in arb_action("ask-human.bound"),
+        argv in arb_argv(),
+        listed in any::<bool>(),
+    ) {
+        prop_assume!(action.confirm != ConfirmPolicy::Always);
+        action.outcome = Outcome::Allow;
+        action.harness.clear();
+        let before = decide(&action, &argv, true, Vec::new());
+        action.outcome = Outcome::AskHuman;
+        action.harness = vec![if listed {
+            "claude-code".to_owned()
+        } else {
+            "other-harness".to_owned()
+        }];
+        let after = decide(&action, &argv, true, Vec::new());
+        prop_assert_ne!(after.verdict, Verdict::Allow);
+        prop_assert_ne!(after.verdict, Verdict::AllowWithConfirmation);
+        if before.verdict == Verdict::Deny {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, before.denial);
+        } else if listed {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::AskHuman));
+        } else {
+            prop_assert_eq!(after.verdict, Verdict::Deny);
+            prop_assert_eq!(after.denial, Some(DenialCode::HumanPathOnly));
+        }
+    }
+
     /// The generation is a function of the files, never of the order a reader
     /// happened to list them in.
     ///
@@ -604,7 +835,7 @@ fn arb_tokens() -> impl Strategy<Value = Argv> {
 }
 
 /// An action's program, arguments, and requirements, before it has an id.
-type Parts = (String, Vec<ArgSpec>, Tier, ConfirmPolicy, bool);
+type Parts = (String, Vec<ArgSpec>, Tier, ConfirmPolicy, bool, Outcome);
 
 fn arb_parts() -> impl Strategy<Value = Parts> {
     (
@@ -613,25 +844,12 @@ fn arb_parts() -> impl Strategy<Value = Parts> {
         arb_tier(),
         arb_confirm(),
         any::<bool>(),
+        arb_outcome(),
     )
 }
 
-fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed): Parts) -> Action {
-    let confirm = if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
-        ConfirmPolicy::Always
-    } else {
-        confirm
-    };
-    Action {
-        id: ActionId::new(id),
-        tier,
-        exe,
-        args,
-        confirm,
-        agent_allowed,
-        env_allow: Vec::new(),
-        source: Source::new("generated.toml", 1),
-    }
+fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed, outcome): Parts) -> Action {
+    finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
 }
 
 /// One to `max` actions with distinct ids, in declaration order.
@@ -705,7 +923,12 @@ fn severity(decision: &Decision) -> Option<u8> {
         }
         (
             Verdict::Deny,
-            Some(DenialCode::HumanPathOnly | DenialCode::DenyListed | DenialCode::Frozen),
+            Some(
+                DenialCode::HumanPathOnly
+                | DenialCode::DenyListed
+                | DenialCode::Frozen
+                | DenialCode::AskHuman,
+            ),
             _,
         ) => Some(10),
         _ => None,
@@ -884,8 +1107,8 @@ proptest! {
         .canonicalize();
         let accepted_by_both = match_argv(&first, &argv).is_ok() && match_argv(&second, &argv).is_ok();
         let set = RuleSet::load(vec![
-            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         let overlaps = set.overlaps();
@@ -924,8 +1147,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);
@@ -953,8 +1176,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);
@@ -1057,6 +1280,38 @@ fn arb_rules_text() -> impl Strategy<Value = Vec<&'static str>> {
 
 fn both_callers() -> [CallerFacts; 2] {
     [caller(false, Vec::new()), caller(true, Vec::new())]
+}
+
+const DENY_ACTION: &str = r#"[[action]]
+id = "xudo.pkg.remove"
+tier = "pkg-remove"
+exe = "/usr/bin/apt-get"
+args = [{ name = "arg", matcher = { name = "deb-name" }, repeat = { between = { min = 0, max = 4 } } }]
+"#;
+const DENY_RULE_TEXT: &str = r#"[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "protected package"
+program = ["apt-get"]
+all = [{ any-arg = ["remove"] }, { any-deb-name = ["xudo"] }]
+"#;
+
+fn deny_test_rules(add_deny: bool) -> RuleSet {
+    let text = if add_deny {
+        format!("{DENY_ACTION}\n{DENY_RULE_TEXT}")
+    } else {
+        DENY_ACTION.to_owned()
+    };
+    RuleSet::from_toml("invariants.toml", &text).unwrap()
+}
+
+fn decide_deny_test(rules: &RuleSet, caller: &CallerFacts, args: &[&str]) -> Decision {
+    evaluate_command(
+        rules,
+        caller,
+        &Arg::from("/usr/bin/apt-get"),
+        &Argv::new(args.iter().copied()),
+        Settings::default(),
+    )
 }
 
 proptest! {

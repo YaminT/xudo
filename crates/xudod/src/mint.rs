@@ -292,6 +292,36 @@ pub(crate) fn entry_for(
     )
 }
 
+type Stored = (AttestedClass, Option<u64>, Option<String>, Option<String>);
+
+fn stored_attestation(
+    caller: &CallerFacts,
+    identity: &PeerIdentity,
+    boot_id: Option<&str>,
+) -> Result<Stored, MintError> {
+    match &caller.classification {
+        Classification::Unattested { .. } => Ok((AttestedClass::Unattested, None, None, None)),
+        Classification::Human => Ok((AttestedClass::Human, None, None, None)),
+        Classification::EnrolledAgent { agent_id, .. } => {
+            let Some(scope_id) = identity.cgroup_id else {
+                return Err(MintError::NoAttestedScope);
+            };
+            let Some(boot_id) = boot_id.filter(|id| is_boot_id(id)) else {
+                return Err(MintError::NoAttestedScope);
+            };
+            if !xudo_policy::valid_harness_label(agent_id) {
+                return Err(MintError::NoAttestedScope);
+            }
+            Ok((
+                AttestedClass::EnrolledAgent { scope_id },
+                Some(scope_id),
+                Some(boot_id.to_owned()),
+                Some(agent_id.clone()),
+            ))
+        }
+    }
+}
+
 pub(crate) fn entry_for_classified(
     decision: &Decision,
     attested: &AttestedCaller<'_>,
@@ -306,29 +336,56 @@ pub(crate) fn entry_for_classified(
         facts: caller,
         boot_id,
     } = attested;
+    let (attested_class, attested_scope_id, stored_boot, attested_harness) =
+        stored_attestation(caller, identity, *boot_id)?;
+    if let Some((target, dry_run, claimed)) = request.remove_fields() {
+        let Some(action) = &decision.action else {
+            return Err(MintError::NoAction);
+        };
+        return Ok(PendingRequest {
+            schema_version: REQUEST_SCHEMA_VERSION,
+            nonce,
+            caller_pid: identity.pid,
+            caller_starttime: identity.starttime,
+            action: action.as_str().to_owned(),
+            program: xudo_wire::OPERATION_PROGRAM.to_owned(),
+            argv: vec![target.escape_ascii().to_string()],
+            generation,
+            deadline: BoottimeMillis(deadline),
+            confirmed: false,
+            confirmed_by: None,
+            state: xudo_gate::request::ConfirmationState::Pending,
+            caller_uid: identity.uid,
+            caller_sid: identity.sid,
+            caller_tty: identity.tty,
+            needs_watch: confirm_human_path,
+            shown_at_ms: None,
+            shown_to: None,
+            fingerprint: crate::confirm::fingerprint(
+                identity.uid,
+                xudo_wire::OPERATION_PROGRAM.as_bytes(),
+                &[target],
+            ),
+            claimed_classification: claimed.to_owned(),
+            attested_class,
+            attested_scope_id,
+            boot_id: stored_boot,
+            attested_harness,
+            queue_id: None,
+            operation: Some(xudo_gate::request::RequestedOp {
+                op: "remove-path".to_owned(),
+                target: target.to_vec(),
+                dry_run,
+            }),
+        });
+    }
     let Some(action) = &decision.action else {
         return Err(MintError::NoAction);
     };
     let Some((program, argv, claimed_classification)) = request.run_fields() else {
         return Err(MintError::NoAction);
     };
-    let (attested_class, attested_scope_id, boot_id) = match &caller.classification {
-        Classification::Unattested { .. } => (AttestedClass::Unattested, None, None),
-        Classification::Human => (AttestedClass::Human, None, None),
-        Classification::EnrolledAgent { .. } => {
-            let Some(scope_id) = identity.cgroup_id else {
-                return Err(MintError::NoAttestedScope);
-            };
-            let Some(boot_id) = boot_id.filter(|id| is_boot_id(id)) else {
-                return Err(MintError::NoAttestedScope);
-            };
-            (
-                AttestedClass::EnrolledAgent { scope_id },
-                Some(scope_id),
-                Some(boot_id.to_owned()),
-            )
-        }
-    };
+    let boot_id = stored_boot;
     Ok(PendingRequest {
         schema_version: REQUEST_SCHEMA_VERSION,
         nonce,
@@ -357,6 +414,9 @@ pub(crate) fn entry_for_classified(
         attested_class,
         attested_scope_id,
         boot_id,
+        attested_harness,
+        queue_id: None,
+        operation: None,
     })
 }
 
@@ -412,7 +472,10 @@ fn prune_and_publish<S: Spool + ?Sized>(
                     this_uid = this_uid.saturating_add(usize::from(same_uid));
                 }
             }
-            Existing::Stale => spool.remove(&name).map_err(MintError::Spool)?,
+            Existing::Stale => {
+                // Already gone is success: a stale grant may have been consumed.
+                let _removed = spool.remove(&name).map_err(MintError::Spool)?;
+            }
             Existing::ConfirmationThrottled => return Err(MintError::ConfirmationThrottled),
             Existing::Foreign => {}
         }
@@ -592,6 +655,8 @@ mod tests {
             diverged: false,
             pinned: true,
             cgroup_id: None,
+            cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
+            cgroup_rung: None,
             euid_source: EuidSource::ProcStatus,
         }
     }
@@ -625,6 +690,9 @@ mod tests {
             attested_class: AttestedClass::Unattested,
             attested_scope_id: None,
             boot_id: None,
+            attested_harness: None,
+            queue_id: None,
+            operation: None,
         }
     }
 
@@ -775,6 +843,9 @@ mod tests {
                 attested_class: AttestedClass::Unattested,
                 attested_scope_id: None,
                 boot_id: None,
+                attested_harness: None,
+                queue_id: None,
+                operation: None,
             }
         );
     }
@@ -915,6 +986,36 @@ mod tests {
             entry.boot_id.as_deref(),
             Some("abcdef01-2345-6789-abcd-ef0123456789")
         );
+        assert_eq!(entry.attested_harness.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn an_enrolled_class_without_a_registry_label_is_not_minted() {
+        let mut peer = identity(4242, 5_000);
+        peer.cgroup_id = Some(77);
+        let caller = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: String::new(),
+                session_id: "session".to_owned(),
+                declared_yolo: false,
+            },
+            peer.uid,
+        );
+        let request = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        let minted = entry_for_classified(
+            &permitted(),
+            &AttestedCaller {
+                identity: &peer,
+                facts: &caller,
+                boot_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            },
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        );
+        assert_eq!(minted, Err(MintError::NoAttestedScope));
     }
 
     #[test]
@@ -1103,6 +1204,55 @@ mod tests {
             entry_for(&decision, &identity(1, 1), &request, 7, true, 1, nonce('a')),
             Err(MintError::NoAction)
         );
+    }
+
+    #[test]
+    fn a_remove_path_without_an_action_mints_nothing() {
+        let mut decision = permitted();
+        decision.action = None;
+        let mut request = BrokerRequest::new("/bin/true", Vec::new(), "unattested");
+        request.question = xudo_wire::Question::RemovePath {
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: false,
+            claimed_classification: "unattested".to_owned(),
+        };
+        assert_eq!(
+            entry_for(&decision, &identity(1, 1), &request, 7, true, 1, nonce('a')),
+            Err(MintError::NoAction)
+        );
+    }
+
+    #[test]
+    fn a_remove_path_is_minted_with_a_watch_when_human_path_confirmation_is_on() {
+        let target = b"/srv/app/build/cache\xff";
+        let mut request = BrokerRequest::new("/bin/true", Vec::new(), "unattested");
+        request.question = xudo_wire::Question::RemovePath {
+            target: target.to_vec(),
+            dry_run: true,
+            claimed_classification: "unattested".to_owned(),
+        };
+        let minted = entry_for(
+            &permitted(),
+            &identity(4242, 5_000),
+            &request,
+            7,
+            true,
+            1_900,
+            nonce('a'),
+        )
+        .unwrap();
+        assert!(minted.needs_watch);
+        assert_eq!(minted.program, xudo_wire::OPERATION_PROGRAM);
+        assert_eq!(minted.argv, vec![target.escape_ascii().to_string()]);
+        let operation = minted.operation.unwrap();
+        assert_eq!(operation.op, "remove-path");
+        assert_eq!(operation.target, target);
+        assert!(operation.dry_run);
+        assert_eq!(
+            minted.fingerprint,
+            crate::confirm::fingerprint(1000, xudo_wire::OPERATION_PROGRAM.as_bytes(), &[target])
+        );
+        assert_ne!(minted.fingerprint, minted.argv[0]);
     }
 
     #[test]

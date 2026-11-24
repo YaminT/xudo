@@ -20,8 +20,11 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::deny_rule::{DenyClause, DenyRule};
+use crate::harness::{HarnessError, HarnessRegistry};
 use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
-use crate::rule::{Action, ConfirmPolicy, RuleSet, RuleSetError, Tier};
+use crate::operation::{OpKind, Operation};
+use crate::rule::{Action, ConfirmPolicy, Outcome, RuleSet, RuleSetError, Tier};
 use crate::rule_test::RuleTest;
 
 /// The suffix that makes a directory entry a rule file.
@@ -29,7 +32,7 @@ pub const RULE_FILE_SUFFIX: &[u8] = b".toml";
 
 /// Separates this hash from every other SHA-256 the project computes, and
 /// names the framing version so a later change cannot collide with this one.
-const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v2\0";
+const GENERATION_DOMAIN: &[u8] = b"xudo.ruleset.generation.v3\0";
 
 /// The most `[[test]]` tables one ruleset may carry across all its files.
 ///
@@ -56,10 +59,21 @@ pub struct RuleFile {
     pub bytes: Vec<u8>,
 }
 
+/// One harness registry file, in the same shape as a [`RuleFile`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessFile {
+    /// The file name, as the bytes the kernel returned.
+    pub name: Vec<u8>,
+    /// The file's contents.
+    pub bytes: Vec<u8>,
+}
+
 /// Which policy a set of rule files is.
 ///
-/// A SHA-256 over the name of every rule file that defines actions, and those
-/// actions, in name order, each field length-prefixed. The prefixes matter: hashing names and
+/// A SHA-256 over the name of every rule file that defines actions or deny
+/// rules, then its actions and deny rules in canonical form, each field
+/// length-prefixed. Deny rules are sorted by their canonical form, since their
+/// declaration order changes only trace ordering. The prefixes matter: hashing names and
 /// contents back to back would give `1.toml` holding `#a2.toml#b` the same
 /// generation as `1.toml` holding `#a` beside `2.toml` holding `#b`, two
 /// different rulesets that a stale request could not tell apart.
@@ -68,9 +82,9 @@ pub struct RuleFile {
 /// policy is not in the digest: a `[[test]]` table (see [`crate::rule_test`]),
 /// a comment, and the line an action sits on can all change without
 /// invalidating a request minted under the same rules. Every field of
-/// [`Action`] that can change a decision is hashed. Two things that also bear
-/// on a decision are outside the generation: the settings, and the compiled
-/// engine (the deny-list), which no rule file can change. The generation only
+/// [`Action`] and [`DenyRule`] that can change a decision is hashed. Two things
+/// that also bear on a decision are outside the generation: the settings, and
+/// the compiled engine (the deny-list), which no rule file can change. The generation only
 /// tells a stale request from a fresh one; the gate re-decides from root-owned
 /// state, so it never trusts a generation to vouch for either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +134,8 @@ pub struct LoadedRuleSet {
     ///
     /// Beside the ruleset and outside the generation: a test is not policy.
     pub tests: Vec<RuleTest>,
+    /// The harness registry hashed into this generation when it is not empty.
+    pub harnesses: HarnessRegistry,
 }
 
 /// Why a set of rule files could not become a ruleset. Every variant fails
@@ -166,6 +182,9 @@ pub enum RuleFilesError {
     /// line it is about.
     #[error(transparent)]
     Rules(#[from] RuleSetError),
+    /// A harness file could not be read as a registry entry.
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
 }
 
 /// Builds the ruleset and its generation from rule files.
@@ -180,12 +199,32 @@ pub enum RuleFilesError {
 /// The first file that is not a rule file, or whose name or contents are not
 /// UTF-8, as the matching [`RuleFilesError`]; and anything the policy engine
 /// refuses, as [`RuleFilesError::Rules`].
-pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFilesError> {
+pub fn load_rule_files(files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFilesError> {
+    load_policy(files, &[])
+}
+
+/// [`load_rule_files`], plus the harness registry those rules may name.
+///
+/// An empty harness list leaves the generation unchanged. A non-empty list is
+/// hashed after the rules, under a `harnesses-v1` frame, in label order. A
+/// harness label on an action that is not in `harnesses` is a load error.
+///
+/// # Errors
+///
+/// As [`load_rule_files`], plus a harness file that does not parse and an
+/// action that names a label the registry does not have.
+pub fn load_policy(
+    mut files: Vec<RuleFile>,
+    harnesses: &[HarnessFile],
+) -> Result<LoadedRuleSet, RuleFilesError> {
+    let registry = harness_registry(harnesses)?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut hasher = Sha256::new();
     hasher.update(GENERATION_DOMAIN);
     let mut actions: Vec<Action> = Vec::new();
+    let mut deny_rules: Vec<DenyRule> = Vec::new();
+    let mut operations: Vec<Operation> = Vec::new();
     let mut tests: Vec<RuleTest> = Vec::new();
 
     for file in &files {
@@ -203,12 +242,30 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
 
         let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
 
-        // A file with no actions is not policy, so it is not hashed: a file
-        // of tests alone, added or removed, must not move the generation.
-        if !parsed.actions().is_empty() {
+        // A file with no actions, deny rules, or operations is not policy, so
+        // it is not hashed: a file of tests alone must not move the generation.
+        // The operations frame is written only when the file has operations, so
+        // an action-only file keeps the generation it had before operations
+        // existed.
+        if !parsed.actions().is_empty()
+            || !parsed.deny_rules().is_empty()
+            || !parsed.operations().is_empty()
+        {
             framed(&mut hasher, &file.name);
             for action in parsed.actions() {
                 framed(&mut hasher, &policy_form(action));
+            }
+            framed(&mut hasher, b"deny-rules-v1");
+            let mut deny_forms: Vec<_> = parsed.deny_rules().iter().map(policy_form_deny).collect();
+            deny_forms.sort_unstable();
+            for form in deny_forms {
+                framed(&mut hasher, &form);
+            }
+            if !parsed.operations().is_empty() {
+                framed(&mut hasher, b"operations-v1");
+                for operation in parsed.operations() {
+                    framed(&mut hasher, &policy_form_operation(operation));
+                }
             }
             // Closes the file, so the last action of one cannot be read as the
             // first of the next.
@@ -216,17 +273,115 @@ pub fn load_rule_files(mut files: Vec<RuleFile>) -> Result<LoadedRuleSet, RuleFi
         }
 
         actions.extend(parsed.actions().iter().cloned());
+        deny_rules.extend(parsed.deny_rules().iter().cloned());
+        operations.extend(parsed.operations().iter().cloned());
         tests.extend(file_tests);
         if tests.len() > MAX_TESTS {
             return Err(RuleFilesError::TooManyTests { limit: MAX_TESTS });
         }
     }
 
+    for action in &actions {
+        for label in &action.harness {
+            if registry.get(label).is_none() {
+                return Err(RuleSetError::UnknownHarness {
+                    kind: "action",
+                    id: action.id.as_str().to_owned(),
+                    label: label.clone(),
+                    at: action.source.clone(),
+                }
+                .into());
+            }
+        }
+    }
+    for operation in &operations {
+        for label in &operation.harness {
+            if registry.get(label).is_none() {
+                return Err(RuleSetError::UnknownHarness {
+                    kind: "operation",
+                    id: operation.id.as_str().to_owned(),
+                    label: label.clone(),
+                    at: operation.source.clone(),
+                }
+                .into());
+            }
+        }
+    }
+
+    // Hashed only when present, so a ruleset with no harness files keeps the
+    // generation it had before the registry existed.
+    if !registry.is_empty() {
+        framed(&mut hasher, b"harnesses-v1");
+        for entry in registry.entries() {
+            framed(&mut hasher, &entry.canonical());
+        }
+    }
+
     Ok(LoadedRuleSet {
-        rules: RuleSet::load(actions)?,
+        rules: RuleSet::load_all(actions, deny_rules, operations)?,
         generation: Generation(hasher.finalize().into()),
         tests,
+        harnesses: registry,
     })
+}
+
+fn harness_registry(files: &[HarnessFile]) -> Result<HarnessRegistry, RuleFilesError> {
+    let mut named = Vec::with_capacity(files.len());
+    for file in files {
+        let name = std::str::from_utf8(&file.name).map_err(|_| RuleFilesError::NameNotUtf8 {
+            name: escaped(&file.name),
+        })?;
+        let text = std::str::from_utf8(&file.bytes).map_err(|_| RuleFilesError::NotUtf8 {
+            file: name.to_owned(),
+        })?;
+        named.push((name.to_owned(), text.to_owned()));
+    }
+    Ok(HarnessRegistry::from_files(named)?)
+}
+
+/// Exhaustive canonical encoding of every field that changes deny evaluation.
+/// Provenance is excluded because it affects the trace only.
+fn policy_form_deny(rule: &DenyRule) -> Vec<u8> {
+    let DenyRule {
+        id,
+        reason,
+        program,
+        all,
+        source: _,
+    } = rule;
+    let mut out = Vec::new();
+    put(&mut out, b"deny-rule-v1");
+    put(&mut out, id.as_str().as_bytes());
+    put(&mut out, reason.as_bytes());
+    put_len(&mut out, program.len());
+    for item in program {
+        put(&mut out, item.as_bytes());
+    }
+    put_len(&mut out, all.len());
+    for clause in all {
+        let DenyClause {
+            any_arg,
+            any_deb_name,
+        } = clause;
+        match (any_arg, any_deb_name) {
+            (Some(values), None) => {
+                put(&mut out, b"any-arg");
+                put_len(&mut out, values.len());
+                for value in values {
+                    put(&mut out, value.as_bytes());
+                }
+            }
+            (None, Some(values)) => {
+                put(&mut out, b"any-deb-name");
+                put_len(&mut out, values.len());
+                for value in values {
+                    put(&mut out, value.as_bytes());
+                }
+            }
+            (Some(_), Some(_)) | (None, None) => put(&mut out, b"invalid-clause"),
+        }
+    }
+    out
 }
 
 /// Everything about an action that can change a decision, as bytes.
@@ -248,6 +403,8 @@ fn policy_form(action: &Action) -> Vec<u8> {
         confirm,
         agent_allowed,
         env_allow,
+        harness,
+        outcome,
         source: _,
     } = action;
     let mut out = Vec::new();
@@ -283,6 +440,61 @@ fn policy_form(action: &Action) -> Vec<u8> {
     put_len(&mut out, env_allow.len());
     for name in env_allow {
         put(&mut out, name.as_bytes());
+    }
+    // Default harness and outcome are omitted so an action that does not name
+    // them keeps the canonical form it had before those fields existed.
+    if !harness.is_empty() {
+        put(&mut out, b"harness");
+        put_len(&mut out, harness.len());
+        for label in harness {
+            put(&mut out, label.as_bytes());
+        }
+    }
+    if *outcome != Outcome::Allow {
+        put(&mut out, b"outcome");
+        put(&mut out, outcome.as_str().as_bytes());
+    }
+    out
+}
+
+/// Canonical form of one operation. Every field that can change a decision is
+/// included. `source` is provenance. An empty harness list is still encoded,
+/// because this frame did not exist before operations did, so there is no old
+/// digest to preserve inside it.
+fn policy_form_operation(operation: &Operation) -> Vec<u8> {
+    let Operation {
+        id,
+        op,
+        under,
+        recursive,
+        max_depth,
+        max_entries,
+        owners,
+        harness,
+        source: _,
+    } = operation;
+    let mut out = Vec::new();
+    put(&mut out, id.as_str().as_bytes());
+    match op {
+        OpKind::RemovePath => put(&mut out, b"remove-path"),
+    }
+    put(&mut out, under.as_bytes());
+    out.push(u8::from(*recursive));
+    put(&mut out, &max_depth.to_be_bytes());
+    put(&mut out, &max_entries.to_be_bytes());
+    match owners {
+        None => put(&mut out, b"owners-any-but-root"),
+        Some(names) => {
+            put(&mut out, b"owners");
+            put_len(&mut out, names.len());
+            for name in names {
+                put(&mut out, name.as_bytes());
+            }
+        }
+    }
+    put_len(&mut out, harness.len());
+    for label in harness {
+        put(&mut out, label.as_bytes());
     }
     out
 }
@@ -412,6 +624,16 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         load_rule_files(files).unwrap().generation
     }
 
+    fn harness_file(name: &str, account: &str, max_sessions: u32) -> HarnessFile {
+        HarnessFile {
+            name: format!("{name}.toml").into_bytes(),
+            bytes: format!(
+                "label = \"{name}\"\nway = \"service\"\naccount = \"{account}\"\nreviewers = [\"alice\"]\nmax-sessions = {max_sessions}\n"
+            )
+            .into_bytes(),
+        }
+    }
+
     #[test]
     fn a_rule_file_is_named_something_dot_toml() {
         for name in ["10-a.toml", "a.toml", ".hidden.toml", "x.y.toml"] {
@@ -479,6 +701,129 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
+    fn an_operation_is_hashed_and_a_test_file_is_not() {
+        let action = generation(vec![file("10-a.toml", ONE_ACTION)]);
+        let with_test = generation(vec![file(
+            "10-a.toml",
+            &format!(
+                "{ONE_ACTION}\n[[test]]\nargv = [\"/usr/bin/systemctl\", \"restart\", \"nginx.service\"]\nexpect = \"allow\"\n"
+            ),
+        )]);
+        assert_eq!(action, with_test);
+        let operation = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 8
+max-entries = 10
+"#;
+        let only = generation(vec![file("50-remove.toml", operation)]);
+        let changed = generation(vec![file(
+            "50-remove.toml",
+            &operation.replace("max-entries = 10", "max-entries = 11"),
+        )]);
+        assert_ne!(only, changed);
+        assert_ne!(only, action);
+        let alongside = generation(vec![
+            file("10-a.toml", ONE_ACTION),
+            file("50-remove.toml", operation),
+        ]);
+        assert_ne!(alongside, action);
+    }
+
+    #[test]
+    fn an_operation_owner_and_harness_change_the_generation() {
+        let base = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\n";
+        let harnesses = [harness_file("codex", "agent", 4)];
+        let of = |text: &str| {
+            load_policy(vec![file("50-remove.toml", text)], &harnesses)
+                .unwrap()
+                .generation
+        };
+        let plain = of(base);
+        let owned = of(&format!("{base}owners = [\"agent\"]\n"));
+        let other = of(&format!("{base}owners = [\"agent\", \"www-data\"]\n"));
+        let labelled = of(&format!("{base}harness = [\"codex\"]\n"));
+        assert_ne!(plain, owned);
+        assert_ne!(owned, other);
+        assert_ne!(plain, labelled);
+    }
+
+    #[test]
+    fn an_operation_naming_an_unknown_harness_does_not_load() {
+        let text = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"ghost\"]\n";
+        let err = load_rule_files(vec![file("50-remove.toml", text)]).unwrap_err();
+        assert!(format!("{err:?}").contains("UnknownHarness"), "{err:?}");
+        assert!(err.to_string().contains("operation o"), "{err}");
+    }
+
+    #[test]
+    fn the_generation_includes_the_current_harness_registry() {
+        let empty = load_policy(Vec::new(), &[]).unwrap().generation;
+        let registered = load_policy(Vec::new(), &[harness_file("codex", "agent", 4)])
+            .unwrap()
+            .generation;
+        let changed = load_policy(Vec::new(), &[harness_file("codex", "agent", 5)])
+            .unwrap()
+            .generation;
+        assert_ne!(empty, registered);
+        assert_ne!(registered, changed);
+    }
+
+    #[test]
+    fn an_action_with_a_label_missing_from_the_registry_fails_to_load() {
+        let action = ONE_ACTION.replace("exe =", "harness = [\"codex\"]\nexe =");
+        let result = load_policy(vec![file("10-a.toml", &action)], &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn an_action_with_a_registered_harness_loads() {
+        let action = ONE_ACTION.replace("exe =", "harness = [\"codex\"]\nexe =");
+        let result = load_policy(
+            vec![file("10-a.toml", &action)],
+            &[harness_file("codex", "agent", 4)],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn malformed_harness_file_names_and_bytes_fail_closed() {
+        assert!(
+            load_policy(
+                Vec::new(),
+                &[HarnessFile {
+                    name: vec![0xff],
+                    bytes: b"".to_vec()
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            load_policy(
+                Vec::new(),
+                &[HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: vec![0xff]
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            load_policy(
+                Vec::new(),
+                &[HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: b"label = \"codex\"\nway = \"service\"\n".to_vec(),
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn two_rulesets_that_concatenate_alike_have_different_generations() {
         // Back to back, the actions of `1.toml` holding both and of `1.toml`
         // and `2.toml` holding one each are the same bytes. Without the length
@@ -503,11 +848,11 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         ]);
         assert_eq!(
             pinned.hex(),
-            "aa1f8736c26f54a0bcfb00cd90243f6991fffd6e010c83044cbbc85120784cf8"
+            "5e0c3d2b07766bd3b976031f438a84848f7b32dfec78d3f836dba1e71c8b26e4"
         );
         assert_eq!(
             generation(Vec::new()).hex(),
-            "8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
+            "d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
         );
     }
 
@@ -598,8 +943,45 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             file("20-b.toml", ONE_ACTION),
         ])
         .unwrap_err();
-        assert!(err.to_string().contains("duplicate action id"), "{err}");
+        assert!(err.to_string().contains("duplicate rule id"), "{err}");
         assert!(format!("{err:?}").contains("DuplicateId"));
+    }
+
+    #[test]
+    fn a_duplicate_deny_id_across_two_files_fails_the_combined_load() {
+        let deny = "[[deny]]\nid = \"xudo.protect.same\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
+        let err = load_rule_files(vec![
+            file(
+                "00-actions.toml",
+                &ONE_ACTION.replace("systemctl", "apt-get"),
+            ),
+            file("10-a.toml", deny),
+            file("20-b.toml", deny),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate rule id xudo.protect.same"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_naming_an_unused_program_loads_inert() {
+        let deny = "[[deny]]\nid = \"xudo.protect.pkg\"\nreason = \"protected package\"\nprogram = [\"apt-get\"]\nall = []\n";
+        let loaded = load_rule_files(vec![
+            file("10-actions.toml", ONE_ACTION),
+            file("20-deny.toml", deny),
+        ])
+        .unwrap();
+        assert!(
+            loaded
+                .rules
+                .actions()
+                .iter()
+                .all(|action| action.exe != "/usr/bin/apt-get")
+        );
+        assert_eq!(loaded.rules.deny_rules()[0].id.as_str(), "xudo.protect.pkg");
     }
 
     const WITH_TESTS: &str = r#"
@@ -770,6 +1152,46 @@ args = [
         );
     }
 
+    #[test]
+    fn every_deny_policy_field_is_canonical_and_provenance_is_not() {
+        let base = DenyRule {
+            id: crate::rule::ActionId::new("xudo.protect.test"),
+            reason: "protected package".into(),
+            program: vec!["apt-get".into()],
+            all: vec![DenyClause {
+                any_arg: Some(vec!["remove".into()]),
+                any_deb_name: None,
+            }],
+            source: Source::new("a.toml", 1),
+        };
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.id = crate::rule::ActionId::new("xudo.protect.other");
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.reason.push('!');
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.program.push("apt".into());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.all[0].any_arg = Some(vec!["purge".into()]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.all[0].any_arg = None;
+        changed.all[0].any_deb_name = Some(vec!["xudo".into()]);
+        variants.push(changed);
+        for variant in variants {
+            assert_ne!(policy_form_deny(&variant), policy_form_deny(&base));
+        }
+        let mut moved = base.clone();
+        moved.source = Source::new("elsewhere.toml", 55);
+        assert_eq!(policy_form_deny(&moved), policy_form_deny(&base));
+        let mut invalid = base.clone();
+        invalid.all[0].any_deb_name = Some(vec!["xudo".into()]);
+        assert!(policy_form_deny(&invalid).ends_with(b"invalid-clause"));
+    }
+
     mod canonical {
         use proptest::prelude::*;
 
@@ -872,6 +1294,11 @@ args = [
                         confirm,
                         agent_allowed,
                         env_allow,
+                        // Fixed non-default values ensure both mutation arms
+                        // for these newly decision-relevant fields run on
+                        // every platform, independent of proptest sampling.
+                        harness: vec!["codex".to_owned()],
+                        outcome: Outcome::AskHuman,
                         source: Source::new("p.toml", line),
                     },
                 )
@@ -897,6 +1324,20 @@ args = [
             }
             with(&|a| a.agent_allowed = !a.agent_allowed);
             with(&|a| a.env_allow.push("NEW".into()));
+            with(&|a| {
+                a.harness = if a.harness.is_empty() {
+                    vec!["codex".into()]
+                } else {
+                    Vec::new()
+                };
+            });
+            with(&|a| a.harness.push("claude".into()));
+            with(&|a| {
+                a.outcome = match a.outcome {
+                    Outcome::Allow => Outcome::AskHuman,
+                    Outcome::AskHuman => Outcome::Allow,
+                };
+            });
             with(&|a| a.env_allow.reverse());
             with(&|a| {
                 if let Some(first) = a.env_allow.first_mut() {
@@ -973,6 +1414,8 @@ args = [
                 confirm: ConfirmPolicy::Default,
                 agent_allowed: false,
                 env_allow: Vec::new(),
+                harness: Vec::new(),
+                outcome: Outcome::Allow,
                 source: Source::new("p.toml", 1),
             }
         }

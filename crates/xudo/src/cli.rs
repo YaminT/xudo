@@ -5,6 +5,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -76,8 +77,14 @@ pub struct EvalArgs {
     /// Ask about this action instead of searching the ruleset for one. Every
     /// other action that accepts the same command still contributes its
     /// requirement: overlapping rules resolve to the strictest.
-    #[arg(long, value_name = "ACTION_ID")]
+    #[arg(long, value_name = "ACTION_ID", conflicts_with = "operation")]
     pub action: Option<String>,
+
+    /// Evaluate this typed operation instead of a command. `remove-path` takes
+    /// one absolute path. The path is UTF-8 here; `xudo op` accepts the raw
+    /// bytes.
+    #[arg(long, value_name = "OP", conflicts_with = "action")]
+    pub operation: Option<String>,
 
     /// The command and its arguments, after `--`.
     #[arg(trailing_var_arg = true, value_name = "ARGV")]
@@ -147,6 +154,19 @@ pub struct CheckArgs {
     pub(crate) fuzz_seed: u64,
 }
 
+/// A typed operation `xudo` performs itself.
+#[derive(Debug, Subcommand)]
+pub enum OpCommand {
+    /// Remove a path under a `remove-path` rule. Asks for your password.
+    RemovePath {
+        /// The absolute path to remove.
+        target: OsString,
+        /// List what would be removed and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -166,15 +186,29 @@ pub enum Command {
 
     /// Run a command as root, if the broker permits it. Asks for your password.
     Exec {
-        /// The command and its arguments, after `--`. The program is an absolute path.
-        #[arg(trailing_var_arg = true, required = true, value_name = "ARGV")]
-        argv: Vec<String>,
+        /// Run one root-held queue entry. The broker re-decides it, then sudo asks.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with = "argv",
+            required_unless_present = "argv"
+        )]
+        queued: Option<String>,
 
-        /// If the denial is one only a human can resolve (`human-path-only` or
-        /// `no-confirmation-channel`), queue the command for `ido` and report
-        /// its id. Never runs anything and never changes the verdict.
-        #[arg(long)]
-        queue: bool,
+        /// The command and its arguments, after `--`. The program is an absolute path.
+        #[arg(
+            trailing_var_arg = true,
+            required_unless_present = "queued",
+            value_name = "ARGV"
+        )]
+        argv: Vec<String>,
+    },
+
+    /// Run a typed operation as root, if a rule permits it. Asks for your password.
+    Op {
+        /// Which operation.
+        #[command(subcommand)]
+        command: OpCommand,
     },
 
     /// Lint the ruleset, then run the `[[test]]` tables in its rule files.
@@ -391,6 +425,88 @@ pub fn run_with_installer(
     )
 }
 
+/// A queued plan is ready for `sudo`, which this process does not exec.
+/// The library returns the plan so a test can see it, and this process stops.
+fn queued_plan_exit(planned: &Result<exec::QueuedRun, ExitCode>) -> ExitCode {
+    match planned {
+        Ok(_) => ExitCode::Unusable,
+        Err(code) => *code,
+    }
+}
+
+/// `xudo exec`, including a queued claim. The library reports the plan and
+/// does not exec it.
+fn exec_command(
+    cli: &Cli,
+    argv: &[String],
+    queued: Option<&str>,
+    probe: &dyn Probe,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some(wait) = exec::configured_timeout(cli, err) else {
+        return ExitCode::Unusable;
+    };
+    if let Some(id) = queued {
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        let tty = exec::queued_terminal(
+            std::io::IsTerminal::is_terminal(&stdin),
+            std::io::IsTerminal::is_terminal(&stderr),
+        );
+        let mut input = stdin.lock();
+        return queued_plan_exit(&exec::plan_queued(
+            cli,
+            id,
+            probe,
+            socket,
+            exec::TIMEOUT,
+            tty,
+            &mut input,
+            out,
+            err,
+        ));
+    }
+    exec::plan_with_confirmation_timeout(
+        cli,
+        argv,
+        probe,
+        socket,
+        exec::TIMEOUT,
+        wait,
+        None,
+        out,
+        err,
+    )
+    .err()
+    .unwrap_or(ExitCode::Unusable)
+}
+
+/// `xudo op`. The library reports the plan and does not exec it.
+fn op_command(
+    cli: &Cli,
+    command: &OpCommand,
+    probe: &dyn Probe,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let OpCommand::RemovePath { target, dry_run } = command;
+    exec::plan_remove_path(
+        cli,
+        target.as_bytes(),
+        *dry_run,
+        probe,
+        socket,
+        (exec::TIMEOUT, std::time::Duration::ZERO),
+        out,
+        err,
+    )
+    .err()
+    .unwrap_or(ExitCode::Unusable)
+}
+
 /// [`run_with_installer`], with the broker socket supplied by the caller.
 pub fn run_with_installer_at_socket(
     cli: &Cli,
@@ -455,25 +571,12 @@ pub fn run_with_installer_at_socket(
             with_rules!(|l: &LoadedRules| why_not(cli, ops, l, action, argv, out, err))
         }
         // The library never execs; `xudo-bin` calls `exec::plan_live` and does that.
-        Command::Exec { argv, .. } => {
-            let Some(wait) = exec::configured_timeout(cli, err) else {
-                return ExitCode::Unusable;
-            };
-            exec::plan_with_confirmation_timeout(
-                cli,
-                argv,
-                probe,
-                Path::new(xudo_wire::BROKER_SOCKET),
-                exec::TIMEOUT,
-                wait,
-                None,
-                out,
-                err,
-            )
-            .err()
-            .unwrap_or(ExitCode::Unusable)
+        Command::Exec { argv, queued } => {
+            exec_command(cli, argv, queued.as_deref(), probe, socket, out, err)
         }
-        Command::Check(args) => with_rules!(|l| check::run(cli, l, args, out, err)),
+        // Same split: this plans the password gate and does not exec it.
+        Command::Op { command } => op_command(cli, command, probe, socket, out, err),
+        Command::Check(args) => check::dispatch(cli, loaded.as_ref(), args, out, err),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
         }
@@ -1066,7 +1169,8 @@ fn explain(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if args.argv.is_empty() {
+    // An operation explains a path, and says so. A command explains an argv.
+    if args.operation.is_none() && args.argv.is_empty() {
         let _ = writeln!(err, "xudo: nothing to explain; pass a command after `--`");
         return ExitCode::Unusable;
     }
@@ -1075,6 +1179,9 @@ fn explain(
         return ExitCode::Unusable;
     };
     let caller = classify(ops, err);
+    if let Some(op) = &args.operation {
+        return explain_operation(cli, loaded, op, &args.argv, settings, &caller, out, err);
+    }
     // argv[0] is the program, the rest are its operands. Splitting here and
     // handing both to the engine is what makes the program part of the decision:
     // before this split the whole command was matched against the argument list,
@@ -1115,6 +1222,41 @@ fn explain(
         decision
     };
 
+    emit(cli, &decision, out)
+}
+
+/// Explains one typed operation. The target is the single UTF-8 argument.
+#[allow(clippy::too_many_arguments)]
+fn explain_operation(
+    cli: &Cli,
+    loaded: &LoadedRules,
+    op: &str,
+    argv: &[String],
+    settings: Settings,
+    caller: &CallerFacts,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if op != "remove-path" {
+        let _ = writeln!(err, "xudo: unknown operation {op}");
+        return ExitCode::Unusable;
+    }
+    let Some(target) = argv.first() else {
+        let _ = writeln!(err, "xudo: nothing to explain; pass a path");
+        return ExitCode::Unusable;
+    };
+    if argv.len() != 1 {
+        let _ = writeln!(err, "xudo: remove-path explains one path");
+        return ExitCode::Unusable;
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let decision = xudo_policy::evaluate_remove_path(
+        loaded.rules(),
+        caller,
+        target.as_bytes(),
+        settings,
+        &passwd,
+    );
     emit(cli, &decision, out)
 }
 
@@ -1193,6 +1335,36 @@ fn list(
         );
         shown = shown.saturating_add(1);
     }
+    let _ = writeln!(out, "deny rules");
+    for rule in loaded.rules().deny_rules() {
+        let _ = writeln!(
+            out,
+            "{:<28} {:<12} {:<26} {}: {}",
+            rule.id.as_str(),
+            "deny",
+            rule.program.join(","),
+            rule.source,
+            rule.reason
+        );
+        shown = shown.saturating_add(1);
+    }
+    if tier.is_none() {
+        let operations = loaded.rules().operations();
+        if !operations.is_empty() {
+            let _ = writeln!(out, "operations");
+            for operation in operations {
+                let _ = writeln!(
+                    out,
+                    "{:<28} {:<12} {:<26} {}",
+                    operation.id.as_str(),
+                    operation.op.as_str(),
+                    operation.under,
+                    operation.source
+                );
+                shown = shown.saturating_add(1);
+            }
+        }
+    }
     if shown == 0 {
         let _ = writeln!(err, "xudo: no action matched");
         return ExitCode::Denied;
@@ -1202,10 +1374,9 @@ fn list(
 
 /// Loads the settings file and derives the engine's view of it.
 ///
-/// Without this the layered configuration would be reported by `xudo config` and
-/// then ignored by every decision, which is worse than having no configuration
-/// at all: an operator would set `confirm_agent_actions` and be told it took
-/// effect while the engine ran on its defaults.
+/// A broken file yields `None` and the caller fails closed. Agent actions stay
+/// on the human confirmation path until a later policy change introduces a
+/// separate, explicit authorization model.
 ///
 /// A broken file yields `None` and the caller fails closed. Falling back to the
 /// defaults would be *safe* — they are the strict values — but it would also be
@@ -1229,8 +1400,7 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     }
 
     Some(Settings {
-        confirm_agent_actions: config.get(Setting::ConfirmAgentActions).value
-            == ConfigValue::Bool(true),
+        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
@@ -1316,7 +1486,6 @@ fn legacy_report(settings: &ConfigSettings, out: &mut dyn Write) {
         out,
         "\n* security-relevant: never settable from the environment."
     );
-    let _ = writeln!(out, "confirm_agent_actions has no effect until M4.");
 }
 
 /// Classifies the current process, falling back to a password-requiring caller.
@@ -1633,12 +1802,24 @@ mod tests {
     }
 
     #[test]
+    fn exec_rejects_the_removed_queue_flag_and_accepts_queued() {
+        assert!(Cli::try_parse_from(["xudo", "exec", "--queue", "ab"]).is_err());
+        assert!(Cli::try_parse_from(["xudo", "exec"]).is_err());
+        assert!(Cli::try_parse_from(["xudo", "exec", "--queued", "ab", "--", "true"]).is_err());
+        let queued = Cli::try_parse_from(["xudo", "exec", "--queued", "ab"]).unwrap();
+        assert!(matches!(
+            queued.command,
+            Command::Exec { queued: Some(ref id), ref argv, .. } if id == "ab" && argv.is_empty()
+        ));
+    }
+
+    #[test]
     fn an_option_looking_exec_argv_is_data_after_the_separator() {
-        for first in ["--queue", "--config-file"] {
+        for first in ["--queue", "--queued", "--config-file"] {
             let cli = Cli::try_parse_from(["xudo", "exec", "--", first, "x"]).unwrap();
             assert!(matches!(
                 cli.command,
-                Command::Exec { ref argv, queue: false } if argv == &[first, "x"]
+                Command::Exec { ref argv, .. } if argv == &[first, "x"]
             ));
         }
     }
@@ -2914,6 +3095,18 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             out.contains(crate::lifecycle_note::TEXT),
             "shipped rules have no lifecycle action, so check must say so: {out}"
         );
+        assert!(
+            !out.contains("deny-rule:"),
+            "shipped deny rules have workspace adversarial coverage: {out}"
+        );
+        assert!(
+            out.contains("xudo.protect.pkg-remove for apt is inert today"),
+            "{out}"
+        );
+        assert!(
+            out.contains("xudo.protect.dpkg-remove for dpkg is inert today"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -3032,6 +3225,55 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
+    fn check_reports_harness_guardrails_as_lint_errors() {
+        let root = test_tmp_root().join("cli-check-harness-guardrails");
+        let _ = std::fs::remove_dir_all(&root);
+        let rules = root.join("rules.d");
+        let harnesses = root.join("harnesses.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&harnesses).unwrap();
+        std::fs::write(
+            rules.join("10-harness.toml"),
+            r#"
+[[action]]
+id = "xudo.harness.broad"
+tier = "diag-read"
+exe = "/usr/bin/awk"
+agent-allowed = false
+harness = ["codex"]
+args = [
+  { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
+  { name = "name", matcher = { pattern = "[a-z]+" } },
+]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            harnesses.join("codex.toml"),
+            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
+        )
+        .unwrap();
+        let fixture = Fixture { dir: rules };
+        let (code, out, err) = fixture.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 21);
+        let lints = parsed["lint"]["harness_lints"].as_array().unwrap();
+        assert!(lints.len() >= 5, "{out}");
+        let messages = lints
+            .iter()
+            .filter_map(|item| item["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(messages.contains("path-under"), "{messages}");
+        assert!(messages.contains("pattern"), "{messages}");
+        assert!(messages.contains("agent-allowed"), "{messages}");
+        assert!(messages.contains("GTFOBins"), "{messages}");
+        assert!(messages.contains("near-miss"), "{messages}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_command_with_no_program_named_matches_nothing() {
         // Before the program became part of the decision, a bare `restart
         // nginx.service` was matched against the argument list and *allowed* by
@@ -3050,6 +3292,103 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
+    fn explain_remove_path_uses_the_operation_table() {
+        const OPERATION: &str = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#;
+        let fx = Fixture::new("cli-op-explain").write("50-remove-path.toml", OPERATION);
+        let (code, out, err) = fx.run(&[
+            "explain",
+            "--operation",
+            "remove-path",
+            "--",
+            "/srv/app/build/cache",
+        ]);
+        assert_eq!(code, ExitCode::Delegated, "{out} {err}");
+        assert!(out.contains("ALLOW"), "{out}");
+        assert!(out.contains("web.clean-build"), "{out}");
+
+        let (code, _, err) = fx.run(&["explain", "--operation", "remove-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("pass a path"), "{err}");
+
+        let (code, _, err) = fx.run(&["explain", "--operation", "nope", "--", "/x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("unknown operation"), "{err}");
+
+        let (code, _, err) = fx.run(&[
+            "explain",
+            "--operation",
+            "remove-path",
+            "--",
+            "/srv/app/build/cache",
+            "/srv/app/build/other",
+        ]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("one path"), "{err}");
+
+        let (code, out, err) = fx.run(&["list"]);
+        assert_eq!(code, ExitCode::Delegated, "{out} {err}");
+        assert!(out.contains("operations"), "{out}");
+        assert!(out.contains("web.clean-build"), "{out}");
+        assert!(out.contains("remove-path"), "{out}");
+
+        let (code, out, err) = fx.run(&["list", "--tier", "svc"]);
+        assert_eq!(code, ExitCode::Denied, "{out} {err}");
+        assert!(!out.contains("operations"), "{out}");
+
+        let parsed = Cli::try_parse_from([
+            "xudo",
+            "op",
+            "remove-path",
+            "--dry-run",
+            "/srv/app/build/cache",
+        ])
+        .unwrap();
+        let shown = format!("{:?}", parsed.command);
+        assert!(shown.contains("RemovePath"), "{shown}");
+        assert!(shown.contains("dry_run: true"), "{shown}");
+        assert!(shown.contains("/srv/app/build/cache"), "{shown}");
+        assert!(
+            Cli::try_parse_from([
+                "xudo",
+                "explain",
+                "--action",
+                "web.clean-build",
+                "--operation",
+                "remove-path",
+                "--",
+                "/srv/app/build/cache",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn op_remove_path_against_a_missing_socket_is_unusable() {
+        let fixture = fixture("cli-op-missing");
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let (code, _, err) =
+            fixture.run_at_socket(&["op", "remove-path", "/srv/app/build/cache"], &socket);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo doctor"), "{err}");
+
+        let (code, _, err) = fixture.run_at_socket(
+            &["op", "remove-path", "--dry-run", "/srv/app/build/cache"],
+            &socket,
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo doctor"), "{err}");
+    }
+
+    #[test]
     fn explain_emits_the_envelope_in_json_mode() {
         let (_, out, _) = fixture("cli-json").run(&[
             "--output",
@@ -3061,7 +3400,10 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
             "nginx.service",
         ]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            xudo_policy::decision::ENVELOPE_SCHEMA_VERSION
+        );
         assert_eq!(parsed["action"], "xudo.svc.restart");
     }
 
@@ -3374,8 +3716,51 @@ expect = "deny"
             "[[test]]\nargv = [\"/x\"]\nexpect = \"deny\"\nnopasswd = true\n",
         );
         let (code, _, err) = fx.run(&["check"]);
-        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(code, ExitCode::LintError);
         assert!(err.contains("nopasswd"), "{err}");
+    }
+
+    #[test]
+    fn check_warns_for_a_deny_rule_that_no_test_names() {
+        let fx = closed_fixture("cli-check-deny-rule-lint").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.unused\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::LintWarning, "{out}");
+        assert!(out.contains("xudo.protect.unused"), "{out}");
+        assert!(out.contains("no test names this rule"), "{out}");
+    }
+
+    #[test]
+    fn check_accepts_a_test_pinned_to_the_deny_rule_that_decided() {
+        let fx = closed_fixture("cli-check-deny-rule-pin")
+            .write(
+                "30-deny.toml",
+                "[[deny]]\nid = \"xudo.protect.update\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+            )
+            .write(
+                "40-test.toml",
+                "[[test]]\nargv = [\"/usr/bin/apt-get\", \"update\"]\nexpect = \"deny\"\ndeny-rule = \"xudo.protect.update\"\n",
+            );
+        let (code, out, _) = fx.run(&["check"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}");
+        assert!(out.contains("tests: 1 passed, 0 failed"), "{out}");
+        assert!(!out.contains("no test names this rule"), "{out}");
+    }
+
+    #[test]
+    fn list_shows_deny_rules_in_their_own_section() {
+        let fx = fixture("cli-list-deny-rule").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.listed\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["list"]);
+        assert_eq!(code, ExitCode::Delegated, "{out}");
+        let section = out.find("deny rules").expect("deny section");
+        let entry = out.find("xudo.protect.listed").expect("deny entry");
+        assert!(entry > section, "{out}");
+        assert!(out.contains("operator protection"), "{out}");
     }
 
     #[test]
@@ -4004,16 +4389,11 @@ expect = "deny"
         assert_eq!(code, ExitCode::Delegated);
         // Every setting appears, defaults say they are defaults, and a
         // compiled-in value says it is compiled in rather than being omitted.
-        assert!(out.contains("confirm_agent_actions      true"), "{out}");
+        assert!(!out.contains("confirm_agent_actions"), "{out}");
         assert!(out.contains("<default>"), "{out}");
         assert!(out.contains("use_pty"), "{out}");
         assert!(out.contains("<compiled-in>"), "{out}");
-        assert!(
-            out.contains("confirm_agent_actions has no effect until M4"),
-            "{out}"
-        );
         // Security-relevant settings are marked, and the legend explains it.
-        assert!(out.contains("* confirm_agent_actions"), "{out}");
         assert!(out.contains("  color"), "{out}");
         assert!(out.contains("never settable from the environment"), "{out}");
     }
@@ -4052,7 +4432,7 @@ expect = "deny"
             "config",
         ]);
         assert_eq!(code, ExitCode::Delegated);
-        assert!(out.contains("confirm_agent_actions      true"), "{out}");
+        assert!(!out.contains("confirm_agent_actions"), "{out}");
         assert!(out.contains("<default>"), "{out}");
     }
 
@@ -4069,12 +4449,7 @@ expect = "deny"
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let entries = parsed.as_array().unwrap();
         assert_eq!(entries.len(), Setting::ALL.len());
-        let confirm = entries
-            .iter()
-            .find(|e| e["key"] == "confirm_agent_actions")
-            .unwrap();
-        assert_eq!(confirm["settable_from_environment"], false);
-        assert_eq!(confirm["default"], "true");
+        assert!(!entries.iter().any(|e| e["key"] == "confirm_agent_actions"));
         let color = entries.iter().find(|e| e["key"] == "color").unwrap();
         assert_eq!(color["settable_from_environment"], true);
     }
@@ -4334,6 +4709,18 @@ expect = "deny"
     }
 
     #[test]
+    fn doctor_reports_the_loaded_deny_rule_count() {
+        let fx = fixture("cli-doctor-deny-count").write(
+            "30-deny.toml",
+            "[[deny]]\nid = \"xudo.protect.doctor\"\nreason = \"operator protection\"\nprogram = [\"apt-get\"]\nall = []\n",
+        );
+        let (code, out, _) = fx.run(&["--output", "json", "doctor"]);
+        assert_eq!(code, ExitCode::Delegated);
+        let report: serde_json::Value = serde_json::from_str(&out).expect("doctor JSON");
+        assert_eq!(report["ruleset"]["loaded"]["deny_rules"], 1);
+    }
+
+    #[test]
     fn a_broken_ruleset_fails_closed_for_every_command_that_needs_it() {
         let broken = Fixture::new("cli-broken").write("10-a.toml", "[[action]\nid =");
         for args in [
@@ -4343,8 +4730,18 @@ expect = "deny"
             vec!["agentdoc"],
         ] {
             let (code, _, err) = broken.run(&args);
-            assert_eq!(code, ExitCode::Unusable, "{args:?}");
-            assert!(err.contains("failing closed"), "{args:?}: {err}");
+            let expected = if args.first() == Some(&"check") {
+                ExitCode::LintError
+            } else {
+                ExitCode::Unusable
+            };
+            assert_eq!(code, expected, "{args:?}");
+            if expected == ExitCode::Unusable {
+                assert!(err.contains("failing closed"), "{args:?}: {err}");
+            } else {
+                assert!(!err.is_empty(), "{args:?}: {err}");
+                assert!(!err.contains("failing closed"), "{args:?}: {err}");
+            }
         }
     }
 
@@ -4355,7 +4752,7 @@ expect = "deny"
         let mut err = Vec::new();
         assert_eq!(
             run(&cli, &Invocation::default(), &mut out, &mut err),
-            ExitCode::Unusable
+            ExitCode::LintError
         );
         assert!(String::from_utf8_lossy(&err).contains("cannot read the rules directory"));
     }
@@ -4365,6 +4762,22 @@ expect = "deny"
         let cli = Cli::try_parse_from(["xudo", "check"]).unwrap();
         assert_eq!(cli.rules, PathBuf::from(DEFAULT_RULES_DIR));
         assert_eq!(cli.output, Format::Human);
+    }
+
+    #[test]
+    fn queued_plan_exit_maps_a_ready_run_to_unusable_and_keeps_a_refusal() {
+        let ready = exec::QueuedRun {
+            plan: exec::ExecPlan {
+                backend: "/usr/bin/sudo",
+                gate: xudo_backend::snippet::GATE_AUTH,
+                spawn: true,
+            },
+            id: "ab".repeat(32),
+            cwd: exec::QUEUED_CWD,
+            claim_token: "cd".repeat(32),
+        };
+        assert_eq!(queued_plan_exit(&Ok(ready)), ExitCode::Unusable);
+        assert_eq!(queued_plan_exit(&Err(ExitCode::Denied)), ExitCode::Denied);
     }
 
     #[test]

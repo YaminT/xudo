@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.2" "File Formats"
+.TH XUDO-RULES 5 "2026-11-22" "xudo 0.1.0-beta.2" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -13,6 +13,14 @@ Unknown keys are a hard error, on the file and on every table in it
 A key that is silently ignored would be a constraint the operator believes
 is in force.
 A file that fails to parse fails the whole directory.
+.PP
+Harness registrations are separate files under
+.IR /etc/xudo/harnesses.d/ ,
+one named
+.I <label>.toml
+per label. They are root-owned policy inputs and contribute to the ruleset
+generation. A missing or changed registration invalidates records that name
+the old entry.
 .SH LOCATION
 The default directory is
 .IR /etc/xudo/rules.d/ .
@@ -49,7 +57,13 @@ The top-level keys are
 .BR action ,
 written as one
 .B [[action]]
-table per action, and
+table per action,
+.BR operation ,
+written as one
+.B [[operation]]
+table per typed operation (see
+.BR OPERATION ),
+and
 .BR test ,
 written as one
 .B [[test]]
@@ -97,9 +111,7 @@ Two positions in one action may not share a name.
 .B confirm
 When a human must approve.
 .B default
-(the default) asks a person only when the action is
-.B critical
-or an overlapping action demands it.
+(the default) keeps the human password path in force.
 .B always
 asks a person for every caller.
 On the human path the password is that answer, plus an approval in
@@ -112,7 +124,12 @@ that needs a person goes to the
 .B ido
 queue.
 .B never
-asks for no confirmation from this action.
+skips confirmation for this action.
+A rule that lists no
+.B harness
+is never passwordless, and confirming an agent under
+.B never
+is part of the passwordless step still to come.
 It is not a grant against a stricter overlapping action, and a
 .B critical
 action cannot set it.
@@ -130,6 +147,140 @@ Environment variable names to pass through, by exact name.
 The default is none.
 The child's environment is built from scratch, so a name on no list does not
 exist for the child.
+.TP
+.B harness
+Labels from the root-owned harness registry. Without this key, an action is
+eligible for a verified harness only when the broker's kernel classification
+and root-owned registry agree on that label. A listed label is not proof of
+identity by itself.
+.TP
+.B outcome
+The outcome for a verified harness named by
+.B harness :
+.B allow
+uses the normal policy path; this is the default. The
+.B ask-human
+outcome submits the request to the broker's root-held queue and denies the
+current request. For this outcome, the action must list the caller's verified
+harness label; an empty or different list does not queue it. A human-path
+denial is never queued. A command with no matching rule is denied. A human
+reviewer runs the queued entry with
+.B xudo exec \-\-queued
+through the password-authenticated gate, and
+.B ido
+lists it separately from the user-side queue. The passwordless gate is not
+installed.
+.SH OPERATION
+An
+.B [[operation]]
+table names work xudo performs itself.
+The only operation in this release is
+.BR remove\-path .
+It removes one path under a fixed tree.
+It does not run
+.BR rm .
+The password gate re-decides the request and walks the tree from a
+descriptor opened with
+.BR openat2 .
+A planned count and the tree and target are written to the audit log before
+the first unlink. The final record cites that intent. A fatal signal such as
+.B SIGKILL
+can still terminate the gate during the walk; the intent record is the trace
+available for that interrupted walk.
+A
+.B harness
+list is parsed and checked against the registry.
+It is not a grant.
+Harness use is planned.
+This release runs the operation only on the password path.
+.TP
+.B id
+Stable identifier, unique across actions, deny rules, and operations.
+1 to 128 bytes of
+.BR [A-Za-z0-9._-] .
+.TP
+.B op
+.B remove\-path
+in this release.
+.TP
+.B under
+Absolute tree root.
+The walk never removes this directory.
+It must be lexically clean: no empty component, no
+.BR . ,
+no
+.BR .. .
+Load refuses
+.BR / ,
+a path equal to or inside
+.BR /etc ,
+.BR /usr ,
+.BR /boot ,
+.BR /proc ,
+.BR /sys ,
+.BR /dev ,
+or
+.BR /run ,
+.B /home
+itself (a directory under
+.B /home
+is allowed),
+and xudo's protected prefixes.
+An ancestor of a protected prefix is also refused, so a tree cannot contain
+xudo's state or audit log. The trees
+.BR /root ,
+.BR /opt ,
+and
+.B /var/mail
+are refused as well. Nested operation trees do not load.
+Every ancestor must be root-owned and not writable by group or other.
+That ownership check happens when the walk opens the tree, not at load.
+At execution, the tree's device is compared with its opened parent's device;
+a tree that is a mount point is refused. This check cannot be made while
+loading the pure rule file.
+.TP
+.B recursive
+Whether a directory target is removed with its contents.
+A directory target with
+.B false
+is refused.
+.TP
+.B max\-depth
+Deepest relative path, counted in components from
+.BR under .
+1 to 32.
+.TP
+.B max\-entries
+Most entries one request may remove.
+1 to 100000.
+The walk stops before the next removal and reports a partial result.
+.TP
+.B owners
+Account names whose entries may be removed.
+Omit the key to allow any owner except root.
+An empty list does not load.
+A name that is not an account in the passwd text the broker read fails closed
+when the request is decided.
+An owner that resolves to uid 0 is refused.
+Root-owned entries are kept when the key is omitted.
+.TP
+.B harness
+Labels from the root-owned harness registry.
+A label missing from the registry fails the load.
+The list does not authorize the operation.
+.PP
+The target is one absolute path under
+.BR under .
+It may not be the tree itself.
+A shared string prefix is not enough:
+.B /srv/app/build\-evil
+is not under
+.BR /srv/app/build .
+No component may be empty,
+.BR . ,
+or
+.BR .. .
+A leaf symlink is removed as a link and is never followed.
 .SH TESTS
 A rule file may carry
 .B [[test]]
@@ -448,6 +599,89 @@ the timesyncd dbus alias, and
 A rule that still uses
 .B unit\-name
 cannot start those names.
+.SS Operator deny rules
+An operator may add
+.B [[deny]]
+tables to refuse selected commands after an action matches.
+Each
+.B any\-arg
+member is compared with one argv element byte for byte. No option parsing
+unifies equivalent spellings: clustered dpkg short options, GNU long-option
+prefixes such as
+.BR --purg ,
+and joined options such as
+.B --opt=value
+must each be listed when required.
+.PP
+.B any\-deb\-name
+compares a package operand after removing one trailing removal suffix
+.RB ( - or + )
+and cutting an architecture, version, or suite suffix at
+.BR : ,
+.BR = ,
+or
+.BR / .
+A non-plain apt pattern operand is treated as a match because it may select a
+protected package. Valid literal Debian names, including names with
+.B .
+or
+.BR + ,
+are compared exactly.
+.PP
+These name checks see only the explicit argv operands. They cannot identify
+indirect removals, such as an apt conflict that removes
+.BR sudo\-ldap ,
+or a dependency change that removes
+.BR libpam0g .
+Use confirmation policy for actions whose dependency resolution can remove
+other packages.
+.SS Shipped package protect rules
+The package installs
+.IR 00-protect.toml
+as an active dpkg conffile in
+.IR /etc/xudo/rules.d/ .
+It refuses the protected package names in the shipped
+.B apt-get remove
+action. Its purge, autoremove, autopurge, trailing-hyphen install, and dpkg
+clauses are tripwires for operator actions that accept those spellings.
+The protected names are xudo, sudo, sudo-rs, apparmor, auditd, nftables,
+iptables, ufw, firewalld, rsyslog, systemd-timesyncd, chrony, and
+openssh-server.
+.PP
+These checks apply only to commands xudo mediates. They do not constrain the
+host's own package tools or indirect package removals, such as installing
+.BR sudo-ldap .
+Removing
+.B openssh-client
+can remove
+.BR openssh-server ;
+removing
+.B libip4tc2
+or
+.B libxtables12
+can remove
+.BR iptables ;
+removing
+.B libnftables1
+can remove
+.BR nftables ;
+removing
+.B python3
+can remove
+.B ufw
+or
+.BR firewalld ;
+and removing
+.B init-system-helpers
+can remove xudo.
+Rules whose program has no loaded action remain inactive; `xudo check` and
+`xudo doctor` report them as "inert today" until an operator action names that
+program. The compiled path checks also protect
+.BR /usr/bin/xudo ,
+.BR /usr/bin/ido ,
+and
+.BR /usr/bin/willyoumarryme
+from xudo-mediated writes.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .

@@ -1,6 +1,6 @@
 # One broker per connection, as root without capabilities, in the tightest
 # sandbox that still lets it do its one job: identify the peer, read root's
-# ruleset, write its audit record, and write one entry under /run/xudo/req.
+# ruleset, write its audit record, and write one entry under its root-owned spools.
 #
 # crates/xudod/tests/units.rs asserts every security-relevant line here, and
 # refuses any key it does not know: systemd ignores a misspelled directive with
@@ -39,7 +39,7 @@ ReadWritePaths=-/run/xudo/req -/run/xudo/confirm -/var/lib/xudo
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ProcSubset=pid
+# X8: ProcSubset=pid hides the kernel boot id required by live_attestation.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -57,6 +57,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# openat2 is already in @file-system, which @system-service includes.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 # A filtered call fails rather than killing the broker, so the client still

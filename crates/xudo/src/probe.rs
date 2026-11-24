@@ -154,7 +154,10 @@ impl InstallProbe for BrokerProbe<'_> {
             Answer::Refused { code, .. } => {
                 return unavailable(format!("the broker refused the probe ({code:?})"));
             }
-            Answer::Pending { .. } | Answer::Watching { .. } | Answer::Done => {
+            Answer::Pending { .. }
+            | Answer::Watching { .. }
+            | Answer::QueueListed { .. }
+            | Answer::Done => {
                 return unavailable(
                     "the broker returned an answer for an unsupported question".to_owned(),
                 );
@@ -249,6 +252,8 @@ mod tests {
             nonce: "0".repeat(64),
             expires_in_ms: 1,
             gate: gate.into(),
+            claim_token: None,
+            harness: None,
         }
     }
 

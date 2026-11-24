@@ -3,7 +3,7 @@ source: crates/xudo/tests/render_snapshots.rs
 expression: "render::json(&decision)"
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verdict": "deny",
   "denial": "confirmation_throttled",
   "remediation": "an identical request is already pending or throttled; wait, then ask a person to approve it with `xudo watch`",

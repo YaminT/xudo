@@ -1,5 +1,6 @@
 ---
 source: crates/xudod/tests/record_snapshots.rs
+assertion_line: 145
 expression: text
 ---
 ## minted
@@ -13,7 +14,7 @@ expression: text
   "classification": "unattested",
   "decision": "allowed",
   "denial": null,
-  "deny_list_version": 6,
+  "deny_list_version": 7,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -28,11 +29,11 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94",
+    "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1",
     "nonce=abababababababababababababababababababababababababababababababab",
     "deadline_ms=1900"
   ],
-  "hash": "6afe0a5c68ab158bc1a2dbf8318b0b3f61b3db1221bc5c5ec9ba5b0e6a4f7446",
+  "hash": "840dcd940c0b699c73c0a5d2ce4d31382f50c1f441606b980dd58e228937dbf5",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -51,7 +52,7 @@ expression: text
   "classification": "unattested",
   "decision": "awaiting_confirmation",
   "denial": null,
-  "deny_list_version": 6,
+  "deny_list_version": 7,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -66,9 +67,9 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
+    "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "30524484842aecd31d11f0c70776ac3cb46e10b1152e61342c2e00c2eec4e36f",
+  "hash": "5ba2de4d8485c824b06d6b9f0672d2cca4329f2d2e0c99541d3b5ca67b6471ce",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -85,7 +86,7 @@ expression: text
   "classification": "unattested",
   "decision": "denied",
   "denial": "argv_rejected",
-  "deny_list_version": 6,
+  "deny_list_version": 7,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -100,9 +101,9 @@ expression: text
     "euid_from=PIDFD_GET_INFO",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
-    "generation=8890096d8c109ed7990ff882e1664a56d674b25f7cff7539a22ae46efcf6fd94"
+    "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "46793cdc522836578c9dacb9fff68d970256a7d25b22de050cb401da42c50591",
+  "hash": "53b845bdff75616fb4a61bfae73031c684c2fdf353b514434b36af246cf4e595",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": null,

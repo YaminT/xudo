@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-13" "xudo 0.1.0-beta.2" "User Commands"
+.TH XUDO 1 "2026-11-22" "xudo 0.1.0-beta.2" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -25,10 +25,17 @@ xudo \- decide whether a privileged command runs as root
 .br
 .B xudo exec
 .RB [ options ]
-.RB [ \-\-queue ]
 .B \-\-
 .I program
 .RI [ arg ...]
+.br
+.B xudo op remove\-path
+.I target
+.RB [ \-\-dry\-run ]
+.br
+.B xudo exec
+.B \-\-queued
+.I id
 .br
 .B xudo check
 .RB [ \-\-tests\-only "\||\|" \-\-fuzz
@@ -139,12 +146,42 @@ the program is the first argument.
 asks about one action id.
 Every other action that accepts the same command still applies, and
 overlapping actions resolve to the strictest.
+.B \-\-operation remove\-path
+asks about one absolute path against the
+.B [[operation]]
+table.
+The path is UTF\-8 on this command.
+.B xudo op
+accepts the raw bytes.
+Executes nothing.
 .TP
 .B why\-not
 Show why one action would refuse this argv.
 .B \-\-action
 is required.
 Executes nothing.
+.TP
+.B op
+Run a typed operation as root, if a rule permits it.
+Asks for your password through the host backend.
+.B remove\-path
+.I target
+removes
+.I target
+when an
+.B [[operation]]
+rule names the tree that contains it.
+It does not run
+.BR rm .
+.B \-\-dry\-run
+lists the paths and removes nothing.
+A
+.B harness
+label on the rule is parsed and checked against the registry.
+It is not a grant.
+Harness use is planned.
+This command uses the password path only.
+The passwordless gate is not in this release.
 .TP
 .B exec
 Run the command as root, if the broker permits it.
@@ -154,24 +191,25 @@ The program is an absolute path, after
 The command's own status is the process status.
 A policy refusal happens before the command runs.
 .IP
-With
-.BR \-\-queue ,
-a denial that only a person can resolve (human-path-only, or no confirmation
-channel) is also written to the invoking user's
+Human-path denials are not written to the invoking user's
 .BR ido (1)
-queue, exactly as
-.B ido queue
-would, and the id is reported: "queued as #7, run `ido` to execute".
-With
-.B \-\-output json
-the envelope gains
-.BR queued :
-{"id": 7}.
-The exit status is still the denial's: nothing ran, and the verdict is
-unchanged.
-Any other outcome behaves as without the flag and queues nothing.
-If the queue cannot be written, nothing is queued, the failure is reported on
-standard error, and the denial is shown as without the flag.
+queue. A verified harness request matched by an
+.B ask-human
+rule is stored by the broker in its root-held queue.
+.B xudo exec \-\-queued
+.I id
+claims that entry for a fresh decision against the current rules. The stored
+working directory is not used; the command runs in
+.BR / .
+Only a human reviewer who does not own the entry can claim it. The run uses
+the same scoped sudo rule as any other xudo authorization, so sudo asks for
+the password. Its
+.B timestamp_timeout=0
+setting prevents it from reusing a sudo credential cached by an earlier
+terminal login; the backend tests pin this setting in the generated rule.
+The entry is marked done only after the gate's audit record for that run.
+A denied password releases the claim back to pending. A rules change after
+queueing denies the run. The passwordless gate is not installed.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
@@ -296,6 +334,11 @@ The same ruleset and seed give the same report.
 .TP
 .B list
 List each action's id, tier, executable, and the file and line it came from.
+When the ruleset contains typed operations and
+.B \-\-tier
+is omitted, the list continues with an
+.B operations
+section: id, operation, tree, and source.
 .B \-\-tier
 shows actions whose tier contains that name.
 Hyphens in the name are ignored, so
@@ -365,12 +408,12 @@ A missing file is the defaults, not an error.
 A file that does not parse, or that contains an unrecognised key, exits
 .BR 19 .
 The keys are
-.B confirm_agent_actions
-(default true; no effect in this release, and the design removes it),
 .B confirm_human_path
 (default false),
 .B confirmation_timeout_secs
 (default 0, maximum 600 seconds),
+.B queue_ttl_secs
+(default 86400, maximum 86400; a project setting may only shorten it),
 .B frozen
 (default false),
 .B audit_sink

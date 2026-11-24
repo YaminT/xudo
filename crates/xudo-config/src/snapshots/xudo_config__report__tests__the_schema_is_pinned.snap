@@ -4,14 +4,6 @@ expression: "Settings::schema()"
 ---
 [
   {
-    "key": "confirm_agent_actions",
-    "value_type": "boolean",
-    "default": "true",
-    "configurable": true,
-    "security_relevant": true,
-    "settable_from_environment": false
-  },
-  {
     "key": "confirm_human_path",
     "value_type": "boolean",
     "default": "false",
@@ -26,6 +18,14 @@ expression: "Settings::schema()"
     "configurable": true,
     "security_relevant": false,
     "settable_from_environment": true
+  },
+  {
+    "key": "queue_ttl_secs",
+    "value_type": "integer",
+    "default": "86400",
+    "configurable": true,
+    "security_relevant": true,
+    "settable_from_environment": false
   },
   {
     "key": "frozen",

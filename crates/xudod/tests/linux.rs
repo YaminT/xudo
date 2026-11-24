@@ -237,6 +237,8 @@ args = [
         Ok(LoadedPolicy {
             rules,
             settings: xudo_policy::engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
+            passwd: Vec::new(),
         })
     }
 }
@@ -248,6 +250,7 @@ fn decided(answer: Answer) -> Option<(Decision, Option<Minted>)> {
         Answer::Refused { .. }
         | Answer::Pending { .. }
         | Answer::Watching { .. }
+        | Answer::QueueListed { .. }
         | Answer::Done => None,
     }
 }
@@ -278,6 +281,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
     let mut platform = Platform {
         hygiene: &hygiene,
         syscalls: &HostSyscalls,
+        cgroups: None,
         peers: &HostPeer,
         clock: &HostClock,
         entropy: &HostEntropy,
@@ -285,6 +289,7 @@ fn a_real_client_is_identified_decided_and_minted_for_end_to_end() {
         audit: &mut audit,
         confirmations: None,
         freeze_file: None,
+        queue: None,
     };
     let spool = FakeSpool::new();
     let before = xudo_sys::Clock::boottime_millis(&HostClock);
