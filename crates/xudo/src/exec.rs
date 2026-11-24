@@ -175,7 +175,7 @@ fn plan_paced(
     socket: &Path,
     timeout: Duration,
     wait: Duration,
-    mut pace: Option<&mut Pace<'_>>,
+    pace: Option<&mut Pace<'_>>,
     queue: Option<&ido::Host>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -212,36 +212,14 @@ fn plan_paced(
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
             Err(ExitCode::Unusable)
         }
-        Answer::Pending { id, expires_in_ms } => pending_or_wait(
+        Answer::Pending { id, expires_in_ms } => await_approval(
             cli,
-            &id,
-            expires_in_ms,
-            wait,
+            (&id, expires_in_ms, wait),
+            pace,
+            (&request, socket, timeout, backend),
             out,
             err,
-            &mut |wait, status_request| {
-                let mut status = |remaining| {
-                    ask(
-                        socket,
-                        timeout.min(remaining).min(Duration::from_millis(500)),
-                        status_request,
-                    )
-                };
-                if let Some(pace) = pace.as_deref_mut() {
-                    return poll_status_with(&id, wait, &mut status, pace.elapsed, pace.sleep);
-                }
-                let started = Instant::now();
-                let mut elapsed = || started.elapsed();
-                let mut sleep = std::thread::sleep;
-                poll_status_with(&id, wait, &mut status, &mut elapsed, &mut sleep)
-            },
-        )
-        .and_then(|answer| match answer {
-            None => Err(ExitCode::NotConfirmed),
-            Some(answer) => handle_status_answer(
-                cli, answer, &id, &request, socket, timeout, backend, err, out,
-            ),
-        }),
+        ),
         Answer::Watching { .. } | Answer::QueueListed { .. } | Answer::Done => {
             let _ = writeln!(
                 err,
@@ -315,6 +293,49 @@ fn timeout_from_value(value: &ConfigValue, err: &mut dyn Write) -> Option<Durati
             None
         }
     }
+}
+
+/// Waits for the human to decide a pending request, then claims the approval
+/// by asking the same question again. Shared by `xudo` and `xudo op`.
+#[allow(clippy::too_many_arguments)]
+fn await_approval(
+    cli: &Cli,
+    (id, expires_in_ms, wait): (&str, u64, Duration),
+    mut pace: Option<&mut Pace<'_>>,
+    (request, socket, timeout, backend): (&BrokerRequest, &Path, Duration, &'static str),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    pending_or_wait(
+        cli,
+        id,
+        expires_in_ms,
+        wait,
+        out,
+        err,
+        &mut |wait, status_request| {
+            let mut status = |remaining| {
+                ask(
+                    socket,
+                    timeout.min(remaining).min(Duration::from_millis(500)),
+                    status_request,
+                )
+            };
+            if let Some(pace) = pace.as_deref_mut() {
+                return poll_status_with(id, wait, &mut status, pace.elapsed, pace.sleep);
+            }
+            let started = Instant::now();
+            let mut elapsed = || started.elapsed();
+            let mut sleep = std::thread::sleep;
+            poll_status_with(id, wait, &mut status, &mut elapsed, &mut sleep)
+        },
+    )
+    .and_then(|answer| match answer {
+        None => Err(ExitCode::NotConfirmed),
+        Some(answer) => {
+            handle_status_answer(cli, answer, id, request, socket, timeout, backend, err, out)
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -903,7 +924,34 @@ pub fn plan_remove_path(
     dry_run: bool,
     probe: &dyn Probe,
     socket: &Path,
-    timeout: Duration,
+    (timeout, wait): (Duration, Duration),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    plan_remove_paced(
+        cli,
+        target,
+        dry_run,
+        probe,
+        socket,
+        (timeout, wait),
+        None,
+        out,
+        err,
+    )
+}
+
+/// [`plan_remove_path`] with the approval wait paced by `pace`, or by the
+/// real clock when it is `None`.
+#[allow(clippy::too_many_arguments)]
+fn plan_remove_paced(
+    cli: &Cli,
+    target: &[u8],
+    dry_run: bool,
+    probe: &dyn Probe,
+    socket: &Path,
+    (timeout, wait): (Duration, Duration),
+    pace: Option<&mut Pace<'_>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
@@ -924,6 +972,19 @@ pub fn plan_remove_path(
             return Err(ExitCode::Unusable);
         }
     };
+    if let Answer::Pending { id, expires_in_ms } = &response.answer {
+        let Some(backend) = selected_backend(probe, err) else {
+            return Err(ExitCode::Unusable);
+        };
+        return await_approval(
+            cli,
+            (id, *expires_in_ms, wait),
+            pace,
+            (&request, socket, timeout, backend),
+            out,
+            err,
+        );
+    }
     remove_plan_from_answer(cli, target, &response, probe, out, err)
 }
 
@@ -939,13 +1000,16 @@ pub fn plan_remove_live(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ExecPlan, ExitCode> {
+    let Some(wait) = configured_timeout(cli, err) else {
+        return Err(ExitCode::Unusable);
+    };
     plan_remove_path(
         cli,
         target,
         dry_run,
         &xudo_sys::HostProbe,
         Path::new(xudo_wire::BROKER_SOCKET),
-        TIMEOUT,
+        (TIMEOUT, wait),
         out,
         err,
     )
@@ -3442,7 +3506,7 @@ mod tests {
             true,
             &SUDO,
             &dir.path().join("none.sock"),
-            TIMEOUT,
+            (TIMEOUT, Duration::ZERO),
             &mut out,
             &mut err,
         );
@@ -3460,7 +3524,7 @@ mod tests {
             false,
             &SUDO,
             Path::new("/no/such/sock"),
-            TIMEOUT,
+            (TIMEOUT, Duration::ZERO),
             &mut out,
             &mut err,
         );
@@ -3478,7 +3542,7 @@ mod tests {
             true,
             &SUDO,
             &socket,
-            PATIENT,
+            (PATIENT, Duration::ZERO),
             &mut out,
             &mut err,
         )
@@ -3497,6 +3561,95 @@ mod tests {
     }
 
     #[test]
+    fn remove_path_waits_for_the_human_when_confirm_human_path_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let id = "e".repeat(64);
+        let mint = Minted {
+            nonce: id.clone(),
+            expires_in_ms: 30_000,
+            gate: GATE_AUTH.into(),
+            claim_token: None,
+            harness: None,
+        };
+        let broker = crate::test_broker::serve_many(
+            listener,
+            vec![
+                json(&Answer::Pending {
+                    id: id.clone(),
+                    expires_in_ms: 30_000,
+                }),
+                decided(allow(), Some(mint.clone())),
+                decided(allow(), Some(mint)),
+            ],
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let virtual_now = std::cell::Cell::new(Duration::ZERO);
+        let mut elapsed = || virtual_now.get();
+        let mut sleep = |slept: Duration| virtual_now.set(virtual_now.get() + slept);
+        let plan = plan_remove_paced(
+            &cli(),
+            b"/srv/app/build/cache",
+            false,
+            &SUDO,
+            &socket,
+            (PATIENT, Duration::from_secs(2)),
+            Some(&mut Pace {
+                elapsed: &mut elapsed,
+                sleep: &mut sleep,
+            }),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(plan.gate, GATE_AUTH);
+        let report = broker.finish_report();
+        let requests = report
+            .requests
+            .iter()
+            .map(|request| BrokerRequest::parse(request).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[2]);
+        assert_eq!(
+            requests[0].question,
+            remove_path_request(b"/srv/app/build/cache", false)
+                .unwrap()
+                .question
+        );
+        assert_eq!(
+            std::mem::discriminant(&requests[1].question),
+            std::mem::discriminant(&Question::Status { id: String::new() })
+        );
+
+        // No backend: a pending answer stops before it waits for anything.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let broker = crate::test_broker::serve_once(
+            listener,
+            json(&Answer::Pending {
+                id,
+                expires_in_ms: 30_000,
+            }),
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let none = plan_remove_path(
+            &cli(),
+            b"/srv/app/build/cache",
+            false,
+            &Has(&[]),
+            &socket,
+            (PATIENT, Duration::from_secs(2)),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(none, Err(ExitCode::Unusable));
+        drop(broker.finish());
+    }
+
+    #[test]
     fn plan_remove_live_refuses_a_relative_target_before_the_socket() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
@@ -3504,6 +3657,23 @@ mod tests {
             Err(ExitCode::Unusable)
         );
         assert!(String::from_utf8(err).unwrap().contains("absolute path"));
+    }
+
+    #[test]
+    fn plan_remove_live_refuses_a_settings_path_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = cli();
+        cli.config_file = dir.path().to_path_buf();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            plan_remove_live(&cli, b"/srv/app/build/cache", false, &mut out, &mut err),
+            Err(ExitCode::Unusable)
+        );
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("settings file could not be read")
+        );
     }
 
     /// `read_line` fails. Used so that arm is taken on every platform.

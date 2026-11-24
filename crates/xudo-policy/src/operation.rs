@@ -122,6 +122,14 @@ const TREES: &[&[u8]] = &[
     b"/root",
     b"/opt",
     b"/var/mail",
+    b"/var/spool",
+    b"/var/cache",
+    b"/bin",
+    b"/sbin",
+    b"/lib",
+    b"/lib32",
+    b"/lib64",
+    b"/libx32",
 ];
 
 /// Why `under` cannot be a tree root. `None` means the lexical check passed.
@@ -510,6 +518,27 @@ harness = ["codex"]
     }
 
     #[test]
+    fn an_under_on_a_system_binary_or_spool_tree_is_refused() {
+        for under in [
+            "/bin",
+            "/bin/sh",
+            "/sbin",
+            "/lib",
+            "/lib32",
+            "/lib64/ld",
+            "/libx32",
+            "/var/spool",
+            "/var/spool/cron",
+            "/var/cache",
+            "/var/cache/apt",
+        ] {
+            assert!(forbidden_under(under.as_bytes()).is_some(), "{under}");
+        }
+        assert!(forbidden_under(b"/var/cachefoo").is_none());
+        assert!(forbidden_under(b"/binx/tree").is_none());
+    }
+
+    #[test]
     fn a_tree_under_proc_or_xudo_state_fails_to_load() {
         let proc = RuleSet::from_toml(
             "bad.toml",
@@ -556,6 +585,8 @@ max-entries = 1
             "/run",
             "/run/xudo",
             "/etc/xudo",
+            "/var/spool",
+            "/var/cache/apt",
         ] {
             let text = format!(
                 "[[operation]]\nid = \"bad.tree\"\nop = \"remove-path\"\nunder = \"{under}\"\nrecursive = false\nmax-depth = 1\nmax-entries = 1\n"

@@ -209,12 +209,13 @@ pub trait RemoveFs {
     /// Returns the failing syscall's error.
     fn lstat(&mut self, dir: u64, name: &[u8]) -> Result<NodeStat, RemoveError>;
 
-    /// Directory entry names, without `.` and `..`, in byte order.
+    /// Up to `limit` directory entry names, without `.` and `..`, sorted
+    /// among themselves. A larger directory is not read to the end.
     ///
     /// # Errors
     ///
     /// Returns the failing syscall's error.
-    fn list(&mut self, dir: u64) -> Result<Vec<Vec<u8>>, RemoveError>;
+    fn list(&mut self, dir: u64, limit: usize) -> Result<Vec<Vec<u8>>, RemoveError>;
 
     /// `unlinkat`. `directory` sets `AT_REMOVEDIR`. A symlink is removed only
     /// when `directory` is false: the call never follows the link.
@@ -317,6 +318,12 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
         }
     }
     Ok((dir, stat))
+}
+
+/// An entry that is neither `.` nor `..`; an error passes through.
+#[cfg(target_os = "linux")]
+fn keeps_entry<E>(name: &Result<Vec<u8>, E>) -> bool {
+    !matches!(name, Ok(name) if name == b"." || name == b"..")
 }
 
 fn ancestor_ok(stat: &NodeStat) -> bool {
@@ -516,7 +523,9 @@ impl Walk<'_> {
         if is_target && !self.req.recursive {
             return Err(RemoveError::DirectoryRequiresRecursive);
         }
-        let names = self.fs.list(child)?;
+        let cap = usize::try_from(self.req.max_entries).unwrap_or(usize::MAX);
+        let names = self.fs.list(child, cap.saturating_add(1))?;
+        let truncated = names.len() > cap;
         for entry in &names {
             if self.partial || self.at_cap() {
                 self.partial = true;
@@ -532,8 +541,12 @@ impl Walk<'_> {
                 return Ok(());
             }
         }
+        if truncated {
+            self.partial = true;
+            return Ok(());
+        }
         if !self.req.dry_run {
-            let left = self.fs.list(child)?;
+            let left = self.fs.list(child, 1)?;
             if !left.is_empty() {
                 return Ok(());
             }
@@ -896,16 +909,17 @@ impl RemoveFs for LinuxRemoveFs {
             .map_err(host_err("statat"))
     }
 
-    fn list(&mut self, dir: u64) -> Result<Vec<Vec<u8>>, RemoveError> {
+    fn list(&mut self, dir: u64, limit: usize) -> Result<Vec<Vec<u8>>, RemoveError> {
         let parent = self.fd(dir, "getdents")?;
         rustix::fs::Dir::read_from(parent)
             .and_then(|entries| {
                 entries
                     .map(|entry| entry.map(|entry| entry.file_name().to_bytes().to_vec()))
+                    .filter(keeps_entry)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .map(|mut names| {
-                names.retain(|name| name != b"." && name != b"..");
                 names.sort_unstable();
                 names
             })
@@ -1408,7 +1422,7 @@ impl RemoveFs for FakeRemoveFs {
         self.stat_of(ino)
     }
 
-    fn list(&mut self, dir: u64) -> Result<Vec<Vec<u8>>, RemoveError> {
+    fn list(&mut self, dir: u64, limit: usize) -> Result<Vec<Vec<u8>>, RemoveError> {
         self.fault("list")?;
         let ino = self.opens.get(&dir).ok_or(RemoveError::Os {
             op: "getdents",
@@ -1417,7 +1431,7 @@ impl RemoveFs for FakeRemoveFs {
         Ok(self
             .nodes
             .get(ino)
-            .map(|node| node.children.keys().cloned().collect())
+            .map(|node| node.children.keys().take(limit).cloned().collect())
             .unwrap_or_default())
     }
 
@@ -2037,9 +2051,9 @@ mod tests {
         assert_eq!(stat.uid, 0);
         fs.add(&[], b"dir", NodeKind::Dir, 0, 0o755, 0);
         let dir = fs.open_dir(root, b"dir", false).unwrap();
-        assert!(fs.list(dir).unwrap().is_empty());
+        assert!(fs.list(dir, 99).unwrap().is_empty());
         fs.add(&[b"dir"], b"file", NodeKind::File, 1000, 0o644, 3);
-        let listed = fs.list(dir).unwrap();
+        let listed = fs.list(dir, 99).unwrap();
         assert_eq!(listed, vec![b"file".to_vec()]);
         let leaf = fs.lstat(dir, b"file").unwrap();
         assert_eq!(leaf.kind, NodeKind::File);
@@ -2210,8 +2224,9 @@ mod tests {
         assert_eq!(root_stat.kind, NodeKind::Dir);
         assert_eq!(root_stat.uid, 0);
         let fd = open_components(&mut host, &dir);
-        let names = host.list(fd).unwrap();
+        let names = host.list(fd, 99).unwrap();
         assert!(names.iter().any(|name| name == b"sub"));
+        assert_eq!(host.list(fd, 1).unwrap().len(), 1);
         let sub = host.open_dir(fd, b"sub", true).unwrap();
         let note = host.lstat(sub, b"note").unwrap();
         assert_eq!(note.kind, NodeKind::File);
@@ -2490,7 +2505,7 @@ mod tests {
         );
         assert_eq!(fs.fstat(99).unwrap_err(), expected("fstat"));
         assert_eq!(fs.lstat(99, b"x").unwrap_err(), expected("statat"));
-        assert_eq!(fs.list(99).unwrap_err(), expected("getdents"));
+        assert_eq!(fs.list(99, 99).unwrap_err(), expected("getdents"));
         assert_eq!(
             fs.unlink(99, b"x", false).unwrap_err(),
             expected("unlinkat")
@@ -2563,6 +2578,63 @@ mod tests {
             remove_path(&mut fs, &req("box/a")).unwrap_err(),
             RemoveError::AncestorRefused
         );
+    }
+
+    #[test]
+    fn a_crowded_directory_of_skipped_entries_is_partial_and_stays() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"a", NodeKind::File, 0, 0o644, 1);
+        fs.add(&BOX, b"b", NodeKind::File, 1000, 0o644, 1);
+        fs.add(&BOX, b"c", NodeKind::File, 1000, 0o644, 1);
+        let mut request = req("box");
+        request.max_entries = 2;
+        let report = remove_path(&mut fs, &request).unwrap();
+        assert!(report.partial);
+        assert!(fs.exists(&BOX));
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+    }
+
+    #[test]
+    fn an_intermediate_ancestor_that_is_group_writable_refuses_the_tree() {
+        let (mut fs, _) = tree();
+        let app = fs.ino_at(&[b"srv", b"app"]).unwrap();
+        fs.set_mode(app, 0o775);
+        assert_eq!(
+            remove_path(&mut fs, &req("x")).unwrap_err(),
+            RemoveError::AncestorRefused
+        );
+    }
+
+    #[test]
+    fn an_intermediate_ancestor_not_owned_by_root_refuses_the_tree() {
+        let mut fs = FakeRemoveFs::new();
+        fs.add(&[], b"srv", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(&[b"srv"], b"app", NodeKind::Dir, 0, 0o755, 0);
+        fs.add(&[b"srv", b"app"], b"build", NodeKind::Dir, 0, 0o755, 0);
+        assert_eq!(
+            remove_path(&mut fs, &req("x")).unwrap_err(),
+            RemoveError::AncestorRefused
+        );
+    }
+
+    #[test]
+    fn a_directory_larger_than_the_limit_is_not_read_to_the_end() {
+        let (mut fs, _) = boxed(&[]);
+        for index in 0..50u8 {
+            fs.add(&BOX, &[b'f', index], NodeKind::File, 1000, 0o644, 1);
+        }
+        let open = fs.open_root().unwrap();
+        let mut dir = open;
+        for name in BOX {
+            dir = fs.open_dir(dir, name, false).unwrap();
+        }
+        assert_eq!(fs.list(dir, 3).unwrap().len(), 3);
+        let mut request = req("box");
+        request.max_entries = 4;
+        let report = remove_path(&mut fs, &request).unwrap();
+        assert!(report.partial);
+        assert_eq!(report.removed.len(), 4);
+        assert!(fs.exists(&BOX));
     }
 
     #[test]
@@ -2731,7 +2803,7 @@ mod tests {
         fs.hardlink(&[], b"ghost", 99);
         assert!(fs.exists(&[b"ghost"]));
         let root = fs.open_root().unwrap();
-        assert_eq!(fs.list(55).unwrap_err(), os("getdents", EBADF));
+        assert_eq!(fs.list(55, 99).unwrap_err(), os("getdents", EBADF));
         assert_eq!(
             fs.unlink(55, b"x", false).unwrap_err(),
             os("unlinkat", EBADF)
@@ -2756,7 +2828,7 @@ mod tests {
         let open = fs.open_dir(root, b"d", false).unwrap();
         fs.forget(dir);
         assert_eq!(fs.lstat(open, b"x").unwrap_err(), os("openat2", ENOENT));
-        assert!(fs.list(open).unwrap().is_empty());
+        assert!(fs.list(open, 99).unwrap().is_empty());
         assert_eq!(fs.fstat(open).unwrap_err(), os("fstat", ENOENT));
     }
 
@@ -2824,7 +2896,7 @@ mod tests {
         );
         assert_eq!(host.fstat(77).unwrap_err(), os("fstat", EBADF));
         assert_eq!(host.lstat(77, b"x").unwrap_err(), os("statat", EBADF));
-        assert_eq!(host.list(77).unwrap_err(), os("getdents", EBADF));
+        assert_eq!(host.list(77, 99).unwrap_err(), os("getdents", EBADF));
         assert_eq!(
             host.unlink(77, b"x", false).unwrap_err(),
             os("unlinkat", EBADF)

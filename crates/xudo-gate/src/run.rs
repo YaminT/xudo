@@ -483,6 +483,9 @@ struct Progress {
     /// record is a second append; either one is enough to warn the operator.
     /// The sentence is static.
     audit_notice: Option<&'static str>,
+    /// Entries a remove-path walk already removed when its final audit
+    /// record failed: the work is done, so the exit must not say "refused".
+    removed_unrecorded: Option<usize>,
 }
 
 /// Runs the gate.
@@ -514,11 +517,18 @@ fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progres
     // Either one reporting damage is enough, and the sentence is the same,
     // so the operator sees it once.
     let notice = record(host, refusal, progress).or(progress.audit_notice);
-    let mut message = format!(
-        "xudo-gate: refused ({}, severity {})",
-        refusal.code(),
-        refusal.severity().label()
-    );
+    let mut message = match progress.removed_unrecorded {
+        Some(count) => format!(
+            "xudo-gate: removed {count} entries; the audit record failed ({}, severity {})",
+            refusal.code(),
+            refusal.severity().label()
+        ),
+        None => format!(
+            "xudo-gate: refused ({}, severity {})",
+            refusal.code(),
+            refusal.severity().label()
+        ),
+    };
     if let Some(line) = notice {
         message.push('\n');
         message.push_str("xudo-gate: ");
@@ -793,6 +803,7 @@ fn run_typed_operation(
         crate::operate::remove_record(previous, &recorded_caller, &recorded_work, &recorded_report)
     }) {
         progress.audit_notice = error.damaged_log_notice();
+        progress.removed_unrecorded = Some(report.removed.len());
         return Err(Refusal::Failed {
             stage: Stage::Audit,
             reason: error.to_string(),
@@ -3318,7 +3329,12 @@ max-entries = 10
         );
         let exit = run(&mut host, &auth());
         assert_ne!(exit.status, 0, "{exit:?}");
-        assert!(exit.message.contains("refused"), "{exit:?}");
+        assert!(!exit.message.contains("refused"), "{exit:?}");
+        assert!(
+            exit.message
+                .contains("removed 1 entries; the audit record failed"),
+            "{exit:?}"
+        );
         assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
         assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
         let records = host.audit.records();

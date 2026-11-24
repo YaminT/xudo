@@ -499,7 +499,7 @@ fn op_command(
         *dry_run,
         probe,
         socket,
-        exec::TIMEOUT,
+        (exec::TIMEOUT, std::time::Duration::ZERO),
         out,
         err,
     )
