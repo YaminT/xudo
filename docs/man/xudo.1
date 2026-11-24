@@ -258,8 +258,15 @@ backoff strike; a human's pending request is left alone.
 Lift the caller's own freeze and resume that scope. A user's thaw removes only
 the marker for their own uid: root's global freeze stays in force, and so does
 every other user's, until root lifts it. Root's thaw lifts the global freeze
-and every user's marker. An attested agent cannot thaw, and neither can a peer
-in another user namespace. Run it as the user who froze; do not run it as
+and every user's marker. A non-root thaw is accepted only from a caller the
+kernel positively classes as a human: an attested agent, an unattested caller,
+and a peer in another user namespace cannot thaw. If the harness registry or
+/etc/passwd cannot be read, freeze and thaw both refuse, so a broken registry
+also locks the human out; nothing runs while the policy fails to load, and root
+can
+.B touch /var/lib/xudo/frozen
+to freeze or remove it to thaw. A thaw that needs a password proof arrives with
+the passwordless gate. Run it as the user who froze; do not run it as
 .B sudo
 to clear a user's freeze unless root's global freeze should go as well.
 .TP

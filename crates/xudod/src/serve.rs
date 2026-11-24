@@ -2652,7 +2652,10 @@ fn registry_caller(
         .policy
         .load()
         .map_err(|error| Refusal::from(&error))?;
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let passwd = std::str::from_utf8(&policy.passwd)
+        .ok()
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| Refusal::from(&crate::policy::PolicyError::PasswdUnusable))?;
     Ok(classify_with_registry(
         identity,
         &policy.rules.harnesses,
@@ -2670,6 +2673,13 @@ const MAX_STATE_NAMES: usize = 128;
 /// facts, and an agent that could freeze could stop its owner's other agents.
 fn refuse_attested_agent(caller: &CallerFacts, what: &'static str) -> Result<(), Refusal> {
     if caller.classification.is_enrolled_agent() {
+        return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
+    }
+    Ok(())
+}
+
+fn refuse_unless_human(caller: &CallerFacts, what: &'static str) -> Result<(), Refusal> {
+    if !matches!(caller.classification, xudo_policy::Classification::Human) {
         return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
     }
     Ok(())
@@ -2930,6 +2940,11 @@ fn thaw(
 ) -> Result<BrokerResponse, Refusal> {
     refuse_diverged(identity, "thaw requires an undiverged peer")?;
     refuse_attested_agent(caller, "an attested agent cannot thaw")?;
+    // Thaw lifts a stop, so misclassification must not allow it: a user may
+    // thaw only when positively classed human. Root is unchanged.
+    if identity.uid != 0 {
+        refuse_unless_human(caller, "only a human can thaw")?;
+    }
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
     })?;
@@ -4110,7 +4125,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .unwrap(),
             settings: xudo_policy::engine::Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: Vec::new(),
+            passwd: b"alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_vec(),
         }
     }
 
@@ -6607,12 +6622,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             schema_version: WIRE_SCHEMA_VERSION,
             question: xudo_wire::Question::Thaw,
         };
-        let outcome = serve_with(
-            &mut host,
-            &connection(Ok(thaw.to_json().into_bytes())),
-            Ok(&spool),
-        );
-        assert_eq!(outcome.answer, Answer::Done);
+        let conn = connection(Ok(thaw.to_json().into_bytes()));
+        let served = serve_request(&conn, &mut host.platform(), &spool, human_identity(), thaw);
+        assert_eq!(served, Served::Decided);
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(answer, Answer::Done);
     }
 
     fn thaw_request() -> BrokerRequest {
@@ -6644,12 +6658,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         for name in ["frozen", "frozen-1000", "frozen-2000", "audit.jsonl"] {
             host.freeze_file.publish(name, MARKER).unwrap();
         }
-        let outcome = serve_with(
-            &mut host,
-            &connection(Ok(thaw_request().to_json().into_bytes())),
-            Ok(&FakeSpool::new()),
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            human_identity(),
+            thaw_request(),
         );
-        assert_eq!(outcome.answer, Answer::Done);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(refusal_code_written(&conn), None);
         let left: Vec<_> = host.freeze_file.files().into_keys().collect();
         assert_eq!(
             left,
@@ -6745,10 +6763,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.freeze_file = FakeSpool::new()
             .with_file("frozen-1000", MARKER)
             .failing_remove(broken);
+        let human = human_identity();
         let error = thaw(
             &mut host.platform(),
-            &identity,
-            &classify(&identity),
+            &human,
+            &classify(&human),
             &thaw_request(),
         )
         .unwrap_err();
@@ -11551,6 +11570,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let identity = enrolled_identity(&mut host);
         host.freeze_file.publish("frozen", MARKER).unwrap();
+        host.freeze_file.publish("frozen-2000", MARKER).unwrap();
         let spool = FakeSpool::new();
         let conn = connection(Ok(freeze_request().to_json().into_bytes()));
         let served = serve_request(
@@ -11561,6 +11581,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
         let served = serve_request(
             &conn,
             &mut host.platform(),
@@ -11569,9 +11594,98 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
         let files = host.freeze_file.files();
         assert!(files.contains_key(b"frozen".as_slice()));
         assert!(!files.contains_key(b"frozen-1000".as_slice()));
+        assert!(files.contains_key(b"frozen-2000".as_slice()));
+    }
+
+    fn human_identity() -> PeerIdentity {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        identity
+    }
+
+    fn refusal_code_written(conn: &FakeConnection) -> Option<RefusalCode> {
+        refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer)
+    }
+
+    #[test]
+    fn an_unattested_caller_cannot_thaw() {
+        // An agent that left its scope, or whose record is stale, is not
+        // positively a human: it must not lift its owner's freeze.
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            test_identity(PID, START, 0, 0),
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
+        assert!(
+            host.freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_human_caller_can_thaw_its_own_freeze() {
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            human_identity(),
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Decided);
+        assert_eq!(refusal_code_written(&conn), None);
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn a_non_utf8_passwd_refuses_freeze_and_thaw() {
+        for passwd in [b"alice:x:1000\xff\n".to_vec(), Vec::new()] {
+            let mut host = Host::honest();
+            let mut loaded = policy();
+            loaded.passwd = passwd;
+            host.policy.answer = Ok(loaded);
+            host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+            for request in [thaw_request(), freeze_request()] {
+                let conn = connection(Ok(request.to_json().into_bytes()));
+                let served = serve_request(
+                    &conn,
+                    &mut host.platform(),
+                    &FakeSpool::new(),
+                    human_identity(),
+                    request,
+                );
+                assert_eq!(served, Served::Refused(Fault::Broker));
+                assert_eq!(
+                    refusal_code_written(&conn),
+                    Some(RefusalCode::PolicyUnloadable)
+                );
+            }
+            assert_eq!(host.freeze_file.files().len(), 1);
+        }
     }
 
     #[test]

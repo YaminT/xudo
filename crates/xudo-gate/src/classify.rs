@@ -762,6 +762,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 /// Classifies one pinned ancestor. `child` is the process immediately below
 /// it in the gate's lineage; rechecking that link after `pidfd_open` closes the
 /// PID reuse gap in the ancestor rung.

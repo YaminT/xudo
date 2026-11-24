@@ -99,6 +99,10 @@ pub enum PolicyError {
     /// The settings bytes could not be interpreted.
     #[error(transparent)]
     Config(SettingsError),
+    /// `/etc/passwd` is missing, empty, or not UTF-8. Without it no enrolled
+    /// agent can be told from a human, so the policy does not load.
+    #[error("the account database is missing, empty, or not UTF-8")]
+    PasswdUnusable,
 }
 
 impl From<SettingsError> for PolicyError {
@@ -132,7 +136,8 @@ fn attach_passwd(
     passwd: Result<Option<Vec<u8>>, PolicyError>,
 ) -> Result<LoadedPolicy, PolicyError> {
     let mut loaded = loaded?;
-    loaded.passwd = passwd?.unwrap_or_default();
+    let passwd = passwd?.filter(|bytes| !bytes.is_empty() && std::str::from_utf8(bytes).is_ok());
+    loaded.passwd = passwd.ok_or(PolicyError::PasswdUnusable)?;
     Ok(loaded)
 }
 
@@ -336,8 +341,31 @@ mod tests {
             &ABSENT_FREEZE,
         )
         .unwrap();
-        let attached = attach_passwd(Ok(loaded), Ok(None)).unwrap();
-        assert!(attached.passwd.is_empty());
+        let error = attach_passwd(Ok(loaded), Ok(None)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the account database is missing, empty, or not UTF-8"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_non_utf8_passwd_fails_the_load_closed() {
+        for bytes in [Vec::new(), b"agent:x:1000\xff\n".to_vec()] {
+            let loaded = load_with(
+                Path::new("rules"),
+                Path::new("config.toml"),
+                &empty_rules,
+                &|_, _| Ok(None),
+                &ABSENT_FREEZE,
+            )
+            .unwrap();
+            let error = attach_passwd(Ok(loaded), Ok(Some(bytes))).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the account database is missing, empty, or not UTF-8"
+            );
+            assert!(error.to_string().contains("account database"));
+        }
     }
 
     #[test]
