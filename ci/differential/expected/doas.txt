@@ -1,7 +1,8 @@
 backend      doas (<version>)
-backend caps 5 of 7 supported
+backend caps 4 of 7 supported
+             exempt: allocate pty (REQUIRED): doas never allocates a pty; accepted because the target is root
              absent: rejects argument wildcards
-             absent: persistent credential cache
+             unknown: persistent credential cache
 install      exit 0
 plan for     doas
 snippet      accepted by /usr/bin/doas -C /dev/stdin

@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use xudo_backend::paths_to_root::HostView;
+use xudo_backend::paths_to_root::{Finding, HostView, Input, assess};
 use xudo_backend::{BackendKind, InstallPlan, PlanStep, Probe, detect, uninstall_plan};
 use xudo_config::report::{self, ListOptions};
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
@@ -554,6 +554,7 @@ pub fn run_with_installer_at_socket(
             show_contents,
             uninstall,
         } => install(
+            platform.host,
             probe,
             installer,
             InstallMode {
@@ -682,6 +683,7 @@ struct InstallMode {
 /// can still be cleaned up. Both backends' removals run, each of them removing
 /// nothing it did not write.
 fn install(
+    host: &dyn HostView,
     probe: &dyn Probe,
     installer: &dyn Installer,
     mode: InstallMode,
@@ -709,6 +711,11 @@ fn install(
             }
         }
     };
+    if !mode.uninstall && plans.iter().any(|plan| plan.backend == BackendKind::Doas) {
+        if let Some(refusal) = doas_later_rules(host, err) {
+            return refusal;
+        }
+    }
 
     if mode.dry_run {
         for plan in &plans {
@@ -751,6 +758,56 @@ fn install(
         }
         None => ExitCode::Delegated,
     }
+}
+
+/// Looks at the doas rules that come after xudo's own: doas uses the last
+/// rule that matches, so a later `nopass` takes the human's password from the
+/// gate, which is the only proof of a human. That refuses; a later `persist`
+/// only warns. `None` means go on.
+///
+/// This reads a rule of xudo's that is already installed: before the first
+/// install there is no rule for a later one to follow, so the first install is
+/// checked by `xudo doctor` after it.
+fn doas_later_rules(host: &dyn HostView, err: &mut dyn Write) -> Option<ExitCode> {
+    let report = assess(
+        host,
+        &Input {
+            user_path: None,
+            backend_exe: None,
+            sudo_exe: None,
+            doas_exe: None,
+        },
+    );
+    let mut refused = false;
+    for finding in report.checks.iter().flat_map(|check| &check.findings) {
+        let Finding::DoasLaterRule {
+            file,
+            line,
+            nopass,
+            persist,
+            ..
+        } = finding
+        else {
+            continue;
+        };
+        let at = file.display();
+        if *nopass {
+            refused = true;
+            let _ = writeln!(
+                err,
+                "xudo: refusing to install: {at}:{line} is a doas rule after xudo's own that \
+                 carries nopass, so the gate would run without a password. Remove nopass \
+                 from it, or move it above xudo's rule."
+            );
+        } else if *persist {
+            let _ = writeln!(
+                err,
+                "xudo: warning: {at}:{line} is a doas rule after xudo's own that carries \
+                 persist, so one password could be reused."
+            );
+        }
+    }
+    refused.then_some(ExitCode::Unusable)
 }
 
 /// The word for what is being done, for a failure message.
@@ -4536,6 +4593,124 @@ expect = "deny"
             !out.contains("REQUIRED"),
             "a required control is missing: {out}"
         );
+    }
+
+    /// A doas with a drop-in directory, for the install gate.
+    struct DoasInstallProbe;
+    impl Probe for DoasInstallProbe {
+        fn exists(&self, absolute_path: &str) -> bool {
+            absolute_path == "/usr/bin/doas"
+        }
+        fn version_banner(&self, _absolute_path: &str) -> Option<String> {
+            Some("doas (OpenDoas) 6.8.2".to_owned())
+        }
+        fn directory_exists(&self, _absolute_path: &str) -> bool {
+            false
+        }
+        fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
+            true
+        }
+        fn honours_scoped_directive(&self, _path: &str, _directive: &str) -> bool {
+            true
+        }
+        fn validates_named_file(&self, _path: &str) -> bool {
+            true
+        }
+        fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
+    /// `xudo install` on a doas host whose rules are `later`, after xudo's own.
+    fn install_on_doas(later: &[u8], args: &[&str]) -> (ExitCode, String, String) {
+        let mut rules =
+            b"permit :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n".to_vec();
+        rules.extend_from_slice(later);
+        let host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n")
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
+        .dir("/etc/doas.d", 0, 0, 0o755)
+        .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, &rules);
+        let fx = fixture("cli-install-doas-later");
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "install"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let platform = Platform {
+            ops: &BlindOps,
+            probe: &DoasInstallProbe,
+            host: &host,
+            path: None,
+        };
+        let code = run_with(&cli, &platform, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn install_refuses_a_later_doas_rule_that_takes_the_password_from_the_gate() {
+        let (code, out, err) = install_on_doas(b"permit nopass :xudo\n", &[]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(
+            err.contains("refusing to install: /etc/doas.d/60-xudo.conf:2"),
+            "{err}"
+        );
+        assert!(err.contains("nopass"), "{err}");
+        // Refused before any plan ran, and a dry run is refused the same way.
+        assert!(
+            !err.contains("failed") && !out.contains("done"),
+            "{out}{err}"
+        );
+        let (code, out, _) = install_on_doas(b"permit nopass :xudo\n", &["--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(!out.contains("plan for"), "{out}");
+    }
+
+    #[test]
+    fn the_doas_install_probe_answers_every_question() {
+        let probe = DoasInstallProbe;
+        assert!(probe.honours_directive("/usr/bin/doas", "x"));
+        assert!(probe.honours_scoped_directive("/usr/bin/doas", "x"));
+        assert!(probe.validates_named_file("/usr/bin/doas"));
+        assert!(probe.accepts_argument_wildcard("/usr/bin/doas"));
+        assert!(!probe.directory_exists("/etc/doas.d"));
+    }
+
+    #[test]
+    fn install_warns_about_a_later_doas_persist_and_goes_on() {
+        let (code, out, err) = install_on_doas(b"permit persist :xudo\n", &["--dry-run"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(err.contains("warning: /etc/doas.d/60-xudo.conf:2"), "{err}");
+        assert!(err.contains("persist"), "{err}");
+        assert!(out.contains("plan for"), "{out}");
+    }
+
+    #[test]
+    fn install_ignores_a_later_doas_rule_that_names_someone_else() {
+        let (code, _, err) = install_on_doas(
+            b"permit nopass :staff\npermit nopass :xudo as nobody\npermit :xudo as root cmd /bin/ls\npermit :xudo\n",
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn uninstall_is_never_held_back_by_a_later_doas_rule() {
+        let (code, out, err) =
+            install_on_doas(b"permit nopass :xudo\n", &["--uninstall", "--dry-run"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("plan for"), "{out}");
+        assert!(err.is_empty(), "{err}");
     }
 
     #[test]
