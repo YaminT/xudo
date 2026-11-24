@@ -114,6 +114,14 @@ jobs:
       - name: Fuzz (nightly, long)
         if: github.event_name == 'schedule'
         run: just fuzz 1800
+      # CI keeps no corpus, so without this a crash is lost with the runner.
+      - name: Keep crash inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore
 
   # Every systemd unit under packaging/, checked by systemd's own tools in a
   # Debian trixie container: `systemd-analyze verify` must say nothing, and
