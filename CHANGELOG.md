@@ -20,6 +20,7 @@ All notable changes to xudo are documented here. This project follows
 
 ### Security
 
+- The doas rule `xudo install` writes no longer says `persist`: an OpenDoas built with timestamp support cached the password for later runs of `xudo exec`. Test `doas_snippet_never_enables_credential_persistence`.
 - A queued claim records the reviewer uid and a claim token. Another reviewer cannot release, fail, or complete a fresh claim; after 15 minutes they may recover a stale claim, and only if the audit trail has no gate record for that nonce. A release or failure revokes the minted spool entry. The gate refuses a queued run whose queue record is not currently claimed for that nonce. Completion searches a bounded tail of the audit log under the log lock.
 - Let the broker read `/proc/sys/kernel/random/boot_id` by removing
   `ProcSubset=pid` from its unit. Keep `ProtectKernelTunables=yes`; the unit

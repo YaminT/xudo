@@ -183,11 +183,12 @@ fn sudo_honours(runner: &dyn Runner, absolute_path: &str, directive: &str) -> bo
 /// (`ci/differential/`), not by a unit test, because the fake runner at the
 /// time did not model the difference. It does now.
 fn doas_honours(runner: &dyn Runner, directive: &str) -> bool {
-    // Neither required control maps to a doas keyword: doas has no credential
-    // cache unless built --with-timestamp, so the *absence* of `persist` is the
-    // control, and every doas allocates a pty for its child. For both, the real
-    // question is whether the parser accepts a rule at all, so the option is
-    // omitted. Anything else is spliced in verbatim and must parse.
+    // Neither control maps to a doas keyword. The credential cache is off only
+    // because the rule the snippet writes carries no `persist` (the snippet
+    // test `doas_snippet_never_enables_credential_persistence` pins that), so
+    // here the question is whether the parser accepts a rule at all. doas does
+    // NOT give its child a new pty; `pty` is a parse check only, not proof of
+    // one. Anything else is spliced in verbatim and must parse.
     let option = if matches!(directive, "nopersist" | "pty") {
         String::new()
     } else {

@@ -27,8 +27,8 @@
 //! * `doas` has no drop-in directory on most ports, so its integration is a
 //!   sentinel-delimited block appended under a lock — and it must be removable
 //!   exactly.
-//! * `OpenDoas` disables `persist` unless built `--with-timestamp`, so xudo never
-//!   depends on backend credential caching in either direction.
+//! * `OpenDoas` caches a password only for a rule that says `persist` (and only
+//!   when built `--with-timestamp`), so xudo's doas rule never contains it.
 
 #![forbid(unsafe_code)]
 
