@@ -62,8 +62,8 @@ pub enum Capability {
     RejectsArgumentWildcards,
     /// A credential cache that persists across invocations exists at all.
     ///
-    /// `OpenDoas` disables `persist` unless built `--with-timestamp`. Recorded so
-    /// xudo can state that it does not depend on it either way.
+    /// `OpenDoas` honours `persist` only when built `--with-timestamp`. Recorded
+    /// for `xudo doctor`; xudo's doas rule never says `persist`.
     PersistentCredentialCache,
 }
 
