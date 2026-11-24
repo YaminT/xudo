@@ -2229,7 +2229,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(result.is_err(), "trickling reply was accepted: {result:?}");
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < Duration::from_millis(500),
             "deadline took {elapsed:?}"
         );
         broker.join().unwrap();
@@ -2576,7 +2576,7 @@ mod tests {
         let _ = release_tx.send(());
         assert_eq!(result, Err(ExitCode::Unusable));
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < Duration::from_millis(450),
             "silent broker held the client for {elapsed:?}"
         );
         held.join().unwrap();

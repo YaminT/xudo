@@ -1676,7 +1676,7 @@ mod tests {
             elapsed >= Duration::from_millis(100),
             "returned immediately: {elapsed:?}"
         );
-        assert!(elapsed < Duration::from_millis(1500), "hung: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "hung: {elapsed:?}");
 
         let socket = path.clone();
         let started = Instant::now();
