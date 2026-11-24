@@ -406,16 +406,9 @@ else
     cat /var/tmp/freeze.out >&2
 fi
 clear_confirm freeze_approve none
-set +e
-su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && [ -f "$frozen" ]; then
-    good "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc)"
-else
-    bad "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc, frozen file: $([ -f "$frozen" ] && echo present || echo gone))"
-    cat /var/tmp/nonroot-thaw.out >&2
-fi
+# Only a positively human, non-harness caller may thaw. In this lane an
+# ordinary user is unattested, so the broker refuses (exit 17) and removes
+# nothing; root's thaw (what `sudo xudo thaw` runs) lifts every marker.
 user_frozen=/var/lib/xudo/frozen-$test_uid
 set +e
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/var/tmp/user-freeze.out 2>&1
@@ -428,14 +421,14 @@ else
     cat /var/tmp/user-freeze.out >&2
 fi
 set +e
-su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/user-thaw.out 2>&1
+su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && [ ! -e "$user_frozen" ] && [ -f "$frozen" ]; then
-    good "a_users_thaw_removes_only_their_own_marker"
+if [ "$rc" -eq 17 ] && [ -f "$frozen" ] && [ -f "$user_frozen" ]; then
+    good "an_unattested_users_thaw_is_refused_and_removes_nothing (rc=$rc)"
 else
-    bad "a_users_thaw_removes_only_their_own_marker (rc=$rc)"
-    cat /var/tmp/user-thaw.out >&2
+    bad "an_unattested_users_thaw_is_refused_and_removes_nothing (rc=$rc, global: $([ -f "$frozen" ] && echo present || echo gone), user: $([ -f "$user_frozen" ] && echo present || echo gone))"
+    cat /var/tmp/nonroot-thaw.out >&2
 fi
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/dev/null 2>&1 || true
 if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ] && [ ! -e "$user_frozen" ]; then

@@ -99,9 +99,9 @@ pub enum PolicyError {
     /// The settings bytes could not be interpreted.
     #[error(transparent)]
     Config(SettingsError),
-    /// `/etc/passwd` is missing, empty, or not UTF-8. Without it no enrolled
-    /// agent can be told from a human, so the policy does not load.
-    #[error("the account database is missing, empty, or not UTF-8")]
+    /// `/etc/passwd` is missing or empty. Without it no enrolled agent can be
+    /// told from a human, so the policy does not load.
+    #[error("the account database is missing or empty")]
     PasswdUnusable,
 }
 
@@ -136,8 +136,14 @@ fn attach_passwd(
     passwd: Result<Option<Vec<u8>>, PolicyError>,
 ) -> Result<LoadedPolicy, PolicyError> {
     let mut loaded = loaded?;
+    // Lossy on purpose. Any user may put a stray byte in their own GECOS
+    // (`chfn`), and a strict decode would let one user stop every request. The
+    // name and uid fields are ASCII (`valid_account_name`) and only root edits
+    // uids, so a replacement character, which is neither a newline nor a
+    // colon, cannot change who resolves to which uid. Skipping a bad line
+    // instead would let a harness user hide their own uid, so never do that.
     loaded.passwd = passwd?
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .filter(|text| !text.is_empty())
         .ok_or(PolicyError::PasswdUnusable)?;
     Ok(loaded)
@@ -346,27 +352,53 @@ mod tests {
         let error = attach_passwd(Ok(loaded), Ok(None)).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "the account database is missing, empty, or not UTF-8"
+            "the account database is missing or empty"
         );
     }
 
     #[test]
-    fn an_empty_or_non_utf8_passwd_fails_the_load_closed() {
-        for bytes in [Vec::new(), b"agent:x:1000\xff\n".to_vec()] {
-            let loaded = load_with(
-                Path::new("rules"),
-                Path::new("config.toml"),
-                &empty_rules,
-                &|_, _| Ok(None),
-                &ABSENT_FREEZE,
-            )
-            .unwrap();
-            let error = attach_passwd(Ok(loaded), Ok(Some(bytes))).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "the account database is missing, empty, or not UTF-8"
-            );
-        }
+    fn an_empty_passwd_still_fails_the_load_closed() {
+        let error = attach_passwd(Ok(loaded_policy()), Ok(Some(Vec::new()))).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the account database is missing or empty"
+        );
+    }
+
+    fn loaded_policy() -> LoadedPolicy {
+        load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &ABSENT_FREEZE,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_non_utf8_gecos_does_not_stop_the_policy_load() {
+        // `chfn -r $'\xff'`: any user can do this to their own line.
+        let bytes =
+            b"root:x:0:0:root:/root:/bin/sh\nmallory:x:1001:1001:\xff\xfe:/home/m:/bin/sh\n";
+        let attached = attach_passwd(Ok(loaded_policy()), Ok(Some(bytes.to_vec()))).unwrap();
+        assert!(attached.passwd.contains("mallory:x:1001:1001:\u{fffd}"));
+    }
+
+    #[test]
+    fn a_non_utf8_byte_cannot_change_a_name_or_uid_field() {
+        let bytes = b"agent:x:1000:1000:\xff\n:x:0:0:evil:/:/bin/sh\nbob\xff:x:0:0::/:/bin/sh\nroot:x:0:0:\xff:/root:/bin/sh\n";
+        let attached = attach_passwd(Ok(loaded_policy()), Ok(Some(bytes.to_vec()))).unwrap();
+        let text = &attached.passwd;
+        assert_eq!(xudo_policy::passwd_uid(text, "agent"), Some(1000));
+        assert_eq!(xudo_policy::passwd_uid(text, "root"), Some(0));
+        // A damaged name does not become a clean one, and no new name appears.
+        assert_eq!(xudo_policy::passwd_uid(text, "bob"), None);
+        assert_eq!(xudo_policy::passwd_uid(text, "evil"), None);
+        assert_eq!(
+            text.lines().count(),
+            bytes.split(|b| *b == b'\n').count() - 1
+        );
     }
 
     #[test]

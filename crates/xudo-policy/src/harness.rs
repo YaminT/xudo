@@ -464,12 +464,13 @@ pub fn passwd_uid(text: &str, name: &str) -> Option<u32> {
     line.split(':').nth(2)?.parse().ok()
 }
 
-/// [`passwd_uid`] over bytes already read. Invalid UTF-8 and a failed read
-/// are both "no such account".
+/// [`passwd_uid`] over bytes already read. A failed read is "no such account".
+/// Stray non-UTF-8 bytes (a GECOS field the user edited) are read lossily:
+/// the name and uid fields are ASCII, and a replacement character is neither
+/// a newline nor a colon, so it cannot move a line or a field boundary.
 pub fn uid_from_passwd_read<E>(read: Result<Vec<u8>, E>, name: &str) -> Option<u32> {
     let bytes = read.ok()?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    passwd_uid(text, name)
+    passwd_uid(&String::from_utf8_lossy(&bytes), name)
 }
 
 fn put(out: &mut Vec<u8>, field: &[u8]) {
@@ -831,6 +832,16 @@ max-sessions = 1
         assert_eq!(
             uid_from_passwd_read(Ok::<_, ()>(vec![0xff, 0xfe]), "agent"),
             None
+        );
+        assert_eq!(
+            uid_from_passwd_read(
+                Ok::<_, ()>(
+                    b"root:x:0:0:\xff:/root:/bin/sh\nagent:x:1000:1000:\xff\xfe:/:/bin/sh\n"
+                        .to_vec()
+                ),
+                "agent"
+            ),
+            Some(1000)
         );
         assert_eq!(uid_from_passwd_read(Err::<Vec<u8>, _>(()), "agent"), None);
         assert_eq!(

@@ -2686,7 +2686,7 @@ fn refuse_harness_uid_thaw(identity: &PeerIdentity, harness_uid: bool) -> Result
     if identity.uid != 0 && harness_uid {
         return Err(Refusal::client(
             RefusalCode::ChannelUntrusted,
-            "this account runs an agent harness: use `sudo xudo thaw`",
+            "this account runs an agent harness: use `sudo xudo thaw`, which lifts ALL freezes (the global one and every user's)",
         ));
     }
     Ok(())
@@ -11749,6 +11749,22 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn a_harness_user_with_a_non_utf8_gecos_is_still_refused_a_thaw() {
+        // The poisoned-GECOS attack: alice puts a stray byte in her own line
+        // hoping the line is skipped and her uid stops being a harness uid.
+        // The loader reads passwd lossily, so the line still resolves.
+        let mut host = thaw_host(1000, SESSION_HARNESS, &[1000]);
+        let bytes = b"alice:x:1000:1000:\xff\xfe:/home/alice:/bin/sh\nalias:x:1000:1000:\xff:/home/alice:/bin/sh\nbob:x:2000:2000::/home/bob:/bin/sh\nroot:x:0:0::/root:/bin/sh\n";
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.passwd = String::from_utf8_lossy(bytes).into_owned();
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 1000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
     fn a_user_who_is_not_a_harness_uid_still_thaws_their_own_marker() {
         let mut host = thaw_host(2000, SESSION_HARNESS, &[1000, 2000]);
         let (served, code) = thaw_outside(&mut host, 2000);
@@ -11788,9 +11804,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn an_unusable_passwd_refuses_freeze_and_thaw() {
-        // A non-UTF-8 passwd never loads (the load itself fails); an empty
-        // one that got past a faulty source is refused here too.
+    fn an_empty_passwd_refuses_freeze_and_thaw() {
+        // An empty or missing passwd never loads (the load itself fails); an
+        // empty one that got past a faulty source is refused here too.
         for unloadable in [true, false] {
             let mut host = Host::honest();
             host.policy.answer = if unloadable {
