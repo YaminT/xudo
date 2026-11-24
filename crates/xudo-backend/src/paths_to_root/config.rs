@@ -344,6 +344,116 @@ pub(super) fn scan_doas(bytes: &[u8]) -> Vec<RuleLine> {
         .collect()
 }
 
+/// One doas `permit` or `deny` rule, read for who it names and what it does to
+/// the password. doas uses the last rule that matches, so order matters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DoasRule {
+    /// Its first physical line, counting from 1.
+    pub(super) line: usize,
+    /// The rule, continuation lines joined with a space.
+    pub(super) text: Vec<u8>,
+    /// `permit` (true) or `deny`.
+    pub(super) permit: bool,
+    /// The identity, unquoted: `user`, `:group`, or either by number.
+    pub(super) identity: Vec<u8>,
+    /// The rule carries `persist`.
+    pub(super) persist: bool,
+    /// The rule carries `nopass`.
+    pub(super) nopass: bool,
+    /// Who it runs as, after `as`; none means root.
+    pub(super) target: Option<Vec<u8>>,
+    /// The program after `cmd`; none means any command.
+    pub(super) cmd: Option<Vec<u8>>,
+}
+
+/// Reads every `permit` and `deny` rule of one doas file, in order. A line the
+/// lexer cannot be modelled on is left out: `doas_unmodelled` reports it.
+pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
+    logical_lines(bytes, is_hash_comment, Dialect::Doas)
+        .logical
+        .into_iter()
+        .filter(|logical| !logical.uncertain)
+        .filter_map(|logical| {
+            let trimmed = logical.text.trim_ascii_start();
+            let (permit, rest) = match word_at_start(trimmed, b"permit") {
+                Some(rest) => (true, rest),
+                None => (false, word_at_start(trimmed, b"deny")?),
+            };
+            let words = doas_words(rest);
+            let mut tokens = words.iter().map(Vec::as_slice);
+            let (mut persist, mut nopass) = (false, false);
+            let mut identity = None;
+            while let Some(token) = tokens.next() {
+                match token {
+                    b"nopass" => nopass = true,
+                    b"persist" => persist = true,
+                    b"nolog" | b"keepenv" => {}
+                    b"setenv" => {
+                        // `setenv` takes a brace-wrapped list; without both
+                        // braces doas refuses the file.
+                        if tokens.next() != Some(b"{".as_slice())
+                            || !tokens.by_ref().any(|token| token == b"}")
+                        {
+                            return None;
+                        }
+                    }
+                    other => {
+                        identity = Some(other.to_vec());
+                        break;
+                    }
+                }
+            }
+            let (mut target, mut cmd) = (None, None);
+            while let Some(token) = tokens.next() {
+                match token {
+                    b"as" => target = tokens.next().map(<[u8]>::to_vec),
+                    b"cmd" => {
+                        cmd = tokens.next().map(<[u8]>::to_vec);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Some(DoasRule {
+                line: logical.line,
+                text: logical.text,
+                permit,
+                identity: identity?,
+                persist,
+                nopass,
+                target,
+                cmd,
+            })
+        })
+        .collect()
+}
+
+/// The words of a doas rule the way `OpenDoas`'s lexer cuts them: a `#` ends
+/// the line, blanks separate words, `{` and `}` are words of their own, and
+/// double quotes only group (they are dropped). A quote on a line with a `#`
+/// or a backslash is already unmodelled, so it is never read here.
+fn doas_words(text: &[u8]) -> Vec<Vec<u8>> {
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    let mut word: Vec<u8> = Vec::new();
+    let mut quoted = false;
+    for byte in text.iter().copied() {
+        match byte {
+            b'#' if !quoted => break,
+            b'"' => quoted = !quoted,
+            b'{' | b'}' if !quoted => {
+                words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+                words.push(vec![byte]);
+            }
+            _ if byte.is_ascii_whitespace() && !quoted => {
+                words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+            }
+            _ => word.push(byte),
+        }
+    }
+    words.extend((!word.is_empty()).then_some(word));
+    words
+}
+
 /// The physical lines (from 1) of a doas file whose reading depends on lexer
 /// behaviour this module does not model.
 pub(super) fn doas_unmodelled(bytes: &[u8]) -> Vec<usize> {
