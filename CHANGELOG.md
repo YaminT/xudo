@@ -10,12 +10,20 @@ All notable changes to xudo are documented here. This project follows
 - `xudo op remove-path <target>` removes a path under an `[[operation]]` rule
   through the password-authenticated gate. `--dry-run` lists the paths and
   removes nothing. A `harness` label on the rule is parsed and checked against
-  the registry and is not a grant. Harness use of this operation is planned.
+  the registry and is not a grant. Harness use of this operation is not built yet.
   The passwordless gate is not in this release.
+- Operator `[[deny]]` tables in rule files: `id`, `reason`, `program`, `all` with `any-arg` or `any-deb-name` clauses. A deny rule only narrows an action. `[[test]]` gains `deny-rule`. `xudo check` warns (exit 20) on a deny rule that no test names.
+- A harness registry, `/etc/xudo/harnesses.d/<label>.toml` (`label`, `way`, `account`, `users`, `reviewers`, `max-sessions`), and the action keys `harness` and `outcome` (`allow`, `ask-human`). `outcome = "ask-human"` requires a non-empty `harness`, and a label missing from the registry fails the load. `xudo check` reports a lint error (exit 21) when a harness action uses `path-under` or `pattern`, sets `agent-allowed = false`, names a GTFOBins program without a waiver, or has no near-miss deny test. Nothing grants a passwordless run, and nothing in this release creates an agent scope.
+- The broker and the gate classify each caller from its cgroup: human, unattested, or inside a root-made agent scope named by the registry.
+- Setting `queue_ttl_secs` (default and maximum 86400).
+
+### Removed
+
+- `xudo exec --queue`. A refused request is no longer copied into the caller's `ido` queue. Queue work for a human with `ido queue --root -- <command>`.
 
 ### Changed
 
-- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. A human reviewer runs a queued entry with `xudo exec --queued ID`: the broker re-decides the stored argv, the password gate runs it in `/`, and the entry is completed only from that gate's audit record. `ido` lists the root-held queue separately from the agent-editable user queue. The passwordless gate is not in this release.
+- Ask-human rules now use denial code `ask_human` and send a verified, explicitly listed harness request to the broker's root-held queue by default. The queue stores byte-exact argv and cwd, enforces per-uid and global bounds, uses boottime expiry, and returns entries only to their owner for status or to a Human-classified configured reviewer. Human-path denials are no longer written into the caller-owned `ido` queue. A human reviewer runs a queued entry with `xudo exec --queued ID`: the broker re-decides the stored argv, the password gate runs it in `/`, and the entry is completed only from that gate's audit record. `ido` lists the root-held queue separately from the agent-editable user queue. The passwordless gate is not in this release. No caller can reach this queue until agent enrolment ships: nothing in this release creates an agent scope.
 - `ido list --json` always prints one JSON object with `user` (the previous user-queue array), `root_held`, and `root_queue_unavailable`, including when the root-held list is empty.
 
 ### Security
@@ -40,10 +48,8 @@ All notable changes to xudo are documented here. This project follows
 - Ship active `00-protect.toml` rules that refuse removal of xudo, sudo,
   sudo-rs, AppArmor, audit, firewall, logging, time-sync, and SSH server
   packages through the shipped `apt-get remove` action. Its other clauses are
-  tripwires for broader operator actions. The policy loader still rejects deny
-  rules for programs with no loaded action, so apt and dpkg tripwires are tested
-  with broad test-only operator actions until those executables have shipped actions.
-- Protect `/usr/bin/xudo`, `/usr/bin/ido`, and `/usr/libexec/xudo/xudod` from
+  tripwires for broader operator actions. A deny rule for a program that no loaded action runs loads inert; `xudo check` and `xudo doctor` say so. The apt and dpkg tripwires are tested against broad test-only operator actions.
+- Protect `/usr/bin/xudo`, `/usr/bin/ido` and `/usr/bin/willyoumarryme` from
   xudo-mediated writes; bump the compiled deny-list version to 7.
 
 - `path-under` is lexical only. Nothing in xudo enforces containment for

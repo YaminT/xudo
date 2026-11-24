@@ -15,6 +15,7 @@ Nothing is ever placed under
 One queue per user.
 There is no shared queue: a shared queue is a way for one user to get another
 user to run their command.
+The broker's root\-held review queue, /var/lib/xudo/queue, is a different store that only root writes; ido reads it through the broker, never from disk.
 .SH PERMISSIONS
 The directory is created
 .B 0700

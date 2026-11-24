@@ -21,6 +21,42 @@ one named
 per label. They are root-owned policy inputs and contribute to the ruleset
 generation. A missing or changed registration invalidates records that name
 the old entry.
+.SH HARNESS REGISTRY
+Each
+.I /etc/xudo/harnesses.d/<label>.toml
+file holds one registration.
+Keys are kebab-case and an unknown key is a hard error.
+.TP
+.B label
+The harness label, matching
+.BR [a-z][a-z0-9\-]{0,31} .
+.TP
+.B way
+.B service
+or
+.BR session .
+.TP
+.B account
+For
+.BR service :
+the account the harness runs as.
+.TP
+.B users
+For
+.BR session :
+the users who may start a session.
+.TP
+.B reviewers
+Account names that may claim a queued entry, at most 32.
+.TP
+.B max\-sessions
+At most 1024.
+It is stored and hashed but not enforced yet.
+.PP
+The package ships the directory empty.
+A registration names a scope root made for an agent.
+Nothing in this release creates such a scope, so no caller can be a registered
+agent yet.
 .SH LOCATION
 The default directory is
 .IR /etc/xudo/rules.d/ .
@@ -53,21 +89,17 @@ A rule cannot set
 .BR source :
 that key is rejected.
 .SH FILE
-The top-level keys are
-.BR action ,
-written as one
-.B [[action]]
-table per action,
-.BR operation ,
-written as one
+The top-level keys are action, deny, operation and test, each written as an array of tables:
+.BR [[action]] ,
+.B [[deny]]
+(see
+.BR "Operator deny rules" ),
 .B [[operation]]
-table per typed operation (see
-.BR OPERATION ),
+(see
+.BR OPERATION )
 and
-.BR test ,
-written as one
 .B [[test]]
-table per test (see
+(see
 .BR TESTS ).
 .TP
 .B id
@@ -84,7 +116,7 @@ One of
 .BR net\-filter ,
 .BR critical .
 .B critical
-always demands confirmation.
+always demands confirmation (with confirm_human_path off, the default, the password is the confirmation).
 .TP
 .B exe
 Absolute path of the program.
@@ -113,34 +145,26 @@ When a human must approve.
 .B default
 (the default) keeps the human password path in force.
 .B always
-asks a person for every caller.
-On the human path the password is that answer, plus an approval in
-.B xudo watch
-when
-.B confirm_human_path
-is on.
-In the design a verified harness never waits for a live approval: a command
-that needs a person goes to the
-.B ido
-queue.
+with confirm_human_path = true, the request also needs an approval typed into
+.BR "xudo watch" ;
+with the default (false), the password is that confirmation.
 .B never
-skips confirmation for this action.
-A rule that lists no
-.B harness
-is never passwordless, and confirming an agent under
-.B never
-is part of the passwordless step still to come.
-It is not a grant against a stricter overlapping action, and a
+means no extra confirmation; it cannot lift a stricter overlapping action, and a
 .B critical
 action cannot set it.
+No value of
+.B confirm
+makes a command passwordless.
 Overlapping actions resolve to the strictest requirement.
 File order does not decide whether confirmation is demanded.
 .TP
 .B agent\-allowed
-Whether a verified harness may run this action.
+Whether a registered agent may run this action (false makes it human-only).
 The default is true.
-.B false
-makes it human-only.
+It has no effect until agents can be registered.
+With
+.B harness
+it is a lint error.
 .TP
 .B env\-allow
 Environment variable names to pass through, by exact name.
@@ -149,27 +173,35 @@ The child's environment is built from scratch, so a name on no list does not
 exist for the child.
 .TP
 .B harness
-Labels from the root-owned harness registry. Without this key, an action is
-eligible for a verified harness only when the broker's kernel classification
-and root-owned registry agree on that label. A listed label is not proof of
-identity by itself.
+Labels from the root-owned registry.
+With outcome = allow, a label marks the action for a passwordless run by that registered agent, which is not built: today it grants nothing.
+Without the key an action is never passwordless.
+A label not in the registry fails the load.
+A harness action is linted more strictly (see
+.BR xudo (1),
+check).
 .TP
 .B outcome
-The outcome for a verified harness named by
+The outcome for a registered agent named by
 .B harness :
 .B allow
-uses the normal policy path; this is the default. The
+is the default and grants nothing extra today.
 .B ask-human
-outcome submits the request to the broker's root-held queue and denies the
-current request. For this outcome, the action must list the caller's verified
-harness label; an empty or different list does not queue it. A human-path
-denial is never queued. A command with no matching rule is denied. A human
-reviewer runs the queued entry with
+requires a non-empty
+.BR harness ;
+without one the file fails to load.
+It submits the request to the broker's root-held queue and denies the
+current request.
+The action must list the caller's registered harness label; an empty or different list does not queue it.
+A human-path denial is never queued.
+A command with no matching rule is denied.
+A person classified as human, named in the registration's reviewers and not the entry's owner runs the queued entry with
 .B xudo exec \-\-queued
 through the password-authenticated gate, and
 .B ido
-lists it separately from the user-side queue. The passwordless gate is not
-installed.
+lists it separately from the user-side queue.
+No caller can be a registered agent in this release (nothing creates an agent scope), so nothing reaches the queue yet.
+The passwordless gate is not installed.
 .SH OPERATION
 An
 .B [[operation]]
@@ -191,7 +223,7 @@ A
 .B harness
 list is parsed and checked against the registry.
 It is not a grant.
-Harness use is planned.
+Harness use is not built yet.
 This release runs the operation only on the password path.
 .TP
 .B id
@@ -312,6 +344,11 @@ An id the ruleset does not define is a test error, not a pass.
 .B reason
 Optional text shown when the test fails.
 Displayed with terminal escapes removed.
+.TP
+.B deny\-rule
+Optional.
+The [[deny]] id that must refuse the command.
+A deny rule that no test names is a lint warning.
 .PP
 A test is always decided for a caller classified as a human, with the default
 settings, so the result does not depend on the machine.
@@ -603,6 +640,32 @@ cannot start those names.
 An operator may add
 .B [[deny]]
 tables to refuse selected commands after an action matches.
+A table has
+.B id
+(unique across actions and deny rules),
+.B reason
+(shown when it refuses),
+.B program
+(a list of executable basenames it applies to), and
+.B all
+(a list of clauses, each holding exactly one of any\-arg or any\-deb\-name; every clause must match; an empty list matches every call of program).
+A deny rule only narrows: it applies after an action matched.
+One whose program no loaded action runs loads inert.
+The shipped
+.I 00\-protect.toml
+is the model, shortened here:
+.PP
+.EX
+[[deny]]
+id = "xudo.protect.pkg-remove"
+reason = "xudo protects itself and core security packages from removal"
+program = ["apt-get", "apt"]
+all = [
+  { any-arg = ["remove", "purge", "autoremove"] },
+  { any-deb-name = ["xudo", "sudo", "openssh-server"] },
+]
+.EE
+.PP
 Each
 .B any\-arg
 member is compared with one argv element byte for byte. No option parsing

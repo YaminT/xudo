@@ -23,5 +23,11 @@ args = [
   { name = "verb", matcher = { one-of = ["start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "try-reload-or-restart"] } },
   { name = "unit", matcher = { one-of = ["example.service", "example-other.service"] } },
 ]</code></pre>
+<p>A rule file can also hold <code>[[deny]]</code> tables, which refuse a command an action would accept, and <code>[[test]]</code> tables that state the expected decision. A near-miss test from the lifecycle example:</p>
+<pre><code>[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "restart", "nginx.service"]
+expect = "deny"
+reason = "near miss: nginx.service is not in the operator's list"</code></pre>
+<p><code>xudo check</code> lints and tests the rules and exits 20 for a warning, 21 for an error and 22 for a failing test.</p>
 <p>See the repository's <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rule files</a> and <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">behavior source</a>.</p>
 </main><footer><a href="./">xudo documentation</a></footer></body></html>

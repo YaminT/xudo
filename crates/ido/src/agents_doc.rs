@@ -20,7 +20,7 @@ use crate::error::IdoError;
 
 /// Opening marker. The version lets a later `ido` recognise and replace an
 /// older block.
-pub const BEGIN: &str = "<!-- ido:begin v2 -->";
+pub const BEGIN: &str = "<!-- ido:begin v3 -->";
 
 /// Prefix shared by every version's opening marker.
 const BEGIN_PREFIX: &str = "<!-- ido:begin";
@@ -30,7 +30,7 @@ pub const END: &str = "<!-- ido:end -->";
 
 /// The instructions, in short imperative sentences: this text is parsed by a
 /// model, and hedging produces exactly the ambiguity that gets misread.
-pub const BLOCK: &str = "<!-- ido:begin v2 -->
+pub const BLOCK: &str = "<!-- ido:begin v3 -->
 ## Privileged and high-consequence commands
 
 Do not run commands that need sudo. Do not run cloud CLI commands that write.
@@ -41,7 +41,7 @@ Queue them for the user instead:
 
 Example:
 
-    ido queue -m \"install ripgrep for code search\" -- apt-get install -y ripgrep
+    ido queue --root -m \"install ripgrep for code search\" -- /usr/bin/apt-get -y --no-install-recommends --no-remove install -- ripgrep
 
 The user runs `ido` later and picks what to run. Do not wait for it. Do not ask
 the user to run the command by hand.
@@ -55,7 +55,7 @@ Rules:
 - Queue one command per call.
 - Write a real argument list after `--`. Do not write a shell string.
 - Do not queue the same command twice.
-- If the command needs root, add `--root`. The user's `ido` runs it as `xudo exec`.
+- If the command needs root, add `--root` and write the program as an absolute path. The user's `ido` runs it as `xudo exec`.
 - Never run `ido run` or `ido drop`. Only the user runs or drops queued commands.
 - Say what you queued. Then say: \"Run `ido` to execute it.\"
 <!-- ido:end -->
@@ -315,7 +315,7 @@ commands\n\nQueue them with `ido queue`.\n<!-- ido:end -->\n";
         assert_eq!(new, format!("{before}{BLOCK}{after}"));
         assert_eq!(new.matches("<!-- ido:begin").count(), 1);
         assert!(!new.contains("ido:begin v1"));
-        assert!(new.contains("ido:begin v2"));
+        assert!(new.contains("ido:begin v3"));
         assert!(new.contains("Never run `ido run` or `ido drop`"));
         assert_eq!(
             splice(&new).unwrap(),
@@ -332,6 +332,17 @@ commands\n\nQueue them with `ido queue`.\n<!-- ido:end -->\n";
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
         assert_eq!(add(&file).unwrap(), Added::Unchanged(file.clone()));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+    }
+
+    #[test]
+    fn the_example_an_agent_copies_is_a_root_queue_command_with_an_absolute_program() {
+        assert!(BLOCK.contains(
+            "ido queue --root -m \"install ripgrep for code search\" -- /usr/bin/apt-get -y \
+--no-install-recommends --no-remove install -- ripgrep"
+        ));
+        let old = format!("{}\nold example\n{END}\n", "<!-- ido:begin v2 -->");
+        let new = splice(&old).unwrap();
+        assert_eq!(new, BLOCK, "a v2 block is replaced by the current one");
     }
 
     #[test]

@@ -5,7 +5,7 @@ ido \- a queue of commands an agent asked you to run
 .B ido
 .br
 .B ido queue
-.RB [ \-m
+.RB [ \-m | \-\-reason
 .IR text ]
 .RB [ \-\-group
 .IR name ]
@@ -61,6 +61,8 @@ You run
 .BR ido ,
 see the queue, and choose what to run, in your own terminal.
 Nothing runs without a keystroke from you.
+.B ido
+shows two lists: your own queue, which the agent writes and can edit, and the broker's root\-held review queue, which only root writes (empty until agents can be registered).
 .PP
 .B ido
 holds no privilege.
@@ -112,9 +114,6 @@ as separate arguments, never through a shell.
 If
 .B xudo
 is not installed at that path the entry is not run and stays queued.
-Entries queued by
-.B xudo exec \-\-queue
-carry the marker.
 .TP
 .B add
 Writes the agent instructions between

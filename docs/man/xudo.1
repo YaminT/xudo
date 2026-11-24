@@ -87,6 +87,16 @@ xudo \- decide whether a privileged command runs as root
 .IR harness ]
 .RB [ options ]
 .br
+.B xudo pending
+.br
+.B xudo watch
+.br
+.B xudo freeze
+.B \-\-reason
+.I text
+.br
+.B xudo thaw
+.br
 .B xudo help
 .RI [ command ]
 .SH DESCRIPTION
@@ -179,7 +189,7 @@ A
 .B harness
 label on the rule is parsed and checked against the registry.
 It is not a grant.
-Harness use is planned.
+Harness use is not built yet.
 This command uses the password path only.
 The passwordless gate is not in this release.
 .TP
@@ -193,7 +203,7 @@ A policy refusal happens before the command runs.
 .IP
 Human-path denials are not written to the invoking user's
 .BR ido (1)
-queue. A verified harness request matched by an
+queue. A registered agent's request matched by an
 .B ask-human
 rule is stored by the broker in its root-held queue.
 .B xudo exec \-\-queued
@@ -201,7 +211,7 @@ rule is stored by the broker in its root-held queue.
 claims that entry for a fresh decision against the current rules. The stored
 working directory is not used; the command runs in
 .BR / .
-Only a human reviewer who does not own the entry can claim it. The run uses
+Only a caller classified as human, named in the harness entry's reviewers, and not the entry's owner can claim it. The run uses
 the same scoped sudo rule as any other xudo authorization, so sudo asks for
 the password. Its
 .B timestamp_timeout=0
@@ -209,7 +219,7 @@ setting prevents it from reusing a sudo credential cached by an earlier
 terminal login; the backend tests pin this setting in the generated rule.
 The entry is marked done only after the gate's audit record for that run.
 A denied password releases the claim back to pending. A rules change after
-queueing denies the run. The passwordless gate is not installed.
+queueing denies the run. No caller can be a registered agent in this release (nothing creates an agent scope), so the root-held queue stays empty. The passwordless gate is not installed.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
@@ -250,12 +260,11 @@ Freeze the agent path with an operator supplied reason. The scope is the
 caller's. A user's freeze stops only that user's own agents: it writes a
 marker named by the user's uid, and root's global freeze is untouched.
 Root's freeze is global and stops every user's agents. An attested agent
-cannot freeze, and neither can a peer in another user namespace. Until the
-passwordless agent path ships this sets the flag but changes nothing for new
-requests or for human requests: every caller is unattested, and the human password path
-stays available. Pending or approved requests of a verified harness in the
-freezer's scope (every user's, for root) are denied and audited, without a
-backoff strike; a human's pending request is left alone.
+cannot freeze, and neither can a peer in another user namespace. Until agents can be registered, this sets the flag but changes nothing for new
+requests: no caller is a registered agent, and the password path stays
+available. A pending request from a registered agent in the freezer's scope
+(every user's, for root) would be denied and audited; a human's pending
+request is left alone.
 .TP
 .B thaw
 Lift the caller's own freeze and resume that scope. A user's thaw removes only
@@ -278,6 +287,8 @@ An action that allowlists an executable the compiled-in deny-list refuses is a
 lint error.
 A systemctl rule that can start or stop a unit it does not name is a lint
 error too.
+An action with a harness key is a lint error when it uses path\-under or pattern, sets agent\-allowed = false, names a GTFOBins program without a waiver, or has no near\-miss deny test (JSON: harness_lints).
+Every path\-under matcher, and a [[deny]] rule no test names, is a lint warning.
 In the JSON envelope both sit under
 .BR lint :
 deny-list hits in
@@ -519,12 +530,11 @@ that could not be read, or a status that does not fit in a byte.
 .TP
 .B 20
 .B check
-found a lint warning, and nothing worse.
+found a lint warning (overlapping actions, a path\-under matcher, an untested deny rule), and nothing worse.
 .TP
 .B 21
 .B check
-found a lint error: an action allowlists an executable the deny-list refuses,
-or a systemctl rule can start or stop a unit it does not name.
+found a lint error: a deny\-listed executable, an open systemctl unit, a harness\-rule lint, or a \-\-fuzz finding.
 .TP
 .B 22
 .B check
@@ -564,6 +574,18 @@ group
 .TP
 .I /var/lib/xudo/audit.jsonl
 The hash-chained audit log the broker and the gate append to.
+.TP
+.I /etc/xudo/harnesses.d/
+Agent registrations, one <label>.toml each; empty as shipped.
+.TP
+.I /var/lib/xudo/queue/
+The root-held review queue.
+.TP
+.I /usr/libexec/xudo/xudo\-gate\-auth
+The password-authenticated gate, run by sudo.
+.TP
+.I /usr/libexec/xudo/xudod
+The broker.
 .TP
 .I /etc/sudoers.d/xudo
 Written by

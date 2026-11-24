@@ -8,5 +8,7 @@
 ## Rules
 - [Rule files](https://github.com/YaminT/xudo/tree/main/rules/): Shipped TOML action rules.
 ## Manuals
+- [xudo(1)](https://github.com/YaminT/xudo/blob/main/docs/man/xudo.1): Commands, options and exit codes.
+- [xudo-rules(5)](https://github.com/YaminT/xudo/blob/main/docs/man/xudo-rules.5): Rule, deny-rule, test and harness registry format.
 - [ido(1)](https://github.com/YaminT/xudo/blob/main/docs/man/ido.1): Human-run queued command interface.
 - [ido-queue(5)](https://github.com/YaminT/xudo/blob/main/docs/man/ido-queue.5): Queue data format.

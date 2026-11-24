@@ -5,10 +5,11 @@
 <p>The design, in five steps (steps 2 and 4 are being built):</p>
 <ol>
 <li>You install one package and choose rule files: what agents may run, down to each argument.</li>
-<li>You verify a harness once (being built): on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
+<li>You verify a harness once (not built yet): on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
 <li>The agent runs <code>xudo exec -- &lt;command&gt;</code>. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.</li>
-<li>Allowed: runs as root now, with no password (being built). Needs a person: waits in <code>ido</code>. Anyone else: the normal <code>sudo</code> password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
+<li>Allowed: runs as root now, with no password (not built yet). Needs a person: waits in <code>ido</code>. Anyone else: the normal <code>sudo</code> password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
 <li>Everything is recorded in a log that shows any tampering.</li>
 </ol>
-<p>In this beta every request takes the password path. <code>ido</code> holds no privilege; a person runs its entries through xudo's password path.</p>
+<p>Errors fail closed. No caller can be a registered agent in this release, so every privileged request uses the human password path.</p>
+<p><code>ido</code> stores the exact argv for human review. It holds no privilege: an entry queued with <code>--root</code> runs through <code>xudo exec</code>, which asks for the password.</p>
 </main><footer><a href="./">xudo documentation</a></footer></body></html>

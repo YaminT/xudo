@@ -6,16 +6,16 @@
 precondition for 1.0. Until then, do not deploy this where a compromise would
 matter.
 
-The broker and password-authenticated gate are built. Every caller is currently
-classified as `Unattested`, so every request uses the password path. The
-package does not install a `NOPASSWD` rule. The passwordless agent path,
-Landlock confinement, and same-uid watcher separation are not in this release.
-Out-of-band confirmation through `xudo watch` is built but off by default. It
-is an optional extra on the human path; the agent path never depends
-on it. Every path still requires the password. Session and terminal checks do
-not prove a human: a same-uid agent can run `script -qc 'xudo watch'`. This
-limits only that extra. A cgroup scope for agents, not in this release, is
-needed to separate the agent from the human.
+The broker and the password-authenticated gate are built. Both can recognise a
+caller inside a scope that root made for a registered agent, but nothing in
+this release creates one, so every request takes the password path. The
+package installs no `NOPASSWD` rule. Passwordless runs, agent enrolment,
+Landlock confinement and a separate agent account are not in this release. An
+optional confirmation through `xudo watch` is built and off by default; it is
+an extra on the human path and the agent path never depends on it. Every path
+still requires the password. Session and terminal checks do not prove a human:
+a same-uid agent can run `script -qc 'xudo watch'`. This limits only that
+extra.
 
 The doas rule `xudo install` writes has no `persist`, so every run prompts even on an OpenDoas built
 with timestamp support. doas does not give its command a new pty, so a command that uses the
@@ -28,6 +28,13 @@ package, including a security package. On remove, a name containing `.` or
 `+` was read as a regular expression and could select many packages. The
 fixes, and what an operator who kept an old rule file should do, are in
 [CHANGELOG.md](CHANGELOG.md).
+
+No shipped rule starts or stops a service. To allow it, copy
+`/usr/share/xudo/examples/20-services-lifecycle.toml` into
+`/etc/xudo/rules.d/` and list your units with `one-of`. The built-in list
+refuses power, rescue, firewall, time-sync, journal and xudo's own units on any
+verb that acts, but it is a list of names: an alias it does not name gets past.
+If you kept a beta.1 `20-services.toml` during an upgrade, run `xudo check`.
 
 With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
 `confirm = "always"` is satisfied by the password alone. The shipped active
@@ -118,7 +125,8 @@ If you are reporting a design flaw rather than a bug, that is welcome and useful
 The limits of the design are the rest of this file. The product invariants are
 in `howiwork.md`: agent detection is not a security boundary; no caller gets
 passwordless root by mistake or by default; and a decision that needs a person
-is made where the requester cannot answer it.
+is made where the requester cannot answer it. Passwordless runs are not built
+yet, so today nothing runs without a password.
 
 ## What this does not protect against
 
@@ -154,12 +162,21 @@ one you know you lack.
   report can and cannot see.
 - **`xudo explain` does not verify the rules it reads.** It reads them by path,
   so that it works on a checkout; a tampered ruleset makes it print a wrong
-  answer to the human who asked. `exec` does not use the front-end's rule path. The broker and gate load through the privileged loader `xudo_sys::load_trusted_rules`, which refuses a ruleset with
+  answer to the human who asked. `exec` does not use the front-end's rule path. The broker and gate load through a trusted loader, which refuses a ruleset with
   any component that is not root's, is writable by group or world, is a
   symbolic link, or is on a mount a non-root user could have made — checked on
   the descriptors the rules are read through — and `xudo doctor` reports
   through it. The broker and gate use this trusted loader for privileged
   requests; `explain` itself remains an unprivileged inspection command.
+- **The review queue shows text the agent wrote.** A queued entry's reason is
+  agent-written and shown sanitised. Judge the exact argv, which is re-checked
+  against the current rules when you run it, in `/`. Only a person classified
+  as human and listed in the harness's `reviewers` may claim an entry, never
+  the account that queued it. The queue holds at most 32 entries per account
+  and 1024 in total, and an entry expires after `queue_ttl_secs` (at most one
+  day). A harness label names a scope root made, not a program: whatever runs
+  in that scope gets that label's rules. Nothing in this release creates such
+  a scope, so the queue stays empty.
 - **Not every user-writable filesystem is refused yet.** A mount that root made
   from a block device or loop file a user can write passes, and so does an
   overlay whose upper layer a user can write: what is checked is who made the

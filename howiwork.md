@@ -33,7 +33,9 @@ included, gets the machine's normal `sudo` password prompt. Every decision is
 recorded in a tamper-evident trail.
 
 Today's beta builds the password half only: every request, from anyone, asks
-for a password. The verified-harness half is being built.
+for a password. The verified-harness half is not built yet: the registry, the
+rule keys and the root-held queue exist in the code, but nothing in this
+release creates an agent scope, so no caller counts as a registered agent.
 
 The long-term shape is a system where xudo is part of the installed path of a
 machine built for agent work (ultimately a Linux distribution that ships it
@@ -92,20 +94,46 @@ A permission answers: *may requester Z perform action X in situation Y?*
 
 ### Permission sets
 
-A **permission set** groups named actions into something an admin can reason
-about — e.g. *web admin*: install from the web-server list (nginx, apache),
-write under `/var/www`, run `certbot` as root. **Predefined permission sets
-(PRS)** are shipped, reviewed sets the operator selects or imports.
+A **permission set** would group named actions into something an admin can
+reason about, for example *web admin*: install from the web-server list (nginx,
+apache), write under `/var/www`, run `certbot` as root. **Predefined permission
+sets** (rule packs) are not built yet. Today the shipped rules are the files in
+`/etc/xudo/rules.d/`.
 
 The engine's native, tested format is TOML under root-owned
-`/etc/xudo/rules.d/` (this is what ships today). YAML and JSON are accepted as
-*import formats* for permission sets: converted to the native rules, shown to
-the operator as a capability-level diff, and installed only after review.
-Every shipped set is tested as code and checked against the GTFOBins gate —
-a set that allowlists something shell-capable needs a written waiver naming
-why the rule makes the technique unreachable.
+`/etc/xudo/rules.d/` (this is what ships today). YAML and JSON import,
+converted to native rules and shown as a capability diff before install, is not
+built yet. Every shipped rule is tested as code and checked against the
+GTFOBins gate: a rule that allowlists something shell-capable needs a written
+waiver naming why the rule makes the technique unreachable.
+
+### Operator deny rules, protect rules, the registry and the queue
+
+These exist in the code today.
+
+- **`[[deny]]` tables.** A rule file may refuse a command an action would
+  accept: `id` (unique across actions and deny rules), `reason`, `program` (a
+  list of executable basenames) and `all` (a list of clauses, each holding
+  exactly one of `any-arg` or `any-deb-name`; every clause must match). A deny
+  rule only narrows. One whose program no loaded action runs loads inert, and
+  `xudo check` and `xudo doctor` say so.
+- **Protect rules.** `rules/00-protect.toml` ships active. Through xudo it
+  refuses removal of xudo, sudo, sudo-rs, AppArmor, auditd, firewall, logging,
+  time-sync and SSH server packages. It cannot stop the host's own `apt` or
+  `dpkg`.
+- **The harness registry.** Root-written `/etc/xudo/harnesses.d/<label>.toml`
+  files (`label`, `way`, `account` or `users`, `reviewers`, `max-sessions`;
+  the package ships the directory empty). An action may name labels with
+  `harness` and set `outcome` to `allow` or `ask-human`. Nothing in this
+  release creates an agent scope, so none of this can trigger yet.
+- **The root-held queue.** An `ask-human` request from a registered agent
+  would be stored in `/var/lib/xudo/queue`, which the agent cannot edit. A
+  person classified as human, named in the harness's `reviewers` and not the
+  entry's owner, runs it with `xudo exec --queued ID`.
 
 ### Temporary permissions
+
+*Not built yet.* None of the commands below exist.
 
 A **temporary permission** lets a harness use a defined permission, or a whole
 permission set, without asking the human each time, for a bounded window that
@@ -180,7 +208,7 @@ files first.
 | `xudo-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
 | `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: xudo ships no setuid bit anywhere. Two rules point at two hardlinks of the gate: `xudo-gate-nopass` (`NOPASSWD`, for a verified harness; not shipped yet) and `xudo-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. |
 | `ido` | user | The buffered human-run queue (below). Where the human's password is entered. |
-| `airead` | user | The read-only surface (below). |
+| `airead` | user | Not built yet. The read-only surface (below). |
 | `pasban` | root (scheduled) | The watchman (below). |
 
 ## The three outcomes
@@ -197,12 +225,18 @@ Every request resolves to exactly one of:
    never allowed this way (invariant 2): it takes the human path.
    *Not built yet:* harness verification and the passwordless hop. Today's
    beta ships only the `PASSWD` hop, so nothing runs without a password.
-3. **Needs a human** — a rule says a person must decide (a human-only action,
-   or one that requires confirmation). The command goes to the `ido` queue
-   with its exact arguments and the agent's reason, and it waits there. It
-   never resolves by itself. **This is where the human password lives**: the
-   person runs the entry, and the privileged step goes through the `PASSWD`
-   hop, which asks for it once.
+3. **Needs a human** — a rule with `outcome = "ask-human"` that lists the
+   caller's registered harness label. The broker denies the request and stores
+   its exact argv and the agent's reason in a root-held queue
+   (`/var/lib/xudo/queue`) that the agent cannot edit. A person classified as
+   human, named in that harness's `reviewers`, and not the entry's owner sees
+   it in `ido` and runs it with `xudo exec --queued ID`. The broker re-decides
+   it against the current rules, `sudo` asks for the password, and the command
+   runs in `/`. It never resolves by itself. A request from anyone else that a
+   rule refuses is denied, never queued. *Not built yet:* nothing in this
+   release creates an agent scope, so this queue stays empty until enrolment
+   ships. Separately, an agent can always hand work to a person with
+   `ido queue --root`, in the person's own editable queue.
 
 A human who runs `xudo` directly is on the same human path: `sudo` asks the
 password. An administrator who wants a second check there can turn on
@@ -217,12 +251,13 @@ When several rules accept the same command, the **strictest requirement wins**
 
 `ido` keeps a queue of commands an agent wanted but could not run. Each entry
 stores the exact argv (never re-parsed through a shell), the agent's stated
-reason, and an identifier; `ido {id}` runs one entry, `ido` opens the picker.
+reason, and an identifier; `ido run <id>` runs one entry, `ido` opens the picker.
 The admin is told when unfinished tasks exist.
 
-Today the queue is the user's own file. In the design, requests from a
-verified harness that need a human go into a root-held queue the agent cannot
-edit, and `ido` reads it.
+`ido` shows two lists: the user's own queue, which the agent writes and can
+edit, and the broker's root-held review queue, which only root writes and
+which `ido` reads through the broker. The root-held queue is empty until
+agents can be registered.
 
 Running an entry is a *human* act: it executes with the human's own authority,
 and anything privileged goes through xudo's human path, where the `PASSWD` hop
@@ -234,7 +269,7 @@ every run lands in the audit chain.
 
 ### airead
 
-`airead` is xudo's read-only twin: the same engine, the same attestation, the
+*Not built yet.* `airead` would be xudo's read-only twin: the same engine, the same attestation, the
 same audit trail, but it can only ever grant actions whose capability class is
 *reads* — no file writes, no database writes, no cloud-CLI mutations, no
 network egress that changes state. The separation is structural, not
@@ -245,6 +280,8 @@ copying a binary. A rule whose action could write is simply not expressible in
 airead's rule set.
 
 ### Vision mode and blind mode
+
+*Not built yet.* Blind mode below is what runs today; vision mode is the design.
 
 **Blind mode is the authorization engine and it is always on.** Strictly
 defined rules, compiled-in deny-list, fail closed; only known actions pass.
@@ -290,18 +327,18 @@ pasban's next run reports exactly where.
 ## How a request flows
 
 ```
-harness ── xudo exec ──► xudod (root service)
+caller ── xudo exec ──► xudod (root service)
                            ├ who is asking? (from the kernel; names are hints)
                            ├ a verified harness? (root-created scope + root's registry)
                            ├ which rules accept this command and its arguments?
                            ├ deny-list (built in, cannot be switched off)
-                           └ outcome: Denied │ Allowed │ Needs a human
+                           └ outcome: Denied │ Allowed │ ask-human queue
 
-  Allowed ─► one-use record ─► sudo/doas, NOPASSWD ─► xudo-gate-nopass
+  Allowed ─► one-use record ─► sudo/doas, NOPASSWD ─► xudo-gate-nopass (not built yet)
                                (identity switch only,       │
                                 no password)                │
-  Needs a human ─► ido queue ─► person runs the entry       │
-                 ─► xudo exec (human path)                  │
+  ask-human queue ─► reviewer runs xudo exec --queued ID    │
+                 ─► xudo (human path)                       │
                  ─► sudo/doas, PASSWD ─────► xudo-gate-auth │
                     (the person types the password here)    │
                                                             ▼
@@ -314,7 +351,8 @@ harness ── xudo exec ──► xudod (root service)
 
 Today only the human half is built: every request takes the `PASSWD` hop.
 
-Why the hop exists at all when an allowed command needs no password: it is
+Why the hop exists at all when an allowed command needs no password (today
+only the `PASSWD` hop ships): it is
 the only place a uid transition happens, because xudo has no setuid bit. It
 also gives the gate a real pty (`use_pty`, the TIOCSTI defence), faithful exit
 status, and the operator's existing sudo/doas logging. Take it away and the
@@ -339,8 +377,8 @@ Recorded so the reconciliation is visible, not silent:
    unprivileged; privileged entries run through xudo's human path with its
    password prompt. Same user experience, no second privilege boundary.
 4. *"Permission sets in YAML and JSON"* → native engine format stays TOML
-   (tested, shipped); YAML/JSON are import formats converted and reviewed
-   before install.
+   (tested, shipped); YAML/JSON import, converted and reviewed before
+   install, is not built yet.
 5. *"If something is approved, no human password is needed"* → true for a
    command a root-written rule allows for a verified harness, which takes the
    `NOPASSWD` hop. The password belongs to the human path (a person running an
@@ -348,7 +386,7 @@ Recorded so the reconciliation is visible, not silent:
    verified harness, a human included, never gets passwordless root by mistake
    or by default (invariant 2). The `sudo`/`doas` hop itself stays: it is the
    uid transition, not the password mechanism.
-6. *"airead as a separate app"* → same engine, structurally restricted to
+6. *"airead as a separate app"* (not built yet) → same engine, structurally restricted to
    read-class capabilities, so the read/write separation cannot drift between
    two codebases.
 7. *"Temp permissions: `xudo set-temp nginx-reload 30m`, `xudo set-temp
@@ -389,17 +427,19 @@ file before acting on it.
 
 ## Where the build stands
 
-Built and released (beta.2): the rule engine and its built-in deny-list, the
-root service and the gate, `xudo exec`, `xudo install`, `xudo doctor`, the
-`ido` queue, the tamper-evident audit trail with Pasban's daily check, and the
-optional `xudo watch` confirmation for the human path (off by default). The
-same rules behave the same through sudo, sudo-rs and OpenDoas. In this release
-every privileged request asks for a password. The doas install probe remains
-NOT VERIFIED.
+Built: the policy engine with `[[test]]` tables and `xudo check`; the broker
+and the password-authenticated gate, both deciding independently; `xudo exec`,
+`xudo install` and `xudo doctor`; the hash-chained audit log, verified daily by
+Pasban; `[[deny]]` rules and the shipped protect rules; the safe `remove-path`
+operation (`xudo op remove-path`, on the password path); classification of each
+caller from its cgroup; the harness registry and the rule keys `harness` and
+`outcome`; the root-held ask-human queue with `xudo exec --queued` and its
+listing in `ido`; the optional `xudo watch` check on the password path (off by
+default). The same rules behave the same through sudo, sudo-rs and OpenDoas.
+The doas install probe remains NOT VERIFIED.
 
-Being built: verified harnesses (a root-created scope per harness and root's
-registry), running rule-allowed commands without a password, and a root-held
-queue for commands that need a human. After that: rule packs you can select
-and download, safe file operations such as removing a path only under a home
-directory, temporary permissions, `airead`, and confinement with an external
-audit.
+Not built yet: agent enrolment, so no caller can be a registered agent and the
+queue stays empty; passwordless runs; rule packs; temporary permissions;
+`xudo setup` and an apt repository; `airead`; vision mode; Landlock
+confinement; an external audit. In this release every privileged request asks
+for a password.
