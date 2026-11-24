@@ -170,6 +170,26 @@ pub fn decide(policy: &LoadedPolicy, caller: &CallerFacts, request: &BrokerReque
     )
 }
 
+/// The decision for a remove-path question.
+///
+/// A question that is not a remove-path is refused as a bad argv. The
+/// operation table is the only rule consulted.
+pub fn decide_remove(
+    policy: &LoadedPolicy,
+    caller: &CallerFacts,
+    request: &BrokerRequest,
+) -> Decision {
+    let Some((target, _, _)) = request.remove_fields() else {
+        return Decision::deny(
+            xudo_policy::DenialCode::ArgvRejected,
+            Vec::new(),
+            Vec::new(),
+        );
+    };
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or("");
+    xudo_policy::evaluate_remove_path(&policy.rules.rules, caller, target, policy.settings, passwd)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -202,6 +222,37 @@ mod tests {
             prop_assert_eq!(loaded.confirm_human_path, human.unwrap_or(Settings::default().confirm_human_path));
             prop_assert_eq!(loaded.frozen, frozen.unwrap_or(Settings::default().frozen));
         }
+    }
+
+    #[test]
+    fn decide_remove_uses_the_operation_table_and_refuses_a_run_question() {
+        let policy = policy_of(
+            r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#,
+        );
+        let caller = CallerFacts::new(Classification::Human, 1000);
+        let mut request = BrokerRequest::new("/bin/true", Vec::new(), "human");
+        request.question = xudo_wire::Question::RemovePath {
+            target: b"/srv/app/build/cache".to_vec(),
+            dry_run: false,
+            claimed_classification: "human".to_owned(),
+        };
+        let allowed = decide_remove(&policy, &caller, &request);
+        assert_eq!(allowed.verdict, Verdict::Allow);
+        assert_eq!(
+            allowed.action.as_ref().map(xudo_policy::ActionId::as_str),
+            Some("web.clean-build")
+        );
+        let run = BrokerRequest::new("/usr/bin/systemctl", vec!["restart".to_owned()], "human");
+        let denied = decide_remove(&policy, &caller, &run);
+        assert_eq!(denied.denial, Some(DenialCode::ArgvRejected));
     }
 
     fn policy_of(toml: &str) -> LoadedPolicy {

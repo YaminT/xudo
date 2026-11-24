@@ -46,6 +46,8 @@ ido queue -m "show listeners after review" -- /usr/bin/ss -tulpnH
 
 Then run `xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service`. `exec` asks the broker. If a rule permits the command, the host's privilege backend prompts for a password and the gate runs it. A verified harness request matching an `ask-human` action is stored in the broker's root-held queue. A human reviewer runs it with `xudo exec --queued ID`: the broker re-decides the stored argv, sudo asks for the password, and the command runs in `/`. `ido` lists that queue separately from the user-side queue, which stays labelled as written by the agent and editable by it. Human-path denials are not copied into the caller's editable `ido` queue. The passwordless gate is not in this release.
 
+`xudo op remove-path /srv/app/build/cache` removes that path when an `[[operation]]` rule names the tree. It does not run `rm`. `--dry-run` lists the paths and removes nothing. The example is `rules/examples/50-remove-path.toml.example`, installed as `/usr/share/xudo/examples/50-remove-path.toml`. Copy it into `/etc/xudo/rules.d/` and set `under` to a tree whose ancestors are root-owned and not writable by group or other. The rule's `harness` list is parsed and checked against the registry and is not a grant. Harness use of this operation is planned. This release runs it only on the password path.
+
 ## Security status
 
 **Beta. Not externally audited.** The rule-file format and command-line interface may change, and an upgrade may require rule edits. Do not deploy this where a compromise would matter.
@@ -66,7 +68,7 @@ The broker can classify a caller as a verified harness only from kernel-attested
 
 ## Rule format
 
-Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names.
+Rules are TOML files. An action fixes the executable and constrains each argument by position. `rules/20-services.toml` clears a failed service state and reloads unit files. It does not start or stop a service. That rule is the example at `rules/examples/20-services-lifecycle.toml.example`: an operator copies it into `rules.d` and replaces the placeholder unit names. An `[[operation]]` rule names work xudo performs itself. `remove-path` is the shipped operation, and it runs on the password path. The example at `rules/examples/50-remove-path.toml.example` is not loaded until an operator copies it into `rules.d`.
 
 Harness registrations live in root-owned `/etc/xudo/harnesses.d/<label>.toml` files. An action may name labels with `harness = ["codex"]` and set `outcome = "ask-human"`; a verified matching request is stored by the broker. A human reviewer, and not the entry's owner, claims it with `xudo exec --queued ID`. The broker re-decides the stored bytes against the current rules and, only if they still match, asks for the password through the `-auth` gate. `ido` shows that queue separately from the agent-editable list. `outcome = "allow"` does not create a passwordless grant in this release. The passwordless gate is not installed.
 

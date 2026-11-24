@@ -5,6 +5,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -76,8 +77,14 @@ pub struct EvalArgs {
     /// Ask about this action instead of searching the ruleset for one. Every
     /// other action that accepts the same command still contributes its
     /// requirement: overlapping rules resolve to the strictest.
-    #[arg(long, value_name = "ACTION_ID")]
+    #[arg(long, value_name = "ACTION_ID", conflicts_with = "operation")]
     pub action: Option<String>,
+
+    /// Evaluate this typed operation instead of a command. `remove-path` takes
+    /// one absolute path. The path is UTF-8 here; `xudo op` accepts the raw
+    /// bytes.
+    #[arg(long, value_name = "OP", conflicts_with = "action")]
+    pub operation: Option<String>,
 
     /// The command and its arguments, after `--`.
     #[arg(trailing_var_arg = true, value_name = "ARGV")]
@@ -147,6 +154,19 @@ pub struct CheckArgs {
     pub(crate) fuzz_seed: u64,
 }
 
+/// A typed operation `xudo` performs itself.
+#[derive(Debug, Subcommand)]
+pub enum OpCommand {
+    /// Remove a path under a `remove-path` rule. Asks for your password.
+    RemovePath {
+        /// The absolute path to remove.
+        target: OsString,
+        /// List what would be removed and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -182,6 +202,13 @@ pub enum Command {
             value_name = "ARGV"
         )]
         argv: Vec<String>,
+    },
+
+    /// Run a typed operation as root, if a rule permits it. Asks for your password.
+    Op {
+        /// Which operation.
+        #[command(subcommand)]
+        command: OpCommand,
     },
 
     /// Lint the ruleset, then run the `[[test]]` tables in its rule files.
@@ -456,6 +483,30 @@ fn exec_command(
     .unwrap_or(ExitCode::Unusable)
 }
 
+/// `xudo op`. The library reports the plan and does not exec it.
+fn op_command(
+    cli: &Cli,
+    command: &OpCommand,
+    probe: &dyn Probe,
+    socket: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let OpCommand::RemovePath { target, dry_run } = command;
+    exec::plan_remove_path(
+        cli,
+        target.as_bytes(),
+        *dry_run,
+        probe,
+        socket,
+        (exec::TIMEOUT, std::time::Duration::ZERO),
+        out,
+        err,
+    )
+    .err()
+    .unwrap_or(ExitCode::Unusable)
+}
+
 /// [`run_with_installer`], with the broker socket supplied by the caller.
 pub fn run_with_installer_at_socket(
     cli: &Cli,
@@ -523,6 +574,8 @@ pub fn run_with_installer_at_socket(
         Command::Exec { argv, queued } => {
             exec_command(cli, argv, queued.as_deref(), probe, socket, out, err)
         }
+        // Same split: this plans the password gate and does not exec it.
+        Command::Op { command } => op_command(cli, command, probe, socket, out, err),
         Command::Check(args) => check::dispatch(cli, loaded.as_ref(), args, out, err),
         Command::List { tier } => {
             with_rules!(|l: &LoadedRules| list(l, tier.as_deref(), out, err))
@@ -1116,7 +1169,8 @@ fn explain(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if args.argv.is_empty() {
+    // An operation explains a path, and says so. A command explains an argv.
+    if args.operation.is_none() && args.argv.is_empty() {
         let _ = writeln!(err, "xudo: nothing to explain; pass a command after `--`");
         return ExitCode::Unusable;
     }
@@ -1125,6 +1179,9 @@ fn explain(
         return ExitCode::Unusable;
     };
     let caller = classify(ops, err);
+    if let Some(op) = &args.operation {
+        return explain_operation(cli, loaded, op, &args.argv, settings, &caller, out, err);
+    }
     // argv[0] is the program, the rest are its operands. Splitting here and
     // handing both to the engine is what makes the program part of the decision:
     // before this split the whole command was matched against the argument list,
@@ -1165,6 +1222,41 @@ fn explain(
         decision
     };
 
+    emit(cli, &decision, out)
+}
+
+/// Explains one typed operation. The target is the single UTF-8 argument.
+#[allow(clippy::too_many_arguments)]
+fn explain_operation(
+    cli: &Cli,
+    loaded: &LoadedRules,
+    op: &str,
+    argv: &[String],
+    settings: Settings,
+    caller: &CallerFacts,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if op != "remove-path" {
+        let _ = writeln!(err, "xudo: unknown operation {op}");
+        return ExitCode::Unusable;
+    }
+    let Some(target) = argv.first() else {
+        let _ = writeln!(err, "xudo: nothing to explain; pass a path");
+        return ExitCode::Unusable;
+    };
+    if argv.len() != 1 {
+        let _ = writeln!(err, "xudo: remove-path explains one path");
+        return ExitCode::Unusable;
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let decision = xudo_policy::evaluate_remove_path(
+        loaded.rules(),
+        caller,
+        target.as_bytes(),
+        settings,
+        &passwd,
+    );
     emit(cli, &decision, out)
 }
 
@@ -1255,6 +1347,23 @@ fn list(
             rule.reason
         );
         shown = shown.saturating_add(1);
+    }
+    if tier.is_none() {
+        let operations = loaded.rules().operations();
+        if !operations.is_empty() {
+            let _ = writeln!(out, "operations");
+            for operation in operations {
+                let _ = writeln!(
+                    out,
+                    "{:<28} {:<12} {:<26} {}",
+                    operation.id.as_str(),
+                    operation.op.as_str(),
+                    operation.under,
+                    operation.source
+                );
+                shown = shown.saturating_add(1);
+            }
+        }
     }
     if shown == 0 {
         let _ = writeln!(err, "xudo: no action matched");
@@ -3180,6 +3289,103 @@ args = [
         let (code, _, err) = fixture("cli-noargv").run(&["explain"]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(err.contains("pass a command after"), "{err}");
+    }
+
+    #[test]
+    fn explain_remove_path_uses_the_operation_table() {
+        const OPERATION: &str = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#;
+        let fx = Fixture::new("cli-op-explain").write("50-remove-path.toml", OPERATION);
+        let (code, out, err) = fx.run(&[
+            "explain",
+            "--operation",
+            "remove-path",
+            "--",
+            "/srv/app/build/cache",
+        ]);
+        assert_eq!(code, ExitCode::Delegated, "{out} {err}");
+        assert!(out.contains("ALLOW"), "{out}");
+        assert!(out.contains("web.clean-build"), "{out}");
+
+        let (code, _, err) = fx.run(&["explain", "--operation", "remove-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("pass a path"), "{err}");
+
+        let (code, _, err) = fx.run(&["explain", "--operation", "nope", "--", "/x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("unknown operation"), "{err}");
+
+        let (code, _, err) = fx.run(&[
+            "explain",
+            "--operation",
+            "remove-path",
+            "--",
+            "/srv/app/build/cache",
+            "/srv/app/build/other",
+        ]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("one path"), "{err}");
+
+        let (code, out, err) = fx.run(&["list"]);
+        assert_eq!(code, ExitCode::Delegated, "{out} {err}");
+        assert!(out.contains("operations"), "{out}");
+        assert!(out.contains("web.clean-build"), "{out}");
+        assert!(out.contains("remove-path"), "{out}");
+
+        let (code, out, err) = fx.run(&["list", "--tier", "svc"]);
+        assert_eq!(code, ExitCode::Denied, "{out} {err}");
+        assert!(!out.contains("operations"), "{out}");
+
+        let parsed = Cli::try_parse_from([
+            "xudo",
+            "op",
+            "remove-path",
+            "--dry-run",
+            "/srv/app/build/cache",
+        ])
+        .unwrap();
+        let shown = format!("{:?}", parsed.command);
+        assert!(shown.contains("RemovePath"), "{shown}");
+        assert!(shown.contains("dry_run: true"), "{shown}");
+        assert!(shown.contains("/srv/app/build/cache"), "{shown}");
+        assert!(
+            Cli::try_parse_from([
+                "xudo",
+                "explain",
+                "--action",
+                "web.clean-build",
+                "--operation",
+                "remove-path",
+                "--",
+                "/srv/app/build/cache",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn op_remove_path_against_a_missing_socket_is_unusable() {
+        let fixture = fixture("cli-op-missing");
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let (code, _, err) =
+            fixture.run_at_socket(&["op", "remove-path", "/srv/app/build/cache"], &socket);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo doctor"), "{err}");
+
+        let (code, _, err) = fixture.run_at_socket(
+            &["op", "remove-path", "--dry-run", "/srv/app/build/cache"],
+            &socket,
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo doctor"), "{err}");
     }
 
     #[test]

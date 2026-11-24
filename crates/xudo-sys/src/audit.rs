@@ -375,6 +375,7 @@ pub struct FakeAuditSink {
     /// How many of the next appends fail. `None` means every append, once
     /// `failure` is set. `Some(0)` accepts.
     failures_left: Option<usize>,
+    successes_before_failure: Option<usize>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -397,6 +398,7 @@ impl FakeAuditSink {
             records: Vec::new(),
             failure: Some(error),
             failures_left: None,
+            successes_before_failure: None,
         }
     }
 
@@ -407,6 +409,17 @@ impl FakeAuditSink {
             records: Vec::new(),
             failure: Some(error),
             failures_left: Some(times),
+            successes_before_failure: None,
+        }
+    }
+
+    /// A sink that accepts `successes` records, then refuses every append.
+    pub fn failing_after(successes: usize, error: AuditError) -> Self {
+        Self {
+            records: Vec::new(),
+            failure: Some(error),
+            failures_left: None,
+            successes_before_failure: Some(successes),
         }
     }
 
@@ -424,15 +437,19 @@ impl AuditSink for FakeAuditSink {
         check: &dyn Fn(&Record) -> Result<(), AuditError>,
     ) -> Result<AuditReceipt, AuditError> {
         if let Some(error) = self.failure.clone() {
-            match self.failures_left {
-                None => return Err(error),
-                Some(0) => {
-                    // The budget is spent. This append is accepted.
-                }
-                Some(left) => {
-                    self.failures_left = Some(left.saturating_sub(1));
-                    return Err(error);
-                }
+            match self.successes_before_failure {
+                Some(0) => return Err(error),
+                Some(left) => self.successes_before_failure = Some(left.saturating_sub(1)),
+                None => match self.failures_left {
+                    None => return Err(error),
+                    Some(0) => {
+                        // The failure budget is spent. This append is accepted.
+                    }
+                    Some(left) => {
+                        self.failures_left = Some(left.saturating_sub(1));
+                        return Err(error);
+                    }
+                },
             }
         }
         let (record, _line) = next_record(self.records.last(), build, check)?;

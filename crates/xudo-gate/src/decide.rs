@@ -109,6 +109,8 @@ pub struct GateContext {
 /// How loudly a refusal should be reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
+    /// A dry-run operation: listed, nothing removed.
+    Low,
     /// An ordinary refusal: a policy denial, a race, an expiry.
     Normal,
     /// A refusal that only happens when someone is trying something.
@@ -119,6 +121,7 @@ impl Severity {
     /// The label recorded in the audit trail.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Low => "low",
             Self::Normal => "normal",
             Self::High => "high",
         }
@@ -391,16 +394,7 @@ pub fn decide(
             pid: caller.pin.pid,
         });
     };
-    pending.validate(caller.pin, context.generation, context.now)?;
-    // Every state, not only `Consumed`: an entry for a class the gate cannot
-    // attest is refused whatever its state, so no path depends on state alone.
-    if !pending.live_attested_identity_matches(
-        &caller.attested_class,
-        caller.attested_scope_id,
-        caller.boot_id.as_deref(),
-    ) {
-        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
-    }
+    validate_pending_identity(pending, caller, &context)?;
 
     let action_id = ActionId::new(pending.action.clone());
     let request = Request::for_program(
@@ -474,6 +468,24 @@ pub fn decide(
         requested_rule_source: action.source.to_string(),
         nonce: pending.nonce.clone(),
     })
+}
+
+/// Validate common spool-entry invariants on every gate path, including typed
+/// operations which do not pass through the ordinary action decision.
+pub(crate) fn validate_pending_identity(
+    pending: &PendingRequest,
+    caller: &GateCaller,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    pending.validate(caller.pin, context.generation, context.now)?;
+    if !pending.live_attested_identity_matches(
+        &caller.attested_class,
+        caller.attested_scope_id,
+        caller.boot_id.as_deref(),
+    ) {
+        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
+    }
+    Ok(())
 }
 
 fn confirmation_satisfied(pending: &PendingRequest, context: &GateContext) -> bool {
@@ -807,6 +819,7 @@ all = [
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         }
     }
 
@@ -1231,6 +1244,7 @@ all = [
 
     #[test]
     fn severity_labels_are_the_strings_an_alert_matches_on() {
+        assert_eq!(Severity::Low.label(), "low");
         assert_eq!(Severity::Normal.label(), "normal");
         assert_eq!(Severity::High.label(), "high");
     }

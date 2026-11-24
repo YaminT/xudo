@@ -218,6 +218,7 @@ fn write_entry(round: u64) -> String {
         boot_id: None,
         attested_harness: None,
         queue_id: None,
+        operation: None,
     };
     root_file(
         &format!("{SPOOL_DIR}/{nonce}"),

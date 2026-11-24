@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-13" "xudo 0.1.0-beta.2" "File Formats"
+.TH XUDO-RULES 5 "2026-11-22" "xudo 0.1.0-beta.2" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -57,7 +57,13 @@ The top-level keys are
 .BR action ,
 written as one
 .B [[action]]
-table per action, and
+table per action,
+.BR operation ,
+written as one
+.B [[operation]]
+table per typed operation (see
+.BR OPERATION ),
+and
 .BR test ,
 written as one
 .B [[test]]
@@ -155,6 +161,117 @@ through the password-authenticated gate, and
 .B ido
 lists it separately from the user-side queue. The passwordless gate is not
 installed.
+.SH OPERATION
+An
+.B [[operation]]
+table names work xudo performs itself.
+The only operation in this release is
+.BR remove\-path .
+It removes one path under a fixed tree.
+It does not run
+.BR rm .
+The password gate re-decides the request and walks the tree from a
+descriptor opened with
+.BR openat2 .
+A planned count and the tree and target are written to the audit log before
+the first unlink. The final record cites that intent. A fatal signal such as
+.B SIGKILL
+can still terminate the gate during the walk; the intent record is the trace
+available for that interrupted walk.
+A
+.B harness
+list is parsed and checked against the registry.
+It is not a grant.
+Harness use is planned.
+This release runs the operation only on the password path.
+.TP
+.B id
+Stable identifier, unique across actions, deny rules, and operations.
+1 to 128 bytes of
+.BR [A-Za-z0-9._-] .
+.TP
+.B op
+.B remove\-path
+in this release.
+.TP
+.B under
+Absolute tree root.
+The walk never removes this directory.
+It must be lexically clean: no empty component, no
+.BR . ,
+no
+.BR .. .
+Load refuses
+.BR / ,
+a path equal to or inside
+.BR /etc ,
+.BR /usr ,
+.BR /boot ,
+.BR /proc ,
+.BR /sys ,
+.BR /dev ,
+or
+.BR /run ,
+.B /home
+itself (a directory under
+.B /home
+is allowed),
+and xudo's protected prefixes.
+An ancestor of a protected prefix is also refused, so a tree cannot contain
+xudo's state or audit log. The trees
+.BR /root ,
+.BR /opt ,
+and
+.B /var/mail
+are refused as well. Nested operation trees do not load.
+Every ancestor must be root-owned and not writable by group or other.
+That ownership check happens when the walk opens the tree, not at load.
+At execution, the tree's device is compared with its opened parent's device;
+a tree that is a mount point is refused. This check cannot be made while
+loading the pure rule file.
+.TP
+.B recursive
+Whether a directory target is removed with its contents.
+A directory target with
+.B false
+is refused.
+.TP
+.B max\-depth
+Deepest relative path, counted in components from
+.BR under .
+1 to 32.
+.TP
+.B max\-entries
+Most entries one request may remove.
+1 to 100000.
+The walk stops before the next removal and reports a partial result.
+.TP
+.B owners
+Account names whose entries may be removed.
+Omit the key to allow any owner except root.
+An empty list does not load.
+A name that is not an account in the passwd text the broker read fails closed
+when the request is decided.
+An owner that resolves to uid 0 is refused.
+Root-owned entries are kept when the key is omitted.
+.TP
+.B harness
+Labels from the root-owned harness registry.
+A label missing from the registry fails the load.
+The list does not authorize the operation.
+.PP
+The target is one absolute path under
+.BR under .
+It may not be the tree itself.
+A shared string prefix is not enough:
+.B /srv/app/build\-evil
+is not under
+.BR /srv/app/build .
+No component may be empty,
+.BR . ,
+or
+.BR .. .
+A leaf symlink is removed as a link and is never followed.
 .SH TESTS
 A rule file may carry
 .B [[test]]

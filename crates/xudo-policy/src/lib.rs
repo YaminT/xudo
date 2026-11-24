@@ -61,6 +61,7 @@ pub mod files;
 pub mod fuzz_check;
 pub mod harness;
 pub mod matcher;
+pub mod operation;
 pub mod overlap;
 pub mod rule;
 pub mod rule_test;
@@ -80,6 +81,10 @@ pub use harness::{
     uid_from_passwd_read, valid_account_name, valid_harness_label,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
+pub use operation::{
+    MAX_COMPONENT_BYTES, MAX_DEPTH_LIMIT, MAX_ENTRIES_LIMIT, MAX_PATH_BYTES, OpKind, Operation,
+    OwnerPolicy, RemoveGrant, evaluate_remove_path, judge_remove_path, target_under,
+};
 pub use overlap::Overlap;
 pub use rule::{
     Action, ActionId, GtfobinSets, HarnessLint, OpenUnitLint, Outcome, RuleSet, RuleSetError,

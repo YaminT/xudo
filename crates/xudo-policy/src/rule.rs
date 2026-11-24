@@ -29,6 +29,7 @@ use crate::deny::{
 };
 use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
 use crate::matcher::{ArgSpec, Matcher};
+use crate::operation::{Operation, check_operation};
 use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
@@ -257,6 +258,11 @@ struct RuleFile {
     action: Vec<Action>,
     #[serde(default)]
     deny: Vec<DenyRule>,
+    /// Typed operations. Kept beside actions: an operation is policy, and it
+    /// is hashed and enforced. It is not an action and it is not executed by
+    /// name through `execve`.
+    #[serde(default)]
+    operation: Vec<Operation>,
     /// Executable tests. Kept apart from `action` on purpose: a test is not
     /// policy and never reaches the compiled ruleset.
     #[serde(default)]
@@ -407,9 +413,11 @@ pub enum RuleSetError {
         at: Source,
     },
     /// A harness label is not in the registry this load was given.
-    #[error("action {id} at {at}: harness label {label:?} is not in the registry")]
+    #[error("{kind} {id} at {at}: harness label {label:?} is not in the registry")]
     UnknownHarness {
-        /// The offending action.
+        /// Whether this is an action or typed operation.
+        kind: &'static str,
+        /// The offending action or operation.
         id: String,
         /// The label.
         label: String,
@@ -425,6 +433,16 @@ pub enum RuleSetError {
         /// Where it is defined.
         at: Source,
     },
+    /// An operation rule failed its load-time checks.
+    #[error("operation {id} at {at}: {reason}")]
+    OperationInvalid {
+        /// The offending operation.
+        id: String,
+        /// Where it is defined.
+        at: Source,
+        /// What was wrong.
+        reason: String,
+    },
 }
 
 /// A validated set of allowlisted actions.
@@ -432,6 +450,7 @@ pub enum RuleSetError {
 pub struct RuleSet {
     actions: Vec<Action>,
     deny_rules: Vec<DenyRule>,
+    operations: Vec<Operation>,
 }
 
 /// A systemctl action whose unit position can name any unit.
@@ -499,6 +518,84 @@ fn matcher_accepts_lifecycle_or_power_verb(matcher: &Matcher) -> bool {
         .any(|verb| matcher.accepts(&Arg::new(verb.to_vec())))
 }
 
+fn check_operations(
+    actions: &[Action],
+    deny_rules: &[DenyRule],
+    operations: &[Operation],
+) -> Result<(), RuleSetError> {
+    for (index, operation) in operations.iter().enumerate() {
+        if let Some(prior) = actions.iter().find(|action| action.id == operation.id) {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(prior) = deny_rules.iter().find(|deny| deny.id == operation.id) {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(prior) = operations
+            .iter()
+            .take(index)
+            .find(|other| other.id == operation.id)
+        {
+            return Err(RuleSetError::DuplicateId {
+                id: operation.id.as_str().to_owned(),
+                first: prior.source.clone(),
+                second: operation.source.clone(),
+            });
+        }
+        if let Some(other) = operations.iter().find(|other| {
+            other.id != operation.id
+                && (operation
+                    .under
+                    .as_bytes()
+                    .strip_prefix(other.under.as_bytes())
+                    .is_some_and(|rest| rest.starts_with(b"/"))
+                    || other
+                        .under
+                        .as_bytes()
+                        .strip_prefix(operation.under.as_bytes())
+                        .is_some_and(|rest| rest.starts_with(b"/")))
+        }) {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason: format!(
+                    "nested under trees are not allowed ({} and {})",
+                    operation.under, other.under
+                ),
+            });
+        }
+        if let Err(reason) = check_operation(operation) {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason,
+            });
+        }
+        if let Some(prior) = operations
+            .iter()
+            .take(index)
+            .find(|other| other.under == operation.under)
+        {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason: format!(
+                    "under {} is already the tree of {}",
+                    operation.under, prior.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl RuleSet {
     /// Validates and takes ownership of a list of actions.
     ///
@@ -518,6 +615,19 @@ impl RuleSet {
     pub fn load_with_deny_rules(
         actions: Vec<Action>,
         deny_rules: Vec<DenyRule>,
+    ) -> Result<Self, RuleSetError> {
+        Self::load_all(actions, deny_rules, Vec::new())
+    }
+
+    /// [`Self::load_with_deny_rules`] plus typed operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation error; no partial ruleset is returned.
+    pub fn load_all(
+        actions: Vec<Action>,
+        deny_rules: Vec<DenyRule>,
+        operations: Vec<Operation>,
     ) -> Result<Self, RuleSetError> {
         if deny_rules.len() > MAX_DENY_RULES {
             return Err(RuleSetError::Parse {
@@ -610,9 +720,12 @@ impl RuleSet {
             validate_action_harness(action)?;
         }
 
+        check_operations(&actions, &deny_rules, &operations)?;
+
         Ok(Self {
             actions,
             deny_rules,
+            operations,
         })
     }
 
@@ -664,6 +777,14 @@ impl RuleSet {
                 deny
             })
             .collect();
+        let operations = parsed
+            .operation
+            .into_iter()
+            .map(|mut operation| {
+                operation.source = Source::new(file, line_of_id(contents, operation.id.as_str()));
+                operation
+            })
+            .collect();
         if parsed.test.len() > MAX_TESTS_PER_FILE {
             return Err(RuleSetError::TooManyTests {
                 file: file.to_owned(),
@@ -684,7 +805,7 @@ impl RuleSet {
                 test
             })
             .collect();
-        Ok((Self::load_with_deny_rules(actions, deny_rules)?, tests))
+        Ok((Self::load_all(actions, deny_rules, operations)?, tests))
     }
 
     /// Looks up an action by id.
@@ -700,6 +821,11 @@ impl RuleSet {
     /// Every configured deny rule, in declaration order.
     pub fn deny_rules(&self) -> &[DenyRule] {
         &self.deny_rules
+    }
+
+    /// Every typed operation, in declaration order.
+    pub fn operations(&self) -> &[Operation] {
+        &self.operations
     }
 
     /// Every allowlisted executable that the compiled-in deny-list refuses.

@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-21" "xudo 0.1.0-beta.2" "User Commands"
+.TH XUDO 1 "2026-11-22" "xudo 0.1.0-beta.2" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -28,6 +28,10 @@ xudo \- decide whether a privileged command runs as root
 .B \-\-
 .I program
 .RI [ arg ...]
+.br
+.B xudo op remove\-path
+.I target
+.RB [ \-\-dry\-run ]
 .br
 .B xudo exec
 .B \-\-queued
@@ -142,12 +146,42 @@ the program is the first argument.
 asks about one action id.
 Every other action that accepts the same command still applies, and
 overlapping actions resolve to the strictest.
+.B \-\-operation remove\-path
+asks about one absolute path against the
+.B [[operation]]
+table.
+The path is UTF\-8 on this command.
+.B xudo op
+accepts the raw bytes.
+Executes nothing.
 .TP
 .B why\-not
 Show why one action would refuse this argv.
 .B \-\-action
 is required.
 Executes nothing.
+.TP
+.B op
+Run a typed operation as root, if a rule permits it.
+Asks for your password through the host backend.
+.B remove\-path
+.I target
+removes
+.I target
+when an
+.B [[operation]]
+rule names the tree that contains it.
+It does not run
+.BR rm .
+.B \-\-dry\-run
+lists the paths and removes nothing.
+A
+.B harness
+label on the rule is parsed and checked against the registry.
+It is not a grant.
+Harness use is planned.
+This command uses the password path only.
+The passwordless gate is not in this release.
 .TP
 .B exec
 Run the command as root, if the broker permits it.
@@ -297,6 +331,11 @@ The same ruleset and seed give the same report.
 .TP
 .B list
 List each action's id, tier, executable, and the file and line it came from.
+When the ruleset contains typed operations and
+.B \-\-tier
+is omitted, the list continues with an
+.B operations
+section: id, operation, tree, and source.
 .B \-\-tier
 shows actions whose tier contains that name.
 Hyphens in the name are ignored, so

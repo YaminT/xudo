@@ -293,16 +293,12 @@ pub fn serve(
             );
         }
     };
-    let should_expire = match &request.question {
-        xudo_wire::Question::Run { .. } => platform.confirmations.is_some(),
-        xudo_wire::Question::Watch => {
-            !identity.diverged && xudo_gate::request::is_watch_terminal(identity.tty)
-        }
-        xudo_wire::Question::Pending
-        | xudo_wire::Question::Status { .. }
-        | xudo_wire::Question::Answer { .. } => true,
-        _ => false,
-    };
+    let watch_terminal = !identity.diverged && xudo_gate::request::is_watch_terminal(identity.tty);
+    let should_expire = question_expires(
+        &request.question,
+        platform.confirmations.is_some(),
+        watch_terminal,
+    );
     if should_expire {
         if let Err(refusal) = expire_entries(platform, spool, &request) {
             return refuse(
@@ -317,6 +313,24 @@ pub fn serve(
     serve_request(conn, platform, spool, identity, request)
 }
 
+/// Whether this question should expire stale spool entries before it is served.
+///
+/// A remove-path does not. The catch-all is the queue questions and thaw.
+fn question_expires(
+    question: &xudo_wire::Question,
+    confirmations_open: bool,
+    watch_terminal: bool,
+) -> bool {
+    match question {
+        xudo_wire::Question::Run { .. } => confirmations_open,
+        xudo_wire::Question::Watch => watch_terminal,
+        xudo_wire::Question::Pending
+        | xudo_wire::Question::Status { .. }
+        | xudo_wire::Question::Answer { .. } => true,
+        _ => false,
+    }
+}
+
 fn serve_request(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
@@ -324,6 +338,9 @@ fn serve_request(
     identity: PeerIdentity,
     request: BrokerRequest,
 ) -> Served {
+    if matches!(request.question, xudo_wire::Question::RemovePath { .. }) {
+        return serve_remove(conn, platform, spool, identity, request);
+    }
     if !matches!(request.question, xudo_wire::Question::Run { .. }) {
         return serve_confirmation_question(conn, platform, spool, &identity, &request);
     }
@@ -2562,7 +2579,9 @@ fn serve_confirmation_question(
             freeze(platform, spool, identity, request, reason)
         }
         xudo_wire::Question::Thaw => thaw(platform, identity, &classify(identity), request),
-        xudo_wire::Question::Run { .. } => return Served::Refused(Fault::Broker),
+        xudo_wire::Question::Run { .. } | xudo_wire::Question::RemovePath { .. } => {
+            return Served::Refused(Fault::Broker);
+        }
         xudo_wire::Question::QueueList | xudo_wire::Question::QueueListPage { .. } => {
             return serve_queue_list(conn, platform, identity, request);
         }
@@ -3540,6 +3559,63 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
     BrokerRequest::parse(&bytes).map_err(|error| Refusal::from(&error))
 }
 
+/// A remove-path is re-decided from the operation table and minted only for
+/// the password gate. It is not queued and it does not ask for a watch.
+fn serve_remove(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    spool: &dyn Spool,
+    identity: PeerIdentity,
+    request: BrokerRequest,
+) -> Served {
+    let mut policy = match platform.policy.load() {
+        Ok(policy) => policy,
+        Err(error) => {
+            return refuse(
+                conn,
+                platform.audit,
+                &Refusal::from(&error),
+                Some(&identity),
+                Some(&request),
+            );
+        }
+    };
+    policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
+    let decision = crate::policy::decide_remove(&policy, &caller, &request);
+    if !decision.verdict.is_permitted() {
+        let _ = platform.audit.append(&|previous| {
+            decided(
+                previous,
+                &decision,
+                &caller,
+                &identity,
+                &request,
+                &policy.rules.generation,
+                None,
+            )
+        });
+        return answer(
+            conn,
+            &BrokerResponse::decided(decision, None),
+            Served::Decided,
+        );
+    }
+    mint(
+        conn,
+        platform,
+        spool,
+        Evaluated {
+            decision,
+            caller,
+            identity,
+            request,
+            policy,
+        },
+    )
+}
+
 /// Mints the entry for a permitted decision and answers with it.
 fn mint(
     conn: &dyn Connection,
@@ -4246,6 +4322,149 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .iter()
                 .all(|record| record.classification != "agent")
         );
+    }
+
+    fn remove_question(target: &[u8], dry_run: bool) -> BrokerRequest {
+        BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::RemovePath {
+                target: target.to_vec(),
+                dry_run,
+                claimed_classification: "unattested".to_owned(),
+            },
+        }
+    }
+
+    fn operation_policy() -> LoadedPolicy {
+        let mut loaded = policy();
+        loaded.rules = load_rule_files(vec![RuleFile {
+            name: b"50-remove.toml".to_vec(),
+            bytes: b"[[operation]]\nid = \"web.clean-build\"\nop = \"remove-path\"\nunder = \"/srv/app/build\"\nrecursive = true\nmax-depth = 4\nmax-entries = 10\n".to_vec(),
+        }])
+        .unwrap();
+        loaded.settings.confirm_human_path = true;
+        loaded
+    }
+
+    #[test]
+    fn question_expiry_follows_the_question_and_not_a_default() {
+        let run = xudo_wire::Question::Run {
+            program: "/bin/true".to_owned(),
+            argv: Vec::new(),
+            cwd: Vec::new(),
+            claimed_classification: "x".to_owned(),
+        };
+        assert!(question_expires(&run, true, false));
+        assert!(!question_expires(&run, false, true));
+        assert!(!question_expires(
+            &remove_question(b"/srv/app/build/cache", false).question,
+            true,
+            true
+        ));
+        assert!(question_expires(&xudo_wire::Question::Watch, false, true));
+        assert!(!question_expires(&xudo_wire::Question::Watch, true, false));
+        assert!(question_expires(
+            &xudo_wire::Question::Pending,
+            false,
+            false
+        ));
+        assert!(question_expires(
+            &xudo_wire::Question::Status {
+                id: "ab".repeat(32)
+            },
+            false,
+            false
+        ));
+        assert!(question_expires(
+            &xudo_wire::Question::Answer {
+                id: "ab".repeat(32),
+                token: String::new(),
+                approve: false,
+            },
+            false,
+            false
+        ));
+        assert!(!question_expires(
+            &xudo_wire::Question::QueueList,
+            true,
+            true
+        ));
+        assert!(!question_expires(&xudo_wire::Question::Thaw, true, true));
+    }
+
+    #[test]
+    fn a_remove_path_sent_to_the_confirmation_dispatcher_is_refused() {
+        let mut host = Host::honest();
+        let request = remove_question(b"/srv/app/build/cache", false);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let identity = test_identity(PID, START, 1, 0);
+        let served =
+            serve_confirmation_question(&conn, &mut host.platform(), &spool, &identity, &request);
+        assert_eq!(served, Served::Refused(Fault::Broker));
+    }
+
+    #[test]
+    fn a_remove_path_outside_the_tree_is_decided_and_not_minted() {
+        let mut host = Host::honest();
+        let request = remove_question(b"/etc/passwd", false);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        assert_eq!(outcome.served, Served::Decided);
+        let (decision, minted) = decision_of(&outcome.answer).unwrap();
+        assert!(minted.is_none());
+        assert_eq!(
+            decision.denial,
+            Some(xudo_policy::DenialCode::OperationRefused)
+        );
+        assert!(spool.names().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_remove_path_honors_confirm_human_path() {
+        let mut host = Host::honest();
+        host.policy.answer = Ok(operation_policy());
+        let request = remove_question(b"/srv/app/build/cache", true);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        assert_eq!(outcome.served, Served::Minted);
+        assert_eq!(
+            outcome.answer,
+            xudo_wire::Answer::Pending {
+                id: "ab".repeat(32),
+                expires_in_ms: crate::mint::REQUEST_TTL_MILLIS,
+            }
+        );
+        let names = spool.names().unwrap();
+        assert_eq!(names.len(), 1);
+        let bytes = spool.read(&names[0], 1_000_000).unwrap();
+        let entry: PendingRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(entry.program, xudo_wire::OPERATION_PROGRAM);
+        assert!(entry.needs_watch);
+        let operation = entry.operation.unwrap();
+        assert_eq!(operation.op, "remove-path");
+        assert!(operation.dry_run);
+        assert_eq!(operation.target, b"/srv/app/build/cache");
+    }
+
+    #[test]
+    fn a_remove_path_with_an_unreadable_policy_is_refused_and_mints_nothing() {
+        let mut host = Host::honest();
+        host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
+            file: "settings".to_owned(),
+        }));
+        let request = remove_question(b"/srv/app/build/cache", false);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let outcome = serve_with(&mut host, &conn, Ok(&spool));
+        assert!(
+            refusal_of(&outcome.answer).is_some(),
+            "{:?}",
+            outcome.answer
+        );
+        assert!(spool.names().unwrap().is_empty());
     }
 
     #[test]
@@ -11688,6 +11907,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             boot_id: None,
             attested_harness: None,
             queue_id: None,
+            operation: None,
         }
     }
 
