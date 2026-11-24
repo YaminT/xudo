@@ -533,6 +533,20 @@ pub enum Finding {
         #[serde(serialize_with = "display")]
         file: PathBuf,
     },
+    /// A doas rule that comes after xudo's own and names the xudo group or the
+    /// gate. doas uses the LAST matching rule, so it replaces xudo's: it can
+    /// restore `persist` or add `nopass` for the gate.
+    DoasLaterRule {
+        /// The file it is in.
+        #[serde(serialize_with = "display")]
+        file: PathBuf,
+        /// Its first line, counting from 1.
+        line: usize,
+        /// The rule as written, continuation lines joined.
+        text: String,
+        /// Why it matters, in one sentence.
+        why: String,
+    },
     /// Membership of a group that is root, or a way to it.
     GroupMembership {
         /// The group.
@@ -1050,16 +1064,7 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     // The reader's gaps wait here: sudo's own answer may settle them.
     let reader_gaps = std::mem::take(&mut sink.unverified);
     let doas_files = doas_files(ctx, &mut sink);
-    for file in &doas_files {
-        let read = ctx.host.read(file);
-        if let Some(bytes) = sink.take(file, read) {
-            sink.unverified
-                .extend(unmodelled_gap(file, &config::doas_unmodelled(&bytes)));
-            for rule in config::scan_doas(&bytes) {
-                sink.findings.push(passwordless(ctx, file, &rule));
-            }
-        }
-    }
+    read_doas_files(ctx, &doas_files, &mut sink);
 
     if let Some(exe) = input.sudo_exe {
         ask_sudo(ctx, exe, reader_gaps, &mut sink, &mut note);
@@ -1076,6 +1081,78 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
         unread,
         unmodelled,
     }
+}
+
+/// Reads every doas file in order: the passwordless rules, the lexer gaps, and
+/// the later rules that would replace xudo's own.
+fn read_doas_files(ctx: &Ctx<'_>, doas_files: &[PathBuf], sink: &mut Sink) {
+    let mut ordered = Vec::new();
+    for file in doas_files {
+        let read = ctx.host.read(file);
+        if let Some(bytes) = sink.take(file, read) {
+            sink.unverified
+                .extend(unmodelled_gap(file, &config::doas_unmodelled(&bytes)));
+            for rule in config::scan_doas(&bytes) {
+                sink.findings.push(passwordless(ctx, file, &rule));
+            }
+            ordered.extend(
+                config::scan_doas_rules(&bytes)
+                    .into_iter()
+                    .map(|rule| (file.clone(), rule)),
+            );
+        }
+    }
+    sink.findings.extend(later_doas_rules(ctx, &ordered));
+}
+
+/// The doas rules after xudo's own that would replace it.
+///
+/// doas uses the last rule that matches, in file order: `/etc/doas.conf`, then
+/// `/etc/doas.d` by name. xudo's own rule is the `permit` for its group and its
+/// gate. Any later `permit` that names the group, or a member of it, and the
+/// gate or any command takes over from it, so it is reported, with the
+/// `persist` or `nopass` it brings when it brings one.
+fn later_doas_rules(ctx: &Ctx<'_>, ordered: &[(PathBuf, config::DoasRule)]) -> Vec<Finding> {
+    let group = ctx
+        .groups
+        .iter()
+        .find(|group| group.name == XUDO_GROUP.as_bytes());
+    let gate = crate::snippet::GATE_AUTH.as_bytes();
+    let names_group = |identity: &[u8]| match identity {
+        [b':', rest @ ..] => {
+            rest == XUDO_GROUP.as_bytes()
+                || group.is_some_and(|g| config::number(rest) == Some(g.gid))
+        }
+        user => group.is_some_and(|g| g.members.iter().any(|member| member == user)),
+    };
+    let names_gate = |rule: &config::DoasRule| rule.cmd.as_deref().is_none_or(|cmd| cmd == gate);
+    let Some(own) = ordered.iter().position(|(_, rule)| {
+        rule.permit
+            && rule.identity == [b":", XUDO_GROUP.as_bytes()].concat()
+            && rule.cmd.as_deref() == Some(gate)
+    }) else {
+        return Vec::new();
+    };
+    ordered
+        .iter()
+        .skip(own.saturating_add(1))
+        .filter(|(_, rule)| rule.permit && names_group(&rule.identity) && names_gate(rule))
+        .map(|(file, rule)| {
+            let brings = match (rule.persist, rule.nopass) {
+                (_, true) => " and carries nopass, so the gate runs without a password",
+                (true, false) => " and carries persist, so a long-lived caller could reuse one password",
+                (false, false) => "",
+            };
+            Finding::DoasLaterRule {
+                file: file.clone(),
+                line: rule.line,
+                text: String::from_utf8_lossy(rule.text.trim_ascii()).into_owned(),
+                why: format!(
+                    "doas uses the last matching rule: this one comes after xudo's own, so it replaces it{brings}"
+                ),
+            }
+        })
+        .collect()
 }
 
 /// The most users sudo is asked about: one process each.

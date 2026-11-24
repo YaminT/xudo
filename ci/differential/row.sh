@@ -46,7 +46,7 @@ sed -nE \
     -e 's/^(backend      UNUSABLE: [a-z-]+) .* (is missing a required control .*)$/\1 <version> \2/p' \
     -e '/^backend      NONE/p' \
     -e '/^backend caps /p' \
-    -e '/^ +absent: /p' \
+    -e '/^ +(absent|exempt|unknown): /p' \
     "$out/doctor.txt" >>"$report"
 
 # 2. The install plan: refused with exit 19 where nothing usable exists,

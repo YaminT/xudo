@@ -81,14 +81,33 @@ impl Capability {
 
     /// Whether xudo refuses to operate without this capability.
     ///
-    /// Only two are required, and both for the same reason: without them there
-    /// is a path by which a privileged command runs with less checking than the
-    /// operator was promised.
+    /// Three are required, all for the same reason: without them there is a
+    /// path by which a privileged command runs with less checking than the
+    /// operator was promised. A backend that can never provide one needs an
+    /// explicit exemption, which `xudo doctor` reports.
     pub fn is_required(self) -> bool {
         matches!(
             self,
             Self::DisableCredentialCache | Self::AllocatePty | Self::PerCommandDefaults
         )
+    }
+
+    /// Why a backend may lack this required capability, when xudo accepts that.
+    ///
+    /// Only the pty control has one: doas never allocates a pty, and the
+    /// target of every xudo rule is root.
+    pub fn exemption(self) -> Option<&'static str> {
+        match self {
+            Self::AllocatePty => {
+                Some("doas never allocates a pty; accepted because the target is root")
+            }
+            Self::DropInDirectory
+            | Self::ValidateNamedFile
+            | Self::PerCommandDefaults
+            | Self::DisableCredentialCache
+            | Self::RejectsArgumentWildcards
+            | Self::PersistentCredentialCache => None,
+        }
     }
 
     /// Why xudo cares, in one sentence, for `xudo doctor`.
@@ -120,8 +139,9 @@ impl Capability {
                  containing one will be rejected rather than silently accepted"
             }
             Self::PersistentCredentialCache => {
-                "recorded only so xudo can state that it never depends on backend \
-                 credential caching in either direction"
+                "recorded for xudo doctor: whether the backend can cache a credential \
+                 so that a long-lived caller reuses one password; xudo's rules never \
+                 ask for it"
             }
         }
     }
@@ -132,6 +152,13 @@ impl Capability {
 #[serde(transparent)]
 pub struct CapabilityMatrix {
     supported: BTreeSet<Capability>,
+    /// Required capabilities the backend never provides and xudo accepts, with
+    /// the reason in [`Capability::exemption`]. Not part of the wire form.
+    #[serde(skip)]
+    exempt: BTreeSet<Capability>,
+    /// Capabilities no probe can answer for this backend. Not "absent".
+    #[serde(skip)]
+    unknown: BTreeSet<Capability>,
 }
 
 impl CapabilityMatrix {
@@ -148,6 +175,7 @@ impl CapabilityMatrix {
     pub fn from_supported(items: impl IntoIterator<Item = Capability>) -> Self {
         Self {
             supported: items.into_iter().collect(),
+            ..Self::default()
         }
     }
 
@@ -156,6 +184,32 @@ impl CapabilityMatrix {
     pub fn with(mut self, capability: Capability) -> Self {
         self.supported.insert(capability);
         self
+    }
+
+    /// Records that the backend never provides `capability` and xudo accepts
+    /// that, for the reason [`Capability::exemption`] gives. It stays absent
+    /// from `has`; it only stops counting as missing.
+    #[must_use]
+    pub fn with_exemption(mut self, capability: Capability) -> Self {
+        self.exempt.insert(capability);
+        self
+    }
+
+    /// Records that nothing can tell whether the backend has `capability`.
+    #[must_use]
+    pub fn with_unknown(mut self, capability: Capability) -> Self {
+        self.unknown.insert(capability);
+        self
+    }
+
+    /// Whether `capability` is accepted as missing.
+    pub fn is_exempt(&self, capability: Capability) -> bool {
+        self.exempt.contains(&capability)
+    }
+
+    /// Whether `capability` could not be determined.
+    pub fn is_unknown(&self, capability: Capability) -> bool {
+        self.unknown.contains(&capability)
     }
 
     /// Whether the backend supports `capability`.
@@ -180,7 +234,7 @@ impl CapabilityMatrix {
     pub fn missing_required(&self) -> Vec<Capability> {
         Capability::ALL
             .into_iter()
-            .filter(|c| c.is_required() && !self.has(*c))
+            .filter(|c| c.is_required() && !self.has(*c) && !self.is_exempt(*c))
             .collect()
     }
 
@@ -272,6 +326,34 @@ mod tests {
 
         let neither = CapabilityMatrix::empty().with(Capability::DropInDirectory);
         assert_eq!(neither.missing_required().len(), 3);
+    }
+
+    #[test]
+    fn an_exempt_capability_is_not_missing_but_is_still_not_supported() {
+        let doas = CapabilityMatrix::empty()
+            .with(Capability::PerCommandDefaults)
+            .with(Capability::DisableCredentialCache)
+            .with_exemption(Capability::AllocatePty)
+            .with_unknown(Capability::PersistentCredentialCache);
+        assert!(doas.is_usable());
+        assert!(!doas.has(Capability::AllocatePty));
+        assert!(doas.is_exempt(Capability::AllocatePty));
+        assert!(!doas.is_exempt(Capability::DisableCredentialCache));
+        assert!(doas.is_unknown(Capability::PersistentCredentialCache));
+        assert!(!doas.is_unknown(Capability::AllocatePty));
+        assert_eq!(
+            Capability::AllocatePty.exemption(),
+            Some("doas never allocates a pty; accepted because the target is root")
+        );
+        for capability in Capability::ALL {
+            if capability != Capability::AllocatePty {
+                assert_eq!(capability.exemption(), None, "{capability:?}");
+            }
+        }
+        // The exemption does not travel on the wire.
+        let wire = serde_json::to_string(&doas).unwrap();
+        let back: CapabilityMatrix = serde_json::from_str(&wire).unwrap();
+        assert!(!back.is_exempt(Capability::AllocatePty));
     }
 
     #[test]

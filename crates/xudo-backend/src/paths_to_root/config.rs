@@ -344,6 +344,82 @@ pub(super) fn scan_doas(bytes: &[u8]) -> Vec<RuleLine> {
         .collect()
 }
 
+/// One doas `permit` or `deny` rule, read for who it names and what it does to
+/// the password. doas uses the last rule that matches, so order matters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DoasRule {
+    /// Its first physical line, counting from 1.
+    pub(super) line: usize,
+    /// The rule, continuation lines joined with a space.
+    pub(super) text: Vec<u8>,
+    /// `permit` (true) or `deny`.
+    pub(super) permit: bool,
+    /// The identity, unquoted: `user`, `:group`, or either by number.
+    pub(super) identity: Vec<u8>,
+    /// The rule carries `persist`.
+    pub(super) persist: bool,
+    /// The rule carries `nopass`.
+    pub(super) nopass: bool,
+    /// The program after `cmd`; none means any command.
+    pub(super) cmd: Option<Vec<u8>>,
+}
+
+/// Reads every `permit` and `deny` rule of one doas file, in order. A line the
+/// lexer cannot be modelled on is left out: `doas_unmodelled` reports it.
+pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
+    logical_lines(bytes, is_hash_comment, Dialect::Doas)
+        .logical
+        .into_iter()
+        .filter(|logical| !logical.uncertain)
+        .filter_map(|logical| {
+            let trimmed = logical.text.trim_ascii_start();
+            let (permit, rest) = match word_at_start(trimmed, b"permit") {
+                Some(rest) => (true, rest),
+                None => (false, word_at_start(trimmed, b"deny")?),
+            };
+            let mut tokens = rest
+                .split(u8::is_ascii_whitespace)
+                .filter(|token| !token.is_empty());
+            let (mut persist, mut nopass) = (false, false);
+            let mut identity = None;
+            while let Some(token) = tokens.next() {
+                match token {
+                    b"nopass" => nopass = true,
+                    b"persist" => persist = true,
+                    b"nolog" | b"keepenv" => {}
+                    b"setenv" => {
+                        if !tokens.by_ref().any(|token| token.ends_with(b"}")) {
+                            return None;
+                        }
+                    }
+                    other => {
+                        identity = Some(other.iter().copied().filter(|b| *b != b'"').collect());
+                        break;
+                    }
+                }
+            }
+            let mut cmd = None;
+            while let Some(token) = tokens.next() {
+                if token == b"cmd" {
+                    cmd = tokens
+                        .next()
+                        .map(|c| c.iter().copied().filter(|b| *b != b'"').collect());
+                    break;
+                }
+            }
+            Some(DoasRule {
+                line: logical.line,
+                text: logical.text,
+                permit,
+                identity: identity?,
+                persist,
+                nopass,
+                cmd,
+            })
+        })
+        .collect()
+}
+
 /// The physical lines (from 1) of a doas file whose reading depends on lexer
 /// behaviour this module does not model.
 pub(super) fn doas_unmodelled(bytes: &[u8]) -> Vec<usize> {

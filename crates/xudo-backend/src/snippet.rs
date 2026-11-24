@@ -279,8 +279,8 @@ impl DoasSnippet {
              # of what is wanted, so it is written explicitly.\n\
              #\n\
              # No `persist`: on an OpenDoas built --with-timestamp it would cache the\n\
-             # password, so one prompt would cover later runs. Without it every\n\
-             # invocation prompts.\n\
+             # password, so a long-lived caller could reuse one password. Without it\n\
+             # every invocation prompts.\n\
              {rule}",
             kind = backend.kind.label(),
             version = backend.version,
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn doas_snippet_never_enables_credential_persistence() {
         // A `--with-timestamp` OpenDoas caches the password for a rule that
-        // says `persist`, so one prompt would cover later runs.
+        // says `persist`, so a long-lived caller could reuse one password.
         for drop_in in [true, false] {
             let snippet = DoasSnippet::human_only(&doas(drop_in)).unwrap();
             for line in snippet.contents.lines().filter(|l| !l.starts_with('#')) {

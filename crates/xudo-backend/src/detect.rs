@@ -230,7 +230,7 @@ pub fn identify(probe: &dyn Probe) -> Option<Backend> {
         let banner = probe.version_banner(doas).unwrap_or_default();
         return Some(Backend {
             kind: BackendKind::Doas,
-            capabilities: doas_capabilities(&banner, probe),
+            capabilities: doas_capabilities(probe),
             version: first_line(&banner),
             exe: doas.to_owned(),
         });
@@ -298,7 +298,7 @@ fn sudo_capabilities(exe: &str, probe: &dyn Probe) -> CapabilityMatrix {
 }
 
 /// What a doas port supports.
-fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
+fn doas_capabilities(probe: &dyn Probe) -> CapabilityMatrix {
     let exe = BackendKind::Doas.exe();
     // doas carries its options **on the rule itself**, so a setting cannot leak
     // onto anything else by construction. That is the property
@@ -313,20 +313,17 @@ fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
     if probe.honours_directive(exe, "nopersist") {
         matrix = matrix.with(Capability::DisableCredentialCache);
     }
-    // Parse check only: doas does not allocate a pty for its child.
-    if probe.honours_directive(exe, "pty") {
-        matrix = matrix.with(Capability::AllocatePty);
-    }
+    // doas never allocates a pty for its child, so the control is not claimed
+    // from a parse check. The exemption is explicit and `xudo doctor` shows it.
+    matrix = matrix.with_exemption(Capability::AllocatePty);
 
     if probe.directory_exists("/etc/doas.d") {
         matrix = matrix.with(Capability::DropInDirectory);
     }
 
-    // A `--with-timestamp` build can cache credentials only for a rule that says
-    // `persist`; xudo's never does. Recorded for `xudo doctor`.
-    if banner.to_ascii_lowercase().contains("with-timestamp") {
-        matrix = matrix.with(Capability::PersistentCredentialCache);
-    }
+    // Whether this build can cache a credential (`--with-timestamp`) cannot be
+    // read from a banner, so the answer is unknown, not absent.
+    matrix = matrix.with_unknown(Capability::PersistentCredentialCache);
 
     matrix
 }
@@ -553,24 +550,23 @@ mod tests {
     }
 
     #[test]
-    fn doas_persistence_is_recorded_but_never_depended_on() {
-        let without = detect(&alpine_doas()).unwrap();
-        assert!(
-            !without
-                .capabilities
-                .has(Capability::PersistentCredentialCache)
-        );
-        // Either way the backend is usable, because xudo does not rely on it.
-        assert!(without.is_usable());
-
-        let with = FakeMachine::default()
-            .with_exe("/usr/bin/doas", "doas (OpenDoas) 6.8.2 --with-timestamp\n");
-        assert!(
-            detect(&with)
-                .unwrap()
-                .capabilities
-                .has(Capability::PersistentCredentialCache)
-        );
+    fn doas_never_claims_a_pty_and_reports_its_credential_cache_as_unknown() {
+        for banner in [
+            "doas (OpenDoas) 6.8.2\n",
+            "doas (OpenDoas) 6.8.2 --with-timestamp\n",
+        ] {
+            let found = detect(&FakeMachine::default().with_exe("/usr/bin/doas", banner)).unwrap();
+            let caps = &found.capabilities;
+            // A banner never shows whether the cache exists: unknown, not absent.
+            assert!(!caps.has(Capability::PersistentCredentialCache));
+            assert!(caps.is_unknown(Capability::PersistentCredentialCache));
+            // No pty is allocated, and that is an accepted, visible exemption.
+            assert!(!caps.has(Capability::AllocatePty));
+            assert!(caps.is_exempt(Capability::AllocatePty));
+            assert!(found.is_usable());
+        }
+        let sudo = detect(&debian()).unwrap();
+        assert!(!sudo.capabilities.is_exempt(Capability::AllocatePty));
     }
 
     #[test]
@@ -618,12 +614,14 @@ mod tests {
 
     #[test]
     fn a_doas_port_that_ignores_a_required_directive_is_refused_too() {
-        // Both required controls, so neither is special-cased on this backend
-        // either.
-        for directive in ["pty", "nopersist"] {
-            let deaf = alpine_doas().ignoring(directive);
-            assert!(detect(&deaf).is_err(), "{directive} was tolerated");
-        }
+        // The cache control is probed and required. doas never allocates a pty,
+        // so the `pty` probe is not consulted: that control is an explicit
+        // exemption, not a claim.
+        let deaf = alpine_doas().ignoring("nopersist");
+        assert!(detect(&deaf).is_err(), "nopersist was tolerated");
+        let no_pty_probe = detect(&alpine_doas().ignoring("pty")).unwrap();
+        assert!(no_pty_probe.is_usable());
+        assert!(!no_pty_probe.capabilities.has(Capability::AllocatePty));
     }
 
     #[test]

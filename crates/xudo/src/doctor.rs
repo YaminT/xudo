@@ -316,6 +316,19 @@ pub struct CapabilityRow {
     pub supported: bool,
     /// Whether xudo refuses to operate without it.
     pub required: bool,
+    /// Why it is neither supported nor plainly absent, when that is so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<CapabilityNote>,
+}
+
+/// A capability that is not supported and not simply absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityNote {
+    /// The backend never provides it and xudo accepts that.
+    Exempt,
+    /// No probe can tell whether the backend has it.
+    Unknown,
 }
 
 impl BackendReport {
@@ -345,6 +358,13 @@ impl BackendReport {
                     capability,
                     supported: backend.capabilities.has(capability),
                     required: capability.is_required(),
+                    note: if backend.capabilities.is_exempt(capability) {
+                        Some(CapabilityNote::Exempt)
+                    } else if backend.capabilities.is_unknown(capability) {
+                        Some(CapabilityNote::Unknown)
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
             missing_required: backend.capabilities.missing_required(),
@@ -1054,7 +1074,16 @@ fn backend_lines(backend: &BackendReport, line: &mut dyn FnMut(&str, &str)) {
                 ),
             );
             for row in backend.capabilities.iter().filter(|row| !row.supported) {
-                line("", &format!("absent: {}", capability_label(row.capability)));
+                let label = capability_label(row.capability);
+                match (row.note, row.capability.exemption()) {
+                    (Some(CapabilityNote::Exempt), Some(reason)) => {
+                        line("", &format!("exempt: {label}: {reason}"));
+                    }
+                    (Some(CapabilityNote::Unknown), _) => {
+                        line("", &format!("unknown: {label}"));
+                    }
+                    _ => line("", &format!("absent: {label}")),
+                }
             }
         }
     }
@@ -1202,6 +1231,17 @@ fn finding_line(finding: &Finding) -> String {
             "doas itself permits {} for you without a password, by {}",
             safe(command),
             safe_path(file)
+        ),
+        Finding::DoasLaterRule {
+            file,
+            line,
+            text,
+            why,
+        } => format!(
+            "warning: {}:{line} {}: {}",
+            safe_path(file),
+            safe(why),
+            safe(text)
         ),
         Finding::GroupMembership {
             group,
@@ -2357,6 +2397,53 @@ mod tests {
         );
         insta::assert_snapshot!("json_every_path", render::json_of(&hostile_report(true)));
         insta::assert_snapshot!("human_every_path", human(&hostile_report(true)));
+    }
+
+    #[test]
+    fn a_later_doas_rule_is_a_warning_with_its_file_and_line() {
+        let finding = Finding::DoasLaterRule {
+            file: std::path::PathBuf::from("/etc/doas.d/doas.conf"),
+            line: 3,
+            text: "permit persist :xudo".to_owned(),
+            why: "doas uses the last matching rule".to_owned(),
+        };
+        assert_eq!(
+            finding_line(&finding),
+            "warning: /etc/doas.d/doas.conf:3 doas uses the last matching rule: permit persist :xudo"
+        );
+    }
+
+    #[test]
+    fn doas_reports_its_pty_as_an_exemption_and_its_cache_as_unknown() {
+        let doas = xudo_backend::Backend {
+            exe: "/usr/bin/doas".to_owned(),
+            kind: BackendKind::Doas,
+            version: "doas (OpenDoas) 6.8.2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::empty()
+                .with(Capability::PerCommandDefaults)
+                .with(Capability::DisableCredentialCache)
+                .with_exemption(Capability::AllocatePty)
+                .with_unknown(Capability::PersistentCredentialCache),
+        };
+        let mut report = hostile_report(false);
+        report.backend = BackendReport::of(Some(doas));
+        assert_eq!(report.backend.status, BackendStatus::Usable);
+        let text = human(&report);
+        assert!(text.contains("backend caps 2 of 7 supported"), "{text}");
+        assert!(
+            text.contains(
+                "exempt: allocate pty (REQUIRED): doas never allocates a pty; accepted because the target is root"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("unknown: persistent credential cache"),
+            "{text}"
+        );
+        assert!(text.contains("absent: drop-in directory"), "{text}");
+        let json = render::json_of(&report);
+        assert!(json.contains("\"note\": \"exempt\""), "{json}");
+        assert!(json.contains("\"note\": \"unknown\""), "{json}");
     }
 
     #[test]
