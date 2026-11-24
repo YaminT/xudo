@@ -476,7 +476,7 @@ fn doas_nopass_rules_are_found_in_the_conf_and_its_drop_ins() {
         )
         .file("/etc/doas.d/.hidden", 0, 0, 0o400, b"permit nopass yamin\n")
         .file("/etc/doas.d/old~", 0, 0, 0o400, b"permit nopass yamin\n")
-        .unreadable_file("/etc/doas.d/70-secret", 0, 0, 0o400);
+        .unreadable_file("/etc/doas.d/70-secret.conf", 0, 0, 0o400);
     let report = run(&host, "/usr/bin");
     let rules = check(&report, CheckId::PasswordlessRules);
     let found: Vec<Option<(Grant, Applies)>> = rules
@@ -4119,6 +4119,186 @@ fn flags_a_later_rule_naming_a_member_or_the_gid_of_the_group() {
     assert!(later_rules(&nobody).is_empty());
 }
 
+/// A host where alice is listed in xudo and wheel, bob's primary group is xudo,
+/// and carol is in neither.
+fn doas_world(after: &[u8]) -> MemoryHost {
+    with_xudo_drop_in(after)
+        .file(
+            "/etc/passwd",
+            0,
+            0,
+            0o644,
+            b"root:x:0:0:root:/root:/bin/sh\n\
+              alice:x:1001:1001::/home/alice:/bin/sh\n\
+              bob:x:1002:998::/home/bob:/bin/sh\n\
+              carol:x:1003:1003::/home/carol:/bin/sh\n",
+        )
+        .file(
+            "/etc/group",
+            0,
+            0,
+            0o644,
+            b"root:x:0:\nxudo:x:998:alice\nwheel:x:10:alice\nstaff:x:50:carol\n",
+        )
+}
+
+fn later_lines(host: &MemoryHost) -> Vec<usize> {
+    later_rules(host).iter().map(|found| found.1).collect()
+}
+
+#[test]
+fn a_hash_ends_the_word_in_a_later_rule() {
+    // `:xudo#c` is `:xudo` to doas; the rest is a comment.
+    assert_eq!(later_lines(&doas_world(b"permit persist :xudo#c\n")), [2]);
+}
+
+#[test]
+fn a_cmd_inside_a_comment_does_not_limit_the_rule() {
+    let host = doas_world(b"permit persist :xudo # cmd /bin/ls\n");
+    assert_eq!(later_lines(&host), [2]);
+}
+
+#[test]
+fn a_setenv_brace_is_its_own_token() {
+    let host =
+        doas_world(b"permit persist setenv{A=1} :xudo\npermit persist setenv { A=1 }:xudo\n");
+    assert_eq!(later_lines(&host), [2, 3]);
+}
+
+#[test]
+fn a_numeric_uid_identity_is_resolved() {
+    // alice (1001) is in xudo; bob (1002) is by primary group; carol (1003) is not.
+    let host = doas_world(b"permit persist 1001\npermit persist 1002\npermit persist 1003\n");
+    assert_eq!(later_lines(&host), [2, 3]);
+}
+
+#[test]
+fn group_membership_by_supplementary_group_is_resolved() {
+    // alice is listed in both xudo and wheel, so a rule for wheel reaches her
+    // and replaces xudo's; staff holds only carol.
+    let host = doas_world(b"permit persist :wheel\npermit persist :staff\npermit persist :10\n");
+    assert_eq!(later_lines(&host), [2, 4]);
+}
+
+#[test]
+fn primary_gid_membership_is_resolved() {
+    // bob is in xudo by primary gid alone; carol's primary group is her own,
+    // which names no one in xudo.
+    let host = doas_world(b"permit persist bob\npermit persist carol\npermit persist :1003\n");
+    assert_eq!(later_lines(&host), [2]);
+}
+
+#[test]
+fn an_identity_doas_may_resolve_but_this_cannot_is_unverified() {
+    let host = doas_world(b"permit persist dave\npermit persist :ghosts\n");
+    assert!(later_rules(&host).is_empty());
+    let report = run(&host, "/usr/bin");
+    let rules = check(&report, CheckId::PasswordlessRules);
+    let reasons: Vec<&str> = rules.unverified.iter().map(|u| u.reason.as_str()).collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("line 2 names `dave`")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("line 3 names `:ghosts`")),
+        "{reasons:?}"
+    );
+    // A deny it cannot resolve weakens nothing, so it asks for nothing.
+    let deny = doas_world(b"deny dave\n");
+    assert!(
+        check(&run(&deny, "/usr/bin"), CheckId::PasswordlessRules)
+            .unverified
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_later_rule_for_another_target_is_not_flagged() {
+    let host = doas_world(b"permit nopass :xudo as nobody\n");
+    assert!(later_rules(&host).is_empty());
+    // As root, spelled three ways, it replaces the rule.
+    let root =
+        doas_world(b"permit nopass :xudo as root\npermit nopass :xudo as 0\npermit nopass :xudo\n");
+    assert_eq!(later_lines(&root), [2, 3, 4]);
+    // A second account with uid 0 is root as well.
+    let alias = doas_world(b"permit nopass :xudo as toor\n").file(
+        "/etc/passwd",
+        0,
+        0,
+        0o644,
+        b"root:x:0:0::/root:/bin/sh\ntoor:x:0:0::/root:/bin/sh\n",
+    );
+    assert_eq!(later_lines(&alias), [2]);
+}
+
+#[test]
+fn a_note_is_added_after_one_already_there() {
+    let mut note = None;
+    append_note(&mut note, "a");
+    append_note(&mut note, "b");
+    assert_eq!(note.as_deref(), Some("a; b"));
+}
+
+#[test]
+fn a_user_only_listed_in_the_group_is_resolved_without_an_account() {
+    let host = with_xudo_drop_in(b"permit persist ghost\n").file(
+        "/etc/group",
+        0,
+        0,
+        0o644,
+        b"xudo:x:998:ghost\n",
+    );
+    assert_eq!(later_lines(&host), [2]);
+}
+
+#[test]
+fn a_stray_word_after_the_identity_does_not_hide_a_later_rule() {
+    assert_eq!(
+        later_lines(&doas_world(b"permit persist :xudo bogus\n")),
+        [2]
+    );
+}
+
+#[test]
+fn a_group_name_xudo_is_matched_even_if_the_host_has_no_such_group() {
+    let host = with_xudo_drop_in(b"permit persist :xudo\n").file(
+        "/etc/group",
+        0,
+        0,
+        0o644,
+        b"root:x:0:\n",
+    );
+    assert_eq!(later_lines(&host), [2]);
+}
+
+#[test]
+fn a_later_deny_is_a_note_not_a_weakening() {
+    let host = doas_world(b"deny :xudo\ndeny :staff\n");
+    assert!(later_rules(&host).is_empty());
+    let report = run(&host, "/usr/bin");
+    let note = check(&report, CheckId::PasswordlessRules)
+        .note
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        note.contains("60-xudo.conf:2 denies the xudo group"),
+        "{note}"
+    );
+    assert!(!note.contains(":3 "), "{note}");
+}
+
+#[test]
+fn doas_reads_only_conf_files_of_its_drop_in_directory() {
+    let rule: &[u8] = b"permit persist :xudo\n";
+    let host = with_xudo_drop_in(b"")
+        .file("/etc/doas.d/zz", 0, 0, 0o400, rule)
+        .file("/etc/doas.d/zz.CONF", 0, 0, 0o400, rule)
+        .file("/etc/doas.d/zz.conf", 0, 0, 0o400, rule);
+    let found = later_rules(&host);
+    let files: Vec<&str> = found.iter().map(|f| f.0.as_str()).collect();
+    assert_eq!(files, ["/etc/doas.d/zz.conf"]);
+}
+
 #[test]
 fn ignores_later_rules_that_do_not_replace_xudos() {
     // Before xudo's rule, another command, another group, a deny, an unclosed
@@ -4135,7 +4315,7 @@ fn ignores_later_rules_that_do_not_replace_xudos() {
         .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, XUDO_RULE);
     assert!(later_rules(&before).is_empty());
     let after = with_xudo_drop_in(
-        b"permit persist :xudo as root cmd /bin/ls\npermit persist :wheel\ndeny :xudo\npermit setenv { A=1\npermit nopass\nfoo :xudo\n",
+        b"permit persist :xudo as root cmd /bin/ls\npermit persist :staff\ndeny :xudo\npermit setenv { A=1\npermit nopass\nfoo :xudo\n",
     );
     assert!(later_rules(&after).is_empty());
     // `cmd` with nothing after it names no program, which reads as any

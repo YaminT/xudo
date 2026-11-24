@@ -234,7 +234,9 @@ impl CapabilityMatrix {
     pub fn missing_required(&self) -> Vec<Capability> {
         Capability::ALL
             .into_iter()
-            .filter(|c| c.is_required() && !self.has(*c) && !self.is_exempt(*c))
+            .filter(|c| {
+                c.is_required() && !self.has(*c) && !(self.is_exempt(*c) && c.exemption().is_some())
+            })
             .collect()
     }
 
@@ -354,6 +356,18 @@ mod tests {
         let wire = serde_json::to_string(&doas).unwrap();
         let back: CapabilityMatrix = serde_json::from_str(&wire).unwrap();
         assert!(!back.is_exempt(Capability::AllocatePty));
+    }
+
+    #[test]
+    fn an_exemption_without_a_recorded_reason_is_still_missing() {
+        let matrix = CapabilityMatrix::empty().with_exemption(Capability::PerCommandDefaults);
+        assert_eq!(Capability::PerCommandDefaults.exemption(), None);
+        assert!(
+            matrix
+                .missing_required()
+                .contains(&Capability::PerCommandDefaults)
+        );
+        assert!(!matrix.is_usable());
     }
 
     #[test]

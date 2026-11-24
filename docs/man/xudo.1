@@ -441,6 +441,13 @@ prints the plan and changes nothing.
 prints the file each step would write.
 .B \-\-uninstall
 removes what an install wrote, for both backends, and nothing else.
+On doas, which uses the last rule that matches, an install refuses (exit 19)
+when a rule after xudo's own gives the xudo group
+.BR nopass ,
+and warns when it gives
+.BR persist .
+It can only see xudo's rule once installed, so the first install is checked by
+.BR "xudo doctor" .
 The rules this build would install all require a password.
 An install is reported as verified only when the broker minted a request for
 .BR "id -u" ,

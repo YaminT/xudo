@@ -360,6 +360,8 @@ pub(super) struct DoasRule {
     pub(super) persist: bool,
     /// The rule carries `nopass`.
     pub(super) nopass: bool,
+    /// Who it runs as, after `as`; none means root.
+    pub(super) target: Option<Vec<u8>>,
     /// The program after `cmd`; none means any command.
     pub(super) cmd: Option<Vec<u8>>,
 }
@@ -377,9 +379,8 @@ pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
                 Some(rest) => (true, rest),
                 None => (false, word_at_start(trimmed, b"deny")?),
             };
-            let mut tokens = rest
-                .split(u8::is_ascii_whitespace)
-                .filter(|token| !token.is_empty());
+            let words = doas_words(rest);
+            let mut tokens = words.iter().map(Vec::as_slice);
             let (mut persist, mut nopass) = (false, false);
             let mut identity = None;
             while let Some(token) = tokens.next() {
@@ -388,23 +389,29 @@ pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
                     b"persist" => persist = true,
                     b"nolog" | b"keepenv" => {}
                     b"setenv" => {
-                        if !tokens.by_ref().any(|token| token.ends_with(b"}")) {
+                        // `setenv` takes a brace-wrapped list; without both
+                        // braces doas refuses the file.
+                        if tokens.next() != Some(b"{".as_slice())
+                            || !tokens.by_ref().any(|token| token == b"}")
+                        {
                             return None;
                         }
                     }
                     other => {
-                        identity = Some(other.iter().copied().filter(|b| *b != b'"').collect());
+                        identity = Some(other.to_vec());
                         break;
                     }
                 }
             }
-            let mut cmd = None;
+            let (mut target, mut cmd) = (None, None);
             while let Some(token) = tokens.next() {
-                if token == b"cmd" {
-                    cmd = tokens
-                        .next()
-                        .map(|c| c.iter().copied().filter(|b| *b != b'"').collect());
-                    break;
+                match token {
+                    b"as" => target = tokens.next().map(<[u8]>::to_vec),
+                    b"cmd" => {
+                        cmd = tokens.next().map(<[u8]>::to_vec);
+                        break;
+                    }
+                    _ => {}
                 }
             }
             Some(DoasRule {
@@ -414,10 +421,37 @@ pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
                 identity: identity?,
                 persist,
                 nopass,
+                target,
                 cmd,
             })
         })
         .collect()
+}
+
+/// The words of a doas rule the way `OpenDoas`'s lexer cuts them: a `#` ends
+/// the line, blanks separate words, `{` and `}` are words of their own, and
+/// double quotes only group (they are dropped). A quote on a line with a `#`
+/// or a backslash is already unmodelled, so it is never read here.
+fn doas_words(text: &[u8]) -> Vec<Vec<u8>> {
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    let mut word: Vec<u8> = Vec::new();
+    let mut quoted = false;
+    for byte in text.iter().copied() {
+        match byte {
+            b'#' if !quoted => break,
+            b'"' => quoted = !quoted,
+            b'{' | b'}' if !quoted => {
+                words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+                words.push(vec![byte]);
+            }
+            _ if byte.is_ascii_whitespace() && !quoted => {
+                words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+            }
+            _ => word.push(byte),
+        }
+    }
+    words.extend((!word.is_empty()).then_some(word));
+    words
 }
 
 /// The physical lines (from 1) of a doas file whose reading depends on lexer

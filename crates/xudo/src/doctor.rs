@@ -1237,6 +1237,7 @@ fn finding_line(finding: &Finding) -> String {
             line,
             text,
             why,
+            ..
         } => format!(
             "warning: {}:{line} {}: {}",
             safe_path(file),
@@ -2406,6 +2407,8 @@ mod tests {
             line: 3,
             text: "permit persist :xudo".to_owned(),
             why: "doas uses the last matching rule".to_owned(),
+            nopass: false,
+            persist: true,
         };
         assert_eq!(
             finding_line(&finding),
