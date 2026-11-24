@@ -285,6 +285,7 @@ pub fn load_policy(
         for label in &action.harness {
             if registry.get(label).is_none() {
                 return Err(RuleSetError::UnknownHarness {
+                    kind: "action",
                     id: action.id.as_str().to_owned(),
                     label: label.clone(),
                     at: action.source.clone(),
@@ -297,6 +298,7 @@ pub fn load_policy(
         for label in &operation.harness {
             if registry.get(label).is_none() {
                 return Err(RuleSetError::UnknownHarness {
+                    kind: "operation",
                     id: operation.id.as_str().to_owned(),
                     label: label.clone(),
                     at: operation.source.clone(),
@@ -754,6 +756,7 @@ max-entries = 10
         let text = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"ghost\"]\n";
         let err = load_rule_files(vec![file("50-remove.toml", text)]).unwrap_err();
         assert!(format!("{err:?}").contains("UnknownHarness"), "{err:?}");
+        assert!(err.to_string().contains("operation o"), "{err}");
     }
 
     #[test]

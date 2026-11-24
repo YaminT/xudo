@@ -173,6 +173,11 @@ It does not run
 The password gate re-decides the request and walks the tree from a
 descriptor opened with
 .BR openat2 .
+A planned count and the tree and target are written to the audit log before
+the first unlink. The final record cites that intent. A fatal signal such as
+.B SIGKILL
+can still terminate the gate during the walk; the intent record is the trace
+available for that interrupted walk.
 A
 .B harness
 list is parsed and checked against the registry.
@@ -212,8 +217,18 @@ itself (a directory under
 .B /home
 is allowed),
 and xudo's protected prefixes.
+An ancestor of a protected prefix is also refused, so a tree cannot contain
+xudo's state or audit log. The trees
+.BR /root ,
+.BR /opt ,
+and
+.B /var/mail
+are refused as well. Nested operation trees do not load.
 Every ancestor must be root-owned and not writable by group or other.
 That ownership check happens when the walk opens the tree, not at load.
+At execution, the tree's device is compared with its opened parent's device;
+a tree that is a mount point is refused. This check cannot be made while
+loading the pure rule file.
 .TP
 .B recursive
 Whether a directory target is removed with its contents.
@@ -237,6 +252,7 @@ Omit the key to allow any owner except root.
 An empty list does not load.
 A name that is not an account in the passwd text the broker read fails closed
 when the request is decided.
+An owner that resolves to uid 0 is refused.
 Root-owned entries are kept when the key is omitted.
 .TP
 .B harness

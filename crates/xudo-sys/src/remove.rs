@@ -72,6 +72,8 @@ pub struct RemoveReport {
     pub bytes: u64,
     /// The walk stopped early. Already-removed names stay removed.
     pub partial: bool,
+    /// The syscall or walk error that stopped a partial walk, when one did.
+    pub error: Option<RemoveError>,
     /// Copied from the request so a record can tell a list from a deletion.
     pub dry_run: bool,
     /// SHA-256 of the full path list, length-framed.
@@ -96,6 +98,10 @@ pub enum RemoveError {
         "an ancestor of the tree is not a root-owned directory closed to group and other writes"
     )]
     AncestorRefused,
+    /// The operation tree itself is a mount point, detected by comparing its
+    /// device with its opened parent at execution time.
+    #[error("the operation tree is a mount point")]
+    MountPoint,
     /// `recursive` is false and the target is a directory.
     #[error("a directory target needs recursive = true")]
     DirectoryRequiresRecursive,
@@ -141,6 +147,15 @@ pub struct NodeStat {
     pub kind: NodeKind,
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn verify_dir_stat_result(
+    result: Result<NodeStat, i32>,
+    expected: NodeStat,
+) -> Result<bool, RemoveError> {
+    let actual = result.map_err(|errno| RemoveError::Os { op: "fstat", errno })?;
+    Ok(actual.dev == expected.dev && actual.ino == expected.ino && actual.kind == NodeKind::Dir)
+}
+
 /// The syscalls the walk uses. One object, so the algorithm is not generic.
 pub trait RemoveFs {
     /// Open `/` with `RESOLVE_NO_SYMLINKS`.
@@ -166,6 +181,26 @@ pub trait RemoveFs {
     ///
     /// Returns the failing syscall's error.
     fn fstat(&mut self, fd: u64) -> Result<NodeStat, RemoveError>;
+
+    /// Re-resolve a held directory from the pinned operation root and compare
+    /// its inode. An empty relative path checks the root itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failing descriptor or resolution syscall error.
+    fn verify_dir(
+        &mut self,
+        root: u64,
+        relative: &[u8],
+        expected: NodeStat,
+    ) -> Result<bool, RemoveError>;
+
+    /// Close a directory token when its stack frame is done.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is stale or the close operation fails.
+    fn close(&mut self, fd: u64) -> Result<(), RemoveError>;
 
     /// `statat` with `AT_SYMLINK_NOFOLLOW`.
     ///
@@ -233,17 +268,20 @@ fn remove_from_open(
         fs,
         req,
         tree_dev: under_stat.dev,
+        root_fd: under_fd,
         removed: Vec::new(),
         bytes: 0,
         partial: false,
+        error: None,
     };
     let outcome = walk.remove_target(under_fd, under_stat);
     let report = walk.finish();
     match outcome {
         Ok(()) => Ok(report),
-        Err(_error) if !report.removed.is_empty() => {
+        Err(error) if !report.removed.is_empty() => {
             let mut partial = report;
             partial.partial = true;
+            partial.error = Some(error);
             partial.digest = removal_digest(&partial.removed);
             Ok(partial)
         }
@@ -259,8 +297,10 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
     if !ancestor_ok(&stat) {
         return Err(RemoveError::AncestorRefused);
     }
-    for name in &components {
-        dir = fs.open_dir(dir, name, false).map_err(|error| {
+    for (index, name) in components.iter().enumerate() {
+        let parent_dev = stat.dev;
+        let parent = dir;
+        dir = fs.open_dir(parent, name, false).map_err(|error| {
             if matches_errno(&error, ENOENT) || matches_errno(&error, ELOOP) {
                 RemoveError::AncestorRefused
             } else {
@@ -268,8 +308,12 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
             }
         })?;
         stat = fs.fstat(dir)?;
+        fs.close(parent)?;
         if !ancestor_ok(&stat) {
             return Err(RemoveError::AncestorRefused);
+        }
+        if index.saturating_add(1) == components.len() && stat.dev != parent_dev {
+            return Err(RemoveError::MountPoint);
         }
     }
     Ok((dir, stat))
@@ -325,9 +369,11 @@ struct Walk<'a> {
     fs: &'a mut dyn RemoveFs,
     req: &'a RemoveRequest,
     tree_dev: u64,
+    root_fd: u64,
     removed: Vec<Vec<u8>>,
     bytes: u64,
     partial: bool,
+    error: Option<RemoveError>,
 }
 
 impl Walk<'_> {
@@ -337,6 +383,7 @@ impl Walk<'_> {
             removed: self.removed.clone(),
             bytes: self.bytes,
             partial: self.partial,
+            error: self.error.clone(),
             dry_run: self.req.dry_run,
         }
     }
@@ -365,22 +412,38 @@ impl Walk<'_> {
         let mut dir_stat = under_stat;
         let mut path = self.req.under.clone();
         for name in &parts {
-            dir = match self.fs.open_dir(dir, name, true) {
+            let parent = dir;
+            dir = match self.fs.open_dir(parent, name, true) {
                 Ok(fd) => fd,
                 Err(error) if stop_errno(&error) => {
+                    if parent != under_fd {
+                        let _ = self.fs.close(parent);
+                    }
                     self.partial = true;
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if parent != under_fd {
+                        let _ = self.fs.close(parent);
+                    }
+                    return Err(error);
+                }
             };
             dir_stat = self.fs.fstat(dir)?;
+            if parent != under_fd {
+                self.fs.close(parent)?;
+            }
             if dir_stat.dev != self.tree_dev || dir_stat.kind != NodeKind::Dir {
                 self.partial = true;
                 return Ok(());
             }
             push_component(&mut path, name);
         }
-        self.remove_named(dir, dir_stat, &path, &leaf, depth, true)
+        let result = self.remove_named(dir, dir_stat, &path, &leaf, depth, true);
+        if dir != under_fd {
+            self.fs.close(dir)?;
+        }
+        result
     }
 
     fn remove_named(
@@ -421,6 +484,27 @@ impl Walk<'_> {
         path: &[u8],
         (depth, is_target): (u32, bool),
     ) -> Result<(), RemoveError> {
+        let result = self.remove_directory_contents(
+            parent,
+            parent_stat,
+            child,
+            name,
+            path,
+            (depth, is_target),
+        );
+        self.fs.close(child)?;
+        result
+    }
+
+    fn remove_directory_contents(
+        &mut self,
+        parent: u64,
+        parent_stat: NodeStat,
+        child: u64,
+        name: &[u8],
+        path: &[u8],
+        (depth, is_target): (u32, bool),
+    ) -> Result<(), RemoveError> {
         let stat = self.fs.fstat(child)?;
         if stat.dev != self.tree_dev || stat.kind != NodeKind::Dir {
             self.partial = true;
@@ -448,9 +532,11 @@ impl Walk<'_> {
                 return Ok(());
             }
         }
-        let left = self.fs.list(child)?;
-        if !left.is_empty() {
-            return Ok(());
+        if !self.req.dry_run {
+            let left = self.fs.list(child)?;
+            if !left.is_empty() {
+                return Ok(());
+            }
         }
         self.commit(
             parent,
@@ -513,10 +599,21 @@ impl Walk<'_> {
             self.partial = true;
             return Ok(());
         }
-        let now = self.fs.fstat(parent)?;
-        if now.dev != parent_stat.dev || now.ino != parent_stat.ino {
-            self.partial = true;
-            return Ok(());
+        let parent_relative = relative_parent(&self.req.under, path);
+        match self
+            .fs
+            .verify_dir(self.root_fd, &parent_relative, parent_stat)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.partial = true;
+                return Ok(());
+            }
+            Err(error) if matches_errno(&error, ENOENT) || stop_errno(&error) => {
+                self.partial = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         }
         let leaf = match self.fs.lstat(parent, name) {
             Ok(stat) => stat,
@@ -563,6 +660,20 @@ fn push_component(path: &mut Vec<u8>, name: &[u8]) {
     path.extend_from_slice(name);
 }
 
+fn relative_parent(under: &[u8], path: &[u8]) -> Vec<u8> {
+    let Some(relative) = path
+        .strip_prefix(under)
+        .and_then(|rest| rest.strip_prefix(b"/"))
+    else {
+        return Vec::new();
+    };
+    relative
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .and_then(|index| relative.get(..index))
+        .map_or_else(Vec::new, <[u8]>::to_vec)
+}
+
 fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     let mut path = parent.to_vec();
     push_component(&mut path, name);
@@ -588,8 +699,29 @@ pub fn remove_path_on_host(req: &RemoveRequest) -> Result<RemoveReport, RemoveEr
     }
 }
 
+/// Linux real-kernel hook used by the root lane to race a directory rename
+/// immediately before its ancestry re-resolution.
+///
+/// # Errors
+///
+/// Returns the walk's refusal or syscall error.
+#[cfg(all(target_os = "linux", feature = "root-tests"))]
+pub fn remove_path_on_host_with_before_verify(
+    req: &RemoveRequest,
+    hook: impl FnMut(&[u8]) + 'static,
+) -> Result<RemoveReport, RemoveError> {
+    let mut host = LinuxRemoveFs {
+        before_verify: Some(Box::new(hook)),
+        ..LinuxRemoveFs::default()
+    };
+    remove_path(&mut host, req)
+}
+
 #[cfg(all(target_os = "linux", test))]
 type BeforeUnlink = Box<dyn FnMut(&std::os::fd::OwnedFd, &[u8])>;
+
+#[cfg(all(target_os = "linux", any(test, feature = "root-tests")))]
+type BeforeVerify = Box<dyn FnMut(&[u8])>;
 
 /// Linux `openat2` / `unlinkat` host. Not part of the macOS build.
 #[cfg(target_os = "linux")]
@@ -598,6 +730,8 @@ struct LinuxRemoveFs {
     next: u64,
     #[cfg(test)]
     before_unlink: Option<BeforeUnlink>,
+    #[cfg(any(test, feature = "root-tests"))]
+    before_verify: Option<BeforeVerify>,
 }
 
 #[cfg(target_os = "linux")]
@@ -608,6 +742,8 @@ impl Default for LinuxRemoveFs {
             next: 1,
             #[cfg(test)]
             before_unlink: None,
+            #[cfg(any(test, feature = "root-tests"))]
+            before_verify: None,
         }
     }
 }
@@ -621,11 +757,10 @@ impl LinuxRemoveFs {
         token
     }
 
-    fn fd(&self, token: u64) -> Result<&std::os::fd::OwnedFd, RemoveError> {
-        self.fds.get(&token).ok_or(RemoveError::Os {
-            op: "fstat",
-            errno: EBADF,
-        })
+    fn fd(&self, token: u64, op: &'static str) -> Result<&std::os::fd::OwnedFd, RemoveError> {
+        self.fds
+            .get(&token)
+            .ok_or(RemoveError::Os { op, errno: EBADF })
     }
 }
 
@@ -713,26 +848,56 @@ impl RemoveFs for LinuxRemoveFs {
     }
 
     fn open_dir(&mut self, dir: u64, name: &[u8], beneath: bool) -> Result<u64, RemoveError> {
-        let opened = open_at(self.fd(dir)?, name, beneath);
+        let opened = open_at(self.fd(dir, "openat2")?, name, beneath);
         opened.map(|fd| self.insert(fd))
     }
 
     fn fstat(&mut self, fd: u64) -> Result<NodeStat, RemoveError> {
-        let fd = self.fd(fd)?;
+        let fd = self.fd(fd, "fstat")?;
         rustix::fs::fstat(fd)
             .map(|stat| host_stat(&stat))
             .map_err(host_err("fstat"))
     }
 
+    fn verify_dir(
+        &mut self,
+        root: u64,
+        relative: &[u8],
+        expected: NodeStat,
+    ) -> Result<bool, RemoveError> {
+        #[cfg(any(test, feature = "root-tests"))]
+        if let Some(hook) = self.before_verify.as_mut() {
+            hook(relative);
+        }
+        let root_fd = self.fd(root, "openat2")?;
+        let opened = if relative.is_empty() {
+            None
+        } else {
+            Some(open_at(root_fd, relative, true)?)
+        };
+        let fd = opened.as_ref().unwrap_or(root_fd);
+        let stat = rustix::fs::fstat(fd)
+            .map(|stat| host_stat(&stat))
+            .map_err(rustix::io::Errno::raw_os_error);
+        verify_dir_stat_result(stat, expected)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<(), RemoveError> {
+        self.fds.remove(&fd).map(|_| ()).ok_or(RemoveError::Os {
+            op: "close",
+            errno: EBADF,
+        })
+    }
+
     fn lstat(&mut self, dir: u64, name: &[u8]) -> Result<NodeStat, RemoveError> {
-        let parent = self.fd(dir)?;
+        let parent = self.fd(dir, "statat")?;
         rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
             .map(|stat| host_stat(&stat))
             .map_err(host_err("statat"))
     }
 
     fn list(&mut self, dir: u64) -> Result<Vec<Vec<u8>>, RemoveError> {
-        let parent = self.fd(dir)?;
+        let parent = self.fd(dir, "getdents")?;
         rustix::fs::Dir::read_from(parent)
             .and_then(|entries| {
                 entries
@@ -754,7 +919,7 @@ impl RemoveFs for LinuxRemoveFs {
         {
             hook(fd, name);
         }
-        let parent = self.fd(dir)?;
+        let parent = self.fd(dir, "unlinkat")?;
         let flags = if directory {
             rustix::fs::AtFlags::REMOVEDIR
         } else {
@@ -800,6 +965,7 @@ pub struct FakeRemoveFs {
     remount: Option<(u64, u64)>,
     /// The owner the diverging inode reports from its second `stat` on.
     diverge_uid: Option<u32>,
+    rename_out: Option<(Vec<u8>, Vec<u8>, bool)>,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -834,6 +1000,7 @@ impl FakeRemoveFs {
             faults: Vec::new(),
             remount: None,
             diverge_uid: None,
+            rename_out: None,
         }
     }
 
@@ -940,6 +1107,17 @@ impl FakeRemoveFs {
         self.diverge_hits = 0;
     }
 
+    /// Move a directory out of its relative name immediately before ancestry
+    /// verification, so the resolver observes a different tree entry.
+    pub fn rename_out_before_verify(&mut self, relative: Vec<u8>, replacement: Vec<u8>) {
+        self.rename_out = Some((relative, replacement, false));
+    }
+
+    /// Move a directory out and plant a different directory at its old name.
+    pub fn replace_path_before_verify(&mut self, relative: Vec<u8>, replacement: Vec<u8>) {
+        self.rename_out = Some((relative, replacement, true));
+    }
+
     /// The next `unlink` of `name` first turns that entry into a symlink.
     pub fn swap_to_symlink_before_unlink(&mut self, name: Vec<u8>, target: u64) {
         self.swap = Some((name, target));
@@ -959,6 +1137,11 @@ impl FakeRemoveFs {
     /// Names passed to `unlink`, in order.
     pub fn unlinked(&self) -> &[Vec<u8>] {
         &self.unlinked
+    }
+
+    /// Number of currently open fake directory descriptors.
+    pub fn open_count(&self) -> usize {
+        self.opens.len()
     }
 
     fn ino_at(&self, path: &[&[u8]]) -> Option<u64> {
@@ -1137,6 +1320,88 @@ impl RemoveFs for FakeRemoveFs {
         self.stat_of(ino)
     }
 
+    fn verify_dir(
+        &mut self,
+        root: u64,
+        relative: &[u8],
+        expected: NodeStat,
+    ) -> Result<bool, RemoveError> {
+        self.fault("verify_dir")?;
+        let root_ino = self.opens.get(&root).copied().ok_or(RemoveError::Os {
+            op: "openat2",
+            errno: EBADF,
+        })?;
+        if let Some((moved, replacement, replace_original)) = self.rename_out.clone()
+            && moved == relative
+        {
+            self.rename_out = None;
+            let mut components = relative.split(|byte| *byte == b'/');
+            let leaf = components.next_back().unwrap_or_default();
+            let parent = components.fold(root_ino, |at, component| {
+                self.nodes
+                    .get(&at)
+                    .and_then(|node| node.children.get(component))
+                    .copied()
+                    .unwrap_or(0)
+            });
+            let moved_ino = self
+                .nodes
+                .get_mut(&parent)
+                .and_then(|node| node.children.remove(leaf));
+            if let Some(moved_ino) = moved_ino {
+                self.nodes
+                    .entry(parent)
+                    .and_modify(|node| _ = node.children.insert(replacement, moved_ino));
+                if replace_original {
+                    let replacement_ino = self.next_ino;
+                    self.next_ino = self.next_ino.saturating_add(1);
+                    let parent_dev = self.nodes.get(&parent).map_or(1, |node| node.dev);
+                    self.nodes.insert(
+                        replacement_ino,
+                        Node {
+                            dev: parent_dev,
+                            ino: replacement_ino,
+                            uid: 1000,
+                            mode: 0o755,
+                            kind: NodeKind::Dir,
+                            size: 0,
+                            nlink: 2,
+                            link: Vec::new(),
+                            children: BTreeMap::new(),
+                        },
+                    );
+                    self.nodes.entry(parent).and_modify(|node| {
+                        _ = node.children.insert(leaf.to_vec(), replacement_ino);
+                    });
+                }
+            }
+        }
+        let mut ino = root_ino;
+        if !relative.is_empty() {
+            for component in relative.split(|byte| *byte == b'/') {
+                ino = self
+                    .nodes
+                    .get(&ino)
+                    .and_then(|node| node.children.get(component))
+                    .copied()
+                    .ok_or(RemoveError::Os {
+                        op: "openat2",
+                        errno: ENOENT,
+                    })?;
+            }
+        }
+        let stat = self.stat_of(ino)?;
+        Ok(stat.dev == expected.dev && stat.ino == expected.ino && stat.kind == NodeKind::Dir)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<(), RemoveError> {
+        self.fault("close")?;
+        self.opens.remove(&fd).map(|_| ()).ok_or(RemoveError::Os {
+            op: "close",
+            errno: EBADF,
+        })
+    }
+
     fn lstat(&mut self, dir: u64, name: &[u8]) -> Result<NodeStat, RemoveError> {
         self.fault("lstat")?;
         let (ino, _) = self.lookup(dir, name)?;
@@ -1211,6 +1476,15 @@ mod tests {
     )]
 
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_remove_path_fails_closed() {
+        assert_eq!(
+            remove_path_on_host(&req("x")).unwrap_err(),
+            RemoveError::Unsupported
+        );
+    }
 
     fn tree() -> (FakeRemoveFs, u64) {
         let mut fs = FakeRemoveFs::new();
@@ -1372,9 +1646,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_that_is_a_mount_point_is_refused() {
+        let (mut fs, tree_root) = tree();
+        fs.set_device(tree_root, 9);
+        assert_eq!(
+            remove_path(&mut fs, &req("item")).unwrap_err(),
+            RemoveError::MountPoint
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
     fn a_directory_renamed_out_mid_walk_stops_the_walk() {
         let (mut fs, _) = tree();
-        let cache = fs.add(
+        fs.add(
             &[b"srv", b"app", b"build"],
             b"cache",
             NodeKind::Dir,
@@ -1398,12 +1683,52 @@ mod tests {
             0o644,
             1,
         );
-        fs.diverge_on_restat(cache);
+        fs.rename_out_before_verify(b"cache".to_vec(), b"moved-cache".to_vec());
         let report = remove_path(&mut fs, &req("cache")).unwrap();
         assert!(report.partial);
         assert!(report.removed.is_empty());
-        assert!(fs.exists(&[b"srv", b"app", b"build", b"cache", b"a"]));
-        assert!(fs.exists(&[b"srv", b"app", b"build", b"cache", b"b"]));
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"moved-cache", b"a"]));
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"moved-cache", b"b"]));
+    }
+
+    #[test]
+    fn a_nested_directory_renamed_out_mid_walk_stops_the_walk() {
+        let (mut fs, _) = tree();
+        fs.add(
+            &[b"srv", b"app", b"build"],
+            b"box",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"sub"],
+            b"a",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        fs.rename_out_before_verify(b"box/sub".to_vec(), b"moved-sub".to_vec());
+        let report = remove_path(&mut fs, &req("box/sub/a")).unwrap();
+        assert!(report.partial);
+        assert!(report.removed.is_empty());
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"moved-sub", b"a"]));
+    }
+
+    #[test]
+    fn a_stale_rename_hook_with_a_missing_parent_fails_closed() {
+        let mut fs = FakeRemoveFs::new();
+        let root = fs.open_root().unwrap();
+        let expected = fs.fstat(root).unwrap();
+        fs.rename_out_before_verify(b"missing/sub".to_vec(), b"moved-sub".to_vec());
+        assert_eq!(
+            fs.verify_dir(root, b"missing/sub", expected).unwrap_err(),
+            os("openat2", ENOENT)
+        );
+        fs.close(root).unwrap();
     }
 
     #[test]
@@ -1576,6 +1901,50 @@ mod tests {
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box"]));
         assert!(fs.unlinked().is_empty());
         assert!(report.removed.iter().any(|path| path.ends_with(b"/c")));
+        assert!(report.removed.contains(&b"/srv/app/build/box".to_vec()));
+    }
+
+    #[test]
+    fn an_unlink_error_after_a_partial_walk_is_preserved() {
+        let (mut fs, _) = boxed(&[b"a", b"b"]);
+        fs.fail_at("unlinkat", 1, 5);
+        let report = remove_path(&mut fs, &req("box")).unwrap();
+        assert!(report.partial);
+        assert_eq!(report.error, Some(os("unlinkat", 5)));
+        assert_eq!(report.removed.len(), 1);
+    }
+
+    #[test]
+    fn directory_descriptors_are_closed_as_the_walk_unwinds() {
+        let (mut fs, _) = tree();
+        fs.add(
+            &[b"srv", b"app", b"build"],
+            b"box",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.add(&BOX, b"one", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"one"],
+            b"two",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"one", b"two"],
+            b"item",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        let report = remove_path(&mut fs, &req("box")).unwrap();
+        assert!(!report.partial, "{report:?}");
+        assert_eq!(fs.open_count(), 1);
     }
 
     #[test]
@@ -2057,12 +2426,12 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_that_changes_between_stat_and_unlink_stops_the_walk() {
-        let (mut fs, dir) = boxed(&[b"a"]);
-        fs.diverge_on_restat(dir);
+    fn a_parent_renamed_out_before_unlink_stops_the_walk() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.rename_out_before_verify(b"box".to_vec(), b"moved-box".to_vec());
         let report = remove_path(&mut fs, &req("box/a")).unwrap();
         assert!(report.partial);
-        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"moved-box", b"a"]));
     }
 
     #[test]
@@ -2093,6 +2462,7 @@ mod tests {
     fn the_fake_refuses_what_a_kernel_would() {
         let mut fs = FakeRemoveFs::default();
         assert_eq!(fs.lstat(77, b"x").unwrap_err(), os("openat2", EBADF));
+        assert_eq!(fs.close(77).unwrap_err(), os("close", EBADF));
         // A name added under a parent that is not there links nothing.
         fs.add(&[b"nope"], b"x", NodeKind::File, 0, 0o644, 0);
         assert!(!fs.exists(&[b"nope", b"x"]));
@@ -2107,6 +2477,38 @@ mod tests {
             fs.unlink(root, b"d", false).unwrap_err(),
             os("unlinkat", 21)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_linux_remove_descriptor_reports_the_actual_operation() {
+        let mut fs = LinuxRemoveFs::default();
+        let expected = |op| RemoveError::Os { op, errno: EBADF };
+        assert_eq!(
+            fs.open_dir(99, b"x", true).unwrap_err(),
+            expected("openat2")
+        );
+        assert_eq!(fs.fstat(99).unwrap_err(), expected("fstat"));
+        assert_eq!(fs.lstat(99, b"x").unwrap_err(), expected("statat"));
+        assert_eq!(fs.list(99).unwrap_err(), expected("getdents"));
+        assert_eq!(
+            fs.unlink(99, b"x", false).unwrap_err(),
+            expected("unlinkat")
+        );
+        let expected_stat = NodeStat {
+            dev: 1,
+            ino: 1,
+            uid: 0,
+            mode: 0o755,
+            size: 0,
+            nlink: 1,
+            kind: NodeKind::Dir,
+        };
+        assert_eq!(
+            fs.verify_dir(99, b"", expected_stat).unwrap_err(),
+            expected("openat2")
+        );
+        assert_eq!(fs.close(99).unwrap_err(), expected("close"));
     }
 
     #[test]
@@ -2177,8 +2579,17 @@ mod tests {
     #[test]
     fn a_failing_stat_while_opening_the_tree_or_walking_is_returned() {
         // `/`, `srv`, `app`, `build`: four fstats open the tree.
-        for (skip, relative) in [(0, "box"), (1, "box"), (4, "box"), (5, "box/a")] {
+        for (skip, relative) in [(0, "box"), (1, "box"), (4, "box"), (5, "box/sub/file")] {
             let (mut fs, _) = boxed(&[b"a"]);
+            fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+            fs.add(
+                &[b"srv", b"app", b"build", b"box", b"sub"],
+                b"file",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
             fs.fail_at("fstat", skip, 5);
             assert_eq!(
                 remove_path(&mut fs, &req(relative)).unwrap_err(),
@@ -2193,6 +2604,123 @@ mod tests {
             remove_path(&mut fs, &req("box")).unwrap_err(),
             os("openat2", 5)
         );
+    }
+
+    #[test]
+    fn an_intermediate_stop_errno_closes_its_open_parent() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+        fs.fail_at("openat2", 5, ENOENT);
+        assert!(remove_path(&mut fs, &req("box/sub/file")).unwrap().partial);
+        assert_eq!(fs.open_count(), 1);
+    }
+
+    #[test]
+    fn an_intermediate_non_stop_open_error_closes_its_parent_and_is_returned() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+        fs.fail_at("openat2", 5, 5);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/sub/file")).unwrap_err(),
+            os("openat2", 5)
+        );
+        assert_eq!(fs.open_count(), 1);
+    }
+
+    #[test]
+    fn an_intermediate_parent_close_error_is_returned() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"sub"],
+            b"file",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        fs.fail_at("close", 3, 5);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/sub/file")).unwrap_err(),
+            os("close", 5)
+        );
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"sub", b"file"]));
+    }
+
+    #[test]
+    fn a_tree_parent_close_error_stops_before_the_walk_starts() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.fail_at("close", 0, 5);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            os("close", 5)
+        );
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+    }
+
+    #[test]
+    fn a_walk_parent_close_error_is_reported_after_the_target_unlink() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"sub", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"sub"],
+            b"file",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        fs.fail_at("close", 4, 5);
+        let report = remove_path(&mut fs, &req("box/sub/file")).unwrap();
+        assert!(report.partial);
+        assert_eq!(report.error, Some(os("close", 5)));
+        assert!(!fs.exists(&[b"srv", b"app", b"build", b"box", b"sub", b"file"]));
+    }
+
+    #[test]
+    fn a_removed_directory_close_error_is_reported_after_its_contents() {
+        let (mut fs, _) = boxed(&[]);
+        fs.add(&BOX, b"dir", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"dir"],
+            b"file",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        fs.fail_at("close", 3, 5);
+        let report = remove_path(&mut fs, &req("box/dir")).unwrap();
+        assert!(report.partial);
+        assert_eq!(report.error, Some(os("close", 5)));
+        assert!(!fs.exists(&[b"srv", b"app", b"build", b"box", b"dir", b"file"]));
+    }
+
+    #[test]
+    fn a_parent_replaced_by_another_directory_stops_the_walk() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.replace_path_before_verify(b"box".to_vec(), b"moved-box".to_vec());
+        let report = remove_path(&mut fs, &req("box/a")).unwrap();
+        assert!(report.partial);
+        assert!(report.removed.is_empty());
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"moved-box", b"a"]));
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box"]));
+    }
+
+    #[test]
+    fn a_non_stop_ancestry_verification_error_is_returned() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.fail_at("verify_dir", 0, 5);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            os("verify_dir", 5)
+        );
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+    }
+
+    #[test]
+    fn relative_parent_returns_empty_for_a_path_outside_the_tree() {
+        assert!(relative_parent(b"/srv/app/build", b"/elsewhere/box/a").is_empty());
     }
 
     #[test]
@@ -2233,6 +2761,50 @@ mod tests {
     }
 
     #[test]
+    fn a_fake_ancestry_check_fails_closed_for_a_missing_inode() {
+        let mut fs = FakeRemoveFs::new();
+        fs.hardlink(&[], b"ghost", 99);
+        let root = fs.open_root().unwrap();
+        let expected = fs.fstat(root).unwrap();
+        assert_eq!(
+            fs.verify_dir(root, b"ghost", expected).unwrap_err(),
+            os("fstat", ENOENT)
+        );
+    }
+
+    #[test]
+    fn a_fake_ancestry_check_fails_closed_for_a_stale_root_token() {
+        let mut fs = FakeRemoveFs::new();
+        let root = fs.open_root().unwrap();
+        let expected = fs.fstat(root).unwrap();
+        assert_eq!(
+            fs.verify_dir(99, b"", expected).unwrap_err(),
+            os("openat2", EBADF)
+        );
+    }
+
+    #[test]
+    fn directory_stat_result_propagates_fstat_errno_and_compares_identity() {
+        let expected = NodeStat {
+            dev: 7,
+            ino: 11,
+            uid: 1000,
+            mode: 0o755,
+            size: 0,
+            nlink: 2,
+            kind: NodeKind::Dir,
+        };
+        assert_eq!(
+            verify_dir_stat_result(Err(EBADF), expected).unwrap_err(),
+            os("fstat", EBADF)
+        );
+        assert!(verify_dir_stat_result(Ok(expected), expected).unwrap());
+        let mut changed = expected;
+        changed.ino += 1;
+        assert!(!verify_dir_stat_result(Ok(changed), expected).unwrap());
+    }
+
+    #[test]
     fn a_swap_for_a_name_that_is_not_there_plants_a_link_that_is_then_removed() {
         let mut fs = FakeRemoveFs::new();
         let root = fs.open_root().unwrap();
@@ -2248,14 +2820,14 @@ mod tests {
         let mut host = LinuxRemoveFs::default();
         assert_eq!(
             host.open_dir(77, b"x", false).unwrap_err(),
-            os("fstat", EBADF)
+            os("openat2", EBADF)
         );
         assert_eq!(host.fstat(77).unwrap_err(), os("fstat", EBADF));
-        assert_eq!(host.lstat(77, b"x").unwrap_err(), os("fstat", EBADF));
-        assert_eq!(host.list(77).unwrap_err(), os("fstat", EBADF));
+        assert_eq!(host.lstat(77, b"x").unwrap_err(), os("statat", EBADF));
+        assert_eq!(host.list(77).unwrap_err(), os("getdents", EBADF));
         assert_eq!(
             host.unlink(77, b"x", false).unwrap_err(),
-            os("fstat", EBADF)
+            os("unlinkat", EBADF)
         );
         let root = host.open_root().unwrap();
         let missing = b"xudo-no-such-name-t1";
@@ -2267,6 +2839,50 @@ mod tests {
         assert_eq!(
             host.unlink(root, missing, false).unwrap_err(),
             os("unlinkat", ENOENT)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ancestry_verification_reopens_from_the_pinned_root_and_calls_its_hook() {
+        let mut host = LinuxRemoveFs {
+            before_verify: Some(Box::new(|relative| assert!(!relative.is_empty()))),
+            ..LinuxRemoveFs::default()
+        };
+        let tree = host_dir("xudo-remove-verify");
+        std::fs::create_dir(tree.join("child")).unwrap();
+        let root = open_components(&mut host, &tree);
+        let child = host.open_dir(root, b"child", true).unwrap();
+        let stat = host.fstat(child).unwrap();
+        assert!(host.verify_dir(root, b"child", stat).unwrap());
+        host.close(child).unwrap();
+        host.close(root).unwrap();
+        std::fs::remove_dir_all(tree).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestry_resolution_rejects_a_parent_escape() {
+        let mut host = LinuxRemoveFs::default();
+        let root = host.open_root().unwrap();
+        let expected = host.fstat(root).unwrap();
+        assert_eq!(
+            host.verify_dir(root, b"../", expected).unwrap_err(),
+            os("openat2", EXDEV)
+        );
+        host.close(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "root-tests"))]
+    #[test]
+    fn the_linux_race_hook_api_fails_closed_for_an_invalid_tree() {
+        fn ignore_relative(_relative: &[u8]) {}
+        ignore_relative(b"");
+        let mut request = req("x");
+        request.under = b"/".to_vec();
+        assert_eq!(
+            remove_path_on_host_with_before_verify(&request, ignore_relative),
+            Err(RemoveError::TreeRoot)
         );
     }
 

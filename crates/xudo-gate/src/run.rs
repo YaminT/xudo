@@ -666,6 +666,7 @@ fn proceed(
             pid: caller.pin.pid,
         });
     };
+    crate::decide::validate_pending_identity(&pending_entry, &caller, &context)?;
     // A typed operation never opens the marker program and never execs.
     // The password name was already required by `accept_invocation`.
     if let Some(requested) = pending_entry.operation.as_ref() {
@@ -745,7 +746,7 @@ fn run_typed_operation(
     progress: &mut Progress,
 ) -> Result<xudo_sys::RemoveReport, Refusal> {
     let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or("");
-    let work = crate::operate::prepare_remove(
+    let mut work = crate::operate::prepare_remove(
         &loaded.rules.rules,
         &caller.facts,
         pending,
@@ -761,6 +762,26 @@ fn run_typed_operation(
         requested.target.escape_ascii()
     ));
     stage(Stage::Spool, spool.consume(&pending.nonce))?;
+    // Fatal signals may still terminate the gate between this record and an
+    // unlink; no safe signal-deferral API is available in this crate. The
+    // intent remains a durable trace of what the walk was about to do.
+    let mut planned_request = work.request.clone();
+    planned_request.dry_run = true;
+    let planned = match host.remove_path(&planned_request) {
+        Ok(report) => report,
+        Err(error) => return Err(crate::operate::walk_refusal(&error)),
+    };
+    let intent = host
+        .audit()
+        .append(&|previous| crate::operate::intent_record(previous, caller, &work, &planned))
+        .map_err(|error| {
+            progress.audit_notice = error.damaged_log_notice();
+            Refusal::Failed {
+                stage: Stage::Audit,
+                reason: error.to_string(),
+            }
+        })?;
+    work.intent_sequence = Some(intent.seq().get());
     let report = match host.remove_path(&work.request) {
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
@@ -1261,6 +1282,8 @@ args = [
         freeze_asked: std::cell::RefCell<Vec<u32>>,
         /// The in-memory tree a remove-path walks.
         remove: xudo_sys::FakeRemoveFs,
+        /// Make the fake unlink seam assert that a durable intent exists.
+        assert_intent_before_unlink: bool,
     }
 
     #[test]
@@ -1408,6 +1431,7 @@ args = [
                 user_freezes: Vec::new(),
                 freeze_asked: std::cell::RefCell::new(Vec::new()),
                 remove: xudo_sys::FakeRemoveFs::new(),
+                assert_intent_before_unlink: false,
             }
         }
     }
@@ -1481,6 +1505,14 @@ args = [
             &mut self,
             request: &xudo_sys::RemoveRequest,
         ) -> Result<xudo_sys::RemoveReport, xudo_sys::RemoveError> {
+            if self.assert_intent_before_unlink && !request.dry_run {
+                assert!(
+                    self.audit
+                        .records()
+                        .iter()
+                        .any(|record| { has_line(&record.evidence, "op=remove-path-intent") })
+                );
+            }
             xudo_sys::remove_path(&mut self.remove, request)
         }
     }
@@ -3049,6 +3081,48 @@ max-entries = 10
         );
     }
 
+    fn assert_remove_entry_refused(entry: PendingRequest) {
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+    }
+
+    #[test]
+    fn an_expired_remove_path_entry_is_refused_by_the_gate() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.deadline = crate::request::BoottimeMillis(NOW);
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn a_stale_generation_remove_path_entry_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.generation = entry.generation.saturating_add(1);
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn an_entry_minted_under_another_operation_rule_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.action = "other.clean-build".to_owned();
+        assert_remove_entry_refused(entry);
+    }
+
+    #[test]
+    fn a_remove_path_entry_for_another_attested_identity_is_refused() {
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 91 };
+        entry.attested_scope_id = Some(91);
+        entry.boot_id = Some("01234567-89ab-cdef-0123-456789abcdef".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        assert_remove_entry_refused(entry);
+    }
+
     #[test]
     fn a_password_gate_removes_a_path_and_does_not_exec() {
         let spool = Rc::new(holding(&[(
@@ -3065,11 +3139,33 @@ max-entries = 10
         assert!(exit.message.contains("removed 1"));
         assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
         let records = host.audit.records();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].decision, AuditDecision::Allowed);
-        assert!(has_line(&records[0].evidence, "op=remove-path"));
-        assert!(has_line(&records[0].evidence, "severity=normal"));
-        assert_eq!(records[0].outcome.kind(), "exited");
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[0].evidence, "planned_count=1"));
+        assert_eq!(records[1].decision, AuditDecision::Allowed);
+        assert!(has_line(&records[1].evidence, "op=remove-path"));
+        assert!(has_line(&records[1].evidence, "intent_seq=1"));
+        assert!(has_line(&records[1].evidence, "severity=normal"));
+        assert_eq!(records[1].outcome.kind(), "exited");
+    }
+
+    #[test]
+    fn a_killed_walk_leaves_an_intent_record() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.remove.fail_at("unlinkat", 0, 5);
+        host.assert_intent_before_unlink = true;
+        let _ = run(&mut host, &auth());
+        assert!(host.audit.records().iter().any(|record| {
+            has_line(&record.evidence, "op=remove-path-intent")
+                && has_line(&record.evidence, "planned_count=1")
+        }));
+        assert!(host.remove.unlinked().is_empty());
     }
 
     #[test]
@@ -3087,10 +3183,13 @@ max-entries = 10
         assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
         assert!(host.remove.unlinked().is_empty());
         let records = host.audit.records();
-        assert_eq!(records.len(), 1);
-        assert!(has_line(&records[0].evidence, "severity=low"));
-        assert!(has_line(&records[0].evidence, "dry_run=true"));
-        assert_eq!(records[0].outcome.kind(), "not_executed");
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[0].evidence, "planned_count=1"));
+        assert!(has_line(&records[1].evidence, "severity=low"));
+        assert!(has_line(&records[1].evidence, "dry_run=true"));
+        assert!(has_line(&records[1].evidence, "intent_seq=1"));
+        assert_eq!(records[1].outcome.kind(), "not_executed");
     }
 
     #[test]
@@ -3154,9 +3253,10 @@ max-entries = 10
         assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
         assert!(exit.message.contains("partial"));
         let records = host.audit.records();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].decision, AuditDecision::Allowed);
-        assert!(has_line(&records[0].evidence, "partial=true"));
+        assert_eq!(records.len(), 2);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert_eq!(records[1].decision, AuditDecision::Allowed);
+        assert!(has_line(&records[1].evidence, "partial=true"));
         let left = [&b"a"[..], &b"b"[..]]
             .iter()
             .filter(|name| {
@@ -3184,7 +3284,7 @@ max-entries = 10
     }
 
     #[test]
-    fn an_audit_failure_after_unlink_still_reports_the_removal() {
+    fn an_audit_failure_before_intent_stops_before_unlink() {
         let spool = Rc::new(holding(&[(
             NONCE_A,
             remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
@@ -3196,8 +3296,33 @@ max-entries = 10
         let exit = run(&mut host, &auth());
         assert_eq!(exec_calls(&host), 0);
         assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
-        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
         assert!(exit.message.contains("refused"), "{exit:?}");
         assert_ne!(exit.status, 0);
+    }
+
+    #[test]
+    fn a_final_audit_failure_after_the_walk_preserves_the_intent_record() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        host.audit = FakeAuditSink::failing_after(
+            1,
+            AuditError::Unavailable {
+                reason: "sink closed after walk".into(),
+            },
+        );
+        let exit = run(&mut host, &auth());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(exit.message.contains("refused"), "{exit:?}");
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        let records = host.audit.records();
+        assert_eq!(records.len(), 1);
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
     }
 }

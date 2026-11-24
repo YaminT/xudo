@@ -3602,7 +3602,6 @@ fn serve_remove(
             Served::Decided,
         );
     }
-    policy.settings.confirm_human_path = false;
     mint(
         conn,
         platform,
@@ -4423,7 +4422,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
-    fn a_permitted_remove_path_is_minted_for_the_password_gate() {
+    fn a_remove_path_honors_confirm_human_path() {
         let mut host = Host::honest();
         host.policy.answer = Ok(operation_policy());
         let request = remove_question(b"/srv/app/build/cache", true);
@@ -4431,16 +4430,19 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let spool = FakeSpool::new();
         let outcome = serve_with(&mut host, &conn, Ok(&spool));
         assert_eq!(outcome.served, Served::Minted);
-        let (decision, minted) = decision_of(&outcome.answer).unwrap();
-        assert!(decision.verdict.is_permitted());
-        let minted = minted.unwrap();
-        assert_eq!(minted.gate, xudo_backend::snippet::GATE_AUTH);
+        assert_eq!(
+            outcome.answer,
+            xudo_wire::Answer::Pending {
+                id: "ab".repeat(32),
+                expires_in_ms: crate::mint::REQUEST_TTL_MILLIS,
+            }
+        );
         let names = spool.names().unwrap();
         assert_eq!(names.len(), 1);
         let bytes = spool.read(&names[0], 1_000_000).unwrap();
         let entry: PendingRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(entry.program, xudo_wire::OPERATION_PROGRAM);
-        assert!(!entry.needs_watch);
+        assert!(entry.needs_watch);
         let operation = entry.operation.unwrap();
         assert_eq!(operation.op, "remove-path");
         assert!(operation.dry_run);

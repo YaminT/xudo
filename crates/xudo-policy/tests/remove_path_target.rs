@@ -128,3 +128,91 @@ proptest! {
         assert_eq!(decide(&escaped).verdict, Verdict::Deny);
     }
 }
+
+#[test]
+fn an_owner_missing_from_passwd_refuses_and_names_the_rule() {
+    let set = RuleSet::from_toml(
+        "op.toml",
+        r#"
+[[operation]]
+id = "web.owned"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 8
+max-entries = 100
+owners = ["ghost"]
+"#,
+    )
+    .unwrap();
+    let decision = evaluate_remove_path(
+        &set,
+        &human(),
+        b"/srv/app/build/cache",
+        Settings::default(),
+        "",
+    );
+    assert_eq!(decision.denial, Some(DenialCode::OperationRefused));
+    assert_eq!(
+        decision.action.as_ref().map(xudo_policy::ActionId::as_str),
+        Some("web.owned")
+    );
+}
+
+#[test]
+fn a_tree_inside_a_protected_system_directory_does_not_load() {
+    let text = r#"
+[[operation]]
+id = "web.etc"
+op = "remove-path"
+under = "/etc/app"
+recursive = true
+max-depth = 8
+max-entries = 100
+"#;
+    let error = RuleSet::from_toml("op.toml", text).unwrap_err();
+    assert!(
+        error.to_string().contains("protected system directory"),
+        "{error}"
+    );
+}
+
+fn tree(id: &str, under: &str, max_depth: u32) -> xudo_policy::Operation {
+    xudo_policy::Operation {
+        id: xudo_policy::ActionId::new(id),
+        op: xudo_policy::OpKind::RemovePath,
+        under: under.to_owned(),
+        recursive: true,
+        max_depth,
+        max_entries: 100,
+        owners: None,
+        harness: Vec::new(),
+        source: xudo_policy::rule::Source::default(),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn a_granted_path_is_always_granted_by_the_longest_containing_tree(
+        longer_cap in 1u32..6,
+        target_depth in 1u32..8,
+    ) {
+        let operations = [
+            tree("wide", "/srv", 32),
+            tree("narrow", "/srv/app/data", longer_cap),
+        ];
+        let mut target = b"/srv/app/data".to_vec();
+        for _ in 0..target_depth {
+            target.extend_from_slice(b"/x");
+        }
+        match xudo_policy::operation::select(&operations, &target) {
+            Ok((granted, _)) => {
+                assert_eq!(granted.under.as_str(), "/srv/app/data");
+                assert!(target_depth <= longer_cap);
+            }
+            Err(_) => assert!(target_depth > longer_cap),
+        }
+    }
+}

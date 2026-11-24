@@ -1398,6 +1398,18 @@ pub(crate) fn touches_protected_path(path: &[u8]) -> bool {
     })
 }
 
+/// Returns `true` when `path` contains a protected prefix as a descendant.
+pub(crate) fn contains_protected_path(path: &[u8]) -> bool {
+    if !path.starts_with(b"/") {
+        return false;
+    }
+    PROTECTED_PREFIXES.iter().any(|prefix| {
+        prefix
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+    })
+}
+
 /// Evaluates the compiled-in deny-list against a resolved executable and its
 /// canonical argv.
 ///
@@ -1955,6 +1967,14 @@ mod tests {
         assert!(!touches_protected_path(b"/etc/xudoxyz"));
         assert!(!touches_protected_path(b"/usr/bin/xudo-helper"));
         assert!(!touches_protected_path(b"etc/xudo"));
+    }
+
+    #[test]
+    fn a_path_ancestor_of_a_protected_prefix_is_detected_component_wise() {
+        assert!(contains_protected_path(b"/var"));
+        assert!(contains_protected_path(b"/var/lib"));
+        assert!(!contains_protected_path(b"/var-lib"));
+        assert!(!contains_protected_path(b"var"));
     }
 
     #[test]

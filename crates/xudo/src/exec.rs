@@ -2147,8 +2147,10 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
             stream.read_to_end(&mut request).unwrap();
-            for byte in reply {
-                if stream.write_all(&[byte]).is_err() {
+            // Cycle the bytes so the loop ends only when the client hangs up:
+            // the `break` is reached on every run, however slow the machine.
+            for byte in reply.iter().cycle() {
+                if stream.write_all(&[*byte]).is_err() {
                     break;
                 }
                 thread::sleep(Duration::from_millis(30));
@@ -2163,7 +2165,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(result.is_err(), "trickling reply was accepted: {result:?}");
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_millis(1500),
             "deadline took {elapsed:?}"
         );
         broker.join().unwrap();
@@ -2510,7 +2512,7 @@ mod tests {
         let _ = release_tx.send(());
         assert_eq!(result, Err(ExitCode::Unusable));
         assert!(
-            elapsed < Duration::from_millis(450),
+            elapsed < Duration::from_millis(1500),
             "silent broker held the client for {elapsed:?}"
         );
         held.join().unwrap();

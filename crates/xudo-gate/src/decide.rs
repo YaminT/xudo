@@ -394,16 +394,7 @@ pub fn decide(
             pid: caller.pin.pid,
         });
     };
-    pending.validate(caller.pin, context.generation, context.now)?;
-    // Every state, not only `Consumed`: an entry for a class the gate cannot
-    // attest is refused whatever its state, so no path depends on state alone.
-    if !pending.live_attested_identity_matches(
-        &caller.attested_class,
-        caller.attested_scope_id,
-        caller.boot_id.as_deref(),
-    ) {
-        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
-    }
+    validate_pending_identity(pending, caller, &context)?;
 
     let action_id = ActionId::new(pending.action.clone());
     let request = Request::for_program(
@@ -477,6 +468,24 @@ pub fn decide(
         requested_rule_source: action.source.to_string(),
         nonce: pending.nonce.clone(),
     })
+}
+
+/// Validate common spool-entry invariants on every gate path, including typed
+/// operations which do not pass through the ordinary action decision.
+pub(crate) fn validate_pending_identity(
+    pending: &PendingRequest,
+    caller: &GateCaller,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    pending.validate(caller.pin, context.generation, context.now)?;
+    if !pending.live_attested_identity_matches(
+        &caller.attested_class,
+        caller.attested_scope_id,
+        caller.boot_id.as_deref(),
+    ) {
+        return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
+    }
+    Ok(())
 }
 
 fn confirmation_satisfied(pending: &PendingRequest, context: &GateContext) -> bool {

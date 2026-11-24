@@ -2,16 +2,16 @@
 //!
 //! The tree is `/var/lib/xudo-t1-remove-path`. That name is not under the
 //! protected prefix `/var/lib/xudo`. The walk still requires `/`, `/var`, and
-//! `/var/lib` to be root-owned and closed to group and other writes. A bind
-//! mount that the container refuses is a panic, with the command's output.
+//! `/var/lib` to be root-owned and closed to group and other writes. Docker
+//! supplies a tmpfs at the tree root, without granting `SYS_ADMIN`.
 
-#![cfg(feature = "root-tests")]
+#![cfg(all(feature = "root-tests", target_os = "linux"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    // mount and umount are run by absolute path; there is no PATH search.
+    // chown is run by absolute path; there is no PATH search.
     clippy::disallowed_methods
 )]
 
@@ -25,19 +25,16 @@ use xudo_tests::root_lane::root_guard;
 
 const TREE: &str = "/var/lib/xudo-t1-remove-path";
 const SECRET: &str = "/var/lib/xudo-t1-remove-secret";
-const BIND_SRC: &str = "/var/lib/xudo-t1-bind-src";
+const MOVED: &str = "/var/lib/xudo-t1-moved-out";
+const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
         return false;
     }
-    let mounted = format!("{TREE}/box/mnt");
-    if Path::new(&mounted).exists() {
-        let _ = Command::new("/usr/bin/umount").arg(&mounted).status();
-    }
     let _ = fs::remove_dir_all(TREE);
     let _ = fs::remove_file(SECRET);
-    let _ = fs::remove_dir_all(BIND_SRC);
+    let _ = fs::remove_dir_all(MOVED);
     fs::create_dir_all(TREE).unwrap();
     let mut perms = fs::metadata(TREE).unwrap().permissions();
     perms.set_mode(0o755);
@@ -52,7 +49,7 @@ fn request(relative: &[u8], recursive: bool) -> RemoveRequest {
         recursive,
         max_depth: 8,
         max_entries: 100,
-        owners: RemoveOwnerPolicy::Only(vec![0]),
+        owners: RemoveOwnerPolicy::Only(vec![65534]),
         dry_run: false,
     }
 }
@@ -61,9 +58,18 @@ fn walk(relative: &[u8], recursive: bool) -> Result<RemoveReport, RemoveError> {
     remove_path_on_host(&request(relative, recursive))
 }
 
+fn chown_unprivileged(path: &str, symlink: bool) {
+    let mut command = Command::new("/usr/bin/chown");
+    if symlink {
+        command.arg("-h");
+    }
+    let status = command.arg("65534:65534").arg(path).status().unwrap();
+    assert!(status.success(), "chown failed for {path}");
+}
+
 #[test]
-fn a_root_owned_file_under_the_tree_is_unlinked() {
-    if !begin_root_test("a_root_owned_file_under_the_tree_is_unlinked") {
+fn a_root_owned_entry_is_never_removed() {
+    if !begin_root_test("a_root_owned_entry_is_never_removed") {
         return;
     }
     let file = format!("{TREE}/keep-me");
@@ -71,7 +77,8 @@ fn a_root_owned_file_under_the_tree_is_unlinked() {
     fs::set_permissions(&file, Permissions::from_mode(0o644)).unwrap();
     let report = walk(b"keep-me", false).unwrap();
     assert!(!report.partial, "{report:?}");
-    assert!(!Path::new(&file).exists());
+    assert!(report.removed.is_empty());
+    assert!(Path::new(&file).exists());
     assert!(Path::new(TREE).is_dir());
 }
 
@@ -93,7 +100,9 @@ fn a_symlink_planted_by_the_agent_is_never_followed() {
         return;
     }
     fs::write(SECRET, b"secret").unwrap();
-    std::os::unix::fs::symlink(SECRET, format!("{TREE}/link")).unwrap();
+    let link = format!("{TREE}/link");
+    std::os::unix::fs::symlink(SECRET, &link).unwrap();
+    chown_unprivileged(&link, true);
     let report = walk(b"link", false).unwrap();
     assert!(!report.partial, "{report:?}");
     assert!(!Path::new(&format!("{TREE}/link")).exists());
@@ -102,11 +111,12 @@ fn a_symlink_planted_by_the_agent_is_never_followed() {
 }
 
 #[test]
-fn a_hardlink_to_a_root_file_is_unlinked_and_the_file_survives() {
-    if !begin_root_test("a_hardlink_to_a_root_file_is_unlinked_and_the_file_survives") {
+fn a_hardlink_to_an_unprivileged_file_is_unlinked_and_the_file_survives() {
+    if !begin_root_test("a_hardlink_to_an_unprivileged_file_is_unlinked_and_the_file_survives") {
         return;
     }
     fs::write(SECRET, b"root-file").unwrap();
+    chown_unprivileged(SECRET, false);
     fs::hard_link(SECRET, format!("{TREE}/alias")).unwrap();
     let before = fs::metadata(SECRET).unwrap().nlink();
     assert!(before >= 2);
@@ -128,6 +138,7 @@ fn a_file_named_dash_rf_is_only_a_name() {
     }
     let name = format!("{TREE}/-rf");
     fs::write(&name, b"name").unwrap();
+    chown_unprivileged(&name, false);
     fs::write(format!("{TREE}/other"), b"stay").unwrap();
     let report = walk(b"-rf", false).unwrap();
     assert!(!report.partial, "{report:?}");
@@ -136,37 +147,49 @@ fn a_file_named_dash_rf_is_only_a_name() {
 }
 
 #[test]
-fn a_bind_mount_under_the_tree_is_not_crossed() {
-    if !begin_root_test("a_bind_mount_under_the_tree_is_not_crossed") {
+fn a_tree_that_is_a_mount_point_is_refused() {
+    if !begin_root_test("a_tree_that_is_a_mount_point_is_refused") {
+        return;
+    }
+    fs::write(format!("{TREE}/stay"), b"secret").unwrap();
+    let mut mounted = request(b"stay", false);
+    mounted.under = MOUNT_TREE.as_bytes().to_vec();
+    fs::write(format!("{MOUNT_TREE}/stay"), b"secret").unwrap();
+    assert_eq!(
+        remove_path_on_host(&mounted).unwrap_err(),
+        RemoveError::MountPoint
+    );
+    assert_eq!(fs::read(format!("{MOUNT_TREE}/stay")).unwrap(), b"secret");
+}
+
+#[test]
+fn a_directory_renamed_out_of_the_tree_mid_walk_stops_the_walk() {
+    if !begin_root_test("a_directory_renamed_out_of_the_tree_mid_walk_stops_the_walk") {
         return;
     }
     let box_dir = format!("{TREE}/box");
-    let mnt = format!("{box_dir}/mnt");
-    fs::create_dir_all(&mnt).unwrap();
-    fs::create_dir_all(BIND_SRC).unwrap();
-    fs::write(format!("{BIND_SRC}/inside"), b"secret").unwrap();
-    fs::write(format!("{box_dir}/a"), b"a").unwrap();
-    let output = Command::new("/usr/bin/mount")
-        .args(["--bind", BIND_SRC, &mnt])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "mount --bind failed: status {} stdout {} stderr {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report = walk(b"box", true).unwrap();
+    fs::create_dir(&box_dir).unwrap();
+    let inside = format!("{box_dir}/inside");
+    fs::write(&inside, b"keep after rename").unwrap();
+    chown_unprivileged(&inside, false);
+    chown_unprivileged(&box_dir, false);
+    let mut moved = false;
+    let report = xudo_sys::remove::remove_path_on_host_with_before_verify(
+        &request(b"box", true),
+        move |relative| {
+            if relative == b"box" && !moved {
+                fs::rename(&box_dir, MOVED).unwrap();
+                moved = true;
+            }
+        },
+    )
+    .unwrap();
     assert!(report.partial, "{report:?}");
-    assert!(Path::new(&mnt).exists());
-    assert_eq!(fs::read(format!("{mnt}/inside")).unwrap(), b"secret");
-    assert_eq!(fs::read(format!("{BIND_SRC}/inside")).unwrap(), b"secret");
-    let umount = Command::new("/usr/bin/umount").arg(&mnt).output().unwrap();
-    assert!(
-        umount.status.success(),
-        "umount failed: {}",
-        String::from_utf8_lossy(&umount.stderr)
+    assert!(Path::new(MOVED).is_dir());
+    assert_eq!(
+        fs::read(format!("{MOVED}/inside")).unwrap(),
+        b"keep after rename"
     );
-    let _ = fs::remove_dir_all(BIND_SRC);
+    assert!(!Path::new(&format!("{TREE}/box")).exists());
+    let _ = fs::remove_dir_all(MOVED);
 }

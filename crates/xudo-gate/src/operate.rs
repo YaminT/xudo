@@ -26,6 +26,8 @@ pub(crate) struct OperationWork {
     pub(crate) under: Vec<u8>,
     /// The absolute target the caller asked for.
     pub(crate) target: Vec<u8>,
+    /// Sequence number of the pre-walk intent record.
+    pub(crate) intent_sequence: Option<u64>,
 }
 
 /// Re-decide `pending` and build the walk request.
@@ -52,6 +54,12 @@ pub(crate) fn prepare_remove(
             reason: "remove-path runs only through the password gate".to_owned(),
         });
     }
+    if settings.confirm_human_path && !pending.confirmed {
+        return Err(Refusal::Failed {
+            stage: Stage::Invocation,
+            reason: "remove-path requires the configured human-path confirmation".to_owned(),
+        });
+    }
     if pending.program != OPERATION_PROGRAM || op_name != "remove-path" {
         return Err(Refusal::Failed {
             stage: Stage::Invocation,
@@ -62,6 +70,23 @@ pub(crate) fn prepare_remove(
         Ok(grant) => grant,
         Err(decision) => return Err(Refusal::Policy(decision)),
     };
+    let requested_target = target.escape_ascii().to_string();
+    if pending.action != grant.id.as_str()
+        || pending.operation.as_ref().is_none_or(|operation| {
+            operation.op != op_name || operation.target.as_slice() != target
+        })
+        || pending.argv.len() != 1
+        || pending
+            .argv
+            .first()
+            .is_none_or(|argument| argument != &requested_target)
+    {
+        return Err(Refusal::Failed {
+            stage: Stage::Rules,
+            reason: "the spool entry does not match the gate-selected operation and target"
+                .to_owned(),
+        });
+    }
     Ok(OperationWork {
         request: RemoveRequest {
             under: grant.under.clone(),
@@ -76,6 +101,7 @@ pub(crate) fn prepare_remove(
         source: grant.source.to_string(),
         under: grant.under,
         target: target.to_vec(),
+        intent_sequence: None,
     })
 }
 
@@ -104,10 +130,44 @@ pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Ve
         format!("partial={}", report.partial),
         format!("paths_sha256={}", hex_digest(&report.digest)),
     ];
+    if let Some(error) = &report.error {
+        evidence.push(format!("error={error}"));
+    }
+    if let Some(sequence) = work.intent_sequence {
+        evidence.push(format!("intent_seq={sequence}"));
+    }
     for path in xudo_sys::remove::audit_path_head(&report.removed) {
         evidence.push(format!("path={}", path.escape_ascii()));
     }
     evidence
+}
+
+/// Audit the planned tree and target before any unlink can occur.
+pub(crate) fn intent_record(
+    previous: Option<&Record>,
+    caller: &GateCaller,
+    work: &OperationWork,
+    planned: &RemoveReport,
+) -> Record {
+    let argv = vec![
+        OPERATION_PROGRAM.to_owned(),
+        work.target.escape_ascii().to_string(),
+    ];
+    Record::after(
+        previous,
+        AuditDecision::Allowed,
+        argv,
+        caller.facts.classification.label(),
+    )
+    .with_rule(&work.id, &work.source)
+    .with_evidence(vec![
+        "op=remove-path-intent".to_owned(),
+        format!("tree={}", work.under.escape_ascii()),
+        format!("target={}", work.target.escape_ascii()),
+        format!("planned_count={}", planned.removed.len()),
+        format!("planned_partial={}", planned.partial),
+    ])
+    .with_outcome(Outcome::NotExecuted)
 }
 
 /// The audit record written after the walk. A dry run did not exec and did
@@ -276,7 +336,7 @@ owners = ["agent"]
             caller_starttime: 2,
             action: "web.clean-build".into(),
             program: program.into(),
-            argv: Vec::new(),
+            argv: vec![b"/srv/app/build/cache".escape_ascii().to_string()],
             generation: 1,
             deadline: BoottimeMillis(9),
             confirmed: false,
@@ -357,6 +417,56 @@ owners = ["agent"]
     }
 
     #[test]
+    fn prepare_remove_requires_the_configured_human_path_confirmation() {
+        let settings = Settings {
+            confirm_human_path: true,
+            ..Settings::default()
+        };
+        let entry = pending(OPERATION_PROGRAM, "remove-path");
+        assert_eq!(
+            prepare_remove(
+                &sample(),
+                &human(),
+                &entry,
+                "remove-path",
+                b"/srv/app/build/cache",
+                false,
+                settings,
+                PASSWD,
+                true,
+            )
+            .unwrap_err(),
+            Refusal::Failed {
+                stage: Stage::Invocation,
+                reason: "remove-path requires the configured human-path confirmation".into(),
+            }
+        );
+        let mut confirmed = entry;
+        confirmed.confirmed = true;
+        confirmed.confirmed_by = Some(crate::request::WatcherPin {
+            uid: 1000,
+            pid: 9,
+            starttime: 10,
+            tty: 2,
+            sid: 3,
+        });
+        assert!(
+            prepare_remove(
+                &sample(),
+                &human(),
+                &confirmed,
+                "remove-path",
+                b"/srv/app/build/cache",
+                false,
+                settings,
+                PASSWD,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn prepare_remove_refuses_a_marker_mismatch_and_an_unknown_op() {
         let wrong_program =
             prepare(&sample(), &pending("/bin/true", "remove-path"), true).unwrap_err();
@@ -428,6 +538,7 @@ owners = ["agent"]
             removed,
             bytes: 4,
             partial,
+            error: None,
             dry_run,
         }
     }
@@ -491,7 +602,24 @@ owners = ["agent"]
         assert!(real.evidence.iter().any(|line| line == "partial=true"));
         assert_eq!(operation_status(&full), 1);
         assert_eq!(operation_status(&head), 1);
-        let complete = report(&[b"/srv/app/build/cache"], false, false);
+        let mut complete = report(&[b"/srv/app/build/cache"], false, false);
+        complete.error = Some(xudo_sys::RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        let complete_record = remove_record(None, &caller(), &work, &complete);
+        assert!(
+            complete_record
+                .evidence
+                .iter()
+                .any(|line| line == "bytes=4")
+        );
+        assert!(
+            complete_record
+                .evidence
+                .iter()
+                .any(|line| line == "error=unlinkat failed with errno 5")
+        );
         assert_eq!(operation_status(&complete), 0);
         assert!(operation_message(&complete).contains("removed 1"));
         assert!(operation_message(&report(&[b"/a"], true, false)).contains("dry-run"));
@@ -528,6 +656,7 @@ owners = ["agent"]
             removed: paths.to_vec(),
             bytes: 1,
             partial,
+            error: None,
             dry_run,
         }
     }

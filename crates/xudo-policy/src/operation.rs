@@ -13,7 +13,7 @@
 
 use crate::caller::CallerFacts;
 use crate::decision::{Confirm, Decision, DenialCode, ENVELOPE_SCHEMA_VERSION, TraceStep, Verdict};
-use crate::deny::touches_protected_path;
+use crate::deny::{contains_protected_path, touches_protected_path};
 use crate::engine::Settings;
 use crate::harness::{passwd_uid, valid_account_name, valid_harness_label};
 use crate::rule::{ActionId, RuleSet, Source};
@@ -112,7 +112,16 @@ pub struct RemoveGrant {
 }
 
 const TREES: &[&[u8]] = &[
-    b"/etc", b"/usr", b"/boot", b"/proc", b"/sys", b"/dev", b"/run",
+    b"/etc",
+    b"/usr",
+    b"/boot",
+    b"/proc",
+    b"/sys",
+    b"/dev",
+    b"/run",
+    b"/root",
+    b"/opt",
+    b"/var/mail",
 ];
 
 /// Why `under` cannot be a tree root. `None` means the lexical check passed.
@@ -134,6 +143,9 @@ pub fn forbidden_under(under: &[u8]) -> Option<&'static str> {
     }
     if touches_protected_path(under) {
         return Some("an xudo protected prefix");
+    }
+    if contains_protected_path(under) {
+        return Some("an ancestor of an xudo protected prefix");
     }
     None
 }
@@ -173,6 +185,9 @@ pub fn check_operation(op: &Operation) -> Result<(), String> {
             for name in names {
                 if !valid_account_name(name) {
                     return Err(format!("owner {name:?} is not an account name"));
+                }
+                if name == "root" {
+                    return Err("owners may not include uid 0 (root)".to_owned());
                 }
                 if !seen.insert(name.as_str()) {
                     return Err(format!("owner {name:?} is listed twice"));
@@ -251,6 +266,7 @@ pub fn resolve_owners(op: &Operation, passwd: &str) -> Result<OwnerPolicy, Strin
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         match passwd_uid(passwd, name) {
+            Some(0) => return Err("owners may not include uid 0 (root)".to_owned()),
             Some(uid) => ids.push(uid),
             None => return Err(format!("owner {name} is not in passwd")),
         }
@@ -275,19 +291,17 @@ pub fn select<'a>(
     if operations.iter().any(|op| op.under.as_bytes() == target) {
         return Err("the tree root is never removed");
     }
-    let mut best: Option<(&Operation, Vec<u8>)> = None;
-    for op in operations {
-        let Ok(relative) = target_under(op.under.as_bytes(), target, op.max_depth) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(current, _)| op.under.len() > current.under.len())
-        {
-            best = Some((op, relative));
-        }
-    }
-    best.ok_or("no remove-path rule covers this target")
+    let op = operations
+        .iter()
+        .filter(|op| {
+            target
+                .strip_prefix(op.under.as_bytes())
+                .is_some_and(|rest| rest.starts_with(b"/"))
+        })
+        .max_by_key(|op| op.under.len())
+        .ok_or("no remove-path rule covers this target")?;
+    let relative = target_under(op.under.as_bytes(), target, op.max_depth)?;
+    Ok((op, relative))
 }
 
 /// The grant the walk runs, or a denial. Frozen enrolled agents are refused
@@ -437,6 +451,20 @@ owners = ["agent", "www-data"]
 harness = ["codex"]
 "#,
         )
+    }
+
+    fn operation(id: &str, under: &str, max_depth: u32) -> Operation {
+        Operation {
+            id: ActionId::new(id),
+            op: OpKind::RemovePath,
+            under: under.to_owned(),
+            recursive: true,
+            max_depth,
+            max_entries: 100,
+            owners: None,
+            harness: Vec::new(),
+            source: Source::default(),
+        }
     }
 
     fn human() -> CallerFacts {
@@ -590,46 +618,17 @@ owners = ["agent", "www-data"]
 
     #[test]
     fn the_longest_under_wins_and_a_shared_prefix_does_not() {
-        let set = rules(
-            r#"
-[[operation]]
-id = "wide"
-op = "remove-path"
-under = "/srv/app"
-recursive = true
-max-depth = 8
-max-entries = 10
-
-[[operation]]
-id = "narrow"
-op = "remove-path"
-under = "/srv/app/build"
-recursive = true
-max-depth = 8
-max-entries = 10
-"#,
-        );
-        let grant = judge_remove_path(
-            &set,
-            &human(),
-            b"/srv/app/build/cache",
-            Settings::default(),
-            "",
-        )
-        .unwrap();
+        let operations = [
+            operation("wide", "/srv/app", 8),
+            operation("narrow", "/srv/app/build", 8),
+        ];
+        let (grant, relative) = select(&operations, b"/srv/app/build/cache").unwrap();
         assert_eq!(grant.id.as_str(), "narrow");
-        assert_eq!(grant.relative, b"cache");
+        assert_eq!(relative, b"cache");
         // `/srv/app/build-evil` shares a string prefix with `narrow` and is
         // still inside `wide`. The narrow rule must not claim it.
-        let shared = evaluate_remove_path(
-            &set,
-            &human(),
-            b"/srv/app/build-evil/cache",
-            Settings::default(),
-            "",
-        );
-        assert_eq!(shared.verdict, Verdict::Allow);
-        assert_eq!(shared.action.as_ref().map(ActionId::as_str), Some("wide"));
+        let (shared, _) = select(&operations, b"/srv/app/build-evil/cache").unwrap();
+        assert_eq!(shared.id.as_str(), "wide");
         let only_narrow = rules(
             r#"
 [[operation]]
@@ -672,34 +671,18 @@ max-entries = 10
 
     #[test]
     fn the_longest_under_wins_whatever_order_the_rules_are_listed_in() {
-        let set = rules(
-            r#"
-[[operation]]
-id = "narrow"
-op = "remove-path"
-under = "/srv/app/build"
-recursive = true
-max-depth = 8
-max-entries = 10
-
-[[operation]]
-id = "wide"
-op = "remove-path"
-under = "/srv/app"
-recursive = true
-max-depth = 8
-max-entries = 10
-"#,
+        let operations = [
+            operation("narrow", "/srv/app/build", 8),
+            operation("wide", "/srv/app", 8),
+        ];
+        assert_eq!(
+            select(&operations, b"/srv/app/build/cache")
+                .unwrap()
+                .0
+                .id
+                .as_str(),
+            "narrow"
         );
-        let grant = judge_remove_path(
-            &set,
-            &human(),
-            b"/srv/app/build/cache",
-            Settings::default(),
-            "",
-        )
-        .unwrap();
-        assert_eq!(grant.id.as_str(), "narrow");
     }
 
     #[test]
@@ -864,6 +847,25 @@ max-entries = 4
             (op_toml("a", "srv/a", ""), "not absolute"),
             (op_toml("a", "/srv//a", ""), "empty, current, or parent"),
             (
+                op_toml("a", "/var", ""),
+                "ancestor of an xudo protected prefix",
+            ),
+            (
+                op_toml("a", "/var/lib", ""),
+                "ancestor of an xudo protected prefix",
+            ),
+            (op_toml("a", "/root", ""), "protected system directory"),
+            (op_toml("a", "/opt", ""), "protected system directory"),
+            (
+                op_toml("a", "/var/log", ""),
+                "ancestor of an xudo protected prefix",
+            ),
+            (op_toml("a", "/var/mail", ""), "protected system directory"),
+            (
+                op_toml("a", "/srv/a", "owners = [\"root\"]\n"),
+                "uid 0 (root)",
+            ),
+            (
                 op_toml("a", &format!("/{}", "x".repeat(300)), ""),
                 "component is longer",
             ),
@@ -903,5 +905,58 @@ max-entries = 4
             op_toml("two", "/srv/a", "")
         ));
         assert!(message.contains("already the tree of one"), "{message}");
+    }
+
+    #[test]
+    fn a_longer_tree_that_refuses_is_never_overridden_by_a_shorter_one() {
+        let operations = [
+            operation("wide", "/srv", 32),
+            operation("narrow", "/srv/app/data", 1),
+        ];
+        assert_eq!(
+            select(&operations, b"/srv/app/data/x/y").unwrap_err(),
+            "target is deeper than max-depth"
+        );
+    }
+
+    #[test]
+    fn nested_operation_trees_do_not_load() {
+        let text = format!(
+            "{}\n{}",
+            op_toml("wide", "/srv", ""),
+            op_toml("narrow", "/srv/app/data", "")
+        );
+        assert!(load_err(&text).contains("nested under trees are not allowed"));
+    }
+
+    #[test]
+    fn an_under_that_contains_xudos_state_is_refused() {
+        for under in [b"/var".as_slice(), b"/var/lib", b"/var/log"] {
+            let text = op_toml("state", std::str::from_utf8(under).unwrap(), "");
+            assert!(load_err(&text).contains("protected"));
+        }
+    }
+
+    #[test]
+    fn the_operation_kind_names_itself_for_a_record() {
+        assert_eq!(OpKind::RemovePath.as_str(), "remove-path");
+    }
+
+    #[test]
+    fn an_omitted_owner_list_means_any_owner_but_root() {
+        let any = operation("any", "/srv/a", 2);
+        assert_eq!(resolve_owners(&any, PASSWD), Ok(OwnerPolicy::AnyButRoot));
+    }
+
+    #[test]
+    fn an_owner_of_root_is_refused() {
+        let text = op_toml("root-owner", "/srv/a", "owners = [\"root\"]\n");
+        assert!(load_err(&text).contains("uid 0 (root)"));
+        let mut direct = operation("direct-root-owner", "/srv/a", 2);
+        direct.owners = Some(vec!["root".to_owned()]);
+        assert_eq!(
+            resolve_owners(&direct, PASSWD).unwrap_err(),
+            "owners may not include uid 0 (root)"
+        );
     }
 }

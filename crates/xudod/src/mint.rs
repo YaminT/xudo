@@ -358,7 +358,7 @@ pub(crate) fn entry_for_classified(
             caller_uid: identity.uid,
             caller_sid: identity.sid,
             caller_tty: identity.tty,
-            needs_watch: false,
+            needs_watch: confirm_human_path,
             shown_at_ms: None,
             shown_to: None,
             fingerprint: crate::confirm::fingerprint(
@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remove_path_is_minted_on_the_password_gate_without_a_watch() {
+    fn a_remove_path_is_minted_with_a_watch_when_human_path_confirmation_is_on() {
         let target = b"/srv/app/build/cache\xff";
         let mut request = BrokerRequest::new("/bin/true", Vec::new(), "unattested");
         request.question = xudo_wire::Question::RemovePath {
@@ -1241,7 +1241,7 @@ mod tests {
             nonce('a'),
         )
         .unwrap();
-        assert!(!minted.needs_watch);
+        assert!(minted.needs_watch);
         assert_eq!(minted.program, xudo_wire::OPERATION_PROGRAM);
         assert_eq!(minted.argv, vec![target.escape_ascii().to_string()]);
         let operation = minted.operation.unwrap();

@@ -413,9 +413,11 @@ pub enum RuleSetError {
         at: Source,
     },
     /// A harness label is not in the registry this load was given.
-    #[error("action {id} at {at}: harness label {label:?} is not in the registry")]
+    #[error("{kind} {id} at {at}: harness label {label:?} is not in the registry")]
     UnknownHarness {
-        /// The offending action.
+        /// Whether this is an action or typed operation.
+        kind: &'static str,
+        /// The offending action or operation.
         id: String,
         /// The label.
         label: String,
@@ -545,6 +547,28 @@ fn check_operations(
                 id: operation.id.as_str().to_owned(),
                 first: prior.source.clone(),
                 second: operation.source.clone(),
+            });
+        }
+        if let Some(other) = operations.iter().find(|other| {
+            other.id != operation.id
+                && (operation
+                    .under
+                    .as_bytes()
+                    .strip_prefix(other.under.as_bytes())
+                    .is_some_and(|rest| rest.starts_with(b"/"))
+                    || other
+                        .under
+                        .as_bytes()
+                        .strip_prefix(operation.under.as_bytes())
+                        .is_some_and(|rest| rest.starts_with(b"/")))
+        }) {
+            return Err(RuleSetError::OperationInvalid {
+                id: operation.id.as_str().to_owned(),
+                at: operation.source.clone(),
+                reason: format!(
+                    "nested under trees are not allowed ({} and {})",
+                    operation.under, other.under
+                ),
             });
         }
         if let Err(reason) = check_operation(operation) {
