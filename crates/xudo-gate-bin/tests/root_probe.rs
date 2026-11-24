@@ -220,8 +220,9 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(output.stdout.trim(), "0");
     assert!(!entry_exists(&nonce));
 
-    // An ordinary user's thaw lifts only their own marker: root's global
-    // freeze stands, and the broker says done all the same.
+    // An unattested caller cannot thaw at all. In
+    // this container the peer's cgroup cannot be read, so the user is
+    // unattested and the thaw is refused (fail closed); root's marker stands.
     let as_user = |args: &[&str]| {
         Command::new("/usr/sbin/runuser")
             .args(["-u", USER, "--"])
@@ -232,7 +233,11 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
             .unwrap()
     };
     let thawed = as_user(&["thaw"]);
-    assert!(thawed.status.success(), "{thawed:?}");
+    assert!(!thawed.status.success(), "{thawed:?}");
+    assert!(
+        String::from_utf8_lossy(&thawed.stderr).contains("only a human can thaw"),
+        "{thawed:?}"
+    );
     assert!(marker.exists(), "a user's thaw lifted root's freeze");
 
     // A user's own freeze writes their own marker, which the gate reads for
@@ -261,8 +266,8 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), record);
     assert!(frozen_for(uid));
     assert!(!frozen_for(uid + 1));
-    assert!(as_user(&["thaw"]).status.success());
-    assert!(!theirs.exists());
+    assert!(!as_user(&["thaw"]).status.success());
+    assert!(theirs.exists(), "an unattested user's thaw lifted a marker");
     assert!(marker.exists());
     // Root's thaw clears every marker, a user's included.
     assert!(

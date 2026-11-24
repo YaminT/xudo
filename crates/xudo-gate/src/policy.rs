@@ -70,7 +70,7 @@ pub struct LoadedPolicy {
     /// Maximum lifetime, in seconds, of a root-held ask-human entry.
     pub queue_ttl_secs: u64,
     /// Root-owned account records used to match harness accounts to uids.
-    pub passwd: Vec<u8>,
+    pub passwd: String,
 }
 
 /// Why settings bytes could not be interpreted.
@@ -99,6 +99,10 @@ pub enum PolicyError {
     /// The settings bytes could not be interpreted.
     #[error(transparent)]
     Config(SettingsError),
+    /// `/etc/passwd` is missing or empty. Without it no enrolled agent can be
+    /// told from a human, so the policy does not load.
+    #[error("the account database is missing or empty")]
+    PasswdUnusable,
 }
 
 impl From<SettingsError> for PolicyError {
@@ -132,7 +136,16 @@ fn attach_passwd(
     passwd: Result<Option<Vec<u8>>, PolicyError>,
 ) -> Result<LoadedPolicy, PolicyError> {
     let mut loaded = loaded?;
-    loaded.passwd = passwd?.unwrap_or_default();
+    // Lossy on purpose. Any user may put a stray byte in their own GECOS
+    // (`chfn`), and a strict decode would let one user stop every request. The
+    // name and uid fields are ASCII (`valid_account_name`) and only root edits
+    // uids, so a replacement character, which is neither a newline nor a
+    // colon, cannot change who resolves to which uid. Skipping a bad line
+    // instead would let a harness user hide their own uid, so never do that.
+    loaded.passwd = passwd?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .filter(|text| !text.is_empty())
+        .ok_or(PolicyError::PasswdUnusable)?;
     Ok(loaded)
 }
 
@@ -162,7 +175,7 @@ fn load_with(
         rules,
         settings,
         queue_ttl_secs,
-        passwd: Vec::new(),
+        passwd: String::new(),
     })
 }
 
@@ -336,8 +349,56 @@ mod tests {
             &ABSENT_FREEZE,
         )
         .unwrap();
-        let attached = attach_passwd(Ok(loaded), Ok(None)).unwrap();
-        assert!(attached.passwd.is_empty());
+        let error = attach_passwd(Ok(loaded), Ok(None)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the account database is missing or empty"
+        );
+    }
+
+    #[test]
+    fn an_empty_passwd_still_fails_the_load_closed() {
+        let error = attach_passwd(Ok(loaded_policy()), Ok(Some(Vec::new()))).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the account database is missing or empty"
+        );
+    }
+
+    fn loaded_policy() -> LoadedPolicy {
+        load_with(
+            Path::new("rules"),
+            Path::new("config.toml"),
+            &empty_rules,
+            &|_, _| Ok(None),
+            &ABSENT_FREEZE,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_non_utf8_gecos_does_not_stop_the_policy_load() {
+        // `chfn -r $'\xff'`: any user can do this to their own line.
+        let bytes =
+            b"root:x:0:0:root:/root:/bin/sh\nmallory:x:1001:1001:\xff\xfe:/home/m:/bin/sh\n";
+        let attached = attach_passwd(Ok(loaded_policy()), Ok(Some(bytes.to_vec()))).unwrap();
+        assert!(attached.passwd.contains("mallory:x:1001:1001:\u{fffd}"));
+    }
+
+    #[test]
+    fn a_non_utf8_byte_cannot_change_a_name_or_uid_field() {
+        let bytes = b"agent:x:1000:1000:\xff\n:x:0:0:evil:/:/bin/sh\nbob\xff:x:0:0::/:/bin/sh\nroot:x:0:0:\xff:/root:/bin/sh\n";
+        let attached = attach_passwd(Ok(loaded_policy()), Ok(Some(bytes.to_vec()))).unwrap();
+        let text = &attached.passwd;
+        assert_eq!(xudo_policy::passwd_uid(text, "agent"), Some(1000));
+        assert_eq!(xudo_policy::passwd_uid(text, "root"), Some(0));
+        // A damaged name does not become a clean one, and no new name appears.
+        assert_eq!(xudo_policy::passwd_uid(text, "bob"), None);
+        assert_eq!(xudo_policy::passwd_uid(text, "evil"), None);
+        assert_eq!(
+            text.lines().count(),
+            bytes.split(|b| *b == b'\n').count() - 1
+        );
     }
 
     #[test]
@@ -352,7 +413,7 @@ mod tests {
         .unwrap();
         let bytes = b"agent:x:1000:1000::/:/bin/sh\n".to_vec();
         let attached = attach_passwd(Ok(loaded), Ok(Some(bytes.clone()))).unwrap();
-        assert_eq!(attached.passwd, bytes);
+        assert_eq!(attached.passwd.as_bytes(), bytes);
     }
 
     #[test]
