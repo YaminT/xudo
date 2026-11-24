@@ -31,9 +31,7 @@ use crate::mint::{
     AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
     entry_for_classified, publish,
 };
-use crate::policy::{
-    LoadedPolicy, PolicySource, classify, classify_with_registry, decide, stored_caller,
-};
+use crate::policy::{LoadedPolicy, PolicySource, classify_with_registry, decide, stored_caller};
 use crate::record::{decided, refused};
 use crate::refusal::Refusal;
 
@@ -2578,7 +2576,8 @@ fn serve_confirmation_question(
         xudo_wire::Question::Freeze { reason } => {
             freeze(platform, spool, identity, request, reason)
         }
-        xudo_wire::Question::Thaw => thaw(platform, identity, &classify(identity), request),
+        xudo_wire::Question::Thaw => registry_caller(platform, identity)
+            .and_then(|caller| thaw(platform, identity, &caller, request)),
         xudo_wire::Question::Run { .. } | xudo_wire::Question::RemovePath { .. } => {
             return Served::Refused(Fault::Broker);
         }
@@ -2629,15 +2628,36 @@ fn freeze(
     request: &BrokerRequest,
     reason: &str,
 ) -> Result<BrokerResponse, Refusal> {
+    let caller = registry_caller(platform, identity)?;
     freeze_with(
         platform,
         spool,
         identity,
-        &classify(identity),
+        &caller,
         request,
         reason,
         &serde_json::to_vec,
     )
+}
+
+/// Classifies the peer against the registry the broker loads for this very
+/// request, as a run does. An empty registry would call an enrolled agent
+/// unattested and let it lift its owner's freeze. A ruleset that cannot be
+/// loaded cannot say who is an agent, so the request is refused.
+fn registry_caller(
+    platform: &Platform<'_>,
+    identity: &PeerIdentity,
+) -> Result<CallerFacts, Refusal> {
+    let policy = platform
+        .policy
+        .load()
+        .map_err(|error| Refusal::from(&error))?;
+    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    Ok(classify_with_registry(
+        identity,
+        &policy.rules.harnesses,
+        passwd,
+    ))
 }
 
 /// The most names the state directory is listed to: the audit log, root's
@@ -3929,7 +3949,7 @@ mod tests {
 
     use super::*;
     use crate::mint::{MAX_SPOOL_ENTRIES, MintError, entry_for};
-    use crate::policy::PolicyError;
+    use crate::policy::{PolicyError, classify};
 
     const PID: u32 = 4242;
     const UID: u32 = 1000;
@@ -11495,6 +11515,87 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             outcome.records[0].decision,
             AuditDecision::AwaitingConfirmation
         );
+    }
+
+    fn enrolled_identity(host: &mut Host) -> PeerIdentity {
+        let scope = registered_harness_scope(host);
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity
+    }
+
+    #[test]
+    fn an_enrolled_agent_cannot_thaw_its_owners_freeze_through_the_broker() {
+        let mut host = Host::honest();
+        let identity = enrolled_identity(&mut host);
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert!(
+            host.freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
+    }
+
+    #[test]
+    fn an_enrolled_agent_cannot_freeze_or_thaw_others() {
+        let mut host = Host::honest();
+        let identity = enrolled_identity(&mut host);
+        host.freeze_file.publish("frozen", MARKER).unwrap();
+        let spool = FakeSpool::new();
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.clone(),
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity,
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        let files = host.freeze_file.files();
+        assert!(files.contains_key(b"frozen".as_slice()));
+        assert!(!files.contains_key(b"frozen-1000".as_slice()));
+    }
+
+    #[test]
+    fn freeze_and_thaw_refuse_when_the_registry_cannot_be_loaded() {
+        let mut host = Host::honest();
+        host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
+            file: "config".to_owned(),
+        }));
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let identity = test_identity(PID, START, 0, 0);
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        for request in [thaw_request(), freeze_request()] {
+            let served = serve_request(
+                &conn,
+                &mut host.platform(),
+                &FakeSpool::new(),
+                identity.clone(),
+                request,
+            );
+            assert_eq!(served, Served::Refused(Fault::Broker));
+        }
+        let files = host.freeze_file.files();
+        assert!(files.contains_key(b"frozen-1000".as_slice()));
+        assert_eq!(files.len(), 1);
     }
 
     #[test]
