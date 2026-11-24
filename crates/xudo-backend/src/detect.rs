@@ -308,12 +308,12 @@ fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
         .with(Capability::ValidateNamedFile)
         .with(Capability::PerCommandDefaults);
 
-    // doas has no credential cache to disable unless it was built with one,
-    // which is the same practical guarantee — but it is still probed rather
-    // than assumed, so a port that behaves differently is caught.
+    // The cache is off because the snippet never writes `persist`, not because
+    // of this probe, which only checks that the parser accepts a plain rule.
     if probe.honours_directive(exe, "nopersist") {
         matrix = matrix.with(Capability::DisableCredentialCache);
     }
+    // Parse check only: doas does not allocate a pty for its child.
     if probe.honours_directive(exe, "pty") {
         matrix = matrix.with(Capability::AllocatePty);
     }
@@ -322,8 +322,8 @@ fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
         matrix = matrix.with(Capability::DropInDirectory);
     }
 
-    // `OpenDoas` disables `persist` unless built --with-timestamp. Recorded, and
-    // depended on in neither direction.
+    // A `--with-timestamp` build can cache credentials only for a rule that says
+    // `persist`; xudo's never does. Recorded for `xudo doctor`.
     if banner.to_ascii_lowercase().contains("with-timestamp") {
         matrix = matrix.with(Capability::PersistentCredentialCache);
     }
