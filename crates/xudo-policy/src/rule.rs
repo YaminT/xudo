@@ -24,9 +24,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::argv::Arg;
-use crate::deny::{
-    LIFECYCLE_OR_POWER_VERBS, evaluate_deny_list, exe_is_systemctl, unit_literal_is_refused,
-};
+use crate::deny::{LIFECYCLE_OR_POWER_VERBS, exe_is_systemctl, unit_literal_is_refused};
 use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
 use crate::matcher::{ArgSpec, Matcher};
 use crate::operation::{Operation, check_operation};
@@ -831,7 +829,9 @@ impl RuleSet {
     /// Every allowlisted executable that the compiled-in deny-list refuses.
     ///
     /// A non-empty result means a rule allowlists something that can be turned
-    /// into a root shell, which defeats the design. This is the in-process half
+    /// into a root shell, which defeats the design. Only findings that hold for
+    /// every argument list count: a multicall applet comes from an argument, so
+    /// a rule that pins one is judged at decision time instead. This is the in-process half
     /// of the `GTFOBins` gate, and it runs against the shipped ruleset in the
     /// test suite so the check cannot be forgotten.
     pub fn self_denying_actions(&self) -> Vec<(&ActionId, Vec<crate::deny::CapabilityClass>)> {
@@ -839,7 +839,7 @@ impl RuleSet {
             .iter()
             .filter_map(|action| {
                 let classes: Vec<_> =
-                    evaluate_deny_list(action.exe.as_bytes(), &crate::Argv::default())
+                    crate::deny::evaluate_deny_list_for_any_argv(action.exe.as_bytes())
                         .into_iter()
                         .map(|f| f.class)
                         .collect();

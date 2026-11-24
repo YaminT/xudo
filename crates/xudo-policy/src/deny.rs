@@ -1436,6 +1436,19 @@ pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     findings
 }
 
+/// The findings that hold whatever arguments follow: the executable's own
+/// identity and the argument checks on an empty argv. The multicall applet is
+/// read from an argument, so it is left out: `coreutils` with no applet is
+/// refused, `coreutils true` is not, and a rule that pins the applet must not
+/// be reported as one that can never allow.
+pub(crate) fn evaluate_deny_list_for_any_argv(exe: &[u8]) -> Vec<DenyFinding> {
+    let name = basename(exe);
+    let mut findings = deny_by_executable(name);
+    findings.extend(deny_by_arguments(name, &Argv::default()));
+    findings.dedup();
+    findings
+}
+
 /// A multicall binary names its applet in the first argument: `busybox rm`,
 /// `toybox rm`, `coreutils rm`, or `coreutils --coreutils-prog=rm`. The
 /// executable's basename is the multicall name, so the applet's class has to

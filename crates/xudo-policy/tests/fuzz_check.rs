@@ -373,3 +373,49 @@ fn a_self_denying_rule_loads_and_can_never_produce_an_allow() {
         assert_eq!(decision.denial, Some(DenialCode::DenyListed));
     }
 }
+
+/// Found by the CI fuzz smoke: `coreutils` with no applet is refused, so the
+/// rule was reported self-denying, yet `coreutils true` is allowed because the
+/// applet comes from the argument. A rule pinning a harmless applet is not
+/// self-denying. The seed `self-denying-coreutils-applet.seed` is this rule.
+#[test]
+fn a_coreutils_rule_pinning_a_harmless_applet_is_not_called_self_denying() {
+    let rules = RuleSet::from_toml(
+        "x.toml",
+        include_str!("../../../fuzz/seeds/rules_toml/self-denying-coreutils-applet.seed"),
+    )
+    .unwrap();
+    assert!(rules.self_denying_actions().is_empty());
+    let human = CallerFacts::new(Classification::Human, 1000);
+    let run = |argv: &[&str]| {
+        evaluate_command(
+            &rules,
+            &human,
+            &Arg::from("/usr/bin/coreutils"),
+            &Argv::new(argv.iter().copied()),
+            Settings::default(),
+        )
+    };
+    assert_eq!(run(&["true"]).verdict, Verdict::Allow);
+}
+
+/// The attack the lint must not hide: a rule that lets `coreutils` run `rm`
+/// stays refused at decision time, and is not an allow.
+#[test]
+fn denies_coreutils_rm_applet_through_a_rule_that_names_it() {
+    let rules = RuleSet::from_toml(
+        "x.toml",
+        "[[action]]\nid = \"x.r\"\ntier = \"diag-read\"\nexe = \"/usr/bin/coreutils\"\nargs = [{ name = \"a\", matcher = { literal = \"rm\" } }]\n",
+    )
+    .unwrap();
+    let human = CallerFacts::new(Classification::Human, 1000);
+    let decision = evaluate_command(
+        &rules,
+        &human,
+        &Arg::from("/usr/bin/coreutils"),
+        &Argv::new(["rm"]),
+        Settings::default(),
+    );
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert_eq!(decision.denial, Some(DenialCode::DenyListed));
+}
