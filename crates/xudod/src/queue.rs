@@ -431,13 +431,18 @@ pub fn visibility(
     passwd: &str,
 ) -> Visibility {
     let owner = entry.uid == peer_uid;
+    // The load check compares names; two names can share one uid, so the
+    // peer's uid is also compared against every harness account at request time.
     let reviewer = peer_class == PeerClass::Human
         && registry.get(&entry.harness).is_some_and(|harness| {
             harness
                 .reviewers
                 .iter()
                 .any(|name| xudo_policy::passwd_uid(passwd, name) == Some(peer_uid))
-        });
+        })
+        && !registry
+            .entries()
+            .any(|e| e.uid_matches(peer_uid, &|name| xudo_policy::passwd_uid(passwd, name)));
     Visibility {
         visible: owner || reviewer,
         reviewer: reviewer && !owner,
@@ -2044,6 +2049,23 @@ mod tests {
         );
         assert!(access.visible);
         assert!(!access.reviewer);
+    }
+
+    #[test]
+    fn an_alias_reviewer_with_a_harness_accounts_uid_is_refused() {
+        // alice (reviewer) and agent (codex's account) share uid 1000.
+        let passwd = "alice:x:1000:1000::/:/bin/sh\nagent:x:1000:1000::/:/bin/sh\n";
+        let access = visibility(&entry(1), 1000, PeerClass::Human, &registry(), passwd);
+        assert!(!access.visible);
+        assert!(!access.reviewer);
+    }
+
+    #[test]
+    fn a_reviewer_with_a_distinct_uid_is_still_allowed() {
+        let passwd = "alice:x:1000:1000::/:/bin/sh\nagent:x:1001:1000::/:/bin/sh\n";
+        let access = visibility(&entry(1), 1000, PeerClass::Human, &registry(), passwd);
+        assert!(access.visible);
+        assert!(access.reviewer);
     }
 
     #[test]

@@ -191,21 +191,22 @@ impl HarnessRegistry {
 /// harness account or user, of this entry or of any other: an agent that could
 /// act as its own reviewer would approve itself.
 fn refuse_reviewer_overlap(entries: &BTreeMap<String, HarnessEntry>) -> Result<(), HarnessError> {
-    let agents: BTreeSet<&str> = entries
-        .values()
-        .flat_map(|entry| entry.account.iter().chain(entry.users.iter()))
-        .map(String::as_str)
-        .collect();
     for entry in entries.values() {
-        if let Some(reviewer) = entry
-            .reviewers
-            .iter()
-            .find(|reviewer| agents.contains(reviewer.as_str()))
-        {
-            return Err(HarnessError::ReviewerIsHarnessAccount {
-                label: entry.label.clone(),
-                reviewer: reviewer.clone(),
+        for reviewer in &entry.reviewers {
+            let owner = entries.values().find(|other| {
+                other
+                    .account
+                    .iter()
+                    .chain(other.users.iter())
+                    .any(|name| name == reviewer)
             });
+            if let Some(owner) = owner {
+                return Err(HarnessError::ReviewerIsHarnessAccount {
+                    label: entry.label.clone(),
+                    reviewer: reviewer.clone(),
+                    owner: owner.label.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -261,13 +262,15 @@ pub enum HarnessError {
     },
     /// A reviewer is also the account or a user of some harness.
     #[error(
-        "harness {label}: reviewer {reviewer} is a harness account or user; reviewers must be disjoint from every harness's account and users"
+        "harness {label}: reviewer {reviewer} is an account or user of harness {owner}; reviewers must be disjoint from every harness's account and users"
     )]
     ReviewerIsHarnessAccount {
         /// The harness that lists the reviewer.
         label: String,
         /// The reviewer.
         reviewer: String,
+        /// The harness whose account or user the reviewer is.
+        owner: String,
     },
 }
 
@@ -313,7 +316,7 @@ pub fn valid_account_name(name: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`HarnessError`] when the name, the text, or a field is refused.
-pub fn parse_harness_file(name: &str, text: &str) -> Result<HarnessEntry, HarnessError> {
+pub(crate) fn parse_harness_file(name: &str, text: &str) -> Result<HarnessEntry, HarnessError> {
     let Some(stem) = harness_stem(name) else {
         return Err(HarnessError::NotAHarnessFile {
             file: name.to_owned(),
@@ -517,9 +520,11 @@ max-sessions = 1
             HarnessError::ReviewerIsHarnessAccount {
                 label: "codex".to_owned(),
                 reviewer: "agent".to_owned(),
+                owner: "codex".to_owned(),
             }
         );
         assert!(error.to_string().contains("disjoint"));
+        assert!(error.to_string().contains("harness codex"));
     }
 
     #[test]
@@ -531,6 +536,7 @@ max-sessions = 1
             HarnessError::ReviewerIsHarnessAccount {
                 label: "claude".to_owned(),
                 reviewer: "bob".to_owned(),
+                owner: "claude".to_owned(),
             }
         );
     }
@@ -544,6 +550,7 @@ max-sessions = 1
             HarnessError::ReviewerIsHarnessAccount {
                 label: "codex".to_owned(),
                 reviewer: "alice".to_owned(),
+                owner: "claude".to_owned(),
             }
         );
         let other = SESSION.replace(r#"["carol"]"#, r#"["agent"]"#);
