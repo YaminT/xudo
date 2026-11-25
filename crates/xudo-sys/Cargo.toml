@@ -83,6 +83,10 @@ name = "root_install"
 required-features = ["root-tests"]
 
 [[test]]
+name = "root_agent"
+required-features = ["root-tests"]
+
+[[test]]
 name = "root_sudo_names"
 required-features = ["root-tests"]
 

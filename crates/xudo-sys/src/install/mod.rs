@@ -50,10 +50,12 @@
 
 mod blocks;
 mod effect;
+mod enrol;
 #[cfg(test)]
 mod fake;
 mod host;
 
+use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest};
 use xudo_backend::snippet::{
     DOAS_BEGIN, DOAS_CONF_PATH, DOAS_DROP_IN_PATH, DOAS_END, SUDOERS_PATH, XUDO_GROUP,
 };
@@ -61,6 +63,9 @@ use xudo_backend::{BackendKind, InstallPlan, PlanStep};
 
 pub use blocks::BlockError;
 pub use effect::{Effect, check_effect};
+pub use enrol::{
+    AgentError, AgentRow, EnrolOps, Systemctl, apply_enrol, list_agents, plan_enrol, remove_agent,
+};
 pub use host::HostInstallOps;
 
 use crate::exec::{HostRunner, Runner};
@@ -418,6 +423,40 @@ pub trait Installer {
     ///
     /// Whatever stopped it.
     fn run(&self, plan: &InstallPlan) -> Result<InstallReport, InstallError>;
+
+    /// Decides what enrolling `request` would write, reading the machine.
+    ///
+    /// `scan` is the report of other paths to root on the account.
+    ///
+    /// # Errors
+    ///
+    /// A refusal, or whatever stopped a read.
+    fn agent_plan(
+        &self,
+        request: &EnrolRequest,
+        scan: AccountScan,
+    ) -> Result<EnrolPlan, AgentError>;
+
+    /// Writes an enrolment and starts its unit.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stopped it, after what it wrote was taken back.
+    fn agent_apply(&self, plan: &EnrolPlan) -> Result<(), AgentError>;
+
+    /// The enrolled agents and their unit state.
+    ///
+    /// # Errors
+    ///
+    /// A registry that does not load, or a failed read.
+    fn agent_list(&self) -> Result<Vec<AgentRow>, AgentError>;
+
+    /// Stops an enrolled agent and removes what enrolling wrote.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stopped it.
+    fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError>;
 }
 
 /// The installer for a real machine: real file operations and the given probe.
@@ -440,6 +479,29 @@ impl Installer for HostInstaller<'_> {
             execute(plan, &HostInstallOps::system(), self.probe),
             &HostRunner,
         )
+    }
+
+    fn agent_plan(
+        &self,
+        request: &EnrolRequest,
+        scan: AccountScan,
+    ) -> Result<EnrolPlan, AgentError> {
+        let ops = HostInstallOps::system();
+        plan_enrol(request, scan, &ops, &ops)
+    }
+
+    fn agent_apply(&self, plan: &EnrolPlan) -> Result<(), AgentError> {
+        let ops = HostInstallOps::system();
+        apply_enrol(plan, &ops, &ops)
+    }
+
+    fn agent_list(&self) -> Result<Vec<AgentRow>, AgentError> {
+        list_agents(&HostInstallOps::system())
+    }
+
+    fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError> {
+        let ops = HostInstallOps::system();
+        remove_agent(label, &ops, &ops)
     }
 }
 
@@ -476,6 +538,26 @@ pub struct RefusingInstaller;
 impl Installer for RefusingInstaller {
     fn run(&self, _plan: &InstallPlan) -> Result<InstallReport, InstallError> {
         Err(InstallError::NoInstaller)
+    }
+
+    fn agent_plan(
+        &self,
+        _request: &EnrolRequest,
+        _scan: AccountScan,
+    ) -> Result<EnrolPlan, AgentError> {
+        Err(InstallError::NoInstaller.into())
+    }
+
+    fn agent_apply(&self, _plan: &EnrolPlan) -> Result<(), AgentError> {
+        Err(InstallError::NoInstaller.into())
+    }
+
+    fn agent_list(&self) -> Result<Vec<AgentRow>, AgentError> {
+        Err(InstallError::NoInstaller.into())
+    }
+
+    fn agent_remove(&self, _label: &str) -> Result<Vec<String>, AgentError> {
+        Err(InstallError::NoInstaller.into())
     }
 }
 

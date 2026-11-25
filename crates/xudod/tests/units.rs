@@ -870,7 +870,17 @@ const AGENT_KEYS: &[(&str, &[&str])] = &[
             "ExecStopPost",
         ],
     ),
+    ("Install", &["WantedBy"]),
 ];
+
+#[test]
+fn the_agent_template_is_enabled_for_multi_user_only_by_enrol_and_never_by_the_package() {
+    let unit = parse(AGENT_SERVICE);
+    assert_eq!(values(&unit, "Install", "WantedBy"), ["multi-user.target"]);
+    for key in ["RequiredBy", "Alias", "Also", "DefaultInstance"] {
+        assert!(values(&unit, "Install", key).is_empty(), "{key}");
+    }
+}
 
 #[test]
 fn the_agent_template_is_placed_in_the_slice_and_cannot_delegate() {
