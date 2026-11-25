@@ -39,6 +39,16 @@ pub trait ProcSource {
         let bytes = self.read(relative)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+
+    /// The inode of the namespace a `ns/<kind>` link names, e.g.
+    /// `"412/ns/user"`. Two processes share a namespace exactly when these
+    /// numbers are equal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Read`] when the link cannot be followed, or does
+    /// not lead to a namespace file. Callers treat that as "cannot attest".
+    fn namespace_inode(&self, relative: &str) -> Result<u64, SysError>;
 }
 
 /// A source backed by a real directory.
@@ -115,12 +125,22 @@ impl ProcSource for DirSource {
         let path = self.resolve(relative)?;
         std::fs::read(&path).map_err(|e| SysError::read(relative, e.to_string()))
     }
+
+    fn namespace_inode(&self, relative: &str) -> Result<u64, SysError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let path = self.resolve(relative)?;
+        std::fs::metadata(&path)
+            .map(|meta| meta.ino())
+            .map_err(|e| SysError::read(relative, e.to_string()))
+    }
 }
 
 /// An in-memory source, for tests.
 #[derive(Clone, Debug, Default)]
 pub struct MapSource {
     files: BTreeMap<String, Vec<u8>>,
+    inodes: BTreeMap<String, u64>,
 }
 
 impl MapSource {
@@ -133,6 +153,13 @@ impl MapSource {
     #[must_use]
     pub fn with(mut self, relative: impl Into<String>, contents: impl Into<Vec<u8>>) -> Self {
         self.files.insert(relative.into(), contents.into());
+        self
+    }
+
+    /// Adds a namespace link and the inode it leads to.
+    #[must_use]
+    pub fn with_inode(mut self, relative: impl Into<String>, inode: u64) -> Self {
+        self.inodes.insert(relative.into(), inode);
         self
     }
 
@@ -152,6 +179,13 @@ impl ProcSource for MapSource {
         self.files
             .get(relative)
             .cloned()
+            .ok_or_else(|| SysError::read(relative, "not present in the in-memory source"))
+    }
+
+    fn namespace_inode(&self, relative: &str) -> Result<u64, SysError> {
+        self.inodes
+            .get(relative)
+            .copied()
             .ok_or_else(|| SysError::read(relative, "not present in the in-memory source"))
     }
 }
@@ -215,6 +249,26 @@ mod tests {
         // empty string, which a caller could mistake for an empty file.
         let text_err = source.read_text("999999/stat").unwrap_err();
         assert_eq!(err, text_err);
+    }
+
+    #[test]
+    fn a_map_source_answers_a_namespace_inode_only_where_one_was_put() {
+        let source = MapSource::new().with_inode("1/ns/user", 4_026_531_837);
+        assert_eq!(source.namespace_inode("1/ns/user").unwrap(), 4_026_531_837);
+        assert!(source.namespace_inode("2/ns/user").is_err());
+    }
+
+    #[test]
+    fn a_dir_source_reports_the_inode_of_a_file_and_refuses_a_missing_or_escaping_path() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let source = DirSource::new(fixture_root());
+        let want = std::fs::metadata(fixture_root().join("100/stat"))
+            .unwrap()
+            .ino();
+        assert_eq!(source.namespace_inode("100/stat").unwrap(), want);
+        assert!(source.namespace_inode("999999/ns/user").is_err());
+        assert!(source.namespace_inode("../x").is_err());
     }
 
     #[test]

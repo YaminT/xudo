@@ -46,8 +46,9 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use xudo_sys::{
     Attestation, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo, ProcFile,
-    Scope, ScopeKind, SysError, Syscalls, lacks_peer_pidfd, lacks_pidfd_info, lacks_pidfd_open,
-    parse_stat, parse_status_euid, peer_cgroup_id, peer_was_reaped, process_is_gone, scope_status,
+    Scope, ScopeKind, SysError, Syscalls, is_identity_uid_map, lacks_peer_pidfd, lacks_pidfd_info,
+    lacks_pidfd_open, parse_nspid_count, parse_stat, parse_status_euid, peer_cgroup_id,
+    peer_was_reaped, process_is_gone, scope_status,
 };
 
 /// Kernel-derived cgroup result retained for classification and audit.
@@ -470,30 +471,6 @@ fn namespace_facts(pid: u32, peers: &dyn PeerCalls, status: Option<&[u8]>) -> bo
         .read_proc(pid, ProcFile::UidMap)
         .is_ok_and(|bytes| is_identity_uid_map(&bytes));
     nested_pid || !identity_uid
-}
-
-fn is_identity_uid_map(uid_map: &[u8]) -> bool {
-    let fields: Vec<_> = uid_map
-        .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-        .collect();
-    fields.as_slice() == [&b"0"[..], &b"0"[..], &b"4294967295"[..]]
-}
-
-fn parse_nspid_count(status: &[u8]) -> Option<usize> {
-    let line = status
-        .split(|byte| *byte == b'\n')
-        .find(|line| line.starts_with(b"NSpid:"))?;
-    let values = line.get(6..).unwrap_or_default();
-    let ids: Vec<_> = values
-        .split(u8::is_ascii_whitespace)
-        .filter(|id| !id.is_empty())
-        .collect();
-    if ids.iter().all(|id| id.iter().all(u8::is_ascii_digit)) {
-        Some(ids.len())
-    } else {
-        None
-    }
 }
 
 /// Confirms, through the pidfd, that the pinned process has not exited.

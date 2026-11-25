@@ -91,7 +91,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use xudo_audit::record::Record;
-use xudo_policy::{CallerFacts, Classification};
 #[cfg(test)]
 use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
@@ -578,10 +577,19 @@ fn annotate(record: Record, extra: &[String]) -> Record {
 /// up. Opening the queue directory is a spool failure. A missing, unreadable,
 /// or non-matching record is [`RequestError::QueueNotClaimed`]: the request
 /// must not fall through and run as a normal human-path command.
-fn require_queued_claim(host: &dyn GateHost, entry: &PendingRequest) -> Result<(), Refusal> {
+fn require_queued_claim(
+    host: &dyn GateHost,
+    entry: &PendingRequest,
+    caller: &GateCaller,
+) -> Result<(), Refusal> {
     let Some(id) = entry.queue_id.as_deref() else {
         return Ok(());
     };
+    // The queue is the human's. A caller the gate could only read as
+    // unattested, or in other namespaces than the host's, never claims it.
+    if caller.attested_class != crate::request::AttestedClass::Human {
+        return Err(Refusal::Request(RequestError::QueueNotClaimed));
+    }
     let queue = stage(Stage::Spool, host.open_queue())?;
     let name = queue_claim::queue_file_name(id);
     let held = match queue.read(&name) {
@@ -642,8 +650,9 @@ fn proceed(
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
     let passwd = loaded.passwd.as_str();
-    let caller = caller_for(
+    let (caller, live_uid) = caller_for(
         host,
+        &*proc,
         matched.as_ref(),
         own,
         &ancestors.chain,
@@ -655,13 +664,20 @@ fn proceed(
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
-    // The matched entry's uid, which the broker stored at mint from the
-    // kernel's facts, picks whose freeze marker also applies. Root's global
-    // marker is already in the loaded settings. With no entry there is no uid,
-    // and `decide` refuses on the missing entry.
+    // The uid read from the live ancestor's own `status` picks whose freeze
+    // marker also applies, and must be the uid the broker minted the entry for.
+    // The entry's uid is a claim and is never used for a decision. Root's
+    // global marker is already in the loaded settings. With no entry there is
+    // no uid, and `decide` refuses on the missing entry.
     let mut settings = loaded.settings;
     if let Some(found) = &pending {
-        settings.frozen |= host.user_frozen(found.caller_uid);
+        let Some(live) = live_uid.filter(|live| *live == found.caller_uid) else {
+            return Err(Refusal::Request(RequestError::WrongCallerUid {
+                expected: found.caller_uid,
+                actual: live_uid,
+            }));
+        };
+        settings.frozen |= host.user_frozen(live);
     }
     let context = GateContext {
         generation: loaded.rules.generation.id(),
@@ -694,7 +710,7 @@ fn proceed(
     }
     let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
     progress.evidence.push(entry.confirmation().to_owned());
-    require_queued_claim(host, &pending_entry)?;
+    require_queued_claim(host, &pending_entry, &caller)?;
 
     // Consumed before anything runs: the entry is used at most once, and a
     // second gate that read it too fails here, on the unlink, and runs nothing.
@@ -872,20 +888,24 @@ struct Matched {
     caller: CallerPin,
 }
 
-/// The caller `decide` judges the entry for. Any class comes from a fresh
-/// kernel cgroup read and ancestor recheck; the entry supplies only the uid
-/// against which the root record is checked.
+/// The caller `decide` judges the entry for, and the uid read from its live
+/// process. Any class comes from a fresh kernel cgroup read and ancestor
+/// recheck, and the uid from the ancestor's own `status`; the entry supplies
+/// neither. A caller or a gate in namespaces other than PID 1's is unattested,
+/// and the class is never stronger than the broker's.
+#[allow(clippy::too_many_arguments)]
 fn caller_for(
     host: &dyn GateHost,
+    proc: &dyn ProcSource,
     matched: Option<&Matched>,
     own: CallerPin,
     ancestors: &[ProcRef],
     now: u64,
     registry: &xudo_policy::HarnessRegistry,
     passwd: &str,
-) -> GateCaller {
+) -> (GateCaller, Option<u32>) {
     let Some(found) = matched else {
-        return GateCaller::unidentified(own.pid);
+        return (GateCaller::unidentified(own.pid), None);
     };
     let index = ancestors.iter().position(|ancestor| {
         ancestor.pid == found.caller.pid && ancestor.starttime == found.caller.starttime
@@ -894,39 +914,52 @@ fn caller_for(
         .and_then(|at| at.checked_sub(1))
         .and_then(|at| ancestors.get(at))
         .map(|child| (child.pid, child.starttime));
-    let live = match (host.cgroups(), child) {
-        (Ok(cgroups), Some(child)) => crate::classify::classify_with_registry(
-            cgroups.as_ref(),
-            host.peers(),
-            host.syscalls(),
-            registry,
-            passwd,
-            crate::classify::AncestorPin {
-                caller: (found.caller.pid, found.caller.starttime),
-                uid: found.entry.caller_uid,
-                child,
-                now_boottime_ms: now,
-            },
-        ),
-        _ => crate::classify::LiveClass {
-            facts: CallerFacts::new(
-                Classification::Unattested {
-                    reason: "the gate could not recheck its caller's lineage".to_owned(),
+    let gate_clean = ancestors
+        .first()
+        .is_some_and(|gate| crate::live::read(proc, gate).namespaces_match_init);
+    let caller_facts = index
+        .and_then(|at| ancestors.get(at))
+        .map(|caller| crate::live::read(proc, caller));
+    let live_uid = caller_facts.and_then(|facts| facts.uid);
+    let live = match (host.cgroups(), child, live_uid, caller_facts) {
+        (Ok(cgroups), Some(child), Some(uid), Some(facts))
+            if gate_clean && facts.namespaces_match_init =>
+        {
+            let live = crate::classify::classify_with_registry(
+                cgroups.as_ref(),
+                host.peers(),
+                host.syscalls(),
+                registry,
+                passwd,
+                crate::classify::AncestorPin {
+                    caller: (found.caller.pid, found.caller.starttime),
+                    uid,
+                    child,
+                    now_boottime_ms: now,
                 },
-                found.entry.caller_uid,
-            ),
-            attested_class: crate::request::AttestedClass::Unattested,
-            scope_id: None,
-            boot_id: None,
-        },
+            );
+            if found.entry.effective_class(&live.attested_class) == live.attested_class {
+                live
+            } else {
+                crate::classify::LiveClass::unattested(
+                    uid,
+                    "the broker could not attest this caller, and the gate never upgrades it",
+                )
+            }
+        }
+        _ => crate::classify::LiveClass::unattested(
+            live_uid.unwrap_or(crate::decide::UNKNOWN_UID),
+            "the gate could not recheck its caller's lineage, uid, and namespaces",
+        ),
     };
-    GateCaller {
+    let caller = GateCaller {
         pin: found.caller,
         facts: live.facts,
         attested_class: live.attested_class,
         attested_scope_id: live.scope_id,
         boot_id: live.boot_id,
-    }
+    };
+    (caller, live_uid)
 }
 
 /// The spool entry pinned to one of the `ancestors`, if exactly one is, and
@@ -1158,13 +1191,43 @@ args = [
     /// The gate under sudo with `use_pty`, under xudo, under a shell:
     /// 500 gate, 400 sudo monitor, 300 sudo, 200 xudo, 100 bash, 1 init.
     fn proc_tree() -> MapSource {
-        MapSource::new()
+        let source = MapSource::new()
             .with("500/stat", stat(500, "xudo-gate-auth", 400, 9_000))
             .with("400/stat", stat(400, "sudo", 300, 8_500))
             .with("300/stat", stat(300, "sudo", 200, 8_000))
             .with("200/stat", stat(200, "xudo", 100, XUDO_START))
             .with("100/stat", stat(100, "bash", 1, 5_000))
-            .with("1/stat", stat(1, "systemd", 0, 1))
+            .with("1/stat", stat(1, "systemd", 0, 1));
+        // Every process in PID 1's namespaces, as an ordinary host has it; the
+        // gate (500) as root, the rest as the user the entries are for.
+        [500_u32, 400, 300, 200, 100, 1]
+            .into_iter()
+            .fold(source, |source, pid| {
+                let uid = if (300..=500).contains(&pid) || pid == 1 {
+                    0
+                } else {
+                    1000
+                };
+                in_init_namespaces(source, pid, uid)
+            })
+    }
+
+    /// `pid`'s status, `uid_map` and namespace links, all as PID 1's.
+    fn in_init_namespaces(source: MapSource, pid: u32, uid: u32) -> MapSource {
+        ["user", "pid", "cgroup", "mnt"].iter().enumerate().fold(
+            source
+                .with(
+                    format!("{pid}/status"),
+                    format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nNSpid:\t{pid}\n"),
+                )
+                .with(format!("{pid}/uid_map"), "0 0 4294967295\n"),
+            |source, (at, kind)| {
+                let inode = 4_026_531_800 + u64::try_from(at).unwrap();
+                source
+                    .with_inode(format!("{pid}/ns/{kind}"), inode)
+                    .with_inode(format!("1/ns/{kind}"), inode)
+            },
+        )
     }
 
     fn entry(nonce: &str, pid: u32, starttime: u64, argv: &[&str]) -> PendingRequest {
@@ -1269,6 +1332,8 @@ args = [
         Host,
         Agent,
         MissingAgentFacts,
+        /// A caller outside `xudo.slice`, in an ordinary login session.
+        Human,
         Unavailable,
     }
 
@@ -1340,6 +1405,53 @@ args = [
 
     struct AgentCgroup {
         missing_facts: bool,
+    }
+
+    /// A cgroup tree in which every process is in a login session.
+    struct HumanCgroup;
+
+    impl CgroupCalls for HumanCgroup {
+        fn require_cgroup2(&self) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn pidfd_cgroup_id(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn proc_cgroup(&self, _pid: u32) -> Result<Vec<u8>, SysError> {
+            Ok(b"0::/user.slice/session-1.scope\n".to_vec())
+        }
+        fn cgroup_inode(&self, _path: &str) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn peer_alive(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<bool, SysError> {
+            Ok(true)
+        }
+        fn scope_facts(
+            &self,
+            _name: &str,
+            _id: u64,
+            _with_processes: bool,
+        ) -> Result<Option<ScopeFacts>, SysError> {
+            Ok(None)
+        }
+        fn scope_names(&self) -> Result<Vec<String>, SysError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_human_cgroup_double_answers_every_read() {
+        use std::os::fd::AsFd as _;
+
+        let fd = std::os::unix::net::UnixStream::pair().unwrap().0;
+        let seam = HumanCgroup;
+        assert!(seam.require_cgroup2().is_ok());
+        assert_eq!(seam.pidfd_cgroup_id(fd.as_fd()).unwrap(), 90);
+        assert!(seam.proc_cgroup(1).is_ok());
+        assert_eq!(seam.cgroup_inode("x").unwrap(), 90);
+        assert!(seam.peer_alive(fd.as_fd()).unwrap());
+        assert!(seam.scope_facts("x", 90, false).unwrap().is_none());
+        assert!(seam.scope_names().unwrap().is_empty());
     }
 
     impl CgroupCalls for AgentCgroup {
@@ -1471,6 +1583,7 @@ args = [
                         missing_facts: true,
                     }));
                 }
+                FakeCgroupMode::Human => return Ok(Box::new(HumanCgroup)),
                 FakeCgroupMode::Host => {}
             }
             boxed_cgroups(xudo_sys::HostCgroup::open())
@@ -1530,6 +1643,22 @@ args = [
         }
     }
 
+    /// Makes the gate read this entry's caller as a human: the entry says
+    /// `Human`, the pinned ancestors are scripted, and no cgroup is the slice.
+    fn human_caller(host: &mut FakeHost, entry: &mut PendingRequest) {
+        entry.attested_class = crate::request::AttestedClass::Human;
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(host);
+    }
+
+    /// The scripted reads one gate run consumes; script again before each run.
+    fn script_human(host: &mut FakeHost) {
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+    }
+
     fn auth() -> Vec<OsString> {
         vec![OsString::from("/usr/libexec/xudo/xudo-gate-auth")]
     }
@@ -1566,8 +1695,11 @@ args = [
         let id = "c".repeat(64);
         let mut entry = ours();
         entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
         let spool = Rc::new(holding(&[(NONCE_A, entry)]));
-        let mut host = FakeHost::new(&spool);
+        host.spool = Ok(Rc::clone(&spool));
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1576,6 +1708,7 @@ args = [
             format!(r#"{{"state":"pending","run_nonce":"{NONCE_A}"}}"#),
         )));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1584,6 +1717,7 @@ args = [
             format!(r#"{{"state":"claimed","run_nonce":"{NONCE_B}"}}"#),
         )));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1591,6 +1725,7 @@ args = [
             FakeSpool::new().with_file(format!("{id}.json"), b"no".to_vec()),
         ));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1598,6 +1733,7 @@ args = [
             at: "queue".to_owned(),
         });
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "gate_failed_spool");
     }
@@ -1607,12 +1743,15 @@ args = [
         let id = "c".repeat(64);
         let mut entry = ours();
         entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
         let spool = Rc::new(holding(&[(NONCE_A, entry)]));
-        let mut host = FakeHost::new(&spool);
+        host.spool = Ok(Rc::clone(&spool));
         host.queue = Ok(Rc::new(FakeSpool::new().with_file(
             format!("{id}.json"),
             format!(r#"{{"state":"claimed","run_nonce":"{NONCE_A}","argv":[]}}"#),
         )));
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_eq!(exit.status, 19);
         assert!(
@@ -1822,6 +1961,169 @@ args = [
         assert!(host.freeze_asked.borrow().is_empty());
     }
 
+    /// A queued, claimed run by a caller the broker called `stored`, in a
+    /// proc tree that `tree` has altered, and what the gate did with it.
+    fn queued_run(
+        stored: crate::request::AttestedClass,
+        tree: impl FnOnce(MapSource) -> MapSource,
+    ) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        let id = "c".repeat(64);
+        let mut entry = ours();
+        entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
+        entry.attested_class = stored;
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        host.spool = Ok(Rc::clone(&spool));
+        host.proc = Ok(tree(proc_tree()));
+        host.queue = Ok(Rc::new(FakeSpool::new().with_file(
+            format!("{id}.json"),
+            format!(r#"{{"state":"claimed","run_nonce":"{NONCE_A}","argv":[]}}"#),
+        )));
+        let exit = run(&mut host, &auth());
+        (host, spool, exit)
+    }
+
+    /// The same run, with the caller's `ns/<kind>` (or the gate's) altered.
+    fn queued_run_with_namespace(pid: u32, kind: &str) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with_inode(format!("{pid}/ns/{kind}"), 4_026_539_999)
+        })
+    }
+
+    #[test]
+    fn a_clean_queued_human_run_is_the_baseline_the_namespace_tests_differ_from() {
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| tree);
+        assert!(
+            exit.message.contains("gate_failed_exec"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert_eq!(exec_calls(&host), 1);
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_user_namespace() {
+        let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "user");
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_mount_namespace() {
+        let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "mnt");
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_pid_or_cgroup_namespace() {
+        for kind in ["pid", "cgroup"] {
+            let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, kind);
+            assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_when_it_is_itself_in_another_mount_namespace() {
+        // sudo runs the gate in its caller's mount namespace, so a caller that
+        // unshared one reaches the gate in it.
+        let (host, spool, exit) = queued_run_with_namespace(GATE_PID, "mnt");
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+    }
+
+    #[test]
+    fn an_ancestor_with_a_nested_pid_or_mapped_uid_namespace_is_unattested() {
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with(
+                "200/status",
+                "Uid:\t1000\t1000\t1000\t1000\nNSpid:\t200\t1\n",
+            )
+        });
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with("200/uid_map", "0 100000 65536\n")
+        });
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+    }
+
+    #[test]
+    fn the_gate_reads_the_uid_from_the_live_ancestor() {
+        // The marker consulted is the live process's uid, which here is also
+        // the entry's. Nothing the entry says is asked about on its own.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.proc =
+            Ok(proc_tree().with("200/status", "Uid:\t1001\t1001\t1001\t1001\nNSpid:\t200\n"));
+        let exit = run(&mut host, &auth());
+        // The live uid is 1001, the entry says 1000: nothing it says is used.
+        assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+        assert!(host.freeze_asked.borrow().is_empty());
+        assert!(exit.message.contains("request_wrong_caller_uid"));
+
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        let _ = run(&mut host, &auth());
+        assert_eq!(*host.freeze_asked.borrow(), [1000]);
+    }
+
+    #[test]
+    fn a_spool_uid_that_differs_from_the_live_one_is_refused() {
+        // An entry that claims another uid, including the one whose marker is
+        // absent or whose registry entry would grant something.
+        for claimed in [0, 1001, 4_294_967_294] {
+            let mut forged = ours();
+            forged.caller_uid = claimed;
+            let spool = Rc::new(holding(&[(NONCE_A, forged)]));
+            let mut host = FakeHost::new(&spool);
+            let exit = run(&mut host, &auth());
+            assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+            assert!(host.freeze_asked.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_ancestor_whose_uid_cannot_be_read_is_refused_not_trusted_from_the_entry() {
+        for status in ["Uid:\tx\t1000\t1000\t1000\nNSpid:\t200\n", "NSpid:\t200\n"] {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc_tree().with("200/status", status));
+            let exit = run(&mut host, &auth());
+            assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+        }
+    }
+
+    #[test]
+    fn a_stored_unattested_entry_is_never_human_at_the_gate() {
+        // The gate reads this caller as a human; the broker could not attest
+        // it. The gate does not upgrade it: no queue claim, and the audit
+        // record says unattested.
+        let (host, spool, exit) =
+            queued_run(crate::request::AttestedClass::Unattested, |tree| tree);
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let _ = run(&mut host, &auth());
+        assert_eq!(host.audit.records()[0].classification, "unattested");
+    }
+
+    #[test]
+    fn a_live_unattested_read_downgrades_a_human_entry() {
+        // Stored human; the gate's own cgroup read fails. Effective class is
+        // the weaker one, so the queue stays closed to this run.
+        let mut human = ours();
+        human.queue_id = Some("c".repeat(64));
+        human.attested_class = crate::request::AttestedClass::Human;
+        let spool = Rc::new(holding(&[(NONCE_A, human)]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Unavailable;
+        script_human(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+    }
+
     #[test]
     fn an_entry_is_consumed_exactly_once_so_a_second_gate_finds_nothing() {
         let spool = Rc::new(holding(&[(NONCE_A, ours())]));
@@ -1912,8 +2214,9 @@ args = [
         };
         let spool = Rc::new(holding(&[]));
         let host = FakeHost::new(&spool);
-        let caller = caller_for(
+        let (caller, _) = caller_for(
             &host,
+            &MapSource::new(),
             Some(&found),
             CallerPin::new(500, 9_000),
             &[],

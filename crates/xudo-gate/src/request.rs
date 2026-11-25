@@ -246,6 +246,18 @@ pub enum RequestError {
         /// Its start time.
         actual_starttime: u64,
     },
+    /// The live caller's uid is not the uid the entry was minted for, or could
+    /// not be read from its `/proc` at all.
+    #[error(
+        "request was minted for uid {expected}, but the live caller's uid is {}",
+        .actual.map_or_else(|| "unreadable".to_owned(), |uid| uid.to_string())
+    )]
+    WrongCallerUid {
+        /// The uid the entry names.
+        expected: u32,
+        /// The uid the gate read from the live ancestor, if it could.
+        actual: Option<u32>,
+    },
     /// The entry claims a confirmation but records no channel for it.
     #[error("request is marked confirmed but names no channel that carried the approval")]
     UnattributedConfirmation,
@@ -315,6 +327,7 @@ impl RequestError {
             Self::InteriorNul { .. } => "request_interior_nul",
             Self::Expired { .. } => "request_expired",
             Self::WrongCaller { .. } => "request_wrong_caller",
+            Self::WrongCallerUid { .. } => "request_wrong_caller_uid",
             Self::UnattributedConfirmation => "request_unattributed_confirmation",
             Self::InvalidConfirmationState => "request_invalid_confirmation_state",
             Self::StaleGeneration { .. } => "request_stale_generation",
@@ -683,6 +696,20 @@ impl PendingRequest {
                     && self.boot_id.as_deref().is_some_and(is_boot_id)
                     && boot_id == self.boot_id.as_deref()
             }
+        }
+    }
+
+    /// The class the gate acts on: the weaker of the one the broker recorded
+    /// and the one the gate read, with `Unattested` below `Human`.
+    ///
+    /// Never an upgrade. A caller the broker could not attest stays unattested
+    /// when the gate's own read says `Human`, and a human entry the gate cannot
+    /// re-attest is unattested. An enrolled agent is a separate case, settled
+    /// exactly by [`Self::live_attested_identity_matches`] before this runs.
+    pub fn effective_class(&self, live: &AttestedClass) -> AttestedClass {
+        match (&self.attested_class, live) {
+            (AttestedClass::Unattested, AttestedClass::Human) => AttestedClass::Unattested,
+            _ => live.clone(),
         }
     }
 
@@ -1780,6 +1807,10 @@ mod tests {
                 actual_pid: 3,
                 actual_starttime: 4,
             },
+            RequestError::WrongCallerUid {
+                expected: 1000,
+                actual: Some(0),
+            },
             RequestError::UnattributedConfirmation,
             RequestError::InvalidConfirmationState,
             RequestError::StaleGeneration {
@@ -1806,6 +1837,56 @@ mod tests {
         let total = codes.len();
         codes.dedup();
         assert_eq!(codes.len(), total, "two refusals share an audit code");
+    }
+
+    #[test]
+    fn a_wrong_uid_names_both_uids_or_says_the_live_one_was_unreadable() {
+        let read = RequestError::WrongCallerUid {
+            expected: 1000,
+            actual: Some(0),
+        };
+        assert!(read.to_string().contains("uid 1000"), "{read}");
+        assert!(read.to_string().ends_with("is 0"), "{read}");
+        let unread = RequestError::WrongCallerUid {
+            expected: 1000,
+            actual: None,
+        };
+        assert!(unread.to_string().ends_with("is unreadable"), "{unread}");
+        assert_eq!(unread.code(), "request_wrong_caller_uid");
+    }
+
+    #[test]
+    fn the_effective_class_is_the_weaker_of_stored_and_live_and_never_an_upgrade() {
+        let mut request = live();
+        let agent = AttestedClass::EnrolledAgent { scope_id: 9 };
+        let table = [
+            (
+                AttestedClass::Unattested,
+                AttestedClass::Human,
+                AttestedClass::Unattested,
+            ),
+            (
+                AttestedClass::Unattested,
+                AttestedClass::Unattested,
+                AttestedClass::Unattested,
+            ),
+            (
+                AttestedClass::Human,
+                AttestedClass::Human,
+                AttestedClass::Human,
+            ),
+            (
+                AttestedClass::Human,
+                AttestedClass::Unattested,
+                AttestedClass::Unattested,
+            ),
+            (agent.clone(), agent.clone(), agent.clone()),
+            (agent.clone(), AttestedClass::Human, AttestedClass::Human),
+        ];
+        for (stored, live_class, want) in table {
+            request.attested_class = stored.clone();
+            assert_eq!(request.effective_class(&live_class), want, "{stored:?}");
+        }
     }
 
     #[test]

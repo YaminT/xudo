@@ -433,7 +433,9 @@ fn write_entry_for(
         confirmed: false,
         confirmed_by: None,
         state: xudo_gate::request::ConfirmationState::Pending,
-        caller_uid: 1000,
+        // The pinned process is this test, and the gate now reads its uid from
+        // the live `/proc`, so the entry must name the uid the test runs as.
+        caller_uid: id_of(&["-u"]),
         caller_sid: 10,
         caller_tty: 20,
         needs_watch: false,
