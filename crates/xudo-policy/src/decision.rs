@@ -401,10 +401,11 @@ pub struct Decision {
     pub resolved_argv: Vec<String>,
     /// Whether a human must approve.
     pub confirm: Confirm,
-    /// The action that grants an enrolled agent this command without a
-    /// confirmation, set only on [`Verdict::Allow`] for an agent.
+    /// The action whose rule lists the enrolled agent's harness with
+    /// `outcome = "allow"`, and nothing stricter overlapped.
     ///
-    /// A fact about policy and nothing more: it opens no passwordless path.
+    /// A fact about policy and nothing more: G1 will act on it; until then the
+    /// verdict still confirms, and it opens no passwordless path.
     pub harness_grant: Option<ActionId>,
     /// The evaluation trace.
     pub trace: Vec<TraceStep>,

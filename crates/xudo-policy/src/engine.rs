@@ -395,6 +395,13 @@ impl<'c> Run<'c> {
             _ => None,
         };
 
+        // G1 will act on the grant; until then the verdict still confirms, so a
+        // grant never lifts the operator's `confirm_human_path` approval.
+        // G1a deletes the next statement.
+        let reason = reason.or(harness_grant
+            .as_ref()
+            .map(|_| ConfirmReason::AgentActionsConfirmed));
+
         let (verdict, confirm) = match reason {
             Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
             None => (Verdict::Allow, Confirm::NotRequired),
@@ -679,6 +686,16 @@ mod tests {
             && d.harness_grant.is_none()
     }
 
+    /// A grant is recorded and the verdict still confirms (until G1).
+    fn confirmed_with_grant(d: &Decision) -> bool {
+        d.verdict == Verdict::AllowWithConfirmation
+            && d.confirm
+                == Confirm::Required {
+                    reason: ConfirmReason::AgentActionsConfirmed,
+                }
+            && d.harness_grant.is_some()
+    }
+
     #[test]
     fn a_rule_may_opt_a_human_out_of_confirmation_entirely() {
         let mut never = svc_restart();
@@ -711,8 +728,7 @@ mod tests {
         let set =
             RuleSet::load(vec![granted(&["claude-code"], crate::rule::Outcome::Allow)]).unwrap();
         let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert_eq!(d.verdict, Verdict::Allow);
-        assert_eq!(d.confirm, Confirm::NotRequired);
+        assert!(confirmed_with_grant(&d), "{d:?}");
         assert_eq!(d.harness_grant, Some(ActionId::new("xudo.svc.restart")));
         assert!(d.trace.iter().any(|step| matches!(
             step,

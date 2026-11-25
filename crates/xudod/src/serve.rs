@@ -11889,16 +11889,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
         let mut host = Host::honest();
+        let scope = registered_harness_scope(&mut host);
         host.syscalls =
             FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
-                kind: xudo_sys::ScopeKind::Agent,
-                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
-                record: Vec::new(),
-            });
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11912,7 +11908,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(served, Served::Minted);
         let response = BrokerResponse::parse(&conn.written()).unwrap();
         let (decision, minted) = decision_of(&response.answer).unwrap();
-        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
         assert!(minted.is_some());
         assert_eq!(spool.files().len(), 1);
     }

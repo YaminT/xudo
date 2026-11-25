@@ -149,8 +149,9 @@ impl Tier {
 pub enum ConfirmPolicy {
     /// Confirm an enrolled agent, and not a human. The default.
     ///
-    /// No configuration key turns this off. A harness label on the action is
-    /// the planned passwordless path, and no such grant is armed yet.
+    /// No configuration key turns this off. An agent whose harness the rule
+    /// lists with `outcome = "allow"` is recorded as granted; until G1 the
+    /// verdict still confirms.
     #[default]
     Default,
     /// Always confirm, for every caller.
@@ -158,9 +159,9 @@ pub enum ConfirmPolicy {
     /// Ask for no confirmation from this action, on the human path.
     ///
     /// This is not a passwordless grant: a rule that lists no `harness` is
-    /// never passwordless. An agent-specific confirmation for `never` rules is
-    /// part of the passwordless step still to come. It does not lift a
-    /// stricter overlapping action. A critical action cannot set it.
+    /// never passwordless. An enrolled agent is still confirmed under `never`;
+    /// only a listed harness with `outcome = "allow"` is granted. It does not
+    /// lift a stricter overlapping action. A critical action cannot set it.
     Never,
 }
 
@@ -253,8 +254,8 @@ impl Action {
     /// is armed.
     ///
     /// True only when `label` is listed and [`Outcome::Allow`] is set. The
-    /// engine does not consult this. A rule with no `harness` key is never
-    /// passwordless.
+    /// engine consults it to record a grant. A rule with no `harness` key is
+    /// never passwordless.
     pub fn passwordless_for(&self, label: &str) -> bool {
         self.outcome == Outcome::Allow && self.harness.iter().any(|item| item == label)
     }

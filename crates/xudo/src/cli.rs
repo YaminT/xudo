@@ -2906,7 +2906,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "nginx.service",
         ]);
         // ALLOW, and note what that does *not* mean: the human path's password
-        // is sudo's job, not the verdict's. `confirm_agent_actions` applies to
+        // is sudo's job, not the verdict's. The agent confirmation applies to
         // an attested agent, and nobody is attested in this build, so the
         // policy answer here is a plain allow.
         assert_eq!(code, ExitCode::Delegated);
