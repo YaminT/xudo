@@ -166,7 +166,6 @@ fn denial(code: DenialCode) -> Decision {
             ),
             Settings {
                 frozen: true,
-                confirm_agent_actions: true,
                 confirm_human_path: false,
             },
         ),

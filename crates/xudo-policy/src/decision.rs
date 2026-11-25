@@ -78,7 +78,7 @@ impl ConfirmReason {
     pub fn explain(self) -> &'static str {
         match self {
             Self::AgentActionsConfirmed => {
-                "an enrolled agent requested a privileged action and confirm_agent_actions is on"
+                "an enrolled agent requested a privileged action and no rule grants it to this harness"
             }
             Self::RuleRequiresConfirmation => "the matched rule always requires confirmation",
             Self::CriticalTier => "the matched rule is in a critical tier",
@@ -346,6 +346,14 @@ pub enum TraceStep {
         /// Why.
         reason: String,
     },
+    /// A rule naming the verified harness with `outcome = "allow"` lifted the
+    /// agent confirmation, and no other accepting action required one.
+    HarnessGranted {
+        /// The action that granted it.
+        action: String,
+        /// The harness label.
+        harness: String,
+    },
     /// A matching ask-human rule diverted the verified harness to the reviewer queue.
     AskHumanQueued {
         /// The action that requested review.
@@ -393,6 +401,11 @@ pub struct Decision {
     pub resolved_argv: Vec<String>,
     /// Whether a human must approve.
     pub confirm: Confirm,
+    /// The action that grants an enrolled agent this command without a
+    /// confirmation, set only on [`Verdict::Allow`] for an agent.
+    ///
+    /// A fact about policy and nothing more: it opens no passwordless path.
+    pub harness_grant: Option<ActionId>,
     /// The evaluation trace.
     pub trace: Vec<TraceStep>,
 }
@@ -410,6 +423,7 @@ impl Decision {
             resolved_exe: None,
             resolved_argv,
             confirm: Confirm::NotRequired,
+            harness_grant: None,
             trace,
         }
     }

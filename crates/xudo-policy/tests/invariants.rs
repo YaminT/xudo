@@ -591,10 +591,9 @@ proptest! {
         argv in arb_argv(),
         agent in any::<bool>(),
         frozen in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
     ) {
         let rules = RuleSet::load(vec![action.clone()]).unwrap();
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
         let d = xudo_policy::evaluate(
             &rules,
             &caller(agent, Vec::new()),
@@ -623,6 +622,74 @@ proptest! {
         prop_assert_eq!(after.verdict, before.verdict);
         prop_assert_eq!(after.confirm, before.confirm);
         prop_assert_eq!(after.denial, before.denial);
+    }
+
+    /// h2-req 1: no harness listed, no grant, whatever `confirm` says.
+    #[test]
+    fn a_rule_without_harness_is_never_granted(
+        mut action in arb_action("g.test"),
+        argv in arb_argv(),
+        written_allow in any::<bool>(),
+    ) {
+        action.harness.clear();
+        action.outcome = if written_allow { Outcome::Allow } else { Outcome::Unset };
+        let d = decide(&action, &argv, true, Vec::new());
+        prop_assert!(d.harness_grant.is_none());
+        prop_assert_ne!(d.verdict, Verdict::Allow);
+    }
+
+    /// Whatever else is loaded beside a rule that grants only `codex`, the
+    /// `claude-code` agent is granted nothing.
+    #[test]
+    fn adding_a_rule_never_creates_a_grant_for_an_unlisted_label(
+        mut granted in arb_action("g.listed"),
+        mut extra in arb_action("g.extra"),
+        argv in arb_argv(),
+        same_exe in any::<bool>(),
+    ) {
+        granted.harness = vec!["codex".to_owned()];
+        granted.outcome = Outcome::Allow;
+        if granted.confirm == ConfirmPolicy::Always {
+            granted.confirm = ConfirmPolicy::Default;
+        }
+        if same_exe {
+            extra.exe = granted.exe.clone();
+            extra.args = granted.args.clone();
+        }
+        if extra.harness.iter().any(|label| label == "claude-code") {
+            extra.harness.clear();
+            extra.outcome = Outcome::Unset;
+        }
+        let rules = RuleSet::load(vec![granted.clone(), extra]).unwrap();
+        let d = xudo_policy::evaluate_command(
+            &rules,
+            &caller(true, Vec::new()),
+            &Arg::from(granted.exe.as_str()),
+            &argv,
+            Settings::default(),
+        );
+        prop_assert!(d.harness_grant.is_none());
+        prop_assert_ne!(d.verdict, Verdict::Allow);
+    }
+
+    /// OD15: a grant is never wider than the human's own allow.
+    #[test]
+    fn a_grant_implies_a_human_allow(
+        mut action in arb_action("g.od15"),
+        argv in arb_argv(),
+    ) {
+        action.harness = vec!["claude-code".to_owned()];
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let agent = decide(&action, &argv, true, Vec::new());
+        if agent.harness_grant.is_some() {
+            let human = decide(&action, &argv, false, Vec::new());
+            prop_assert_eq!(agent.verdict, Verdict::Allow);
+            prop_assert_eq!(human.verdict, Verdict::Allow);
+            prop_assert_eq!(human.action, agent.action);
+        }
     }
 
     #[test]
@@ -958,7 +1025,6 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
         frozen in prop::bool::weighted(0.1),
     ) {
         let mut grown = rules.clone();
@@ -967,7 +1033,7 @@ proptest! {
         let before = RuleSet::load(rules.clone()).unwrap();
         let after = RuleSet::load(grown).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
 
         let then = evaluate_command(&before, &facts, &program, &argv, settings);
         let now = evaluate_command(&after, &facts, &program, &argv, settings);
@@ -1002,13 +1068,12 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
     ) {
         let (program, argv) = command_for(&rules, pick, &choices, &random, sampled);
         let forward = RuleSet::load(rules.clone()).unwrap();
         let shuffled = RuleSet::load(reordered).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen: false, ..Settings::default() };
+        let settings = Settings { frozen: false, ..Settings::default() };
 
         let a = evaluate_command(&forward, &facts, &program, &argv, settings);
         let b = evaluate_command(&shuffled, &facts, &program, &argv, settings);
@@ -1038,13 +1103,12 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
         frozen in prop::bool::weighted(0.1),
     ) {
         let (program, argv) = command_for(&rules, pick, &choices, &random, sampled);
         let set = RuleSet::load(rules.clone()).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
         let whole = evaluate_command(&set, &facts, &program, &argv, settings);
 
         for action in &rules {

@@ -263,19 +263,20 @@ fn naming_the_permissive_duplicate_cannot_skip_the_confirmation() {
 }
 
 #[test]
-fn turning_the_agent_setting_off_does_not_combine_with_a_duplicate_to_skip_an_always_rule() {
-    // `confirm_agent_actions = false` lifts the agent-path confirmation and
-    // nothing else; the duplicate's `confirm = "never"` lifts nothing for a
-    // command another rule always confirms.
+fn a_never_duplicate_cannot_combine_with_an_always_rule_to_skip_it() {
+    // The duplicate's `confirm = "never"` lifts nothing for a command another
+    // rule always confirms.
     let rules = load(&[
         ("10-quick.toml", PERMISSIVE),
         ("90-toolchain.toml", CONFIRMING),
     ]);
-    let off = Settings {
-        confirm_agent_actions: false,
-        ..Settings::default()
-    };
-    let d = evaluate_command(&rules, &agent(), &apt_get(), &remove(&["gcc"]), off);
+    let d = evaluate_command(
+        &rules,
+        &agent(),
+        &apt_get(),
+        &remove(&["gcc"]),
+        Settings::default(),
+    );
     assert_eq!(d.confirm, always());
 }
 

@@ -11889,12 +11889,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
         let mut host = Host::honest();
-        host.policy
-            .answer
-            .as_mut()
-            .unwrap()
-            .settings
-            .confirm_agent_actions = false;
         host.syscalls =
             FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);

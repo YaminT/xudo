@@ -24,7 +24,7 @@ use crate::deny_rule::{DenyClause, DenyRule};
 use crate::harness::{HarnessError, HarnessRegistry};
 use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
 use crate::operation::{OpKind, Operation};
-use crate::rule::{Action, ConfirmPolicy, Outcome, RuleSet, RuleSetError, Tier};
+use crate::rule::{Action, ConfirmPolicy, RuleSet, RuleSetError, Tier};
 use crate::rule_test::RuleTest;
 
 /// The suffix that makes a directory entry a rule file.
@@ -441,7 +441,7 @@ fn policy_form(action: &Action) -> Vec<u8> {
     for name in env_allow {
         put(&mut out, name.as_bytes());
     }
-    // Default harness and outcome are omitted so an action that does not name
+    // An unset outcome is omitted so an action that does not name
     // them keeps the canonical form it had before those fields existed.
     if !harness.is_empty() {
         put(&mut out, b"harness");
@@ -450,7 +450,7 @@ fn policy_form(action: &Action) -> Vec<u8> {
             put(&mut out, label.as_bytes());
         }
     }
-    if *outcome != Outcome::Allow {
+    if !outcome.is_unset() {
         put(&mut out, b"outcome");
         put(&mut out, outcome.as_str().as_bytes());
     }
@@ -774,14 +774,16 @@ max-entries = 10
 
     #[test]
     fn an_action_with_a_label_missing_from_the_registry_fails_to_load() {
-        let action = ONE_ACTION.replace("exe =", "harness = [\"codex\"]\nexe =");
+        let action =
+            ONE_ACTION.replace("exe =", "harness = [\"codex\"]\noutcome = \"allow\"\nexe =");
         let result = load_policy(vec![file("10-a.toml", &action)], &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn an_action_with_a_registered_harness_loads() {
-        let action = ONE_ACTION.replace("exe =", "harness = [\"codex\"]\nexe =");
+        let action =
+            ONE_ACTION.replace("exe =", "harness = [\"codex\"]\noutcome = \"allow\"\nexe =");
         let result = load_policy(
             vec![file("10-a.toml", &action)],
             &[harness_file("codex", "agent", 4)],
@@ -1197,6 +1199,7 @@ args = [
 
         use super::*;
         use crate::matcher::AnchoredPattern;
+        use crate::rule::Outcome;
 
         /// Every `NameKind`, as a fixed-size array so that adding a kind to the
         /// enum without listing it here is caught by the pin below.
@@ -1334,7 +1337,7 @@ args = [
             with(&|a| a.harness.push("claude".into()));
             with(&|a| {
                 a.outcome = match a.outcome {
-                    Outcome::Allow => Outcome::AskHuman,
+                    Outcome::Unset | Outcome::Allow => Outcome::AskHuman,
                     Outcome::AskHuman => Outcome::Allow,
                 };
             });

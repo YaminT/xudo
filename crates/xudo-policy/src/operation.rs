@@ -374,6 +374,7 @@ pub fn evaluate_remove_path(
             resolved_exe: None,
             resolved_argv: display_target(target),
             confirm: Confirm::NotRequired,
+            harness_grant: None,
             trace: vec![
                 TraceStep::OperationMatched {
                     action: grant.id.to_string(),

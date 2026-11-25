@@ -241,7 +241,6 @@ fn parse_config(contents: Option<&[u8]>, file: &Path) -> Result<ConfigSettings, 
 
 fn settings_of(config: &ConfigSettings) -> Settings {
     Settings {
-        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == Value::Bool(true),
         frozen: config.get(Setting::Frozen).value == Value::Bool(true),
     }

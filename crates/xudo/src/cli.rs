@@ -1457,7 +1457,6 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     }
 
     Some(Settings {
-        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
@@ -3298,6 +3297,7 @@ tier = "diag-read"
 exe = "/usr/bin/awk"
 agent-allowed = false
 harness = ["codex"]
+outcome = "allow"
 args = [
   { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
   { name = "name", matcher = { pattern = "[a-z]+" } },
