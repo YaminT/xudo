@@ -1457,7 +1457,6 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     }
 
     Some(Settings {
-        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
@@ -2907,7 +2906,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "nginx.service",
         ]);
         // ALLOW, and note what that does *not* mean: the human path's password
-        // is sudo's job, not the verdict's. `confirm_agent_actions` applies to
+        // is sudo's job, not the verdict's. The agent confirmation applies to
         // an attested agent, and nobody is attested in this build, so the
         // policy answer here is a plain allow.
         assert_eq!(code, ExitCode::Delegated);
@@ -3315,6 +3314,7 @@ tier = "diag-read"
 exe = "/usr/bin/awk"
 agent-allowed = false
 harness = ["codex"]
+outcome = "allow"
 args = [
   { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
   { name = "name", matcher = { pattern = "[a-z]+" } },

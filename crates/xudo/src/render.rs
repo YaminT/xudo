@@ -152,6 +152,9 @@ fn trace_line(step: &TraceStep) -> String {
             };
             format!("confirmation {state}: {reason}")
         }
+        TraceStep::HarnessGranted { action, harness } => {
+            format!("harness {harness} granted by {action}")
+        }
         TraceStep::AskHumanQueued { action, source } => {
             format!("ask-human queued by {action} at {source}")
         }
@@ -326,7 +329,7 @@ args = [
     fn a_confirmation_renders_the_reason_a_human_will_be_shown() {
         let text = human(&decide(&["restart", "nginx.service"], true));
         assert!(text.starts_with("ALLOW, after a human confirms"), "{text}");
-        assert!(text.contains("confirm_agent_actions is on"), "{text}");
+        assert!(text.contains("no rule grants it to this harness"), "{text}");
         assert!(text.contains("confirmation required"), "{text}");
     }
 
@@ -534,6 +537,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             TraceStep::ConfirmationDecided {
                 required: false,
                 reason: "r".into(),
+            },
+            TraceStep::HarnessGranted {
+                action: "xudo.grant.test".into(),
+                harness: "codex".into(),
             },
             TraceStep::AskHumanQueued {
                 action: "xudo.review.test".into(),

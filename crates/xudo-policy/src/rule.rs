@@ -147,8 +147,9 @@ impl Tier {
 pub enum ConfirmPolicy {
     /// Confirm an enrolled agent, and not a human. The default.
     ///
-    /// No configuration key turns this off. A harness label on the action is
-    /// the planned passwordless path, and no such grant is armed yet.
+    /// No configuration key turns this off. An agent whose harness the rule
+    /// lists with `outcome = "allow"` is recorded as granted; until G1 the
+    /// verdict still confirms.
     #[default]
     Default,
     /// Always confirm, for every caller.
@@ -156,9 +157,9 @@ pub enum ConfirmPolicy {
     /// Ask for no confirmation from this action, on the human path.
     ///
     /// This is not a passwordless grant: a rule that lists no `harness` is
-    /// never passwordless. An agent-specific confirmation for `never` rules is
-    /// part of the passwordless step still to come. It does not lift a
-    /// stricter overlapping action. A critical action cannot set it.
+    /// never passwordless. An enrolled agent is still confirmed under `never`;
+    /// only a listed harness with `outcome = "allow"` is granted. It does not
+    /// lift a stricter overlapping action. A critical action cannot set it.
     Never,
 }
 
@@ -166,17 +167,27 @@ pub enum ConfirmPolicy {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-    /// Permit the verified harness when all other policy checks pass. The default.
+    /// Not written. The default, and valid only on a rule that lists no
+    /// harness: a rule that names a harness must say what it does for it.
     #[default]
+    #[serde(skip)]
+    Unset,
+    /// Permit the verified harness when all other policy checks pass.
     Allow,
     /// Deny the current request and submit it to the root-held human review queue.
     AskHuman,
 }
 
 impl Outcome {
+    /// Whether the rule left the outcome unwritten.
+    pub const fn is_unset(&self) -> bool {
+        matches!(self, Self::Unset)
+    }
+
     /// The word a rule file uses.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Unset => "unset",
             Self::Allow => "allow",
             Self::AskHuman => "ask-human",
         }
@@ -225,8 +236,8 @@ pub struct Action {
     /// to load. A label that is not in the registry fails the combined load.
     #[serde(default)]
     pub harness: Vec<String>,
-    /// The planned outcome for a listed harness. Default [`Outcome::Allow`].
-    #[serde(default)]
+    /// What a listed harness gets. Required when `harness` is non-empty.
+    #[serde(default, skip_serializing_if = "Outcome::is_unset")]
     pub outcome: Outcome,
     /// Where this action was defined.
     ///
@@ -241,8 +252,8 @@ impl Action {
     /// is armed.
     ///
     /// True only when `label` is listed and [`Outcome::Allow`] is set. The
-    /// engine does not consult this. A rule with no `harness` key is never
-    /// passwordless.
+    /// engine consults it to record a grant. A rule with no `harness` key is
+    /// never passwordless.
     pub fn passwordless_for(&self, label: &str) -> bool {
         self.outcome == Outcome::Allow && self.harness.iter().any(|item| item == label)
     }
@@ -426,6 +437,15 @@ pub enum RuleSetError {
     /// engine fell through, would confirm an enrolled agent instead of denying.
     #[error("action {id} at {at}: outcome \"ask-human\" requires a non-empty harness list")]
     AskHumanWithoutHarness {
+        /// The offending action.
+        id: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// A rule lists a harness and says nothing about what happens for it.
+    /// There is no default: a grant is written, never implied.
+    #[error("action {id} at {at}: a rule that lists a harness must set outcome")]
+    HarnessWithoutOutcome {
         /// The offending action.
         id: String,
         /// Where it is defined.
@@ -1042,6 +1062,12 @@ fn validate_action_harness(action: &Action) -> Result<(), RuleSetError> {
             at: action.source.clone(),
         });
     }
+    if !action.harness.is_empty() && action.outcome.is_unset() {
+        return Err(RuleSetError::HarnessWithoutOutcome {
+            id: action.id.as_str().to_owned(),
+            at: action.source.clone(),
+        });
+    }
     if action.outcome == Outcome::AskHuman && action.harness.is_empty() {
         return Err(RuleSetError::AskHumanWithoutHarness {
             id: action.id.as_str().to_owned(),
@@ -1263,6 +1289,54 @@ outcome = \"ask-human\"
                 at: Source::new("20.toml", 2),
             }
         );
+    }
+
+    #[test]
+    fn a_harness_rule_without_outcome_fails_to_load() {
+        let mut listed = action("xudo.svc.restart");
+        listed.harness = vec!["codex".into()];
+        listed.outcome = Outcome::Unset;
+        assert!(listed.outcome.is_unset());
+        let error = RuleSet::load(vec![listed]).unwrap_err();
+        let at = Source::new("20-services.toml", 3);
+        assert_eq!(
+            error,
+            RuleSetError::HarnessWithoutOutcome {
+                id: "xudo.svc.restart".into(),
+                at: at.clone(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "action xudo.svc.restart at {at}: a rule that lists a harness must set outcome"
+            )
+        );
+
+        let text = "\
+[[action]]
+id = \"xudo.svc.restart\"
+tier = \"svc-control\"
+exe = \"/usr/bin/systemctl\"
+harness = [\"codex\"]
+";
+        assert_eq!(
+            RuleSet::from_toml("20.toml", text).unwrap_err(),
+            RuleSetError::HarnessWithoutOutcome {
+                id: "xudo.svc.restart".into(),
+                at: Source::new("20.toml", 2),
+            }
+        );
+        let written = format!("{text}outcome = \"allow\"\n");
+        assert!(RuleSet::from_toml("20.toml", &written).is_ok());
+        // `unset` is not a word a rule file may write.
+        let spelled = format!("{text}outcome = \"unset\"\n");
+        assert!(RuleSet::from_toml("20.toml", &spelled).is_err());
+        // And a rule with no harness needs no outcome.
+        let bare =
+            "[[action]]\nid = \"x.y\"\ntier = \"svc-control\"\nexe = \"/usr/bin/systemctl\"\n";
+        assert!(RuleSet::from_toml("20.toml", bare).is_ok());
+        assert_eq!(Outcome::Unset.as_str(), "unset");
     }
 
     #[test]

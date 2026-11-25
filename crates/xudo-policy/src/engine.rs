@@ -120,26 +120,12 @@ impl Request {
 /// `trust.d` record plus a per-invocation flag, both enforced by the broker,
 /// because the realistic failure mode for this whole project is someone
 /// disabling a noisy prompt to unstick a workflow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// Whether an enrolled agent's actions are confirmed by a human.
-    ///
-    /// Defaults to `true` via [`Settings::default`].
-    pub confirm_agent_actions: bool,
     /// Whether human-path confirmation rules also require a watch approval.
     pub confirm_human_path: bool,
     /// Whether the agent path is frozen.
     pub frozen: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            confirm_agent_actions: true,
-            confirm_human_path: false,
-            frozen: false,
-        }
-    }
 }
 
 /// Evaluates a request that names an action. The whole crate exists to
@@ -390,11 +376,31 @@ impl<'c> Run<'c> {
             Err(run) => run,
         };
 
-        let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
+        let (cited, reason) = strictest(seed, accepting, self.caller);
         self.trace.push(TraceStep::ConfirmationDecided {
             required: reason.is_some(),
             reason: confirmation_text(reason, accepting.len()),
         });
+
+        // A grant is an agent the rule itself names, and nothing stricter
+        // overlapped: `reason` is the strictest of every accepting action.
+        let harness_grant = match (reason, self.caller.classification.enrolled_agent_id()) {
+            (None, Some(label)) => {
+                self.trace.push(TraceStep::HarnessGranted {
+                    action: cited.id.to_string(),
+                    harness: label.to_owned(),
+                });
+                Some(cited.id.clone())
+            }
+            _ => None,
+        };
+
+        // G1 will act on the grant; until then the verdict still confirms, so a
+        // grant never lifts the operator's `confirm_human_path` approval.
+        // G1a deletes the next statement.
+        let reason = reason.or(harness_grant
+            .as_ref()
+            .map(|_| ConfirmReason::AgentActionsConfirmed));
 
         let (verdict, confirm) = match reason {
             Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
@@ -416,6 +422,7 @@ impl<'c> Run<'c> {
             resolved_exe: Some(cited.exe.clone()),
             resolved_argv: self.resolved_argv(),
             confirm,
+            harness_grant,
             trace: self.trace,
         }
     }
@@ -469,11 +476,7 @@ impl<'c> Run<'c> {
 
 /// What one action demands before it runs a command for this caller,
 /// considered on its own.
-fn confirmation_for(
-    action: &Action,
-    caller: &CallerFacts,
-    settings: Settings,
-) -> Option<ConfirmReason> {
+fn confirmation_for(action: &Action, caller: &CallerFacts) -> Option<ConfirmReason> {
     if action.tier.always_confirms() {
         // Checked first, so a critical action reports the critical reason
         // whatever its own `confirm` says: with `always`, ranking it as an
@@ -485,10 +488,15 @@ fn confirmation_for(
         Some(ConfirmReason::CriticalTier)
     } else if action.confirm == ConfirmPolicy::Always {
         Some(ConfirmReason::RuleRequiresConfirmation)
-    } else if action.confirm == ConfirmPolicy::Never {
-        None
-    } else if caller.classification.is_enrolled_agent() && settings.confirm_agent_actions {
-        Some(ConfirmReason::AgentActionsConfirmed)
+    } else if let Some(label) = caller.classification.enrolled_agent_id() {
+        // Checked before `confirm = "never"`: that setting is about the human
+        // path. An agent skips confirmation only when the rule names its
+        // harness with `outcome = "allow"`, and nothing else turns it off.
+        if action.passwordless_for(label) {
+            None
+        } else {
+            Some(ConfirmReason::AgentActionsConfirmed)
+        }
     } else {
         None
     }
@@ -503,13 +511,12 @@ fn strictest<'a>(
     seed: &'a Action,
     accepting: &[&'a Action],
     caller: &CallerFacts,
-    settings: Settings,
 ) -> (&'a Action, Option<ConfirmReason>) {
     let rank = |reason: Option<ConfirmReason>| reason.map_or(0, ConfirmReason::strictness);
     accepting.iter().fold(
-        (seed, confirmation_for(seed, caller, settings)),
+        (seed, confirmation_for(seed, caller)),
         |(cited, reason), &action| {
-            let candidate = confirmation_for(action, caller, settings);
+            let candidate = confirmation_for(action, caller);
             if rank(candidate) > rank(reason) {
                 (action, candidate)
             } else {
@@ -616,13 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_confirming_agent_actions() {
-        // The requirement: confirm even in yolo mode, unless explicitly
-        // narrowed. The default must not be silent.
+    fn settings_default_to_an_open_human_path_and_no_freeze() {
         let s = Settings::default();
-        assert!(s.confirm_agent_actions);
         assert!(!s.frozen);
-        assert!(format!("{s:?}").contains("confirm_agent_actions"));
+        assert!(!s.confirm_human_path);
+        assert!(format!("{s:?}").contains("frozen"));
     }
 
     #[test]
@@ -665,35 +670,120 @@ mod tests {
         assert_eq!(d.verdict, Verdict::AllowWithConfirmation);
     }
 
-    #[test]
-    fn narrowing_the_confirmation_requires_the_setting_and_the_rule_to_agree() {
-        // Turning the global setting off is not enough on its own for a rule
-        // that always confirms, and turning it off for an ordinary rule is the
-        // only combination that yields a bare allow on the agent path.
-        let mut always = svc_restart();
-        always.confirm = ConfirmPolicy::Always;
-        let strict = RuleSet::load(vec![always]).unwrap();
-        let off = Settings {
-            confirm_agent_actions: false,
-            ..Settings::default()
-        };
-        assert_eq!(
-            evaluate(&strict, &agent(), &restart_request(), off).verdict,
-            Verdict::AllowWithConfirmation
-        );
-        assert_eq!(
-            evaluate(&rules(), &agent(), &restart_request(), off).verdict,
-            Verdict::Allow
-        );
+    fn granted(labels: &[&str], outcome: crate::rule::Outcome) -> Action {
+        let mut action = svc_restart();
+        action.harness = labels.iter().map(|label| (*label).to_owned()).collect();
+        action.outcome = outcome;
+        action
+    }
+
+    fn confirmed(d: &Decision) -> bool {
+        d.verdict == Verdict::AllowWithConfirmation
+            && d.confirm
+                == Confirm::Required {
+                    reason: ConfirmReason::AgentActionsConfirmed,
+                }
+            && d.harness_grant.is_none()
+    }
+
+    /// A grant is recorded and the verdict still confirms (until G1).
+    fn confirmed_with_grant(d: &Decision) -> bool {
+        d.verdict == Verdict::AllowWithConfirmation
+            && d.confirm
+                == Confirm::Required {
+                    reason: ConfirmReason::AgentActionsConfirmed,
+                }
+            && d.harness_grant.is_some()
     }
 
     #[test]
-    fn a_rule_may_opt_out_of_confirmation_entirely() {
+    fn a_rule_may_opt_a_human_out_of_confirmation_entirely() {
+        let mut never = svc_restart();
+        never.confirm = ConfirmPolicy::Never;
+        let set = RuleSet::load(vec![never]).unwrap();
+        let d = evaluate(&set, &human(), &restart_request(), Settings::default());
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert!(d.harness_grant.is_none());
+    }
+
+    #[test]
+    fn an_enrolled_agent_is_confirmed_on_a_never_rule() {
         let mut never = svc_restart();
         never.confirm = ConfirmPolicy::Never;
         let set = RuleSet::load(vec![never]).unwrap();
         let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert_eq!(d.verdict, Verdict::Allow);
+        assert!(confirmed(&d), "{d:?}");
+        let d = evaluate_command(
+            &set,
+            &agent(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(["restart", "nginx.service"]),
+            Settings::default(),
+        );
+        assert!(confirmed(&d), "{d:?}");
+    }
+
+    #[test]
+    fn a_listed_harness_on_an_allow_rule_is_granted() {
+        let set =
+            RuleSet::load(vec![granted(&["claude-code"], crate::rule::Outcome::Allow)]).unwrap();
+        let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert!(confirmed_with_grant(&d), "{d:?}");
+        assert_eq!(d.harness_grant, Some(ActionId::new("xudo.svc.restart")));
+        assert!(d.trace.iter().any(|step| matches!(
+            step,
+            TraceStep::HarnessGranted { action, harness }
+                if action == "xudo.svc.restart" && harness == "claude-code"
+        )));
+        // A human on the same rule is not an agent: no grant is recorded.
+        let human_decision = evaluate(&set, &human(), &restart_request(), Settings::default());
+        assert!(human_decision.harness_grant.is_none());
+        assert!(
+            !human_decision
+                .trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::HarnessGranted { .. }))
+        );
+    }
+
+    #[test]
+    fn an_unlisted_harness_is_confirmed() {
+        let set = RuleSet::load(vec![granted(&["codex"], crate::rule::Outcome::Allow)]).unwrap();
+        let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert!(confirmed(&d), "{d:?}");
+    }
+
+    #[test]
+    fn a_stricter_overlapping_action_cancels_the_grant() {
+        let grant = granted(&["claude-code"], crate::rule::Outcome::Allow);
+        let mut stricter = svc_restart();
+        stricter.id = ActionId::new("xudo.svc.restart-strict");
+        let mut always = stricter.clone();
+        always.id = ActionId::new("xudo.svc.restart-always");
+        always.confirm = ConfirmPolicy::Always;
+        let mut critical = stricter.clone();
+        critical.id = ActionId::new("xudo.svc.restart-critical");
+        critical.tier = Tier::Critical;
+        let mut unlisted = stricter.clone();
+        unlisted.harness = vec!["codex".into()];
+        unlisted.outcome = crate::rule::Outcome::Allow;
+        for other in [stricter, always, critical, unlisted] {
+            for order in [
+                vec![grant.clone(), other.clone()],
+                vec![other.clone(), grant.clone()],
+            ] {
+                let set = RuleSet::load(order).unwrap();
+                let d = evaluate_command(
+                    &set,
+                    &agent(),
+                    &Arg::from("/usr/bin/systemctl"),
+                    &Argv::new(["restart", "nginx.service"]),
+                    Settings::default(),
+                );
+                assert_eq!(d.verdict, Verdict::AllowWithConfirmation, "{other:?}");
+                assert!(d.harness_grant.is_none());
+            }
+        }
     }
 
     #[test]
@@ -749,7 +839,6 @@ mod tests {
     #[test]
     fn a_frozen_agent_path_denies_while_the_human_path_still_works() {
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };
@@ -1149,7 +1238,6 @@ all = []
         // And a freeze does not touch them, because they are not on the agent
         // path at all.
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };
@@ -1492,7 +1580,6 @@ all = []
     #[test]
     fn a_frozen_agent_is_refused_before_any_action_is_consulted() {
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };

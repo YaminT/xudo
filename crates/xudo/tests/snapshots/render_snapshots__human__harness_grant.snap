@@ -1,0 +1,17 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+ALLOW, after a human confirms
+  command   /usr/bin/systemctl restart nginx.service
+  action    xudo.svc.restart
+  rule      snapshot-grant.toml:3
+  confirm   an enrolled agent requested a privileged action and no rule grants it to this harness
+
+  trace
+    canonicalized: unchanged (restart nginx.service)
+    matched xudo.svc.restart at snapshot-grant.toml:3
+    deny-list v7: no capability class matched
+    deny-rules: no configured rule matched
+    confirmation not required: no confirmation requirement applies
+    harness claude-code granted by xudo.svc.restart

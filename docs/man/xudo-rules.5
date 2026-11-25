@@ -118,9 +118,12 @@ confirms for every caller.
 skips confirmation for this action.
 A rule that lists no
 .B harness
-is never passwordless, and confirming an agent under
-.B never
-is part of the passwordless step still to come.
+is never passwordless, and an enrolled agent is still confirmed under
+.BR never ;
+only a rule that lists the agent's harness with
+.B outcome = "allow"
+records a grant, and until the passwordless step ships the verdict still
+confirms.
 It is not a grant against a stricter overlapping action, and a
 .B critical
 action cannot set it.
@@ -140,16 +143,20 @@ The child's environment is built from scratch, so a name on no list does not
 exist for the child.
 .TP
 .B harness
-Labels from the root-owned harness registry. Without this key, an action is
-eligible for a verified harness only when the broker's kernel classification
-and root-owned registry agree on that label. A listed label is not proof of
+Labels from the root-owned harness registry. Without this key, an enrolled
+agent's request is always confirmed, whatever
+.B confirm
+says. A listed label is not proof of
 identity by itself.
 .TP
 .B outcome
 The outcome for a verified harness named by
 .B harness :
 .B allow
-uses the normal policy path; this is the default. The
+lifts the agent confirmation for the listed harness only; there is no default,
+and an action that lists a harness without an
+.B outcome
+fails to load. The password path is unchanged. The
 .B ask-human
 outcome submits the request to the broker's root-held queue and denies the
 current request. For this outcome, the action must list the caller's verified

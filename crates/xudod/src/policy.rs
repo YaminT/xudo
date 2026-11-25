@@ -220,7 +220,6 @@ mod tests {
                 (!rows.is_empty()).then_some(bytes.as_bytes()),
                 Path::new("/etc/xudo/config.toml"),
             ).unwrap();
-            prop_assert!(loaded.confirm_agent_actions);
             prop_assert_eq!(loaded.confirm_human_path, human.unwrap_or(Settings::default().confirm_human_path));
             prop_assert_eq!(loaded.frozen, frozen.unwrap_or(Settings::default().frozen));
         }
@@ -514,9 +513,8 @@ outcome = "ask-human"
         let request = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
         let mut policy = policy_of(RULES);
         let baseline = decide(&policy, &caller, &request);
-        for (confirm_agent_actions, frozen) in [(true, true), (false, false), (false, true)] {
+        for frozen in [true, false] {
             policy.settings = Settings {
-                confirm_agent_actions,
                 frozen,
                 ..Settings::default()
             };
@@ -550,7 +548,6 @@ outcome = "ask-human"
         assert_eq!(
             settings,
             Settings {
-                confirm_agent_actions: true,
                 confirm_human_path: false,
                 frozen: true,
             }
