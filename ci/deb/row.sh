@@ -87,6 +87,24 @@ meta /var/lib/xudo/audit.jsonl "600 root:root"
 meta /run/xudo "755 root:root"
 meta /run/xudo/req "700 root:root"
 meta /run/xudo/confirm "700 root:root"
+meta /run/xudo/sessions "700 root:root"
+meta /run/xudo/rate "700 root:root"
+meta /usr/libexec/xudo/xudo-session "755 root:root"
+for u in xudo.slice xudo-agent@.service; do
+    [ -f "/usr/lib/systemd/system/$u" ] || fail "$u not in the package"
+    meta "/usr/lib/systemd/system/$u" "644 root:root"
+done
+# An enrolled agent needs a human to enrol it: nothing is enabled or started.
+gone /etc/systemd/system/multi-user.target.wants/xudo-agent@.service
+# A template with no instance can never be enabled, so also look for an instance.
+! ls /etc/systemd/system/*.wants/xudo-agent@* 2>/dev/null | grep -q . || fail "an xudo-agent instance is enabled"
+# The record helper runs as root with the unit's EnvironmentFile applied; being
+# static (no ld.so) is what makes LD_PRELOAD and friends inert for it.
+command -v readelf >/dev/null 2>&1 || deb_install binutils
+readelf -lW /usr/libexec/xudo/xudo-session >/tmp/session.elf 2>&1 || fail "readelf xudo-session"
+grep -q 'LOAD' /tmp/session.elf || fail "xudo-session is not an ELF executable"
+! grep -q 'INTERP' /tmp/session.elf || fail "xudo-session is dynamically linked (has PT_INTERP)"
+! grep -rqs NOPASSWD /etc/sudoers /etc/sudoers.d || fail "NOPASSWD found in sudoers after install"
 [ -L "$socket" ] || fail "socket was not enabled"
 [ -f /usr/lib/systemd/system/xudo-pasban.service ] || fail "pasban service not in the package"
 [ -f /usr/lib/systemd/system/xudo-pasban.timer ] || fail "pasban timer not in the package"

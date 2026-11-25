@@ -633,10 +633,32 @@ if [ -f /var/lib/xudo/audit.jsonl ]; then
     sed -n 's/.*\(detail=[^"]*\).*/\1/p' /var/lib/xudo/audit.jsonl
 fi
 
+# An enrolled agent's unit runs when the package is removed: prerm must stop it
+# and ExecStopPost must void its record. A lane-only drop-in (never shipped)
+# supplies the ExecStart= and User= that enrolment will one day write.
+id xudoagent >/dev/null 2>&1 || useradd --system --no-create-home xudoagent
+mkdir -p /etc/xudo/harnesses.d /etc/systemd/system/xudo-agent@t.service.d
+printf 'label = "t"\nway = "service"\naccount = "xudoagent"\nreviewers = ["xudotest"]\nmax-sessions = 1\n' >/etc/xudo/harnesses.d/t.toml
+chmod 644 /etc/xudo/harnesses.d/t.toml
+printf '[Service]\nUser=xudoagent\nExecStart=/bin/sleep 3600\n' >/etc/systemd/system/xudo-agent@t.service.d/lane.conf
+systemctl daemon-reload
+if systemctl start xudo-agent@t.service >/var/tmp/agent-start.log 2>&1 && [ -e /run/xudo/sessions/svc-t ]; then
+    good "xudo-agent@t started and its record exists"
+else
+    bad "xudo-agent@t did not start with a record"
+    cat /var/tmp/agent-start.log >&2
+    journalctl -u xudo-agent@t --no-pager -n 20 >&2 || true
+fi
 if ! apt-get remove -y xudo >/var/tmp/xudo-remove.log 2>&1; then
     cat /var/tmp/xudo-remove.log >&2
     bad "apt remove"
 fi
+aa=$(systemctl is-active xudo-agent@t.service 2>&1 || true)
+case $aa in
+active | activating) bad "xudo-agent@t still running after remove ($aa)" ;;
+*) good "xudo-agent@t stopped by remove ($aa)" ;;
+esac
+if [ ! -e /run/xudo/sessions/svc-t ]; then good "svc-t record gone after remove"; else bad "svc-t record survived remove"; fi
 en=$(systemctl is-enabled xudod.socket 2>&1 || true)
 case $en in
 enabled | static | indirect | generated | alias) bad "socket still enabled ($en)" ;;

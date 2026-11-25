@@ -368,7 +368,7 @@ deb:
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
     export LC_ALL=C TZ=UTC CARGO_INCREMENTAL=0
     export RUSTFLAGS="--remap-path-prefix={{justfile_directory()}}=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rustc"
-    cargo auditable build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
+    cargo auditable build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --release --locked --target {{musl_triple}}
     packaging/deb/build.sh {{musl_triple}}
 
 # Install, upgrade, remove, and purge the .deb in Ubuntu 24.04, Ubuntu 26.04
@@ -381,7 +381,7 @@ deb-test: deb
 # trail is checked, and remove stops the socket. Needs Docker.
 # ci/systemd/run.sh says how the container is booted and what is asserted.
 systemd-test: deb
-    CARGO_TARGET_DIR=target/systemd-short-ttl cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --features xudod/lane-short-ttl --target {{musl_triple}}
+    CARGO_TARGET_DIR=target/systemd-short-ttl cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --release --locked --features xudod/lane-short-ttl --target {{musl_triple}}
     XUDO_BUILD_BIN_DIR=target/systemd-short-ttl/{{musl_triple}}/release packaging/deb/build.sh {{musl_triple}} target/systemd-short-ttl/deb
     ci/systemd/run.sh {{musl_triple}}
 

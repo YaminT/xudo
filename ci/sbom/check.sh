@@ -28,8 +28,8 @@ debs=(target/deb/*.deb)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 dpkg-deb -x "${debs[0]}" "$tmp/deb"
-bins=("$tmp/deb/usr/bin/xudo" "$tmp/deb/usr/bin/ido" "$tmp/deb/usr/libexec/xudo/xudod" "$tmp/deb/usr/libexec/xudo/xudo-gate-auth")
-pkgs=(xudo-bin ido-bin xudod-bin xudo-gate-bin)
+bins=("$tmp/deb/usr/bin/xudo" "$tmp/deb/usr/bin/ido" "$tmp/deb/usr/libexec/xudo/xudod" "$tmp/deb/usr/libexec/xudo/xudo-gate-auth" "$tmp/deb/usr/libexec/xudo/xudo-session")
+pkgs=(xudo-bin ido-bin xudod-bin xudo-gate-bin xudo-session-bin)
 
 ci/sbom/generate.sh "$tmp/sbom.json" >/dev/null
 for p in "${pkgs[@]}"; do
@@ -37,7 +37,7 @@ for p in "${pkgs[@]}"; do
 done
 for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     cargo tree --locked -e normal,build --target "$t" \
-        -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --prefix none >>"$tmp/both.txt"
+        -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --prefix none >>"$tmp/both.txt"
 done
 
 verify() { # <sbom> <binary>...

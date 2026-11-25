@@ -1,0 +1,39 @@
+# One enrolled agent, headless, as its own non-root account. The instance name
+# is the label: it is the same text in the unit name, the record
+# /run/xudo/sessions/svc-<label>, and the registry entry. `xudo-session` refuses
+# to write a record for any cgroup but this unit's own.
+#
+# Not here, on purpose: ExecStart= and User=. `xudo agent enrol` (a later step)
+# writes both into a root-owned drop-in, so a package upgrade never overwrites
+# an operator's choice and the shipped template runs nothing. No credential
+# lives in the unit either: EnvironmentFile= reads root's 0600 file, if there is
+# one. The unit grants no run: every command the agent asks for still asks for
+# the sudo password.
+#
+# No sandbox either, and that is a decision: no NoNewPrivileges=, ProtectSystem=,
+# PrivateTmp= or any other mount-namespace option. sudo is setuid and the gate
+# runs a command in the caller's mount namespace, which it refuses when it is
+# not the host's; NoNewPrivileges= would stop sudo working at all. The boundary
+# is the account's uid and the rules, not this unit, so `just units` exempts
+# this one template from the exposure ceiling (ci/units/check.sh says so).
+#
+# crates/xudod/tests/units.rs asserts every line here, and refuses any key it
+# does not know.
+
+[Unit]
+Description=xudo enrolled agent %i
+Documentation=https://github.com/YaminT/xudo/blob/main/howiwork.md
+
+[Service]
+Slice=xudo.slice
+# The harness may not make cgroups of its own and move into them.
+Delegate=no
+# "-": no file is fine. Written 0600 root by enrol; never world-readable. systemd
+# applies it to the "+" lines too, so `xudo-session record` refuses a file that is
+# not root-owned, private and in a protected directory.
+# H2c: refuse a drop-in whose User= is not the registry account.
+EnvironmentFile=-/etc/xudo/agents/%i.env
+# "+": run with full privileges, as root, whatever User= says. The record helper
+# refuses unless pid 1 started it and its own cgroup is this unit.
+ExecStartPre=+/usr/libexec/xudo/xudo-session record %i
+ExecStopPost=+/usr/libexec/xudo/xudo-session void %i

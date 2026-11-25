@@ -27,6 +27,7 @@
 //! | own cgroup is exactly `/xudo.slice/xudo-agent@<label>.service` | a record for another unit is a record for the wrong harness |
 //! | that directory is root-owned, not group/other writable, populated | a directory an administrator did not make is no unit of ours |
 //! | the registry has `<label>` with `way = service` | no registry entry, no harness |
+//! | `/etc/xudo/agents/<label>.env` is absent, or a root-owned regular file, mode `0600`-like (no group/other bit), not a link, in a root-owned directory nobody else can write | systemd applies that file to this root helper's own environment without checking it |
 //! | its account resolves in `/etc/passwd` to a non-zero uid | the record names the uid the kernel will report |
 
 use std::ffi::OsString;
@@ -35,10 +36,12 @@ use std::path::Path;
 use thiserror::Error;
 use xudo_policy::{HarnessWay, passwd_uid};
 use xudo_sys::{
-    CgroupCalls, Clock, HostCgroup, HostClock, HostOwn, HostSyscalls, OwnFacts, ProcRef,
-    ProcSource, Spool, SpoolDir, SpoolError, SysError, Syscalls, VerifiedProc, process_cgroup,
-    service_record_name,
+    CgroupCalls, Clock, EnvFileProbe, EnvFiles, HostCgroup, HostClock, HostEnvFiles, HostOwn,
+    HostSyscalls, OwnFacts, ProcRef, ProcSource, Spool, SpoolDir, SpoolError, SysError, Syscalls,
+    VerifiedProc, process_cgroup, service_record_name,
 };
+
+use xudo_sys::trust::{Kind, PathFacts};
 
 use crate::policy::{HostPolicy, PolicySource};
 
@@ -81,6 +84,14 @@ pub enum UnitRecordError {
         /// The label asked for.
         label: String,
     },
+    /// The unit's environment file is one root did not make and protect.
+    #[error(
+        "refused: the environment file of {label} is not a root-owned private regular file in a protected directory"
+    )]
+    EnvFileUntrusted {
+        /// The label asked for.
+        label: String,
+    },
     /// The registered account is missing from `/etc/passwd` or is root.
     #[error("refused: the account of {label} is not a non-root account in /etc/passwd")]
     NoAccount {
@@ -120,6 +131,8 @@ pub struct Env<'a> {
     pub sessions: Result<&'a dyn Spool, &'a SpoolError>,
     /// The pinned `/proc`, or why there is none.
     pub proc: Result<&'a dyn ProcSource, &'a SysError>,
+    /// The unit's optional environment file.
+    pub envfiles: &'a dyn EnvFiles,
     /// The boot id.
     pub syscalls: &'a dyn Syscalls,
     /// `CLOCK_BOOTTIME`.
@@ -143,6 +156,7 @@ pub fn run(argv: &[OsString]) -> Exit {
     let cgroups = HostCgroup::open();
     let sessions = SpoolDir::open(Path::new(SESSIONS_DIR));
     let policy = HostPolicy::system();
+    let envfiles = HostEnvFiles::system();
     let proc = VerifiedProc::open();
     execute(
         argv,
@@ -151,6 +165,7 @@ pub fn run(argv: &[OsString]) -> Exit {
             cgroups: cgroups_seam(&cgroups),
             sessions: xudo_sys::as_seam(&sessions),
             proc: proc_seam(&proc),
+            envfiles: &envfiles,
             syscalls: &HostSyscalls,
             clock: &HostClock,
             policy: &policy,
@@ -270,6 +285,8 @@ pub fn record(env: &Env<'_>, label: &str) -> Result<(), UnitRecordError> {
         return Err(UnitRecordError::UnitUntrusted);
     }
 
+    env_file_is_trusted(env, label)?;
+
     let loaded = env.policy.load().map_err(|e| unavailable("policy", &e))?;
     let registry = &loaded.rules.harnesses;
     let entry = registry
@@ -334,6 +351,34 @@ pub fn record(env: &Env<'_>, label: &str) -> Result<(), UnitRecordError> {
         .map_err(|e| unavailable("write the record", &e))
 }
 
+/// systemd feeds `<label>.env` to the root helper's own environment unchecked:
+/// refuse unless it is absent or [`env_file_is_private`].
+fn env_file_is_trusted(env: &Env<'_>, label: &str) -> Result<(), UnitRecordError> {
+    match env
+        .envfiles
+        .probe(label)
+        .map_err(|e| unavailable("environment file", &e))?
+    {
+        EnvFileProbe::Present { file, dir } if !env_file_is_private(&file, &dir) => {
+            Err(UnitRecordError::EnvFileUntrusted {
+                label: label.to_owned(),
+            })
+        }
+        EnvFileProbe::Present { .. } | EnvFileProbe::Absent => Ok(()),
+    }
+}
+
+/// A regular file (not a link) of root's with no group or other permission,
+/// in a directory that is root's and that no one else can write.
+fn env_file_is_private(file: &PathFacts, dir: &PathFacts) -> bool {
+    file.kind == Kind::File
+        && file.uid == 0
+        && file.mode.trailing_zeros() >= 6
+        && dir.kind == Kind::Directory
+        && dir.uid == 0
+        && dir.mode & 0o022 == 0
+}
+
 /// Removes `svc-<label>`; a record that is already gone is fine.
 ///
 /// # Errors
@@ -361,8 +406,8 @@ mod tests {
     use xudo_gate::policy::{LoadedPolicy, PolicyError};
     use xudo_policy::{HarnessRegistry, RuleFile, load_rule_files};
     use xudo_sys::{
-        FakeOwn, FakeSpool, FakeSyscalls, FixedClock, MapSource, ScopeFacts, SpoolCall,
-        unit_dir_name,
+        EnvFileProbe, FakeEnvFiles, FakeOwn, FakeSpool, FakeSyscalls, FixedClock, MapSource,
+        ScopeFacts, SpoolCall, unit_dir_name,
     };
 
     use super::*;
@@ -502,6 +547,7 @@ args = [
         syscalls: FakeSyscalls,
         clock: FixedClock,
         policy: Policy,
+        envfiles: FakeEnvFiles,
     }
 
     /// The helper's own process, in every namespace pid 1 is in.
@@ -545,6 +591,7 @@ args = [
                     passwd: PASSWD,
                     fail: false,
                 },
+                envfiles: FakeEnvFiles(Ok(EnvFileProbe::Absent)),
             }
         }
 
@@ -563,6 +610,7 @@ args = [
                 syscalls: &self.syscalls,
                 clock: &self.clock,
                 policy: &self.policy,
+                envfiles: &self.envfiles,
             }
         }
 
@@ -573,6 +621,98 @@ args = [
         fn written(&self) -> Option<Vec<u8>> {
             self.spool.files().get(&b"svc-codex"[..]).cloned()
         }
+    }
+
+    fn private_file() -> PathFacts {
+        PathFacts {
+            uid: 0,
+            mode: 0o600,
+            kind: Kind::File,
+        }
+    }
+
+    fn present(file: PathFacts, dir: PathFacts) -> FakeEnvFiles {
+        FakeEnvFiles(Ok(EnvFileProbe::Present { file, dir }))
+    }
+
+    #[test]
+    fn a_root_private_env_file_in_a_root_directory_is_accepted() {
+        let mut world = World::new();
+        world.envfiles = present(private_file(), PathFacts::trusted_directory());
+        world.record().unwrap();
+        assert!(world.written().is_some());
+    }
+
+    #[test]
+    fn an_env_file_root_did_not_make_and_protect_is_refused_before_any_record() {
+        let bad_files = [
+            PathFacts {
+                uid: 1001,
+                ..private_file()
+            },
+            PathFacts {
+                mode: 0o640,
+                ..private_file()
+            },
+            PathFacts {
+                mode: 0o604,
+                ..private_file()
+            },
+            PathFacts {
+                kind: Kind::Symlink,
+                ..private_file()
+            },
+            PathFacts {
+                kind: Kind::Directory,
+                ..private_file()
+            },
+            PathFacts {
+                kind: Kind::Other,
+                ..private_file()
+            },
+        ];
+        let dir = PathFacts::trusted_directory();
+        let bad_dirs = [
+            PathFacts { uid: 1001, ..dir },
+            PathFacts { mode: 0o775, ..dir },
+            PathFacts { mode: 0o757, ..dir },
+            PathFacts {
+                kind: Kind::Symlink,
+                ..dir
+            },
+            PathFacts {
+                kind: Kind::File,
+                ..dir
+            },
+        ];
+        let mut cases: Vec<(PathFacts, PathFacts)> =
+            bad_files.iter().map(|file| (*file, dir)).collect();
+        cases.extend(bad_dirs.iter().map(|d| (private_file(), *d)));
+        for (file, dir) in cases {
+            let mut world = World::new();
+            world.envfiles = present(file, dir);
+            assert_eq!(
+                refused(world.record()),
+                UnitRecordError::EnvFileUntrusted {
+                    label: "codex".to_owned()
+                },
+                "{file:?} in {dir:?}"
+            );
+            assert!(world.written().is_none());
+            assert!(world.spool.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_env_file_that_cannot_be_inspected_refuses_the_record() {
+        let mut world = World::new();
+        let error = SysError::read("/etc/xudo/agents", "denied");
+        world.envfiles = FakeEnvFiles(Err(error.clone()));
+        assert_eq!(
+            refused(world.record()),
+            UnitRecordError::Unavailable(format!("environment file: {error}"))
+        );
+        assert!(world.written().is_none());
     }
 
     fn broken_spool() -> SpoolError {

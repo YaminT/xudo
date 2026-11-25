@@ -17,6 +17,9 @@ use xudod::CONFIRM_DIR;
 
 const SOCKET: &str = include_str!("../../../packaging/systemd/xudod.socket");
 const SERVICE: &str = include_str!("../../../packaging/systemd/xudod@.service");
+const SLICE: &str = include_str!("../../../packaging/systemd/xudo.slice");
+const AGENT_SERVICE: &str = include_str!("../../../packaging/systemd/xudo-agent@.service");
+const DEB_BUILD: &str = include_str!("../../../packaging/deb/build.sh");
 const PASBAN_SERVICE: &str = include_str!("../../../packaging/systemd/xudo-pasban.service");
 const PASBAN_TIMER: &str = include_str!("../../../packaging/systemd/xudo-pasban.timer");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/xudo.conf");
@@ -488,6 +491,16 @@ fn tmpfiles_creates_private_confirmation_state_the_spool_and_audit_dir() {
             ["d", "/run/xudo", "0755", "root", "root", "-", "-"],
             ["d", xudo_gate::SPOOL_DIR, "0700", "root", "root", "-", "-"],
             ["d", CONFIRM_DIR, "0700", "root", "root", "-", "-"],
+            [
+                "d",
+                xudod::unit_record::SESSIONS_DIR,
+                "0700",
+                "root",
+                "root",
+                "-",
+                "-"
+            ],
+            ["d", "/run/xudo/rate", "0700", "root", "root", "-", "-"],
             ["d", xudo_sys::AUDIT_DIR, "0700", "root", "root", "-", "-"],
             ["d", "/var/lib/xudo/queue", "0700", "root", "root", "-", "-"],
             [
@@ -782,4 +795,190 @@ fn pasban_runs_daily_and_the_operator_changes_the_period_with_a_drop_in() {
     );
     assert!(PASBAN_TIMER.contains("OnCalendar="));
     assert!(PASBAN_TIMER.contains("OnCalendar=weekly"));
+}
+
+/// The directives that sandbox a unit or give it a mount namespace of its own.
+/// An enrolled agent's template carries none: sudo is setuid and the gate runs
+/// a command in the caller's mount namespace and refuses a private one.
+const SANDBOX_KEYS: &[&str] = &[
+    "NoNewPrivileges",
+    "ProtectSystem",
+    "ProtectHome",
+    "PrivateTmp",
+    "PrivateDevices",
+    "PrivateUsers",
+    "PrivateMounts",
+    "PrivateNetwork",
+    "PrivatePIDs",
+    "ProtectProc",
+    "ProcSubset",
+    "ProtectKernelTunables",
+    "ProtectKernelModules",
+    "ProtectKernelLogs",
+    "ProtectControlGroups",
+    "ProtectClock",
+    "ProtectHostname",
+    "ReadOnlyPaths",
+    "ReadWritePaths",
+    "InaccessiblePaths",
+    "TemporaryFileSystem",
+    "BindPaths",
+    "BindReadOnlyPaths",
+    "RootDirectory",
+    "RootImage",
+    "MountAPIVFS",
+    "MountFlags",
+    "RestrictNamespaces",
+    "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "SystemCallFilter",
+    "RestrictSUIDSGID",
+];
+
+const SLICE_KEYS: &[(&str, &[&str])] =
+    &[("Unit", &["Description", "Documentation"]), ("Slice", &[])];
+
+#[test]
+fn the_slice_delegates_nothing_and_sets_no_limit() {
+    // Delegate= would let the harness make cgroups and move into them.
+    let slice = parse(SLICE);
+    only_known_keys(&slice, SLICE_KEYS);
+    for key in ["Delegate", "DelegateSubgroup", "Slice", "TasksMax"] {
+        assert!(values(&slice, "Slice", key).is_empty(), "{key}");
+    }
+    assert!(
+        !SLICE
+            .lines()
+            .any(|l| l.trim_start().starts_with("Delegate"))
+    );
+    // The name the attestor looks for, `0::/xudo.slice/...`, is the file's name.
+    assert!(
+        include_str!("../../xudo-gate/src/classify.rs").contains("0::/xudo.slice/"),
+        "the attestor no longer names xudo.slice"
+    );
+}
+
+const AGENT_KEYS: &[(&str, &[&str])] = &[
+    ("Unit", &["Description", "Documentation"]),
+    (
+        "Service",
+        &[
+            "Slice",
+            "Delegate",
+            "EnvironmentFile",
+            "ExecStartPre",
+            "ExecStopPost",
+        ],
+    ),
+];
+
+#[test]
+fn the_agent_template_is_placed_in_the_slice_and_cannot_delegate() {
+    let unit = parse(AGENT_SERVICE);
+    only_known_keys(&unit, AGENT_KEYS);
+    assert_eq!(value(&unit, "Service", "Slice"), "xudo.slice");
+    assert_eq!(value(&unit, "Service", "Delegate"), "no");
+}
+
+#[test]
+fn the_agent_template_runs_nothing_and_names_no_account() {
+    // ExecStart= and User= are written by enrol into a root-owned drop-in: a
+    // shipped template that ran something, or ran it as root, is the exploit.
+    let unit = parse(AGENT_SERVICE);
+    for key in ["ExecStart", "ExecStop", "ExecStartPost", "User", "Group"] {
+        assert!(values(&unit, "Service", key).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn the_agent_template_has_no_sandbox_directive_and_says_why() {
+    // The exemption in ci/units/check.sh is honest only while this holds.
+    let unit = parse(AGENT_SERVICE);
+    for key in SANDBOX_KEYS {
+        assert!(values(&unit, "Service", key).is_empty(), "{key}");
+        assert!(values(&unit, "Unit", key).is_empty(), "{key}");
+    }
+    assert!(AGENT_SERVICE.contains("sudo is setuid"));
+    assert!(AGENT_SERVICE.contains("mount namespace"));
+    let check = include_str!("../../../ci/units/check.sh");
+    assert!(check.contains("xudo-agent@.service) return 0"));
+    assert_eq!(check.matches(") return 0 ;;").count(), 1, "one exemption");
+}
+
+#[test]
+fn the_agent_template_records_and_voids_as_root_through_the_installed_helper() {
+    let unit = parse(AGENT_SERVICE);
+    // "+": full privileges whatever User= later says, one record per instance
+    // name, from the one helper the package installs.
+    assert_eq!(
+        values(&unit, "Service", "ExecStartPre"),
+        ["+/usr/libexec/xudo/xudo-session record %i"]
+    );
+    assert_eq!(
+        values(&unit, "Service", "ExecStopPost"),
+        ["+/usr/libexec/xudo/xudo-session void %i"]
+    );
+}
+
+#[test]
+fn the_agent_template_takes_credentials_only_from_an_optional_env_file() {
+    let unit = parse(AGENT_SERVICE);
+    assert_eq!(
+        values(&unit, "Service", "EnvironmentFile"),
+        ["-/etc/xudo/agents/%i.env"]
+    );
+    for key in ["Environment", "PassEnvironment", "UnsetEnvironment"] {
+        assert!(values(&unit, "Service", key).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn the_agent_template_uses_no_specifier_but_the_instance_name() {
+    // %u, %h, %t and the rest name the user, a home or a runtime directory the
+    // label could be mistaken for; only %i is the label.
+    for line in parse(AGENT_SERVICE) {
+        let mut chars = line.value.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                assert_eq!(chars.next(), Some('i'), "{}={}", line.key, line.value);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_package_ships_no_nopasswd_line_and_no_passwordless_gate() {
+    // Nothing in packaging/ may grant a password-free run: not a sudoers text,
+    // not the nopass gate. Comments may say the words.
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, hits);
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+                let lower = line.to_lowercase();
+                if lower.contains("nopasswd") || lower.contains("xudo-gate-nopass") {
+                    hits.push(format!("{}: {line}", path.display()));
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging"),
+        &mut hits,
+    );
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[test]
+fn the_deb_installs_the_session_helper_as_root_only_writable_beside_the_broker() {
+    assert!(DEB_BUILD.contains(
+        "install -m 0755 \"$bin/xudod\" \"$bin/xudo-session\" \"$stage/usr/libexec/xudo/\""
+    ));
+    // The units come in by glob, so a new file under packaging/systemd is shipped.
+    assert!(DEB_BUILD.contains("install -m 0644 \"$root\"/packaging/systemd/*"));
 }
