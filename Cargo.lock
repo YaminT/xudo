@@ -885,6 +885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xudo-session-bin"
+version = "0.1.0-beta.2"
+dependencies = [
+ "assert_cmd",
+ "predicates",
+ "xudod",
+]
+
+[[package]]
 name = "xudo-sys"
 version = "0.1.0-beta.2"
 dependencies = [

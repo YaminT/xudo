@@ -1,0 +1,27 @@
+[package]
+name = "xudo-session-bin"
+description = "The `xudo-session` executable: the record helper an enrolled service's unit runs as root before it starts and after it stops. A five-line entry point over the xudod library. Installed as /usr/libexec/xudo/xudo-session."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Its own package for the reason `xudo-bin`, `xudo-gate-bin` and `xudod-bin`
+# are: the logic, `xudod::unit_record`, is compiled and measured exactly once,
+# at 100%, and `tests/binary.rs` runs the real binary as a process. Excluded
+# from coverage in the justfile.
+[[bin]]
+name = "xudo-session"
+path = "src/main.rs"
+
+[dependencies]
+xudod = { path = "../xudod", version = "0.1.0-beta.1" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+
+[lints]
+workspace = true

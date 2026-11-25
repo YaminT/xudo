@@ -53,6 +53,7 @@ pub mod install;
 pub mod kernel;
 pub mod live;
 mod mounts;
+pub mod own;
 pub mod peer;
 pub mod platform;
 pub mod probe;
@@ -75,8 +76,9 @@ pub use audit::{
 };
 pub use cgroup::{
     CgroupCalls, CgroupIdentity, CgroupRung, HostCgroup, ProcessSecurityStatus, RecordIdentity,
-    Scope, ScopeFacts, ScopeKind, parse_process_security_status, peer_cgroup_id,
-    process_security_status, scope_status, verify_parent_pid,
+    SERVICE_RECORD_PREFIX, Scope, ScopeFacts, ScopeKind, is_record_name,
+    parse_process_security_status, peer_cgroup_id, process_cgroup, process_security_status,
+    scope_status, service_record_name, unit_dir_name, verify_parent_pid,
 };
 #[cfg(target_os = "linux")]
 pub use clock::DEADLINE_CLOCK;
@@ -95,6 +97,9 @@ pub use install::{
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;
 pub use mounts::MountRefusal;
+#[cfg(any(test, feature = "fake"))]
+pub use own::FakeOwn;
+pub use own::{HostOwn, OwnFacts};
 pub use peer::{
     FakePeer, HostPeer, PeerCall, PeerCalls, PeerCred, ProcFile, StatusUids, lacks_peer_pidfd,
     lacks_pidfd_info, lacks_pidfd_open, parse_status_euid, parse_status_uids, peer_was_reaped,

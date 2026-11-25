@@ -115,11 +115,19 @@ no-ignored-passes:
 #               that returns. Its `tests/broker.rs` runs the real binary with a
 #               real socket, a file, and nothing at all on descriptor 0. Every
 #               decision is in the `xudod` library, at 100%.
+#   xudo-session-bin is the same shape for the unit-record helper an enrolled
+#               service's unit runs as root: `main` collects argv, hands
+#               `xudod::unit_record::run` the real host, writes the one line it
+#               returns, and exits with its status. Its `tests/binary.rs` runs
+#               the real binary as a process (a caller that is not root and not
+#               pid 1's child, a hostile argv, a hostile environment). Every
+#               check the helper makes, and every fake it runs against, is in
+#               the `xudod` and `xudo-sys` libraries, at 100%.
 #
 # Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features \
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features \
         --show-missing-lines \
         --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
@@ -133,11 +141,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 

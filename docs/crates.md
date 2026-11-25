@@ -20,6 +20,7 @@ fails the build when this table and the manifest disagree.
 | `xudo-wire` | Wire protocol between `xudo` and `xudod`. Pure data. |
 | `xudod` | Root broker library. Identifies the peer, decides, mints. Executes nothing. |
 | `xudod-bin` | The `xudod` executable. Excluded from coverage; tested as a process. |
+| `xudo-session-bin` | The `xudo-session` record helper an enrolled service's unit runs as root (`record`, `void`). Excluded from coverage; tested as a process. |
 | `xudo-gate` | Second policy engine. Re-decides from root-owned state. |
 | `xudo-gate-bin` | The `xudo-gate` executable. Excluded from coverage; tested as a process. |
 | `ido` | Unprivileged command queue. |
