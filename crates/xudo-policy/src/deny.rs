@@ -1221,7 +1221,7 @@ pub(crate) fn exe_is_systemctl(exe: &[u8]) -> bool {
 ///
 /// `python3.11` is `python`, and `mkfs.ext4` is `mkfs`. Matching the stem is
 /// what stops a version bump from silently un-denying an interpreter.
-fn matches_name(name: &[u8], set: &[&[u8]]) -> bool {
+pub(crate) fn matches_name(name: &[u8], set: &[&[u8]]) -> bool {
     let stem = name.split_str(b".").next().unwrap_or(name);
     set.iter().any(|candidate| {
         *candidate == name || *candidate == stem || {

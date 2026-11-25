@@ -173,6 +173,12 @@ fn arb_specs() -> impl Strategy<Value = Vec<ArgSpec>> {
             "port",
             Matcher::IntRange { lo: 1, hi: 65_535 }
         )),
+        Just(ArgSpec::one(
+            "path",
+            Matcher::PathUnder {
+                prefix: "/opt".into()
+            }
+        )),
     ];
     // Positions must have distinct names for a ruleset to load, so build the
     // list and then de-duplicate by name rather than rejecting samples.
@@ -232,26 +238,30 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
     ]
 }
 
-/// A reviewed waiver. Every generated exe but `/bin/sh` is a `GTFOBins`
-/// program, and a harness rule on one loads only with this.
+/// A reviewed waiver. Every generated exe is a `GTFOBins` program, and a
+/// harness rule on one loads only with this.
 const WAIVER: &str = "a generated technique for the property tests: the matchers pin every operand to a literal or a name, so the program cannot be steered at all";
 
 /// Lists `labels` on `action` the way a loadable harness rule is written: no
 /// `path-under` or `pattern` matcher, not human-only, and a waiver where the
 /// program needs one. An empty list takes all of that back off.
 fn set_harness(action: &mut Action, labels: Vec<String>) {
-    action.gtfobins_waiver =
-        (!labels.is_empty() && action.exe != "/bin/sh").then(|| WAIVER.to_owned());
+    action.gtfobins_waiver = (!labels.is_empty()).then(|| WAIVER.to_owned());
     if !labels.is_empty() {
         action.agent_allowed = true;
-        action.args.retain(|spec| {
-            !matches!(
-                spec.matcher,
-                Matcher::PathUnder { .. } | Matcher::Pattern(_)
-            )
-        });
+        drop_human_only_matchers(action);
     }
     action.harness = labels;
+}
+
+/// Takes the matchers a harness rule may not use off `action`.
+fn drop_human_only_matchers(action: &mut Action) {
+    action.args.retain(|spec| {
+        !matches!(
+            spec.matcher,
+            Matcher::PathUnder { .. } | Matcher::Pattern(_)
+        )
+    });
 }
 
 /// Builds an action `RuleSet::load` accepts.
@@ -635,12 +645,14 @@ proptest! {
 
     #[test]
     fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
         ask_human in any::<bool>(),
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // A harness rule cannot carry these, so both sides drop them.
+        drop_human_only_matchers(&mut action);
         let before = decide(&action, &argv, false, Vec::new());
         let mut with_harness = action;
         set_harness(&mut with_harness, vec![label]);
@@ -722,7 +734,7 @@ proptest! {
 
     #[test]
     fn every_harness_action_auth_can_run_too(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
     ) {
@@ -732,6 +744,7 @@ proptest! {
         // Ask-human changes the agent's verdict on purpose. This property is
         // about a passwordless-shaped allow rule, which must not.
         prop_assume!(action.outcome == Outcome::Allow);
+        drop_human_only_matchers(&mut action);
         let human_before = decide(&action, &argv, false, Vec::new());
         let agent_before = decide(&action, &argv, true, Vec::new());
         let mut with_harness = action;
@@ -777,6 +790,8 @@ proptest! {
         // A human-only rule cannot list a harness: that is a load error now.
         prop_assume!(action.agent_allowed);
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // Both sides carry the same matchers, so only the outcome differs.
+        drop_human_only_matchers(&mut action);
         action.outcome = Outcome::Allow;
         set_harness(&mut action, Vec::new());
         let before = decide(&action, &argv, true, Vec::new());

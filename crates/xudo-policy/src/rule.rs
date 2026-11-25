@@ -1073,12 +1073,25 @@ fn validate_action_harness(action: &Action) -> Result<(), RuleSetError> {
 /// The vendored `GTFOBins` basenames, the list `just gtfobins` checks.
 const GTFOBINS: &str = include_str!("../../../ci/gtfobins.txt");
 
+/// The list must be a real one: a damaged or empty file would make every
+/// program look safe.
+const _: () = assert!(GTFOBINS.len() > 1000);
+
+/// Matches the way the deny-list does: the stem counts, so `python3.12` is
+/// `python` and a version bump cannot un-list an interpreter. A trailing
+/// version (`perl5.38`) is cut too.
 fn is_gtfobin(exe: &str) -> bool {
     let base = exe.rsplit('/').next().unwrap_or_default();
-    GTFOBINS
-        .lines()
-        .map(str::trim)
-        .any(|line| !line.starts_with('#') && line == base && !base.is_empty())
+    let unversioned = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    !base.is_empty()
+        && GTFOBINS
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .any(|line| {
+                line == unversioned
+                    || crate::deny::matches_name(base.as_bytes(), &[line.as_bytes()])
+            })
 }
 
 fn validate_harness_shape(action: &Action) -> Result<(), RuleSetError> {
@@ -1116,11 +1129,15 @@ fn validate_gtfobins_waiver(action: &Action) -> Result<(), RuleSetError> {
         return Ok(());
     };
     let (technique, why) = waiver.split_once(": ").unwrap_or_default();
+    let (technique, why) = (technique.trim(), why.trim());
+    let substantive = |part: &str, min: usize| {
+        part.chars().count() >= min && part.chars().any(char::is_alphanumeric)
+    };
     let reason = if action.harness.is_empty() {
         "waives nothing on a rule with no harness"
     } else if !is_gtfobin(&action.exe) {
         "waives nothing: the program is not a GTFOBins program"
-    } else if technique.chars().count() < 20 || why.chars().count() < 80 {
+    } else if !substantive(technique, 20) || !substantive(why, 80) {
         "must read \"<technique, 20+ characters>: <why it is unreachable, 80+ characters>\""
     } else {
         return Ok(());
@@ -1147,24 +1164,25 @@ pub fn harness_near_miss(action: &Action, tests: &[RuleTest]) -> bool {
         test.action.as_ref() == Some(&action.id)
             && test.argv.first().map(String::as_str) == Some(action.exe.as_str())
     };
-    let fits = |test: &RuleTest| {
+    let canonical = |test: &RuleTest| {
         let operands: Vec<&str> = test.argv.iter().skip(1).map(String::as_str).collect();
-        let argv = crate::argv::Argv::new(operands).canonicalize();
-        crate::matcher::match_argv(&action.args, &argv).is_ok()
+        crate::argv::Argv::new(operands).canonicalize()
     };
+    let fits = |test: &RuleTest| crate::matcher::match_argv(&action.args, &canonical(test)).is_ok();
     tests
         .iter()
         .filter(ours)
         .filter(|deny| deny.expect == Expectation::Deny && !fits(deny))
         .any(|deny| {
             tests.iter().filter(ours).any(|allow| {
+                let (allow_ops, deny_ops) = (canonical(allow), canonical(deny));
+                let (allow_ops, deny_ops) = (allow_ops.as_slice(), deny_ops.as_slice());
                 allow.expect != Expectation::Deny
-                    && allow.argv.len() == deny.argv.len()
+                    && allow_ops.len() == deny_ops.len()
                     && fits(allow)
-                    && allow
-                        .argv
+                    && allow_ops
                         .iter()
-                        .zip(&deny.argv)
+                        .zip(deny_ops)
                         .filter(|(a, d)| a != d)
                         .count()
                         == 1
@@ -1424,7 +1442,17 @@ harness = [\"codex\"]
 
     #[test]
     fn a_harness_rule_on_a_gtfobin_without_waiver_fails_to_load() {
-        for exe in ["/usr/bin/apt-get", "/usr/bin/systemctl", "/opt/copy/awk"] {
+        for exe in [
+            "/usr/bin/apt-get",
+            "/usr/bin/systemctl",
+            "/opt/copy/awk",
+            "/bin/sh",
+            "/usr/bin/python3.12",
+            "/usr/bin/perl5.38",
+            "/usr/bin/coreutils",
+            "/usr/bin/toybox",
+            "/usr/bin/nvim",
+        ] {
             let mut rule = harness_action("xudo.harness.gtfo");
             rule.exe = exe.into();
             assert_eq!(
@@ -1488,6 +1516,8 @@ harness = [\"codex\"]
             "short: short",
             "a technique long enough here, but no colon and a rationale long enough to count as reviewed evidence for it",
             "a technique long enough here: too short",
+            "                    : ................................................................................",
+            "a technique long enough here:                                                                                  ",
             "tiny: this rationale is deliberately long enough to count as a reviewed waiver for the test fixture only",
         ] {
             assert!(reason_of(gtfo(thin)).starts_with("must read"), "{thin}");
@@ -1571,6 +1601,11 @@ harness = [\"codex\"]
                 rule_test(Deny, id, &[exe, "restart", "a.service", "b"]),
             ),
             ("one fewer", rule_test(Deny, id, &[exe, "restart"])),
+            // Canonicalizing drops the trailing `--`, so the length differs.
+            (
+                "trailing separator",
+                rule_test(Deny, id, &[exe, "restart", "--"]),
+            ),
             // Another program is refused by program.
             (
                 "program",
