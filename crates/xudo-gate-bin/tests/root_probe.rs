@@ -411,6 +411,25 @@ fn write_entry_for(
     program: &str,
     argv: Vec<String>,
 ) -> String {
+    write_entry_as(
+        pin,
+        id_of(&["-u"]),
+        generation_offset,
+        action,
+        program,
+        argv,
+    )
+}
+
+/// [`write_entry_for`] for a pinned process running as `uid`.
+fn write_entry_as(
+    pin: (u32, u64),
+    uid: u32,
+    generation_offset: u64,
+    action: &str,
+    program: &str,
+    argv: Vec<String>,
+) -> String {
     let nonce = format!(
         "{:064x}",
         (u128::from(std::process::id()) << 64)
@@ -435,7 +454,7 @@ fn write_entry_for(
         state: xudo_gate::request::ConfirmationState::Pending,
         // The pinned process is this test, and the gate now reads its uid from
         // the live `/proc`, so the entry must name the uid the test runs as.
-        caller_uid: id_of(&["-u"]),
+        caller_uid: uid,
         caller_sid: 10,
         caller_tty: 20,
         needs_watch: false,
@@ -498,6 +517,59 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         journal.text().contains(ACTION),
         "the journal was sent nothing"
     );
+    remove_snippet();
+}
+
+/// The production shape: the pinned process is the unprivileged user's own,
+/// and it execs setuid `sudo`, whose real uid stays the user's. The gate must
+/// read that real uid as the caller's, not uid 0 and not the test's.
+#[test]
+fn a_pinned_non_root_process_that_execs_sudo_is_read_as_its_real_uid() {
+    if !begin_root_test("a_pinned_non_root_process_that_execs_sudo_is_read_as_its_real_uid") {
+        return;
+    }
+    let _journal = install_everything();
+    let user_uid = id_of(&["-u", USER]);
+    assert_ne!(user_uid, 0);
+
+    // The shell prints its own pid, waits to be pinned, then becomes `sudo`
+    // (the same pid, so the pin stays valid and `sudo` is its image).
+    let script = format!("echo $$; read go; exec /usr/bin/sudo -S {GATE_AUTH}");
+    let mut child = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--", "/bin/sh", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut first).unwrap();
+    let pid: u32 = first.trim().parse().unwrap();
+    let proc = VerifiedProc::open().unwrap();
+    let chain = lineage(&proc, pid, 1).unwrap().chain;
+    let pin = (chain[0].pid, chain[0].starttime);
+    let nonce = write_entry_as(
+        pin,
+        user_uid,
+        0,
+        ACTION,
+        "/usr/bin/id",
+        vec!["-u".to_owned()],
+    );
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(format!("go\n{PASSWORD}\n").as_bytes())
+        .unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(status.success(), "{rest:?} {status:?}");
+    assert_eq!(rest.trim(), "0", "id -u did not run as root: {rest:?}");
+    assert!(!entry_exists(&nonce), "the entry was not consumed");
     remove_snippet();
 }
 

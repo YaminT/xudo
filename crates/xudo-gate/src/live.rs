@@ -7,6 +7,18 @@
 //! user, pid, cgroup, or mount namespace of its own can show the gate a `/proc`
 //! or a cgroup tree that is not the host's, so the answer for such a caller is
 //! "cannot attest", and the gate treats it as unattested.
+//!
+//! # Where the trust boundary sits
+//!
+//! "PID 1's namespaces" means PID 1 of the pid namespace of the pinned `/proc`.
+//! On a normal host that is the host's init. Inside a container, or a setuid
+//! sandbox that gives the caller its own pid and mount namespaces and a fresh
+//! `/proc` (firejail), the checks compare against that namespace's init and
+//! pass. Containers are not a supported deployment. No upgrade is known from
+//! there: cgroup membership does not change, and an unprivileged user cannot
+//! build that layout without a setuid helper. The stricter check, if it is
+//! ever wanted, compares the fixed init inodes (user `0xEFFFFFFD`, pid
+//! `0xEFFFFFFC`, cgroup `0xEFFFFFFB`).
 
 use xudo_sys::{
     ProcRef, ProcSource, is_identity_uid_map, parse_nspid_count, parse_stat, parse_status_uids,
@@ -143,7 +155,8 @@ mod tests {
 
     #[test]
     fn the_gate_refuses_an_ancestor_in_another_namespace_of_each_kind() {
-        for kind in KINDS {
+        // A literal list: it must not shrink when `KINDS` does.
+        for kind in ["user", "pid", "cgroup", "mnt"] {
             let source = clean().with_inode(format!("{PID}/ns/{kind}"), 4_026_539_999);
             let seen = facts(&source);
             assert!(!seen.namespaces_match_init, "{kind}");
@@ -218,6 +231,55 @@ mod tests {
         }
         let no_status = MapSource::new().with(format!("{PID}/stat"), stat(PID, START));
         assert_eq!(facts(&no_status).uid, None);
+    }
+
+    /// A source whose `<pid>/stat` answers from a script, one entry per read.
+    struct Sequenced {
+        inner: MapSource,
+        stats: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ProcSource for Sequenced {
+        fn read(&self, relative: &str) -> Result<Vec<u8>, xudo_sys::SysError> {
+            if relative == format!("{PID}/stat") {
+                let mut stats = self.stats.borrow_mut();
+                let next = if stats.len() > 1 {
+                    stats.remove(0)
+                } else {
+                    stats.first().cloned().unwrap_or_default()
+                };
+                return Ok(next.into_bytes());
+            }
+            self.inner.read(relative)
+        }
+
+        fn namespace_inode(&self, relative: &str) -> Result<u64, xudo_sys::SysError> {
+            self.inner.namespace_inode(relative)
+        }
+    }
+
+    #[test]
+    fn a_pid_reused_between_the_reads_yields_nothing() {
+        // The first stat names the pinned process, the second a reused pid:
+        // dropping the check after the reads would let this through.
+        let source = Sequenced {
+            inner: clean(),
+            stats: std::cell::RefCell::new(vec![stat(PID, START), stat(PID, START + 1)]),
+        };
+        assert_eq!(
+            read(&source, &process()),
+            LiveFacts {
+                uid: None,
+                namespaces_match_init: false
+            }
+        );
+        // The same fake with both answers right is clean, so the fake itself
+        // is not what refuses.
+        let steady = Sequenced {
+            inner: clean(),
+            stats: std::cell::RefCell::new(vec![stat(PID, START), stat(PID, START)]),
+        };
+        assert!(read(&steady, &process()).namespaces_match_init);
     }
 
     #[test]

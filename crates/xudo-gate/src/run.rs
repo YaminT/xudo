@@ -588,7 +588,7 @@ fn require_queued_claim(
     // The queue is the human's. A caller the gate could only read as
     // unattested, or in other namespaces than the host's, never claims it.
     if caller.attested_class != crate::request::AttestedClass::Human {
-        return Err(Refusal::Request(RequestError::QueueNotClaimed));
+        return Err(Refusal::Request(RequestError::QueueNeedsAttestedHuman));
     }
     let queue = stage(Stage::Spool, host.open_queue())?;
     let name = queue_claim::queue_file_name(id);
@@ -939,6 +939,7 @@ fn caller_for(
                 },
             );
             if found.entry.effective_class(&live.attested_class) == live.attested_class {
+                // Agreement with the broker's record, or nothing.
                 live
             } else {
                 crate::classify::LiveClass::unattested(
@@ -1967,12 +1968,22 @@ args = [
         stored: crate::request::AttestedClass,
         tree: impl FnOnce(MapSource) -> MapSource,
     ) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        queued_run_in(stored, FakeCgroupMode::Human, tree)
+    }
+
+    /// [`queued_run`] with the gate's own cgroup read set to `mode`.
+    fn queued_run_in(
+        stored: crate::request::AttestedClass,
+        mode: FakeCgroupMode,
+        tree: impl FnOnce(MapSource) -> MapSource,
+    ) -> (FakeHost, Rc<FakeSpool>, GateExit) {
         let id = "c".repeat(64);
         let mut entry = ours();
         entry.queue_id = Some(id.clone());
         let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
         human_caller(&mut host, &mut entry);
         entry.attested_class = stored;
+        host.cgroup_mode = mode;
         let spool = Rc::new(holding(&[(NONCE_A, entry)]));
         host.spool = Ok(Rc::clone(&spool));
         host.proc = Ok(tree(proc_tree()));
@@ -2006,20 +2017,20 @@ args = [
     #[test]
     fn the_gate_refuses_an_ancestor_in_another_user_namespace() {
         let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "user");
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]
     fn the_gate_refuses_an_ancestor_in_another_mount_namespace() {
         let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "mnt");
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]
     fn the_gate_refuses_an_ancestor_in_another_pid_or_cgroup_namespace() {
         for kind in ["pid", "cgroup"] {
             let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, kind);
-            assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+            assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
         }
     }
 
@@ -2028,7 +2039,7 @@ args = [
         // sudo runs the gate in its caller's mount namespace, so a caller that
         // unshared one reaches the gate in it.
         let (host, spool, exit) = queued_run_with_namespace(GATE_PID, "mnt");
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]
@@ -2039,11 +2050,11 @@ args = [
                 "Uid:\t1000\t1000\t1000\t1000\nNSpid:\t200\t1\n",
             )
         });
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
         let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| {
             tree.with("200/uid_map", "0 100000 65536\n")
         });
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]
@@ -2099,7 +2110,7 @@ args = [
         // record says unattested.
         let (host, spool, exit) =
             queued_run(crate::request::AttestedClass::Unattested, |tree| tree);
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
 
         let spool = Rc::new(holding(&[(NONCE_A, ours())]));
         let mut host = FakeHost::new(&spool);
@@ -2111,17 +2122,15 @@ args = [
 
     #[test]
     fn a_live_unattested_read_downgrades_a_human_entry() {
-        // Stored human; the gate's own cgroup read fails. Effective class is
-        // the weaker one, so the queue stays closed to this run.
-        let mut human = ours();
-        human.queue_id = Some("c".repeat(64));
-        human.attested_class = crate::request::AttestedClass::Human;
-        let spool = Rc::new(holding(&[(NONCE_A, human)]));
-        let mut host = FakeHost::new(&spool);
-        host.cgroup_mode = FakeCgroupMode::Unavailable;
-        script_human(&mut host);
-        let exit = run(&mut host, &auth());
-        assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
+        // Stored human, queue record claimed; the gate's own cgroup read
+        // fails. The effective class is the weaker one, so the queue stays
+        // closed to this run although its record would hold.
+        let (host, spool, exit) = queued_run_in(
+            crate::request::AttestedClass::Human,
+            FakeCgroupMode::Unavailable,
+            |tree| tree,
+        );
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]

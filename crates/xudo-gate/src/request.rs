@@ -308,6 +308,17 @@ pub enum RequestError {
         "queued run is not claimed for this nonce: the gate runs a queued command only while its queue entry is claimed for the minted nonce"
     )]
     QueueNotClaimed,
+    /// A queued run whose caller the gate could not attest as a human.
+    ///
+    /// The queue is the human's. The gate's own read of the caller (cgroup,
+    /// uid, and the user, pid, cgroup, and mount namespaces against PID 1's)
+    /// did not say `Human`, or the broker had not said so either. A human whose
+    /// session sits in another mount namespace (`pam_namespace`, a snap) lands
+    /// here: the non-queued password path still runs for them.
+    #[error(
+        "queued run needs an attested human: the gate could not attest this caller as a human, so the queue stays closed to it"
+    )]
+    QueueNeedsAttestedHuman,
 }
 
 impl RequestError {
@@ -334,6 +345,7 @@ impl RequestError {
             Self::Ambiguous { .. } => "request_ambiguous",
             Self::ForgedNonce { .. } => "request_forged_nonce",
             Self::QueueNotClaimed => "request_queue_not_claimed",
+            Self::QueueNeedsAttestedHuman => "request_queue_needs_attested_human",
         }
     }
 }
@@ -699,17 +711,17 @@ impl PendingRequest {
         }
     }
 
-    /// The class the gate acts on: the weaker of the one the broker recorded
-    /// and the one the gate read, with `Unattested` below `Human`.
+    /// The class the gate acts on: the live one when it equals the one the
+    /// broker recorded, and `Unattested` for any disagreement.
     ///
-    /// Never an upgrade. A caller the broker could not attest stays unattested
-    /// when the gate's own read says `Human`, and a human entry the gate cannot
-    /// re-attest is unattested. An enrolled agent is a separate case, settled
-    /// exactly by [`Self::live_attested_identity_matches`] before this runs.
+    /// Never an upgrade, and no re-labelling either: a stored enrolled agent
+    /// the gate reads as a human is unattested, not a human. Agreement is the
+    /// only way to keep a class.
     pub fn effective_class(&self, live: &AttestedClass) -> AttestedClass {
-        match (&self.attested_class, live) {
-            (AttestedClass::Unattested, AttestedClass::Human) => AttestedClass::Unattested,
-            _ => live.clone(),
+        if &self.attested_class == live {
+            live.clone()
+        } else {
+            AttestedClass::Unattested
         }
     }
 
@@ -887,6 +899,15 @@ mod tests {
             "request_queue_not_claimed"
         );
         assert!(RequestError::QueueNotClaimed.to_string().len() > 20);
+        assert_eq!(
+            RequestError::QueueNeedsAttestedHuman.code(),
+            "request_queue_needs_attested_human"
+        );
+        assert!(
+            RequestError::QueueNeedsAttestedHuman
+                .to_string()
+                .contains("attested human")
+        );
     }
 
     #[test]
@@ -1821,6 +1842,7 @@ mod tests {
             RequestError::ForgedNonce {
                 name: NONCE.to_owned(),
             },
+            RequestError::QueueNeedsAttestedHuman,
             RequestError::QueueNotClaimed,
         ];
 
@@ -1881,7 +1903,21 @@ mod tests {
                 AttestedClass::Unattested,
             ),
             (agent.clone(), agent.clone(), agent.clone()),
-            (agent.clone(), AttestedClass::Human, AttestedClass::Human),
+            (
+                agent.clone(),
+                AttestedClass::Human,
+                AttestedClass::Unattested,
+            ),
+            (
+                AttestedClass::Unattested,
+                agent.clone(),
+                AttestedClass::Unattested,
+            ),
+            (
+                AttestedClass::Human,
+                agent.clone(),
+                AttestedClass::Unattested,
+            ),
         ];
         for (stored, live_class, want) in table {
             request.attested_class = stored.clone();
