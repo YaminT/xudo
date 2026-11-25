@@ -402,6 +402,35 @@ fn parse_u64(path: &str, bytes: &[u8]) -> Result<u64, SysError> {
         .map_err(|_| SysError::malformed(path, format!("{text:?} is not a u64")))
 }
 
+/// How many pid namespaces a `/proc/<pid>/status` `NSpid:` line spans: one
+/// for a process in the initial pid namespace. `None` when the line is absent
+/// or not all digits.
+pub fn parse_nspid_count(status: &[u8]) -> Option<usize> {
+    let line = status
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"NSpid:"))?;
+    let values = line.get(6..).unwrap_or_default();
+    let ids: Vec<_> = values
+        .split(u8::is_ascii_whitespace)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.iter().all(|id| id.iter().all(u8::is_ascii_digit)) {
+        Some(ids.len())
+    } else {
+        None
+    }
+}
+
+/// Whether a `/proc/<pid>/uid_map` is the identity map of the initial user
+/// namespace: `0 0 4294967295`.
+pub fn is_identity_uid_map(uid_map: &[u8]) -> bool {
+    let fields: Vec<_> = uid_map
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect();
+    fields.as_slice() == [&b"0"[..], &b"0"[..], &b"4294967295"[..]]
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -413,6 +442,23 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn nspid_counts_levels_and_refuses_junk() {
+        assert_eq!(parse_nspid_count(b"Name:\tx\nNSpid:\t412\n"), Some(1));
+        assert_eq!(parse_nspid_count(b"NSpid:\t412\t1\n"), Some(2));
+        assert_eq!(parse_nspid_count(b"NSpid:\t412\tx\n"), None);
+        assert_eq!(parse_nspid_count(b"Name:\tx\n"), None);
+        assert_eq!(parse_nspid_count(b"NSpid:"), Some(0));
+    }
+
+    #[test]
+    fn only_the_identity_uid_map_is_the_initial_namespace() {
+        assert!(is_identity_uid_map(b"         0          0 4294967295\n"));
+        assert!(!is_identity_uid_map(b"0 1000 1\n"));
+        assert!(!is_identity_uid_map(b"0 0 4294967295\n1000 1000 1\n"));
+        assert!(!is_identity_uid_map(b""));
+    }
 
     /// A realistic line, with all 52 fields.
     fn stat_line(pid: u32, comm: &str, parent: u32, starttime: u64) -> String {

@@ -64,6 +64,10 @@ impl ProcSource for VerifiedProc {
     fn read(&self, relative: &str) -> Result<Vec<u8>, SysError> {
         imp::read(self, relative)
     }
+
+    fn namespace_inode(&self, relative: &str) -> Result<u64, SysError> {
+        imp::namespace_inode(self, relative)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -126,6 +130,28 @@ mod imp {
         .and_then(|fd| read_bounded(fd, relative))
     }
 
+    /// `NSFS_MAGIC`: the filesystem every namespace file lives on.
+    const NSFS_MAGIC: i128 = 0x6e73_6673;
+
+    /// Follows the namespace link, proves the target is on nsfs, and reports
+    /// its inode. Opened from the pinned descriptor, so a mount over a path
+    /// elsewhere cannot answer for it.
+    pub(super) fn namespace_inode(proc: &VerifiedProc, relative: &str) -> Result<u64, SysError> {
+        check_relative(relative)?;
+        let fd = openat(
+            &proc.root,
+            relative,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .map_err(|errno| failed(relative, errno))?;
+        let on_nsfs = fstatfs(&fd).is_ok_and(|stat| i128::from(stat.f_type) == NSFS_MAGIC);
+        match rustix::fs::fstat(&fd) {
+            Ok(stat) if on_nsfs => Ok(stat.st_ino),
+            _ => Err(SysError::read(relative, "not a namespace file")),
+        }
+    }
+
     fn read_bounded(fd: OwnedFd, at: &str) -> Result<Vec<u8>, SysError> {
         let mut bytes = Vec::new();
         std::fs::File::from(fd)
@@ -155,6 +181,12 @@ mod imp {
             "reading {relative} from procfs"
         )))
     }
+
+    pub(super) fn namespace_inode(_proc: &VerifiedProc, relative: &str) -> Result<u64, SysError> {
+        Err(SysError::unsupported(format!(
+            "reading {relative} from procfs"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +209,8 @@ mod tests {
         // is exercised from inside it.
         let proc = VerifiedProc {};
         let err = proc.read("1/stat").unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+        let err = proc.namespace_inode("1/ns/user").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
         assert!(format!("{proc:?}").contains("VerifiedProc"));
     }
@@ -244,6 +278,22 @@ mod tests {
             assert!(proc.read("self").is_err());
             // A pid nothing has.
             assert!(proc.read("4194999/stat").is_err());
+        }
+
+        #[test]
+        fn a_namespace_link_leads_to_an_inode_and_a_non_namespace_file_is_refused() {
+            let proc = VerifiedProc::open().unwrap();
+            let own = std::process::id();
+            let mine = proc.namespace_inode(&format!("{own}/ns/user")).unwrap();
+            assert_eq!(mine, proc.namespace_inode("self/ns/user").unwrap());
+            assert_ne!(mine, 0);
+            // A plain procfs file is not on nsfs, so it is not a namespace.
+            let err = proc.namespace_inode(&format!("{own}/stat")).unwrap_err();
+            assert!(err.to_string().contains("not a namespace file"), "{err}");
+            for bad in ["", "/proc/1/ns/user", "1/../1/ns/user"] {
+                assert!(proc.namespace_inode(bad).is_err(), "{bad:?}");
+            }
+            assert!(proc.namespace_inode("4194999/ns/user").is_err());
         }
 
         #[test]
