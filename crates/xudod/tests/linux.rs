@@ -238,7 +238,7 @@ args = [
             rules,
             settings: xudo_policy::engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
-            passwd: Vec::new(),
+            passwd: String::new(),
         })
     }
 }

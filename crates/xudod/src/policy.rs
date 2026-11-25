@@ -60,7 +60,9 @@ impl PolicySource for HostPolicy {
 
 /// Classifies the peer from the cgroup result derived while its kernel pidfd
 /// was held. Process names and caller-controlled environment are audit hints
-/// only and are never inputs here.
+/// only and are never inputs here. Tests only: the empty registry calls every
+/// enrolled agent unattested, so no decision path may use it.
+#[cfg(test)]
 pub fn classify(identity: &PeerIdentity) -> CallerFacts {
     classify_with_registry(identity, &HarnessRegistry::empty(), "")
 }
@@ -186,7 +188,7 @@ pub fn decide_remove(
             Vec::new(),
         );
     };
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or("");
+    let passwd = policy.passwd.as_str();
     xudo_policy::evaluate_remove_path(&policy.rules.rules, caller, target, policy.settings, passwd)
 }
 
@@ -264,7 +266,7 @@ max-entries = 10
             .unwrap(),
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: Vec::new(),
+            passwd: String::new(),
         }
     }
 
@@ -404,7 +406,7 @@ outcome = "ask-human"
             .unwrap(),
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: PASSWD.as_bytes().to_vec(),
+            passwd: PASSWD.to_owned(),
         };
         let request = ask("/usr/bin/true", &["upgrade"]);
         let broker_decision = decide(&policy, &broker, &request);
