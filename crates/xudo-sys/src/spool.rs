@@ -658,6 +658,25 @@ impl Spool for SpoolDir {
     }
 }
 
+impl crate::rate::RateDir for SpoolDir {
+    fn try_lock(&self) -> Result<bool, SpoolError> {
+        self.lock_outcome(flock(&self.dir, FlockOperation::NonBlockingLockExclusive))
+    }
+}
+
+impl SpoolDir {
+    /// What one non-blocking `flock` said: held by someone else is `false`,
+    /// any other failure an error. A function of its own so a test can hand it
+    /// an errno `flock` does not produce on demand.
+    pub(crate) fn lock_outcome(&self, result: rustix::io::Result<()>) -> Result<bool, SpoolError> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+            Err(errno) => Err(self.failure("flock", &errno.into())),
+        }
+    }
+}
+
 impl SpoolDir {
     fn replace_with_hook(
         &self,
@@ -752,6 +771,8 @@ impl SpoolDir {
 pub enum SpoolCall {
     /// [`Spool::lock`].
     Lock,
+    /// [`crate::RateDir::try_lock`].
+    TryLock,
     /// [`Spool::unlock`].
     Unlock,
     /// [`Spool::names`].
@@ -784,6 +805,7 @@ pub struct FakeSpool {
     files: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
     calls: RefCell<Vec<SpoolCall>>,
     lock_error: Option<SpoolError>,
+    busy_locks: std::cell::Cell<usize>,
     names_error: Option<SpoolError>,
     names_error_on_call: Option<(usize, SpoolError)>,
     names_calls: std::cell::Cell<usize>,
@@ -860,6 +882,14 @@ impl FakeSpool {
     #[must_use]
     pub fn failing_lock(mut self, error: SpoolError) -> Self {
         self.lock_error = Some(error);
+        self
+    }
+
+    /// Makes the next `tries` calls of [`crate::RateDir::try_lock`] find the
+    /// lock held by someone else.
+    #[must_use]
+    pub fn busy_locks(self, tries: usize) -> Self {
+        self.busy_locks.set(tries);
         self
     }
 
@@ -971,6 +1001,20 @@ fn scripted(error: Option<&SpoolError>) -> Result<(), SpoolError> {
     match error {
         Some(error) => Err(error.clone()),
         None => Ok(()),
+    }
+}
+
+#[cfg(any(test, feature = "fake"))]
+impl crate::rate::RateDir for FakeSpool {
+    fn try_lock(&self) -> Result<bool, SpoolError> {
+        self.record(SpoolCall::TryLock);
+        scripted(self.lock_error.as_ref())?;
+        let busy = self.busy_locks.get();
+        if busy == 0 {
+            return Ok(true);
+        }
+        self.busy_locks.set(busy.saturating_sub(1));
+        Ok(false)
     }
 }
 

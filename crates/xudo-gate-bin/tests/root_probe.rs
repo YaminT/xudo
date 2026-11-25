@@ -521,6 +521,78 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
     remove_snippet();
 }
 
+const GATE_NOPASS: &str = "/usr/libexec/xudo/xudo-gate-nopass";
+const RATE_DIR: &str = "/run/xudo/rate";
+
+/// An agent that calls the passwordless door in a loop cannot fill the audit
+/// trail, and a human's password run still goes through afterwards.
+///
+/// The real `-nopass` file, as root, with nothing minted for it, two hundred
+/// times: each is a refusal, and each used to be an audit append. The ledger
+/// counts them first, so the trail holds the sixty the ceiling admits and the
+/// one record that says how many were left out. Then a human runs a command
+/// through the real `sudo` and the password prompt, and it runs as uid 0, and
+/// the trail takes its record.
+#[test]
+fn an_agent_flood_leaves_the_human_path_running() {
+    if !begin_root_test("an_agent_flood_leaves_the_human_path_running") {
+        return;
+    }
+    let _journal = install_everything();
+    let _ = fs::remove_file(GATE_NOPASS);
+    fs::copy(GATE, GATE_NOPASS).unwrap();
+    fs::set_permissions(GATE_NOPASS, Permissions::from_mode(0o755)).unwrap();
+    chown(GATE_NOPASS, Some(0), Some(0)).unwrap();
+    root_dir(RATE_DIR, 0o700);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let mut last = String::new();
+    for _ in 0..200 {
+        let output = Command::new(GATE_NOPASS).output().unwrap();
+        assert_eq!(output.status.code(), Some(19), "{output:?}");
+        assert!(output.stdout.is_empty());
+        last = String::from_utf8(output.stderr).unwrap();
+    }
+    assert!(last.contains("gate_rate_ceiling"), "{last}");
+
+    // The trail holds sixty refusals and one report, not two hundred.
+    let log = fs::read_to_string(AUDIT_LOG).unwrap();
+    let lines = log.lines().count();
+    assert!(lines <= 61, "{lines} records for 200 refusals");
+    assert_eq!(log.matches("suppressed=").count(), 1, "{log}");
+    // And the ledger is a whole file, root's, private.
+    let ledgers: Vec<_> = fs::read_dir(RATE_DIR)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(ledgers.len(), 1, "{ledgers:?}");
+    let meta = fs::metadata(&ledgers[0]).unwrap();
+    assert_eq!((meta.uid(), meta.mode() & 0o777), (0, 0o600));
+    assert!(
+        fs::read_to_string(&ledgers[0])
+            .unwrap()
+            .starts_with("xudo-rate 1\n")
+    );
+
+    // The human path, untouched: a password run still reaches the exec.
+    let nonce = write_entry(own_pin(), 0);
+    let output = through_sudo();
+    assert!(output.success, "{output:?}");
+    assert_eq!(output.stdout.trim(), "0", "{output:?}");
+    assert!(!entry_exists(&nonce), "the entry was not consumed");
+    let after = fs::read_to_string(AUDIT_LOG).unwrap();
+    assert!(after.lines().count() > lines, "the trail took no record");
+    assert!(after.contains("/usr/bin/id"), "{after}");
+
+    let _ = fs::remove_file(GATE_NOPASS);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    remove_snippet();
+}
+
 /// The production shape: the pinned process is the unprivileged user's own,
 /// and it execs setuid `sudo`, whose real uid stays the user's. The gate must
 /// read that real uid as the caller's, not uid 0 and not the test's.

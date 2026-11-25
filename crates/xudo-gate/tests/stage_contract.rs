@@ -19,7 +19,8 @@ fn lists_every_stage(stage: Stage) {
         | Stage::Program
         | Stage::Audit
         | Stage::Exec
-        | Stage::Config => {}
+        | Stage::Config
+        | Stage::Ledger => {}
     }
 }
 
@@ -39,10 +40,11 @@ fn position(stage: Stage) -> usize {
         Stage::Audit => 11,
         Stage::Exec => 12,
         Stage::Config => 13,
+        Stage::Ledger => 14,
     }
 }
 
-const ALL_STAGES: [Stage; 14] = [
+const ALL_STAGES: [Stage; 15] = [
     Stage::Descriptors,
     Stage::Streams,
     Stage::CallerState,
@@ -57,6 +59,7 @@ const ALL_STAGES: [Stage; 14] = [
     Stage::Audit,
     Stage::Exec,
     Stage::Config,
+    Stage::Ledger,
 ];
 
 #[test]
@@ -66,8 +69,8 @@ fn every_gate_stage_audit_code_is_pinned() {
         lists_every_stage(stage);
         let _ = writeln!(snapshot, "{stage:?} {}", stage.code());
     }
-    assert_eq!(ALL_STAGES.len(), 14);
-    let mut positions = [false; 14];
+    assert_eq!(ALL_STAGES.len(), 15);
+    let mut positions = [false; 15];
     for stage in ALL_STAGES {
         let index = position(stage);
         assert_eq!(ALL_STAGES.get(index).copied(), Some(stage));

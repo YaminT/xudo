@@ -97,6 +97,8 @@ impl From<&MintError> for Refusal {
             MintError::Spool(_) => Self::broker(RefusalCode::SpoolUnusable, error.to_string()),
             MintError::Full { .. }
             | MintError::UidFull { .. }
+            | MintError::HarnessFull { .. }
+            | MintError::HarnessUidFull { .. }
             | MintError::ConfirmationThrottled => {
                 Self::client(RefusalCode::SpoolFull, error.to_string())
             }
@@ -181,6 +183,22 @@ mod tests {
                 MintError::UidFull {
                     uid: 1000,
                     entries: 8,
+                },
+                RefusalCode::SpoolFull,
+                Fault::Client,
+            ),
+            (
+                MintError::HarnessFull {
+                    entries: 1,
+                    bytes: 1,
+                },
+                RefusalCode::SpoolFull,
+                Fault::Client,
+            ),
+            (
+                MintError::HarnessUidFull {
+                    uid: 1000,
+                    entries: 4,
                 },
                 RefusalCode::SpoolFull,
                 Fault::Client,
