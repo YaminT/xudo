@@ -71,6 +71,7 @@ fn input(path: &str) -> Input<'_> {
         backend_exe: Some(Path::new("/usr/bin/sudo")),
         sudo_exe: None,
         doas_exe: None,
+        doas_ignores_drop_ins: false,
     }
 }
 
@@ -1274,6 +1275,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
             backend_exe: None,
             sudo_exe: None,
             doas_exe: None,
+            doas_ignores_drop_ins: false,
         },
     );
     let path = check(&unknown, CheckId::UserPath);
@@ -1308,6 +1310,7 @@ fn with_the_backend_off_path_or_unknown_every_entry_is_ahead() {
             backend_exe: Some(Path::new("/opt/gone/sudo")),
             sudo_exe: None,
             doas_exe: None,
+            doas_ignores_drop_ins: false,
         },
     );
     assert_eq!(check(&gone, CheckId::UserPath).examined, 2);
@@ -3887,6 +3890,7 @@ fn asked_doas(host: &dyn HostView) -> Report {
         host,
         &Input {
             doas_exe: Some("/usr/bin/doas"),
+            doas_ignores_drop_ins: false,
             ..input("/usr/bin")
         },
     )
@@ -4252,11 +4256,14 @@ fn a_user_only_listed_in_the_group_is_resolved_without_an_account() {
 }
 
 #[test]
-fn a_stray_word_after_the_identity_does_not_hide_a_later_rule() {
-    assert_eq!(
-        later_lines(&doas_world(b"permit persist :xudo bogus\n")),
-        [2]
-    );
+fn a_stray_word_after_the_identity_is_a_syntax_error_not_a_rule() {
+    // doas refuses the whole file on it, so no later rule applies: said as a
+    // gap, and not read as a rule.
+    let host = doas_world(b"permit persist :xudo bogus\n");
+    assert!(later_rules(&host).is_empty());
+    let report = run(&host, "/usr/bin");
+    let gaps = &check(&report, CheckId::PasswordlessRules).unverified;
+    assert!(gaps[0].reason.contains("refuses every rule"), "{gaps:?}");
 }
 
 #[test]
@@ -4315,15 +4322,378 @@ fn ignores_later_rules_that_do_not_replace_xudos() {
         .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, XUDO_RULE);
     assert!(later_rules(&before).is_empty());
     let after = with_xudo_drop_in(
-        b"permit persist :xudo as root cmd /bin/ls\npermit persist :staff\ndeny :xudo\npermit setenv { A=1\npermit nopass\nfoo :xudo\n",
+        b"permit persist :xudo as root cmd /bin/ls\npermit persist :staff\ndeny :xudo\npermit setenv { A=1\nfoo :xudo\n",
     );
     assert!(later_rules(&after).is_empty());
-    // `cmd` with nothing after it names no program, which reads as any
-    // command: reported, because withholding the warning is the unsafe error.
-    assert_eq!(
-        later_rules(&with_xudo_drop_in(b"permit :xudo cmd\n")).len(),
-        1
-    );
+    // `cmd` with nothing after it is a syntax error: doas refuses the file.
+    assert!(later_rules(&with_xudo_drop_in(b"permit :xudo cmd\n")).is_empty());
     let none = clean().file("/etc/doas.conf", 0, 0, 0o400, b"permit persist :xudo\n");
     assert!(later_rules(&none).is_empty());
+}
+
+// ---- RT-4d: the first install, unparsed lines, and the rest -----------------
+
+/// What a lookup found; a test that expected a file to be there.
+fn found<T>(lookup: Lookup<T>) -> T {
+    match lookup {
+        Lookup::Found(value) => Some(value),
+        _ => None,
+    }
+    .unwrap()
+}
+
+fn gaps_of(host: &MemoryHost) -> Vec<String> {
+    check(&run(host, "/usr/bin"), CheckId::PasswordlessRules)
+        .unverified
+        .iter()
+        .map(|gap| gap.reason.clone())
+        .collect()
+}
+
+#[test]
+fn a_line_doas_applies_as_nopass_that_this_cannot_parse_is_a_later_rule() {
+    // Each is `nopass` for the xudo group to the real doas (rt4c matrix), and
+    // none of them can be modelled: a continuation, an escape, a quote with a
+    // hash, a setenv value holding a hash.
+    for line in [
+        &b"permit nopass :xudo \\\n"[..],
+        b"permit nopass :xu\\do\n",
+        b"permit nopass \":xudo\"#x\n",
+        b"permit nopass setenv { A=\"#\" } :xudo\n",
+    ] {
+        let found = later_rules(&doas_world(line));
+        assert_eq!(found.len(), 1, "{line:?}: {found:?}");
+        assert!(found[0].2.contains("cannot read it"), "{found:?}");
+        assert_eq!(found[0].1, 2, "{found:?}");
+    }
+}
+
+#[test]
+fn an_unparsed_line_before_xudos_rule_or_without_nopass_is_not_a_later_rule() {
+    let before = clean()
+        .dir("/etc/doas.d", 0, 0, 0o755)
+        .file(
+            "/etc/doas.d/10-first.conf",
+            0,
+            0,
+            0o400,
+            b"permit nopass :xu\\do\n",
+        )
+        .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, XUDO_RULE);
+    assert!(later_rules(&before).is_empty());
+    assert!(later_rules(&doas_world(b"permit persist :xu\\do\n")).is_empty());
+}
+
+#[test]
+fn a_line_with_a_lowercase_nopass_that_the_grammar_rejects_still_counts_as_nopass() {
+    // If doas took it after all, nopass would hurt: refuse rather than guess.
+    for line in [
+        &b"permit nopass :xudo bogus\n"[..],
+        b"permit nopass\n",
+        b"deny nopass :xudo\n",
+    ] {
+        let found = later_rules(&doas_world(line));
+        assert_eq!(found.len(), 1, "{line:?}: {found:?}");
+    }
+}
+
+#[test]
+fn uppercase_keywords_make_doas_refuse_every_rule_and_that_is_said() {
+    for line in [
+        &b"PERMIT nopass :xudo\n"[..],
+        b"permit NOPASS :xudo\n",
+        b"allow :xudo\n",
+    ] {
+        let host = with_xudo_drop_in(line);
+        let gaps = gaps_of(&host);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("refuses every rule")),
+            "{line:?}: {gaps:?}"
+        );
+    }
+    // A blank line, and a comment, are no syntax error.
+    let fine = with_xudo_drop_in(b"\n   \n# comment\n");
+    assert!(gaps_of(&fine).is_empty());
+}
+
+#[test]
+fn a_carriage_return_is_part_of_the_word_so_the_rule_names_nobody_in_xudo() {
+    // doas cuts words at a space or a tab: `:xudo\r` is the group "xudo\r".
+    assert!(later_rules(&doas_world(b"permit nopass :xudo\r\n")).is_empty());
+    assert!(later_rules(&doas_world(b"permit nopass alice\r\n")).is_empty());
+}
+
+#[test]
+fn a_later_rule_with_an_argument_list_does_not_match_the_gate_which_has_none() {
+    let host = doas_world(
+        b"permit nopass :xudo cmd /usr/libexec/xudo/xudo-gate-auth args a \"b c\"\n\
+          permit nopass :xudo cmd /usr/libexec/xudo/xudo-gate-auth args\n",
+    );
+    // Only the second, with an empty list, matches a run with no arguments.
+    assert_eq!(later_lines(&host), [3]);
+}
+
+#[test]
+fn a_plain_duplicate_of_xudos_rule_is_no_finding_but_a_changed_one_is() {
+    let dup = doas_world(
+        b"permit :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n\
+          permit keepenv :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n\
+          permit setenv { A=1 } :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth\n\
+          permit persist :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth\n",
+    );
+    assert_eq!(later_lines(&dup), [3, 4, 5]);
+}
+
+#[test]
+fn rules_written_around_options_and_deny_are_read_by_the_grammar() {
+    // `deny` takes no options; `as` and `cmd` come in that order; `args` takes
+    // the rest of the line.
+    for line in [
+        &b"deny nolog :xudo\n"[..],
+        b"permit :xudo cmd /bin/ls as root\n",
+        b"permit persist\n",
+        b"permit :xudo as\n",
+        b"permit setenv :xudo\n",
+    ] {
+        assert!(later_rules(&doas_world(line)).is_empty(), "{line:?}");
+        assert!(
+            gaps_of(&doas_world(line))
+                .iter()
+                .any(|gap| gap.contains("refuses every rule")),
+            "{line:?}"
+        );
+    }
+    assert_eq!(
+        later_lines(&doas_world(
+            b"permit nolog persist :xudo as root cmd /x args 1 2\n"
+        )),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn a_doas_build_without_a_drop_in_directory_does_not_read_it() {
+    let host =
+        with_xudo_drop_in(b"").file("/etc/doas.d/zz.conf", 0, 0, 0o400, b"permit nopass :xudo\n");
+    let mut input = input("/usr/bin");
+    assert_eq!(later_rules(&host).len(), 1);
+    input.doas_ignores_drop_ins = true;
+    let report = assess(&host, &input);
+    let rules = check(&report, CheckId::PasswordlessRules);
+    assert!(rules.findings.is_empty(), "{rules:?}");
+    assert!(
+        rules
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not read by this doas build"),
+        "{rules:?}"
+    );
+}
+
+fn doas_plan(drop_in: bool) -> crate::InstallPlan {
+    use crate::capability::{Capability, CapabilityMatrix};
+    let mut matrix = CapabilityMatrix::empty()
+        .with(Capability::ValidateNamedFile)
+        .with(Capability::PerCommandDefaults)
+        .with(Capability::DisableCredentialCache)
+        .with_exemption(Capability::AllocatePty);
+    if drop_in {
+        matrix = matrix.with(Capability::DropInDirectory);
+    }
+    let backend = crate::Backend {
+        kind: crate::BackendKind::Doas,
+        exe: "/usr/bin/doas".to_owned(),
+        version: "doas".to_owned(),
+        capabilities: matrix,
+    };
+    crate::InstallPlan::human_only(&backend).unwrap()
+}
+
+fn first_install_findings(host: &dyn HostView, plan: &crate::InstallPlan) -> Vec<(String, usize)> {
+    let planned = PlannedHost::new(host, plan).unwrap();
+    let report = assess(&planned, &input("/usr/bin"));
+    check(&report, CheckId::PasswordlessRules)
+        .findings
+        .iter()
+        .filter_map(|finding| match finding {
+            Finding::DoasLaterRule { file, line, .. } => Some((file.display().to_string(), *line)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_first_install_is_checked_against_the_rules_that_will_follow_it() {
+    // zz-local.conf exists and 60-xudo.conf does not: the planned file is
+    // served at its place, so the later nopass is found before anything is written.
+    let host = doas_world(b"")
+        .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, b"")
+        .file(
+            "/etc/doas.d/zz-local.conf",
+            0,
+            0,
+            0o400,
+            b"permit nopass :wheel\n",
+        );
+    // Without the planned file there is nothing to be after.
+    let bare = clean().dir("/etc/doas.d", 0, 0, 0o755).file(
+        "/etc/doas.d/zz-local.conf",
+        0,
+        0,
+        0o400,
+        b"permit nopass :xudo\n",
+    );
+    assert!(later_rules(&bare).is_empty());
+    let plan = doas_plan(true);
+    assert_eq!(
+        first_install_findings(&bare, &plan),
+        [("/etc/doas.d/zz-local.conf".to_owned(), 1)]
+    );
+    // A file that sorts before it is no finding; an existing copy of xudo's
+    // file is replaced by the planned one, not read twice.
+    let early = bare.clone().file(
+        "/etc/doas.d/10-a.conf",
+        0,
+        0,
+        0o400,
+        b"permit nopass :xudo\n",
+    );
+    assert_eq!(first_install_findings(&early, &plan).len(), 1);
+    assert_eq!(first_install_findings(&host, &plan).len(), 1);
+    // A machine with no drop-in directory at all gets one made in the view.
+    let nodir = clean();
+    assert!(first_install_findings(&nodir, &plan).is_empty());
+}
+
+#[test]
+fn the_appended_block_is_read_at_the_end_of_doas_conf() {
+    let plan = doas_plan(false);
+    let existing = clean().file("/etc/doas.conf", 0, 0, 0o400, b"permit nopass :xudo\n");
+    // Before the block: no finding. After it, there is nothing later in the file.
+    assert!(first_install_findings(&existing, &plan).is_empty());
+    // A missing doas.conf is made by the append.
+    assert!(first_install_findings(&clean(), &plan).is_empty());
+    let planned = PlannedHost::new(&existing, &plan).unwrap();
+    assert!(!planned.is_drop_in());
+    let bytes = found(planned.read(Path::new("/etc/doas.conf")));
+    assert!(bytes.starts_with(b"permit nopass :xudo\n"));
+    assert!(bytes.ends_with(b"\n"));
+    assert!(bytes.len() > 21);
+    // An unreadable doas.conf stays unreadable, not empty.
+    let broken = clean().unreadable_file("/etc/doas.conf", 0, 0, 0o400);
+    let planned = PlannedHost::new(&broken, &plan).unwrap();
+    assert!(matches!(
+        planned.read(Path::new("/etc/doas.conf")),
+        Lookup::Unreadable(_)
+    ));
+}
+
+#[test]
+fn the_planned_host_serves_everything_else_as_the_real_one_does() {
+    let host = clean()
+        .dir("/etc/doas.d", 0, 0, 0o755)
+        .file("/etc/doas.d/a.conf", 0, 0, 0o400, b"x")
+        .unreadable_file("/etc/doas.d/bad", 0, 0, 0o400)
+        .doas_says("/etc/doas.conf", "/bin/sh", nopass())
+        .link("/etc/doas.d/l", "a.conf");
+    let plan = doas_plan(true);
+    let planned = PlannedHost::new(&host, &plan).unwrap();
+    assert!(planned.is_drop_in());
+    let ours = Path::new("/etc/doas.d/60-xudo.conf");
+    assert_eq!(
+        planned.stat(ours),
+        Lookup::Found(Meta {
+            uid: 0,
+            gid: 0,
+            mode: 0o400,
+            kind: Kind::File
+        })
+    );
+    assert_eq!(
+        planned.stat(Path::new("/etc/doas.d/a.conf")),
+        host.stat(Path::new("/etc/doas.d/a.conf"))
+    );
+    assert_eq!(planned.stat(Path::new("/etc/doas.d/none")), Lookup::Missing);
+    assert_eq!(
+        planned.read(Path::new("/etc/doas.d/a.conf")),
+        host.read(Path::new("/etc/doas.d/a.conf"))
+    );
+    let listed = found(planned.list(Path::new("/etc/doas.d")));
+    assert!(
+        listed.contains(&OsString::from("60-xudo.conf"))
+            && listed.contains(&OsString::from("a.conf"))
+    );
+    assert_eq!(
+        listed.iter().filter(|name| *name == "60-xudo.conf").count(),
+        1
+    );
+    // Listed once even where the file is there already; other directories untouched.
+    let there = host
+        .clone()
+        .file(ours.to_str().unwrap(), 0, 0, 0o400, b"old");
+    let listed = found(
+        PlannedHost::new(&there, &plan)
+            .unwrap()
+            .list(Path::new("/etc/doas.d")),
+    );
+    assert_eq!(
+        listed.iter().filter(|name| *name == "60-xudo.conf").count(),
+        1
+    );
+    assert_eq!(
+        planned.list(Path::new("/etc")),
+        host.list(Path::new("/etc"))
+    );
+    assert_eq!(
+        planned.read_link(Path::new("/etc/doas.d/l")),
+        host.read_link(Path::new("/etc/doas.d/l"))
+    );
+    assert_eq!(
+        planned.writable(Path::new("/etc")),
+        host.writable(Path::new("/etc"))
+    );
+    assert_eq!(planned.caller(), host.caller());
+    assert_eq!(
+        planned.ask_sudo("/usr/bin/sudo", "u"),
+        host.ask_sudo("/usr/bin/sudo", "u")
+    );
+    assert_eq!(
+        planned.ask_doas("/usr/bin/doas", Path::new("/etc/doas.conf"), "/bin/sh"),
+        host.ask_doas("/usr/bin/doas", Path::new("/etc/doas.conf"), "/bin/sh")
+    );
+}
+
+#[test]
+fn the_planned_host_makes_a_missing_drop_in_directory_and_keeps_an_unreadable_one() {
+    let plan = doas_plan(true);
+    let host = clean();
+    let nodir = clean();
+    let listed = found(
+        PlannedHost::new(&nodir, &plan)
+            .unwrap()
+            .list(Path::new("/etc/doas.d")),
+    );
+    assert_eq!(listed, [OsString::from("60-xudo.conf")]);
+    let hidden = clean().unlistable_dir("/etc/doas.d", 0, 0, 0o000);
+    assert!(matches!(
+        PlannedHost::new(&hidden, &plan)
+            .unwrap()
+            .list(Path::new("/etc/doas.d")),
+        Lookup::Unreadable(_)
+    ));
+    // A plan that writes nothing there has no planned host.
+    let empty = crate::InstallPlan {
+        backend: crate::BackendKind::Doas,
+        steps: Vec::new(),
+    };
+    assert!(PlannedHost::new(&host, &empty).is_none());
+    let orphan = crate::InstallPlan {
+        backend: crate::BackendKind::Doas,
+        steps: vec![crate::PlanStep::Install {
+            from: "/x".to_owned(),
+            to: "/y".to_owned(),
+        }],
+    };
+    assert!(PlannedHost::new(&host, &orphan).is_none());
 }

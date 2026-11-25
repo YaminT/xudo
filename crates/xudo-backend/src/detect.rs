@@ -80,6 +80,11 @@ impl Backend {
     pub fn is_usable(&self) -> bool {
         self.capabilities.is_usable()
     }
+
+    /// Whether this is a doas build that does not read `/etc/doas.d`.
+    pub fn doas_ignores_drop_ins(&self) -> bool {
+        self.kind == BackendKind::Doas && !self.capabilities.has(Capability::DropInDirectory)
+    }
 }
 
 /// Facts about the machine, gathered elsewhere.
@@ -536,6 +541,18 @@ mod tests {
         // Most ports have no drop-in directory, so the integration is a
         // delimited block instead.
         assert!(!backend.capabilities.has(Capability::DropInDirectory));
+    }
+
+    #[test]
+    fn only_a_doas_without_a_drop_in_directory_ignores_doas_d() {
+        assert!(detect(&alpine_doas()).unwrap().doas_ignores_drop_ins());
+        let with_dir = alpine_doas().with_dir("/etc/doas.d");
+        assert!(!detect(&with_dir).unwrap().doas_ignores_drop_ins());
+        // sudo has a drop-in directory of its own and is not doas.
+        assert!(!detect(&debian()).unwrap().doas_ignores_drop_ins());
+        let mut sudo = detect(&debian()).unwrap();
+        sudo.capabilities = CapabilityMatrix::empty();
+        assert!(!sudo.doas_ignores_drop_ins());
     }
 
     #[test]

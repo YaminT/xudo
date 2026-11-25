@@ -409,6 +409,7 @@ pub(crate) fn gather(
                 .as_ref()
                 .filter(|found| matches!(found.kind, BackendKind::Doas))
                 .map(|found| found.exe.as_str()),
+            doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
         },
     );
     // Root commands go through the backend, where the human types their

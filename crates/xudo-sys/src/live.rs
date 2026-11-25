@@ -449,6 +449,7 @@ mod tests {
                 backend_exe: Some(Path::new("/usr/bin/sudo")),
                 sudo_exe: None,
                 doas_exe: None,
+                doas_ignores_drop_ins: false,
             },
         );
         let order: Vec<CheckId> = report.checks.iter().map(|c| c.check).collect();
