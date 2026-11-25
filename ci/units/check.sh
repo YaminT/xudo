@@ -110,7 +110,9 @@ check_units() {
         shift
         case $unit in
             *.service)
-                if ! grep -q '^ExecStart=' "$unit"; then
+                # Only the exempt template: any other unit that lost its ExecStart=
+                # must still fail verify.
+                if exposure_exempt "$unit" && ! grep -q '^ExecStart=' "$unit"; then
                     mkdir -p "$stage/$(basename "$unit").d"
                     printf '[Service]\nExecStart=/bin/true\n' >"$stage/$(basename "$unit").d/lane.conf"
                     cp "$unit" "$stage/"
@@ -152,6 +154,7 @@ check_units() {
             echo "units: $unit: $overall, ceiling $(tenths "$ceiling")"
         fi
     done
+    rm -rf "$stage"
     return "$bad"
 }
 

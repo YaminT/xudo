@@ -28,7 +28,10 @@ Documentation=https://github.com/YaminT/xudo/blob/main/howiwork.md
 Slice=xudo.slice
 # The harness may not make cgroups of its own and move into them.
 Delegate=no
-# "-": no file is fine. Written 0600 root by enrol; never world-readable.
+# "-": no file is fine. Written 0600 root by enrol; never world-readable. systemd
+# applies it to the "+" lines too, so `xudo-session record` refuses a file that is
+# not root-owned, private and in a protected directory.
+# H2c: refuse a drop-in whose User= is not the registry account.
 EnvironmentFile=-/etc/xudo/agents/%i.env
 # "+": run with full privileges, as root, whatever User= says. The record helper
 # refuses unless pid 1 started it and its own cgroup is this unit.

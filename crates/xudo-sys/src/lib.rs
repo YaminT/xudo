@@ -46,6 +46,7 @@ pub mod cgroup;
 pub mod clock;
 pub mod connection;
 pub mod entropy;
+pub mod envfile;
 pub mod error;
 pub mod exec;
 pub mod hygiene;
@@ -87,6 +88,9 @@ pub use connection::{
     AdoptError, Connection, FakeConnection, ReadFailure, UnixConnection, connected_unix_stream,
 };
 pub use entropy::{Entropy, FakeEntropy, HostEntropy};
+#[cfg(any(test, feature = "fake"))]
+pub use envfile::FakeEnvFiles;
+pub use envfile::{AGENT_ENV_DIR, EnvFileProbe, EnvFiles, HostEnvFiles};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
