@@ -756,6 +756,75 @@ fn the_host_installer_refuses_a_caller_that_is_not_root() {
     assert!(matches!(err, InstallError::NotRoot { .. }), "{err}");
 }
 
+fn agent_request() -> xudo_backend::enrol::EnrolRequest {
+    xudo_backend::enrol::EnrolRequest {
+        label: "codex".to_owned(),
+        account: "agent".to_owned(),
+        reviewers: vec!["alice".to_owned()],
+        argv: vec!["/usr/bin/codex".to_owned()],
+    }
+}
+
+fn agent_scan() -> xudo_backend::enrol::AccountScan {
+    xudo_backend::enrol::AccountScan {
+        uid: 990,
+        blockers: Vec::new(),
+    }
+}
+
+fn agent_plan() -> xudo_backend::enrol::EnrolPlan {
+    let file = |path: &str| xudo_backend::enrol::PlannedFile {
+        path: path.to_owned(),
+        contents: String::new(),
+        mode: 0o644,
+        keep: false,
+    };
+    xudo_backend::enrol::EnrolPlan {
+        label: "codex".to_owned(),
+        account: "agent".to_owned(),
+        unit: "xudo-agent@codex.service".to_owned(),
+        registry: file("/etc/xudo/harnesses.d/codex.toml"),
+        drop_in_dir: "/etc/systemd/system/xudo-agent@codex.service.d".to_owned(),
+        drop_in: file("/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf"),
+        env: file("/etc/xudo/agents/codex.env"),
+    }
+}
+
+#[test]
+fn the_refusing_installer_enrols_nothing() {
+    let none = || AgentError::Install(InstallError::NoInstaller);
+    assert_eq!(
+        RefusingInstaller
+            .agent_plan(&agent_request(), agent_scan())
+            .unwrap_err(),
+        none()
+    );
+    assert_eq!(
+        RefusingInstaller.agent_apply(&agent_plan()).unwrap_err(),
+        none()
+    );
+    assert_eq!(RefusingInstaller.agent_list().unwrap_err(), none());
+    assert_eq!(RefusingInstaller.agent_remove("codex").unwrap_err(), none());
+}
+
+#[test]
+fn the_host_installer_refuses_to_enrol_or_remove_when_not_root() {
+    if rustix::process::geteuid().as_raw() == 0 {
+        return;
+    }
+    let installer = HostInstaller::new(&Probe(ProbeResult::Verified));
+    let not_root = |error: AgentError| matches!(error, AgentError::NotRoot { .. });
+    assert!(not_root(
+        installer
+            .agent_plan(&agent_request(), agent_scan())
+            .unwrap_err()
+    ));
+    assert!(not_root(installer.agent_apply(&agent_plan()).unwrap_err()));
+    assert!(not_root(installer.agent_remove("codex").unwrap_err()));
+    // Listing reads only, so it is not refused; what it finds is the machine's.
+    let _ = installer.agent_list();
+}
+
 #[test]
 fn every_error_has_words_an_operator_can_act_on() {
     let samples = [

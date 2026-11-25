@@ -95,8 +95,10 @@ pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
-    Effect, HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,
-    Installer, ProbeResult, RefusingInstaller, Verification, check_effect, execute,
+    AgentError, AgentRow, Effect, EnrolOps, HostInstallOps, HostInstaller, InstallError,
+    InstallOps, InstallProbe, InstallReport, Installer, ProbeResult, RefusingInstaller, Removal,
+    Systemctl, Verification, apply_enrol, check_effect, execute, list_agents, plan_enrol,
+    remove_agent,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;

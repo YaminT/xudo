@@ -809,6 +809,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "xudo-policy",
 ]
 
 [[package]]

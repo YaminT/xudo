@@ -633,21 +633,84 @@ if [ -f /var/lib/xudo/audit.jsonl ]; then
     sed -n 's/.*\(detail=[^"]*\).*/\1/p' /var/lib/xudo/audit.jsonl
 fi
 
-# An enrolled agent's unit runs when the package is removed: prerm must stop it
-# and ExecStopPost must void its record. A lane-only drop-in (never shipped)
-# supplies the ExecStart= and User= that enrolment will one day write.
+# `xudo agent enrol` under the real systemd: the files it writes, the unit it
+# enables, the record the helper makes, `remove` undoing all of it, and an
+# enrolled agent's unit still running when the package is removed (prerm must
+# stop it and ExecStopPost must void its record).
 id xudoagent >/dev/null 2>&1 || useradd --system --no-create-home xudoagent
-mkdir -p /etc/xudo/harnesses.d /etc/systemd/system/xudo-agent@t.service.d
-printf 'label = "t"\nway = "service"\naccount = "xudoagent"\nreviewers = ["xudotest"]\nmax-sessions = 1\n' >/etc/xudo/harnesses.d/t.toml
-chmod 644 /etc/xudo/harnesses.d/t.toml
-printf '[Service]\nUser=xudoagent\nExecStart=/bin/sleep 3600\n' >/etc/systemd/system/xudo-agent@t.service.d/lane.conf
-systemctl daemon-reload
-if systemctl start xudo-agent@t.service >/var/tmp/agent-start.log 2>&1 && [ -e /run/xudo/sessions/svc-t ]; then
+enrol_agent() {
+    /usr/bin/xudo agent enrol t --account xudoagent --reviewer xudotest -- /bin/sleep 3600 \
+        >/var/tmp/agent-enrol.log 2>&1
+}
+if enrol_agent; then
+    good "xudo agent enrol t"
+else
+    bad "xudo agent enrol t"
+    cat /var/tmp/agent-enrol.log >&2
+fi
+if [ "$(systemctl show --property=User --value xudo-agent@t.service)" = xudoagent ]; then
+    good "xudo-agent@t runs as xudoagent"
+else
+    bad "xudo-agent@t does not run as xudoagent"
+fi
+if [ "$(systemctl is-enabled xudo-agent@t.service 2>&1 || true)" = enabled ]; then
+    good "xudo-agent@t enabled"
+else
+    bad "xudo-agent@t not enabled"
+fi
+# The record helper runs as ExecStartPre=+, so a started unit has its record.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e /run/xudo/sessions/svc-t ] && break
+    sleep 1
+done
+if [ -e /run/xudo/sessions/svc-t ] && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
     good "xudo-agent@t started and its record exists"
 else
     bad "xudo-agent@t did not start with a record"
-    cat /var/tmp/agent-start.log >&2
     journalctl -u xudo-agent@t --no-pager -n 20 >&2 || true
+fi
+modes=$(stat -c '%U:%G %a' /etc/xudo/harnesses.d/t.toml /etc/xudo/agents/t.env /etc/xudo/agents)
+expected=$(printf 'root:root 644\nroot:root 600\nroot:root 700')
+if [ "$modes" = "$expected" ]; then good "enrolled files are root's with the planned modes"; else bad "enrolled file modes: $modes"; fi
+# A second enrol of the same label is refused and changes nothing.
+before=$(sha256sum /etc/xudo/harnesses.d/t.toml)
+if /usr/bin/xudo agent enrol t --account xudoagent --reviewer xudotest -- /bin/sleep 1 >/dev/null 2>&1; then
+    bad "a second enrol of t was accepted"
+else
+    good "a second enrol of t is refused"
+fi
+[ "$before" = "$(sha256sum /etc/xudo/harnesses.d/t.toml)" ] || bad "a refused enrol changed the registry entry"
+# A login as the agent account (what ssh gives it) is not the enrolled unit: it
+# is outside xudo.slice, so nothing attests it as the harness. It takes the
+# human path, where the password decides.
+login_cgroup=$(su -s /bin/sh xudoagent -c 'cat /proc/self/cgroup' 2>&1 || true)
+case $login_cgroup in
+*xudo.slice*) bad "a login as xudoagent is inside xudo.slice: $login_cgroup" ;;
+*) good "a login as xudoagent is outside xudo.slice (human path)" ;;
+esac
+if /usr/bin/xudo agent remove t >/var/tmp/agent-remove.log 2>&1; then
+    good "xudo agent remove t"
+else
+    bad "xudo agent remove t"
+    cat /var/tmp/agent-remove.log >&2
+fi
+case $(systemctl is-active xudo-agent@t.service 2>&1 || true) in
+active | activating) bad "xudo-agent@t still running after agent remove" ;;
+*) good "xudo-agent@t stopped by agent remove" ;;
+esac
+if [ ! -e /run/xudo/sessions/svc-t ]; then good "svc-t record voided by agent remove"; else bad "svc-t record survived agent remove"; fi
+if [ ! -e /etc/xudo/harnesses.d/t.toml ] && [ ! -e /etc/systemd/system/xudo-agent@t.service.d ]; then
+    good "agent remove took back the registry entry and the drop-in"
+else
+    bad "agent remove left files"
+fi
+[ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
+# Enrol again, and leave it running for the package removal below.
+if enrol_agent && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
+    good "xudo-agent@t enrolled again and running"
+else
+    bad "xudo-agent@t not running after the second enrol"
+    cat /var/tmp/agent-enrol.log >&2
 fi
 if ! apt-get remove -y xudo >/var/tmp/xudo-remove.log 2>&1; then
     cat /var/tmp/xudo-remove.log >&2

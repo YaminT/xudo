@@ -31,9 +31,15 @@ Delegate=no
 # "-": no file is fine. Written 0600 root by enrol; never world-readable. systemd
 # applies it to the "+" lines too, so `xudo-session record` refuses a file that is
 # not root-owned, private and in a protected directory.
-# H2c: refuse a drop-in whose User= is not the registry account.
+# `xudo agent enrol` refuses a drop-in directory that already holds files and, before it
+# enables the unit, asks systemd for User= and refuses any account but the registry's.
 EnvironmentFile=-/etc/xudo/agents/%i.env
 # "+": run with full privileges, as root, whatever User= says. The record helper
 # refuses unless pid 1 started it and its own cgroup is this unit.
 ExecStartPre=+/usr/libexec/xudo/xudo-session record %i
 ExecStopPost=+/usr/libexec/xudo/xudo-session void %i
+
+# What `xudo agent enrol` enables, so an enrolled harness comes back after a reboot.
+# Nothing enables an instance on install: the package ships the template only.
+[Install]
+WantedBy=multi-user.target
