@@ -451,9 +451,9 @@ fn entry_hash(canonical: &[u8]) -> [u8; 32] {
 
 /// The uid of `name` in a `/etc/passwd` text, if a line is well formed.
 ///
-/// The first matching name whose uid field parses wins, as glibc does: a line
-/// with an unparsable uid is skipped, and a later line for the same name is
-/// used. A comment, a short line, and a `+` inclusion are not a match. This
+/// The first matching name whose uid and gid fields both parse wins, as glibc
+/// does: a line with an unparsable uid or gid is skipped, and a later line for
+/// the same name is used. A comment, a short line, and a `+` inclusion are not a match. This
 /// does not read the file, and asks no NSS source: `/etc/passwd` only.
 pub fn passwd_uid(text: &str, name: &str) -> Option<u32> {
     if !valid_account_name(name) {
@@ -462,7 +462,12 @@ pub fn passwd_uid(text: &str, name: &str) -> Option<u32> {
     let prefix = format!("{name}:");
     text.lines()
         .filter(|line| !line.starts_with('#') && line.starts_with(&prefix))
-        .find_map(|line| line.split(':').nth(2)?.parse().ok())
+        .find_map(|line| {
+            let mut fields = line.split(':').skip(2);
+            let uid = fields.next()?.parse().ok()?;
+            fields.next()?.parse::<u32>().ok()?;
+            Some(uid)
+        })
 }
 
 /// [`passwd_uid`] over bytes already read. A failed read is "no such account".
@@ -494,7 +499,8 @@ pub fn passwd_fault(bytes: &[u8]) -> Option<String> {
         }
         let mut fields = text.split(':');
         let named = fields.next().is_some_and(|name| !name.is_empty());
-        let numeric = fields.nth(1).is_some_and(|uid| uid.parse::<u32>().is_ok());
+        let numeric = fields.nth(1).is_some_and(|uid| uid.parse::<u32>().is_ok())
+            && fields.next().is_some_and(|gid| gid.parse::<u32>().is_ok());
         if !(named && numeric) {
             malformed = malformed.saturating_add(1);
         }
@@ -891,6 +897,11 @@ max-sessions = 1
         assert_eq!(passwd_uid(text, "agent"), Some(1000));
         assert_eq!(passwd_uid("agent:x::1::/:/bin/sh\n", "agent"), None);
         assert_eq!(passwd_uid("agent:x:-1:1::/:/bin/sh\n", "agent"), None);
+        // glibc keeps a line only when the gid parses too.
+        let no_gid = "agent:x:1000\nagent:x:2000:abc::/:/bin/sh\nagent:x:3000:3000::/:/bin/sh\n";
+        assert_eq!(passwd_uid(no_gid, "agent"), Some(3000));
+        assert_eq!(passwd_uid("agent:x:1000:\n", "agent"), None);
+        assert!(passwd_fault(b"agent:x:1000:abc::/:/bin/sh\n").is_some());
     }
 
     #[test]

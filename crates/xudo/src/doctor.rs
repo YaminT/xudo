@@ -992,7 +992,10 @@ fn fault_lines(ruleset: &RulesetReport, line: &mut dyn FnMut(&str, &str)) {
     if let Some(why) = &ruleset.registry_fault {
         line(
             "registry",
-            &format!("FAULT, no harness is armed: {}", safe(why)),
+            &format!(
+                "FAULT (parse only, no trust walk), no harness is armed: {}",
+                safe(why)
+            ),
         );
     }
     if let Some(why) = &ruleset.passwd_fault {

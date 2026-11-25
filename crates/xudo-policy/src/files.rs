@@ -873,7 +873,7 @@ max-entries = 10
     }
 
     #[test]
-    fn removing_a_registry_file_makes_its_harness_human() {
+    fn removing_a_registry_file_unregisters_its_harness() {
         let both = [
             harness_file("codex", "agent", 4),
             harness_file("claude", "agent2", 4),

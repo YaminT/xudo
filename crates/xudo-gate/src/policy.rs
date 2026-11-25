@@ -96,10 +96,25 @@ impl LoadedPolicy {
 /// `text` with every control character, newlines included, as a space: a
 /// fault carries parser output that root wrote, and evidence is one line.
 fn one_line(text: &str) -> String {
-    text.chars()
+    let mut out: String = text
+        .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+        .collect();
+    if out.len() > FAULT_EVIDENCE_MAX {
+        // Byte 0 is always a boundary, so the search never comes up empty.
+        let end = (0..=FAULT_EVIDENCE_MAX)
+            .rev()
+            .find(|at| out.is_char_boundary(*at))
+            .unwrap_or_default();
+        out.truncate(end);
+        out.push('…');
+    }
+    out
 }
+
+/// Longest fault text one evidence line keeps. A parser error can echo a whole
+/// offending line, and a record over the audit limit is refused outright.
+const FAULT_EVIDENCE_MAX: usize = 512;
 
 /// Why settings bytes could not be interpreted.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -463,6 +478,21 @@ mod tests {
                 "passwd_fault=3 unusable".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn an_oversized_fault_is_capped_so_a_record_stays_writable() {
+        let mut loaded = loaded_policy();
+        let huge = format!("é{}", "x".repeat(200 * 1024));
+        loaded.rules =
+            xudo_policy::load_policy_with_registry(Vec::new(), Err(huge.clone())).unwrap();
+        // One ASCII byte first, so byte 512 falls inside a two-byte char.
+        loaded.passwd_fault = Some(format!("a{}", "é".repeat(100 * 1024)));
+        let evidence = loaded.fault_evidence();
+        assert!(evidence.iter().all(|line| line.len() <= 530));
+        assert!(evidence.iter().all(|line| line.ends_with('…')));
+        let record: usize = evidence.iter().map(String::len).sum();
+        assert!(record < 64 * 1024);
     }
 
     #[test]

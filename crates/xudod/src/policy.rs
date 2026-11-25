@@ -447,6 +447,12 @@ outcome = "ask-human"
         );
         assert!(!facts.classification.is_enrolled_agent());
         assert!(facts.classification.requires_password());
+        // A removed registry file leaves its scope unattested, never human.
+        assert!(
+            format!("{:?}", facts.classification).starts_with("Unattested"),
+            "{:?}",
+            facts.classification
+        );
     }
 
     #[test]

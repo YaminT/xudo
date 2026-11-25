@@ -233,7 +233,7 @@ pub struct Action {
     /// no such grant is armed. Absent means never passwordless. For
     /// [`Outcome::AskHuman`] the list is required: it is the only set of
     /// enrolled agents the action queues, and an empty or missing list fails
-    /// to load. A label that is not in the registry fails the combined load.
+    /// to load. A label that is not in the registry grants nothing: it matches no caller, and `check` reports it.
     #[serde(default)]
     pub harness: Vec<String>,
     /// What a listed harness gets. Required when `harness` is non-empty.
