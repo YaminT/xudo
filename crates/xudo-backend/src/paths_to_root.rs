@@ -1076,7 +1076,8 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     if input.doas_ignores_drop_ins {
         append_note(
             &mut note,
-            "/etc/doas.d is not read by this doas build, so nothing in it was analysed",
+            "xudo does not use /etc/doas.d on this doas (the build is not shown to read it, or the \
+             directory is missing), so nothing in it was analysed",
         );
     }
     read_doas_files(ctx, &doas_files, &mut sink, &mut note);
@@ -1255,6 +1256,21 @@ fn target_is_root(ctx: &Ctx<'_>, target: Option<&[u8]>) -> bool {
             .any(|account| account.uid == 0 && account.name == target)
 }
 
+/// The identity of xudo's own doas rule: its group.
+fn own_identity() -> Vec<u8> {
+    [b":", XUDO_GROUP.as_bytes()].concat()
+}
+
+/// Whether a doas rule is xudo's own: a `permit` for the group that runs the
+/// gate with no arguments.
+fn is_own_doas_rule(rule: &config::DoasRule) -> bool {
+    rule.reading == DoasReading::Rule
+        && rule.permit
+        && rule.identity == own_identity()
+        && rule.args == DoasArgs::Open
+        && rule.cmd.as_deref() == Some(crate::snippet::GATE_AUTH.as_bytes())
+}
+
 /// The doas rules after xudo's own that would replace it.
 ///
 /// doas uses the last rule that matches, in file order: `/etc/doas.conf`, then
@@ -1276,14 +1292,8 @@ fn later_doas_rules(ctx: &Ctx<'_>, ordered: &[(PathBuf, config::DoasRule)]) -> L
     let names_gate = |rule: &config::DoasRule| {
         rule.args == DoasArgs::Open && rule.cmd.as_deref().is_none_or(|cmd| cmd == gate)
     };
-    let own_identity = [b":", XUDO_GROUP.as_bytes()].concat();
-    let Some(own) = ordered.iter().position(|(_, rule)| {
-        rule.reading == DoasReading::Rule
-            && rule.permit
-            && rule.identity == own_identity
-            && rule.args == DoasArgs::Open
-            && rule.cmd.as_deref() == Some(gate)
-    }) else {
+    let own_identity = own_identity();
+    let Some(own) = ordered.iter().position(|(_, rule)| is_own_doas_rule(rule)) else {
         return out;
     };
     let later = ordered

@@ -1988,6 +1988,10 @@ mod tests {
         fn validates_named_file(&self, _absolute_path: &str) -> bool {
             true
         }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            true
+        }
+
         fn accepts_argument_wildcard(&self, _absolute_path: &str) -> bool {
             true
         }

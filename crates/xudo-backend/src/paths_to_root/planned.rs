@@ -4,8 +4,11 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::{Answer, Caller, HostView, Kind, Lookup, Meta};
+use super::config::scan_doas_rules;
+use super::{Answer, Caller, HostView, Kind, Lookup, Meta, is_own_doas_rule};
+use crate::blocks;
 use crate::plan::{InstallPlan, PlanStep};
+use crate::snippet::{DOAS_BEGIN, DOAS_END};
 
 /// What the plan does to its one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +17,14 @@ enum Change {
     Write(Vec<u8>),
     /// The block is added to the end of the file that is there.
     Append(Vec<u8>),
+}
+
+/// `text` with xudo's block set, or why it cannot be.
+fn insert_block(text: &[u8], block: &[u8]) -> Lookup<Vec<u8>> {
+    match blocks::insert(text, block, DOAS_BEGIN.as_bytes(), DOAS_END.as_bytes()) {
+        Ok(bytes) => Lookup::Found(bytes),
+        Err(error) => Lookup::Unreadable(error.to_string()),
+    }
 }
 
 /// A host that serves the file a plan would write as it would be, and
@@ -61,6 +72,16 @@ impl<'a> PlannedHost<'a> {
         matches!(self.change, Change::Write(_))
     }
 
+    /// Whether xudo's own rule is in the file as the plan makes it. It is there
+    /// by construction, so a file that cannot be read, or one the install would
+    /// refuse, or one whose block does not hold the rule, answers `false`.
+    pub fn holds_own_rule(&self) -> bool {
+        match self.read(&self.file) {
+            Lookup::Found(bytes) => scan_doas_rules(&bytes).iter().any(is_own_doas_rule),
+            Lookup::Missing | Lookup::Unreadable(_) => false,
+        }
+    }
+
     fn is_ours(&self, path: &Path) -> bool {
         path == self.file
     }
@@ -89,12 +110,12 @@ impl HostView for PlannedHost<'_> {
         }
         match &self.change {
             Change::Write(contents) => Lookup::Found(contents.clone()),
+            // The very function the install writes with, so the file read here
+            // is the file it makes: an old block of xudo's is replaced where
+            // it stands, and a last line without a newline gets one.
             Change::Append(block) => match self.host.read(path) {
-                Lookup::Found(mut bytes) => {
-                    bytes.extend_from_slice(block);
-                    Lookup::Found(bytes)
-                }
-                Lookup::Missing => Lookup::Found(block.clone()),
+                Lookup::Found(bytes) => insert_block(&bytes, block),
+                Lookup::Missing => insert_block(&[], block),
                 unreadable @ Lookup::Unreadable(_) => unreadable,
             },
         }

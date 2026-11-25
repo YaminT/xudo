@@ -780,6 +780,10 @@ fn install(
 /// xudo cannot read that may carry `nopass` counts as one that does. That
 /// refuses; a later `persist` only warns. `None` means go on.
 ///
+/// A rule that merely says `permit "nopass"` (a user named nopass, quoted) is
+/// refused too: the reader drops the quotes, so it cannot tell it from the
+/// keyword. A false positive, and the safe direction.
+///
 /// The host is asked as it would be after the plan, with xudo's rule in the
 /// file and at the place the plan puts it, so the first install is checked
 /// the way every later one is, by the one reader `xudo doctor` uses.
@@ -803,6 +807,21 @@ fn doas_later_rules(
         },
     );
     let mut refused = false;
+    // xudo's rule is in the planned file by construction. If it cannot be found
+    // there, the file could not be read or the install would not make what was
+    // modelled, so nothing said about the rules after it can be trusted.
+    if planned
+        .as_ref()
+        .is_some_and(|planned| !planned.holds_own_rule())
+    {
+        refused = true;
+        let _ = writeln!(
+            err,
+            "xudo: refusing to install: xudo's own rule could not be found in the doas \
+             configuration as the install would leave it, so the rules after it could not \
+             be checked."
+        );
+    }
     for finding in report.checks.iter().flat_map(|check| &check.findings) {
         let Finding::DoasLaterRule {
             file,
@@ -1633,6 +1652,7 @@ mod tests {
     use xudo_backend::Capability;
     use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest, PlannedFile};
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
+    use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END};
     use xudo_config::Setting;
     use xudo_sys::{AgentError, AgentRow};
 
@@ -3979,6 +3999,10 @@ expect = "deny"
             true
         }
 
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
+        }
+
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
             true
         }
@@ -4007,6 +4031,10 @@ expect = "deny"
 
         fn validates_named_file(&self, _path: &str) -> bool {
             true
+        }
+
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
         }
 
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
@@ -4051,9 +4079,11 @@ expect = "deny"
         assert!(WorkingSudoProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(WorkingSudoProbe.validates_named_file("/usr/bin/sudo"));
         assert!(WorkingSudoProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!WorkingSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         assert!(!NoBackendProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(NoBackendProbe.validates_named_file("/usr/bin/sudo"));
         assert!(NoBackendProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!NoBackendProbe.doas_reads_drop_ins("/usr/bin/doas"));
     }
 
     #[test]
@@ -4408,10 +4438,15 @@ expect = "deny"
             fn validates_named_file(&self, _path: &str) -> bool {
                 false
             }
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 false
             }
         }
+        assert!(!MuteProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let fx = fixture("cli-install-mute");
         let (code, _, err) = run_probe_full(&fx, &MuteProbe, &["install", "--dry-run"]);
         assert_eq!(code, ExitCode::Unusable);
@@ -4739,6 +4774,8 @@ expect = "deny"
     struct DoasInstallProbe {
         /// Whether the build has `/etc/doas.d`.
         drop_in: bool,
+        /// Whether the build is shown to read it.
+        reads: bool,
     }
     impl Probe for DoasInstallProbe {
         fn exists(&self, absolute_path: &str) -> bool {
@@ -4759,6 +4796,10 @@ expect = "deny"
         fn validates_named_file(&self, _path: &str) -> bool {
             true
         }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            self.reads
+        }
+
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
             true
         }
@@ -4775,6 +4816,22 @@ expect = "deny"
     /// reads `/etc/doas.d` or not.
     fn install_on_doas_with(
         drop_in: bool,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        install_on_doas_probe(
+            &DoasInstallProbe {
+                drop_in,
+                reads: drop_in,
+            },
+            files,
+            args,
+        )
+    }
+
+    /// The same with the probe described in full.
+    fn install_on_doas_probe(
+        probe: &DoasInstallProbe,
         files: &[(&str, &[u8])],
         args: &[&str],
     ) -> (ExitCode, String, String) {
@@ -4798,7 +4855,7 @@ expect = "deny"
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let platform = Platform {
             ops: &BlindOps,
-            probe: &DoasInstallProbe { drop_in },
+            probe,
             host: &host,
             path: None,
         };
@@ -4831,13 +4888,23 @@ expect = "deny"
 
     #[test]
     fn the_doas_install_probe_answers_every_question() {
-        let probe = DoasInstallProbe { drop_in: false };
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
         assert!(probe.honours_directive("/usr/bin/doas", "x"));
         assert!(probe.honours_scoped_directive("/usr/bin/doas", "x"));
         assert!(probe.validates_named_file("/usr/bin/doas"));
         assert!(probe.accepts_argument_wildcard("/usr/bin/doas"));
         assert!(!probe.directory_exists("/etc/doas.d"));
-        assert!(DoasInstallProbe { drop_in: true }.directory_exists("/etc/doas.d"));
+        assert!(!probe.doas_reads_drop_ins("/usr/bin/doas"));
+        assert!(
+            DoasInstallProbe {
+                drop_in: true,
+                reads: true
+            }
+            .directory_exists("/etc/doas.d")
+        );
     }
 
     #[test]
@@ -4906,6 +4973,67 @@ expect = "deny"
         );
         assert_eq!(code, ExitCode::Delegated, "{err}");
         assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn install_appends_when_a_directory_exists_that_the_doas_build_does_not_read() {
+        // Debian's opendoas ignores a /etc/doas.d someone made. A drop-in there
+        // would never take effect, and doas.conf's own `permit nopass :xudo`
+        // would look overridden by it. The block goes to doas.conf instead, so
+        // the nopass line above it is seen as coming BEFORE xudo's rule.
+        let probe = DoasInstallProbe {
+            drop_in: true,
+            reads: false,
+        };
+        let (code, out, err) = install_on_doas_probe(
+            &probe,
+            &[
+                ("/etc/doas.conf", b"permit nopass :xudo\n"),
+                ("/etc/doas.d/zz-local.conf", b"permit nopass :xudo\n"),
+            ],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("append"), "{out}");
+        assert!(!out.contains("60-xudo.conf"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_when_a_stale_xudo_block_hides_a_nopass_line_behind_it() {
+        // An operator edited xudo's block so it no longer matches, then added
+        // `permit nopass :xudo` after it. The install puts the new rule back
+        // INSIDE the old block, which is before that line: the nopass line
+        // wins. Appending at the end of the file would have hidden it.
+        let conf = format!("{DOAS_BEGIN}\n# xudo disabled\n{DOAS_END}\npermit nopass :xudo\n");
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) =
+            install_on_doas_probe(&probe, &[("/etc/doas.conf", conf.as_bytes())], &[]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("doas.conf:15"), "{err}");
+        assert!(err.contains("Remove nopass"), "{err}");
+    }
+
+    #[test]
+    fn install_refuses_when_the_planned_doas_file_cannot_be_read() {
+        // A doas.conf whose block the install would refuse to edit (an unpaired
+        // sentinel) cannot be shown to hold xudo's rule: refuse, never go on.
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) = install_on_doas_probe(
+            &probe,
+            &[(
+                "/etc/doas.conf",
+                format!("{DOAS_BEGIN}\npermit nopass :xudo\n").as_bytes(),
+            )],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo's own rule could not be found"), "{err}");
     }
 
     #[test]
@@ -4984,6 +5112,10 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
@@ -4993,6 +5125,7 @@ expect = "deny"
         assert!(DoasProbe.honours_scoped_directive("/usr/bin/doas", "pty"));
         assert!(DoasProbe.validates_named_file("/usr/bin/doas"));
         assert!(DoasProbe.accepts_argument_wildcard("/usr/bin/doas"));
+        assert!(!DoasProbe.doas_reads_drop_ins("/usr/bin/doas"));
 
         let out = run_probe(&fixture("cli-doctor-doas"), &DoasProbe, &["doctor"]);
         assert!(out.contains("backend      doas"), "{out}");
@@ -5024,10 +5157,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!MuteSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-mute"), &MuteSudoProbe, &["doctor"]);
         assert!(out.contains("no version banner"), "{out}");
         // An unreadable banner is assumed to be the stricter implementation.
@@ -5069,10 +5207,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!DeafSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-deaf"), &DeafSudoProbe, &["doctor"]);
         assert!(out.contains("backend      UNUSABLE"), "{out}");
         assert!(out.contains("fresh pty"), "{out}");
@@ -5361,7 +5504,10 @@ expect = "deny"
         assert!(installer.agent.asked.borrow()[0].contains("blockers: [\"BackendListing"));
         // doas, and no backend at all: the same scan without a program to ask.
         for probe in [
-            &DoasInstallProbe { drop_in: false } as &dyn Probe,
+            &DoasInstallProbe {
+                drop_in: false,
+                reads: false,
+            } as &dyn Probe,
             &NoBackendProbe,
         ] {
             let installer = ScriptedInstaller::answering(vec![]);

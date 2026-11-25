@@ -13,6 +13,7 @@
 
 use super::walk::{self, Outcome};
 use super::*;
+use crate::snippet::{DOAS_BEGIN, DOAS_END};
 
 const ME: u32 = 1000;
 const ALICE: u32 = 1001;
@@ -4486,7 +4487,7 @@ fn a_doas_build_without_a_drop_in_directory_does_not_read_it() {
             .note
             .as_deref()
             .unwrap_or_default()
-            .contains("not read by this doas build"),
+            .contains("xudo does not use /etc/doas.d on this doas"),
         "{rules:?}"
     );
 }
@@ -4587,6 +4588,62 @@ fn the_appended_block_is_read_at_the_end_of_doas_conf() {
         planned.read(Path::new("/etc/doas.conf")),
         Lookup::Unreadable(_)
     ));
+}
+
+#[test]
+fn a_stale_xudo_block_is_replaced_where_it_stands_as_the_install_does() {
+    // The block an operator disabled sits BEFORE `permit nopass :xudo`; the real
+    // install writes the new rule back into that place, so the nopass line
+    // comes after xudo's rule. Appending at the end would hide it.
+    let plan = doas_plan(false);
+    let conf = format!("{DOAS_BEGIN}\n# off\n{DOAS_END}\npermit nopass :xudo\n");
+    let host = clean().file("/etc/doas.conf", 0, 0, 0o400, conf.as_bytes());
+    let planned = PlannedHost::new(&host, &plan).unwrap();
+    let bytes = found(planned.read(Path::new("/etc/doas.conf")));
+    assert!(bytes.starts_with(DOAS_BEGIN.as_bytes()), "{bytes:?}");
+    assert!(!bytes.starts_with(conf.as_bytes()), "{bytes:?}");
+    assert!(bytes.ends_with(b"permit nopass :xudo\n"), "{bytes:?}");
+    assert!(planned.holds_own_rule());
+    assert_eq!(
+        first_install_findings(&host, &plan).len(),
+        1,
+        "the nopass line after the block must be a finding"
+    );
+}
+
+#[test]
+fn a_last_line_without_a_newline_gets_one_before_the_block() {
+    let plan = doas_plan(false);
+    let host = clean().file("/etc/doas.conf", 0, 0, 0o400, b"permit :wheel");
+    let planned = PlannedHost::new(&host, &plan).unwrap();
+    let bytes = found(planned.read(Path::new("/etc/doas.conf")));
+    assert!(
+        bytes.starts_with(format!("permit :wheel\n{DOAS_BEGIN}\n").as_bytes()),
+        "{bytes:?}"
+    );
+}
+
+#[test]
+fn a_planned_file_the_install_would_refuse_holds_no_own_rule() {
+    let plan = doas_plan(false);
+    for conf in [
+        format!("{DOAS_BEGIN}\npermit nopass :xudo\n"),
+        format!("{DOAS_END}\n{DOAS_BEGIN}\n"),
+    ] {
+        let host = clean().file("/etc/doas.conf", 0, 0, 0o400, conf.as_bytes());
+        let planned = PlannedHost::new(&host, &plan).unwrap();
+        assert!(matches!(
+            planned.read(Path::new("/etc/doas.conf")),
+            Lookup::Unreadable(_)
+        ));
+        assert!(!planned.holds_own_rule());
+    }
+    let broken = clean().unreadable_file("/etc/doas.conf", 0, 0, 0o400);
+    assert!(!PlannedHost::new(&broken, &plan).unwrap().holds_own_rule());
+    // The drop-in plan holds the rule in its own file.
+    let dropin = doas_plan(true);
+    let host = clean();
+    assert!(PlannedHost::new(&host, &dropin).unwrap().holds_own_rule());
 }
 
 #[test]

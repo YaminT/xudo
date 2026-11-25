@@ -48,7 +48,6 @@
 //! also asks the backend ([`check_effect`]) and will not call an install
 //! verified when the backend does not list the gate.
 
-mod blocks;
 mod effect;
 mod enrol;
 #[cfg(test)]
@@ -61,12 +60,12 @@ use xudo_backend::snippet::{
 };
 use xudo_backend::{BackendKind, InstallPlan, PlanStep};
 
-pub use blocks::BlockError;
 pub use effect::{Effect, check_effect};
 pub use enrol::{
     AgentError, AgentRow, EnrolOps, Systemctl, apply_enrol, list_agents, plan_enrol, remove_agent,
 };
 pub use host::HostInstallOps;
+pub use xudo_backend::blocks::BlockError;
 
 use crate::exec::{HostRunner, Runner};
 use crate::trust::TrustError;
