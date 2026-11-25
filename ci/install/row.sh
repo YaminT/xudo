@@ -86,6 +86,8 @@ reject_doas() {
     mv /usr/bin/doas /usr/bin/doas.orig
     cat >/usr/bin/doas <<EOF
 #!/bin/sh
+# Stands in for a doas that reads /etc/doas.d: xudo finds that by the name in
+# the executable, so the wrapper has to carry it as the real binary does.
 case "\$*" in $1) echo "rejected by the test" >&2; exit 1 ;; esac
 exec /usr/bin/doas.orig "\$@"
 EOF
