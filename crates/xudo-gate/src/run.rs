@@ -54,6 +54,14 @@
 //!     more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
 //!     one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!     reading of zero is refused as no reading.
+//!     **The `-nopass` ledger.** For the `-nopass` file only, every invocation
+//!     is counted in the rate ledger ([`xudo_sys::rate`]) under the live uid
+//!     and label, **once** and before any audit append: after [`decide`] and
+//!     before consume for a request that got that far, and first thing in the
+//!     refusal path for one that did not. Over the ceiling the refusal is
+//!     `gate_rate_ceiling`, and one audit record a minute says how many it
+//!     stands for; a ledger that cannot be used refuses without a record. An
+//!     agent that loops on the door cannot fill the trail.
 //! 11. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
 //!     through the verified directory descriptor before anything executes, and
 //!     a failed unlink — `ENOENT` included, which means a second gate took it
@@ -101,9 +109,10 @@ use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
 use xudo_sys::TrustedRulesError;
 use xudo_sys::{
-    AuditSink, Authorized, CgroupCalls, Clock, GateFiles, GateMode, HostClock, HostGateFiles,
-    HostHygiene, HostPeer, HostPrograms, HostSyscalls, Hygiene, PeerCalls, ProcRef, ProcSource,
-    Program, Programs, Spool, SpoolDir, SpoolError, Syscalls, VerifiedProc, authorize, lineage,
+    Admission, AuditSink, Authorized, CgroupCalls, Clock, GateFiles, GateMode, HostClock,
+    HostGateFiles, HostHygiene, HostPeer, HostPrograms, HostRateLedger, HostSyscalls, Hygiene,
+    LedgerKey, PeerCalls, ProcRef, ProcSource, Program, Programs, RateLedger, Spool, SpoolDir,
+    SpoolError, Syscalls, VerifiedProc, authorize, lineage,
 };
 
 use crate::decide::{
@@ -219,6 +228,8 @@ pub trait GateHost {
     fn gate_files(&self) -> &dyn GateFiles;
     /// Where programs are opened.
     fn programs(&self) -> &dyn Programs;
+    /// The `-nopass` rate ledger.
+    fn rate(&self) -> &dyn RateLedger;
     /// The audit trail.
     fn audit(&mut self) -> &mut dyn AuditSink;
     /// Runs a typed remove-path. The host opens nothing until this is called.
@@ -303,6 +314,10 @@ impl GateHost for SystemHost {
 
     fn programs(&self) -> &dyn Programs {
         &HostPrograms
+    }
+
+    fn rate(&self) -> &dyn RateLedger {
+        &HostRateLedger
     }
 
     fn audit(&mut self) -> &mut dyn AuditSink {
@@ -462,10 +477,14 @@ fn accept_invocation(args: &[OsString]) -> Result<GateMode, Refusal> {
 
 /// The mode the executed file says, and refused unless it is the one `argv[0]`
 /// claimed.
+///
+/// An executed `-nopass` file is noted in `progress` before the comparison, so
+/// the invocation counts against the ledger even when `argv[0]` lied about it.
 fn mode_of_executed_file(
     host: &dyn GateHost,
     proc: &dyn ProcSource,
     claimed: GateMode,
+    progress: &mut Progress,
 ) -> Result<GateMode, Refusal> {
     let refuse = |reason: String| Refusal::Failed {
         stage: Stage::Invocation,
@@ -475,6 +494,7 @@ fn mode_of_executed_file(
         .gate_files()
         .executing(proc)
         .map_err(|error| refuse(error.to_string()))?;
+    progress.nopass |= executed == GateMode::Nopass;
     if executed == claimed {
         Ok(executed)
     } else {
@@ -482,6 +502,104 @@ fn mode_of_executed_file(
             "argv[0] names one gate file and the executed file is the other".to_owned(),
         ))
     }
+}
+
+/// The step of the `-nopass` ledger, and the only place it is counted.
+///
+/// Every `-nopass` invocation counts, a refusal as much as a run, and counts
+/// **before** any audit append, so an agent that calls the door in a loop is
+/// stopped by the ledger and not by a full trail. [`proceed`] counts a
+/// request that has been decided, after `decide` and before the entry is
+/// consumed; [`finish_refusal`] counts a refusal that ended earlier. Whichever
+/// comes first counts, and the other finds it done: once per invocation.
+///
+/// `Ok` is "counted, carry on" or "not the `-nopass` gate". `Err` is the
+/// refusal that stands for the invocation now: over the ceiling, or a ledger
+/// that could not be used. Neither is ever retried.
+fn count_nopass(host: &dyn GateHost, progress: &mut Progress) -> Result<(), Refusal> {
+    if !progress.nopass || progress.ledger != LedgerStep::Uncounted {
+        return Ok(());
+    }
+    progress.ledger = LedgerStep::Ended;
+    let now = read_clock(host.clock())?;
+    let key = progress.ledger_key.clone().unwrap_or(LedgerKey {
+        uid: crate::decide::UNKNOWN_UID,
+        label: None,
+    });
+    match host.rate().admit(&key, now) {
+        Ok(Admission::Admitted {
+            minute,
+            hour,
+            carried,
+        }) => {
+            progress.ledger = LedgerStep::Counted;
+            progress
+                .evidence
+                .push(format!("ledger_minute={minute} ledger_hour={hour}"));
+            if carried > 0 {
+                // Refusals over the ceiling that no record has counted yet.
+                progress
+                    .evidence
+                    .push(format!("ledger_suppressed_before={carried}"));
+            }
+            Ok(())
+        }
+        Ok(Admission::OverCeiling {
+            minute,
+            hour,
+            report,
+        }) => Err(Refusal::RateCeiling {
+            minute,
+            hour,
+            suppressed: report,
+        }),
+        Err(error) => Err(Refusal::Failed {
+            stage: Stage::Ledger,
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The key of an invocation no broker entry matches: the real uid read from
+/// `sudo`'s own `status`, and the shared unknown uid only when that cannot
+/// be read.
+fn unmatched_ledger_key(uid: Option<u32>) -> LedgerKey {
+    LedgerKey {
+        uid: uid.unwrap_or(crate::decide::UNKNOWN_UID),
+        label: None,
+    }
+}
+
+/// The ledger key of a caller the gate has read live: its uid, and its harness
+/// label when the kernel attests one. A caller that is not attested is counted
+/// by uid alone.
+fn ledger_key_of(caller: &GateCaller) -> LedgerKey {
+    let label = match &caller.facts.classification {
+        xudo_policy::Classification::EnrolledAgent { agent_id, .. } => Some(agent_id.clone()),
+        _ => None,
+    };
+    LedgerKey {
+        uid: caller.facts.uid,
+        label,
+    }
+}
+
+/// Whether a refusal is left out of the audit trail on purpose: a refusal over
+/// the ceiling that is not the minute's one, and a ledger that could not be
+/// used. Both are what a caller can repeat without limit; the trail is the
+/// one shared resource every gate, a human's included, must still be able to
+/// write. The refusal is still the gate's exit and its line on standard error.
+fn left_off_the_trail(refusal: &Refusal) -> bool {
+    matches!(
+        refusal,
+        Refusal::RateCeiling {
+            suppressed: None,
+            ..
+        } | Refusal::Failed {
+            stage: Stage::Ledger,
+            ..
+        }
+    )
 }
 
 /// Turns a failure of one step into the refusal that names it.
@@ -514,6 +632,26 @@ struct Progress {
     /// Entries a remove-path walk already removed when its final audit
     /// record failed: the work is done, so the exit must not say "refused".
     removed_unrecorded: Option<usize>,
+    /// Whether this is the `-nopass` gate, by `argv[0]` or by the executed
+    /// file: either one counts, so neither can be used to dodge the ledger.
+    nopass: bool,
+    /// Who the ledger counts: set once the live caller is read. Until then the
+    /// invocation is counted under the unknown uid.
+    ledger_key: Option<LedgerKey>,
+    /// Where the invocation is in the ledger.
+    ledger: LedgerStep,
+}
+
+/// Whether this invocation has been counted in the ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LedgerStep {
+    /// Not yet.
+    #[default]
+    Uncounted,
+    /// Counted: the invocation is under the ceiling.
+    Counted,
+    /// The ledger refused it, or could not be used: never asked again.
+    Ended,
 }
 
 /// Runs the gate.
@@ -535,16 +673,31 @@ pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
             status: crate::operate::operation_status(&report),
             message: crate::operate::operation_message(&report),
         },
-        Err(refusal) => finish_refusal(host, &refusal, &progress),
+        Err(refusal) => finish_refusal(host, &refusal, &mut progress),
     }
 }
 
 /// Writes the refusal and builds the exit line.
-fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) -> GateExit {
+fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &mut Progress) -> GateExit {
+    // A refusal that ended the run before the count still counts, and counts
+    // first. Over the ceiling it is replaced by the ledger's own refusal. A
+    // ledger that cannot be used leaves the refusal as it was and leaves it
+    // out of the trail: with no count, a loop of calls would be a loop of
+    // appends.
+    let counted = count_nopass(&*host, progress).err();
+    let (refusal, recorded) = match &counted {
+        Some(over @ Refusal::RateCeiling { .. }) => (over, !left_off_the_trail(over)),
+        Some(_unusable) => (refusal, false),
+        None => (refusal, !left_off_the_trail(refusal)),
+    };
     // The authorization append and the refusal append are different calls.
     // Either one reporting damage is enough, and the sentence is the same,
     // so the operator sees it once.
-    let notice = record(host, refusal, progress).or(progress.audit_notice);
+    let notice = if recorded {
+        record(host, refusal, progress).or(progress.audit_notice)
+    } else {
+        progress.audit_notice
+    };
     let mut message = match progress.removed_unrecorded {
         Some(count) => format!(
             "xudo-gate: removed {count} entries; the audit record failed ({}, severity {})",
@@ -655,13 +808,14 @@ fn proceed(
     stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
     let claimed = accept_invocation(args)?;
+    progress.nopass = claimed == GateMode::Nopass;
     progress
         .evidence
         .push(format!("gate_argv0={}", args_first_escaped(args)));
 
     let proc = stage(Stage::Procfs, host.open_proc())?;
     // The mode is the executed file's, and `argv[0]` only has to agree.
-    let mode = mode_of_executed_file(&*host, &*proc, claimed)?;
+    let mode = mode_of_executed_file(&*host, &*proc, claimed, progress)?;
     let ancestors = stage(
         Stage::Lineage,
         lineage(&*proc, progress.gate_pid, LINEAGE_PROCESSES),
@@ -680,6 +834,7 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
+    let pending_entry_missing = matched.is_none();
     let passwd = loaded.passwd.as_str();
     let (caller, live_uid) = caller_for(
         host,
@@ -692,6 +847,12 @@ fn proceed(
         passwd,
     );
     progress.caller = Some(caller.clone());
+    progress.ledger_key = Some(match (&pending_entry_missing, ancestors.chain.get(1)) {
+        // No entry: count by the real uid of `sudo`, the process that
+        // authenticates, so one flood cannot fill every stranger's bucket.
+        (true, Some(sudo)) => unmatched_ledger_key(crate::live::read(&*proc, sudo).uid),
+        _ => ledger_key_of(&caller),
+    });
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
@@ -740,7 +901,9 @@ fn proceed(
             progress,
         );
     }
-    let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
+    // Counted once: after the decision, before the entry is consumed.
+    let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)
+        .and_then(|approved| count_nopass(&*host, progress).map(|()| approved))?;
     progress.evidence.push(confirmation_text(mode).to_owned());
     progress.evidence.push(format!(
         "gate_mode={mode:?} via={}",
@@ -819,7 +982,9 @@ fn run_typed_operation(
         context.settings,
         passwd,
         context.password_confirms,
-    )?;
+    )
+    .and_then(|work| count_nopass(&*host, progress).map(|()| work))?;
+    // (Counted once, above: after the decision, before the entry is consumed.)
     progress.evidence.push(format!(
         "op=remove-path target={}",
         requested.target.escape_ascii()
@@ -1400,6 +1565,36 @@ args = [
         remove: xudo_sys::FakeRemoveFs,
         /// Make the fake unlink seam assert that a durable intent exists.
         assert_intent_before_unlink: bool,
+        /// The `-nopass` ledger.
+        rate: FakeRate,
+    }
+
+    /// The real ledger logic on an in-memory directory, remembering whom it
+    /// was asked to count.
+    struct FakeRate {
+        dir: FakeSpool,
+        failing: Option<xudo_sys::RateError>,
+        keys: std::cell::RefCell<Vec<LedgerKey>>,
+    }
+
+    impl FakeRate {
+        fn new() -> Self {
+            Self {
+                dir: FakeSpool::new(),
+                failing: None,
+                keys: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RateLedger for FakeRate {
+        fn admit(&self, key: &LedgerKey, now_ms: u64) -> Result<Admission, xudo_sys::RateError> {
+            self.keys.borrow_mut().push(key.clone());
+            match &self.failing {
+                Some(error) => Err(error.clone()),
+                None => xudo_sys::rate::admit(&self.dir, key, now_ms, &std::mem::drop),
+            }
+        }
     }
 
     #[test]
@@ -1597,6 +1792,7 @@ args = [
                 freeze_asked: std::cell::RefCell::new(Vec::new()),
                 remove: xudo_sys::FakeRemoveFs::new(),
                 assert_intent_before_unlink: false,
+                rate: FakeRate::new(),
             }
         }
     }
@@ -1666,6 +1862,9 @@ args = [
         }
         fn programs(&self) -> &dyn Programs {
             &self.programs
+        }
+        fn rate(&self) -> &dyn RateLedger {
+            &self.rate
         }
         fn audit(&mut self) -> &mut dyn AuditSink {
             &mut self.audit
@@ -1961,6 +2160,14 @@ args = [
     fn system_host_constructs_its_peer_and_cgroup_adapters() {
         let host = SystemHost::new();
         let _peers = host.peers();
+        // The real ledger answers or refuses; it never needs a lane here.
+        let _ledger = host.rate().admit(
+            &LedgerKey {
+                uid: 1,
+                label: None,
+            },
+            1,
+        );
         #[cfg(target_os = "linux")]
         assert!(host.cgroups().is_ok());
         #[cfg(not(target_os = "linux"))]
@@ -3879,5 +4086,345 @@ max-entries = 10
             .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let exit = run(&mut host, &nopass());
         assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+    }
+
+    // ---- the -nopass ledger: every invocation counts, before any append ----
+
+    /// Runs the `-nopass` gate on `host` with the clock at `at`.
+    fn nopass_run_at(host: &mut FakeHost, at: u64) -> GateExit {
+        host.clock = FixedClock(at);
+        run(host, &nopass())
+    }
+
+    /// A host with no entry in its spool, running as the `-nopass` file.
+    fn flooded_host() -> FakeHost {
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Nopass);
+        host
+    }
+
+    fn suppressed_lines(host: &FakeHost) -> Vec<String> {
+        host.audit
+            .records()
+            .iter()
+            .flat_map(|record| record.evidence.iter())
+            .filter(|line| line.starts_with("suppressed="))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_nopass_refusal_flood_writes_one_record_per_minute() {
+        let mut host = flooded_host();
+        // Sixty refusals spread over half a minute are under the ceiling: each
+        // is counted and each is recorded.
+        for step in 0..60u64 {
+            let exit = nopass_run_at(&mut host, NOW + step * 500);
+            assert!(exit.message.contains("gate_no_pending_request"));
+        }
+        assert_eq!(host.audit.records().len(), 60);
+        // An agent that goes on: the hundreds of refusals that follow in the
+        // same minute write ONE record, the first, and it says how many it is.
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            exits.push(nopass_run_at(&mut host, NOW + 30_000));
+        }
+        for _ in 0..100 {
+            exits.push(nopass_run_at(&mut host, NOW + 45_000));
+        }
+        assert_eq!(host.audit.records().len(), 61);
+        assert_eq!(suppressed_lines(&host), vec!["suppressed=1".to_owned()]);
+        let last = host.audit.records().last().unwrap().clone();
+        assert_eq!(last.denial.as_deref(), Some("gate_rate_ceiling"));
+        assert!(has_line(&last.evidence, "ledger_minute="));
+        assert!(has_line(&last.evidence, "severity=high"));
+        // Every one of them was still refused, and said so on standard error.
+        for exit in &exits {
+            assert_eq!(exit.status, 19);
+            assert!(
+                exit.message.contains("gate_rate_ceiling"),
+                "{}",
+                exit.message
+            );
+        }
+        assert_eq!(exec_calls(&host), 0);
+    }
+
+    #[test]
+    fn a_flood_that_goes_on_for_minutes_writes_a_bounded_trail() {
+        // Ten calls a second for three minutes.
+        let mut host = flooded_host();
+        let mut calls = 0u64;
+        for tick in 0..1800u64 {
+            let exit = nopass_run_at(&mut host, NOW + tick * 100);
+            assert_eq!(exit.status, 19);
+            calls += 1;
+        }
+        let records = host.audit.records();
+        let written = records
+            .iter()
+            .filter(|record| record.denial.as_deref() == Some("gate_no_pending_request"))
+            .count() as u64;
+        let reports: Vec<u64> = suppressed_lines(&host)
+            .iter()
+            .map(|line| line.trim_start_matches("suppressed=").parse().unwrap())
+            .collect();
+        // The sixty a minute the ceiling admits, three minutes of it at most
+        // plus the burst at the start, and one report per minute at most.
+        assert!(written <= 60 * 4, "{written} admitted refusals written");
+        assert!((2..=4).contains(&reports.len()), "{reports:?}");
+        // Every refusal is either its own record or counted in a report (or
+        // is still waiting for the next one): none is lost.
+        assert!(written + reports.iter().sum::<u64>() <= calls);
+        assert!(records.len() < 250);
+    }
+
+    #[test]
+    fn a_refusal_before_the_lineage_is_counted_under_the_unknown_uid() {
+        let mut host = flooded_host();
+        host.proc = Err(SysError::unsupported("no procfs"));
+        let exit = nopass_run_at(&mut host, NOW);
+        assert!(exit.message.contains("gate_failed_procfs"));
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: crate::decide::UNKNOWN_UID,
+                label: None
+            }]
+        );
+    }
+
+    #[test]
+    fn the_ledger_counts_a_live_harness_by_uid_and_label_and_an_unattested_caller_by_uid() {
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, _spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        script_human(&mut host);
+        let _ = run(&mut host, &nopass());
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: Some("codex".to_owned())
+            }]
+        );
+        // The same caller read as nobody in particular: the uid alone.
+        let (mut host, _spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        host.cgroup_mode = FakeCgroupMode::Unavailable;
+        script_human(&mut host);
+        let _ = run(&mut host, &nopass());
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_caller_with_no_entry_is_counted_under_the_real_uid_of_sudo_not_the_shared_one() {
+        let mut host = flooded_host();
+        let exit = nopass_run_at(&mut host, NOW);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let keys = host.rate.keys.borrow();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(keys[0].uid, crate::decide::UNKNOWN_UID);
+        assert_eq!(keys[0].label, None);
+        // When sudo's uid cannot be read, only then the shared bucket.
+        assert_eq!(
+            unmatched_ledger_key(None),
+            LedgerKey {
+                uid: crate::decide::UNKNOWN_UID,
+                label: None
+            }
+        );
+        assert_eq!(unmatched_ledger_key(Some(1234)).uid, 1234);
+    }
+
+    #[test]
+    fn refusals_a_flood_left_unreported_are_evidence_on_the_next_admitted_record() {
+        let mut host = flooded_host();
+        for step in 0..60u64 {
+            nopass_run_at(&mut host, NOW + step);
+        }
+        // Reported at once (the first), then three more that are not.
+        for step in 0..4u64 {
+            nopass_run_at(&mut host, NOW + 100 + step);
+        }
+        // The minute passes: the stamps age out and the door reopens. The
+        // run let through says how many refusals no record has counted.
+        let exit = nopass_run_at(&mut host, NOW + 70_000);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let last = host.audit.records().last().unwrap().clone();
+        assert!(
+            has_line(&last.evidence, "ledger_suppressed_before=3"),
+            "{:?}",
+            last.evidence
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_counted_once_however_far_the_run_got() {
+        // Refused after the decision (not granted) and refused in the middle
+        // (wrong via): one ledger call each.
+        let (mut host, _spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let _ = run(&mut host, &nopass());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        let mut host = flooded_host();
+        let _ = run(&mut host, &nopass());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_auth_run_never_touches_the_ledger() {
+        // The human path asks sudo's password and is not rate limited here.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        let _ = run(&mut host, &auth());
+        let _ = run(&mut FakeHost::new(&Rc::new(holding(&[]))), &auth());
+        assert!(host.rate.keys.borrow().is_empty());
+        assert!(host.rate.dir.calls().is_empty());
+    }
+
+    #[test]
+    fn an_executed_nopass_file_counts_even_when_argv0_says_auth() {
+        let mut host = flooded_host();
+        let exit = run(&mut host, &auth());
+        assert!(exit.message.contains("gate_failed_invocation"));
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_ledger_refuses() {
+        // The refusal stands as the step that ended the run, and it is left out
+        // of the trail: with no count, a loop of calls would be a loop of
+        // appends.
+        let mut host = flooded_host();
+        host.rate.failing = Some(xudo_sys::RateError::Corrupt("test"));
+        for _ in 0..5 {
+            let exit = nopass_run_at(&mut host, NOW);
+            assert_eq!(exit.status, 19);
+            assert!(
+                exit.message.contains("gate_no_pending_request"),
+                "{}",
+                exit.message
+            );
+        }
+        assert_eq!(exec_calls(&host), 0);
+        assert!(host.audit.records().is_empty());
+        assert_eq!(host.rate.keys.borrow().len(), 5);
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_used_stops_a_decided_request_before_it_is_consumed() {
+        // What `proceed` does between `decide` and the consume, on a progress
+        // that is the `-nopass` gate's: the refusal is the ledger's own, high
+        // severity, and left off the trail.
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.rate.failing = Some(xudo_sys::RateError::Busy);
+        let mut progress = Progress {
+            nopass: true,
+            ..Progress::default()
+        };
+        let refusal = count_nopass(&host, &mut progress).unwrap_err();
+        assert_eq!(refusal.code(), "gate_failed_ledger");
+        assert_eq!(refusal.severity(), crate::decide::Severity::High);
+        assert!(left_off_the_trail(&refusal));
+        // Asked once: the same invocation is never counted again.
+        assert!(count_nopass(&host, &mut progress).is_ok());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        assert!(consumed(&spool).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_is_counted_once_and_only_for_the_nopass_gate() {
+        let spool = Rc::new(holding(&[]));
+        let host = FakeHost::new(&spool);
+        let mut auth_gate = Progress::default();
+        assert!(count_nopass(&host, &mut auth_gate).is_ok());
+        assert!(host.rate.keys.borrow().is_empty());
+        let mut nopass_gate = Progress {
+            nopass: true,
+            ledger_key: Some(LedgerKey {
+                uid: 7,
+                label: Some("codex".to_owned()),
+            }),
+            ..Progress::default()
+        };
+        assert!(count_nopass(&host, &mut nopass_gate).is_ok());
+        assert!(count_nopass(&host, &mut nopass_gate).is_ok());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        assert_eq!(nopass_gate.ledger, LedgerStep::Counted);
+        assert!(has_line(
+            &nopass_gate.evidence,
+            "ledger_minute=1 ledger_hour=1"
+        ));
+    }
+
+    #[test]
+    fn only_a_repeatable_refusal_is_left_off_the_trail() {
+        let over = |suppressed| Refusal::RateCeiling {
+            minute: 60,
+            hour: 60,
+            suppressed,
+        };
+        assert!(left_off_the_trail(&over(None)));
+        assert!(!left_off_the_trail(&over(Some(3))));
+        let failed = |stage| Refusal::Failed {
+            stage,
+            reason: String::new(),
+        };
+        assert!(left_off_the_trail(&failed(Stage::Ledger)));
+        assert!(!left_off_the_trail(&failed(Stage::Clock)));
+        assert!(!left_off_the_trail(&Refusal::NoPendingRequest { pid: 1 }));
+    }
+
+    #[test]
+    fn a_clock_that_cannot_be_read_refuses_the_nopass_count() {
+        let mut host = flooded_host();
+        host.clock = FixedClock(0);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 19);
+        assert!(
+            exit.message.contains("gate_failed_clock"),
+            "{}",
+            exit.message
+        );
+        assert!(host.rate.keys.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_ledger_over_the_ceiling_still_lets_the_human_path_run() {
+        // One account at its ceiling and the trail still writable: a human's
+        // password run goes through to the exec.
+        let mut agent = flooded_host();
+        for step in 0..70u64 {
+            nopass_run_at(&mut agent, NOW + step);
+        }
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut human = FakeHost::new(&spool);
+        human.audit = std::mem::replace(&mut agent.audit, FakeAuditSink::new());
+        let exit = run(&mut human, &auth());
+        assert!(
+            exit.message.contains("gate_failed_exec"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(exec_calls(&human), 1);
     }
 }

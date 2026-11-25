@@ -255,6 +255,7 @@ pub(crate) fn is_operation_refusal(refusal: &Refusal) -> bool {
         | Refusal::Request(_)
         | Refusal::ConfirmationMissing(_)
         | Refusal::Mode { .. }
+        | Refusal::RateCeiling { .. }
         | Refusal::Failed { .. } => false,
     }
 }
@@ -524,6 +525,7 @@ owners = ["agent"]
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
             | Refusal::Mode { .. }
+            | Refusal::RateCeiling { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -535,6 +537,7 @@ owners = ["agent"]
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
             | Refusal::Mode { .. }
+            | Refusal::RateCeiling { .. }
             | Refusal::Failed { .. } => None,
         }
     }

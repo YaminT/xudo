@@ -168,6 +168,22 @@ pub enum Refusal {
         /// Which requirement failed.
         reason: ModeRefusal,
     },
+    /// The account is over the `-nopass` ceiling: nothing ran and nothing was
+    /// queued.
+    ///
+    /// `suppressed` is `Some(n)` for the one refusal a minute that is written
+    /// to the audit trail, and `n` is how many refusals the record stands for.
+    /// Every other refusal over the ceiling is `None` and writes nothing, so
+    /// an agent that floods the door cannot fill the trail every gate needs.
+    #[error("the -nopass ceiling is reached: {minute} runs in the last minute, {hour} in the hour")]
+    RateCeiling {
+        /// Invocations counted in the last minute.
+        minute: usize,
+        /// Invocations counted in the last hour.
+        hour: usize,
+        /// What the audit record stands for, when this one is written.
+        suppressed: Option<u64>,
+    },
     /// The gate could not do one of the steps that come before or after the
     /// decision, and so did not run anything.
     ///
@@ -255,6 +271,8 @@ pub enum Stage {
     Exec,
     /// Load and parse the root-owned configuration.
     Config,
+    /// Count the invocation in the `-nopass` rate ledger.
+    Ledger,
 }
 
 impl Stage {
@@ -275,6 +293,7 @@ impl Stage {
             Self::Program => "open the program",
             Self::Audit => "record the authorization",
             Self::Exec => "execute the program",
+            Self::Ledger => "count this invocation in the rate ledger",
         }
     }
 
@@ -295,6 +314,7 @@ impl Stage {
             Self::Program => "gate_failed_program",
             Self::Audit => "gate_failed_audit",
             Self::Exec => "gate_failed_exec",
+            Self::Ledger => "gate_failed_ledger",
         }
     }
 
@@ -306,7 +326,7 @@ impl Stage {
     /// ordinary.
     pub fn severity(self) -> Severity {
         match self {
-            Self::Invocation | Self::Spool | Self::Program => Severity::High,
+            Self::Invocation | Self::Spool | Self::Program | Self::Ledger => Severity::High,
             _ => Severity::Normal,
         }
     }
@@ -329,6 +349,7 @@ impl Refusal {
                 .map_or("gate_policy_denied", DenialCode::as_str),
             Self::ConfirmationMissing(_) => "gate_confirmation_missing",
             Self::Mode { reason, .. } => reason.code(),
+            Self::RateCeiling { .. } => "gate_rate_ceiling",
             Self::Failed { stage, .. } => stage.code(),
         }
     }
@@ -346,6 +367,7 @@ impl Refusal {
             Self::NoPendingRequest { .. }
             | Self::Request(_)
             | Self::ConfirmationMissing(_)
+            | Self::RateCeiling { .. }
             | Self::Mode { .. } => Severity::High,
         }
     }
@@ -357,6 +379,11 @@ impl Refusal {
     /// the gate execs in place, so a child that exits 17, 18 or 19 cannot be
     /// told from a refusal by status alone. The refusal line on standard error
     /// is the distinguishing signal, and the front-end must use it.
+    ///
+    /// The rate ceiling is 19 and not 17 on purpose: 17 is "policy decided no
+    /// to this command", a final answer a script gives up on, while the
+    /// ceiling says nothing about the command and passes with the clock, which
+    /// is what 19 ("could not operate now") already means.
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Policy(_) => ExitCode::Denied,
@@ -364,6 +391,7 @@ impl Refusal {
             Self::NoPendingRequest { .. }
             | Self::Request(_)
             | Self::Mode { .. }
+            | Self::RateCeiling { .. }
             | Self::Failed { .. } => ExitCode::Unusable,
         }
     }
@@ -670,6 +698,17 @@ pub fn refusal_record(
                 .collect::<String>()
         ));
     }
+    if let Refusal::RateCeiling {
+        minute,
+        hour,
+        suppressed,
+    } = refusal
+    {
+        evidence.push(format!("ledger_minute={minute} ledger_hour={hour}"));
+        if let Some(count) = suppressed {
+            evidence.push(format!("suppressed={count}"));
+        }
+    }
     if let Refusal::Policy(decision) | Refusal::ConfirmationMissing(decision) = refusal
         && let Some(id) = deciding_deny_rule_id(decision)
     {
@@ -971,6 +1010,7 @@ all = [
             Refusal::NoPendingRequest { .. }
             | Refusal::Request(_)
             | Refusal::Mode { .. }
+            | Refusal::RateCeiling { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -1811,6 +1851,7 @@ args = [
             Stage::Audit,
             Stage::Exec,
             Stage::Config,
+            Stage::Ledger,
         ];
         let mut codes: Vec<&str> = stages.iter().map(|stage| stage.code()).collect();
         codes.sort_unstable();
@@ -1828,9 +1869,46 @@ args = [
             assert_eq!(refusal.severity(), stage.severity());
             assert_eq!(refusal.exit_code(), ExitCode::Unusable);
             assert!(refusal.to_string().contains("could not"), "{refusal}");
-            let high = matches!(stage, Stage::Invocation | Stage::Spool | Stage::Program);
+            let high = matches!(
+                stage,
+                Stage::Invocation | Stage::Spool | Stage::Program | Stage::Ledger
+            );
             assert_eq!(stage.severity() == Severity::High, high, "{stage:?}");
         }
+    }
+
+    #[test]
+    fn a_refusal_over_the_ceiling_has_its_own_code_and_says_what_it_stands_for() {
+        let written = Refusal::RateCeiling {
+            minute: 60,
+            hour: 61,
+            suppressed: Some(17),
+        };
+        assert_eq!(written.code(), "gate_rate_ceiling");
+        assert_eq!(written.severity(), Severity::High);
+        assert_eq!(written.exit_code(), ExitCode::Unusable);
+        assert!(written.to_string().contains("60 runs in the last minute"));
+        let record = refusal_record(None, &written, &GateCaller::unidentified(77), None);
+        assert_eq!(record.denial.as_deref(), Some("gate_rate_ceiling"));
+        assert!(record.evidence.contains(&"suppressed=17".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&"ledger_minute=60 ledger_hour=61".to_owned())
+        );
+        // A refusal that is not the minute's record has no count to carry.
+        let silent = Refusal::RateCeiling {
+            minute: 60,
+            hour: 61,
+            suppressed: None,
+        };
+        let record = refusal_record(None, &silent, &GateCaller::unidentified(77), None);
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|line| line.starts_with("suppressed="))
+        );
     }
 
     #[test]

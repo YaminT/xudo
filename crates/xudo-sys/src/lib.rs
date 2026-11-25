@@ -63,6 +63,7 @@ pub mod proc;
 pub mod procfs;
 pub mod program;
 pub mod provenance;
+pub mod rate;
 pub mod remove;
 pub mod source;
 pub mod spool;
@@ -126,6 +127,7 @@ pub use proc::{
 pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
+pub use rate::{Admission, HostRateLedger, LedgerKey, RATE_DIR, RateDir, RateError, RateLedger};
 #[cfg(any(test, feature = "fake"))]
 pub use remove::FakeRemoveFs;
 pub use remove::{
