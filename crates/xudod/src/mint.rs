@@ -276,7 +276,7 @@ pub(crate) fn entry_for(
     deadline: u64,
     nonce: String,
 ) -> Result<PendingRequest, MintError> {
-    let caller = crate::policy::classify(identity);
+    let caller = crate::policy::classify_for_test(identity);
     entry_for_classified(
         decision,
         &AttestedCaller {
