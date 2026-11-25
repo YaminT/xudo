@@ -55,7 +55,7 @@ use crate::argv::Argv;
 /// Bump on every change, so a decision can be replayed against the exact list
 /// that produced it.
 pub fn deny_list_version() -> u32 {
-    7
+    8
 }
 
 /// A class of capability that is never permitted as root.
@@ -1436,6 +1436,34 @@ pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     findings
 }
 
+/// The findings that hold whatever arguments follow: the executable's own
+/// identity, nothing more. Every argument check refuses on a token that is
+/// present, so none can hold for every argv; the multicall applet is read from
+/// an argument, so it is left out too (`coreutils` with no applet is refused,
+/// `coreutils true` is not). A rule that pins the applet must not be reported
+/// as one that can never allow; [`pinned_applet_is_accepted`] judges that.
+pub(crate) fn evaluate_deny_list_for_any_argv(exe: &[u8]) -> Vec<DenyFinding> {
+    deny_by_executable(basename(exe))
+}
+
+/// Multicall binaries that read their applet from an argument and are not
+/// refused by name (`busybox` is a shell and is).
+pub(crate) const MULTICALLS: &[&[u8]] = &[b"coreutils", b"toybox"];
+
+/// Whether `exe` is a multicall binary that reads its applet from an argument.
+pub(crate) fn is_multicall(exe: &[u8]) -> bool {
+    matches_name(basename(exe), MULTICALLS)
+}
+
+/// Whether the deny-list accepts `applet` as the first argument to the
+/// multicall `exe`. A plain name only: anything with a flag or a `/` is not.
+pub(crate) fn pinned_applet_is_accepted(exe: &[u8], applet: &[u8]) -> bool {
+    !applet.is_empty()
+        && !is_flag_token(applet)
+        && !applet.contains(&b'/')
+        && evaluate_deny_list(exe, &Argv::new([crate::argv::Arg::new(applet)])).is_empty()
+}
+
 /// A multicall binary names its applet in the first argument: `busybox rm`,
 /// `toybox rm`, `coreutils rm`, or `coreutils --coreutils-prog=rm`. The
 /// executable's basename is the multicall name, so the applet's class has to
@@ -1453,7 +1481,7 @@ pub fn evaluate_deny_list(exe: &[u8], argv: &Argv) -> Vec<DenyFinding> {
 /// applet cannot be read: a flag, or a missing applet, has unknown meaning.
 fn multicall_applet(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
     let busybox = matches_name(name, &[b"busybox"]);
-    if !busybox && !matches_name(name, &[b"coreutils", b"toybox"]) {
+    if !busybox && !matches_name(name, MULTICALLS) {
         return Vec::new();
     }
     let first = argv.as_slice().first().map(super::argv::Arg::as_bytes);
@@ -1488,8 +1516,79 @@ fn multicall_applet(name: &[u8], argv: &Argv) -> Vec<DenyFinding> {
                 format!("multicall applet {}: {}", applet.as_bstr(), f.evidence),
             )
         }));
+        let rest = argv.as_slice().get(1..).unwrap_or_default();
+        findings.extend(applet_findings(applet, rest));
     }
     findings
+}
+
+/// Applets that no name list covers, because the standalone program is
+/// harmless with fixed arguments, but that write a named file, run a program,
+/// signal a process, or change the security context once the caller picks
+/// the arguments.
+fn applet_findings(applet: &[u8], rest: &[super::argv::Arg]) -> Vec<DenyFinding> {
+    let tokens: Vec<&[u8]> = rest.iter().map(super::argv::Arg::as_bytes).collect();
+    let note = |class, why: &str| {
+        vec![DenyFinding::new(
+            class,
+            format!("multicall applet {}: {why}", applet.as_bstr()),
+        )]
+    };
+    // A short cluster (`-ro`) holds the letter; a long option may be any
+    // unambiguous prefix (`--out`), so a prefix of the full name counts.
+    let has_short = |letters: &[u8]| {
+        tokens.iter().any(|t| {
+            t.first() == Some(&b'-')
+                && t.get(1).is_some_and(|b| *b != b'-')
+                && t.iter().skip(1).any(|b| letters.contains(b))
+        })
+    };
+    let has_long = |full: &[u8], min: usize| {
+        tokens.iter().any(|t| {
+            let head = t.split_str(b"=").next().unwrap_or(t);
+            head.len() >= min && head.starts_with(b"--") && full.starts_with(head)
+        })
+    };
+    match applet {
+        b"sort" | b"shuf" if has_short(b"o") || has_long(b"--output", 3) => {
+            note(CapabilityClass::ArbitraryWrite, "writes the --output file")
+        }
+        b"sort" if has_long(b"--compress-program", 4) => {
+            note(CapabilityClass::ExecProxy, "runs the --compress-program")
+        }
+        b"sort" if has_long(b"--files0-from", 5) => {
+            note(CapabilityClass::ArbitraryRead, "reads --files0-from")
+        }
+        b"uniq" if uniq_operands(&tokens) >= 2 => {
+            note(CapabilityClass::ArbitraryWrite, "writes its second operand")
+        }
+        b"date" if has_short(b"fs") || has_long(b"--file", 3) || has_long(b"--set", 3) => note(
+            CapabilityClass::ArbitraryRead,
+            "reads a file or sets the clock",
+        ),
+        b"ptx" | b"csplit" => note(CapabilityClass::ArbitraryWrite, "writes caller-named files"),
+        b"runcon" => note(
+            CapabilityClass::SecuritySubsystem,
+            "changes the security context",
+        ),
+        b"kill" => note(
+            CapabilityClass::PowerState,
+            "signals any process, pid 1 included",
+        ),
+        _ => Vec::new(),
+    }
+}
+
+/// How many tokens `uniq` could read as operands: a lone `-`, anything not a
+/// flag, and everything after `--`. Over-counts a flag's value, which only
+/// refuses more.
+fn uniq_operands(tokens: &[&[u8]]) -> usize {
+    let after = tokens.iter().position(|t| *t == b"--");
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| **t == b"-" || !is_flag_token(t) || after.is_some_and(|a| *i > a))
+        .count()
 }
 
 /// Classes implied by the executable's identity alone.
@@ -1722,7 +1821,7 @@ mod tests {
 
     #[test]
     fn version_is_reported_for_replay() {
-        assert_eq!(deny_list_version(), 7);
+        assert_eq!(deny_list_version(), 8);
     }
 
     #[test]
@@ -1745,6 +1844,21 @@ mod tests {
         ] {
             assert!(denies(exe, &[]), "{exe} was permitted");
         }
+    }
+
+    #[test]
+    fn no_argument_check_refuses_an_empty_argv() {
+        for name in [
+            &b"systemctl"[..],
+            b"sysctl",
+            b"apt-get",
+            b"dnf",
+            b"coreutils",
+        ] {
+            assert!(deny_by_arguments(name, &Argv::default()).is_empty());
+        }
+        assert!(evaluate_deny_list_for_any_argv(b"/usr/bin/coreutils").is_empty());
+        assert!(!evaluate_deny_list_for_any_argv(b"/usr/bin/sh").is_empty());
     }
 
     #[test]

@@ -1,6 +1,5 @@
 ---
 source: crates/xudod/tests/record_snapshots.rs
-assertion_line: 145
 expression: text
 ---
 ## minted
@@ -14,7 +13,7 @@ expression: text
   "classification": "unattested",
   "decision": "allowed",
   "denial": null,
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -33,7 +32,7 @@ expression: text
     "nonce=abababababababababababababababababababababababababababababababab",
     "deadline_ms=1900"
   ],
-  "hash": "840dcd940c0b699c73c0a5d2ce4d31382f50c1f441606b980dd58e228937dbf5",
+  "hash": "d5a76f1665fb8c8927abdd708d8ceb50461d6793e033082055ece0207e587651",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -52,7 +51,7 @@ expression: text
   "classification": "unattested",
   "decision": "awaiting_confirmation",
   "denial": null,
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -69,7 +68,7 @@ expression: text
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "5ba2de4d8485c824b06d6b9f0672d2cca4329f2d2e0c99541d3b5ca67b6471ce",
+  "hash": "086674ae2b87f6d76d58e704535fa7483e02bef998fe09fb02164ab7f0dfe98f",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -86,7 +85,7 @@ expression: text
   "classification": "unattested",
   "decision": "denied",
   "denial": "argv_rejected",
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -103,7 +102,7 @@ expression: text
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "53b845bdff75616fb4a61bfae73031c684c2fdf353b514434b36af246cf4e595",
+  "hash": "76e90ef8a42090037ec1f71245fa92bc351fcb2d5b308acadc7c8e5e69f076d4",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": null,
