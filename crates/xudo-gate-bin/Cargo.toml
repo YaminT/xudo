@@ -1,6 +1,6 @@
 [package]
 name = "xudo-gate-bin"
-description = "The `xudo-gate` executable, installed as /usr/libexec/xudo/xudo-gate with xudo-gate-auth as a hardlink. A five-line entry point over the xudo-gate library."
+description = "The `xudo-gate` executable, installed as the two files /usr/libexec/xudo/xudo-gate-auth and xudo-gate-nopass (copies, never hardlinks). A five-line entry point over the xudo-gate library."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

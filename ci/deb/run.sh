@@ -48,7 +48,7 @@ command -v grep >/dev/null || { echo "FAIL: grep is required" >&2; exit 1; }
 package_root=$(mktemp -d "$root/target/deb-check.XXXXXX")
 trap 'rm -rf "$package_root"' EXIT
 dpkg-deb -x "$deb" "$package_root"
-for binary in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-session; do
+for binary in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-gate-nopass usr/libexec/xudo/xudo-session; do
     f="$package_root/$binary"
     if [ ! -f "$f" ]; then
         echo "FAIL: normal_package_contains_all_binaries (missing $binary)" >&2

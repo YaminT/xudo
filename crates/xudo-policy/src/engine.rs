@@ -397,7 +397,8 @@ impl<'c> Run<'c> {
 
         // G1 will act on the grant; until then the verdict still confirms, so a
         // grant never lifts the operator's `confirm_human_path` approval.
-        // G1a deletes the next statement.
+        // G1b deletes the next statement. G1a keeps it as a second lock that
+        // leaves `-nopass` inert.
         let reason = reason.or(harness_grant
             .as_ref()
             .map(|_| ConfirmReason::AgentActionsConfirmed));

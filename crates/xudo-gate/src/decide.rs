@@ -35,8 +35,10 @@ use xudo_policy::{
     Request, RuleSet, Verdict, engine,
 };
 
+use xudo_sys::GateMode;
+
 use crate::env::child_environment;
-use crate::request::{BoottimeMillis, CallerPin, PendingRequest, RequestError};
+use crate::request::{AttestedClass, BoottimeMillis, CallerPin, PendingRequest, RequestError, Via};
 
 /// The caller, as the gate itself established it.
 ///
@@ -104,6 +106,12 @@ pub struct GateContext {
     /// that was merely approved: that is the broker's `confirmed`, which adds
     /// the watch fact but never replaces this password fact.
     pub password_confirms: bool,
+    /// Which gate file this process is, as the executed file says.
+    ///
+    /// Never read from `argv[0]`: the caller chooses that. `Nopass` skips the
+    /// password half of a confirmation and so asks for more, not less: see
+    /// [`ModeRefusal`] and [`decide`].
+    pub mode: GateMode,
 }
 
 /// How loudly a refusal should be reported.
@@ -152,6 +160,14 @@ pub enum Refusal {
          channel to ask on"
     )]
     ConfirmationMissing(Box<Decision>),
+    /// The entry does not belong to the gate file that is running it.
+    #[error("the {mode} gate refuses this entry: {reason}")]
+    Mode {
+        /// Which gate file ran.
+        mode: &'static str,
+        /// Which requirement failed.
+        reason: ModeRefusal,
+    },
     /// The gate could not do one of the steps that come before or after the
     /// decision, and so did not run anything.
     ///
@@ -167,6 +183,44 @@ pub enum Refusal {
         /// Why, in words. Display only.
         reason: String,
     },
+}
+
+/// Which requirement of the gate file's mode an entry failed.
+///
+/// `-auth` requires an `auth` entry. `-nopass` requires, all together: a
+/// `harness` entry, a stored and a live class that are both an enrolled
+/// agent, the live label equal to the label the entry was minted for, and a
+/// decision that is a plain `Allow` with a harness grant: an
+/// `AllowWithConfirmation` is refused whatever `confirmed` says, because no
+/// password was asked for and none may be assumed. Every one is a refusal at
+/// high severity: none happens unless someone is trying the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ModeRefusal {
+    /// The entry's `via` is not the one this gate file runs.
+    #[error("the entry was minted for the other gate file")]
+    WrongVia,
+    /// The stored or the live class is not an enrolled agent.
+    #[error("the caller is not a live enrolled agent")]
+    NotAnEnrolledAgent,
+    /// The live label is not the one the entry was minted for.
+    #[error("the live harness label is not the one the entry was minted for")]
+    LabelDiffers,
+    /// The ruleset does not grant this command to this harness without a
+    /// confirmation.
+    #[error("no rule grants this command to this harness without a password")]
+    NotGranted,
+}
+
+impl ModeRefusal {
+    /// The stable code recorded in the audit trail.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::WrongVia => "gate_mode_wrong_via",
+            Self::NotAnEnrolledAgent => "gate_mode_not_an_enrolled_agent",
+            Self::LabelDiffers => "gate_mode_label_differs",
+            Self::NotGranted => "gate_mode_not_granted",
+        }
+    }
 }
 
 /// The steps of the gate's sequence that can fail without the request being at
@@ -274,6 +328,7 @@ impl Refusal {
                 .denial
                 .map_or("gate_policy_denied", DenialCode::as_str),
             Self::ConfirmationMissing(_) => "gate_confirmation_missing",
+            Self::Mode { reason, .. } => reason.code(),
             Self::Failed { stage, .. } => stage.code(),
         }
     }
@@ -288,9 +343,10 @@ impl Refusal {
             Self::Request(RequestError::Expired { .. } | RequestError::StaleGeneration { .. })
             | Self::Policy(_) => Severity::Normal,
             Self::Failed { stage, .. } => stage.severity(),
-            Self::NoPendingRequest { .. } | Self::Request(_) | Self::ConfirmationMissing(_) => {
-                Severity::High
-            }
+            Self::NoPendingRequest { .. }
+            | Self::Request(_)
+            | Self::ConfirmationMissing(_)
+            | Self::Mode { .. } => Severity::High,
         }
     }
 
@@ -305,9 +361,10 @@ impl Refusal {
         match self {
             Self::Policy(_) => ExitCode::Denied,
             Self::ConfirmationMissing(_) => ExitCode::NotConfirmed,
-            Self::NoPendingRequest { .. } | Self::Request(_) | Self::Failed { .. } => {
-                ExitCode::Unusable
-            }
+            Self::NoPendingRequest { .. }
+            | Self::Request(_)
+            | Self::Mode { .. }
+            | Self::Failed { .. } => ExitCode::Unusable,
         }
     }
 }
@@ -422,17 +479,7 @@ pub fn decide(
 
     let decision = engine::evaluate(rules, &caller.facts, &request, context.settings);
 
-    match decision.verdict {
-        Verdict::Deny => return Err(Refusal::Policy(Box::new(decision))),
-        // A confirmation requirement the entry does not satisfy is a refusal
-        // here even though the front-end may already have shown a prompt: the
-        // gate's evidence that a human approved is the broker's record, and
-        // there isn't one.
-        Verdict::AllowWithConfirmation if !confirmation_satisfied(pending, &context) => {
-            return Err(Refusal::ConfirmationMissing(Box::new(decision)));
-        }
-        Verdict::Allow | Verdict::AllowWithConfirmation => {}
-    }
+    check_verdict(&decision, pending, &context)?;
 
     // The engine cites the governing action on every allowing decision. The
     // defaults are the requested action, eagerly built, so there is no arm
@@ -478,12 +525,92 @@ pub(crate) fn validate_pending_identity(
     context: &GateContext,
 ) -> Result<(), Refusal> {
     pending.validate(caller.pin, context.generation, context.now)?;
+    require_mode(pending, caller, context)?;
     if !pending.live_attested_identity_matches(
         &caller.attested_class,
         caller.attested_scope_id,
         caller.boot_id.as_deref(),
     ) {
         return Err(Refusal::Request(RequestError::WrongAttestedIdentity));
+    }
+    Ok(())
+}
+
+/// Whether the verdict lets the gate file that is running proceed.
+///
+/// `-auth` proceeds on an `Allow`, and on an `AllowWithConfirmation` that the
+/// entry's confirmation satisfies. `-nopass` proceeds only on a plain `Allow`
+/// that names a harness grant: no password was asked for, so a confirmation
+/// requirement is refused whatever `confirmed` says, and an `Allow` with no
+/// grant (a human's `confirm = "never"`) is refused too.
+fn check_verdict(
+    decision: &Decision,
+    pending: &PendingRequest,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    match (context.mode, decision.verdict) {
+        (_, Verdict::Deny) => Err(Refusal::Policy(Box::new(decision.clone()))),
+        (GateMode::Nopass, Verdict::Allow) if decision.harness_grant.is_some() => Ok(()),
+        (GateMode::Nopass, _) => Err(mode_refusal(context.mode, ModeRefusal::NotGranted)),
+        // A confirmation requirement the entry does not satisfy is a refusal
+        // here even though the front-end may already have shown a prompt: the
+        // gate's evidence that a human approved is the broker's record, and
+        // there isn't one.
+        (GateMode::Auth, Verdict::AllowWithConfirmation)
+            if !confirmation_satisfied(pending, context) =>
+        {
+            Err(Refusal::ConfirmationMissing(Box::new(decision.clone())))
+        }
+        (GateMode::Auth, Verdict::Allow | Verdict::AllowWithConfirmation) => Ok(()),
+    }
+}
+
+/// The refusal for an entry that does not belong to the running gate file.
+fn mode_refusal(mode: GateMode, reason: ModeRefusal) -> Refusal {
+    Refusal::Mode {
+        mode: match mode {
+            GateMode::Auth => "-auth",
+            GateMode::Nopass => "-nopass",
+        },
+        reason,
+    }
+}
+
+/// What the gate file that is running requires of the entry, before the
+/// decision is made.
+///
+/// `-auth` runs only an `auth` entry. `-nopass` runs only a `harness` entry
+/// for a caller that is, on the gate's own reading, a live enrolled agent
+/// whose label is the one the broker minted the entry for. The grant itself
+/// is [`decide`]'s: it needs the decision.
+fn require_mode(
+    pending: &PendingRequest,
+    caller: &GateCaller,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    let outcome = match context.mode {
+        GateMode::Auth if pending.via == Via::Auth => Ok(()),
+        GateMode::Auth => Err(ModeRefusal::WrongVia),
+        GateMode::Nopass => require_live_harness(pending, caller),
+    };
+    outcome.map_err(|reason| mode_refusal(context.mode, reason))
+}
+
+/// The `-nopass` half of [`require_mode`].
+fn require_live_harness(pending: &PendingRequest, caller: &GateCaller) -> Result<(), ModeRefusal> {
+    if pending.via != Via::Harness {
+        return Err(ModeRefusal::WrongVia);
+    }
+    let (AttestedClass::EnrolledAgent { .. }, AttestedClass::EnrolledAgent { .. }) =
+        (&pending.attested_class, &caller.attested_class)
+    else {
+        return Err(ModeRefusal::NotAnEnrolledAgent);
+    };
+    let Classification::EnrolledAgent { agent_id, .. } = &caller.facts.classification else {
+        return Err(ModeRefusal::NotAnEnrolledAgent);
+    };
+    if pending.attested_harness.as_deref() != Some(agent_id.as_str()) {
+        return Err(ModeRefusal::LabelDiffers);
     }
     Ok(())
 }
@@ -789,6 +916,7 @@ all = [
             now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: false,
+            mode: GateMode::Auth,
         }
     }
 
@@ -818,6 +946,7 @@ all = [
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -839,7 +968,10 @@ all = [
     fn refused_decision(refusal: &Refusal) -> Option<&Decision> {
         match refusal {
             Refusal::Policy(decision) | Refusal::ConfirmationMissing(decision) => Some(decision),
-            Refusal::NoPendingRequest { .. } | Refusal::Request(_) | Refusal::Failed { .. } => None,
+            Refusal::NoPendingRequest { .. }
+            | Refusal::Request(_)
+            | Refusal::Mode { .. }
+            | Refusal::Failed { .. } => None,
         }
     }
 
@@ -1740,5 +1872,471 @@ args = [
         );
         assert!(!record.outcome.executed());
         assert!(record.describes(&approved).is_ok());
+    }
+
+    // ---- the `-nopass` gate file (inert: nothing mints a `harness` entry) ----
+
+    const BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+
+    fn nopass_context() -> GateContext {
+        GateContext {
+            mode: GateMode::Nopass,
+            password_confirms: false,
+            ..context()
+        }
+    }
+
+    /// A live enrolled agent, as the gate itself reads it.
+    fn live_agent(pid: u32, label: &str, scope: u64) -> GateCaller {
+        GateCaller {
+            pin: CallerPin::new(pid, 555),
+            facts: CallerFacts::new(
+                Classification::EnrolledAgent {
+                    agent_id: label.into(),
+                    session_id: "s-9".into(),
+                    declared_yolo: false,
+                },
+                1000,
+            ),
+            attested_class: AttestedClass::EnrolledAgent { scope_id: scope },
+            attested_scope_id: Some(scope),
+            boot_id: Some(BOOT.to_owned()),
+        }
+    }
+
+    /// What the broker would write for a harness grant, once it does.
+    fn harness_entry(pid: u32) -> PendingRequest {
+        let mut pending = status_request(pid);
+        pending.via = Via::Harness;
+        pending.attested_class = AttestedClass::EnrolledAgent { scope_id: 44 };
+        pending.attested_scope_id = Some(44);
+        pending.boot_id = Some(BOOT.to_owned());
+        pending.attested_harness = Some("claude-code".to_owned());
+        pending
+    }
+
+    const GRANT_RULES: &str = r#"
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["claude-code"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+    fn grant_rules() -> RuleSet {
+        RuleSet::from_toml("grant.toml", GRANT_RULES).unwrap()
+    }
+
+    fn mode_code(result: Result<Approved, Refusal>) -> String {
+        let refusal = result.unwrap_err();
+        if matches!(refusal, Refusal::Mode { .. }) {
+            assert_eq!(refusal.severity(), Severity::High, "{refusal}");
+            assert_eq!(refusal.exit_code(), ExitCode::Unusable);
+        }
+        refusal.code().to_owned()
+    }
+
+    #[test]
+    fn nopass_refuses_an_auth_entry() {
+        // The `-nopass` file never runs what a password was meant to confirm.
+        let pending = status_request(77);
+        assert_eq!(pending.via, Via::Auth);
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 44),
+                Some(&pending),
+                nopass_context()
+            )),
+            "gate_mode_wrong_via"
+        );
+    }
+
+    #[test]
+    fn the_auth_gate_refuses_a_harness_entry() {
+        // And the password gate never runs an entry minted to skip the password.
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                context()
+            )),
+            "gate_mode_wrong_via"
+        );
+    }
+
+    #[test]
+    fn nopass_refuses_a_human_entry_in_every_state() {
+        for caller in [human(77), agent(77)] {
+            for class in [AttestedClass::Unattested, AttestedClass::Human] {
+                let mut pending = harness_entry(77);
+                pending.attested_class = class;
+                pending.attested_scope_id = None;
+                pending.boot_id = None;
+                pending.attested_harness = None;
+                assert_eq!(
+                    mode_code(decide(
+                        &grant_rules(),
+                        &caller,
+                        Some(&pending),
+                        nopass_context()
+                    )),
+                    "gate_mode_not_an_enrolled_agent"
+                );
+            }
+        }
+        // A stored human or unattested entry with a live enrolled agent (and
+        // its scope), the one pairing only `require_live_harness` refuses.
+        for class in [AttestedClass::Unattested, AttestedClass::Human] {
+            let mut pending = harness_entry(77);
+            pending.attested_class = class;
+            let live = live_agent(77, "claude-code", 44);
+            assert_eq!(
+                require_live_harness(&pending, &live),
+                Err(ModeRefusal::NotAnEnrolledAgent)
+            );
+            assert!(decide(&grant_rules(), &live, Some(&pending), nopass_context()).is_err());
+        }
+        // A stored enrolled agent whose live read is a human or nothing.
+        for live in [human(77), agent(77)] {
+            assert_eq!(
+                mode_code(decide(
+                    &grant_rules(),
+                    &live,
+                    Some(&harness_entry(77)),
+                    nopass_context()
+                )),
+                "gate_mode_not_an_enrolled_agent"
+            );
+        }
+    }
+
+    #[test]
+    fn nopass_refuses_a_live_class_that_differs_from_the_stored_one() {
+        // Same label, another scope: the entry was minted for a scope the
+        // caller has left.
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 45),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "request_wrong_attested_identity"
+        );
+        // Same scope, another label: the registry names another harness now.
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "codex", 44),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "gate_mode_label_differs"
+        );
+        // An entry that names no label at all is not an enrolled entry.
+        let mut unlabelled = harness_entry(77);
+        unlabelled.attested_harness = None;
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 44),
+                Some(&unlabelled),
+                nopass_context()
+            )),
+            "request_invalid_attested_identity"
+        );
+    }
+
+    #[test]
+    fn nopass_refuses_a_rule_without_this_harness() {
+        let other = GRANT_RULES.replace("claude-code", "codex");
+        let rules = RuleSet::from_toml("other.toml", &other).unwrap();
+        assert_eq!(
+            mode_code(decide(
+                &rules,
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "gate_mode_not_granted"
+        );
+        // And a rule that lists no harness at all.
+        assert_eq!(
+            mode_code(decide(
+                &rules_without_harness(),
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "gate_mode_not_granted"
+        );
+    }
+
+    fn rules_without_harness() -> RuleSet {
+        rules()
+    }
+
+    #[test]
+    fn nopass_refuses_an_ask_human_rule() {
+        let ask = GRANT_RULES.replace("outcome = \"allow\"", "outcome = \"ask-human\"");
+        let rules = RuleSet::from_toml("ask.toml", &ask).unwrap();
+        assert_eq!(
+            mode_code(decide(
+                &rules,
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "ask_human"
+        );
+    }
+
+    #[test]
+    fn nopass_ignores_a_confirmed_flag() {
+        // The verdict decides under `-nopass`: what the entry says a human
+        // approved is not read. Both settings of the watch channel.
+        let mut pending = harness_entry(77);
+        pending.confirmed = true;
+        for confirm_human_path in [false, true] {
+            let mut context = nopass_context();
+            context.settings.confirm_human_path = confirm_human_path;
+            // An approval on a harness entry is not one the broker wrote.
+            assert_eq!(
+                decide(
+                    &grant_rules(),
+                    &live_agent(77, "claude-code", 44),
+                    Some(&pending),
+                    context
+                )
+                .unwrap_err()
+                .code(),
+                "request_unattributed_confirmation"
+            );
+        }
+        // And a stand-alone verdict that confirms is not made an `Allow` by a
+        // confirmed entry, whatever `password_confirms` says.
+        let decision = confirming_decision();
+        let mut context = nopass_context();
+        context.password_confirms = true;
+        let mut approved = harness_entry(77);
+        approved.confirmed = true;
+        assert_eq!(
+            check_verdict(&decision, &approved, &context)
+                .unwrap_err()
+                .code(),
+            "gate_mode_not_granted"
+        );
+    }
+
+    /// What the engine says today for a listed harness on an allow rule: the
+    /// grant is recorded and the verdict still confirms.
+    fn confirming_decision() -> Decision {
+        let decision = engine::evaluate(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44).facts,
+            &Request::for_program(
+                ActionId::new("xudo.svc.status"),
+                "/usr/bin/systemctl",
+                Argv::new(["--no-pager", "status", "nginx.service"]),
+            ),
+            engine::Settings::default(),
+        );
+        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
+        assert!(decision.harness_grant.is_some());
+        decision
+    }
+
+    #[test]
+    fn nopass_stays_inert_while_the_engine_still_confirms_a_granted_harness() {
+        // Everything about the caller is right and a rule grants the harness,
+        // and the `-nopass` gate still refuses: the engine's verdict for a
+        // granted agent is `AllowWithConfirmation` until the broker mints
+        // `harness` entries. Nothing in this change makes a caller passwordless.
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "gate_mode_not_granted"
+        );
+    }
+
+    #[test]
+    fn the_verdict_check_proceeds_only_on_a_plain_allow_that_names_a_grant() {
+        let base = confirming_decision();
+        let mut granted_allow = base.clone();
+        granted_allow.verdict = Verdict::Allow;
+        let mut bare_allow = granted_allow.clone();
+        bare_allow.harness_grant = None;
+        let pending = harness_entry(77);
+        let nopass = nopass_context();
+        assert_eq!(check_verdict(&granted_allow, &pending, &nopass), Ok(()));
+        for refused in [&base, &bare_allow] {
+            assert_eq!(
+                check_verdict(refused, &pending, &nopass)
+                    .unwrap_err()
+                    .code(),
+                "gate_mode_not_granted"
+            );
+        }
+        let mut denied = granted_allow.clone();
+        denied.verdict = Verdict::Deny;
+        assert_eq!(
+            check_verdict(&denied, &pending, &nopass)
+                .unwrap_err()
+                .code(),
+            "gate_policy_denied"
+        );
+        // The same plain allow is fine under `-auth`, and the confirming one
+        // is not, without the password.
+        assert_eq!(check_verdict(&granted_allow, &pending, &context()), Ok(()));
+        assert_eq!(
+            check_verdict(&base, &pending, &context())
+                .unwrap_err()
+                .code(),
+            "gate_confirmation_missing"
+        );
+    }
+
+    #[test]
+    fn a_live_class_that_is_enrolled_while_the_facts_say_otherwise_is_refused() {
+        // The two live readings must agree: the attested class and the
+        // classification the engine decides on.
+        let mut caller = live_agent(77, "claude-code", 44);
+        caller.facts = human(77).facts;
+        assert_eq!(
+            require_live_harness(&harness_entry(77), &caller),
+            Err(ModeRefusal::NotAnEnrolledAgent)
+        );
+    }
+
+    #[test]
+    fn the_live_harness_requirements_hold_for_a_matching_entry() {
+        // The positive half: what a future grant must also satisfy.
+        assert_eq!(
+            require_live_harness(&harness_entry(77), &live_agent(77, "claude-code", 44)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn direct_nopass_invocation_with_no_entry_does_nothing() {
+        let refusal = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            None,
+            nopass_context(),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "gate_no_pending_request");
+    }
+
+    #[test]
+    fn a_mode_refusal_is_audited_with_its_code_and_names_its_gate_file() {
+        let refusal = decide(
+            &grant_rules(),
+            &human(77),
+            Some(&status_request(77)),
+            nopass_context(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "the -nopass gate refuses this entry: the entry was minted for the other gate file"
+        );
+        let record = refusal_record(None, &refusal, &human(77), None);
+        assert_eq!(record.denial.as_deref(), Some("gate_mode_wrong_via"));
+        let auth = decide(
+            &grant_rules(),
+            &human(77),
+            Some(&harness_entry(77)),
+            context(),
+        )
+        .unwrap_err();
+        assert!(auth.to_string().starts_with("the -auth gate refuses"));
+        for reason in [
+            ModeRefusal::WrongVia,
+            ModeRefusal::NotAnEnrolledAgent,
+            ModeRefusal::LabelDiffers,
+            ModeRefusal::NotGranted,
+        ] {
+            assert!(!reason.to_string().is_empty());
+        }
+    }
+
+    /// Over class × via × scope × label × verdict × grant (all 432 cases, no
+    /// sampling: a sampled space this small let a mutant through), `-nopass`
+    /// proceeds for exactly one combination: a harness entry, a stored and a
+    /// live enrolled agent with the stored label, and a plain allow with a
+    /// grant. The scope is `decide`'s separate check
+    /// (`request_wrong_attested_identity`), not this function's, so the
+    /// expectation does not depend on it.
+    #[test]
+    fn nopass_refuses_any_entry_that_is_not_a_live_granted_harness() {
+        let class = |kind: u8, scope: u64| match kind {
+            0 => AttestedClass::Unattested,
+            1 => AttestedClass::Human,
+            _ => AttestedClass::EnrolledAgent { scope_id: scope },
+        };
+        let mut cases = 0_u32;
+        for via_harness in [false, true] {
+            for stored in 0_u8..3 {
+                for live in 0_u8..3 {
+                    for same_scope in [false, true] {
+                        for same_label in [false, true] {
+                            for verdict in 0_u8..3 {
+                                for grant in [false, true] {
+                                    cases += 1;
+                                    let mut pending = harness_entry(77);
+                                    pending.via =
+                                        if via_harness { Via::Harness } else { Via::Auth };
+                                    pending.attested_class = class(stored, 44);
+                                    let label = if same_label { "claude-code" } else { "codex" };
+                                    let mut caller = live_agent(77, label, 44);
+                                    caller.attested_class =
+                                        class(live, if same_scope { 44 } else { 45 });
+                                    let required = require_live_harness(&pending, &caller);
+                                    let mut decision = confirming_decision();
+                                    decision.verdict = match verdict {
+                                        0 => Verdict::Allow,
+                                        1 => Verdict::AllowWithConfirmation,
+                                        _ => Verdict::Deny,
+                                    };
+                                    if !grant {
+                                        decision.harness_grant = None;
+                                    }
+                                    let verdict_ok =
+                                        check_verdict(&decision, &pending, &nopass_context())
+                                            .is_ok();
+                                    let expected = via_harness
+                                        && stored == 2
+                                        && live == 2
+                                        && same_label
+                                        && verdict == 0
+                                        && grant;
+                                    assert_eq!(
+                                        required.is_ok() && verdict_ok,
+                                        expected,
+                                        "{via_harness} {stored} {live} {same_scope} {same_label} {verdict} {grant}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 432);
     }
 }

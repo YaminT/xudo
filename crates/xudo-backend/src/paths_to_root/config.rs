@@ -344,6 +344,38 @@ pub(super) fn scan_doas(bytes: &[u8]) -> Vec<RuleLine> {
         .collect()
 }
 
+/// What one logical line of a doas file came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DoasReading {
+    /// A `permit` or `deny` rule, read in full.
+    Rule,
+    /// A line doas refuses (its first word is not `permit` or `deny`, or the
+    /// words after it are not the grammar's), so it refuses the whole file.
+    Invalid,
+    /// A line the lexer cannot be modelled on that may carry `nopass`: doas
+    /// may apply it as a rule, so it counts as one that does.
+    Unparsed,
+}
+
+/// Whether a doas rule changes the command's environment (`keepenv`, `setenv`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DoasEnv {
+    /// It does not.
+    Unchanged,
+    /// It does.
+    Changed,
+}
+
+/// Whether a doas rule lists arguments after `cmd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DoasArgs {
+    /// None: it matches a run with any, or (with an empty `args`) none.
+    Open,
+    /// A non-empty list: it matches only a run with exactly those, and the
+    /// gate is run with none.
+    Listed,
+}
+
 /// One doas `permit` or `deny` rule, read for who it names and what it does to
 /// the password. doas uses the last rule that matches, so order matters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +384,8 @@ pub(super) struct DoasRule {
     pub(super) line: usize,
     /// The rule, continuation lines joined with a space.
     pub(super) text: Vec<u8>,
+    /// How far it could be read.
+    pub(super) reading: DoasReading,
     /// `permit` (true) or `deny`.
     pub(super) permit: bool,
     /// The identity, unquoted: `user`, `:group`, or either by number.
@@ -360,72 +394,134 @@ pub(super) struct DoasRule {
     pub(super) persist: bool,
     /// The rule carries `nopass`.
     pub(super) nopass: bool,
+    /// The rule carries `keepenv` or `setenv`.
+    pub(super) env: DoasEnv,
     /// Who it runs as, after `as`; none means root.
     pub(super) target: Option<Vec<u8>>,
     /// The program after `cmd`; none means any command.
     pub(super) cmd: Option<Vec<u8>>,
+    /// The rule lists arguments after `cmd`: it matches only a run with
+    /// exactly those, and the gate is run with none.
+    pub(super) args: DoasArgs,
 }
 
-/// Reads every `permit` and `deny` rule of one doas file, in order. A line the
-/// lexer cannot be modelled on is left out: `doas_unmodelled` reports it.
+impl DoasRule {
+    /// A line that is not a rule this reads, whole.
+    fn unread(logical: Logical, reading: DoasReading) -> Self {
+        Self {
+            line: logical.line,
+            text: logical.text,
+            reading,
+            permit: true,
+            identity: Vec::new(),
+            persist: false,
+            nopass: reading == DoasReading::Unparsed,
+            env: DoasEnv::Unchanged,
+            target: None,
+            cmd: None,
+            args: DoasArgs::Open,
+        }
+    }
+}
+
+/// Reads every logical line of one doas file that is a rule or that doas
+/// would act on, in order.
 pub(super) fn scan_doas_rules(bytes: &[u8]) -> Vec<DoasRule> {
     logical_lines(bytes, is_hash_comment, Dialect::Doas)
         .logical
         .into_iter()
-        .filter(|logical| !logical.uncertain)
         .filter_map(|logical| {
-            let trimmed = logical.text.trim_ascii_start();
-            let (permit, rest) = match word_at_start(trimmed, b"permit") {
+            if logical.uncertain {
+                return spelled_with_or_without_escapes(&logical.glued, b"nopass")
+                    .then(|| DoasRule::unread(logical, DoasReading::Unparsed));
+            }
+            let trimmed = logical.text.trim_ascii_start().to_vec();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let (permit, rest) = match word_at_start(&trimmed, b"permit") {
                 Some(rest) => (true, rest),
-                None => (false, word_at_start(trimmed, b"deny")?),
+                None => match word_at_start(&trimmed, b"deny") {
+                    Some(rest) => (false, rest),
+                    None => return Some(DoasRule::unread(logical, DoasReading::Invalid)),
+                },
             };
             let words = doas_words(rest);
-            let mut tokens = words.iter().map(Vec::as_slice);
-            let (mut persist, mut nopass) = (false, false);
-            let mut identity = None;
-            while let Some(token) = tokens.next() {
-                match token {
-                    b"nopass" => nopass = true,
-                    b"persist" => persist = true,
-                    b"nolog" | b"keepenv" => {}
-                    b"setenv" => {
-                        // `setenv` takes a brace-wrapped list; without both
-                        // braces doas refuses the file.
-                        if tokens.next() != Some(b"{".as_slice())
-                            || !tokens.by_ref().any(|token| token == b"}")
-                        {
-                            return None;
-                        }
-                    }
-                    other => {
-                        identity = Some(other.to_vec());
-                        break;
-                    }
-                }
+            let mut rule = parse_doas_words(&words, permit, logical.line, &logical.text);
+            if rule.is_none() {
+                // The grammar rejects it, as far as this knows. If doas was
+                // in fact to accept it, `nopass` is what would hurt.
+                let reading = if words.iter().any(|word| word == b"nopass") {
+                    DoasReading::Unparsed
+                } else {
+                    DoasReading::Invalid
+                };
+                rule = Some(DoasRule::unread(logical, reading));
             }
-            let (mut target, mut cmd) = (None, None);
-            while let Some(token) = tokens.next() {
-                match token {
-                    b"as" => target = tokens.next().map(<[u8]>::to_vec),
-                    b"cmd" => {
-                        cmd = tokens.next().map(<[u8]>::to_vec);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            Some(DoasRule {
-                line: logical.line,
-                text: logical.text,
-                permit,
-                identity: identity?,
-                persist,
-                nopass,
-                target,
-                cmd,
-            })
+            rule
         })
         .collect()
+}
+
+/// The words after `permit` or `deny`, read as `OpenDoas`'s grammar has them:
+/// options (`permit` only), an identity, `as <user>`, then `cmd <program>`
+/// with an optional `args` list. `None` where it does not fit.
+fn parse_doas_words(words: &[Vec<u8>], permit: bool, line: usize, text: &[u8]) -> Option<DoasRule> {
+    let mut tokens = words.iter().map(Vec::as_slice).peekable();
+    let (mut persist, mut nopass, mut env) = (false, false, DoasEnv::Unchanged);
+    let mut identity = None;
+    while let Some(token) = tokens.next() {
+        match token {
+            b"nopass" | b"persist" | b"nolog" | b"keepenv" | b"setenv" if !permit => return None,
+            b"nopass" => nopass = true,
+            b"persist" => persist = true,
+            b"nolog" => {}
+            b"keepenv" => env = DoasEnv::Changed,
+            b"setenv" => {
+                // `setenv` takes a brace-wrapped list; without both braces
+                // doas refuses the file.
+                env = DoasEnv::Changed;
+                if tokens.next() != Some(b"{".as_slice())
+                    || !tokens.by_ref().any(|token| token == b"}")
+                {
+                    return None;
+                }
+            }
+            other => {
+                identity = Some(other.to_vec());
+                break;
+            }
+        }
+    }
+    let identity = identity?;
+    let target = if tokens.next_if_eq(&b"as".as_slice()).is_some() {
+        Some(tokens.next()?.to_vec())
+    } else {
+        None
+    };
+    let (mut cmd, mut args) = (None, DoasArgs::Open);
+    if tokens.next_if_eq(&b"cmd".as_slice()).is_some() {
+        cmd = Some(tokens.next()?.to_vec());
+        if tokens.next_if_eq(&b"args".as_slice()).is_some() {
+            if tokens.next().is_some() {
+                args = DoasArgs::Listed;
+            }
+            tokens.by_ref().for_each(drop);
+        }
+    }
+    tokens.next().is_none().then(|| DoasRule {
+        line,
+        text: text.to_vec(),
+        reading: DoasReading::Rule,
+        permit,
+        identity,
+        persist,
+        nopass,
+        env,
+        target,
+        cmd,
+        args,
+    })
 }
 
 /// The words of a doas rule the way `OpenDoas`'s lexer cuts them: a `#` ends
@@ -444,7 +540,8 @@ fn doas_words(text: &[u8]) -> Vec<Vec<u8>> {
                 words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
                 words.push(vec![byte]);
             }
-            _ if byte.is_ascii_whitespace() && !quoted => {
+            // doas cuts words at a space or a tab only: a `\r` stays in its word.
+            b' ' | b'\t' if !quoted => {
                 words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
             }
             _ => word.push(byte),

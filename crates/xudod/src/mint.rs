@@ -371,6 +371,7 @@ pub(crate) fn entry_for_classified(
             attested_scope_id,
             boot_id: stored_boot,
             attested_harness,
+            via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: Some(xudo_gate::request::RequestedOp {
                 op: "remove-path".to_owned(),
@@ -415,6 +416,7 @@ pub(crate) fn entry_for_classified(
         attested_scope_id,
         boot_id,
         attested_harness,
+        via: xudo_gate::request::Via::Auth,
         queue_id: None,
         operation: None,
     })
@@ -691,6 +693,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -844,6 +847,7 @@ mod tests {
                 attested_scope_id: None,
                 boot_id: None,
                 attested_harness: None,
+                via: xudo_gate::request::Via::Auth,
                 queue_id: None,
                 operation: None,
             }

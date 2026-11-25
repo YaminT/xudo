@@ -8,6 +8,18 @@ export DEBIAN_FRONTEND=noninteractive
 fail() { echo "FAIL: $*" >&2; exit 1; }
 meta() { [ "$(stat -c '%a %U:%G' "$1")" = "$2" ] || fail "$1 is $(stat -c '%a %U:%G' "$1"), wanted $2"; }
 gone() { [ ! -e "$1" ] && [ ! -L "$1" ] || fail "$1 exists, and must not"; }
+# The gate reads its mode from the executed inode: two files of root's, one
+# name each, the same bytes, and no sudoers text naming the passwordless one.
+gate_files_ok() {
+    local a=/usr/libexec/xudo/xudo-gate-auth n=/usr/libexec/xudo/xudo-gate-nopass
+    meta $a "755 root:root"
+    meta $n "755 root:root"
+    [ "$(stat -c %h $a)" = 1 ] || fail "$a has more than one name"
+    [ "$(stat -c %h $n)" = 1 ] || fail "$n has more than one name"
+    [ "$(stat -c %i $a)" != "$(stat -c %i $n)" ] || fail "the two gate files are one inode"
+    cmp -s $a $n || fail "the two gate files differ"
+    ! grep -rqs xudo-gate-nopass /etc/sudoers /etc/sudoers.d || fail "sudoers names the passwordless gate"
+}
 rule=/etc/sudoers.d/xudo
 socket=/etc/systemd/system/sockets.target.wants/xudod.socket
 timer=/etc/systemd/system/timers.target.wants/xudo-pasban.timer
@@ -75,7 +87,9 @@ rm /etc/sudoers.d/xudo.conf
 if command -v debsums >/dev/null 2>&1; then debsums -s xudo || fail "debsums"; else dpkg --verify xudo || fail "dpkg --verify"; fi
 meta $rule "440 root:root"
 ! grep -qs NOPASSWD "$rule" || fail "NOPASSWD found in generated sudoers rule"
-! dpkg -L xudo | grep -q xudo-gate-nopass || fail "passwordless gate listed"
+# The -nopass gate ships as a file of its own, inert: no sudoers text names it,
+# so sudo reaches it only with a password rule that does not exist.
+! grep -qs xudo-gate-nopass "$rule" || fail "the sudoers rule names the passwordless gate"
 getent group xudo >/dev/null || fail "no xudo group"
 [ -z "$(getent group xudo | cut -d: -f4)" ] || fail "xudo group is not empty"
 meta /var/lib/xudo "700 root:root"
@@ -109,9 +123,9 @@ grep -q 'LOAD' /tmp/session.elf || fail "xudo-session is not an ELF executable"
 [ -f /usr/lib/systemd/system/xudo-pasban.service ] || fail "pasban service not in the package"
 [ -f /usr/lib/systemd/system/xudo-pasban.timer ] || fail "pasban timer not in the package"
 [ -L "$timer" ] || fail "timer was not enabled"
-gone /usr/libexec/xudo/xudo-gate-nopass
 gone /usr/libexec/xudo/xudo-gate
 [ -x /usr/libexec/xudo/xudo-gate-auth ] || fail "auth gate missing"
+gate_files_ok
 [ "$(stat -c %i /usr/bin/ido)" = "$(stat -c %i /usr/bin/willyoumarryme)" ] || fail "ido names are not one inode"
 files=$(dpkg -L xudo | while read -r f; do if [ -f "$f" ]; then echo "$f"; fi; done)
 [ -n "$files" ] || fail "no files listed"
@@ -134,6 +148,17 @@ doctor_out=$(xudo doctor)
 printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed locally' || fail "doctor missed local rule edit"
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
+# sudo_n_on_the_nopass_file_asks_a_password_until_e8: a group member reaches the
+# passwordless gate through no rule, so `sudo -n` must not run it. Real sudo and
+# sudo-rs word the refusal differently ("not allowed", "password is required"),
+# so assert the invariant, not a phrase: non-zero exit and the gate never ran.
+set +e
+runuser -u xudomember -- sudo -n /usr/libexec/xudo/xudo-gate-nopass "" >/tmp/nopass-sudo.out 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "sudo -n ran the nopass gate without a password"
+! grep -Eqi 'gate_failed|"code"' /tmp/nopass-sudo.out || fail "the nopass gate produced output under sudo -n: $(cat /tmp/nopass-sudo.out)"
+! sudo -l -U xudomember 2>/dev/null | grep -F 'NOPASSWD' | grep -Fq 'xudo-gate' || fail "a rule grants NOPASSWD on a gate file"
 printf '%s\n' '{"h":null,"b":[["fingerprint",3,123]],"o":[]}' >/run/xudo/confirm/legacy.json
 printf '%s\n' 'keep target' >/run/xudo/confirm/target-data
 ln -s target-data /run/xudo/confirm/link.json
@@ -228,8 +253,8 @@ grep -Fq '/usr/share/doc/xudo/SECURITY.md' /tmp/apt.log || fail "real.deb notice
 if command -v debsums >/dev/null 2>&1; then debsums -s xudo || fail "real.deb debsums"; else dpkg --verify xudo || fail "real.deb dpkg --verify"; fi
 meta $rule "440 root:root"
 ! grep -qs NOPASSWD "$rule" || fail "NOPASSWD found in the real package's sudoers rule"
-gone /usr/libexec/xudo/xudo-gate-nopass
 [ -x /usr/libexec/xudo/xudo-gate-auth ] || fail "real.deb auth gate missing"
+gate_files_ok
 [ -f /usr/share/xudo/examples/20-services-lifecycle.toml ] || fail "real.deb lifecycle example not installed"
 [ -L "$socket" ] || fail "real.deb socket was not enabled"
 [ -L "$timer" ] || fail "real.deb timer was not enabled"

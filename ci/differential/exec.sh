@@ -26,8 +26,10 @@ if command -v apk >/dev/null; then apk add -q socat expect coreutils; else apt-g
 
 # The product's files, where the product looks for them.
 install -d -m755 /usr/libexec/xudo /etc/xudo /etc/xudo/rules.d /etc/xudo/harnesses.d
-install -m755 "$bins/xudod" "$bins/xudo-gate" /usr/libexec/xudo/
-ln -f /usr/libexec/xudo/xudo-gate /usr/libexec/xudo/xudo-gate-auth
+install -m755 "$bins/xudod" /usr/libexec/xudo/
+# A copy, never a hardlink: the gate reads its mode from the executed file and
+# refuses a gate file that has a second name.
+install -m755 "$bins/xudo-gate" /usr/libexec/xudo/xudo-gate-auth
 install -m644 /rules/*.toml /harness/harness-rules.toml /etc/xudo/rules.d/
 install -d -m700 /var/lib/xudo
 install -d -m755 /run/xudo

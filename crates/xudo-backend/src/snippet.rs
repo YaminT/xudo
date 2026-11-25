@@ -38,6 +38,10 @@ pub const DOAS_END: &str = "### xudo:end";
 /// The unix group whose members may invoke the gate.
 pub const XUDO_GROUP: &str = "xudo";
 
+/// The unix group whose members may run the passwordless gate: the agent
+/// account, never the human group.
+pub const XUDO_AGENT_GROUP: &str = "xudo-agent";
+
 /// The human-path helper: always requires a password.
 pub const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 
@@ -46,8 +50,8 @@ pub const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 /// **Not installed by the beta.** Until enrollment, the broker, and out-of-band
 /// confirmation exist, a passwordless rule is a standing root grant with no
 /// compensating control. [`SudoersSnippet::human_only`] is the only constructor
-/// the current release uses, and it does not mention this path at all — the
-/// file is absent from the package rather than present and unreferenced.
+/// the current release uses, and it does not mention this path at all: the file
+/// ships in the package, inert, and no sudoers rule names it.
 pub const GATE_NOPASS: &str = "/usr/libexec/xudo/xudo-gate-nopass";
 
 /// The `secure_path` given to the privileged child.
@@ -159,7 +163,7 @@ impl SudoersSnippet {
 
         let _ = writeln!(out, "%{XUDO_GROUP} ALL=(root) PASSWD:   XUDO_AUTH");
         if includes_nopass {
-            let _ = writeln!(out, "%{XUDO_GROUP} ALL=(root) NOPASSWD: XUDO_NOPASS");
+            let _ = writeln!(out, "%{XUDO_AGENT_GROUP} ALL=(root) NOPASSWD: XUDO_NOPASS");
         }
 
         Ok(Self {
@@ -525,6 +529,12 @@ mod tests {
             .unwrap();
         assert!(nopass_line.contains("XUDO_NOPASS"));
         assert!(!nopass_line.contains("XUDO_AUTH"));
+        // The passwordless rule is for the agent group, never the human one.
+        assert!(
+            nopass_line.starts_with("%xudo-agent "),
+            "the passwordless rule must name %xudo-agent: {nopass_line}"
+        );
+        assert!(!nopass_line.starts_with("%xudo "));
         // Both helpers keep the same hardening. Counted over directive lines
         // only, because the explanatory header mentions the directive too.
         assert_eq!(

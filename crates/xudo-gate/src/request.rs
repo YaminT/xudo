@@ -42,7 +42,35 @@ use serde::{Deserialize, Serialize};
 pub const SPOOL_DIR: &str = "/run/xudo/req";
 
 /// The wire version of a spool entry.
-pub const REQUEST_SCHEMA_VERSION: u32 = 4;
+pub const REQUEST_SCHEMA_VERSION: u32 = 5;
+
+/// Which gate file an entry was minted for: how the human path is skipped, if
+/// it is.
+///
+/// Fixed by the broker and compared by the gate with the file it is executing
+/// (`xudo_sys::GateFiles`), never with `argv[0]`. An `auth` entry runs only
+/// under `xudo-gate-auth`, after `sudo` asked a password. A `harness` entry
+/// runs only under `xudo-gate-nopass`, and only for a live enrolled agent the
+/// ruleset grants. The broker writes only `auth` today: nothing mints
+/// `harness`, so `xudo-gate-nopass` refuses every invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    /// A human typed the password `sudo` asked for.
+    Auth,
+    /// A harness the ruleset grants, with no password.
+    Harness,
+}
+
+impl Via {
+    /// The word in the audit trail.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Harness => "harness",
+        }
+    }
+}
 
 /// Classification fixed by the broker from kernel-attested caller facts.
 ///
@@ -410,6 +438,9 @@ pub struct PendingRequest {
     pub caller_tty: i64,
     /// Whether this request requires out-of-band approval.
     pub needs_watch: bool,
+    /// Which gate file may run it. Required: an entry that does not say is not
+    /// run, so there is no default that could mean `harness`.
+    pub via: Via,
     /// Time the prompt was first shown to the `shown_to` watcher.
     pub shown_at_ms: Option<BoottimeMillis>,
     /// Watcher to whom the prompt timestamp applies.
@@ -644,7 +675,18 @@ impl PendingRequest {
         if self.confirmed && self.confirmed_by.is_none() {
             return Err(RequestError::UnattributedConfirmation);
         }
-        if !consistent
+        // A harness grant is not a human approval, and an entry that carries
+        // one half of each is not one the broker wrote.
+        //
+        // `Pending` is the only state `consistent` accepts without a
+        // confirmation, and a prompt shown without `needs_watch` is refused
+        // below, so these two conditions rule out every form of approval.
+        let harness_with_approval = self.via == Via::Harness
+            && (self.needs_watch
+                || self.queue_id.is_some()
+                || self.state != ConfirmationState::Pending);
+        if harness_with_approval
+            || !consistent
             || (self.shown_at_ms.is_some() && !self.needs_watch)
             || (self.shown_at_ms.is_some() != self.shown_to.is_some())
             || self.shown_to.as_ref().is_some_and(|watcher| {
@@ -822,6 +864,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -920,6 +963,76 @@ mod tests {
                 expected: REQUEST_SCHEMA_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn a_schema_4_entry_with_no_via_is_refused() {
+        // What a broker of the previous release wrote: no `via`, and a schema
+        // that says so. It is refused as a schema, never read with a default
+        // that could mean `harness`.
+        let mut old = serde_json::to_value(live()).unwrap();
+        let fields = old.as_object_mut().unwrap();
+        fields.insert("schema_version".to_owned(), serde_json::json!(4));
+        fields.remove("via");
+        assert_eq!(
+            PendingRequest::parse(&old.to_string()).unwrap_err().code(),
+            "request_wrong_schema"
+        );
+        // The right schema with the field missing is malformed, not defaulted.
+        let mut missing = serde_json::to_value(live()).unwrap();
+        missing.as_object_mut().unwrap().remove("via");
+        assert_eq!(
+            PendingRequest::parse(&missing.to_string())
+                .unwrap_err()
+                .code(),
+            "request_malformed"
+        );
+    }
+
+    #[test]
+    fn via_is_exactly_auth_or_harness() {
+        for (text, expected) in [("auth", Via::Auth), ("harness", Via::Harness)] {
+            let json = live()
+                .to_json()
+                .replace(r#""via":"auth""#, &format!(r#""via":"{text}""#));
+            assert_eq!(PendingRequest::parse(&json).unwrap().via, expected);
+            assert_eq!(expected.label(), text);
+        }
+        for bad in ["nopass", "Auth", "", "auth ", "HARNESS"] {
+            let json = live()
+                .to_json()
+                .replace(r#""via":"auth""#, &format!(r#""via":"{bad}""#));
+            assert_eq!(
+                PendingRequest::parse(&json).unwrap_err().code(),
+                "request_malformed",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_entry_that_carries_a_human_approval_is_refused() {
+        // A grant is not an approval: an entry that is both was not written
+        // by the broker for the `-nopass` file.
+        let mut harness = live();
+        harness.via = Via::Harness;
+        assert_eq!(check(&harness), Ok(()));
+        let mut consumed = approved();
+        consumed.state = ConfirmationState::Consumed;
+        // The same approved entry is fine for `auth` and not for `harness`.
+        assert_eq!(check(&consumed), Ok(()));
+        let mut watched = consumed.clone();
+        watched.via = Via::Harness;
+        assert_eq!(check(&watched), Err(RequestError::InvalidConfirmationState));
+        let mut asked = live();
+        asked.via = Via::Harness;
+        asked.needs_watch = true;
+        assert_eq!(check(&asked), Err(RequestError::InvalidConfirmationState));
+        // A queue id is an `ido` entry's: a harness entry never waits in it.
+        let mut queued = live();
+        queued.via = Via::Harness;
+        queued.queue_id = Some("ab".repeat(32));
+        assert_eq!(check(&queued), Err(RequestError::InvalidConfirmationState));
     }
 
     #[test]

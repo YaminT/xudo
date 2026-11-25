@@ -1101,6 +1101,10 @@ mod tests {
         fn validates_named_file(&self, _: &str) -> bool {
             false
         }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
+        }
+
         fn accepts_argument_wildcard(&self, _: &str) -> bool {
             false
         }
@@ -2690,6 +2694,7 @@ mod tests {
         assert!(!p.honours_scoped_directive("x", "y"));
         assert!(!p.validates_named_file("x"));
         assert!(!p.accepts_argument_wildcard("x"));
+        assert!(!p.doas_reads_drop_ins("x"));
     }
 
     #[test]
