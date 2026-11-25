@@ -49,6 +49,22 @@ pub trait ProcSource {
     /// Returns [`SysError::Read`] when the link cannot be followed, or does
     /// not lead to a namespace file. Callers treat that as "cannot attest".
     fn namespace_inode(&self, relative: &str) -> Result<u64, SysError>;
+
+    /// The inode a link under the root leads to (for example `"self/exe"`),
+    /// opened through this source and not by a path of its own.
+    ///
+    /// The default refuses: a source that cannot open a file through its own
+    /// descriptor cannot vouch for what a link leads to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError`] when the link cannot be opened or inspected.
+    fn file_identity(&self, relative: &str) -> Result<crate::FileId, SysError> {
+        Err(SysError::read(
+            relative,
+            "this source cannot identify the file a link leads to",
+        ))
+    }
 }
 
 /// A source backed by a real directory.
@@ -201,6 +217,12 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn a_source_that_cannot_open_a_link_refuses_to_identify_it() {
+        let error = MapSource::new().file_identity("self/exe").unwrap_err();
+        assert!(error.to_string().contains("cannot identify"), "{error}");
+    }
 
     #[test]
     fn a_map_source_returns_what_was_put_in_it() {

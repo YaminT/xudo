@@ -9,10 +9,12 @@
 //! each opened through the trust walk (every component root's, no link, on a
 //! mount root made), and the file that matches says what this process is.
 //!
-//! Each file must have exactly one name (`st_nlink == 1`). A second name for
-//! either is a name somebody added, and with two names for one inode the
-//! executed file could no longer say which mode it is. A package therefore
-//! ships two files, never a hardlink pair.
+//! The `-nopass` file must have exactly one name (`st_nlink == 1`), and must
+//! not be the same inode as `-auth`: with two names for one inode the executed
+//! file could no longer say which mode it is. A package therefore ships two
+//! files, never a hardlink pair. A second name for `-auth` alone adds no
+//! privilege (`sudo` matches by inode and still asks), so it is not refused:
+//! refusing it would let any local user close the human path.
 //!
 //! The `-nopass` file may be absent, as it is on a host installed before it
 //! shipped; the `-auth` file may not, because a gate that cannot find the one
@@ -24,6 +26,7 @@ use std::path::Path;
 
 use rustix::fs::fstat;
 
+use crate::source::ProcSource;
 use crate::trust::{TrustError, open_trusted};
 
 /// The directory both gate files live in.
@@ -58,7 +61,7 @@ impl FileId {
     /// macOS, so the conversions are real on one platform and an identity on
     /// the other.
     #[allow(clippy::useless_conversion)]
-    fn of(stat: &rustix::fs::Stat) -> Self {
+    pub(crate) fn of(stat: &rustix::fs::Stat) -> Self {
         Self {
             dev: u64::try_from(stat.st_dev).unwrap_or(0),
             ino: stat.st_ino,
@@ -100,12 +103,13 @@ pub enum GateFilesError {
 
 /// The executed file, asked which gate it is.
 pub trait GateFiles {
-    /// Which mode the running executable is.
+    /// Which mode the running executable is. `proc` is the `/proc` the gate
+    /// verified as procfs: the executed file is opened through it.
     ///
     /// # Errors
     ///
     /// [`GateFilesError`]; every one means the gate refuses.
-    fn executing(&self) -> Result<GateMode, GateFilesError>;
+    fn executing(&self, proc: &dyn ProcSource) -> Result<GateMode, GateFilesError>;
 }
 
 /// The real files: `/proc/self/exe` against `/usr/libexec/xudo`.
@@ -113,14 +117,25 @@ pub trait GateFiles {
 pub struct HostGateFiles;
 
 impl GateFiles for HostGateFiles {
-    fn executing(&self) -> Result<GateMode, GateFilesError> {
+    fn executing(&self, proc: &dyn ProcSource) -> Result<GateMode, GateFilesError> {
         executing_with(
             Path::new(GATE_DIR),
-            Path::new("/proc/self/exe"),
+            &|| {
+                proc.file_identity("self/exe")
+                    .map_err(|error| GateFilesError::Unreadable {
+                        at: "self/exe".to_owned(),
+                        reason: error.to_string(),
+                    })
+            },
             &|path| open_trusted(path),
-            &|fd| fstat(fd),
+            &host_stat,
         )
     }
+}
+
+/// The host's `fstat`, a function of its own so a test can run it.
+fn host_stat(fd: BorrowedFd<'_>) -> rustix::io::Result<rustix::fs::Stat> {
+    fstat(fd)
 }
 
 /// [`GateFiles::executing`], with the directory, the executed file, the way to
@@ -128,15 +143,11 @@ impl GateFiles for HostGateFiles {
 /// point it at files it made and make an `fstat` fail.
 pub(crate) fn executing_with(
     dir: &Path,
-    exe: &Path,
+    exe: &dyn Fn() -> Result<FileId, GateFilesError>,
     open: &dyn Fn(&Path) -> Result<std::os::fd::OwnedFd, TrustError>,
     stat: &dyn Fn(BorrowedFd<'_>) -> rustix::io::Result<rustix::fs::Stat>,
 ) -> Result<GateMode, GateFilesError> {
-    let own = std::fs::File::open(exe).map_err(|error| GateFilesError::Unreadable {
-        at: exe.display().to_string(),
-        reason: error.to_string(),
-    })?;
-    let exe_id = identify(stat(own.as_fd()), exe)?;
+    let exe_id = exe()?;
     let auth_path = dir.join(AUTH_FILE);
     let auth = open(&auth_path)?;
     let auth_id = identify(stat(auth.as_fd()), &auth_path)?;
@@ -167,18 +178,26 @@ fn identify(
     }
 }
 
-/// The decision, on the facts alone: each gate file has one name, and the
-/// executed file is one of them.
+/// The decision, on the facts alone. `-nopass` has one name. `-auth` may have
+/// more (a second name adds no privilege: `sudo` matches the rule by inode and
+/// still asks), but is refused when it is the same inode as `-nopass`. The
+/// executed file is one of the two.
 pub(crate) fn judge(
     exe: FileId,
     auth: (&Path, FileId),
     nopass: Option<(&Path, FileId)>,
 ) -> Result<GateMode, GateFilesError> {
-    for (path, id) in std::iter::once(auth).chain(nopass) {
+    if let Some((path, id)) = nopass {
         if id.nlink != 1 {
             return Err(GateFilesError::HardLinked {
                 at: path.display().to_string(),
                 nlink: id.nlink,
+            });
+        }
+        if id.same_file(auth.1) {
+            return Err(GateFilesError::HardLinked {
+                at: auth.0.display().to_string(),
+                nlink: auth.1.nlink,
             });
         }
     }
@@ -216,7 +235,7 @@ impl FakeGateFiles {
 
 #[cfg(any(test, feature = "fake"))]
 impl GateFiles for FakeGateFiles {
-    fn executing(&self) -> Result<GateMode, GateFilesError> {
+    fn executing(&self, _proc: &dyn ProcSource) -> Result<GateMode, GateFilesError> {
         self.answer.clone()
     }
 }
@@ -288,13 +307,43 @@ mod tests {
     }
 
     #[test]
-    fn a_hardlinked_gate_file_is_refused_in_either_mode() {
+    fn a_second_name_for_auth_alone_does_not_close_the_human_path() {
+        // Any local user can `ln` the -auth file on a host with
+        // protected_hardlinks off; that must not refuse every -auth run.
+        let linked_auth = (Path::new("/g/auth"), id(10, 2));
+        assert_eq!(
+            judge(id(10, 2), linked_auth, Some(nopass())),
+            Ok(GateMode::Auth)
+        );
+        assert_eq!(judge(id(10, 2), linked_auth, None), Ok(GateMode::Auth));
+        // The -nopass file never gets a second name, even with -auth fine.
+        assert_eq!(
+            judge(id(20, 1), linked_auth, Some(nopass())),
+            Ok(GateMode::Nopass)
+        );
+    }
+
+    #[test]
+    fn auth_and_nopass_being_one_inode_is_refused_in_either_mode() {
+        let same_auth = (Path::new("/g/auth"), id(10, 2));
+        let same_nopass = (Path::new("/g/nopass"), id(10, 2));
+        {
+            let exe = id(10, 2);
+            let error = judge(exe, same_auth, Some(same_nopass)).unwrap_err();
+            assert_eq!(kind(&error), "HardLinked");
+        }
+        // One inode with a single name each way is still one inode.
+        let one = (Path::new("/g/nopass"), id(10, 1));
+        let error = judge(id(10, 1), auth(), Some(one)).unwrap_err();
+        assert_eq!(kind(&error), "HardLinked");
+    }
+
+    #[test]
+    fn a_hardlinked_nopass_file_is_refused_in_either_mode() {
         let linked = |path, ino| (Path::new(path), id(ino, 2));
         for (exe, a, n) in [
-            (id(10, 2), linked("/g/auth", 10), Some(nopass())),
             (id(20, 2), auth(), Some(linked("/g/nopass", 20))),
-            // Even the other file being linked refuses: two names for one
-            // inode make the mode ambiguous.
+            // Even -auth being run refuses: the other file has two names.
             (id(10, 1), auth(), Some(linked("/g/nopass", 20))),
         ] {
             assert_eq!(kind(&judge(exe, a, n).unwrap_err()), "HardLinked");
@@ -341,8 +390,23 @@ mod tests {
                     fstat(fd)
                 }
             };
-            let result = executing_with(&dir, &dir.join(AUTH_FILE), &plain_open, &stat);
+            let exe = || {
+                let own = std::fs::File::open(dir.join(AUTH_FILE)).unwrap();
+                identify(stat(own.as_fd()), &dir.join(AUTH_FILE))
+            };
+            let result = executing_with(&dir, &exe, &plain_open, &stat);
             assert_eq!(kind(&result.unwrap_err()), "Unreadable", "{failing}");
+        }
+    }
+
+    /// What the host gets from the verified `/proc`, for a file on disk.
+    fn exe_of(path: &Path) -> impl Fn() -> Result<FileId, GateFilesError> + '_ {
+        move || {
+            let file = std::fs::File::open(path).map_err(|error| GateFilesError::Unreadable {
+                at: path.display().to_string(),
+                reason: error.to_string(),
+            })?;
+            identify(fstat(file.as_fd()), path)
         }
     }
 
@@ -366,7 +430,8 @@ mod tests {
         let dir = scratch("disk");
         std::fs::write(dir.join(AUTH_FILE), b"a").unwrap();
         std::fs::write(dir.join(NOPASS_FILE), b"n").unwrap();
-        let run = |exe: &str| executing_with(&dir, &dir.join(exe), &plain_open, &real_stat);
+        let run =
+            |exe: &str| executing_with(&dir, &exe_of(&dir.join(exe)), &plain_open, &real_stat);
         assert_eq!(run(AUTH_FILE), Ok(GateMode::Auth));
         assert_eq!(run(NOPASS_FILE), Ok(GateMode::Nopass));
         // A symlink to the nopass file is the nopass file: the kernel
@@ -376,10 +441,24 @@ mod tests {
         // A copy is another inode.
         std::fs::write(dir.join("copy"), b"n").unwrap();
         assert_eq!(run("copy"), Err(GateFilesError::NotAGateFile));
-        // A hardlink to either gate file gives that file two names.
+        // A second name for -auth leaves it running as -auth.
         std::fs::hard_link(dir.join(AUTH_FILE), dir.join("link")).unwrap();
-        assert_eq!(kind(&run(AUTH_FILE).unwrap_err()), "HardLinked");
+        assert_eq!(run(AUTH_FILE), Ok(GateMode::Auth));
         assert_eq!(std::fs::metadata(dir.join(AUTH_FILE)).unwrap().nlink(), 2);
+        // A second name for -nopass refuses.
+        std::fs::hard_link(dir.join(NOPASS_FILE), dir.join("nlink")).unwrap();
+        assert_eq!(kind(&run(NOPASS_FILE).unwrap_err()), "HardLinked");
+        // The same inode under both gate names refuses.
+        let same = scratch("same-inode");
+        std::fs::write(same.join(AUTH_FILE), b"a").unwrap();
+        std::fs::hard_link(same.join(AUTH_FILE), same.join(NOPASS_FILE)).unwrap();
+        let both = executing_with(
+            &same,
+            &exe_of(&same.join(AUTH_FILE)),
+            &plain_open,
+            &real_stat,
+        );
+        assert_eq!(kind(&both.unwrap_err()), "HardLinked");
     }
 
     #[test]
@@ -387,18 +466,18 @@ mod tests {
         let dir = scratch("absent");
         std::fs::write(dir.join(AUTH_FILE), b"a").unwrap();
         assert_eq!(
-            executing_with(&dir, &dir.join(AUTH_FILE), &plain_open, &real_stat),
+            executing_with(&dir, &exe_of(&dir.join(AUTH_FILE)), &plain_open, &real_stat),
             Ok(GateMode::Auth)
         );
-        let missing =
-            executing_with(&dir, &dir.join("nowhere"), &plain_open, &real_stat).unwrap_err();
+        let missing = executing_with(&dir, &exe_of(&dir.join("nowhere")), &plain_open, &real_stat)
+            .unwrap_err();
         assert_eq!(kind(&missing), "Unreadable");
         let no_auth = scratch("no-auth");
         std::fs::write(no_auth.join(NOPASS_FILE), b"n").unwrap();
         assert_eq!(
             executing_with(
                 &no_auth,
-                &no_auth.join(NOPASS_FILE),
+                &exe_of(&no_auth.join(NOPASS_FILE)),
                 &plain_open,
                 &real_stat
             ),
@@ -437,7 +516,7 @@ mod tests {
             }
         };
         assert_eq!(
-            executing_with(&dir, &dir.join(AUTH_FILE), &refuse, &real_stat),
+            executing_with(&dir, &exe_of(&dir.join(AUTH_FILE)), &refuse, &real_stat),
             Err(GateFilesError::Untrusted(TrustError::Symlink {
                 at: dir.join(NOPASS_FILE).display().to_string()
             }))
@@ -455,17 +534,36 @@ mod tests {
     fn the_host_refuses_a_machine_with_no_gate_installed() {
         // No test host has `/usr/libexec/xudo/xudo-gate-auth` that is this
         // test binary, so the real seam can only refuse.
-        assert!(HostGateFiles.executing().is_err());
+        #[cfg(target_os = "linux")]
+        assert!(
+            HostGateFiles
+                .executing(&crate::VerifiedProc::open().unwrap())
+                .is_err()
+        );
+        let file = std::fs::File::open(file!())
+            .or_else(|_| std::fs::File::open("/"))
+            .unwrap();
+        assert!(host_stat(file.as_fd()).is_ok());
+        // A source that cannot name the executed file refuses too.
+        assert_eq!(
+            kind(
+                &HostGateFiles
+                    .executing(&crate::MapSource::new())
+                    .unwrap_err()
+            ),
+            "Unreadable"
+        );
     }
 
     #[test]
     fn the_fake_says_what_it_was_given() {
         assert_eq!(
-            FakeGateFiles::running_as(GateMode::Nopass).executing(),
+            FakeGateFiles::running_as(GateMode::Nopass).executing(&crate::MapSource::new()),
             Ok(GateMode::Nopass)
         );
         assert_eq!(
-            FakeGateFiles::refusing(GateFilesError::NotAGateFile).executing(),
+            FakeGateFiles::refusing(GateFilesError::NotAGateFile)
+                .executing(&crate::MapSource::new()),
             Err(GateFilesError::NotAGateFile)
         );
     }

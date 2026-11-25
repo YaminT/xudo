@@ -682,7 +682,9 @@ impl PendingRequest {
         // confirmation, and a prompt shown without `needs_watch` is refused
         // below, so these two conditions rule out every form of approval.
         let harness_with_approval = self.via == Via::Harness
-            && (self.needs_watch || self.state != ConfirmationState::Pending);
+            && (self.needs_watch
+                || self.queue_id.is_some()
+                || self.state != ConfirmationState::Pending);
         if harness_with_approval
             || !consistent
             || (self.shown_at_ms.is_some() && !self.needs_watch)
@@ -1026,6 +1028,11 @@ mod tests {
         asked.via = Via::Harness;
         asked.needs_watch = true;
         assert_eq!(check(&asked), Err(RequestError::InvalidConfirmationState));
+        // A queue id is an `ido` entry's: a harness entry never waits in it.
+        let mut queued = live();
+        queued.via = Via::Harness;
+        queued.queue_id = Some("ab".repeat(32));
+        assert_eq!(check(&queued), Err(RequestError::InvalidConfirmationState));
     }
 
     #[test]

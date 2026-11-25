@@ -1993,6 +1993,18 @@ args = [
                 );
             }
         }
+        // A stored human or unattested entry with a live enrolled agent (and
+        // its scope), the one pairing only `require_live_harness` refuses.
+        for class in [AttestedClass::Unattested, AttestedClass::Human] {
+            let mut pending = harness_entry(77);
+            pending.attested_class = class;
+            let live = live_agent(77, "claude-code", 44);
+            assert_eq!(
+                require_live_harness(&pending, &live),
+                Err(ModeRefusal::NotAnEnrolledAgent)
+            );
+            assert!(decide(&grant_rules(), &live, Some(&pending), nopass_context()).is_err());
+        }
         // A stored enrolled agent whose live read is a human or nothing.
         for live in [human(77), agent(77)] {
             assert_eq!(
@@ -2263,51 +2275,68 @@ args = [
         }
     }
 
-    use proptest::prelude::*;
-
-    proptest! {
-        /// Over class × via × label × verdict, `-nopass` proceeds for exactly
-        /// one combination: a harness entry, a live enrolled agent in the
-        /// stored scope with the stored label, and a plain allow with a grant.
-        #[test]
-        fn nopass_refuses_any_entry_that_is_not_a_live_granted_harness(
-            via_harness in any::<bool>(),
-            stored in 0_u8..3,
-            live in 0_u8..3,
-            same_scope in any::<bool>(),
-            same_label in any::<bool>(),
-            verdict in 0_u8..3,
-            grant in any::<bool>(),
-        ) {
-            let class = |kind: u8, scope: u64| match kind {
-                0 => AttestedClass::Unattested,
-                1 => AttestedClass::Human,
-                _ => AttestedClass::EnrolledAgent { scope_id: scope },
-            };
-            let mut pending = harness_entry(77);
-            pending.via = if via_harness { Via::Harness } else { Via::Auth };
-            pending.attested_class = class(stored, 44);
-            let mut caller = live_agent(77, if same_label { "claude-code" } else { "codex" }, 44);
-            caller.attested_class = class(live, if same_scope { 44 } else { 45 });
-            let required = require_live_harness(&pending, &caller);
-            let mut decision = confirming_decision();
-            decision.verdict = match verdict {
-                0 => Verdict::Allow,
-                1 => Verdict::AllowWithConfirmation,
-                _ => Verdict::Deny,
-            };
-            if !grant {
-                decision.harness_grant = None;
+    /// Over class × via × scope × label × verdict × grant (all 432 cases, no
+    /// sampling: a sampled space this small let a mutant through), `-nopass`
+    /// proceeds for exactly one combination: a harness entry, a stored and a
+    /// live enrolled agent with the stored label, and a plain allow with a
+    /// grant. The scope is `decide`'s separate check
+    /// (`request_wrong_attested_identity`), not this function's, so the
+    /// expectation does not depend on it.
+    #[test]
+    fn nopass_refuses_any_entry_that_is_not_a_live_granted_harness() {
+        let class = |kind: u8, scope: u64| match kind {
+            0 => AttestedClass::Unattested,
+            1 => AttestedClass::Human,
+            _ => AttestedClass::EnrolledAgent { scope_id: scope },
+        };
+        let mut cases = 0_u32;
+        for via_harness in [false, true] {
+            for stored in 0_u8..3 {
+                for live in 0_u8..3 {
+                    for same_scope in [false, true] {
+                        for same_label in [false, true] {
+                            for verdict in 0_u8..3 {
+                                for grant in [false, true] {
+                                    cases += 1;
+                                    let mut pending = harness_entry(77);
+                                    pending.via =
+                                        if via_harness { Via::Harness } else { Via::Auth };
+                                    pending.attested_class = class(stored, 44);
+                                    let label = if same_label { "claude-code" } else { "codex" };
+                                    let mut caller = live_agent(77, label, 44);
+                                    caller.attested_class =
+                                        class(live, if same_scope { 44 } else { 45 });
+                                    let required = require_live_harness(&pending, &caller);
+                                    let mut decision = confirming_decision();
+                                    decision.verdict = match verdict {
+                                        0 => Verdict::Allow,
+                                        1 => Verdict::AllowWithConfirmation,
+                                        _ => Verdict::Deny,
+                                    };
+                                    if !grant {
+                                        decision.harness_grant = None;
+                                    }
+                                    let verdict_ok =
+                                        check_verdict(&decision, &pending, &nopass_context())
+                                            .is_ok();
+                                    let expected = via_harness
+                                        && stored == 2
+                                        && live == 2
+                                        && same_label
+                                        && verdict == 0
+                                        && grant;
+                                    assert_eq!(
+                                        required.is_ok() && verdict_ok,
+                                        expected,
+                                        "{via_harness} {stored} {live} {same_scope} {same_label} {verdict} {grant}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            let verdict_ok = check_verdict(&decision, &pending, &nopass_context()).is_ok();
-            let proceeds = required.is_ok() && verdict_ok;
-            let expected = via_harness
-                && stored == 2
-                && live == 2
-                && same_label
-                && verdict == 0
-                && grant;
-            prop_assert_eq!(proceeds, expected);
         }
+        assert_eq!(cases, 432);
     }
 }

@@ -79,7 +79,7 @@ b=$root/target/repro-b/out
 if command -v diffoscope >/dev/null; then
     diffoscope "$a"/xudo_*.deb "$b"/xudo_*.deb || true
 else
-    for f in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth; do
+    for f in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-gate-nopass; do
         n=$(cmp -l "$a/stage/$f" "$b/stage/$f" | wc -l || true)
         echo "$f: $n differing bytes" >&2
     done

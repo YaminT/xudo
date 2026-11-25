@@ -462,14 +462,18 @@ fn accept_invocation(args: &[OsString]) -> Result<GateMode, Refusal> {
 
 /// The mode the executed file says, and refused unless it is the one `argv[0]`
 /// claimed.
-fn mode_of_executed_file(host: &dyn GateHost, claimed: GateMode) -> Result<GateMode, Refusal> {
+fn mode_of_executed_file(
+    host: &dyn GateHost,
+    proc: &dyn ProcSource,
+    claimed: GateMode,
+) -> Result<GateMode, Refusal> {
     let refuse = |reason: String| Refusal::Failed {
         stage: Stage::Invocation,
         reason,
     };
     let executed = host
         .gate_files()
-        .executing()
+        .executing(proc)
         .map_err(|error| refuse(error.to_string()))?;
     if executed == claimed {
         Ok(executed)
@@ -657,7 +661,7 @@ fn proceed(
 
     let proc = stage(Stage::Procfs, host.open_proc())?;
     // The mode is the executed file's, and `argv[0]` only has to agree.
-    let mode = mode_of_executed_file(&*host, claimed)?;
+    let mode = mode_of_executed_file(&*host, &*proc, claimed)?;
     let ancestors = stage(
         Stage::Lineage,
         lineage(&*proc, progress.gate_pid, LINEAGE_PROCESSES),
@@ -1962,7 +1966,11 @@ args = [
         #[cfg(not(target_os = "linux"))]
         assert!(host.cgroups().is_err());
         // No test host has the gate installed as the executed file.
-        assert!(host.gate_files().executing().is_err());
+        assert!(
+            host.gate_files()
+                .executing(&xudo_sys::MapSource::new())
+                .is_err()
+        );
     }
 
     #[test]
