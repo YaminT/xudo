@@ -130,6 +130,11 @@ pub fn classify_with_registry(
 /// An enrolled class carries the registry label in `attested_harness`. That
 /// label is what an ask-human rule matches. A missing or invalid label is
 /// unattested: it is never rewritten to a synthetic `scope-N` id.
+///
+/// This is not an attestation. It reads a spool entry, not the kernel and not
+/// the registry, so it selects which rules apply and nothing else: it must
+/// never feed a harness grant. A passwordless mint must come from the live
+/// `classify_with_registry` caller and the policy it was decided under.
 pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts {
     use xudo_gate::request::AttestedClass;
     let classification = match &entry.attested_class {

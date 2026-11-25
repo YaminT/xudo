@@ -489,7 +489,7 @@ fn queue_ask_human(
             Some(request),
         );
     }
-    if !audit_queue_pruned(platform.audit, &pruned) {
+    if !audit_queue_pruned(platform.audit, &pruned, caller.classification.label()) {
         return refuse(
             conn,
             platform.audit,
@@ -593,7 +593,7 @@ fn queue_entry_from_request(
     .map_err(|error| error.to_string())
 }
 
-fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
+fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String], class: &str) -> bool {
     ids.iter().all(|id| {
         audit
             .append(&|previous| {
@@ -601,7 +601,7 @@ fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
                     previous,
                     xudo_audit::record::Decision::Denied,
                     Vec::new(),
-                    "human",
+                    class,
                 )
                 .with_denial("queue_entry_pruned")
                 .with_evidence(vec![format!("queue_id={id}")])
@@ -821,7 +821,7 @@ fn serve_queue_list(
         };
     // Audit the prune set before any name is removed. A failed audit leaves
     // the store untouched.
-    if !audit_queue_pruned(platform.audit, &planned) {
+    if !audit_queue_pruned(platform.audit, &planned, peer_class_label(ready.class)) {
         return refuse(
             conn,
             platform.audit,
@@ -6173,10 +6173,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             format!("{}.json", stale.id),
             serde_json::to_vec(&stale).unwrap(),
         );
+        let mut pruned_audit = FakeAuditSink::new();
         assert!(audit_queue_pruned(
-            &mut FakeAuditSink::new(),
+            &mut pruned_audit,
             std::slice::from_ref(&stale.id),
+            "unattested",
         ));
+        assert_eq!(pruned_audit.records()[0].classification, "unattested");
         let (mut host, _, _) = ask_human_fixture();
         let mut audit = SecondAuditAppendFails {
             inner: FakeAuditSink::new(),
@@ -6204,6 +6207,106 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, stale.id);
         assert_eq!(audit.snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_prune_record_names_the_class_that_triggered_it_not_human() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        let store = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let mut platform = host.platform();
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        queue_ask_human(
+            &conn,
+            &mut platform,
+            &identity,
+            &request,
+            &decision,
+            &caller,
+            &policy,
+        );
+        let pruned = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(pruned, caller.classification.label());
+        assert_ne!(pruned, "human");
+    }
+
+    #[test]
+    fn a_listing_prune_record_names_the_listers_class_not_human() {
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        let identity = enrolled_identity(&mut host);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            request,
+        );
+        let class = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(class, "enrolled-agent");
     }
 
     #[test]
@@ -11642,15 +11745,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
-    #[test]
-    fn an_unregistered_scope_is_never_a_harness_in_any_handler() {
+    fn run_every_question(
+        make_identity: fn(&mut Host) -> PeerIdentity,
+        expected_class: &str,
+        names_a_harness: bool,
+        expected_own: &[usize],
+    ) {
         let questions = every_question();
         let mut slots: Vec<usize> = questions.iter().map(slot).collect();
         slots.sort_unstable();
         assert_eq!(slots, (0..13).collect::<Vec<_>>());
+        let mut with_own_record = Vec::new();
         for question in questions {
             let mut host = Host::honest();
-            let identity = unregistered_identity(&mut host);
+            host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+            let identity = make_identity(&mut host);
             host.freeze_file.publish("frozen-1000", MARKER).unwrap();
             let request = BrokerRequest {
                 schema_version: WIRE_SCHEMA_VERSION,
@@ -11665,16 +11774,41 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 identity,
                 request.clone(),
             );
-            let shape = format!("question slot {}", slot(&request.question));
-            for record in host.audit.records() {
-                assert_eq!(record.classification, "unattested", "{shape}");
-                assert!(
+            let n = slot(&request.question);
+            let shape = format!("question slot {n}");
+            // A record `refuse()` did not write: its class came from the
+            // handler's own classification.
+            let own: Vec<_> = host
+                .audit
+                .records()
+                .iter()
+                .filter(|record| {
                     !record
                         .evidence
                         .iter()
-                        .any(|item| item.starts_with("agent_id=")),
-                    "{shape}: an unregistered scope was named a harness"
-                );
+                        .any(|item| item.starts_with("fault="))
+                })
+                .collect();
+            if !own.is_empty() {
+                with_own_record.push(n);
+            }
+            for record in &own {
+                assert_eq!(record.classification, expected_class, "{shape}");
+            }
+            for record in host.audit.records() {
+                let has_agent = record
+                    .evidence
+                    .iter()
+                    .any(|item| item.starts_with("agent_id="));
+                if !names_a_harness {
+                    assert!(
+                        !has_agent,
+                        "{shape}: an unregistered scope was named a harness"
+                    );
+                }
+                if !names_a_harness {
+                    assert_eq!(record.classification, "unattested", "{shape}");
+                }
             }
             assert_eq!(
                 host.freeze_file.files().keys().collect::<Vec<_>>(),
@@ -11682,6 +11816,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 "{shape}: the freeze state changed"
             );
         }
+        assert_eq!(
+            with_own_record, expected_own,
+            "handlers that wrote a record"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_scope_is_never_a_harness_in_any_handler() {
+        run_every_question(
+            unregistered_identity,
+            "unattested",
+            false,
+            &[0, 5, 7, 11, 12],
+        );
+    }
+
+    #[test]
+    fn a_registered_scope_is_an_enrolled_agent_in_every_handler() {
+        run_every_question(enrolled_identity, "enrolled-agent", true, &[0, 7, 11, 12]);
     }
 
     #[test]
@@ -12938,6 +13091,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 assert_eq!(got.denial, expected.denial);
             }
         }
+    }
+
+    #[test]
+    fn stored_caller_is_never_a_live_attestation() {
+        use xudo_policy::Classification;
+        // A spool entry names a harness by label only: no scope, no yolo. A
+        // harness grant needs the live kernel-attested session, which this
+        // can never be.
+        let entry = enrolled_entry(NONCE, UID);
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        // The mint, where a grant would be made, never reads the stored class.
+        assert!(!include_str!("mint.rs").contains("stored_caller"));
     }
 
     #[test]
