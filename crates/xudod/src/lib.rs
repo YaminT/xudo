@@ -48,6 +48,7 @@ pub mod queue;
 pub mod record;
 pub mod refusal;
 pub mod serve;
+pub mod unit_record;
 
 /// Parser entry points exposed only to the separate fuzz crate.
 #[cfg(feature = "fuzzing")]

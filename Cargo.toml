@@ -14,6 +14,7 @@ members = [
   "crates/xudod-bin",
   "crates/xudo",
   "crates/xudo-bin",
+  "crates/xudo-session-bin",
   "crates/xudo-tests",
   "crates/ido",
   "crates/ido-bin",

@@ -94,7 +94,7 @@ pub use env::child_environment;
 pub use request::{PendingRequest, RequestError, SPOOL_DIR};
 pub use run::{GateExit, GateHost, SystemHost, run};
 pub use session::{
-    SessionRecord, attested_harness_label, parse_session_record, record_identity,
-    record_identity_registered,
+    NO_DEADLINE, SESSION_MAX_LIFETIME_MS, SessionRecord, attested_harness_label,
+    parse_session_record, record_identity, record_identity_registered,
 };
 pub use status::Termination;
