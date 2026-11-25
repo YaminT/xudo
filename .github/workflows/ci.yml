@@ -122,6 +122,7 @@ jobs:
           name: fuzz-crashes
           path: fuzz/artifacts/**
           if-no-files-found: ignore
+          retention-days: 14
 
   # Every systemd unit under packaging/, checked by systemd's own tools in a
   # Debian trixie container: `systemd-analyze verify` must say nothing, and
