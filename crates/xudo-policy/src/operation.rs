@@ -999,6 +999,18 @@ max-entries = 4
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            // Miri is slow and its isolation refuses the regression file's
+            // I/O; the full 256 cases are the non-miri run.
+            cases: if cfg!(miri) { 2 } else { 256 },
+            failure_persistence: if cfg!(miri) {
+                None
+            } else {
+                proptest::prelude::ProptestConfig::default().failure_persistence
+            },
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
         /// Siblings that share a string prefix (`/srv/a`, `/srv/ab`) are not
         /// nested, and a target under one is never matched to the other.
         #[test]
