@@ -52,8 +52,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use term_sanitize::Limits;
 use xudo_backend::paths_to_root::{
-    self, Applies, Check, CheckId, Finding, Grant, Input, Proposal, Status, Unverified, Via,
-    Writer, assess, propose,
+    self, Applies, Check, CheckId, Finding, Grant, HostView, Input, Lookup, Proposal, Status,
+    Unverified, Via, Writer, assess, propose,
 };
 use xudo_backend::{Backend, BackendKind, Capability, DetectError, identify, judge};
 use xudo_policy::{CallerFacts, ExitCode};
@@ -174,6 +174,18 @@ pub struct RulesetReport {
     /// Absent when the rules did not load or every unit matcher is a finite list.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub open_unit_lints: Vec<OpenUnitLintRow>,
+    /// Why the harness registry is empty although root wrote one.
+    ///
+    /// While set, no harness is armed for anyone; the rules still decide the
+    /// human path. Absent when the registry loaded or the rules did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_fault: Option<String>,
+    /// What is wrong with `/etc/passwd` (only that file: no NSS is asked).
+    ///
+    /// Unusable or non-UTF-8 lines, or a file that cannot be read. Absent
+    /// when the database is clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passwd_fault: Option<String>,
 }
 
 /// One systemctl rule whose unit matcher is not a finite list.
@@ -415,7 +427,7 @@ pub(crate) fn gather(
             |found| format!("xudo exec runs {} on the gate", found.exe),
         ),
         kernel: KernelReport::of(platform.ops.kernel()),
-        ruleset: ruleset(rules, loaded),
+        ruleset: ruleset(rules, loaded, passwd_fault_of(platform.host)),
         sudoers_snippet: sudoers_snippets(),
         caller: caller(platform.ops.classify(std::process::id())),
         backend: BackendReport::of(backend),
@@ -450,7 +462,11 @@ pub(crate) fn run(
 /// Reported here rather than enforced here. `doctor` is diagnostic, and the
 /// enforcement point is the executor: a check the front-end could "pass"
 /// would be a check an attacker races against.
-fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetReport {
+fn ruleset(
+    rules: &Path,
+    loaded: Result<&LoadedRules, &LoadError>,
+    passwd_fault: Option<String>,
+) -> RulesetReport {
     let trusted = xudo_sys::read_trusted_dir(rules);
     let trust = trust_report(&trusted);
     let package_drift = rule_drift(rules, loaded, &trusted);
@@ -504,6 +520,20 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
                     .collect()
             })
             .unwrap_or_default(),
+        registry_fault: loaded
+            .ok()
+            .and_then(|loaded| loaded.registry_fault().map(str::to_owned)),
+        passwd_fault,
+    }
+}
+
+/// What is wrong with the account database, read the way the gate reads it
+/// (bytes, `/etc/passwd` only), or `None` when it is clean.
+fn passwd_fault_of(host: &dyn HostView) -> Option<String> {
+    match host.read(Path::new("/etc/passwd")) {
+        Lookup::Found(bytes) => xudo_policy::passwd_fault(&bytes),
+        Lookup::Missing => Some("/etc/passwd does not exist".to_owned()),
+        Lookup::Unreadable(why) => Some(format!("/etc/passwd cannot be read: {why}")),
     }
 }
 
@@ -884,6 +914,7 @@ pub(crate) fn human(report: &Report) -> String {
     for id in &report.ruleset.inert_shipped_deny_rules {
         line("protect rule", id);
     }
+    fault_lines(&report.ruleset, &mut line);
     if report.backend.implementation == Some(BackendKind::Doas) {
         line("sudoers xudo", "does not apply to the doas backend");
     } else {
@@ -954,6 +985,22 @@ pub(crate) fn human(report: &Report) -> String {
          security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+/// The registry and account-database faults, when there are any.
+fn fault_lines(ruleset: &RulesetReport, line: &mut dyn FnMut(&str, &str)) {
+    if let Some(why) = &ruleset.registry_fault {
+        line(
+            "registry",
+            &format!(
+                "FAULT (parse only, no trust walk), no harness is armed: {}",
+                safe(why)
+            ),
+        );
+    }
+    if let Some(why) = &ruleset.passwd_fault {
+        line("account db", &format!("FAULT: {}", safe(why)));
+    }
 }
 
 fn loaded_ruleset_label(loaded: Option<&LoadedSummary>) -> String {
@@ -2321,7 +2368,7 @@ mod tests {
         )
         .unwrap();
         let loaded = LoadedRules::from_dir(&dir).unwrap();
-        let section = ruleset(&dir, Ok(&loaded));
+        let section = ruleset(&dir, Ok(&loaded), None);
         assert!(section.lifecycle_note.is_none());
         let found = section.open_unit_lints.first().unwrap();
         assert_eq!(found.action, "xudo.svc.lifecycle");
@@ -2354,6 +2401,87 @@ mod tests {
         let json = render::json_of(&report);
         assert!(json.contains("\"open_unit_lints\""), "{json}");
         assert!(json.contains("xudo.svc.lifecycle"), "{json}");
+    }
+
+    fn dirty_passwd_host(contents: &[u8]) -> MemoryHost {
+        MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![1000]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, contents)
+    }
+
+    #[test]
+    fn doctor_reports_each_way_the_account_database_can_be_wrong() {
+        assert_eq!(passwd_fault_of(&clean_host()), None);
+        let mut gecos = b"agent:x:1000:1000:A".to_vec();
+        gecos.extend_from_slice(&[0xff]);
+        gecos.extend_from_slice(b":/h:/bin/sh\nbad:x:nope:1\n");
+        assert_eq!(
+            passwd_fault_of(&dirty_passwd_host(&gecos)).as_deref(),
+            Some("1 unusable and 1 non-UTF-8 line(s) in the account database")
+        );
+        let missing = MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755);
+        assert_eq!(
+            passwd_fault_of(&missing).as_deref(),
+            Some("/etc/passwd does not exist")
+        );
+        let unreadable = dirty_passwd_host(b"").fault("/etc/passwd", "EACCES");
+        assert!(
+            passwd_fault_of(&unreadable)
+                .unwrap()
+                .contains("cannot be read")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_registry_fault_and_a_passwd_fault() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join("doctor-registry-fault");
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = dir.join("rules.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(dir.join("harnesses.d")).unwrap();
+        std::fs::write(
+            dir.join("harnesses.d/codex.toml"),
+            "label = \"codex\"\nwat = 1\n",
+        )
+        .unwrap();
+        let loaded = LoadedRules::from_dir(&rules).unwrap();
+        let report = gathered(
+            &dirty_passwd_host(b"bad:x:nope:1\n"),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        let text = human(&report);
+        assert!(text.contains("no harness is armed"), "{text}");
+        assert!(text.contains("account db"), "{text}");
+        let json = render::json_of(&report);
+        assert!(json.contains("\"registry_fault\""), "{json}");
+        assert!(json.contains("\"passwd_fault\""), "{json}");
+        // A clean machine prints neither, so its pinned envelope is unchanged.
+        let clean = ruleset(&rules, Ok(&loaded), None);
+        assert!(clean.passwd_fault.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

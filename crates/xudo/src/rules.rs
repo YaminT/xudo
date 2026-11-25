@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use xudo_policy::load_rule_files;
 use xudo_policy::{
-    HarnessFile, HarnessRegistry, RuleFile, RuleFilesError, RuleSet, RuleTest, is_rule_file_name,
-    load_policy,
+    HarnessFile, HarnessRegistry, RuleFile, RuleFilesError, RuleSet, RuleTest, UnregisteredLabel,
+    is_rule_file_name, load_policy_with_registry,
 };
 
 /// The default location of the root-owned rule files.
@@ -79,6 +79,37 @@ pub struct LoadedRules {
     generation: String,
     tests: Vec<RuleTest>,
     harnesses: HarnessRegistry,
+    registry_fault: Option<String>,
+    unregistered: Vec<UnregisteredLabel>,
+}
+
+/// Every `*.toml` registry file in `dir`, or why the registry cannot be read.
+///
+/// A missing directory is an empty registry. Anything else wrong is returned
+/// as text for the loader to record as a fault: it never fails the load.
+fn read_registry(dir: &Path) -> Result<Vec<HarnessFile>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+    };
+    let mut entries: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| (entry.path(), entry.file_name()))
+        .filter(|(_, name)| name.as_bytes().ends_with(b".toml"))
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|(path, name)| {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            Ok(HarnessFile {
+                name: name.as_bytes().to_vec(),
+                bytes,
+            })
+        })
+        .collect()
 }
 
 impl LoadedRules {
@@ -112,6 +143,17 @@ impl LoadedRules {
     /// The root-authored harness registry loaded beside the rules.
     pub fn harnesses(&self) -> &HarnessRegistry {
         &self.harnesses
+    }
+
+    /// Why the harness registry is empty although root wrote one, if it is.
+    pub fn registry_fault(&self) -> Option<&str> {
+        self.registry_fault.as_deref()
+    }
+
+    /// Rules naming a harness label the registry lacks: they load and grant
+    /// nothing, and `xudo check` refuses them.
+    pub fn unregistered_labels(&self) -> &[UnregisteredLabel] {
+        &self.unregistered
     }
 
     /// Loads every rule file under `dir`.
@@ -158,42 +200,19 @@ impl LoadedRules {
         }
 
         let harness_dir = dir.parent().unwrap_or(dir).join("harnesses.d");
-        let mut harness_files = Vec::new();
-        match std::fs::read_dir(&harness_dir) {
-            Ok(entries) => {
-                let mut entries: Vec<_> = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| (entry.path(), entry.file_name()))
-                    .filter(|(_, name)| name.as_bytes().ends_with(b".toml"))
-                    .collect();
-                entries.sort();
-                for (path, name) in entries {
-                    let bytes = std::fs::read(&path).map_err(|error| LoadError::Read {
-                        file: path.display().to_string(),
-                        reason: error.to_string(),
-                    })?;
-                    harness_files.push(HarnessFile {
-                        name: name.as_bytes().to_vec(),
-                        bytes,
-                    });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(LoadError::Directory {
-                    dir: harness_dir.display().to_string(),
-                    reason: error.to_string(),
-                });
-            }
-        }
+        let harness_files = read_registry(&harness_dir);
 
-        let loaded = load_policy(files, &harness_files)?;
+        let loaded =
+            load_policy_with_registry(files, harness_files.as_deref().map_err(Clone::clone))?;
+        let unregistered = loaded.unregistered_labels();
         Ok(Self {
             rules: loaded.rules,
             files: entries.into_iter().map(|(path, _)| path).collect(),
             generation: loaded.generation.hex(),
             tests: loaded.tests,
             harnesses: loaded.harnesses,
+            unregistered,
+            registry_fault: loaded.registry_fault,
         })
     }
 }
@@ -409,7 +428,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     }
 
     #[test]
-    fn a_registry_symlink_to_a_missing_file_is_a_read_error() {
+    fn a_registry_symlink_to_a_missing_file_is_a_registry_fault() {
         use std::os::unix::fs::symlink;
 
         let parent = test_tmp_root().join("harness-read-error");
@@ -419,20 +438,23 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
         std::fs::create_dir_all(&rules).unwrap();
         std::fs::create_dir_all(&harnesses).unwrap();
         symlink(parent.join("missing"), harnesses.join("codex.toml")).unwrap();
-        let error = LoadedRules::from_dir(&rules).unwrap_err();
-        assert_eq!(format!("{error:?}").split('{').next(), Some("Read "));
+        // A registry that cannot be read disarms harnesses; it is not a load error.
+        let loaded = LoadedRules::from_dir(&rules).unwrap();
+        assert!(loaded.harnesses().is_empty());
+        assert!(loaded.registry_fault().unwrap().contains("codex.toml"));
         std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
-    fn a_non_directory_registry_path_is_a_directory_error() {
+    fn a_non_directory_registry_path_is_a_registry_fault() {
         let parent = test_tmp_root().join("harness-directory-error");
         let _ = std::fs::remove_dir_all(&parent);
         let rules = parent.join("rules.d");
         std::fs::create_dir_all(&rules).unwrap();
         std::fs::write(parent.join("harnesses.d"), "not a directory").unwrap();
-        let error = LoadedRules::from_dir(&rules).unwrap_err();
-        assert_eq!(format!("{error:?}").split('{').next(), Some("Directory "));
+        let loaded = LoadedRules::from_dir(&rules).unwrap();
+        assert!(loaded.harnesses().is_empty());
+        assert!(loaded.registry_fault().unwrap().contains("harnesses.d"));
         std::fs::remove_dir_all(parent).unwrap();
     }
 

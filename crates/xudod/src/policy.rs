@@ -266,6 +266,7 @@ max-entries = 10
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: String::new(),
+            passwd_fault: None,
         }
     }
 
@@ -406,6 +407,7 @@ outcome = "ask-human"
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: PASSWD.to_owned(),
+            passwd_fault: None,
         };
         let request = ask("/usr/bin/true", &["upgrade"]);
         let broker_decision = decide(&policy, &broker, &request);
@@ -445,6 +447,12 @@ outcome = "ask-human"
         );
         assert!(!facts.classification.is_enrolled_agent());
         assert!(facts.classification.requires_password());
+        // A removed registry file leaves its scope unattested, never human.
+        assert!(
+            format!("{:?}", facts.classification).starts_with("Unattested"),
+            "{:?}",
+            facts.classification
+        );
     }
 
     #[test]

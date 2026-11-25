@@ -19,7 +19,14 @@ Harness registrations are separate files under
 one named
 .I <label>.toml
 per label. They are root-owned policy inputs and contribute to the ruleset
-generation. A missing or changed registration invalidates records that name
+generation. A registry file that fails the trust walk or does not parse leaves
+the registry empty and is reported as a registry fault (in
+.BR "xudo doctor" ,
+and in the evidence of every decision record): the rules still load, so a human
+keeps the password path, and no harness is armed for anyone. Removing a file
+disarms its harness the same way. Account names are resolved from
+.I /etc/passwd
+only (no NSS); a line whose uid does not parse is skipped, as glibc does. A missing or changed registration invalidates records that name
 the old entry.
 .SH LOCATION
 The default directory is
@@ -277,7 +284,9 @@ Root-owned entries are kept when the key is omitted.
 .TP
 .B harness
 Labels from the root-owned harness registry.
-A label missing from the registry fails the load.
+A label missing from the registry loads and grants nothing;
+.B "xudo check"
+refuses it.
 The list does not authorize the operation.
 .PP
 The target is one absolute path under

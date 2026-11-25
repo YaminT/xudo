@@ -3358,6 +3358,44 @@ args = [{ name = "verb", matcher = { literal = "status" } }]
     }
 
     #[test]
+    fn check_refuses_a_rule_naming_an_unregistered_harness_and_a_faulted_registry() {
+        let root = test_tmp_root().join("cli-check-unregistered");
+        let _ = std::fs::remove_dir_all(&root);
+        let rules = root.join("rules.d");
+        let harnesses = root.join("harnesses.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&harnesses).unwrap();
+        std::fs::write(
+            rules.join("10-harness.toml"),
+            "[[action]]\nid = \"xudo.harness.ghost\"\ntier = \"diag-read\"\nexe = \"/usr/bin/id\"\nharness = [\"ghost\"]\noutcome = \"allow\"\nargs = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            harnesses.join("codex.toml"),
+            "label = \"codex\"\nbogus = 1\n",
+        )
+        .unwrap();
+        let fixture = Fixture { dir: rules };
+        let (code, out, err) = fixture.run(&["--output", "json", "check"]);
+        // The rules still load: a registry fault is a lint, not a load failure.
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let messages = parsed["lint"]["harness_lints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            messages.contains("\"ghost\", which is not in the registry"),
+            "{messages}"
+        );
+        assert!(messages.contains("no harness is armed"), "{messages}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_command_with_no_program_named_matches_nothing() {
         // Before the program became part of the decision, a bare `restart
         // nginx.service` was matched against the argument list and *allowed* by

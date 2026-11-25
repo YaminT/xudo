@@ -449,19 +449,25 @@ fn entry_hash(canonical: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The uid of `name` in a `/etc/passwd` text, if the line is well formed.
+/// The uid of `name` in a `/etc/passwd` text, if a line is well formed.
 ///
-/// The first matching name wins. A comment, a short line, and a `+` inclusion
-/// are not a match. This does not read the file.
+/// The first matching name whose uid and gid fields both parse wins, as glibc
+/// does: a line with an unparsable uid or gid is skipped, and a later line for
+/// the same name is used. A comment, a short line, and a `+` inclusion are not a match. This
+/// does not read the file, and asks no NSS source: `/etc/passwd` only.
 pub fn passwd_uid(text: &str, name: &str) -> Option<u32> {
     if !valid_account_name(name) {
         return None;
     }
     let prefix = format!("{name}:");
-    let line = text
-        .lines()
-        .find(|line| !line.starts_with('#') && line.starts_with(&prefix))?;
-    line.split(':').nth(2)?.parse().ok()
+    text.lines()
+        .filter(|line| !line.starts_with('#') && line.starts_with(&prefix))
+        .find_map(|line| {
+            let mut fields = line.split(':').skip(2);
+            let uid = fields.next()?.parse().ok()?;
+            fields.next()?.parse::<u32>().ok()?;
+            Some(uid)
+        })
 }
 
 /// [`passwd_uid`] over bytes already read. A failed read is "no such account".
@@ -471,6 +477,37 @@ pub fn passwd_uid(text: &str, name: &str) -> Option<u32> {
 pub fn uid_from_passwd_read<E>(read: Result<Vec<u8>, E>, name: &str) -> Option<u32> {
     let bytes = read.ok()?;
     passwd_uid(&String::from_utf8_lossy(&bytes), name)
+}
+
+/// What is wrong with a `/etc/passwd` that still resolves accounts, or `None`.
+///
+/// Counts the lines [`passwd_uid`] cannot use (no name, or no numeric uid;
+/// comments, blanks and `+`/`-` inclusions are not lines of that kind) and
+/// the lines holding bytes that are not UTF-8, which are read lossily. It
+/// never changes a decision. It is a report: an operator who sees it in
+/// `doctor` or in an audit record knows an account may not resolve, and why.
+pub fn passwd_fault(bytes: &[u8]) -> Option<String> {
+    let mut malformed = 0_usize;
+    let mut lossy = 0_usize;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if std::str::from_utf8(line).is_err() {
+            lossy = lossy.saturating_add(1);
+        }
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() || text.starts_with(['#', '+', '-']) {
+            continue;
+        }
+        let mut fields = text.split(':');
+        let named = fields.next().is_some_and(|name| !name.is_empty());
+        let numeric = fields.nth(1).is_some_and(|uid| uid.parse::<u32>().is_ok())
+            && fields.next().is_some_and(|gid| gid.parse::<u32>().is_ok());
+        if !(named && numeric) {
+            malformed = malformed.saturating_add(1);
+        }
+    }
+    (malformed.saturating_add(lossy) > 0).then(|| {
+        format!("{malformed} unusable and {lossy} non-UTF-8 line(s) in the account database")
+    })
 }
 
 fn put(out: &mut Vec<u8>, field: &[u8]) {
@@ -851,6 +888,47 @@ max-sessions = 1
         assert_eq!(
             uid_from_passwd_read(Ok::<_, ()>(b"agent\n".to_vec()), "agent"),
             None
+        );
+    }
+
+    #[test]
+    fn passwd_skips_a_line_with_an_unparsable_uid_like_glibc() {
+        let text = "agent:x:abc:1::/:/bin/sh\nagent:x:1000:1000::/:/bin/sh\n";
+        assert_eq!(passwd_uid(text, "agent"), Some(1000));
+        assert_eq!(passwd_uid("agent:x::1::/:/bin/sh\n", "agent"), None);
+        assert_eq!(passwd_uid("agent:x:-1:1::/:/bin/sh\n", "agent"), None);
+        // glibc keeps a line only when the gid parses too.
+        let no_gid = "agent:x:1000\nagent:x:2000:abc::/:/bin/sh\nagent:x:3000:3000::/:/bin/sh\n";
+        assert_eq!(passwd_uid(no_gid, "agent"), Some(3000));
+        assert_eq!(passwd_uid("agent:x:1000:\n", "agent"), None);
+        assert!(passwd_fault(b"agent:x:1000:abc::/:/bin/sh\n").is_some());
+    }
+
+    #[test]
+    fn a_non_utf8_passwd_line_is_reported_not_silent() {
+        let mut bytes = b"root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000:Ag".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        bytes.extend_from_slice(b":/home/agent:/bin/sh\n");
+        // Still resolves: a chfn GECOS with a stray byte must not stop anyone.
+        assert_eq!(
+            uid_from_passwd_read(Ok::<_, ()>(bytes.clone()), "agent"),
+            Some(1000)
+        );
+        assert_eq!(
+            passwd_fault(&bytes).as_deref(),
+            Some("0 unusable and 1 non-UTF-8 line(s) in the account database")
+        );
+    }
+
+    #[test]
+    fn passwd_fault_counts_unusable_lines_and_ignores_the_rest() {
+        assert_eq!(passwd_fault(b""), None);
+        let clean = b"# c\n\nroot:x:0:0::/:/bin/sh\n+inc\n-ex\n";
+        assert_eq!(passwd_fault(clean), None);
+        let text = b"short\n:x:5:5::/:/bin/sh\nbad:x:nope:1\nbad2:x\nok:x:1:1::/:/bin/sh\n";
+        assert_eq!(
+            passwd_fault(text).as_deref(),
+            Some("4 unusable and 0 non-UTF-8 line(s) in the account database")
         );
     }
 }

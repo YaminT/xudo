@@ -233,7 +233,7 @@ pub struct Action {
     /// no such grant is armed. Absent means never passwordless. For
     /// [`Outcome::AskHuman`] the list is required: it is the only set of
     /// enrolled agents the action queues, and an empty or missing list fails
-    /// to load. A label that is not in the registry fails the combined load.
+    /// to load. A label that is not in the registry grants nothing: it matches no caller, and `check` reports it.
     #[serde(default)]
     pub harness: Vec<String>,
     /// What a listed harness gets. Required when `harness` is non-empty.
@@ -445,18 +445,6 @@ pub enum RuleSetError {
     #[error("action {id} at {at}: harness label {label:?} is listed twice")]
     DuplicateHarnessLabel {
         /// The offending action.
-        id: String,
-        /// The label.
-        label: String,
-        /// Where it is defined.
-        at: Source,
-    },
-    /// A harness label is not in the registry this load was given.
-    #[error("{kind} {id} at {at}: harness label {label:?} is not in the registry")]
-    UnknownHarness {
-        /// Whether this is an action or typed operation.
-        kind: &'static str,
-        /// The offending action or operation.
         id: String,
         /// The label.
         label: String,
