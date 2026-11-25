@@ -271,6 +271,16 @@ mod tests {
             .join("test-tmp")
     }
 
+    /// A directory name no other call, test or process shares.
+    ///
+    /// Tests run in parallel and a shared name lets one test's `remove_dir_all`
+    /// pull the directory from under another's write.
+    fn unique_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        test_tmp_root().join(format!("{name}-{}-{n}", std::process::id()))
+    }
+
     /// Writes rule files into a fresh directory under the target dir.
     ///
     /// Deliberately not `/tmp`: a predictable path in a world-writable
@@ -279,10 +289,16 @@ mod tests {
         dir: PathBuf,
     }
 
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(self.dir.with_extension("config"));
+        }
+    }
+
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = test_tmp_root().join(name);
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = unique_dir(name);
             std::fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }
@@ -408,7 +424,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     #[test]
     fn a_front_end_loads_registered_harnesses_and_ignores_other_files() {
-        let parent = test_tmp_root().join("front-end-harnesses");
+        let parent = unique_dir("front-end-harnesses");
         let _ = std::fs::remove_dir_all(&parent);
         let fx = Fixture {
             dir: parent.join("rules.d"),
@@ -431,7 +447,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
     fn a_registry_symlink_to_a_missing_file_is_a_registry_fault() {
         use std::os::unix::fs::symlink;
 
-        let parent = test_tmp_root().join("harness-read-error");
+        let parent = unique_dir("harness-read-error");
         let _ = std::fs::remove_dir_all(&parent);
         let rules = parent.join("rules.d");
         let harnesses = parent.join("harnesses.d");
@@ -447,7 +463,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     #[test]
     fn a_non_directory_registry_path_is_a_registry_fault() {
-        let parent = test_tmp_root().join("harness-directory-error");
+        let parent = unique_dir("harness-directory-error");
         let _ = std::fs::remove_dir_all(&parent);
         let rules = parent.join("rules.d");
         std::fs::create_dir_all(&rules).unwrap();

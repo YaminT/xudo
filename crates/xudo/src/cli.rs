@@ -1687,14 +1687,30 @@ mod tests {
             .join("test-tmp")
     }
 
+    /// A directory name no other call, test or process shares.
+    ///
+    /// Tests run in parallel and a shared name lets one test's `remove_dir_all`
+    /// pull the directory from under another's write.
+    fn unique_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        test_tmp_root().join(format!("{name}-{}-{n}", std::process::id()))
+    }
+
     struct Fixture {
         dir: PathBuf,
     }
 
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(self.dir.with_extension("config"));
+        }
+    }
+
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = test_tmp_root().join(name);
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = unique_dir(name);
             std::fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }
@@ -3346,7 +3362,7 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     const CODEX_FILE: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
 
     fn harness_fixture(name: &str, rule: &str) -> (Fixture, std::path::PathBuf) {
-        let root = test_tmp_root().join(name);
+        let root = unique_dir(name);
         let _ = std::fs::remove_dir_all(&root);
         let rules = root.join("rules.d");
         let harnesses = root.join("harnesses.d");
@@ -3405,7 +3421,7 @@ args = [{ name = "verb", matcher = { literal = "status" } }]
 
     #[test]
     fn check_refuses_a_rule_naming_an_unregistered_harness_and_a_faulted_registry() {
-        let root = test_tmp_root().join("cli-check-unregistered");
+        let root = unique_dir("cli-check-unregistered");
         let _ = std::fs::remove_dir_all(&root);
         let rules = root.join("rules.d");
         let harnesses = root.join("harnesses.d");
