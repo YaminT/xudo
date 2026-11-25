@@ -53,8 +53,10 @@ use xudo_sys::{
 /// Kernel-derived cgroup result retained for classification and audit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CgroupAttestation {
-    /// The peer is in a committed, live, root-owned agent scope.
-    AgentScope(Scope),
+    /// The peer is in a committed, live, root-owned agent scope. Only the
+    /// registry decides whether that scope is a harness: until
+    /// `classify_with_registry` has run, it names none.
+    UnregisteredScope(Scope),
     /// The peer is outside `xudo.slice` on a supported pidfd rung.
     Outside,
     /// A live root-created scope has a valid record, but it is not an agent scope.
@@ -395,7 +397,7 @@ fn classify_live_scope(
     cgroup: CgroupIdentity,
 ) -> (CgroupAttestation, Option<CgroupIdentity>) {
     if scope.kind == ScopeKind::Agent {
-        (CgroupAttestation::AgentScope(scope), Some(cgroup))
+        (CgroupAttestation::UnregisteredScope(scope), Some(cgroup))
     } else {
         (CgroupAttestation::OtherScope(scope), Some(cgroup))
     }
@@ -548,7 +550,7 @@ mod tests {
             fallback_errno: None,
         };
         let (attestation, observed) = classify_live_scope(scope.clone(), cgroup.clone());
-        assert_eq!(attestation, CgroupAttestation::AgentScope(scope));
+        assert_eq!(attestation, CgroupAttestation::UnregisteredScope(scope));
         assert_eq!(observed, Some(cgroup));
     }
 
@@ -761,7 +763,7 @@ mod tests {
         .unwrap();
         assert_eq!(identity.cgroup_attestation, CgroupAttestation::Unattested);
         assert_eq!(
-            std::mem::discriminant(&crate::policy::classify(&identity).classification),
+            std::mem::discriminant(&crate::policy::classify_for_test(&identity).classification),
             std::mem::discriminant(&xudo_policy::Classification::Unattested {
                 reason: String::new(),
             })
@@ -785,7 +787,9 @@ mod tests {
         .unwrap();
         assert_eq!(identity.cgroup_attestation, CgroupAttestation::Outside);
         assert_eq!(
-            crate::policy::classify(&identity).classification.label(),
+            crate::policy::classify_for_test(&identity)
+                .classification
+                .label(),
             "human"
         );
     }

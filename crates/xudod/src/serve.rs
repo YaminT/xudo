@@ -489,7 +489,7 @@ fn queue_ask_human(
             Some(request),
         );
     }
-    if !audit_queue_pruned(platform.audit, &pruned) {
+    if !audit_queue_pruned(platform.audit, &pruned, caller.classification.label()) {
         return refuse(
             conn,
             platform.audit,
@@ -593,7 +593,7 @@ fn queue_entry_from_request(
     .map_err(|error| error.to_string())
 }
 
-fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
+fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String], class: &str) -> bool {
     ids.iter().all(|id| {
         audit
             .append(&|previous| {
@@ -601,7 +601,7 @@ fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
                     previous,
                     xudo_audit::record::Decision::Denied,
                     Vec::new(),
-                    "human",
+                    class,
                 )
                 .with_denial("queue_entry_pruned")
                 .with_evidence(vec![format!("queue_id={id}")])
@@ -617,6 +617,7 @@ fn audit_queue_listed(
     after: &str,
     count: usize,
     next: Option<&str>,
+    class: crate::queue::PeerClass,
 ) -> bool {
     audit
         .append(&|previous| {
@@ -624,7 +625,7 @@ fn audit_queue_listed(
                 previous,
                 xudo_audit::record::Decision::Denied,
                 Vec::new(),
-                "human",
+                peer_class_label(class),
             )
             .with_denial("queue_listed")
             .with_evidence(vec![
@@ -703,6 +704,16 @@ fn prepare_queue<'a>(
         boot_id,
         passwd,
     })
+}
+
+/// The classification label the audit trail records for a queue peer: what the
+/// broker attested, never a fixed "human".
+fn peer_class_label(class: crate::queue::PeerClass) -> &'static str {
+    match class {
+        crate::queue::PeerClass::Human => "human",
+        crate::queue::PeerClass::EnrolledAgent => "enrolled-agent",
+        crate::queue::PeerClass::Unattested => "unattested",
+    }
 }
 
 fn peer_class(caller: &CallerFacts) -> crate::queue::PeerClass {
@@ -810,7 +821,7 @@ fn serve_queue_list(
         };
     // Audit the prune set before any name is removed. A failed audit leaves
     // the store untouched.
-    if !audit_queue_pruned(platform.audit, &planned) {
+    if !audit_queue_pruned(platform.audit, &planned, peer_class_label(ready.class)) {
         return refuse(
             conn,
             platform.audit,
@@ -861,6 +872,7 @@ fn serve_queue_list(
         after,
         page.len(),
         next.as_deref(),
+        ready.class,
     ) {
         return refuse(
             conn,
@@ -2788,7 +2800,7 @@ fn freeze_with(
                 previous,
                 xudo_audit::record::Decision::Denied,
                 vec!["xudo freeze".to_owned()],
-                "human",
+                caller.classification.label(),
             )
             .with_denial("freeze")
             .with_evidence(vec![
@@ -3980,7 +3992,7 @@ mod tests {
 
     use super::*;
     use crate::mint::{MAX_SPOOL_ENTRIES, MintError, entry_for};
-    use crate::policy::{PolicyError, classify};
+    use crate::policy::{PolicyError, classify_for_test};
 
     const PID: u32 = 4242;
     const UID: u32 = 1000;
@@ -4046,7 +4058,7 @@ mod tests {
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
         identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+            crate::identify::CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
                 kind: xudo_sys::ScopeKind::Agent,
                 name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
                 record: serde_json::json!({
@@ -5085,7 +5097,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         // Both read the entry as Approved before either has published.
         let mut taken = Vec::new();
         for identity in [&first, &second] {
-            let caller = classify(identity);
+            let caller = classify_for_test(identity);
             let approved = take_matching_approval(
                 &spool,
                 &search_for(&request, identity, &caller, &syscalls, &action),
@@ -5246,7 +5258,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "unattested",
         );
         let identity = test_identity(PID, START, 7, 7);
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let syscalls = xudo_sys::FakeSyscalls::new();
         let taken = take_matching_approval(
             &spool,
@@ -5378,7 +5390,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let identity =
                 crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
             let policy = confirming_policy();
-            let caller = classify(&identity);
+            let caller = classify_for_test(&identity);
             let decision = decide(&policy, &caller, &request);
             Evaluated {
                 decision,
@@ -5481,7 +5493,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID, START, 0, 0);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let mut evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
@@ -6161,10 +6173,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             format!("{}.json", stale.id),
             serde_json::to_vec(&stale).unwrap(),
         );
+        let mut pruned_audit = FakeAuditSink::new();
         assert!(audit_queue_pruned(
-            &mut FakeAuditSink::new(),
+            &mut pruned_audit,
             std::slice::from_ref(&stale.id),
+            "unattested",
         ));
+        assert_eq!(pruned_audit.records()[0].classification, "unattested");
         let (mut host, _, _) = ask_human_fixture();
         let mut audit = SecondAuditAppendFails {
             inner: FakeAuditSink::new(),
@@ -6192,6 +6207,106 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, stale.id);
         assert_eq!(audit.snapshot().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_prune_record_names_the_class_that_triggered_it_not_human() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        let store = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let mut platform = host.platform();
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        queue_ask_human(
+            &conn,
+            &mut platform,
+            &identity,
+            &request,
+            &decision,
+            &caller,
+            &policy,
+        );
+        let pruned = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(pruned, caller.classification.label());
+        assert_ne!(pruned, "human");
+    }
+
+    #[test]
+    fn a_listing_prune_record_names_the_listers_class_not_human() {
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        let identity = enrolled_identity(&mut host);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            request,
+        );
+        let class = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(class, "enrolled-agent");
     }
 
     #[test]
@@ -6737,7 +6852,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 thaw(
                     &mut host.platform(),
                     &root,
-                    &classify(&root),
+                    &classify_for_test(&root),
                     &thaw_request()
                 )
                 .is_err()
@@ -6751,7 +6866,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &root,
-                &classify(&root),
+                &classify_for_test(&root),
                 &thaw_request()
             )
             .is_err()
@@ -6784,7 +6899,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = thaw(
             &mut host.platform(),
             &human,
-            &classify(&human),
+            &classify_for_test(&human),
             &thaw_request(),
         )
         .unwrap_err();
@@ -6946,7 +7061,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let refused = thaw(
             &mut host.platform(),
             &root,
-            &classify(&root),
+            &classify_for_test(&root),
             &thaw_request(),
         )
         .unwrap_err();
@@ -7055,7 +7170,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &thaw_request(),
             )
             .unwrap_err();
@@ -7160,7 +7275,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         thaw(
             &mut host.platform(),
             &root,
-            &classify(&root),
+            &classify_for_test(&root),
             &thaw_request(),
         )
         .unwrap();
@@ -7318,7 +7433,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &mut host.platform(),
             &FakeSpool::new(),
             &identity,
-            &classify(&identity),
+            &classify_for_test(&identity),
             &request,
             "x",
             &|_| Err(serde_json::from_str::<()>("invalid").unwrap_err()),
@@ -7459,7 +7574,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .unwrap()
@@ -7474,7 +7589,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .is_err()
@@ -7487,7 +7602,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .is_err()
@@ -8143,7 +8258,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn unattested_live(identity: &PeerIdentity) -> LiveAttestation {
         live_attestation(
             &xudo_sys::FakeSyscalls::new(),
-            &classify(identity),
+            &classify_for_test(identity),
             identity,
         )
         .unwrap()
@@ -8188,7 +8303,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
@@ -8224,7 +8339,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
@@ -8265,7 +8380,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
@@ -8752,7 +8867,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                         }
                     },
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8767,7 +8882,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: None,
                     generation,
@@ -8784,7 +8899,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8801,7 +8916,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8818,7 +8933,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8961,7 +9076,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .ok()
                 .map(|live| live.class)
         };
-        let unattested = classify(&identity);
+        let unattested = classify_for_test(&identity);
         assert_eq!(
             class_of(&unattested, &identity),
             Some(xudo_gate::request::AttestedClass::Unattested)
@@ -9044,7 +9159,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation: policy().rules.generation.id(),
@@ -9173,7 +9288,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -9193,7 +9308,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -11027,7 +11142,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "unattested",
         );
         let identity = test_identity(PID, START, 0, 0);
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let decision = decide(&policy, &caller, &request);
         let mut entry = entry_for(
             &decision,
@@ -11553,11 +11668,212 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
     }
 
+    /// A live agent scope whose record names a label the registry lacks.
+    fn unregistered_identity(host: &mut Host) -> PeerIdentity {
+        let mut scope = registered_harness_scope(host);
+        let mut record: serde_json::Value = serde_json::from_slice(&scope.record).unwrap();
+        record["label"] = "ghost".into();
+        scope.record = record.to_string().into_bytes();
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
+        identity
+    }
+
+    /// One request per `Question` variant. `slot` is an exhaustive match, so a
+    /// new variant fails to compile until it has a row here.
+    fn every_question() -> Vec<xudo_wire::Question> {
+        use xudo_wire::Question as Q;
+        let id = || "a".repeat(64);
+        vec![
+            Q::Run {
+                program: "/usr/bin/apt-get".to_owned(),
+                argv: vec!["upgrade".to_owned()],
+                cwd: b"/srv".to_vec(),
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+            Q::Status { id: id() },
+            Q::Watch,
+            Q::Pending,
+            Q::Answer {
+                id: id(),
+                token: "b".repeat(64),
+                approve: true,
+            },
+            Q::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+            Q::Thaw,
+            Q::QueueList,
+            Q::QueueClaim { id: id() },
+            Q::QueueComplete {
+                id: id(),
+                audit_seq: 0,
+                claim_token: String::new(),
+            },
+            Q::QueueRelease {
+                id: id(),
+                claim_token: String::new(),
+            },
+            Q::QueueListPage {
+                after: String::new(),
+            },
+            Q::RemovePath {
+                target: b"/var/tmp/x".to_vec(),
+                dry_run: true,
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+        ]
+    }
+
+    fn slot(question: &xudo_wire::Question) -> usize {
+        use xudo_wire::Question as Q;
+        match question {
+            Q::Run { .. } => 0,
+            Q::Status { .. } => 1,
+            Q::Watch => 2,
+            Q::Pending => 3,
+            Q::Answer { .. } => 4,
+            Q::Freeze { .. } => 5,
+            Q::Thaw => 6,
+            Q::QueueList => 7,
+            Q::QueueClaim { .. } => 8,
+            Q::QueueComplete { .. } => 9,
+            Q::QueueRelease { .. } => 10,
+            Q::QueueListPage { .. } => 11,
+            Q::RemovePath { .. } => 12,
+        }
+    }
+
+    fn run_every_question(
+        make_identity: fn(&mut Host) -> PeerIdentity,
+        expected_class: &str,
+        names_a_harness: bool,
+        expected_own: &[usize],
+    ) {
+        let questions = every_question();
+        let mut slots: Vec<usize> = questions.iter().map(slot).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..13).collect::<Vec<_>>());
+        let mut with_own_record = Vec::new();
+        for question in questions {
+            let mut host = Host::honest();
+            host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+            let identity = make_identity(&mut host);
+            host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            let conn = connection(Ok(request.to_json().into_bytes()));
+            let spool = FakeSpool::new();
+            let _ = serve_request(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                identity,
+                request.clone(),
+            );
+            let n = slot(&request.question);
+            let shape = format!("question slot {n}");
+            // A record `refuse()` did not write: its class came from the
+            // handler's own classification.
+            let own: Vec<_> = host
+                .audit
+                .records()
+                .iter()
+                .filter(|record| {
+                    !record
+                        .evidence
+                        .iter()
+                        .any(|item| item.starts_with("fault="))
+                })
+                .collect();
+            if !own.is_empty() {
+                with_own_record.push(n);
+            }
+            for record in &own {
+                assert_eq!(record.classification, expected_class, "{shape}");
+            }
+            for record in host.audit.records() {
+                let has_agent = record
+                    .evidence
+                    .iter()
+                    .any(|item| item.starts_with("agent_id="));
+                if !names_a_harness {
+                    assert!(
+                        !has_agent,
+                        "{shape}: an unregistered scope was named a harness"
+                    );
+                }
+                if !names_a_harness {
+                    assert_eq!(record.classification, "unattested", "{shape}");
+                }
+            }
+            assert_eq!(
+                host.freeze_file.files().keys().collect::<Vec<_>>(),
+                vec![&b"frozen-1000".to_vec()],
+                "{shape}: the freeze state changed"
+            );
+        }
+        assert_eq!(
+            with_own_record, expected_own,
+            "handlers that wrote a record"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_scope_is_never_a_harness_in_any_handler() {
+        run_every_question(
+            unregistered_identity,
+            "unattested",
+            false,
+            &[0, 5, 7, 11, 12],
+        );
+    }
+
+    #[test]
+    fn a_registered_scope_is_an_enrolled_agent_in_every_handler() {
+        run_every_question(enrolled_identity, "enrolled-agent", true, &[0, 7, 11, 12]);
+    }
+
+    #[test]
+    fn the_audit_names_the_class_the_broker_attested_not_human() {
+        use crate::queue::PeerClass::{EnrolledAgent, Human, Unattested};
+        assert_eq!(peer_class_label(Human), "human");
+        assert_eq!(peer_class_label(EnrolledAgent), "enrolled-agent");
+        assert_eq!(peer_class_label(Unattested), "unattested");
+        let mut host = Host::honest();
+        let identity = unregistered_identity(&mut host);
+        let request = freeze_request();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        assert_eq!(host.audit.records()[0].classification, "unattested");
+    }
+
+    #[test]
+    fn a_real_harness_cannot_freeze() {
+        let mut host = Host::honest();
+        let identity = enrolled_identity(&mut host);
+        let request = freeze_request();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            request,
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert!(host.freeze_file.files().is_empty());
+    }
+
     fn enrolled_identity(host: &mut Host) -> PeerIdentity {
         let scope = registered_harness_scope(host);
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         identity
     }
 
@@ -11880,7 +12196,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.freeze_file.publish("frozen-1000", MARKER).unwrap();
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11907,7 +12223,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11933,7 +12249,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -12499,7 +12815,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let identity =
             crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let evaluated = Evaluated {
-            caller: crate::policy::classify(&identity),
+            caller: crate::policy::classify_for_test(&identity),
             decision,
             identity,
             request,
@@ -12526,7 +12842,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let spool = FakeSpool::new();
         let identity =
             crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
-        let caller = crate::policy::classify(&identity);
+        let caller = crate::policy::classify_for_test(&identity);
         let loaded = policy();
         let mut request = BrokerRequest::new(
             "/usr/bin/systemctl",
@@ -12775,6 +13091,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 assert_eq!(got.denial, expected.denial);
             }
         }
+    }
+
+    #[test]
+    fn stored_caller_is_never_a_live_attestation() {
+        use xudo_policy::Classification;
+        // A spool entry names a harness by label only: no scope, no yolo. A
+        // harness grant needs the live kernel-attested session, which this
+        // can never be.
+        let entry = enrolled_entry(NONCE, UID);
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        // The mint, where a grant would be made, never reads the stored class.
+        assert!(!include_str!("mint.rs").contains("stored_caller"));
     }
 
     #[test]
