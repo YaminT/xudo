@@ -1486,13 +1486,13 @@ fn a_directory_is_listed_sorted_and_only_if_the_walk_trusts_it() {
 
 #[test]
 fn a_directory_with_a_name_that_is_not_text_is_refused() {
-    use std::os::unix::ffi::OsStrExt;
-    let dir = scratch("agent-list-bytes");
-    std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"\xff.toml")), "").unwrap();
-    let err = ops_in(&dir, &Script::new())
-        .list_dir("/etc/xudo")
-        .unwrap_err();
+    // Bytes, not a file: APFS will not create such a name, Linux will.
+    let err = super::agent::utf8_name(b"\xff.toml", "/etc/xudo").unwrap_err();
     assert!(err.to_string().contains("not UTF-8"), "{err}");
+    assert_eq!(
+        super::agent::utf8_name(b"a.toml", "/etc/xudo").unwrap(),
+        "a.toml"
+    );
 }
 
 #[test]

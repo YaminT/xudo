@@ -39,28 +39,30 @@ impl HostInstallOps {
     }
 }
 
+/// A directory entry's name as text, or a refusal: names are compared as text later.
+pub(super) fn utf8_name(name: &[u8], path: &str) -> Result<String, InstallError> {
+    std::str::from_utf8(name)
+        .map(str::to_owned)
+        .map_err(|_| InstallError::UnsafeFile {
+            path: path.to_owned(),
+            reason: "a file name is not UTF-8".to_owned(),
+        })
+}
+
 /// The names in `dir`, without `.` and `..`, sorted.
 fn names_of(dir: Dir, path: &str) -> Result<Vec<String>, InstallError> {
-    let mut names = dir
-        .map(|entry| entry.map_err(io("list", path)))
+    dir.map(|entry| entry.map_err(io("list", path)))
         .filter(|entry| {
             entry.as_ref().map_or(true, |entry| {
                 !matches!(entry.file_name().to_bytes(), b"." | b"..")
             })
         })
-        .map(|entry| {
-            entry.and_then(|entry| {
-                std::str::from_utf8(entry.file_name().to_bytes())
-                    .map(str::to_owned)
-                    .map_err(|_| InstallError::UnsafeFile {
-                        path: path.to_owned(),
-                        reason: "a file name is not UTF-8".to_owned(),
-                    })
-            })
+        .map(|entry| entry.and_then(|entry| utf8_name(entry.file_name().to_bytes(), path)))
+        .collect::<Result<Vec<String>, InstallError>>()
+        .map(|mut names| {
+            names.sort();
+            names
         })
-        .collect::<Result<Vec<String>, InstallError>>()?;
-    names.sort();
-    Ok(names)
 }
 
 impl HostInstallOps {

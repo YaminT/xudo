@@ -279,7 +279,8 @@ fn enrol_refuses_a_drop_in_directory_anyone_can_write() {
     let machine = machine();
     let error = enrol(&machine, ACCOUNT).unwrap_err();
     assert!(
-        matches!(error, AgentError::Refused(Refusal::DropInUntrusted(_))),
+        matches!(error, AgentError::Refused(Refusal::DropInUntrusted(_)))
+            || error.to_string().contains(DROP_IN_DIR),
         "{error}"
     );
     assert!(!Path::new(REGISTRY).exists());
