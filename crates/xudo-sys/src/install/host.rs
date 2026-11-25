@@ -730,5 +730,6 @@ impl InstallOps for HostInstallOps {
     }
 }
 
+mod agent;
 #[cfg(test)]
 mod tests;

@@ -22,6 +22,7 @@ use xudo_sys::{
     RefusingInstaller, Runner, Verification, host_ops,
 };
 
+use crate::agent::{self, AgentAction};
 use crate::agentdoc::{self, DocFormat};
 use crate::check;
 use crate::doctor;
@@ -279,6 +280,16 @@ pub enum Command {
         /// Remove what an install wrote, and nothing else.
         #[arg(long)]
         uninstall: bool,
+    },
+
+    /// Enrol, list or remove a harness that runs as its own account.
+    ///
+    /// `enrol` and `remove` need root, like `install`, and grant nothing: an
+    /// enrolled harness still asks for the sudo password for every command.
+    Agent {
+        /// What to do.
+        #[command(subcommand)]
+        action: AgentAction,
     },
 
     /// Verify that the audit log has not been edited.
@@ -549,6 +560,7 @@ pub fn run_with_installer_at_socket(
             out,
         ),
         Command::Config { schema, action } => config(cli, *schema, action.as_ref(), out, err),
+        Command::Agent { action } => agent::run(platform, installer, action, out, err),
         Command::Install {
             dry_run,
             show_contents,
@@ -1607,8 +1619,10 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixListener;
     use xudo_backend::Capability;
+    use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest, PlannedFile};
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
     use xudo_config::Setting;
+    use xudo_sys::{AgentError, AgentRow};
 
     /// Runs `cli` against `ops` and `probe`, with this machine's filesystem and
     /// no `PATH` to report on.
@@ -4078,6 +4092,21 @@ expect = "deny"
     struct ScriptedInstaller {
         plans: std::cell::RefCell<Vec<InstallPlan>>,
         answers: std::cell::RefCell<Vec<Result<InstallReport, xudo_sys::InstallError>>>,
+        agent: AgentScript,
+    }
+
+    /// What the agent calls were asked, and what each answers once.
+    #[derive(Default)]
+    struct AgentScript {
+        asked: std::cell::RefCell<Vec<String>>,
+        plan: std::cell::RefCell<Option<Result<EnrolPlan, AgentError>>>,
+        apply: std::cell::RefCell<Option<Result<(), AgentError>>>,
+        list: std::cell::RefCell<Option<Result<Vec<AgentRow>, AgentError>>>,
+        remove: std::cell::RefCell<Option<Result<Vec<String>, AgentError>>>,
+    }
+
+    fn nobody<T>() -> Result<T, AgentError> {
+        Err(xudo_sys::InstallError::NoInstaller.into())
     }
 
     impl ScriptedInstaller {
@@ -4085,6 +4114,7 @@ expect = "deny"
             Self {
                 plans: std::cell::RefCell::new(Vec::new()),
                 answers: std::cell::RefCell::new(answers.into_iter().rev().collect()),
+                agent: AgentScript::default(),
             }
         }
     }
@@ -4096,6 +4126,39 @@ expect = "deny"
                 .borrow_mut()
                 .pop()
                 .unwrap_or(Err(xudo_sys::InstallError::NoInstaller))
+        }
+
+        fn agent_plan(
+            &self,
+            request: &EnrolRequest,
+            scan: AccountScan,
+        ) -> Result<EnrolPlan, AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("plan {request:?} {scan:?}"));
+            self.agent.plan.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_apply(&self, plan: &EnrolPlan) -> Result<(), AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("apply {}", plan.label));
+            self.agent.apply.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_list(&self) -> Result<Vec<AgentRow>, AgentError> {
+            self.agent.asked.borrow_mut().push("list".to_owned());
+            self.agent.list.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("remove {label}"));
+            self.agent.remove.borrow_mut().take().unwrap_or_else(nobody)
         }
     }
 
@@ -5052,5 +5115,298 @@ expect = "deny"
     fn the_parsed_command_is_debuggable() {
         let cli = Cli::try_parse_from(["xudo", "explain", "--", "x"]).unwrap();
         assert!(format!("{cli:?}").contains("Explain"));
+    }
+
+    // --- xudo agent --------------------------------------------------------
+
+    const AGENT_PASSWD: &[u8] =
+        b"root:x:0:0::/root:/bin/sh\nagent:x:990:990::/h:/usr/sbin/nologin\nalice:x:1000:1000::/h:/bin/sh\n";
+
+    fn agent_host(sudoers: &[u8]) -> MemoryHost {
+        MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, AGENT_PASSWD)
+        .file("/etc/sudoers", 0, 0, 0o440, sudoers)
+    }
+
+    fn enrol_plan() -> EnrolPlan {
+        let file = |path: &str, contents: &str| PlannedFile {
+            path: path.to_owned(),
+            contents: contents.to_owned(),
+            mode: 0o644,
+            keep: false,
+        };
+        EnrolPlan {
+            label: "codex".to_owned(),
+            account: "agent".to_owned(),
+            unit: "xudo-agent@codex.service".to_owned(),
+            registry: file("/etc/xudo/harnesses.d/codex.toml", "label = \"codex\"\n"),
+            drop_in_dir: "/etc/systemd/system/xudo-agent@codex.service.d".to_owned(),
+            drop_in: file(
+                "/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf",
+                "User=agent\n",
+            ),
+            env: file("/etc/xudo/agents/codex.env", "# stub\n"),
+        }
+    }
+
+    fn run_agent(
+        host: &dyn HostView,
+        probe: &dyn Probe,
+        installer: &dyn Installer,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        // One directory per call: tests run in parallel and a fixture clears its own.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fx = fixture(&format!("cli-agent-{n}"));
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "agent"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ops = host_ops();
+        let platform = Platform {
+            ops: ops.as_ref(),
+            probe,
+            host,
+            path: None,
+        };
+        let code = run_with_installer(&cli, &platform, installer, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    const ENROL: [&str; 9] = [
+        "enrol",
+        "codex",
+        "--account",
+        "agent",
+        "--reviewer",
+        "alice",
+        "--",
+        "/usr/bin/codex",
+        "--full-auto",
+    ];
+
+    #[test]
+    fn agent_enrol_prints_what_it_will_write_before_it_writes() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        *installer.agent.apply.borrow_mut() = Some(Ok(()));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!((code, err.as_str()), (ExitCode::Delegated, ""), "{out}");
+        let diff = out
+            .find("--- /etc/xudo/harnesses.d/codex.toml")
+            .expect(&out);
+        let done = out.find("enrolled codex").expect(&out);
+        assert!(diff < done, "{out}");
+        assert!(out.contains("It grants nothing"), "{out}");
+        let asked = installer.agent.asked.borrow();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked[0].contains("argv: [\"/usr/bin/codex\", \"--full-auto\"]"),
+            "{asked:?}"
+        );
+        assert!(asked[0].contains("reviewers: [\"alice\"]"), "{asked:?}");
+        assert!(asked[0].contains("uid: 990"), "{asked:?}");
+        assert_eq!(asked[1], "apply codex");
+    }
+
+    #[test]
+    fn agent_enrol_dry_run_writes_nothing() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        let mut args = ENROL.to_vec();
+        args.insert(1, "--dry-run");
+        let (code, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &args);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("Nothing was written (--dry-run)"), "{out}");
+        assert_eq!(installer.agent.asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn agent_enrol_scans_the_account_with_whichever_backend_there_is() {
+        // sudo: its own listing for the account is asked, and a rule found
+        // there stops the enrol before anything is planned.
+        let host = agent_host(b"alice ALL=(ALL) ALL\n").sudo_says(
+            "agent",
+            xudo_backend::paths_to_root::Answer::Passwordless("(root) NOPASSWD: ALL".to_owned()),
+        );
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        run_agent(&host, &WorkingSudoProbe, &installer, &ENROL);
+        assert!(installer.agent.asked.borrow()[0].contains("blockers: [\"BackendListing"));
+        // doas, and no backend at all: the same scan without a program to ask.
+        for probe in [&DoasInstallProbe as &dyn Probe, &NoBackendProbe] {
+            let installer = ScriptedInstaller::answering(vec![]);
+            *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+            run_agent(
+                &agent_host(b""),
+                probe,
+                &installer,
+                &[
+                    "enrol",
+                    "codex",
+                    "--account",
+                    "agent",
+                    "--reviewer",
+                    "alice",
+                    "--dry-run",
+                    "--",
+                    "/usr/bin/codex",
+                ],
+            );
+            assert_eq!(installer.agent.asked.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn agent_enrol_refuses_an_account_passwd_does_not_name() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let mut args = ENROL.to_vec();
+        args[3] = "ghost";
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &args);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("ghost is not in /etc/passwd"), "{err}");
+        assert!(installer.agent.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn agent_enrol_reports_a_refusal_and_a_failed_write_and_exits_non_zero() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Err(AgentError::NotRoot { uid: 1000 }));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("this needs root"), "{err}");
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        *installer.agent.apply.borrow_mut() = Some(Err(AgentError::NotEnrolled("x".to_owned())));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(out.contains("--- /etc/xudo"), "the diff came first: {out}");
+        assert!(!out.contains("enrolled codex"), "{out}");
+        assert!(err.contains("x is not an enrolled agent"), "{err}");
+    }
+
+    #[test]
+    fn agent_enrol_needs_a_reviewer_a_program_and_a_label() {
+        for bad in [
+            vec![
+                "enrol",
+                "codex",
+                "--account",
+                "agent",
+                "--",
+                "/usr/bin/codex",
+            ],
+            vec![
+                "enrol",
+                "codex",
+                "--account",
+                "agent",
+                "--reviewer",
+                "alice",
+            ],
+            vec![
+                "enrol",
+                "--account",
+                "agent",
+                "--reviewer",
+                "alice",
+                "--",
+                "/x",
+            ],
+            vec!["enrol", "codex", "--reviewer", "alice", "--", "/x"],
+        ] {
+            let mut full = vec!["xudo", "agent"];
+            full.extend(bad.iter());
+            assert!(Cli::try_parse_from(full).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn agent_list_shows_each_agent_with_its_state() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.list.borrow_mut() = Some(Ok(vec![AgentRow {
+            agent: xudo_backend::enrol::Listed {
+                label: "codex".to_owned(),
+                account: "agent".to_owned(),
+                reviewers: vec!["alice".to_owned(), "bob".to_owned()],
+            },
+            state: "active".to_owned(),
+        }]));
+        let (code, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, "codex  account=agent  active  reviewers=alice,bob\n");
+        *installer.agent.list.borrow_mut() = Some(Ok(vec![]));
+        let (_, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(out, "No agents enrolled.\n");
+        let (code, _, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("cannot modify the machine"), "{err}");
+    }
+
+    #[test]
+    fn agent_remove_reports_each_step_and_each_refusal() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.remove.borrow_mut() =
+            Some(Ok(vec!["stopped u".to_owned(), "removed r".to_owned()]));
+        let (code, out, _) = run_agent(
+            &agent_host(b""),
+            &WorkingSudoProbe,
+            &installer,
+            &["remove", "codex"],
+        );
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::Delegated, "stopped u\nremoved r\n")
+        );
+        assert_eq!(installer.agent.asked.borrow().as_slice(), ["remove codex"]);
+        let (code, _, err) = run_agent(
+            &agent_host(b""),
+            &WorkingSudoProbe,
+            &installer,
+            &["remove", "codex"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.starts_with("xudo: "), "{err}");
+    }
+
+    #[test]
+    fn the_scripted_installer_enrols_nothing_unless_told() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let request = EnrolRequest {
+            label: "a".to_owned(),
+            account: "b".to_owned(),
+            reviewers: vec![],
+            argv: vec![],
+        };
+        let scan = AccountScan {
+            uid: 1,
+            blockers: vec![],
+        };
+        assert!(installer.agent_plan(&request, scan).is_err());
+        assert!(installer.agent_apply(&enrol_plan()).is_err());
+        assert!(installer.agent_list().is_err());
+        assert!(installer.agent_remove("a").is_err());
+        assert_eq!(installer.agent.asked.borrow().len(), 4);
+    }
+
+    #[test]
+    fn agent_without_an_installer_cannot_modify_the_machine() {
+        // `run_with` is what every test drives: enrol and remove from an
+        // injected platform must never reach /etc.
+        let fx = fixture("cli-agent-refusing");
+        let (code, out, err) = fx.run(&["agent", "remove", "codex"]);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("cannot modify the machine"), "{err}");
     }
 }

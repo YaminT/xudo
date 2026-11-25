@@ -34,6 +34,7 @@
 
 pub mod capability;
 pub mod detect;
+pub mod enrol;
 pub mod paths_to_root;
 pub mod plan;
 pub mod snippet;
