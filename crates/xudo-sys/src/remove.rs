@@ -315,9 +315,16 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
     for (index, name) in components.iter().enumerate() {
         let parent_dev = stat.dev;
         let parent = dir;
-        dir = fs.open_dir(parent, name, false).map_err(|error| {
+        // The last component is opened with NO_XDEV (`beneath`): the kernel
+        // itself refuses any mount crossing, bind mounts included, on every
+        // kernel with openat2. The st_dev and mount_root checks below are a
+        // second layer.
+        let last = index.saturating_add(1) == components.len();
+        dir = fs.open_dir(parent, name, last).map_err(|error| {
             if matches_errno(&error, ENOENT) || matches_errno(&error, ELOOP) {
                 RemoveError::AncestorRefused
+            } else if last && matches_errno(&error, EXDEV) {
+                RemoveError::MountPoint
             } else {
                 error
             }
@@ -327,9 +334,7 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
         if !ancestor_ok(&stat) {
             return Err(RemoveError::AncestorRefused);
         }
-        if index.saturating_add(1) == components.len()
-            && (stat.dev != parent_dev || stat.mount_root)
-        {
+        if last && (stat.dev != parent_dev || stat.mount_root) {
             return Err(RemoveError::MountPoint);
         }
     }
@@ -1013,6 +1018,8 @@ pub struct FakeRemoveFs {
     /// The owner the diverging inode reports from its second `stat` on.
     diverge_uid: Option<u32>,
     rename_out: Option<(Vec<u8>, Vec<u8>, bool)>,
+    /// Whether a `beneath` open refuses a mount (`RESOLVE_NO_XDEV`). Off models\n    /// an open that missed it, so the stat checks behind it are exercised.
+    open_checks_mounts: bool,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -1043,6 +1050,7 @@ impl FakeRemoveFs {
             diverge: None,
             diverge_hits: 0,
             swap: None,
+            open_checks_mounts: true,
             unlinked: Vec::new(),
             fail_open: None,
             faults: Vec::new(),
@@ -1148,6 +1156,11 @@ impl FakeRemoveFs {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.dev = dev;
         }
+    }
+
+    /// Turn the `RESOLVE_NO_XDEV` model of `beneath` opens on or off.
+    pub fn set_open_checks_mounts(&mut self, on: bool) {
+        self.open_checks_mounts = on;
     }
 
     /// Mark `ino` as a mount root on the same device, as a same-filesystem bind
@@ -1352,7 +1365,7 @@ impl RemoveFs for FakeRemoveFs {
                 errno: ENOTDIR,
             });
         }
-        if beneath && node.dev != parent_dev {
+        if beneath && self.open_checks_mounts && (node.dev != parent_dev || node.mount_root) {
             return Err(RemoveError::Os {
                 op: "openat2",
                 errno: EXDEV,
@@ -1720,12 +1733,32 @@ mod tests {
     fn a_same_device_bind_mount_as_the_tree_is_refused() {
         let (mut fs, tree_root) = tree();
         fs.set_mount_root(tree_root);
-        fs.set_mount_root(9999);
         assert_eq!(
             remove_path(&mut fs, &req("item")).unwrap_err(),
             RemoveError::MountPoint
         );
         assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn a_bind_mount_as_the_tree_is_refused_by_the_open_and_again_by_the_stat() {
+        for open_checks_mounts in [true, false] {
+            let (mut fs, tree_root) = tree();
+            fs.set_mount_root(tree_root);
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("item")).unwrap_err(),
+                RemoveError::MountPoint
+            );
+            assert!(fs.unlinked().is_empty());
+            let (mut fs, tree_root) = tree();
+            fs.set_device(tree_root, 9);
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("item")).unwrap_err(),
+                RemoveError::MountPoint
+            );
+        }
     }
 
     #[test]
@@ -2562,6 +2595,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn the_real_root_is_a_mount_root_and_a_real_mount_is_not_opened_as_the_tree() {
+        let mut host = LinuxRemoveFs::default();
+        let root = host.open_root().unwrap();
+        assert!(host.fstat(root).unwrap().mount_root);
+        assert_eq!(
+            open_under(&mut host, b"/proc").unwrap_err(),
+            RemoveError::MountPoint
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_stale_linux_remove_descriptor_reports_the_actual_operation() {
         let mut fs = LinuxRemoveFs::default();
         let expected = |op| RemoveError::Os { op, errno: EBADF };
@@ -2865,6 +2910,7 @@ mod tests {
     #[test]
     fn the_fake_tolerates_unknown_inodes_and_stale_descriptors() {
         let mut fs = FakeRemoveFs::new();
+        fs.set_mount_root(99);
         fs.set_device(99, 2);
         fs.set_mode(99, 0o777);
         fs.hardlink(&[], b"ghost", 99);
