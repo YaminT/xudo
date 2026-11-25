@@ -102,7 +102,10 @@ pub use peer::{
 };
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
-pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
+pub use proc::{
+    CgroupPath, MountEntry, ProcStat, is_identity_uid_map, parse_cgroup, parse_mountinfo,
+    parse_nspid_count, parse_stat,
+};
 pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};

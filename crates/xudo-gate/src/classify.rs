@@ -23,6 +23,23 @@ pub struct LiveClass {
     pub boot_id: Option<String>,
 }
 
+impl LiveClass {
+    /// A caller the gate cannot attest, for `reason`, as `uid`.
+    pub fn unattested(uid: u32, reason: &str) -> Self {
+        Self {
+            facts: CallerFacts::new(
+                Classification::Unattested {
+                    reason: reason.to_owned(),
+                },
+                uid,
+            ),
+            attested_class: AttestedClass::Unattested,
+            scope_id: None,
+            boot_id: None,
+        }
+    }
+}
+
 /// The matched ancestor and immediate child pins used by the gate rung.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AncestorPin {
