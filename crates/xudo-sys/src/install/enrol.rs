@@ -14,7 +14,8 @@
 //!
 //! Environment stub, drop-in, registry entry, then systemd is told. Before the
 //! unit is enabled `User=` is asked of systemd itself, because a drop-in
-//! elsewhere in its search path could have the last word. Any failure takes
+//! elsewhere in its search path could have the last word, and so are the drop-in
+//! and unit file paths, which must be exactly ours and the template. Any failure takes
 //! back what this run wrote, in reverse. `remove` stops the unit first: the
 //! unit's own `ExecStopPost` voids the record (the helper insists that pid 1
 //! started it, so `remove` must not run it), and the registry entry is deleted
@@ -27,6 +28,9 @@ use xudo_backend::enrol::{
 use xudo_policy::valid_harness_label;
 
 use super::{FileIdentity, InstallError, InstallOps, Removal};
+
+/// Where the package installs the unit template.
+const TEMPLATE_PATH: &str = "/usr/lib/systemd/system/xudo-agent@.service";
 
 /// What a `systemctl` run said.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +50,14 @@ pub trait EnrolOps {
     ///
     /// A file that is not root's, is writable by others, or is too large.
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError>;
+
+    /// Succeeds only for an existing regular file that is root's, not a link,
+    /// and has no group or other permission bit. An absent file is `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// A file that is a link, not root's, or open to group or others.
+    fn private_file(&self, path: &str) -> Result<(), InstallError>;
 
     /// The names in a directory the walk from `/` finds root's alone; `None`
     /// when it does not exist.
@@ -96,6 +108,20 @@ pub enum AgentError {
     /// A registry file is not UTF-8.
     #[error("{0} is not UTF-8 text")]
     NotText(String),
+    /// systemd would load the unit from more than our drop-in and the template.
+    #[error(
+        "systemd would build {unit} from drop-ins {drop_ins:?} and unit file {fragment:?}, not \
+         only our drop-in and the packaged template: another file could change what runs; \
+         nothing was left in place"
+    )]
+    UnitSources {
+        /// The unit.
+        unit: String,
+        /// What `DropInPaths` said.
+        drop_ins: String,
+        /// What `FragmentPath` said.
+        fragment: String,
+    },
     /// systemd would run the unit as someone else.
     #[error(
         "systemd would run {unit} as {found:?}, not {expected}: another drop-in or unit file \
@@ -196,6 +222,11 @@ pub fn plan_enrol(
     let env_present = host
         .list_dir(AGENTS_DIR)?
         .is_some_and(|names| names.contains(&env_name));
+    if env_present {
+        // The record helper refuses this file at start; refuse here, before
+        // anything is written, when it would.
+        host.private_file(&env_path(&request.label))?;
+    }
     let facts = Facts {
         passwd: read("/etc/passwd")?,
         shadow,
@@ -301,6 +332,34 @@ fn perform(
             found: user.stdout,
         });
     }
+    // A drop-in or unit file anywhere else in systemd's search path could add
+    // groups, capabilities or an `ExecStartPost=+` while `User=` still reads
+    // right. Only our drop-in and the packaged template may be in play.
+    let drop_ins = systemctl_ok(
+        host,
+        &[
+            "show",
+            "--property=DropInPaths",
+            "--value",
+            plan.unit.as_str(),
+        ],
+    )?;
+    let fragment = systemctl_ok(
+        host,
+        &[
+            "show",
+            "--property=FragmentPath",
+            "--value",
+            plan.unit.as_str(),
+        ],
+    )?;
+    if drop_ins.stdout != plan.drop_in.path || fragment.stdout != TEMPLATE_PATH {
+        return Err(AgentError::UnitSources {
+            unit: plan.unit.clone(),
+            drop_ins: drop_ins.stdout,
+            fragment: fragment.stdout,
+        });
+    }
     systemctl_ok(host, &["enable", "--now", plan.unit.as_str()])?;
     Ok(())
 }
@@ -370,7 +429,10 @@ pub fn remove_agent(
     }
     let unit = unit_name(label);
     systemctl_ok(host, &["disable", "--now", unit.as_str()])?;
-    if host.systemctl(&["is-active", unit.as_str()])?.stdout == "active" {
+    // Only a unit that is down: `activating`, `deactivating` and `reloading`
+    // are not.
+    let state = host.systemctl(&["is-active", unit.as_str()])?.stdout;
+    if !matches!(state.as_str(), "inactive" | "failed") {
         return Err(AgentError::StillRunning(unit));
     }
     let mut lines = vec![format!("stopped {unit}")];

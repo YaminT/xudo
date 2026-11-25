@@ -21,7 +21,7 @@ use std::path::Path;
 use xudo_policy::{HarnessError, HarnessRegistry, valid_account_name, valid_harness_label};
 
 use crate::paths_to_root::{
-    Applies, Caller, Check, CheckId, Finding, HostView, Input, Lookup, Meta, assess,
+    Applies, Caller, Check, CheckId, Finding, HostView, Input, Lookup, Meta, Writer, assess,
 };
 
 /// Where registry files live.
@@ -362,34 +362,137 @@ pub fn scan_account(
         gid: entry.gid,
     };
     let report = assess(&as_account, input);
-    let blockers = report
+    let (held, mut gaps) = match host.read(Path::new("/etc/group")) {
+        Lookup::Found(group) => (held_gids(name, entry.gid, &group), Vec::new()),
+        _ => (
+            vec![entry.gid],
+            vec!["could not examine /etc/group: unreadable or missing".to_owned()],
+        ),
+    };
+    // Every check counts, not only the sudo and doas rules: any other way to
+    // root is one the unit would carry.
+    let mut blockers: Vec<String> = report
         .checks
         .iter()
-        .filter(|check| check.check == CheckId::PasswordlessRules)
-        .flat_map(blockers_of)
+        // The user `PATH` check is about whoever invoked `enrol`, who is root.
+        .filter(|check| check.check != CheckId::UserPath)
+        .flat_map(|check| blockers_of(check, entry.uid, &held))
         .collect();
+    blockers.append(&mut gaps);
+    blockers.extend(rules_naming(host, name, entry.uid));
     Ok(AccountScan {
         uid: entry.uid,
         blockers,
     })
 }
 
-fn blockers_of(check: &Check) -> Vec<String> {
-    // A rule that names only others is a finding of the report and not of this
-    // account's.
-    let others = |finding: &&Finding| {
-        matches!(
-            finding,
-            Finding::PasswordlessRule {
-                applies_to_you: Applies::No,
-                ..
+/// The gids the account holds: its primary one and every group that lists it.
+fn held_gids(account: &str, primary: u32, group_file: &[u8]) -> Vec<u32> {
+    let mut held = vec![primary];
+    for line in group_file.split(|byte| *byte == b'\n') {
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+        if let [_, _, gid, members, ..] = fields.as_slice()
+            && members
+                .split(|byte| *byte == b',')
+                .any(|member| member == account.as_bytes())
+            && let Some(gid) = number(gid)
+        {
+            held.push(gid);
+        }
+    }
+    held
+}
+
+/// Where sudo, sudo-rs and doas read rules, and the directories that add to
+/// them.
+const RULE_FILES: [&str; 4] = [
+    "/etc/sudoers",
+    "/etc/sudoers-rs",
+    "/etc/doas.conf",
+    "/usr/local/etc/doas.conf",
+];
+const RULE_DIRS: [&str; 2] = ["/etc/sudoers.d", "/etc/doas.d"];
+
+/// Every line of every sudo or doas file that names the account (by name or
+/// `#uid`), with or without a password, or that names everyone, or that
+/// includes something this cannot follow. A rule that asks for a password is
+/// still a way to root: `rootpw` and `targetpw` make it the root password, and
+/// a PAM module may accept something else.
+fn rules_naming(host: &dyn HostView, name: &str, uid: u32) -> Vec<String> {
+    let mut files: Vec<std::path::PathBuf> =
+        RULE_FILES.iter().map(std::path::PathBuf::from).collect();
+    let mut out = Vec::new();
+    for dir in RULE_DIRS {
+        match host.list(Path::new(dir)) {
+            Lookup::Found(names) => files.extend(names.iter().map(|n| Path::new(dir).join(n))),
+            Lookup::Missing => {}
+            Lookup::Unreadable(why) => out.push(format!("could not examine {dir}: {why}")),
+        }
+    }
+    for file in files {
+        match host.read(&file) {
+            Lookup::Found(bytes) => out.extend(
+                lines_naming(&bytes, name, uid)
+                    .into_iter()
+                    .map(|line| format!("{} line {line} names the account", file.display())),
+            ),
+            Lookup::Missing => {}
+            Lookup::Unreadable(why) => {
+                out.push(format!("could not examine {}: {why}", file.display()));
             }
-        )
-    };
+        }
+    }
+    out
+}
+
+fn lines_naming(bytes: &[u8], name: &str, uid: u32) -> Vec<usize> {
+    let hash_uid = format!("#{uid}");
+    let is_word = |byte: &u8| byte.is_ascii_alphanumeric() || b"_.-#".contains(byte);
+    let mut found = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        let line_no = index.saturating_add(1);
+        let trimmed = line.trim_ascii_start();
+        let directive = [&b"#include"[..], b"@include"]
+            .iter()
+            .any(|word| trimmed.starts_with(word));
+        if directive {
+            let mut parts = trimmed.split(u8::is_ascii_whitespace);
+            let standard = matches!(
+                (parts.next(), parts.next()),
+                (
+                    Some(b"#includedir" | b"@includedir"),
+                    Some(b"/etc/sudoers.d")
+                )
+            );
+            if !standard {
+                found.push(line_no);
+            }
+            continue;
+        }
+        if trimmed.first() == Some(&b'#') && !trimmed.get(1).is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        let words: Vec<&[u8]> = line
+            .split(|byte| !is_word(byte))
+            .filter(|word| !word.is_empty())
+            .collect();
+        let names_account = words
+            .iter()
+            .any(|word| *word == name.as_bytes() || *word == hash_uid.as_bytes());
+        // `ALL ALL=(ALL) ALL`: the first field of a sudoers rule is everyone.
+        let names_everyone = words.first() == Some(&&b"ALL"[..]);
+        if names_account || names_everyone {
+            found.push(line_no);
+        }
+    }
+    found
+}
+
+fn blockers_of(check: &Check, uid: u32, held: &[u32]) -> Vec<String> {
     let mut lines: Vec<String> = check
         .findings
         .iter()
-        .filter(|finding| !others(finding))
+        .filter(|finding| concerns(finding, uid, held))
         .map(|finding| format!("{finding:?}"))
         .collect();
     lines.extend(
@@ -399,6 +502,23 @@ fn blockers_of(check: &Check) -> Vec<String> {
             .map(|gap| format!("could not examine {}: {}", gap.path.display(), gap.reason)),
     );
     lines
+}
+
+/// Whether a finding is about this account. Only what names others alone, or
+/// can be written by others alone, is left out.
+fn concerns(finding: &Finding, uid: u32, held: &[u32]) -> bool {
+    match finding {
+        Finding::PasswordlessRule { applies_to_you, .. } => *applies_to_you != Applies::No,
+        Finding::Writable { writers, .. } => {
+            writers.is_empty()
+                || writers.iter().any(|writer| match writer {
+                    Writer::You | Writer::Everyone => true,
+                    Writer::Owner { uid: owner, .. } => *owner == uid,
+                    Writer::Group { gid, .. } => held.contains(gid),
+                })
+        }
+        _ => true,
+    }
 }
 
 /// The host, answering as another account.
@@ -631,25 +751,23 @@ fn check_password(account: &str, entry: &Passwd<'_>, shadow: Option<&[u8]>) -> R
 }
 
 fn check_groups(account: &str, primary: u32, group_file: &[u8]) -> Result<(), Refusal> {
+    // A group is root-equivalent by its gid, and any name sharing that gid
+    // (`dockerish:x:999:agent` beside `docker:x:999:`) is the same group.
+    let held = held_gids(account, primary, group_file);
     for line in group_file.split(|byte| *byte == b'\n') {
         let mut fields = line.split(|byte| *byte == b':');
-        let (Some(name), Some(_), Some(gid), Some(members)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        let (Some(name), Some(_), Some(gid)) = (fields.next(), fields.next(), fields.next()) else {
             continue;
         };
-        let held = number(gid) == Some(primary)
-            || members
-                .split(|byte| *byte == b',')
-                .any(|member| member == account.as_bytes());
-        if held
-            && ROOT_EQUIVALENT_GROUPS
-                .iter()
-                .any(|bad| bad.as_bytes() == name)
+        let bad = ROOT_EQUIVALENT_GROUPS
+            .iter()
+            .find(|bad| bad.as_bytes() == name);
+        if let (Some(bad), Some(gid)) = (bad, number(gid))
+            && held.contains(&gid)
         {
             return Err(Refusal::RootGroup {
                 account: account.to_owned(),
-                group: String::from_utf8_lossy(name).into_owned(),
+                group: (*bad).to_owned(),
             });
         }
     }

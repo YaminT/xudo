@@ -25,8 +25,15 @@ struct Machine {
     /// The first call whose text starts with this fails.
     fail: RefCell<Option<String>>,
     user: RefCell<String>,
+    /// What `DropInPaths` and `FragmentPath` say.
+    drop_ins: RefCell<String>,
+    fragment: RefCell<String>,
+    /// Env files that are not private.
+    open_env: RefCell<BTreeSet<String>>,
     active: Cell<bool>,
     stuck: Cell<bool>,
+    /// What `is-active` says instead, when set.
+    state: RefCell<Option<String>>,
     unreadable: RefCell<BTreeSet<String>>,
     /// A `systemctl` whose arguments start with this cannot be run at all.
     cannot_run: RefCell<Option<String>>,
@@ -60,8 +67,12 @@ impl Machine {
             calls: RefCell::new(Vec::new()),
             fail: RefCell::new(None),
             user: RefCell::new("agent".to_owned()),
+            drop_ins: RefCell::new(format!("{DROP_IN}/10-xudo.conf")),
+            fragment: RefCell::new(TEMPLATE_PATH.to_owned()),
+            open_env: RefCell::new(BTreeSet::new()),
             active: Cell::new(false),
             stuck: Cell::new(false),
+            state: RefCell::new(None),
             unreadable: RefCell::new(BTreeSet::new()),
             cannot_run: RefCell::new(None),
             ghosts: RefCell::new(Vec::new()),
@@ -217,6 +228,16 @@ impl EnrolOps for Machine {
         Ok(self.files.borrow().get(path).map(|t| t.as_bytes().to_vec()))
     }
 
+    fn private_file(&self, path: &str) -> Result<(), InstallError> {
+        if self.open_env.borrow().contains(path) {
+            return Err(InstallError::UnsafeFile {
+                path: path.to_owned(),
+                reason: "it is open to group or others".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn list_dir(&self, path: &str) -> Result<Option<Vec<String>>, InstallError> {
         if self.unreadable.borrow().contains(path) {
             return Err(InstallError::UnsafeFile {
@@ -287,9 +308,18 @@ impl EnrolOps for Machine {
             .map(|mut answer| {
                 if answer.success {
                     match args[0] {
+                        "show" if line.contains("DropInPaths") => {
+                            answer.stdout = self.drop_ins.borrow().clone();
+                        }
+                        "show" if line.contains("FragmentPath") => {
+                            answer.stdout = self.fragment.borrow().clone();
+                        }
                         "show" => answer.stdout = self.user.borrow().clone(),
                         "enable" => self.active.set(true),
                         "disable" if !self.stuck.get() => self.active.set(false),
+                        "is-active" if self.state.borrow().is_some() => {
+                            answer.stdout = self.state.borrow().clone().unwrap();
+                        }
                         "is-active" => {
                             answer.stdout = if self.active.get() {
                                 "active"
@@ -517,6 +547,69 @@ fn a_drop_in_elsewhere_that_changes_user_stops_the_enrol() {
 }
 
 #[test]
+fn denies_a_drop_in_in_another_directory_that_adds_groups() {
+    for (drop_ins, fragment) in [
+        (
+            format!("{DROP_IN}/10-xudo.conf /etc/systemd/system/xudo-agent@.service.d/x.conf"),
+            TEMPLATE_PATH,
+        ),
+        (
+            "/run/systemd/system/service.d/x.conf".to_owned(),
+            TEMPLATE_PATH,
+        ),
+        (String::new(), TEMPLATE_PATH),
+        (
+            format!("{DROP_IN}/10-xudo.conf"),
+            "/etc/systemd/system/xudo-agent@.service",
+        ),
+        (format!("{DROP_IN}/10-xudo.conf"), ""),
+    ] {
+        let machine = Machine::root();
+        *machine.drop_ins.borrow_mut() = drop_ins.clone();
+        *machine.fragment.borrow_mut() = fragment.to_owned();
+        let error = enrol(&machine).unwrap_err();
+        assert_eq!(
+            error,
+            AgentError::UnitSources {
+                unit: "xudo-agent@codex.service".to_owned(),
+                drop_ins,
+                fragment: fragment.to_owned(),
+            }
+        );
+        assert!(error.to_string().contains("nothing was left"));
+        assert!(
+            !machine
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("systemctl enable"))
+        );
+        assert!(machine.files.borrow().keys().all(|p| !p.contains("codex")));
+    }
+}
+
+#[test]
+fn denies_an_existing_env_file_that_is_open_or_a_link() {
+    let machine = Machine::root().with_file("/etc/xudo/agents/codex.env", "KEY=v\n");
+    machine
+        .open_env
+        .borrow_mut()
+        .insert("/etc/xudo/agents/codex.env".to_owned());
+    let error = plan_enrol(&request(), scan(), &machine, &machine).unwrap_err();
+    assert!(matches!(
+        error,
+        AgentError::Install(InstallError::UnsafeFile { .. })
+    ));
+    // A private one is kept.
+    let machine = Machine::root().with_file("/etc/xudo/agents/codex.env", "KEY=v\n");
+    assert!(
+        plan_enrol(&request(), scan(), &machine, &machine)
+            .unwrap()
+            .env
+            .keep
+    );
+}
+
+#[test]
 fn a_systemctl_that_cannot_run_is_an_error_not_an_answer() {
     let machine = Machine::root().failing("systemctl is-active");
     machine.files.borrow_mut().insert(
@@ -620,6 +713,30 @@ fn remove_keeps_the_registry_entry_of_a_unit_that_will_not_stop() {
             .borrow()
             .contains_key("/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf")
     );
+}
+
+#[test]
+fn denies_remove_while_the_unit_is_still_going_down() {
+    for state in ["activating", "deactivating", "reloading", "active", ""] {
+        let machine = enrolled();
+        *machine.state.borrow_mut() = Some(state.to_owned());
+        assert_eq!(
+            remove_agent("codex", &machine, &machine).unwrap_err(),
+            AgentError::StillRunning("xudo-agent@codex.service".to_owned()),
+            "{state}"
+        );
+        assert!(
+            machine
+                .files
+                .borrow()
+                .contains_key("/etc/xudo/harnesses.d/codex.toml")
+        );
+    }
+    for state in ["inactive", "failed"] {
+        let machine = enrolled();
+        *machine.state.borrow_mut() = Some(state.to_owned());
+        remove_agent("codex", &machine, &machine).unwrap();
+    }
 }
 
 #[test]
@@ -769,4 +886,25 @@ fn an_empty_drop_in_directory_that_was_there_is_used_and_never_removed_on_failur
     let machine = Machine::root();
     machine.dirs.borrow_mut().insert(DROP_IN.to_owned());
     enrol(&machine).unwrap();
+}
+
+#[test]
+fn a_failed_question_about_the_unit_sources_stops_the_enrol() {
+    for call in [
+        "systemctl show --property=DropInPaths",
+        "systemctl show --property=FragmentPath",
+    ] {
+        let machine = Machine::root().failing(call);
+        assert!(matches!(
+            enrol(&machine).unwrap_err(),
+            AgentError::Unit { .. }
+        ));
+        assert!(
+            !machine
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("systemctl enable"))
+        );
+        assert!(machine.files.borrow().keys().all(|p| !p.contains("codex")));
+    }
 }

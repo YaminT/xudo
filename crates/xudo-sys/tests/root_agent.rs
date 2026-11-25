@@ -51,6 +51,10 @@ impl EnrolOps for Machine {
         self.real.read_file(path)
     }
 
+    fn private_file(&self, path: &str) -> Result<(), InstallError> {
+        self.real.private_file(path)
+    }
+
     fn list_dir(&self, path: &str) -> Result<Option<Vec<String>>, InstallError> {
         self.real.list_dir(path)
     }
@@ -65,6 +69,10 @@ impl EnrolOps for Machine {
 
     fn systemctl(&self, args: &[&str]) -> Result<Systemctl, InstallError> {
         let stdout = match args[0] {
+            "show" if args.iter().any(|a| a.contains("DropInPaths")) => DROP_IN,
+            "show" if args.iter().any(|a| a.contains("FragmentPath")) => {
+                "/usr/lib/systemd/system/xudo-agent@.service"
+            }
             "show" => ACCOUNT,
             "enable" => {
                 self.active.set(true);

@@ -618,3 +618,191 @@ fn a_passwd_line_that_is_not_an_account_names_no_one() {
         Refusal::AccountUnknown("agent".to_owned())
     );
 }
+
+fn host_with(group: &str, sudoers: &[u8]) -> MemoryHost {
+    MemoryHost::new(Caller {
+        uid: 0,
+        gid: 0,
+        groups: Lookup::Found(vec![0]),
+    })
+    .dir("/", 0, 0, 0o755)
+    .dir("/etc", 0, 0, 0o755)
+    .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
+    .file("/etc/group", 0, 0, 0o644, group.as_bytes())
+    .file("/etc/sudoers", 0, 0, 0o440, sudoers)
+}
+
+/// What the scan says and what the plan then does, for a described host.
+fn through(host: &MemoryHost) -> (AccountScan, Result<EnrolPlan, Refusal>) {
+    let scan = scan_account(host, "agent", &Input::default()).unwrap();
+    let mut facts = facts();
+    facts.group = match host.read(Path::new("/etc/group")) {
+        Lookup::Found(bytes) => bytes,
+        _ => Vec::new(),
+    };
+    facts.scan = scan.clone();
+    (scan, plan(&request(), &facts))
+}
+
+fn denied(host: &MemoryHost) -> String {
+    let (scan, planned) = through(host);
+    assert!(!scan.blockers.is_empty(), "the scan found nothing");
+    let Refusal::OtherPathToRoot { blockers, .. } = planned.unwrap_err() else {
+        unreachable!("the scan found something, so the plan must say so");
+    };
+    blockers
+}
+
+#[test]
+fn a_plain_account_on_a_plain_host_is_clean() {
+    let host = host_with(
+        GROUP,
+        b"root ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n",
+    )
+    .dir("/etc/sudoers.d", 0, 0, 0o755);
+    let (scan, planned) = through(&host);
+    assert_eq!(scan.blockers, Vec::<String>::new());
+    planned.unwrap();
+}
+
+#[test]
+fn enrol_refuses_a_gid_alias_of_a_root_equivalent_group() {
+    // `dockerish` shares docker's gid and lists the account.
+    let group = format!("{GROUP}docker:x:999:\ndockerish:x:999:agent\n");
+    let host = host_with(&group, b"");
+    let (_, planned) = through(&host);
+    assert_eq!(
+        planned.unwrap_err(),
+        Refusal::RootGroup {
+            account: "agent".to_owned(),
+            group: "docker".to_owned()
+        }
+    );
+    // As a primary gid too.
+    let mut facts = facts();
+    facts.passwd = b"agent:x:990:999::/h:/bin/sh\nalice:x:1000:1000::/h:/bin/sh\n".to_vec();
+    facts.group = b"docker:x:999:\nagent:x:999:\n".to_vec();
+    assert!(matches!(
+        refusal(&request(), &facts),
+        Refusal::RootGroup { .. }
+    ));
+    // A root-equivalent group the account is not in stays harmless.
+    facts.group = b"docker:x:50:\n".to_vec();
+    plan(&request(), &facts).unwrap();
+}
+
+#[test]
+fn enrol_refuses_a_sudo_rule_that_asks_for_a_password() {
+    for sudoers in [
+        &b"Defaults:agent rootpw\nagent ALL=(ALL) ALL\n"[..],
+        b"#990 ALL=(ALL) ALL\n",
+        b"User_Alias A = alice, agent\nA ALL=(ALL) ALL\n",
+        b"ALL ALL=(ALL) ALL\n",
+        b"@include /etc/elsewhere\n",
+        b"#include /etc/elsewhere\n",
+        b"@includedir /etc/other.d\n",
+        b"#includedir /etc/sudoers.d/extra\n",
+    ] {
+        let host = host_with(GROUP, sudoers);
+        let why = denied(&host);
+        assert!(why.contains("/etc/sudoers line"), "{sudoers:?}: {why}");
+    }
+}
+
+#[test]
+fn enrol_refuses_a_rule_in_a_drop_in_or_in_doas() {
+    let host = host_with(GROUP, b"")
+        .dir("/etc/sudoers.d", 0, 0, 0o755)
+        .file(
+            "/etc/sudoers.d/90-agent",
+            0,
+            0,
+            0o440,
+            b"agent ALL=(ALL) ALL\n",
+        );
+    assert!(denied(&host).contains("/etc/sudoers.d/90-agent line 1"));
+    let host = host_with(GROUP, b"").file("/etc/doas.conf", 0, 0, 0o644, b"# c\npermit agent\n");
+    assert!(denied(&host).contains("/etc/doas.conf line 2"));
+    let host = host_with(GROUP, b"").dir("/etc/doas.d", 0, 0, 0o755).file(
+        "/etc/doas.d/a.conf",
+        0,
+        0,
+        0o644,
+        b"permit persist agent as root\n",
+    );
+    assert!(denied(&host).contains("/etc/doas.d/a.conf line 1"));
+}
+
+#[test]
+fn a_rule_naming_someone_else_or_a_comment_is_not_the_accounts() {
+    let host = host_with(
+        GROUP,
+        b"# agent was here\nalice ALL=(ALL) ALL\n%xudo ALL=(root) /usr/libexec/xudo/xudo-gate-auth\nDefaults env_reset\nagentx ALL=(ALL) ALL\n",
+    );
+    let (scan, planned) = through(&host);
+    assert_eq!(scan.blockers, Vec::<String>::new());
+    planned.unwrap();
+}
+
+#[test]
+fn enrol_refuses_rule_files_it_cannot_read() {
+    let host = host_with(GROUP, b"").unreadable_file("/etc/doas.conf", 0, 0, 0o600);
+    assert!(denied(&host).contains("could not examine /etc/doas.conf"));
+    let host = host_with(GROUP, b"").unlistable_dir("/etc/sudoers.d", 0, 0, 0o755);
+    assert!(denied(&host).contains("could not examine /etc/sudoers.d"));
+}
+
+#[test]
+fn enrol_refuses_an_account_that_can_write_a_unit_directory() {
+    let host = host_with(GROUP, b"").dir("/etc/systemd", 0, 0, 0o755).dir(
+        "/etc/systemd/system",
+        990,
+        990,
+        0o755,
+    );
+    assert!(denied(&host).contains("Writable"));
+    // Through a group it holds.
+    let group = format!("{GROUP}ops:x:2000:agent\n");
+    let host = host_with(&group, b"").dir("/etc/systemd", 0, 0, 0o755).dir(
+        "/etc/systemd/system",
+        0,
+        2000,
+        0o775,
+    );
+    assert!(denied(&host).contains("Writable"));
+}
+
+#[test]
+fn a_unit_directory_that_only_others_can_write_is_not_the_accounts() {
+    let host = host_with(GROUP, b"").dir("/etc/systemd", 0, 0, 0o755).dir(
+        "/etc/systemd/system",
+        1000,
+        1000,
+        0o755,
+    );
+    assert_eq!(through(&host).0.blockers, Vec::<String>::new());
+    let host = host_with(GROUP, b"").dir("/etc/systemd", 0, 0, 0o755).dir(
+        "/etc/systemd/system",
+        0,
+        1000,
+        0o775,
+    );
+    assert_eq!(through(&host).0.blockers, Vec::<String>::new());
+}
+
+#[test]
+fn enrol_refuses_when_the_group_file_cannot_be_read() {
+    let host = host_with(GROUP, b"").unreadable_file("/etc/group", 0, 0, 0o600);
+    assert!(denied(&host).contains("could not examine /etc/group"));
+}
+
+#[test]
+fn enrol_refuses_a_world_writable_unit_directory() {
+    let host = host_with(GROUP, b"").dir("/etc/systemd", 0, 0, 0o755).dir(
+        "/etc/systemd/system",
+        0,
+        0,
+        0o777,
+    );
+    assert!(denied(&host).contains("Everyone"));
+}

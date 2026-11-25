@@ -109,6 +109,29 @@ impl EnrolOps for HostInstallOps {
             .map(Some)
     }
 
+    fn private_file(&self, path: &str) -> Result<(), InstallError> {
+        let Some((dir, name)) = self.locate_dir(path)? else {
+            return Ok(());
+        };
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let fd = match openat(&dir, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(errno) => return Err(io("open", path)(errno)),
+        };
+        fstat(&fd).map_err(io("stat", path)).and_then(|stat| {
+            let reason = self.why_not_ours(&stat).or_else(|| {
+                (facts_of(&stat).mode & 0o077 != 0).then_some("it is open to group or others")
+            });
+            reason.map_or(Ok(()), |reason| {
+                Err(InstallError::UnsafeFile {
+                    path: path.to_owned(),
+                    reason: reason.to_owned(),
+                })
+            })
+        })
+    }
+
     fn list_dir(&self, path: &str) -> Result<Option<Vec<String>>, InstallError> {
         let Some(fd) = (self.open_dir)(Path::new(path)).map_err(InstallError::Untrusted)? else {
             return Ok(None);

@@ -308,3 +308,16 @@ The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular f
 ## No telemetry
 
 The shipped release-musl binaries are checked under `strace` across selected commands, failing on socket families outside `AF_UNIX`/`AF_LOCAL`. CI also checks their normal Cargo dependency tree for known networking crates.
+
+## Enrolling an agent account: what the checks read
+
+`xudo agent enrol` resolves the account from `/etc/passwd` alone and consults
+no directory service (`nsswitch.conf` is not read). On a host whose `passwd`
+order is, say, `sss files`, the uid systemd runs the unit as can differ from the
+uid in `/etc/passwd`. That cannot grant anything: the gate compares the uid the
+kernel attests against `/etc/passwd` and refuses on any difference. Enrol also
+refuses on any rule in the sudo or doas files that names the account, whether or
+not it asks for a password, and on a group sharing the gid of a root-equivalent
+one. Before it enables the unit it asks systemd for the unit's `DropInPaths`
+and `FragmentPath` and stops unless they are exactly its own drop-in and the
+packaged template.

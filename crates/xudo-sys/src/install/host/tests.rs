@@ -1425,6 +1425,42 @@ fn a_file_that_is_not_roots_alone_is_not_believed() {
 }
 
 #[test]
+fn denies_an_env_file_open_to_group_or_others_a_link_or_a_stranger() {
+    let dir = scratch("agent-private");
+    let ops = ops_in(&dir, &Script::new());
+    put(&dir, "ok", "x", 0o600);
+    ops.private_file("/etc/ok").unwrap();
+    ops.private_file("/etc/absent").unwrap();
+    without_dirs(ops_in(&dir, &Script::new()))
+        .private_file("/gone/x")
+        .unwrap();
+    assert!(matches!(
+        refusing_dirs(ops_in(&dir, &Script::new()))
+            .private_file("/etc/ok")
+            .unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+    for mode in [0o640, 0o604, 0o660] {
+        put(&dir, "open", "x", mode);
+        let err = ops.private_file("/etc/open").unwrap_err();
+        assert!(err.to_string().contains("open to group"), "{mode:o} {err}");
+    }
+    put(&dir, "real", "x", 0o600);
+    symlink(dir.join("real"), dir.join("link")).unwrap();
+    assert!(matches!(
+        ops.private_file("/etc/link").unwrap_err(),
+        InstallError::Io {
+            operation: "open",
+            ..
+        }
+    ));
+    let meta = std::fs::metadata(&dir).unwrap();
+    let stranger = ops_owned_by(&dir, &Script::new(), meta.uid() + 1, meta.gid());
+    let err = stranger.private_file("/etc/ok").unwrap_err();
+    assert!(err.to_string().contains("not owned by root"), "{err}");
+}
+
+#[test]
 fn a_directory_is_listed_sorted_and_only_if_the_walk_trusts_it() {
     let dir = scratch("agent-list");
     put(&dir, "b.toml", "", 0o644);
