@@ -49,6 +49,7 @@ pub mod entropy;
 pub mod envfile;
 pub mod error;
 pub mod exec;
+pub mod gate_files;
 pub mod hygiene;
 pub mod install;
 pub mod kernel;
@@ -93,6 +94,11 @@ pub use envfile::FakeEnvFiles;
 pub use envfile::{AGENT_ENV_DIR, EnvFileProbe, EnvFiles, HostEnvFiles};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+#[cfg(any(test, feature = "fake"))]
+pub use gate_files::FakeGateFiles;
+pub use gate_files::{
+    AUTH_FILE, FileId, GATE_DIR, GateFiles, GateFilesError, GateMode, HostGateFiles, NOPASS_FILE,
+};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
     Effect, HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,

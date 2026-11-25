@@ -27,9 +27,14 @@
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
-//! 6. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
-//!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
-//! 7. **`/proc` verified as procfs**, on the descriptor it is read through.
+//! 6. **The invocation.** No arguments, and `argv[0]` is one of the two gate
+//!    names, `-auth` or `-nopass`. Any other name is refused.
+//! 7. **`/proc` verified as procfs**, on the descriptor it is read through,
+//!    and then **the mode from the executed file**: `/proc/self/exe` is
+//!    compared with both gate files under `/usr/libexec/xudo`, each opened
+//!    through the trust walk and each with one name only
+//!    ([`xudo_sys::GateFiles`]). The match is the mode, and `argv[0]` must
+//!    say the same: a caller can choose a name and cannot choose an inode.
 //! 8. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
 //!    by `(pid, starttime)`, bounded at [`LINEAGE_PROCESSES`] processes. The
@@ -96,9 +101,9 @@ use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
 use xudo_sys::TrustedRulesError;
 use xudo_sys::{
-    AuditSink, Authorized, CgroupCalls, Clock, HostClock, HostHygiene, HostPeer, HostPrograms,
-    HostSyscalls, Hygiene, PeerCalls, ProcRef, ProcSource, Program, Programs, Spool, SpoolDir,
-    SpoolError, Syscalls, VerifiedProc, authorize, lineage,
+    AuditSink, Authorized, CgroupCalls, Clock, GateFiles, GateMode, HostClock, HostGateFiles,
+    HostHygiene, HostPeer, HostPrograms, HostSyscalls, Hygiene, PeerCalls, ProcRef, ProcSource,
+    Program, Programs, Spool, SpoolDir, SpoolError, Syscalls, VerifiedProc, authorize, lineage,
 };
 
 use crate::decide::{
@@ -126,6 +131,11 @@ pub const LINEAGE_PROCESSES: usize = 9;
 /// The one name the gate runs under: the hardlink `sudo` asks for a password
 /// to reach.
 pub const AUTH_NAME: &[u8] = b"xudo-gate-auth";
+
+/// The other name: the gate a harness grant reaches without a password. No
+/// sudoers text names it until the grant ships, and nothing mints the `harness`
+/// entry it requires, so it refuses every invocation today.
+pub const NOPASS_NAME: &[u8] = b"xudo-gate-nopass";
 
 /// Where the root-owned ruleset is read from.
 pub const RULES_DIR: &str = "/etc/xudo/rules.d";
@@ -205,6 +215,8 @@ pub trait GateHost {
     /// [`SpoolError`] when the directory fails the walk or is not a private
     /// root-owned directory.
     fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError>;
+    /// Which gate file this process is.
+    fn gate_files(&self) -> &dyn GateFiles;
     /// Where programs are opened.
     fn programs(&self) -> &dyn Programs;
     /// The audit trail.
@@ -283,6 +295,10 @@ impl GateHost for SystemHost {
 
     fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError> {
         SpoolDir::open_beneath(Path::new(QUEUE_DIR)).map(into_queue)
+    }
+
+    fn gate_files(&self) -> &dyn GateFiles {
+        &HostGateFiles
     }
 
     fn programs(&self) -> &dyn Programs {
@@ -396,36 +412,22 @@ pub struct GateExit {
     pub message: String,
 }
 
-/// Which hardlink the gate was started as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Entry {
-    /// `xudo-gate-auth`: `sudo` asked a human for a password to start it.
-    Auth,
-}
-
-impl Entry {
-    /// Whether this name proves a password was typed.
-    fn password_confirms(self) -> bool {
-        match self {
-            Self::Auth => true,
-        }
-    }
-
-    /// What the record says confirmed the request under this name.
-    fn confirmation(self) -> &'static str {
-        match self {
-            Self::Auth => "confirmation=password (sudo's own prompt, on the -auth name)",
-        }
+/// What the record says confirmed the request under this gate file.
+fn confirmation_text(mode: GateMode) -> &'static str {
+    match mode {
+        GateMode::Auth => "confirmation=password (sudo's own prompt, on the -auth name)",
+        GateMode::Nopass => "confirmation=none (the -nopass name asks no password)",
     }
 }
 
-/// Accepts the one invocation `sudo` makes: no arguments, under the `-auth`
-/// name.
+/// Accepts the one invocation `sudo` makes: no arguments, under one of the two
+/// gate names.
 ///
 /// The name is the last `/`-separated segment of `argv[0]`, compared as bytes
 /// and exactly: no normalisation, so `xudo-gate-auth/` and `xudo-gate-auth/.`
-/// are not it. `xudo-gate-nopass` is refused with the rest until M4 ships it.
-fn accept_invocation(args: &[OsString]) -> Result<Entry, Refusal> {
+/// are not it. This is what the caller *claims*. [`proceed`] refuses unless
+/// the executed file says the same.
+fn accept_invocation(args: &[OsString]) -> Result<GateMode, Refusal> {
     let refuse = |reason: String| Refusal::Failed {
         stage: Stage::Invocation,
         reason,
@@ -445,13 +447,36 @@ fn accept_invocation(args: &[OsString]) -> Result<Entry, Refusal> {
         .next()
         .unwrap_or_default();
     if last == AUTH_NAME {
-        Ok(Entry::Auth)
+        Ok(GateMode::Auth)
+    } else if last == NOPASS_NAME {
+        Ok(GateMode::Nopass)
     } else {
         Err(refuse(format!(
-            "started as {}, and only {} runs",
+            "started as {}, and only {} and {} run",
             bytes.escape_ascii(),
-            AUTH_NAME.escape_ascii()
+            AUTH_NAME.escape_ascii(),
+            NOPASS_NAME.escape_ascii()
         )))
+    }
+}
+
+/// The mode the executed file says, and refused unless it is the one `argv[0]`
+/// claimed.
+fn mode_of_executed_file(host: &dyn GateHost, claimed: GateMode) -> Result<GateMode, Refusal> {
+    let refuse = |reason: String| Refusal::Failed {
+        stage: Stage::Invocation,
+        reason,
+    };
+    let executed = host
+        .gate_files()
+        .executing()
+        .map_err(|error| refuse(error.to_string()))?;
+    if executed == claimed {
+        Ok(executed)
+    } else {
+        Err(refuse(
+            "argv[0] names one gate file and the executed file is the other".to_owned(),
+        ))
     }
 }
 
@@ -625,12 +650,14 @@ fn proceed(
     stage(Stage::CallerState, host.hygiene().reset_umask())?;
     stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
-    let entry = accept_invocation(args)?;
+    let claimed = accept_invocation(args)?;
     progress
         .evidence
         .push(format!("gate_argv0={}", args_first_escaped(args)));
 
     let proc = stage(Stage::Procfs, host.open_proc())?;
+    // The mode is the executed file's, and `argv[0]` only has to agree.
+    let mode = mode_of_executed_file(&*host, claimed)?;
     let ancestors = stage(
         Stage::Lineage,
         lineage(&*proc, progress.gate_pid, LINEAGE_PROCESSES),
@@ -683,7 +710,8 @@ fn proceed(
         generation: loaded.rules.generation.id(),
         now: BoottimeMillis(now),
         settings,
-        password_confirms: entry.password_confirms(),
+        password_confirms: mode == GateMode::Auth,
+        mode,
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -709,7 +737,11 @@ fn proceed(
         );
     }
     let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
-    progress.evidence.push(entry.confirmation().to_owned());
+    progress.evidence.push(confirmation_text(mode).to_owned());
+    progress.evidence.push(format!(
+        "gate_mode={mode:?} via={}",
+        pending_entry.via.label()
+    ));
     require_queued_claim(host, &pending_entry, &caller)?;
 
     // Consumed before anything runs: the entry is used at most once, and a
@@ -1257,6 +1289,7 @@ args = [
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -1350,6 +1383,7 @@ args = [
         /// The root-owned queue, separate from the request spool.
         queue: Result<Rc<FakeSpool>, SpoolError>,
         rival: bool,
+        gate_files: xudo_sys::FakeGateFiles,
         programs: FakePrograms,
         audit: FakeAuditSink,
         proc_opened: Cell<bool>,
@@ -1550,6 +1584,7 @@ args = [
                 spool: Ok(Rc::clone(spool)),
                 queue: Ok(Rc::new(FakeSpool::new())),
                 rival: false,
+                gate_files: xudo_sys::FakeGateFiles::running_as(GateMode::Auth),
                 programs: FakePrograms::serving(path, owner),
                 audit: FakeAuditSink::new(),
                 proc_opened: Cell::new(false),
@@ -1621,6 +1656,9 @@ args = [
             self.queue
                 .clone()
                 .map(|spool| Box::new(SharedQueue { spool }) as Box<dyn QueueClaim>)
+        }
+        fn gate_files(&self) -> &dyn GateFiles {
+            &self.gate_files
         }
         fn programs(&self) -> &dyn Programs {
             &self.programs
@@ -1833,6 +1871,10 @@ args = [
         );
         assert!(has_line(evidence, "confirmation=password"), "{evidence:?}");
         assert!(
+            has_line(evidence, "gate_mode=Auth via=auth"),
+            "{evidence:?}"
+        );
+        assert!(
             has_line(evidence, "gate_argv0=/usr/libexec"),
             "{evidence:?}"
         );
@@ -1919,6 +1961,14 @@ args = [
         assert!(host.cgroups().is_ok());
         #[cfg(not(target_os = "linux"))]
         assert!(host.cgroups().is_err());
+        // No test host has the gate installed as the executed file.
+        assert!(host.gate_files().executing().is_err());
+    }
+
+    #[test]
+    fn the_record_says_how_each_gate_file_confirmed() {
+        assert!(confirmation_text(GateMode::Auth).starts_with("confirmation=password"));
+        assert!(confirmation_text(GateMode::Nopass).starts_with("confirmation=none"));
     }
 
     #[test]
@@ -2238,6 +2288,7 @@ args = [
             now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: true,
+            mode: GateMode::Auth,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -3181,7 +3232,6 @@ all = [{ any-arg = ["restart"] }]
     fn an_unexpected_argv0_is_refused() {
         for name in [
             &b"xudo-gate"[..],
-            b"xudo-gate-nopass",
             b"/usr/libexec/xudo/xudo-gate",
             b"sh",
             b"",
@@ -3209,11 +3259,17 @@ all = [{ any-arg = ["restart"] }]
         ] {
             assert_eq!(
                 accept_invocation(&[OsString::from(name)]).unwrap(),
-                Entry::Auth,
+                GateMode::Auth,
                 "{name}"
             );
         }
-        assert!(Entry::Auth.password_confirms());
+        for name in ["xudo-gate-nopass", "/usr/libexec/xudo/xudo-gate-nopass"] {
+            assert_eq!(
+                accept_invocation(&[OsString::from(name)]).unwrap(),
+                GateMode::Nopass,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3679,5 +3735,130 @@ max-entries = 10
         let records = host.audit.records();
         assert_eq!(records.len(), 1);
         assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+    }
+
+    // ---- the gate's mode comes from the executed file ---------------------
+
+    fn nopass() -> Vec<OsString> {
+        vec![OsString::from("/usr/libexec/xudo/xudo-gate-nopass")]
+    }
+
+    /// A host whose spool holds one entry and whose executed file is `file`.
+    fn host_running(
+        file: xudo_sys::FakeGateFiles,
+        entry: PendingRequest,
+    ) -> (FakeHost, Rc<FakeSpool>) {
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = file;
+        (host, spool)
+    }
+
+    #[test]
+    fn the_mode_comes_from_the_executed_file_not_argv0() {
+        // The file is the `-nopass` gate and the caller named it `-auth`: a
+        // name the caller chose does not select the mode.
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+        assert!(exit.message.contains("severity high"));
+        // Refused before the ruleset, the spool or the lineage were read.
+        assert!(!host.spool_opened.get());
+    }
+
+    #[test]
+    fn argv0_and_the_executed_file_disagreeing_is_refused() {
+        // The other direction: a password-less name over the `-auth` file.
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Auth), ours());
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+        let detail = &host.audit.records()[0].evidence;
+        assert!(
+            has_line(detail, "detail=argv[0] names one gate file"),
+            "{detail:?}"
+        );
+    }
+
+    #[test]
+    fn a_hardlinked_or_replaced_gate_file_is_refused() {
+        for error in [
+            xudo_sys::GateFilesError::HardLinked {
+                at: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+                nlink: 2,
+            },
+            xudo_sys::GateFilesError::NotAGateFile,
+        ] {
+            for name in [auth(), nopass()] {
+                let (mut host, spool) =
+                    host_running(xudo_sys::FakeGateFiles::refusing(error.clone()), ours());
+                let exit = run(&mut host, &name);
+                assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+                assert!(!host.spool_opened.get());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_nopass_invocation_with_no_entry_does_nothing() {
+        // A hostile user starts the file with nothing minted for them.
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Nopass);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_no_pending_request");
+        assert!(exit.message.contains("severity high"));
+    }
+
+    #[test]
+    fn nopass_refuses_an_auth_entry_the_broker_minted_today() {
+        // The broker writes only `auth`, so under `-nopass` every real entry
+        // is refused, and none is consumed.
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+    }
+
+    #[test]
+    fn nopass_refuses_when_the_caller_left_its_scope() {
+        // A harness entry for a stored scope whose caller now reads as a human.
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_an_enrolled_agent");
+    }
+
+    #[test]
+    fn nopass_refuses_a_live_enrolled_agent_no_rule_grants() {
+        // Every fact about the caller holds, and no rule grants it.
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
     }
 }

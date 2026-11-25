@@ -949,7 +949,14 @@ fn the_agent_template_uses_no_specifier_but_the_instance_name() {
 #[test]
 fn the_package_ships_no_nopasswd_line_and_no_passwordless_gate() {
     // Nothing in packaging/ may grant a password-free run: not a sudoers text,
-    // not the nopass gate. Comments may say the words.
+    // not a unit. Comments may say the words. The one line that may name the
+    // `-nopass` gate are the one that places the inert file (no sudoers text
+    // names it, and nothing mints the entry it requires) and the lintian
+    // override for that same file, each exactly.
+    const OVERRIDES_THE_INERT_FILE: &str =
+        "xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudo-gate-nopass]";
+    const PLACES_THE_INERT_FILE: &str =
+        "install -m 0755 \"$bin/xudo-gate\" \"$stage/usr/libexec/xudo/xudo-gate-nopass\"";
     fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -960,6 +967,12 @@ fn the_package_ships_no_nopasswd_line_and_no_passwordless_gate() {
             let text = std::fs::read_to_string(&path).unwrap();
             for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
                 let lower = line.to_lowercase();
+                if (line.trim() == PLACES_THE_INERT_FILE && path.ends_with("deb/build.sh"))
+                    || (line.trim() == OVERRIDES_THE_INERT_FILE
+                        && path.ends_with("deb/lintian-overrides"))
+                {
+                    continue;
+                }
                 if lower.contains("nopasswd") || lower.contains("xudo-gate-nopass") {
                     hits.push(format!("{}: {line}", path.display()));
                 }

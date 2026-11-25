@@ -62,7 +62,7 @@ sums() { # <out dir> : sha256 of the deb and the files it ships
     local out=$1 deb
     deb=$(ls "$out"/xudo_*.deb)
     sha256sum "$deb" | sed "s|$out/||"
-    (cd "$out/stage" && sha256sum usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth)
+    (cd "$out/stage" && sha256sum usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-gate-nopass)
 }
 sums "$root/target/repro-a/out" >"$root/target/repro-a/sums"
 sums "$root/target/repro-b/out" >"$root/target/repro-b/sums"

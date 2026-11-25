@@ -218,6 +218,7 @@ fn write_entry(round: u64) -> String {
         attested_scope_id: None,
         boot_id: None,
         attested_harness: None,
+        via: xudo_gate::request::Via::Auth,
         queue_id: None,
         operation: None,
     };

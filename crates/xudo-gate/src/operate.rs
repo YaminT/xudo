@@ -250,6 +250,7 @@ pub(crate) fn is_operation_refusal(refusal: &Refusal) -> bool {
         Refusal::NoPendingRequest { .. }
         | Refusal::Request(_)
         | Refusal::ConfirmationMissing(_)
+        | Refusal::Mode { .. }
         | Refusal::Failed { .. } => false,
     }
 }
@@ -354,6 +355,7 @@ owners = ["agent"]
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: Some(RequestedOp {
                 op: op.into(),
@@ -517,6 +519,7 @@ owners = ["agent"]
             Refusal::NoPendingRequest { .. }
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
+            | Refusal::Mode { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -527,6 +530,7 @@ owners = ["agent"]
             Refusal::NoPendingRequest { .. }
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
+            | Refusal::Mode { .. }
             | Refusal::Failed { .. } => None,
         }
     }
