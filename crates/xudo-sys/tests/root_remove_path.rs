@@ -27,6 +27,8 @@ const TREE: &str = "/var/lib/xudo-t1-remove-path";
 const SECRET: &str = "/var/lib/xudo-t1-remove-secret";
 const MOVED: &str = "/var/lib/xudo-t1-moved-out";
 const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
+// Docker mounts a tmpfs at `XDEV_TREE/box/mnt`: a mount inside a walked tree.
+const XDEV_TREE: &str = "/var/lib/xudo-t1-remove-xdev";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -192,4 +194,38 @@ fn a_directory_renamed_out_of_the_tree_mid_walk_stops_the_walk() {
     );
     assert!(!Path::new(&format!("{TREE}/box")).exists());
     let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn a_mount_inside_the_walked_tree_is_not_crossed() {
+    if !begin_root_test("a_mount_inside_the_walked_tree_is_not_crossed") {
+        return;
+    }
+    let box_dir = format!("{XDEV_TREE}/box");
+    let mount = format!("{box_dir}/mnt");
+    let inside = format!("{mount}/inside");
+    let sibling = format!("{box_dir}/a");
+    // The lane's tmpfs must be there; a lane without it proves nothing.
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    assert_ne!(
+        fs::metadata(&mount).unwrap().dev(),
+        fs::metadata(&box_dir).unwrap().dev()
+    );
+    fs::write(&inside, b"behind the mount").unwrap();
+    fs::write(&sibling, b"outside the mount").unwrap();
+    for path in [&inside, &sibling, &mount, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    let mut request = request(b"box", true);
+    request.under = XDEV_TREE.as_bytes().to_vec();
+    let outcome = remove_path_on_host(&request);
+    // Whatever the walk reports, nothing behind the mount may be deleted.
+    assert!(
+        outcome.as_ref().map_or(true, |report| report.partial),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    assert!(Path::new(&mount).is_dir());
+    assert!(Path::new(&box_dir).is_dir());
+    let _ = fs::remove_file(&sibling);
 }

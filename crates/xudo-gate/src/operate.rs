@@ -166,6 +166,7 @@ pub(crate) fn intent_record(
         format!("target={}", work.target.escape_ascii()),
         format!("planned_count={}", planned.removed.len()),
         format!("planned_partial={}", planned.partial),
+        format!("planned_sha256={}", hex_digest(&planned.digest)),
     ])
     .with_outcome(Outcome::NotExecuted)
 }

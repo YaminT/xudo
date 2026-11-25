@@ -991,4 +991,57 @@ max-entries = 4
             "owners may not include uid 0 (root)"
         );
     }
+
+    fn paths_nest(a: &str, b: &str) -> bool {
+        a == b
+            || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+            || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    proptest::proptest! {
+        /// Siblings that share a string prefix (`/srv/a`, `/srv/ab`) are not
+        /// nested, and a target under one is never matched to the other.
+        #[test]
+        fn selection_follows_path_components_over_non_nested_trees(
+            names in proptest::collection::vec(
+                proptest::sample::select(vec!["a", "ab", "abc", "b", "ba", "a-b", "a.b"]),
+                1..6,
+            ),
+            deep in proptest::collection::vec(proptest::bool::ANY, 6),
+            pick in 0usize..6,
+            rest in proptest::collection::vec(
+                proptest::sample::select(vec!["x", "xy", "a", "ab"]),
+                1..3,
+            ),
+        ) {
+            let mut trees: Vec<String> = Vec::new();
+            for (name, deep) in names.iter().zip(deep.iter()) {
+                let tree = if *deep {
+                    format!("/srv/{name}/t")
+                } else {
+                    format!("/srv/{name}")
+                };
+                if !trees.iter().any(|other| paths_nest(other, &tree)) {
+                    trees.push(tree);
+                }
+            }
+            let operations: Vec<Operation> = trees
+                .iter()
+                .enumerate()
+                .map(|(index, tree)| operation(&format!("t{index}"), tree, 4))
+                .collect();
+            let chosen = trees.iter().cycle().nth(pick).unwrap().clone();
+            let target = format!("{chosen}/{}", rest.join("/"));
+            let (op, relative) = select(&operations, target.as_bytes()).unwrap();
+            proptest::prop_assert_eq!(&op.under, &chosen);
+            proptest::prop_assert_eq!(relative, rest.join("/").into_bytes());
+            // A name that merely starts with a tree's text is not inside it.
+            let lookalike = format!("{chosen}{}/f", rest.first().unwrap());
+            if let Ok((other, _)) = select(&operations, lookalike.as_bytes()) {
+                proptest::prop_assert_ne!(&other.under, &chosen);
+            }
+            // The tree root itself is refused.
+            proptest::prop_assert!(select(&operations, chosen.as_bytes()).is_err());
+        }
+    }
 }

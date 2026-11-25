@@ -145,6 +145,20 @@ pub struct NodeStat {
     pub nlink: u64,
     /// File type. A symlink is reported as a symlink, not its target.
     pub kind: NodeKind,
+    /// The kernel says this is the root of a mount (`STATX_ATTR_MOUNT_ROOT`).
+    /// A bind mount from the same filesystem shares `st_dev` with its parent
+    /// and shows only here. Kernels before 5.8 never set it.
+    pub mount_root: bool,
+}
+
+/// `STATX_ATTR_MOUNT_ROOT`.
+#[cfg(any(target_os = "linux", test))]
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+
+/// True only when the kernel supports the attribute (`mask`) and sets it.
+#[cfg(any(target_os = "linux", test))]
+fn mount_root_bits(attributes: u64, mask: u64) -> bool {
+    mask & attributes & STATX_ATTR_MOUNT_ROOT != 0
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -313,7 +327,9 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
         if !ancestor_ok(&stat) {
             return Err(RemoveError::AncestorRefused);
         }
-        if index.saturating_add(1) == components.len() && stat.dev != parent_dev {
+        if index.saturating_add(1) == components.len()
+            && (stat.dev != parent_dev || stat.mount_root)
+        {
             return Err(RemoveError::MountPoint);
         }
     }
@@ -791,6 +807,7 @@ fn host_stat(stat: &rustix::fs::Stat) -> NodeStat {
         size: i64::from(stat.st_size).unsigned_abs(),
         nlink: u64::from(stat.st_nlink),
         kind: kind_of(mode),
+        mount_root: false,
     }
 }
 
@@ -868,8 +885,23 @@ impl RemoveFs for LinuxRemoveFs {
     fn fstat(&mut self, fd: u64) -> Result<NodeStat, RemoveError> {
         let fd = self.fd(fd, "fstat")?;
         rustix::fs::fstat(fd)
-            .map(|stat| host_stat(&stat))
             .map_err(host_err("fstat"))
+            .and_then(|raw| {
+                rustix::fs::statx(
+                    fd,
+                    c"",
+                    rustix::fs::AtFlags::EMPTY_PATH,
+                    rustix::fs::StatxFlags::empty(),
+                )
+                .map_err(host_err("statx"))
+                .map(|extra| NodeStat {
+                    mount_root: mount_root_bits(
+                        extra.stx_attributes.bits(),
+                        extra.stx_attributes_mask.bits(),
+                    ),
+                    ..host_stat(&raw)
+                })
+            })
     }
 
     fn verify_dir(
@@ -954,6 +986,7 @@ struct Node {
     kind: NodeKind,
     size: u64,
     nlink: u64,
+    mount_root: bool,
     link: Vec<u8>,
     children: BTreeMap<Vec<u8>, u64>,
 }
@@ -997,6 +1030,7 @@ impl FakeRemoveFs {
                 kind: NodeKind::Dir,
                 size: 0,
                 nlink: 2,
+                mount_root: false,
                 link: Vec::new(),
                 children: BTreeMap::new(),
             },
@@ -1092,6 +1126,7 @@ impl FakeRemoveFs {
                 kind,
                 size,
                 nlink: 1,
+                mount_root: false,
                 link: Vec::new(),
                 children: BTreeMap::new(),
             },
@@ -1112,6 +1147,14 @@ impl FakeRemoveFs {
     pub fn set_device(&mut self, ino: u64, dev: u64) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.dev = dev;
+        }
+    }
+
+    /// Mark `ino` as a mount root on the same device, as a same-filesystem bind
+    /// mount is.
+    pub fn set_mount_root(&mut self, ino: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.mount_root = true;
         }
     }
 
@@ -1206,6 +1249,7 @@ impl FakeRemoveFs {
                 kind: NodeKind::Symlink,
                 size: link.len() as u64,
                 nlink: 1,
+                mount_root: false,
                 link,
                 children: BTreeMap::new(),
             },
@@ -1251,6 +1295,7 @@ impl FakeRemoveFs {
             size: node.size,
             nlink: node.nlink,
             kind: node.kind,
+            mount_root: node.mount_root,
         };
         if self.diverge == Some(ino) {
             self.diverge_hits = self.diverge_hits.saturating_add(1);
@@ -1380,6 +1425,7 @@ impl RemoveFs for FakeRemoveFs {
                             kind: NodeKind::Dir,
                             size: 0,
                             nlink: 2,
+                            mount_root: false,
                             link: Vec::new(),
                             children: BTreeMap::new(),
                         },
@@ -1668,6 +1714,26 @@ mod tests {
             RemoveError::MountPoint
         );
         assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn a_same_device_bind_mount_as_the_tree_is_refused() {
+        let (mut fs, tree_root) = tree();
+        fs.set_mount_root(tree_root);
+        fs.set_mount_root(9999);
+        assert_eq!(
+            remove_path(&mut fs, &req("item")).unwrap_err(),
+            RemoveError::MountPoint
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn mount_root_needs_kernel_support_and_the_attribute() {
+        assert!(mount_root_bits(0x2000, 0x2000));
+        assert!(!mount_root_bits(0x2000, 0));
+        assert!(!mount_root_bits(0, 0x2000));
+        assert!(!mount_root_bits(0xdfff, 0xffff));
     }
 
     #[test]
@@ -2518,6 +2584,7 @@ mod tests {
             size: 0,
             nlink: 1,
             kind: NodeKind::Dir,
+            mount_root: false,
         };
         assert_eq!(
             fs.verify_dir(99, b"", expected_stat).unwrap_err(),
@@ -2865,6 +2932,7 @@ mod tests {
             size: 0,
             nlink: 2,
             kind: NodeKind::Dir,
+            mount_root: false,
         };
         assert_eq!(
             verify_dir_stat_result(Err(EBADF), expected).unwrap_err(),
