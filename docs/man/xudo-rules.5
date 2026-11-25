@@ -673,6 +673,42 @@ program. The compiled path checks also protect
 and
 .BR /usr/bin/willyoumarryme
 from xudo-mediated writes.
+.PP
+A multicall program (\c
+.B coreutils
+or
+.BR toybox )
+takes its applet from the first argument, so the program name alone says
+nothing.
+The deny-list reads the applet, including the
+.B \-\-coreutils\-prog=
+spelling, and refuses what it would refuse by name, plus
+.B sort
+and
+.B shuf
+with an output file or a compress program,
+.B uniq
+with two operands,
+.B date
+with
+.B \-f
+or
+.BR \-s ,
+and
+.BR ptx ,
+.BR csplit ,
+.B runcon
+and
+.BR kill .
+.B xudo check
+also reports, as a lint error (exit status 21), a rule for such a program
+whose first argument is not one
+.B literal
+or one
+.B one\-of
+of plain applet names that the deny-list accepts.
+Pin the applet; an open matcher there hands the caller every applet the list
+does not know.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .

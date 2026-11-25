@@ -3282,6 +3282,23 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
+    fn check_rejects_an_unpinned_multicall_applet() {
+        let rules = "[[action]]\nid = \"x.any\"\ntier = \"diag-read\"\nexe = \"/usr/bin/coreutils\"\nargs = [{ name = \"a\", matcher = { pattern = \"[a-z]+\" } }]\n";
+        let (code, out, err) = Fixture::new("cli-check-unpinned-multicall")
+            .write("10-rules.toml", rules)
+            .run(&["check"]);
+        assert_eq!(code.as_i32(), 21, "{out}{err}");
+        assert!(!out.contains("ok:"), "{out}");
+        assert!(err.contains("must pin its applet"), "{err}");
+        let (code, json, _) = Fixture::new("cli-check-unpinned-multicall-json")
+            .write("10-rules.toml", rules)
+            .run(&["--output", "json", "check"]);
+        assert_eq!(code.as_i32(), 21);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["lint"]["open_unit_lints"][0]["action"], "x.any");
+    }
+
+    #[test]
     fn check_reports_harness_guardrails_as_lint_errors() {
         let root = test_tmp_root().join("cli-check-harness-guardrails");
         let _ = std::fs::remove_dir_all(&root);

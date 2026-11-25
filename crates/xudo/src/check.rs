@@ -41,7 +41,9 @@ const LIMITS: Limits = Limits {
     max_lines: 1,
 };
 
-/// A systemctl rule that can start or stop a unit it does not name.
+/// A rule that is open where it must be closed: a systemctl rule that can
+/// start or stop a unit it does not name, or a multicall rule with no pinned
+/// applet. Both are lint errors and share the report shape.
 struct OpenUnit {
     action: String,
     file: String,
@@ -105,6 +107,23 @@ impl Report {
         .max_by_key(|code| code.as_i32())
         .unwrap_or(ExitCode::Delegated)
     }
+}
+
+/// Multicall rules whose applet is not pinned, one error each.
+fn unpinned_multicall_lints(rules: &xudo_policy::RuleSet) -> Vec<OpenUnit> {
+    rules
+        .unpinned_multicall_actions()
+        .into_iter()
+        .map(|action| OpenUnit {
+            action: action.id.to_string(),
+            file: action.source.file.clone(),
+            line: action.source.line,
+            message: format!(
+                "{}: a multicall rule must pin its applet with a literal or a one-of of safe applet names",
+                action.id
+            ),
+        })
+        .collect()
 }
 
 /// Lints and tests `loaded`, writes the report, and returns the exit status.
@@ -181,6 +200,7 @@ pub(crate) fn run(
                         line: lint.source.line,
                         message: lint.message(),
                     })
+                    .chain(unpinned_multicall_lints(loaded.rules()))
                     .collect(),
                 harness_rule_lints(loaded),
                 overlaps.iter().map(ToString::to_string).collect(),

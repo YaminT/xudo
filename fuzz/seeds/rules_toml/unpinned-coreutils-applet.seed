@@ -1,0 +1,5 @@
+[[action]]
+id = "x.any"
+tier = "diag-read"
+exe = "/usr/bin/coreutils"
+args = [{ name = "applet", matcher = { pattern = "[-a-z0-9/._=]+" } }]

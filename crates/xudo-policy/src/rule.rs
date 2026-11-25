@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::argv::Arg;
 use crate::deny::{LIFECYCLE_OR_POWER_VERBS, exe_is_systemctl, unit_literal_is_refused};
 use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
-use crate::matcher::{ArgSpec, Matcher};
+use crate::matcher::{ArgSpec, Matcher, Repeat};
 use crate::operation::{Operation, check_operation};
 use crate::rule_test::RuleTest;
 
@@ -848,6 +848,45 @@ impl RuleSet {
                 } else {
                     Some((&action.id, classes))
                 }
+            })
+            .collect()
+    }
+
+    /// Actions that run a multicall binary (`coreutils`, `toybox`) without
+    /// pinning the applet.
+    ///
+    /// Pinned means the first argument is one `literal`, or a `one-of` whose
+    /// values are all plain names the deny-list accepts as an applet, and it
+    /// consumes exactly one argument. Anything else is reported, including an
+    /// action with no arguments and a `--coreutils-prog=` spelling, because a
+    /// matcher that is open at the applet position hands the caller every
+    /// applet the deny-list does not know. A check-time lint: the decision
+    /// path still refuses at run time whatever the deny-list classifies.
+    pub fn unpinned_multicall_actions(&self) -> Vec<&Action> {
+        self.actions
+            .iter()
+            .filter(|action| crate::deny::is_multicall(action.exe.as_bytes()))
+            .filter(|action| {
+                let pinned = action.args.first().is_some_and(|spec| {
+                    matches!(spec.repeat, Repeat::One)
+                        && match &spec.matcher {
+                            Matcher::Literal(value) => crate::deny::pinned_applet_is_accepted(
+                                action.exe.as_bytes(),
+                                value.as_bytes(),
+                            ),
+                            Matcher::OneOf(values) => {
+                                !values.is_empty()
+                                    && values.iter().all(|value| {
+                                        crate::deny::pinned_applet_is_accepted(
+                                            action.exe.as_bytes(),
+                                            value.as_bytes(),
+                                        )
+                                    })
+                            }
+                            _ => false,
+                        }
+                });
+                !pinned
             })
             .collect()
     }

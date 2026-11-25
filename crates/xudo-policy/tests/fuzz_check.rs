@@ -419,3 +419,182 @@ fn denies_coreutils_rm_applet_through_a_rule_that_names_it() {
     assert_eq!(decision.verdict, Verdict::Deny);
     assert_eq!(decision.denial, Some(DenialCode::DenyListed));
 }
+
+fn coreutils_rule(matcher: &str) -> RuleSet {
+    RuleSet::from_toml(
+        "x.toml",
+        &format!(
+            "[[action]]\nid = \"x.c\"\ntier = \"diag-read\"\nexe = \"/usr/bin/coreutils\"\nargs = [{{ name = \"a\", matcher = {matcher} }}, {{ name = \"rest\", matcher = {{ pattern = \"[-a-z0-9/._=]+\" }}, repeat = {{ between = {{ min = 0, max = 4 }} }} }}]\n"
+        ),
+    )
+    .unwrap()
+}
+
+fn coreutils_verdict(rules: &RuleSet, argv: &[&str]) -> Decision {
+    let human = CallerFacts::new(Classification::Human, 1000);
+    evaluate_command(
+        rules,
+        &human,
+        &Arg::from("/usr/bin/coreutils"),
+        &Argv::new(argv.iter().copied()),
+        Settings::default(),
+    )
+}
+
+/// The gap the lint closes: an open applet position passed every gate.
+#[test]
+fn a_coreutils_rule_with_an_unpinned_applet_is_flagged() {
+    let open = RuleSet::from_toml(
+        "x.toml",
+        include_str!("../../../fuzz/seeds/rules_toml/unpinned-coreutils-applet.seed"),
+    )
+    .unwrap();
+    assert_eq!(open.unpinned_multicall_actions().len(), 1);
+    assert!(open.self_denying_actions().is_empty());
+    let no_args = RuleSet::from_toml(
+        "x.toml",
+        "[[action]]\nid = \"x.n\"\ntier = \"diag-read\"\nexe = \"/usr/bin/toybox\"\nargs = []\n",
+    )
+    .unwrap();
+    assert_eq!(no_args.unpinned_multicall_actions().len(), 1);
+    let optional = RuleSet::from_toml(
+        "x.toml",
+        "[[action]]\nid = \"x.o\"\ntier = \"diag-read\"\nexe = \"/usr/bin/coreutils\"\nargs = [{ name = \"a\", matcher = { literal = \"true\" }, repeat = \"optional\" }]\n",
+    )
+    .unwrap();
+    assert_eq!(optional.unpinned_multicall_actions().len(), 1);
+}
+
+#[test]
+fn a_coreutils_rule_pinning_a_safe_applet_is_not_flagged() {
+    for matcher in [
+        "{ literal = \"true\" }",
+        "{ one-of = [\"true\", \"sort\", \"uniq\"] }",
+    ] {
+        assert!(
+            coreutils_rule(matcher)
+                .unpinned_multicall_actions()
+                .is_empty(),
+            "{matcher}"
+        );
+    }
+}
+
+#[test]
+fn a_one_of_with_a_dangerous_applet_is_flagged() {
+    for matcher in [
+        "{ one-of = [\"true\", \"rm\"] }",
+        "{ one-of = [\"true\", \"--coreutils-prog=true\"] }",
+        "{ one-of = [\"true\", \"/bin/true\"] }",
+        "{ one-of = [] }",
+        "{ literal = \"sh\" }",
+        "{ literal = \"\" }",
+        "{ name = \"unit-name\" }",
+    ] {
+        assert_eq!(
+            coreutils_rule(matcher).unpinned_multicall_actions().len(),
+            1,
+            "{matcher}"
+        );
+    }
+}
+
+/// The decision path refuses what the lint would flag, with no lint run.
+#[test]
+fn denies_coreutils_sort_output_to_a_root_file() {
+    let rules = coreutils_rule("{ one-of = [\"sort\", \"shuf\", \"uniq\", \"date\"] }");
+    assert!(rules.unpinned_multicall_actions().is_empty());
+    for argv in [
+        &["sort", "-o", "/root/.bashrc"][..],
+        &["sort", "-o/root/.bashrc"],
+        &["sort", "-ro", "/root/x"],
+        &["sort", "--output=/root/x"],
+        &["sort", "--out=/root/x"],
+        &["sort", "--o", "/root/x"],
+        &["sort", "--compress-program=sh"],
+        &["sort", "--files0-from=/root/x"],
+        &["uniq", "a", "/root/.bashrc"],
+        &["uniq", "-", "x"],
+        &["uniq", "--", "-a", "-b"],
+        &["date", "-f", "/etc/shadow"],
+        &["date", "--file=/etc/shadow"],
+        &["date", "-s", "2000-01-01"],
+        &["date", "--set=2000-01-01"],
+    ] {
+        let decision = coreutils_verdict(&rules, argv);
+        assert_eq!(decision.verdict, Verdict::Deny, "{argv:?}");
+        assert_eq!(decision.denial, Some(DenialCode::DenyListed), "{argv:?}");
+    }
+    assert_eq!(
+        coreutils_verdict(&rules, &["sort", "-r"]).verdict,
+        Verdict::Allow
+    );
+    assert_eq!(
+        coreutils_verdict(&rules, &["uniq", "-c", "-"]).verdict,
+        Verdict::Allow
+    );
+    assert_eq!(
+        coreutils_verdict(&rules, &["date", "-u"]).verdict,
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn denies_coreutils_shuf_output() {
+    let rules = coreutils_rule("{ literal = \"shuf\" }");
+    for argv in [
+        &["shuf", "-o", "/root/x"][..],
+        &["shuf", "--output=/root/x"],
+        &["shuf", "-n1", "-o/root/x"],
+    ] {
+        assert_eq!(
+            coreutils_verdict(&rules, argv).verdict,
+            Verdict::Deny,
+            "{argv:?}"
+        );
+    }
+    assert_eq!(
+        coreutils_verdict(&rules, &["shuf", "-n"]).verdict,
+        Verdict::Allow
+    );
+}
+
+#[test]
+fn denies_coreutils_runcon() {
+    for applet in ["runcon", "ptx", "csplit"] {
+        let rules = coreutils_rule(&format!("{{ literal = \"{applet}\" }}"));
+        assert_eq!(rules.unpinned_multicall_actions().len(), 1, "{applet}");
+        let decision = coreutils_verdict(&rules, &[applet, "x", "sh"]);
+        assert_eq!(decision.verdict, Verdict::Deny, "{applet}");
+        assert_eq!(decision.denial, Some(DenialCode::DenyListed), "{applet}");
+    }
+}
+
+#[test]
+fn denies_coreutils_kill_of_pid_one() {
+    let rules = coreutils_rule("{ literal = \"kill\" }");
+    let decision = coreutils_verdict(&rules, &["kill", "-9", "1"]);
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert_eq!(decision.denial, Some(DenialCode::DenyListed));
+}
+
+proptest! {
+    /// Appending an argument to a multicall applet never turns a deny into an allow.
+    #[test]
+    fn appending_an_argument_to_a_multicall_applet_never_allows(
+        applet in prop::sample::select(vec!["sort", "shuf", "uniq", "date", "rm", "kill", "ptx", "true"]),
+        base in prop::collection::vec("[-a-z0-9/._=]{1,8}", 0..3),
+        extra in "[-a-z0-9/._=]{1,8}",
+    ) {
+        let rules = coreutils_rule("{ pattern = \"[-a-z0-9/._=]+\" }");
+        let mut argv = vec![applet.to_owned()];
+        argv.extend(base);
+        if coreutils_verdict(&rules, &argv.iter().map(String::as_str).collect::<Vec<_>>()).verdict == Verdict::Deny {
+            argv.push(extra);
+            prop_assert_eq!(
+                coreutils_verdict(&rules, &argv.iter().map(String::as_str).collect::<Vec<_>>()).verdict,
+                Verdict::Deny
+            );
+        }
+    }
+}

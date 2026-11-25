@@ -633,6 +633,17 @@ fn no_shipped_rule_allowlists_a_deny_listed_executable() {
 }
 
 #[test]
+fn no_shipped_rule_exposes_an_unpinned_multicall_applet() {
+    let rules = load_all();
+    let open = rules.unpinned_multicall_actions();
+    assert!(
+        open.is_empty(),
+        "shipped rules run a multicall binary with an open applet: {:?}",
+        open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn no_shipped_action_id_is_duplicated_across_files() {
     // `RuleSet::load` enforces this; combining every file is what makes the
     // check meaningful, since duplicates only collide once the set is merged.
