@@ -35,7 +35,6 @@ use rustix::fs::{
 use rustix::io::Errno;
 use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END, MANAGED_MARKER};
 
-use super::blocks;
 use super::{FileIdentity, InstallError, InstallOps, Removal, split, substitute};
 use crate::exec::{HostRunner, Runner};
 use crate::trust::{Kind, TRUSTED_UID, TrustError, facts_of, open_trusted};
@@ -71,7 +70,7 @@ type OpenDir = Box<dyn Fn(&Path) -> Result<Option<OwnedFd>, TrustError>>;
 
 /// What a shared file's editor does with its current contents: the new
 /// contents, or `None` when there is nothing to change.
-type Edit<'a> = &'a dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, blocks::BlockError>;
+type Edit<'a> = &'a dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, xudo_backend::blocks::BlockError>;
 
 /// Reads the real machine, and writes to it.
 pub struct HostInstallOps {
@@ -699,7 +698,7 @@ impl InstallOps for HostInstallOps {
         self.rewrite_shared(
             path,
             &|current| {
-                blocks::insert(
+                xudo_backend::blocks::insert(
                     current,
                     block.as_bytes(),
                     DOAS_BEGIN.as_bytes(),
@@ -715,7 +714,9 @@ impl InstallOps for HostInstallOps {
     fn remove_block(&self, path: &str) -> Result<Removal, InstallError> {
         let changed = match self.rewrite_shared(
             path,
-            &|current| blocks::remove(current, DOAS_BEGIN.as_bytes(), DOAS_END.as_bytes()),
+            &|current| {
+                xudo_backend::blocks::remove(current, DOAS_BEGIN.as_bytes(), DOAS_END.as_bytes())
+            },
             None,
         ) {
             // Nothing to remove from a file that is not there.

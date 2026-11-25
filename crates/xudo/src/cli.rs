@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use xudo_backend::paths_to_root::{Finding, HostView, Input, assess};
+use xudo_backend::paths_to_root::{Finding, HostView, Input, PlannedHost, assess};
 use xudo_backend::{BackendKind, InstallPlan, PlanStep, Probe, detect, uninstall_plan};
 use xudo_config::report::{self, ListOptions};
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
@@ -723,9 +723,11 @@ fn install(
             }
         }
     };
-    if !mode.uninstall && plans.iter().any(|plan| plan.backend == BackendKind::Doas) {
-        if let Some(refusal) = doas_later_rules(host, err) {
-            return refusal;
+    if !mode.uninstall {
+        if let Some(plan) = plans.iter().find(|plan| plan.backend == BackendKind::Doas) {
+            if let Some(refusal) = doas_later_rules(host, plan, err) {
+                return refusal;
+            }
         }
     }
 
@@ -772,29 +774,59 @@ fn install(
     }
 }
 
-/// Looks at the doas rules that come after xudo's own: doas uses the last
-/// rule that matches, so a later `nopass` takes the human's password from the
-/// gate, which is the only proof of a human. That refuses; a later `persist`
-/// only warns. `None` means go on.
+/// Looks at the doas rules that would come after xudo's own once the plan has
+/// run: doas uses the last rule that matches, so a later `nopass` takes the
+/// human's password from the gate, which is the only proof of a human. A line
+/// xudo cannot read that may carry `nopass` counts as one that does. That
+/// refuses; a later `persist` only warns. `None` means go on.
 ///
-/// This reads a rule of xudo's that is already installed: before the first
-/// install there is no rule for a later one to follow, so the first install is
-/// checked by `xudo doctor` after it.
-fn doas_later_rules(host: &dyn HostView, err: &mut dyn Write) -> Option<ExitCode> {
+/// A rule that merely says `permit "nopass"` (a user named nopass, quoted) is
+/// refused too: the reader drops the quotes, so it cannot tell it from the
+/// keyword. A false positive, and the safe direction.
+///
+/// The host is asked as it would be after the plan, with xudo's rule in the
+/// file and at the place the plan puts it, so the first install is checked
+/// the way every later one is, by the one reader `xudo doctor` uses.
+fn doas_later_rules(
+    host: &dyn HostView,
+    plan: &InstallPlan,
+    err: &mut dyn Write,
+) -> Option<ExitCode> {
+    let planned = PlannedHost::new(host, plan);
+    let view: &dyn HostView = planned.as_ref().map_or(host, |planned| planned);
     let report = assess(
-        host,
+        view,
         &Input {
             user_path: None,
             backend_exe: None,
             sudo_exe: None,
             doas_exe: None,
+            doas_ignores_drop_ins: planned
+                .as_ref()
+                .is_some_and(|planned| !planned.is_drop_in()),
         },
     );
     let mut refused = false;
+    // xudo's rule is in the planned file by construction. If it cannot be found
+    // there, the file could not be read or the install would not make what was
+    // modelled, so nothing said about the rules after it can be trusted.
+    if planned
+        .as_ref()
+        .is_some_and(|planned| !planned.holds_own_rule())
+    {
+        refused = true;
+        let _ = writeln!(
+            err,
+            "xudo: refusing to install: xudo's own rule could not be found in the doas \
+             configuration as the install would leave it, so the rules after it could not \
+             be checked."
+        );
+    }
     for finding in report.checks.iter().flat_map(|check| &check.findings) {
         let Finding::DoasLaterRule {
             file,
             line,
+            why,
             nopass,
             persist,
             ..
@@ -807,9 +839,8 @@ fn doas_later_rules(host: &dyn HostView, err: &mut dyn Write) -> Option<ExitCode
             refused = true;
             let _ = writeln!(
                 err,
-                "xudo: refusing to install: {at}:{line} is a doas rule after xudo's own that \
-                 carries nopass, so the gate would run without a password. Remove nopass \
-                 from it, or move it above xudo's rule."
+                "xudo: refusing to install: {at}:{line}: {why}. Remove nopass from it, or \
+                 move it above xudo's rule."
             );
         } else if *persist {
             let _ = writeln!(
@@ -1621,6 +1652,7 @@ mod tests {
     use xudo_backend::Capability;
     use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest, PlannedFile};
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
+    use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END};
     use xudo_config::Setting;
     use xudo_sys::{AgentError, AgentRow};
 
@@ -3967,6 +3999,10 @@ expect = "deny"
             true
         }
 
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
+        }
+
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
             true
         }
@@ -3995,6 +4031,10 @@ expect = "deny"
 
         fn validates_named_file(&self, _path: &str) -> bool {
             true
+        }
+
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
         }
 
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
@@ -4039,9 +4079,11 @@ expect = "deny"
         assert!(WorkingSudoProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(WorkingSudoProbe.validates_named_file("/usr/bin/sudo"));
         assert!(WorkingSudoProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!WorkingSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         assert!(!NoBackendProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(NoBackendProbe.validates_named_file("/usr/bin/sudo"));
         assert!(NoBackendProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!NoBackendProbe.doas_reads_drop_ins("/usr/bin/doas"));
     }
 
     #[test]
@@ -4396,10 +4438,15 @@ expect = "deny"
             fn validates_named_file(&self, _path: &str) -> bool {
                 false
             }
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 false
             }
         }
+        assert!(!MuteProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let fx = fixture("cli-install-mute");
         let (code, _, err) = run_probe_full(&fx, &MuteProbe, &["install", "--dry-run"]);
         assert_eq!(code, ExitCode::Unusable);
@@ -4724,7 +4771,12 @@ expect = "deny"
     }
 
     /// A doas with a drop-in directory, for the install gate.
-    struct DoasInstallProbe;
+    struct DoasInstallProbe {
+        /// Whether the build has `/etc/doas.d`.
+        drop_in: bool,
+        /// Whether the build is shown to read it.
+        reads: bool,
+    }
     impl Probe for DoasInstallProbe {
         fn exists(&self, absolute_path: &str) -> bool {
             absolute_path == "/usr/bin/doas"
@@ -4733,7 +4785,7 @@ expect = "deny"
             Some("doas (OpenDoas) 6.8.2".to_owned())
         }
         fn directory_exists(&self, _absolute_path: &str) -> bool {
-            false
+            self.drop_in
         }
         fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
             true
@@ -4744,17 +4796,46 @@ expect = "deny"
         fn validates_named_file(&self, _path: &str) -> bool {
             true
         }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            self.reads
+        }
+
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
             true
         }
     }
 
-    /// `xudo install` on a doas host whose rules are `later`, after xudo's own.
+    /// `xudo install` on a doas host with a drop-in directory whose only file
+    /// is `zz-local.conf`, holding `later`: xudo's own rule is not installed yet,
+    /// and lands at `60-xudo.conf`, before it.
     fn install_on_doas(later: &[u8], args: &[&str]) -> (ExitCode, String, String) {
-        let mut rules =
-            b"permit :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n".to_vec();
-        rules.extend_from_slice(later);
-        let host = MemoryHost::new(Caller {
+        install_on_doas_with(true, &[("/etc/doas.d/zz-local.conf", later)], args)
+    }
+
+    /// The same with the files `files` on the machine, and a doas build that
+    /// reads `/etc/doas.d` or not.
+    fn install_on_doas_with(
+        drop_in: bool,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        install_on_doas_probe(
+            &DoasInstallProbe {
+                drop_in,
+                reads: drop_in,
+            },
+            files,
+            args,
+        )
+    }
+
+    /// The same with the probe described in full.
+    fn install_on_doas_probe(
+        probe: &DoasInstallProbe,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let mut host = MemoryHost::new(Caller {
             uid: 0,
             gid: 0,
             groups: Lookup::Found(vec![0]),
@@ -4763,8 +4844,10 @@ expect = "deny"
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n")
         .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
-        .dir("/etc/doas.d", 0, 0, 0o755)
-        .file("/etc/doas.d/60-xudo.conf", 0, 0, 0o400, &rules);
+        .dir("/etc/doas.d", 0, 0, 0o755);
+        for (path, contents) in files {
+            host = host.file(path, 0, 0, 0o400, contents);
+        }
         let fx = fixture("cli-install-doas-later");
         let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "install"];
         full.extend_from_slice(args);
@@ -4772,7 +4855,7 @@ expect = "deny"
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let platform = Platform {
             ops: &BlindOps,
-            probe: &DoasInstallProbe,
+            probe,
             host: &host,
             path: None,
         };
@@ -4789,7 +4872,7 @@ expect = "deny"
         let (code, out, err) = install_on_doas(b"permit nopass :xudo\n", &[]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(
-            err.contains("refusing to install: /etc/doas.d/60-xudo.conf:2"),
+            err.contains("refusing to install: /etc/doas.d/zz-local.conf:1"),
             "{err}"
         );
         assert!(err.contains("nopass"), "{err}");
@@ -4805,19 +4888,179 @@ expect = "deny"
 
     #[test]
     fn the_doas_install_probe_answers_every_question() {
-        let probe = DoasInstallProbe;
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
         assert!(probe.honours_directive("/usr/bin/doas", "x"));
         assert!(probe.honours_scoped_directive("/usr/bin/doas", "x"));
         assert!(probe.validates_named_file("/usr/bin/doas"));
         assert!(probe.accepts_argument_wildcard("/usr/bin/doas"));
         assert!(!probe.directory_exists("/etc/doas.d"));
+        assert!(!probe.doas_reads_drop_ins("/usr/bin/doas"));
+        assert!(
+            DoasInstallProbe {
+                drop_in: true,
+                reads: true
+            }
+            .directory_exists("/etc/doas.d")
+        );
+    }
+
+    #[test]
+    fn the_first_install_is_refused_for_a_zz_local_nopass_wheel_rule_the_agent_is_in() {
+        // No rule of xudo's is installed: 60-xudo.conf is planned, and sorts
+        // before zz-local.conf, whose `permit nopass :wheel` covers the agent.
+        let (code, out, err) = install_on_doas_with(
+            true,
+            &[
+                ("/etc/doas.d/zz-local.conf", b"permit nopass :wheel\n"),
+                (
+                    "/etc/passwd",
+                    b"root:x:0:0::/root:/bin/sh\nagent:x:1001:1001::/h:/bin/sh\n",
+                ),
+                (
+                    "/etc/group",
+                    b"root:x:0:\nxudo:x:998:agent\nwheel:x:10:agent\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(
+            err.contains("refusing to install: /etc/doas.d/zz-local.conf:1"),
+            "{err}"
+        );
+        assert!(!out.contains("done"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_a_nopass_line_it_cannot_read_and_names_its_place() {
+        for line in [
+            &b"permit nopass :xudo \\\n"[..],
+            b"permit nopass :xu\\do\n",
+            b"permit nopass \":xudo\"#x\n",
+            b"permit nopass setenv { A=\"#\" } :xudo\n",
+        ] {
+            let (code, _, err) = install_on_doas(line, &["--dry-run"]);
+            assert_eq!(code, ExitCode::Unusable, "{line:?}");
+            assert!(
+                err.contains("zz-local.conf:1: doas may apply this line"),
+                "{err}"
+            );
+            assert!(err.contains("Remove nopass"), "{err}");
+        }
+    }
+
+    #[test]
+    fn install_goes_on_past_doas_lines_that_do_not_match_the_gate() {
+        let (code, _, err) = install_on_doas(
+            b"permit nopass :xudo\r\npermit nopass :xudo cmd /usr/libexec/xudo/xudo-gate-auth args a\npermit :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n",
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn install_does_not_read_a_drop_in_directory_a_doas_build_ignores() {
+        // The block goes to the end of doas.conf; nothing in doas.d is read by
+        // this build, so what it holds cannot follow xudo's rule.
+        let (code, _, err) = install_on_doas_with(
+            false,
+            &[("/etc/doas.d/zz-local.conf", b"permit nopass :xudo\n")],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn install_appends_when_a_directory_exists_that_the_doas_build_does_not_read() {
+        // Debian's opendoas ignores a /etc/doas.d someone made. A drop-in there
+        // would never take effect, and doas.conf's own `permit nopass :xudo`
+        // would look overridden by it. The block goes to doas.conf instead, so
+        // the nopass line above it is seen as coming BEFORE xudo's rule.
+        let probe = DoasInstallProbe {
+            drop_in: true,
+            reads: false,
+        };
+        let (code, out, err) = install_on_doas_probe(
+            &probe,
+            &[
+                ("/etc/doas.conf", b"permit nopass :xudo\n"),
+                ("/etc/doas.d/zz-local.conf", b"permit nopass :xudo\n"),
+            ],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("append"), "{out}");
+        assert!(!out.contains("60-xudo.conf"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_when_a_stale_xudo_block_hides_a_nopass_line_behind_it() {
+        // An operator edited xudo's block so it no longer matches, then added
+        // `permit nopass :xudo` after it. The install puts the new rule back
+        // INSIDE the old block, which is before that line: the nopass line
+        // wins. Appending at the end of the file would have hidden it.
+        let conf = format!("{DOAS_BEGIN}\n# xudo disabled\n{DOAS_END}\npermit nopass :xudo\n");
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) =
+            install_on_doas_probe(&probe, &[("/etc/doas.conf", conf.as_bytes())], &[]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("doas.conf:15"), "{err}");
+        assert!(err.contains("Remove nopass"), "{err}");
+    }
+
+    #[test]
+    fn install_refuses_when_the_planned_doas_file_cannot_be_read() {
+        // A doas.conf whose block the install would refuse to edit (an unpaired
+        // sentinel) cannot be shown to hold xudo's rule: refuse, never go on.
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) = install_on_doas_probe(
+            &probe,
+            &[(
+                "/etc/doas.conf",
+                format!("{DOAS_BEGIN}\npermit nopass :xudo\n").as_bytes(),
+            )],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo's own rule could not be found"), "{err}");
+    }
+
+    #[test]
+    fn a_plan_that_writes_no_file_is_checked_against_the_host_as_it_is() {
+        let host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755);
+        let plan = InstallPlan {
+            backend: BackendKind::Doas,
+            steps: Vec::new(),
+        };
+        let mut err = Vec::new();
+        assert_eq!(doas_later_rules(&host, &plan, &mut err), None);
+        assert!(err.is_empty());
     }
 
     #[test]
     fn install_warns_about_a_later_doas_persist_and_goes_on() {
         let (code, out, err) = install_on_doas(b"permit persist :xudo\n", &["--dry-run"]);
         assert_eq!(code, ExitCode::Delegated);
-        assert!(err.contains("warning: /etc/doas.d/60-xudo.conf:2"), "{err}");
+        assert!(
+            err.contains("warning: /etc/doas.d/zz-local.conf:1"),
+            "{err}"
+        );
         assert!(err.contains("persist"), "{err}");
         assert!(out.contains("plan for"), "{out}");
     }
@@ -4869,6 +5112,10 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
@@ -4878,6 +5125,7 @@ expect = "deny"
         assert!(DoasProbe.honours_scoped_directive("/usr/bin/doas", "pty"));
         assert!(DoasProbe.validates_named_file("/usr/bin/doas"));
         assert!(DoasProbe.accepts_argument_wildcard("/usr/bin/doas"));
+        assert!(!DoasProbe.doas_reads_drop_ins("/usr/bin/doas"));
 
         let out = run_probe(&fixture("cli-doctor-doas"), &DoasProbe, &["doctor"]);
         assert!(out.contains("backend      doas"), "{out}");
@@ -4909,10 +5157,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!MuteSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-mute"), &MuteSudoProbe, &["doctor"]);
         assert!(out.contains("no version banner"), "{out}");
         // An unreadable banner is assumed to be the stricter implementation.
@@ -4954,10 +5207,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!DeafSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-deaf"), &DeafSudoProbe, &["doctor"]);
         assert!(out.contains("backend      UNUSABLE"), "{out}");
         assert!(out.contains("fresh pty"), "{out}");
@@ -5245,7 +5503,13 @@ expect = "deny"
         run_agent(&host, &WorkingSudoProbe, &installer, &ENROL);
         assert!(installer.agent.asked.borrow()[0].contains("blockers: [\"BackendListing"));
         // doas, and no backend at all: the same scan without a program to ask.
-        for probe in [&DoasInstallProbe as &dyn Probe, &NoBackendProbe] {
+        for probe in [
+            &DoasInstallProbe {
+                drop_in: false,
+                reads: false,
+            } as &dyn Probe,
+            &NoBackendProbe,
+        ] {
             let installer = ScriptedInstaller::answering(vec![]);
             *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
             run_agent(

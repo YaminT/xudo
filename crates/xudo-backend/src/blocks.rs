@@ -7,7 +7,8 @@
 //! line is a privilege change nobody asked for.
 //!
 //! Pure: bytes in, bytes out. The lock, the temporary copy, the validator, and
-//! the rename around it are in [`super::host`].
+//! the rename around it are in `xudo-sys`, which calls these same functions, so
+//! an install and the view of one cannot disagree about the bytes.
 
 /// Why a block could not be inserted or removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -97,12 +98,7 @@ fn is_well_formed(block: &[u8], begin: &[u8], end: &[u8]) -> bool {
 ///
 /// [`BlockError::BadBlock`] for a block that does not carry the sentinels
 /// properly; [`BlockError::Ambiguous`] for a file whose sentinels do not pair.
-pub(super) fn insert(
-    text: &[u8],
-    block: &[u8],
-    begin: &[u8],
-    end: &[u8],
-) -> Result<Vec<u8>, BlockError> {
+pub fn insert(text: &[u8], block: &[u8], begin: &[u8], end: &[u8]) -> Result<Vec<u8>, BlockError> {
     if !is_well_formed(block, begin, end) {
         return Err(BlockError::BadBlock);
     }
@@ -133,7 +129,7 @@ pub(super) fn insert(
 /// # Errors
 ///
 /// [`BlockError::Ambiguous`] for a file whose sentinels do not pair.
-pub(super) fn remove(text: &[u8], begin: &[u8], end: &[u8]) -> Result<Option<Vec<u8>>, BlockError> {
+pub fn remove(text: &[u8], begin: &[u8], end: &[u8]) -> Result<Option<Vec<u8>>, BlockError> {
     Ok(locate(text, begin, end)?.map(|span| {
         let mut out = Vec::with_capacity(text.len());
         out.extend_from_slice(text.get(..span.start).unwrap_or_default());

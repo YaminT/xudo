@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod capability;
 pub mod detect;
 pub mod enrol;

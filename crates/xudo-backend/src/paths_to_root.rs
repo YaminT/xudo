@@ -59,6 +59,7 @@ mod accounts;
 mod config;
 mod memory;
 mod oracle;
+mod planned;
 mod proposals;
 mod walk;
 
@@ -72,10 +73,11 @@ use serde::{Serialize, Serializer};
 pub use config::Grant;
 pub use memory::MemoryHost;
 pub use oracle::{Answer, DOAS_ASKED, DOAS_USER_NEEDED, ROOT_NEEDED, read_doas, read_listing};
+pub use planned::PlannedHost;
 pub use proposals::{Proposal, propose};
 
 use accounts::{Account, GroupEntry};
-use config::{Include, RuleLine, Scope};
+use config::{DoasArgs, DoasEnv, DoasReading, Include, RuleLine, Scope};
 use walk::{Outcome, Sink};
 
 /// The sudoers files a sudo-family backend reads first. `sudo-rs` prefers its
@@ -394,6 +396,9 @@ pub struct Input<'a> {
     pub sudo_exe: Option<&'a str>,
     /// The doas executable to ask; `None` for sudo or no backend.
     pub doas_exe: Option<&'a str>,
+    /// This doas build does not read `/etc/doas.d` (Debian's `opendoas` has no
+    /// drop-in directory): its files are not analysed, which is said.
+    pub doas_ignores_drop_ins: bool,
 }
 
 /// The whole report.
@@ -1067,7 +1072,14 @@ fn passwordless_rules(ctx: &Ctx<'_>, input: &Input<'_>) -> ConfigOutcome {
     let unmodelled = unmodelled.into_iter().map(|gap| gap.at).collect();
     // The reader's gaps wait here: sudo's own answer may settle them.
     let reader_gaps = std::mem::take(&mut sink.unverified);
-    let doas_files = doas_files(ctx, &mut sink);
+    let doas_files = doas_files(ctx, input.doas_ignores_drop_ins, &mut sink);
+    if input.doas_ignores_drop_ins {
+        append_note(
+            &mut note,
+            "xudo does not use /etc/doas.d on this doas (the build is not shown to read it, or the \
+             directory is missing), so nothing in it was analysed",
+        );
+    }
     read_doas_files(ctx, &doas_files, &mut sink, &mut note);
 
     if let Some(exe) = input.sudo_exe {
@@ -1104,11 +1116,14 @@ fn read_doas_files(
             for rule in config::scan_doas(&bytes) {
                 sink.findings.push(passwordless(ctx, file, &rule));
             }
-            ordered.extend(
-                config::scan_doas_rules(&bytes)
-                    .into_iter()
-                    .map(|rule| (file.clone(), rule)),
-            );
+            let rules = config::scan_doas_rules(&bytes);
+            let invalid: Vec<usize> = rules
+                .iter()
+                .filter(|rule| rule.reading == DoasReading::Invalid)
+                .map(|rule| rule.line)
+                .collect();
+            sink.unverified.extend(invalid_gap(file, &invalid));
+            ordered.extend(rules.into_iter().map(|rule| (file.clone(), rule)));
         }
     }
     let later = later_doas_rules(ctx, &ordered);
@@ -1117,6 +1132,25 @@ fn read_doas_files(
     for denied in later.denies {
         append_note(note, &denied);
     }
+}
+
+/// What a doas file's lines that doas refuses leave unverified, if it has any.
+/// doas stops at the first syntax error, so none of the file's rules, xudo's
+/// included, would work.
+fn invalid_gap(file: &Path, lines: &[usize]) -> Option<Unverified> {
+    if lines.is_empty() {
+        return None;
+    }
+    let numbers: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    Some(Unverified::new(
+        file,
+        file,
+        format!(
+            "line(s) {} are not a doas rule (the keywords are lowercase `permit`, `deny`, \
+             `nopass`, and the grammar is strict), so doas refuses every rule in this file",
+            numbers.join(", ")
+        ),
+    ))
 }
 
 /// Adds a sentence to a check's note, after any already there.
@@ -1222,6 +1256,21 @@ fn target_is_root(ctx: &Ctx<'_>, target: Option<&[u8]>) -> bool {
             .any(|account| account.uid == 0 && account.name == target)
 }
 
+/// The identity of xudo's own doas rule: its group.
+fn own_identity() -> Vec<u8> {
+    [b":", XUDO_GROUP.as_bytes()].concat()
+}
+
+/// Whether a doas rule is xudo's own: a `permit` for the group that runs the
+/// gate with no arguments.
+fn is_own_doas_rule(rule: &config::DoasRule) -> bool {
+    rule.reading == DoasReading::Rule
+        && rule.permit
+        && rule.identity == own_identity()
+        && rule.args == DoasArgs::Open
+        && rule.cmd.as_deref() == Some(crate::snippet::GATE_AUTH.as_bytes())
+}
+
 /// The doas rules after xudo's own that would replace it.
 ///
 /// doas uses the last rule that matches, in file order: `/etc/doas.conf`, then
@@ -1238,20 +1287,48 @@ fn later_doas_rules(ctx: &Ctx<'_>, ordered: &[(PathBuf, config::DoasRule)]) -> L
         denies: Vec::new(),
     };
     let gate = crate::snippet::GATE_AUTH.as_bytes();
-    let names_gate = |rule: &config::DoasRule| rule.cmd.as_deref().is_none_or(|cmd| cmd == gate);
-    let Some(own) = ordered.iter().position(|(_, rule)| {
-        rule.permit
-            && rule.identity == [b":", XUDO_GROUP.as_bytes()].concat()
-            && rule.cmd.as_deref() == Some(gate)
-    }) else {
+    // A rule with an argument list matches only a run with those arguments,
+    // and the gate is run with none.
+    let names_gate = |rule: &config::DoasRule| {
+        rule.args == DoasArgs::Open && rule.cmd.as_deref().is_none_or(|cmd| cmd == gate)
+    };
+    let own_identity = own_identity();
+    let Some(own) = ordered.iter().position(|(_, rule)| is_own_doas_rule(rule)) else {
         return out;
     };
     let later = ordered
         .iter()
         .skip(own.saturating_add(1))
-        .filter(|(_, rule)| names_gate(rule) && target_is_root(ctx, rule.target.as_deref()));
+        .filter(|(_, rule)| match rule.reading {
+            DoasReading::Invalid => false,
+            DoasReading::Unparsed => true,
+            DoasReading::Rule => names_gate(rule) && target_is_root(ctx, rule.target.as_deref()),
+        });
     for (file, rule) in later {
         let text = String::from_utf8_lossy(rule.text.trim_ascii()).into_owned();
+        if rule.reading == DoasReading::Unparsed {
+            out.findings.push(Finding::DoasLaterRule {
+                file: file.clone(),
+                line: rule.line,
+                text,
+                why: "doas may apply this line, which comes after xudo's own rule, as a rule \
+                      that carries nopass, so the gate could run without a password; xudo \
+                      cannot read it to say otherwise"
+                    .to_owned(),
+                nopass: true,
+                persist: false,
+            });
+            continue;
+        }
+        // The same rule over again changes nothing.
+        let plain = !rule.nopass && !rule.persist && rule.env == DoasEnv::Unchanged;
+        if plain
+            && rule.permit
+            && rule.identity == own_identity
+            && rule.cmd.as_deref() == Some(gate)
+        {
+            continue;
+        }
         match (names_xudo(ctx, &rule.identity), rule.permit) {
             (Names::Unknown, true) => out.gaps.push(Unverified::new(
                 file,
@@ -1473,8 +1550,11 @@ fn included(
 
 /// doas's configuration file, and the `*.conf` files of its drop-in directory
 /// (doas ignores any other name, and the match is case-sensitive).
-fn doas_files(ctx: &Ctx<'_>, sink: &mut Sink) -> Vec<PathBuf> {
+fn doas_files(ctx: &Ctx<'_>, ignores_drop_ins: bool, sink: &mut Sink) -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from(DOAS_CONF)];
+    if ignores_drop_ins {
+        return files;
+    }
     files.extend(listed_names(
         ctx,
         Path::new(DOAS_DIR),

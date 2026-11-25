@@ -11,7 +11,7 @@ use std::io::Write;
 use clap::Subcommand;
 use xudo_backend::enrol::{EnrolRequest, Listed, scan_account};
 use xudo_backend::paths_to_root::Input;
-use xudo_backend::{BackendKind, identify};
+use xudo_backend::{Backend, BackendKind, identify};
 use xudo_policy::ExitCode;
 use xudo_sys::Installer;
 
@@ -112,6 +112,7 @@ fn enrol(
         backend_exe: None,
         sudo_exe: exe_of(|kind| matches!(kind, BackendKind::Sudo | BackendKind::SudoRs)),
         doas_exe: exe_of(|kind| matches!(kind, BackendKind::Doas)),
+        doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
     };
     let scan = match scan_account(platform.host, &request.account, &input) {
         Ok(scan) => scan,

@@ -806,6 +806,7 @@ dependencies = [
 name = "xudo-backend"
 version = "0.1.0-beta.2"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
