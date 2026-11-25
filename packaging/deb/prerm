@@ -8,6 +8,8 @@ remove | deconfigure)
     fi
     # Stop only matters when systemd is up. Disable removes the links either way.
     deb-systemd-invoke stop xudod.socket xudo-pasban.timer xudo-pasban.service >/dev/null || true
+    # Enrolled agents go with the package: their records are voided by ExecStopPost.
+    if [ -d /run/systemd/system ]; then systemctl stop 'xudo-agent@*.service' >/dev/null 2>&1 || true; fi
     deb-systemd-helper disable xudod.socket >/dev/null || true
     deb-systemd-helper disable xudo-pasban.timer >/dev/null || true
     ;;

@@ -1,0 +1,16 @@
+# The slice every enrolled agent's cgroup lives under. The attestor accepts a
+# caller only when its cgroup is exactly `xudo.slice/xudo-agent@<label>.service`
+# (or a root-made `agent-<32 hex>.scope`) AND a root-written record names it, so
+# the slice alone proves nothing: a unit placed here with no record is unattested.
+#
+# No `Delegate=`: delegating the slice would let its processes create child
+# cgroups and move themselves, which is the one thing the attestation cannot
+# survive. No resource limits either; the slice is a name, not a sandbox.
+#
+# crates/xudod/tests/units.rs asserts every line here.
+
+[Unit]
+Description=xudo enrolled agents
+Documentation=https://github.com/YaminT/xudo/blob/main/howiwork.md
+
+[Slice]

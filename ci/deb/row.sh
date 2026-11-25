@@ -87,6 +87,16 @@ meta /var/lib/xudo/audit.jsonl "600 root:root"
 meta /run/xudo "755 root:root"
 meta /run/xudo/req "700 root:root"
 meta /run/xudo/confirm "700 root:root"
+meta /run/xudo/sessions "700 root:root"
+meta /run/xudo/rate "700 root:root"
+meta /usr/libexec/xudo/xudo-session "755 root:root"
+for u in xudo.slice xudo-agent@.service; do
+    [ -f "/usr/lib/systemd/system/$u" ] || fail "$u not in the package"
+    meta "/usr/lib/systemd/system/$u" "644 root:root"
+done
+# An enrolled agent needs a human to enrol it: nothing is enabled or started.
+gone /etc/systemd/system/multi-user.target.wants/xudo-agent@.service
+! grep -rqs NOPASSWD /etc/sudoers /etc/sudoers.d || fail "NOPASSWD found in sudoers after install"
 [ -L "$socket" ] || fail "socket was not enabled"
 [ -f /usr/lib/systemd/system/xudo-pasban.service ] || fail "pasban service not in the package"
 [ -f /usr/lib/systemd/system/xudo-pasban.timer ] || fail "pasban timer not in the package"

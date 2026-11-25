@@ -20,7 +20,9 @@
 #             the net under crates/xudod/tests/units.rs, which asserts each line
 #             by name and knows only the lines its author thought of. Applies to
 #             services only: given a socket it scores everything a socket does
-#             not declare, 9.6 UNSAFE, which means nothing.
+#             not declare, 9.6 UNSAFE, which means nothing. One template is
+#             exempt, by name (see exposure_exempt): an enrolled agent's unit
+#             cannot be sandboxed.
 #
 # The programs the units run are not in the repository, so each absolute path a
 # unit names is stubbed with an executable file before verify looks. That keeps
@@ -54,6 +56,22 @@ if ! { apt-get -o Acquire::Retries=3 update -qq &&
 fi
 echo "units: $(systemd-analyze --version | sed -n 1p)"
 
+# The one unit the exposure ceiling does not apply to: xudo-agent@.service, the
+# template for an enrolled agent. It carries no sandbox on purpose. sudo is
+# setuid, so NoNewPrivileges= would stop it working, and the gate runs a command
+# in the caller's own mount namespace and refuses a private one, so ProtectSystem=,
+# PrivateTmp= and the like are out too; the boundary is the account's uid and the
+# rules. It scores about 9, so the ceiling would only ever fail it. The exemption
+# is by exact name and for nothing else, crates/xudod/tests/units.rs holds the
+# template to "no sandbox directive at all" (so the exemption cannot hide one that
+# was meant to be there), and `verify` still applies to it in full.
+exposure_exempt() {
+    case $(basename "$1") in
+        xudo-agent@.service) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 12 -> 1.2, the way systemd-analyze prints a level.
 tenths() {
     echo "$(($1 / 10)).$(($1 % 10))"
@@ -80,9 +98,28 @@ stub_executables() {
 
 # check_units <unit file>...: one FAIL line per finding on standard error, each
 # naming the check that made it, and a return status of 1 if there was any.
+#
+# A template with no ExecStart= (the shipped agent template: a drop-in writes it)
+# does not load, so verify sees it beside a lane-only drop-in that supplies one.
+# The unit file itself is copied unchanged.
 check_units() {
     bad=0
     stub_executables "$@"
+    stage=$(mktemp -d)
+    for unit in "$@"; do
+        shift
+        case $unit in
+            *.service)
+                if ! grep -q '^ExecStart=' "$unit"; then
+                    mkdir -p "$stage/$(basename "$unit").d"
+                    printf '[Service]\nExecStart=/bin/true\n' >"$stage/$(basename "$unit").d/lane.conf"
+                    cp "$unit" "$stage/"
+                    unit=$stage/$(basename "$unit")
+                fi
+                ;;
+        esac
+        set -- "$@" "$unit"
+    done
 
     out=$(systemd-analyze verify --man=no "$@" 2>&1) && rc=0 || rc=$?
     if [ "$rc" -ne 0 ] || [ -n "$out" ]; then
@@ -96,6 +133,10 @@ check_units() {
             *.service) ;;
             *) continue ;;
         esac
+        if exposure_exempt "$unit"; then
+            echo "units: $unit: exposure ceiling does not apply (documented exemption)"
+            continue
+        fi
         out=$(systemd-analyze security --offline=true --no-pager --threshold="$ceiling" "$unit" 2>&1) && rc=0 || rc=$?
         overall=$(printf '%s\n' "$out" | sed -n 's/^.*\(Overall exposure level for .*\)$/\1/p')
         if [ "$rc" -ne 0 ]; then

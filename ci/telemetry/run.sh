@@ -34,8 +34,8 @@ run() {
 }
 cd /work
 run rustup target add "$triple" >/dev/null
-run cargo build --locked --release --target "$triple" -p xudo-bin -p ido-bin -p xudo-gate-bin -p xudod-bin
-run cargo tree --locked -e normal --target "$triple" -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --prefix none > /work/tree.txt
+run cargo build --locked --release --target "$triple" -p xudo-bin -p ido-bin -p xudo-gate-bin -p xudod-bin -p xudo-session-bin
+run cargo tree --locked -e normal --target "$triple" -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --prefix none > /work/tree.txt
 grep -Eq '^xudo-wire v' /work/tree.txt || { echo "FAIL: shipped dependency tree lacks xudo-wire" >&2; exit 1; }
 for crate in reqwest hyper h2 ureq curl isahc attohttpc tokio mio socket2 rustls native-tls openssl quinn tonic; do
     if grep -Eq "^${crate} v" /work/tree.txt; then echo "FAIL: networking crate in shipped dependency tree: $crate" >&2; exit 1; fi
