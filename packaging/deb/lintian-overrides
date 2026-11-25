@@ -6,6 +6,7 @@ xudo: shared-library-lacks-prerequisites [usr/bin/willyoumarryme]
 xudo: shared-library-lacks-prerequisites [usr/bin/xudo]
 xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudo-gate-auth]
 xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudo-gate-nopass]
+xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudo-session]
 xudo: shared-library-lacks-prerequisites [usr/libexec/xudo/xudod]
 # The packaged binary, called by absolute path. Root's PATH is not searched.
 xudo: command-with-path-in-maintainer-script /usr/bin/xudo*

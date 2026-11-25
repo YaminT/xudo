@@ -149,13 +149,16 @@ printf '%s\n' "$doctor_out" | grep -Fq '/etc/xudo/rules.d/05-probe.toml: changed
 useradd --no-create-home xudomember
 usermod -aG xudo xudomember
 # sudo_n_on_the_nopass_file_asks_a_password_until_e8: a group member reaches the
-# passwordless gate through no rule, so `sudo -n` must refuse for want of one.
+# passwordless gate through no rule, so `sudo -n` must not run it. Real sudo and
+# sudo-rs word the refusal differently ("not allowed", "password is required"),
+# so assert the invariant, not a phrase: non-zero exit and the gate never ran.
 set +e
 runuser -u xudomember -- sudo -n /usr/libexec/xudo/xudo-gate-nopass "" >/tmp/nopass-sudo.out 2>&1
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "sudo -n ran the nopass gate without a password"
-grep -Eqi 'password is required|not allowed' /tmp/nopass-sudo.out || fail "sudo -n on the nopass file said: $(cat /tmp/nopass-sudo.out)"
+! grep -Eqi 'gate_failed|"code"' /tmp/nopass-sudo.out || fail "the nopass gate produced output under sudo -n: $(cat /tmp/nopass-sudo.out)"
+! sudo -l -U xudomember 2>/dev/null | grep -F 'NOPASSWD' | grep -Fq 'xudo-gate' || fail "a rule grants NOPASSWD on a gate file"
 printf '%s\n' '{"h":null,"b":[["fingerprint",3,123]],"o":[]}' >/run/xudo/confirm/legacy.json
 printf '%s\n' 'keep target' >/run/xudo/confirm/target-data
 ln -s target-data /run/xudo/confirm/link.json

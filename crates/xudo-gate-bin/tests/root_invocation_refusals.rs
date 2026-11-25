@@ -141,17 +141,27 @@ fn a_hardlinked_or_replaced_gate_file_is_refused() {
     // the gate files.
     let dir = Path::new(GATE_DIR);
     for (file, other) in [(AUTH, "extra-auth"), (NOPASS, "extra-nopass")] {
-        // A second name for either file makes the executed file ambiguous.
         let extra = dir.join(other);
         let _ = std::fs::remove_file(&extra);
         std::fs::hard_link(file, &extra).unwrap();
         for run in [AUTH, NOPASS] {
             let output = std::process::Command::new(run).output().unwrap();
-            assert_eq!(
-                code_of(&output),
-                "gate_failed_invocation",
-                "{run} with {file} linked"
-            );
+            if file == AUTH {
+                // A second name for -auth adds no privilege (`sudo` matches
+                // by inode and still asks), so it is not refused.
+                assert_ne!(
+                    code_of(&output),
+                    "gate_failed_invocation",
+                    "{run} with {file} linked"
+                );
+            } else {
+                // A second name for -nopass makes the executed file ambiguous.
+                assert_eq!(
+                    code_of(&output),
+                    "gate_failed_invocation",
+                    "{run} with {file} linked"
+                );
+            }
         }
         std::fs::remove_file(&extra).unwrap();
         // Replaced by a symlink to the other file: the trust walk refuses it.
@@ -167,6 +177,17 @@ fn a_hardlinked_or_replaced_gate_file_is_refused() {
         std::fs::remove_file(file).unwrap();
         std::fs::remove_file(&moved).unwrap();
         install_gate_files();
+    }
+    // One inode under both gate names is refused in either mode.
+    std::fs::remove_file(NOPASS).unwrap();
+    std::fs::hard_link(AUTH, NOPASS).unwrap();
+    for run in [AUTH, NOPASS] {
+        let output = std::process::Command::new(run).output().unwrap();
+        assert_eq!(
+            code_of(&output),
+            "gate_failed_invocation",
+            "{run} with one inode under both names"
+        );
     }
     remove_gate_files();
 }
