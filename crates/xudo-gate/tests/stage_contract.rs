@@ -85,3 +85,19 @@ fn every_gate_stage_audit_code_is_pinned() {
     assert!(positions.into_iter().all(|present| present));
     insta::assert_snapshot!("gate_stage_audit_codes", snapshot);
 }
+
+#[test]
+fn the_rate_ceiling_refusal_is_pinned() {
+    let over = xudo_gate::Refusal::RateCeiling {
+        minute: 60,
+        hour: 61,
+        suppressed: Some(3),
+    };
+    let snapshot = format!(
+        "{} {:?} {:?}\n{over}\n",
+        over.code(),
+        over.severity(),
+        over.exit_code()
+    );
+    insta::assert_snapshot!("gate_rate_ceiling", snapshot);
+}

@@ -379,6 +379,11 @@ impl Refusal {
     /// the gate execs in place, so a child that exits 17, 18 or 19 cannot be
     /// told from a refusal by status alone. The refusal line on standard error
     /// is the distinguishing signal, and the front-end must use it.
+    ///
+    /// The rate ceiling is 19 and not 17 on purpose: 17 is "policy decided no
+    /// to this command", a final answer a script gives up on, while the
+    /// ceiling says nothing about the command and passes with the clock, which
+    /// is what 19 ("could not operate now") already means.
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Policy(_) => ExitCode::Denied,

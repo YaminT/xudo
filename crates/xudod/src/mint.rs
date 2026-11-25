@@ -136,7 +136,6 @@ const _: () = assert!(MAX_HARNESS_ENTRIES_PER_UID < MAX_HARNESS_ENTRIES);
 const _: () = assert!(
     MAX_SPOOL_NAMES_TO_WALK == MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + MAX_HARNESS_ENTRIES + 1
 );
-const _: () = assert!(MAX_HARNESS_ENTRIES * MAX_ENTRY_BYTES <= MAX_HARNESS_BYTES * 2);
 const _: () = assert!(MAX_WATCH_ENTRIES * MAX_ENTRY_BYTES <= MAX_SPOOL_BYTES);
 
 /// The largest entry the broker reads back, in bytes.
@@ -1869,6 +1868,136 @@ mod tests {
             }
         );
         assert!(!spool.files().contains_key(nonce('a').as_bytes()));
+    }
+
+    /// Adds `count` live entries to the spool, `per_uid` to each uid from
+    /// `first_uid`, nonces counting up from `first_nonce`.
+    fn add_live(
+        (mut spool, mut host): (FakeSpool, FakePeer),
+        harness: bool,
+        count: usize,
+        per_uid: usize,
+        first_uid: u32,
+        first_nonce: usize,
+    ) -> (FakeSpool, FakePeer) {
+        for index in 0..count {
+            let pid = 50_000 + u32::try_from(first_nonce + index).unwrap();
+            let mut live = if harness {
+                harness_entry('b', pid)
+            } else {
+                entry('c', pid, 7, NOW + 100)
+            };
+            live.nonce = format!("{:064x}", first_nonce + index);
+            let uid = first_uid + u32::try_from(index.div_euclid(per_uid)).unwrap();
+            host = running(host, &live, uid, uid);
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        (spool, host)
+    }
+
+    #[test]
+    fn four_harness_entries_of_one_uid_leave_its_eighth_password_entry_free() {
+        // Uid 1000 holds 4 harness entries and 7 password entries. Counted in
+        // one bucket that is 11 against a limit of 8 and the mint would fail;
+        // each in its own bucket, the eighth password entry is the uid's last
+        // one and goes through.
+        let both = add_live(
+            (FakeSpool::new(), FakePeer::new()),
+            true,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            1000,
+            1,
+        );
+        let (spool, host) = add_live(
+            both,
+            false,
+            MAX_ENTRIES_PER_UID - 1,
+            MAX_ENTRIES_PER_UID,
+            1000,
+            100,
+        );
+        let eighth = entry('a', 4242, 5_000, NOW + 900);
+        publish_as_1000(&spool, &host, &eighth).unwrap();
+        assert!(spool.files().contains_key(eighth.nonce.as_bytes()));
+        // And the ninth is refused: the password limit still bites.
+        let host = running(host, &eighth, 1000, 1000);
+        let ninth = entry('d', 4243, 5_001, NOW + 900);
+        let refused = publish_as_1000(&spool, &host, &ninth).unwrap_err();
+        assert_eq!(
+            refused,
+            MintError::UidFull {
+                uid: 1000,
+                entries: MAX_ENTRIES_PER_UID
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_harness_bucket_leaves_the_sixty_fourth_password_entry_free() {
+        // 63 password entries and 16 harness entries. In one bucket that is 79
+        // against a limit of 64.
+        let passwords = add_live(
+            (FakeSpool::new(), FakePeer::new()),
+            false,
+            MAX_SPOOL_ENTRIES - 1,
+            MAX_ENTRIES_PER_UID,
+            2_000,
+            1,
+        );
+        let (spool, host) = add_live(
+            passwords,
+            true,
+            MAX_HARNESS_ENTRIES,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            6_000,
+            100,
+        );
+        let last = entry('a', 4242, 5_000, NOW + 900);
+        publish_as_1000(&spool, &host, &last).unwrap();
+        assert!(spool.files().contains_key(last.nonce.as_bytes()));
+        // The sixty-fifth is refused.
+        let host = running(host, &last, 1000, 1000);
+        let over = entry('d', 4243, 5_001, NOW + 900);
+        assert!(matches!(
+            publish_as_1000(&spool, &host, &over),
+            Err(MintError::Full { entries, .. }) if entries == MAX_SPOOL_ENTRIES
+        ));
+    }
+
+    #[test]
+    fn the_harness_byte_limit_admits_exactly_the_limit_and_refuses_one_byte_over() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        let mut held = 0usize;
+        for index in 0..8u32 {
+            let mut live = harness_entry('b', 40_000 + index);
+            live.nonce = format!("{:064x}", index + 1);
+            live.argv = vec!["x".repeat(30_000)];
+            host = running(host, &live, 5_000 + index, 5_000 + index);
+            held += live.to_json().len();
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        let sized = |extra: usize| {
+            let mut agent = harness_entry('a', 4242);
+            agent.argv = vec![String::new()];
+            let base = agent.to_json().len();
+            agent.argv = vec!["x".repeat(MAX_HARNESS_BYTES - held - base + extra)];
+            agent
+        };
+        let exact = sized(0);
+        assert_eq!(held + exact.to_json().len(), MAX_HARNESS_BYTES);
+        let over = sized(1);
+        assert_eq!(held + over.to_json().len(), MAX_HARNESS_BYTES + 1);
+        let refused = publish_as_1000(&spool, &host, &over).unwrap_err();
+        assert_eq!(
+            refused,
+            MintError::HarnessFull {
+                entries: 8,
+                bytes: held
+            }
+        );
+        publish_as_1000(&spool, &host, &exact).unwrap();
     }
 
     #[test]

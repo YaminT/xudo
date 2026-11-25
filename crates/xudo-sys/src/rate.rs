@@ -15,10 +15,12 @@
 //! * **Coalescing.** A refusal over the ceiling counts as suppressed. At most
 //!   once per [`REPORT_INTERVAL_MS`] the answer carries the number to write
 //!   as one audit record; every other refusal writes nothing.
-//! * **Atomic.** Written as a temporary file and renamed, under the
-//!   directory's `flock`, so a gate killed at any instant leaves either the
+//! * **Atomic.** Written as a temporary file and renamed, under the key's
+//!   own `flock` (on `<key>.lock`, which no ledger name can equal), so a gate killed at any instant leaves either the
 //!   old ledger or the new one. A temporary file a killed gate left is
 //!   removed under the lock: no write can be in progress while it is held.
+//! * **Per key.** One lock per key: a gate stopped while it holds its lock
+//!   blocks that key's next calls and no other key's.
 //! * **Bounded wait.** The lock is taken without blocking and retried for at
 //!   most [`LOCK_ATTEMPTS`] times [`LOCK_STEP`]: `sudo` relays `SIGTSTP` and
 //!   `SIGTERM` to the gate, and a gate stopped inside a blocking `flock` while
@@ -102,6 +104,9 @@ pub enum Admission {
         minute: usize,
         /// Invocations in the last hour, this one included.
         hour: usize,
+        /// Refusals over the ceiling that no audit record has counted yet:
+        /// they ride on this invocation's record as evidence.
+        carried: u64,
     },
     /// Over the ceiling: nothing was appended.
     OverCeiling {
@@ -136,12 +141,18 @@ pub enum RateError {
 /// The ledger directory: a [`Spool`] that can also be locked without
 /// blocking.
 pub trait RateDir: Spool {
-    /// Tries the directory's exclusive lock once.
+    /// Tries the exclusive lock of the key named `name` once, creating its
+    /// lock file if need be. The lock is held until [`Self::release`].
     ///
     /// # Errors
     ///
-    /// [`SpoolError::Io`] when the lock fails for any reason but being held.
-    fn try_lock(&self) -> Result<bool, SpoolError>;
+    /// [`SpoolError::Io`] when the lock fails for any reason but being held,
+    /// and [`SpoolError::Unreadable`] when the lock file is not a private
+    /// regular file of root's.
+    fn try_lock(&self, name: &str) -> Result<bool, SpoolError>;
+
+    /// Gives up the lock [`Self::try_lock`] won.
+    fn release(&self);
 }
 
 /// The ledger of one account, taken from the host.
@@ -258,16 +269,20 @@ pub fn admit(
     sleep: &dyn Fn(Duration),
 ) -> Result<Admission, RateError> {
     let name = key.file_name()?;
-    lock_within_bound(dir, sleep)?;
+    lock_within_bound(dir, &name, sleep)?;
     let result = admit_locked(dir, &name, now_ms);
-    dir.unlock();
+    dir.release();
     result
 }
 
 /// Tries the lock up to [`LOCK_ATTEMPTS`] times, pausing between tries.
-fn lock_within_bound(dir: &dyn RateDir, sleep: &dyn Fn(Duration)) -> Result<(), RateError> {
+fn lock_within_bound(
+    dir: &dyn RateDir,
+    name: &str,
+    sleep: &dyn Fn(Duration),
+) -> Result<(), RateError> {
     for attempt in 0..LOCK_ATTEMPTS {
-        if dir.try_lock().map_err(RateError::Spool)? {
+        if dir.try_lock(name).map_err(RateError::Spool)? {
             return Ok(());
         }
         if attempt.saturating_add(1) < LOCK_ATTEMPTS {
@@ -336,9 +351,12 @@ fn admit_locked(dir: &dyn RateDir, name: &str, now_ms: u64) -> Result<Admission,
         }
     } else {
         state.stamps.push(now_ms);
+        // A flood that stopped before its next report is written here, once.
+        let carried = std::mem::take(&mut state.suppressed);
         Admission::Admitted {
             minute: minute.saturating_add(1),
             hour: state.stamps.len(),
+            carried,
         }
     };
     store(dir, name, bytes.as_deref(), &state)?;
@@ -430,11 +448,18 @@ mod tests {
     #[test]
     fn the_first_invocation_creates_the_ledger_and_is_counted() {
         let dir = FakeSpool::new();
-        assert_eq!(run(&dir, T0), Admission::Admitted { minute: 1, hour: 1 });
+        assert_eq!(
+            run(&dir, T0),
+            Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            }
+        );
         let files = dir.files();
         let text = String::from_utf8(files[b"1001-codex".as_slice()].clone()).unwrap();
         assert_eq!(text, format!("xudo-rate 1\n0 0\n{T0}\n"));
-        assert_eq!(dir.calls().last(), Some(&SpoolCall::Unlock));
+        assert_eq!(dir.calls().last(), Some(&SpoolCall::Release));
     }
 
     #[test]
@@ -509,7 +534,120 @@ mod tests {
         let dir = FakeSpool::new();
         run(&dir, T0);
         let later = run(&dir, T0 + HOUR_MS + 5);
-        assert_eq!(later, Admission::Admitted { minute: 1, hour: 1 });
+        assert_eq!(
+            later,
+            Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_held_lock_for_one_key_does_not_block_another_key() {
+        let dir = FakeSpool::new().busy_key("1001-codex");
+        assert_eq!(admit(&dir, &key(), T0, &no_sleep), Err(RateError::Busy));
+        let other = LedgerKey {
+            uid: 1002,
+            label: Some("codex".to_owned()),
+        };
+        assert_eq!(
+            admit(&dir, &other, T0, &no_sleep),
+            Ok(Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            })
+        );
+        assert!(dir.files().contains_key(b"1002-codex".as_slice()));
+        assert!(!dir.files().contains_key(b"1001-codex".as_slice()));
+    }
+
+    #[test]
+    fn a_stale_temporary_is_cleared_for_its_own_key_only() {
+        let dir = FakeSpool::new().with_file(".tmp.1002-codex", "another key's write");
+        run(&dir, T0);
+        assert!(dir.files().contains_key(b".tmp.1002-codex".as_slice()));
+    }
+
+    // Exactly on the edge of each window: 1 ms either side flips the answer.
+    #[test]
+    fn a_stamp_exactly_a_minute_old_is_out_of_the_minute_and_one_ms_younger_is_in() {
+        let sixty = |age: u64| State {
+            last_report_ms: 0,
+            suppressed: 0,
+            stamps: vec![T0 - age; 60],
+        };
+        let at_edge = FakeSpool::new().with_file("1001-codex", sixty(MINUTE_MS).render());
+        assert!(admitted(&run(&at_edge, T0)));
+        let inside = FakeSpool::new().with_file("1001-codex", sixty(MINUTE_MS - 1).render());
+        assert!(!admitted(&run(&inside, T0)));
+    }
+
+    #[test]
+    fn a_stamp_exactly_an_hour_old_is_dropped_and_one_ms_younger_is_kept() {
+        let full = |age: u64| State {
+            last_report_ms: 0,
+            suppressed: 0,
+            stamps: vec![T0 - age; MAX_STAMPS],
+        };
+        let at_edge = FakeSpool::new().with_file("1001-codex", full(HOUR_MS).render());
+        assert_eq!(
+            run(&at_edge, T0),
+            Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            }
+        );
+        let inside = FakeSpool::new().with_file("1001-codex", full(HOUR_MS - 1).render());
+        assert!(!admitted(&run(&inside, T0)));
+    }
+
+    #[test]
+    fn the_report_is_due_exactly_one_interval_after_the_last() {
+        let flooded = |last: u64| {
+            let state = State {
+                last_report_ms: last,
+                suppressed: 4,
+                stamps: vec![T0 - 1; 60],
+            };
+            FakeSpool::new().with_file("1001-codex", state.render())
+        };
+        let on_time = flooded(T0 - REPORT_INTERVAL_MS);
+        assert_eq!(report_of(&run(&on_time, T0)), Some(5));
+        let early = flooded(T0 - REPORT_INTERVAL_MS + 1);
+        assert_eq!(report_of(&run(&early, T0)), None);
+    }
+
+    #[test]
+    fn refusals_not_yet_reported_ride_on_the_next_admitted_record() {
+        // A flood that stopped before its minute was up: three refusals are
+        // owed to the trail, and the next run that is let through carries them.
+        let state = State {
+            last_report_ms: T0 - 1,
+            suppressed: 3,
+            stamps: vec![],
+        };
+        let dir = FakeSpool::new().with_file("1001-codex", state.render());
+        assert_eq!(
+            run(&dir, T0),
+            Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 3
+            }
+        );
+        // Said once: the next one carries nothing.
+        assert_eq!(
+            run(&dir, T0 + 1),
+            Admission::Admitted {
+                minute: 2,
+                hour: 2,
+                carried: 0
+            }
+        );
     }
 
     #[test]
@@ -524,7 +662,11 @@ mod tests {
         };
         assert_eq!(
             admit(&dir, &other, T0 + 61, &no_sleep).unwrap(),
-            Admission::Admitted { minute: 1, hour: 1 }
+            Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            }
         );
     }
 
@@ -549,7 +691,7 @@ mod tests {
             let dir = FakeSpool::new().with_file("1001-codex", garbage.clone());
             let refused = admit(&dir, &key(), T0, &no_sleep);
             assert!(refusal_text(refused).contains("not valid"), "{garbage:?}");
-            assert_eq!(dir.calls().last(), Some(&SpoolCall::Unlock));
+            assert_eq!(dir.calls().last(), Some(&SpoolCall::Release));
         }
         let dir = FakeSpool::new().with_file("1001-codex", vec![0xff, 0xfe]);
         assert_eq!(
@@ -626,7 +768,7 @@ mod tests {
         });
         let text = refusal_text(admit(&dir, &key(), T0, &no_sleep));
         assert!(text.contains("scripted"), "{text}");
-        assert_eq!(dir.calls().last(), Some(&SpoolCall::Unlock));
+        assert_eq!(dir.calls().last(), Some(&SpoolCall::Release));
     }
 
     #[test]
@@ -640,7 +782,11 @@ mod tests {
         assert!(!files.contains_key(b".tmp.replace-1001-codex".as_slice()));
         assert_eq!(
             run(&dir, T0 + 1),
-            Admission::Admitted { minute: 2, hour: 2 }
+            Admission::Admitted {
+                minute: 2,
+                hour: 2,
+                carried: 0
+            }
         );
     }
 
@@ -657,11 +803,11 @@ mod tests {
         let tries = dir
             .calls()
             .iter()
-            .filter(|call| **call == SpoolCall::TryLock)
+            .filter(|call| matches!(call, SpoolCall::TryLock(name) if name == "1001-codex"))
             .count();
         assert_eq!(tries, LOCK_ATTEMPTS as usize);
         // Never held, so never released, and nothing read or written.
-        assert!(!dir.calls().contains(&SpoolCall::Unlock));
+        assert!(!dir.calls().contains(&SpoolCall::Release));
         assert!(dir.files().is_empty());
     }
 
@@ -670,7 +816,14 @@ mod tests {
         let dir = FakeSpool::new().busy_locks(3);
         let pauses = Cell::new(0u32);
         let admitted = admit(&dir, &key(), T0, &|_| pauses.set(pauses.get() + 1));
-        assert_eq!(admitted, Ok(Admission::Admitted { minute: 1, hour: 1 }));
+        assert_eq!(
+            admitted,
+            Ok(Admission::Admitted {
+                minute: 1,
+                hour: 1,
+                carried: 0
+            })
+        );
         assert_eq!(pauses.get(), 3);
     }
 
@@ -684,7 +837,10 @@ mod tests {
         });
         let refused = admit(&dir, &key(), T0, &no_sleep);
         assert!(refusal_text(refused).contains("scripted"));
-        assert_eq!(dir.calls(), vec![SpoolCall::TryLock]);
+        assert_eq!(
+            dir.calls(),
+            vec![SpoolCall::TryLock("1001-codex".to_owned())]
+        );
     }
 
     #[test]
@@ -732,7 +888,11 @@ mod tests {
             let opened = SpoolDir::open_test_directory(&path);
             assert_eq!(
                 admit_opened(opened, &key(), T0),
-                Ok(Admission::Admitted { minute: 1, hour: 1 })
+                Ok(Admission::Admitted {
+                    minute: 1,
+                    hour: 1,
+                    carried: 0
+                })
             );
             let refused = admit_opened(
                 Err(SpoolError::Gone {
@@ -760,15 +920,27 @@ mod tests {
         }
 
         #[test]
-        fn a_second_open_of_the_directory_cannot_take_a_held_lock() {
+        fn a_stopped_gate_holding_one_key_blocks_that_key_and_no_other() {
             let path = private("lock");
-            let first = SpoolDir::open_test_directory(&path).unwrap();
-            let second = SpoolDir::open_test_directory(&path).unwrap();
-            assert_eq!(first.try_lock(), Ok(true));
-            assert_eq!(second.try_lock(), Ok(false));
-            first.unlock();
-            assert_eq!(second.try_lock(), Ok(true));
-            second.unlock();
+            let stopped = SpoolDir::open_test_directory(&path).unwrap();
+            let other = SpoolDir::open_test_directory(&path).unwrap();
+            // A gate stopped while it holds the lock of the key's ledger.
+            assert_eq!(stopped.try_lock("1001-codex"), Ok(true));
+            assert_eq!(admit(&other, &key(), T0, &no_sleep), Err(RateError::Busy));
+            let neighbour = LedgerKey {
+                uid: 1002,
+                label: Some("codex".to_owned()),
+            };
+            assert_eq!(
+                admit(&other, &neighbour, T0, &no_sleep),
+                Ok(Admission::Admitted {
+                    minute: 1,
+                    hour: 1,
+                    carried: 0
+                })
+            );
+            stopped.release();
+            assert!(admit(&other, &key(), T0 + 1, &no_sleep).is_ok());
             let _ = std::fs::remove_dir_all(path);
         }
 
@@ -793,7 +965,11 @@ mod tests {
             // And the next gate clears the debris and counts on from it.
             assert_eq!(
                 admit(&dir, &key(), T0 + 10, &no_sleep).unwrap(),
-                Admission::Admitted { minute: 6, hour: 6 }
+                Admission::Admitted {
+                    minute: 6,
+                    hour: 6,
+                    carried: 0
+                }
             );
             assert!(!path.join(".tmp.1001-codex").exists());
             assert!(!path.join(".tmp.replace-1001-codex").exists());

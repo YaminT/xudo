@@ -527,11 +527,21 @@ fn count_nopass(host: &dyn GateHost, progress: &mut Progress) -> Result<(), Refu
         label: None,
     });
     match host.rate().admit(&key, now) {
-        Ok(Admission::Admitted { minute, hour }) => {
+        Ok(Admission::Admitted {
+            minute,
+            hour,
+            carried,
+        }) => {
             progress.ledger = LedgerStep::Counted;
             progress
                 .evidence
                 .push(format!("ledger_minute={minute} ledger_hour={hour}"));
+            if carried > 0 {
+                // Refusals over the ceiling that no record has counted yet.
+                progress
+                    .evidence
+                    .push(format!("ledger_suppressed_before={carried}"));
+            }
             Ok(())
         }
         Ok(Admission::OverCeiling {
@@ -547,6 +557,16 @@ fn count_nopass(host: &dyn GateHost, progress: &mut Progress) -> Result<(), Refu
             stage: Stage::Ledger,
             reason: error.to_string(),
         }),
+    }
+}
+
+/// The key of an invocation no broker entry matches: the real uid read from
+/// `sudo`'s own `status`, and the shared unknown uid only when that cannot
+/// be read.
+fn unmatched_ledger_key(uid: Option<u32>) -> LedgerKey {
+    LedgerKey {
+        uid: uid.unwrap_or(crate::decide::UNKNOWN_UID),
+        label: None,
     }
 }
 
@@ -814,6 +834,7 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
+    let pending_entry_missing = matched.is_none();
     let passwd = loaded.passwd.as_str();
     let (caller, live_uid) = caller_for(
         host,
@@ -826,7 +847,12 @@ fn proceed(
         passwd,
     );
     progress.caller = Some(caller.clone());
-    progress.ledger_key = Some(ledger_key_of(&caller));
+    progress.ledger_key = Some(match (&pending_entry_missing, ancestors.chain.get(1)) {
+        // No entry: count by the real uid of `sudo`, the process that
+        // authenticates, so one flood cannot fill every stranger's bucket.
+        (true, Some(sudo)) => unmatched_ledger_key(crate::live::read(&*proc, sudo).uid),
+        _ => ledger_key_of(&caller),
+    });
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
@@ -4203,6 +4229,48 @@ max-entries = 10
                 uid: 1000,
                 label: None
             }]
+        );
+    }
+
+    #[test]
+    fn a_caller_with_no_entry_is_counted_under_the_real_uid_of_sudo_not_the_shared_one() {
+        let mut host = flooded_host();
+        let exit = nopass_run_at(&mut host, NOW);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let keys = host.rate.keys.borrow();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(keys[0].uid, crate::decide::UNKNOWN_UID);
+        assert_eq!(keys[0].label, None);
+        // When sudo's uid cannot be read, only then the shared bucket.
+        assert_eq!(
+            unmatched_ledger_key(None),
+            LedgerKey {
+                uid: crate::decide::UNKNOWN_UID,
+                label: None
+            }
+        );
+        assert_eq!(unmatched_ledger_key(Some(1234)).uid, 1234);
+    }
+
+    #[test]
+    fn refusals_a_flood_left_unreported_are_evidence_on_the_next_admitted_record() {
+        let mut host = flooded_host();
+        for step in 0..60u64 {
+            nopass_run_at(&mut host, NOW + step);
+        }
+        // Reported at once (the first), then three more that are not.
+        for step in 0..4u64 {
+            nopass_run_at(&mut host, NOW + 100 + step);
+        }
+        // The minute passes: the stamps age out and the door reopens. The
+        // run let through says how many refusals no record has counted.
+        let exit = nopass_run_at(&mut host, NOW + 70_000);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let last = host.audit.records().last().unwrap().clone();
+        assert!(
+            has_line(&last.evidence, "ledger_suppressed_before=3"),
+            "{:?}",
+            last.evidence
         );
     }
 

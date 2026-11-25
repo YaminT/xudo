@@ -567,6 +567,16 @@ fn an_agent_flood_leaves_the_human_path_running() {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
+    // One ledger and its own key lock, both root's and private.
+    assert_eq!(ledgers.len(), 2, "{ledgers:?}");
+    for path in &ledgers {
+        let meta = fs::metadata(path).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o777), (0, 0o600), "{path:?}");
+    }
+    let ledgers: Vec<_> = ledgers
+        .into_iter()
+        .filter(|path| path.extension().is_none_or(|ext| ext != "lock"))
+        .collect();
     assert_eq!(ledgers.len(), 1, "{ledgers:?}");
     let meta = fs::metadata(&ledgers[0]).unwrap();
     assert_eq!((meta.uid(), meta.mode() & 0o777), (0, 0o600));

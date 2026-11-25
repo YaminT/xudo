@@ -274,6 +274,9 @@ pub struct SpoolDir {
     path: PathBuf,
     owner: u32,
     resolve_beneath: bool,
+    /// The descriptor of the key lock [`crate::RateDir::try_lock`] won;
+    /// closing it releases the `flock`.
+    held: std::cell::RefCell<Option<OwnedFd>>,
 }
 
 impl SpoolDir {
@@ -369,6 +372,7 @@ impl SpoolDir {
             path: path.to_path_buf(),
             owner,
             resolve_beneath,
+            held: std::cell::RefCell::new(None),
         })
     }
 
@@ -659,8 +663,31 @@ impl Spool for SpoolDir {
 }
 
 impl crate::rate::RateDir for SpoolDir {
-    fn try_lock(&self) -> Result<bool, SpoolError> {
-        self.lock_outcome(flock(&self.dir, FlockOperation::NonBlockingLockExclusive))
+    fn try_lock(&self, name: &str) -> Result<bool, SpoolError> {
+        plain(name.as_bytes())?;
+        // `<name>.lock` cannot be a ledger name: those never hold a `.`.
+        let lock_name = format!("{name}.lock");
+        let opened = self
+            .open_entry(
+                OsStr::new(lock_name.as_str()),
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .and_then(|fd| fstat(&fd).map(|stat| (fd, stat)));
+        let (fd, stat) = match opened {
+            Ok(opened) => opened,
+            Err(errno) => return Err(self.failure("open the lock", &errno.into())),
+        };
+        self.check_entry(&lock_name, &stat)?;
+        let outcome = self.lock_outcome(flock(&fd, FlockOperation::NonBlockingLockExclusive));
+        if outcome == Ok(true) {
+            *self.held.borrow_mut() = Some(fd);
+        }
+        outcome
+    }
+
+    fn release(&self) {
+        *self.held.borrow_mut() = None;
     }
 }
 
@@ -771,8 +798,10 @@ impl SpoolDir {
 pub enum SpoolCall {
     /// [`Spool::lock`].
     Lock,
-    /// [`crate::RateDir::try_lock`].
-    TryLock,
+    /// [`crate::RateDir::try_lock`] of this key.
+    TryLock(String),
+    /// [`crate::RateDir::release`].
+    Release,
     /// [`Spool::unlock`].
     Unlock,
     /// [`Spool::names`].
@@ -806,6 +835,7 @@ pub struct FakeSpool {
     calls: RefCell<Vec<SpoolCall>>,
     lock_error: Option<SpoolError>,
     busy_locks: std::cell::Cell<usize>,
+    busy_keys: BTreeSet<String>,
     names_error: Option<SpoolError>,
     names_error_on_call: Option<(usize, SpoolError)>,
     names_calls: std::cell::Cell<usize>,
@@ -890,6 +920,14 @@ impl FakeSpool {
     #[must_use]
     pub fn busy_locks(self, tries: usize) -> Self {
         self.busy_locks.set(tries);
+        self
+    }
+
+    /// Makes the lock of this key always find someone else holding it, as a
+    /// stopped gate would; other keys lock as usual.
+    #[must_use]
+    pub fn busy_key(mut self, name: &str) -> Self {
+        self.busy_keys.insert(name.to_owned());
         self
     }
 
@@ -1006,15 +1044,22 @@ fn scripted(error: Option<&SpoolError>) -> Result<(), SpoolError> {
 
 #[cfg(any(test, feature = "fake"))]
 impl crate::rate::RateDir for FakeSpool {
-    fn try_lock(&self) -> Result<bool, SpoolError> {
-        self.record(SpoolCall::TryLock);
+    fn try_lock(&self, name: &str) -> Result<bool, SpoolError> {
+        self.record(SpoolCall::TryLock(name.to_owned()));
         scripted(self.lock_error.as_ref())?;
+        if self.busy_keys.contains(name) {
+            return Ok(false);
+        }
         let busy = self.busy_locks.get();
         if busy == 0 {
             return Ok(true);
         }
         self.busy_locks.set(busy.saturating_sub(1));
         Ok(false)
+    }
+
+    fn release(&self) {
+        self.record(SpoolCall::Release);
     }
 }
 
@@ -1735,6 +1780,73 @@ mod tests {
     }
 
     #[test]
+    fn a_key_lock_blocks_its_own_key_and_no_other() {
+        use crate::RateDir;
+        let (dir, owner) = scratch("key-lock");
+        let first = SpoolDir::from_dir(open_dir(&dir), &dir, owner).unwrap();
+        let second = SpoolDir::from_dir(open_dir(&dir), &dir, owner).unwrap();
+        assert_eq!(first.try_lock("1-a"), Ok(true));
+        // The same key is held; another key is free while it is.
+        assert_eq!(second.try_lock("1-a"), Ok(false));
+        assert_eq!(second.try_lock("1-b"), Ok(true));
+        second.release();
+        first.release();
+        assert_eq!(second.try_lock("1-a"), Ok(true));
+        second.release();
+        let mode = std::fs::metadata(dir.join("1-a.lock")).unwrap().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[test]
+    fn a_key_lock_file_that_is_a_link_loose_or_foreign_is_refused() {
+        use crate::RateDir;
+        let (spool, dir) = spool("key-lock-hostile");
+        std::fs::write(dir.join("target"), "").unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("1-a.lock")).unwrap();
+        let linked = spool.try_lock("1-a").unwrap_err();
+        assert!(linked.to_string().contains("open the lock"), "{linked}");
+        std::fs::write(dir.join("1-b.lock"), "").unwrap();
+        std::fs::set_permissions(dir.join("1-b.lock"), std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        let loose = spool.try_lock("1-b").unwrap_err();
+        assert!(loose.to_string().contains("mode 0666"), "{loose}");
+        assert_eq!(
+            spool.try_lock("a/b"),
+            Err(SpoolError::InvalidName {
+                name: "a/b".to_owned()
+            })
+        );
+        let (dir, owner) = scratch("key-lock-foreign");
+        let foreign = SpoolDir::from_dir(open_dir(&dir), &dir, owner).unwrap();
+        std::fs::write(dir.join("1-c.lock"), "").unwrap();
+        std::fs::set_permissions(dir.join("1-c.lock"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let other = SpoolDir {
+            owner: owner.wrapping_add(1),
+            ..foreign
+        };
+        let refused = other.try_lock("1-c").unwrap_err();
+        assert!(refused.to_string().contains("owned by uid"), "{refused}");
+    }
+
+    #[test]
+    fn the_fake_locks_per_key_and_records_the_release() {
+        use crate::RateDir;
+        let fake = FakeSpool::new().busy_key("1-a");
+        assert_eq!(fake.try_lock("1-a"), Ok(false));
+        assert_eq!(fake.try_lock("1-b"), Ok(true));
+        fake.release();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                SpoolCall::TryLock("1-a".to_owned()),
+                SpoolCall::TryLock("1-b".to_owned()),
+                SpoolCall::Release,
+            ]
+        );
+    }
+
+    #[test]
     fn an_entry_owned_by_someone_else_is_unreadable() {
         let (dir, owner) = scratch("entry-owner");
         std::fs::write(dir.join("e"), "x").unwrap();
@@ -1746,6 +1858,7 @@ mod tests {
             path: dir.clone(),
             owner: owner.wrapping_add(1),
             resolve_beneath: false,
+            held: std::cell::RefCell::new(None),
         };
         let err = foreign.read(b"e", 64).unwrap_err();
         assert!(
