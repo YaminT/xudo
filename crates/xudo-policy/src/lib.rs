@@ -87,7 +87,7 @@ pub use operation::{
 };
 pub use overlap::Overlap;
 pub use rule::{
-    Action, ActionId, GtfobinSets, HarnessLint, OpenUnitLint, Outcome, RuleSet, RuleSetError,
-    Source, Tier, gtfobin_sets, harness_near_miss,
+    Action, ActionId, HarnessLint, OpenUnitLint, Outcome, RuleSet, RuleSetError, Source, Tier,
+    harness_near_miss,
 };
 pub use rule_test::{Expectation, RuleTest, TestError, TestOutcome, TestResult, run_tests};

@@ -425,6 +425,7 @@ tier = "svc-control"
 exe = "/usr/bin/systemctl"
 harness = ["claude-code"]
 outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the verb is the literal restart and the unit a name, so no option can reach the pager"
 args = [
   { name = "verb", matcher = { literal = "restart" } },
   { name = "unit", matcher = { name = "unit-name" } },

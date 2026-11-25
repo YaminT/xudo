@@ -238,6 +238,32 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
     ]
 }
 
+/// A reviewed waiver. Every generated exe is a `GTFOBins` program, and a
+/// harness rule on one loads only with this.
+const WAIVER: &str = "a generated technique for the property tests: the matchers pin every operand to a literal or a name, so the program cannot be steered at all";
+
+/// Lists `labels` on `action` the way a loadable harness rule is written: no
+/// `path-under` or `pattern` matcher, not human-only, and a waiver where the
+/// program needs one. An empty list takes all of that back off.
+fn set_harness(action: &mut Action, labels: Vec<String>) {
+    action.gtfobins_waiver = (!labels.is_empty()).then(|| WAIVER.to_owned());
+    if !labels.is_empty() {
+        action.agent_allowed = true;
+        drop_human_only_matchers(action);
+    }
+    action.harness = labels;
+}
+
+/// Takes the matchers a harness rule may not use off `action`.
+fn drop_human_only_matchers(action: &mut Action) {
+    action.args.retain(|spec| {
+        !matches!(
+            spec.matcher,
+            Matcher::PathUnder { .. } | Matcher::Pattern(_)
+        )
+    });
+}
+
 /// Builds an action `RuleSet::load` accepts.
 ///
 /// A critical tier may not opt out of confirmation. `ask-human` with an empty
@@ -270,7 +296,7 @@ fn finish_generated(
     } else {
         Vec::new()
     };
-    Action {
+    let mut action = Action {
         id: ActionId::new(id),
         tier,
         exe,
@@ -278,10 +304,13 @@ fn finish_generated(
         confirm,
         agent_allowed,
         env_allow: Vec::new(),
-        harness,
+        harness: Vec::new(),
         outcome,
+        gtfobins_waiver: None,
         source: Source::new("generated.toml", 1),
-    }
+    };
+    set_harness(&mut action, harness);
+    action
 }
 
 prop_compose! {
@@ -616,15 +645,17 @@ proptest! {
 
     #[test]
     fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
         ask_human in any::<bool>(),
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // A harness rule cannot carry these, so both sides drop them.
+        drop_human_only_matchers(&mut action);
         let before = decide(&action, &argv, false, Vec::new());
         let mut with_harness = action;
-        with_harness.harness = vec![label];
+        set_harness(&mut with_harness, vec![label]);
         with_harness.outcome = if ask_human { Outcome::AskHuman } else { Outcome::Allow };
         let after = decide(&with_harness, &argv, false, Vec::new());
         prop_assert_eq!(after.verdict, before.verdict);
@@ -639,7 +670,7 @@ proptest! {
         argv in arb_argv(),
         written_allow in any::<bool>(),
     ) {
-        action.harness.clear();
+        set_harness(&mut action, Vec::new());
         action.outcome = if written_allow { Outcome::Allow } else { Outcome::Unset };
         let d = decide(&action, &argv, true, Vec::new());
         prop_assert!(d.harness_grant.is_none());
@@ -655,7 +686,7 @@ proptest! {
         argv in arb_argv(),
         same_exe in any::<bool>(),
     ) {
-        granted.harness = vec!["codex".to_owned()];
+        set_harness(&mut granted, vec!["codex".to_owned()]);
         granted.outcome = Outcome::Allow;
         if granted.confirm == ConfirmPolicy::Always {
             granted.confirm = ConfirmPolicy::Default;
@@ -665,7 +696,7 @@ proptest! {
             extra.args = granted.args.clone();
         }
         if extra.harness.iter().any(|label| label == "claude-code") {
-            extra.harness.clear();
+            set_harness(&mut extra, Vec::new());
             extra.outcome = Outcome::Unset;
         }
         let rules = RuleSet::load(vec![granted.clone(), extra]).unwrap();
@@ -686,7 +717,7 @@ proptest! {
         mut action in arb_action("g.od15"),
         argv in arb_argv(),
     ) {
-        action.harness = vec!["claude-code".to_owned()];
+        set_harness(&mut action, vec!["claude-code".to_owned()]);
         action.outcome = Outcome::Allow;
         if action.confirm == ConfirmPolicy::Always {
             action.confirm = ConfirmPolicy::Default;
@@ -703,18 +734,21 @@ proptest! {
 
     #[test]
     fn every_harness_action_auth_can_run_too(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
     ) {
+        // A human-only rule cannot list a harness: that is a load error now.
+        prop_assume!(action.agent_allowed);
         prop_assume!(action.confirm != ConfirmPolicy::Always);
         // Ask-human changes the agent's verdict on purpose. This property is
         // about a passwordless-shaped allow rule, which must not.
         prop_assume!(action.outcome == Outcome::Allow);
+        drop_human_only_matchers(&mut action);
         let human_before = decide(&action, &argv, false, Vec::new());
         let agent_before = decide(&action, &argv, true, Vec::new());
         let mut with_harness = action;
-        with_harness.harness = vec![label];
+        set_harness(&mut with_harness, vec![label]);
         with_harness.outcome = Outcome::Allow;
         let human_after = decide(&with_harness, &argv, false, Vec::new());
         let agent_after = decide(&with_harness, &argv, true, Vec::new());
@@ -730,7 +764,7 @@ proptest! {
     ) {
         action.agent_allowed = true;
         action.confirm = ConfirmPolicy::Default;
-        action.harness = vec!["claude-code".into()];
+        set_harness(&mut action, vec!["claude-code".into()]);
         action.outcome = Outcome::Allow;
         let before = decide(&action, &argv, true, Vec::new());
         action.outcome = Outcome::AskHuman;
@@ -753,16 +787,20 @@ proptest! {
         argv in arb_argv(),
         listed in any::<bool>(),
     ) {
+        // A human-only rule cannot list a harness: that is a load error now.
+        prop_assume!(action.agent_allowed);
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // Both sides carry the same matchers, so only the outcome differs.
+        drop_human_only_matchers(&mut action);
         action.outcome = Outcome::Allow;
-        action.harness.clear();
+        set_harness(&mut action, Vec::new());
         let before = decide(&action, &argv, true, Vec::new());
         action.outcome = Outcome::AskHuman;
-        action.harness = vec![if listed {
+        set_harness(&mut action, vec![if listed {
             "claude-code".to_owned()
         } else {
             "other-harness".to_owned()
-        }];
+        }]);
         let after = decide(&action, &argv, true, Vec::new());
         prop_assert_ne!(after.verdict, Verdict::Allow);
         prop_assert_ne!(after.verdict, Verdict::AllowWithConfirmation);

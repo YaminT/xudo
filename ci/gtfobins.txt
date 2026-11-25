@@ -308,3 +308,7 @@ zip
 zsh
 zsoelim
 zypper
+sh
+nvim
+coreutils
+toybox

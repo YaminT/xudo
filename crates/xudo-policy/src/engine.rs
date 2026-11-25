@@ -565,6 +565,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("20-services.toml", 3),
         }
     }
@@ -588,6 +589,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("30-packages.toml", 4),
         }
     }
@@ -670,10 +672,16 @@ mod tests {
         assert_eq!(d.verdict, Verdict::AllowWithConfirmation);
     }
 
+    /// `systemctl` is a `GTFOBins` program, so a harness rule on it is a load
+    /// error without a reviewed waiver. The deny-list is what these tests
+    /// exercise, so they keep the real program name and carry the waiver.
+    const WAIVER: &str = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs";
+
     fn granted(labels: &[&str], outcome: crate::rule::Outcome) -> Action {
         let mut action = svc_restart();
         action.harness = labels.iter().map(|label| (*label).to_owned()).collect();
         action.outcome = outcome;
+        action.gtfobins_waiver = Some(WAIVER.into());
         action
     }
 
@@ -766,6 +774,7 @@ mod tests {
         critical.tier = Tier::Critical;
         let mut unlisted = stricter.clone();
         unlisted.harness = vec!["codex".into()];
+        unlisted.gtfobins_waiver = Some(WAIVER.into());
         unlisted.outcome = crate::rule::Outcome::Allow;
         for other in [stricter, always, critical, unlisted] {
             for order in [
@@ -868,6 +877,7 @@ mod tests {
     fn an_ask_human_rule_queues_only_for_an_enrolled_harness() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["claude-code".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
 
@@ -892,6 +902,7 @@ mod tests {
     fn an_unattested_caller_hitting_an_ask_human_rule_keeps_the_password_path() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["claude-code".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
         let unattested = CallerFacts::new(
@@ -914,6 +925,7 @@ mod tests {
     fn an_ask_human_rule_only_applies_to_the_harness_labels_it_names() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["other-harness".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
         let decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
@@ -950,6 +962,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("20-services.toml", 1),
         }
     }
@@ -1071,6 +1084,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell]).unwrap();
@@ -1145,8 +1159,6 @@ all = []
                 Matcher::Pattern(crate::matcher::AnchoredPattern::new(".+").unwrap()),
             ),
         ];
-        loose.harness = vec!["claude-code".into()];
-        loose.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![loose]).unwrap();
         let d = evaluate(
             &set,
@@ -1265,6 +1277,7 @@ all = []
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("30-packages.toml", line),
         }
     }
@@ -1517,6 +1530,7 @@ all = []
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell("xudo.oops.one"), shell("xudo.oops.two")]).unwrap();
