@@ -66,7 +66,7 @@ pub fn parse_session_record(
     {
         return None;
     }
-    if !deadline_is_allowed(&record) {
+    if !deadline_is_allowed(&record, &form) {
         return None;
     }
     if record.uid != uid
@@ -85,12 +85,14 @@ pub fn parse_session_record(
     Some(record)
 }
 
-/// A `session` record expires within twelve hours of its creation; the
-/// absent deadline belongs to a `service` record alone.
-fn deadline_is_allowed(record: &SessionRecord) -> bool {
-    match record.way {
-        HarnessWay::Service => true,
-        HarnessWay::Session => {
+/// A scope's record expires within twelve hours of its creation, whatever
+/// its `way` says: a scope has no stop hook to remove its record. The absent
+/// deadline, or a longer one, belongs to a service unit's record alone, whose
+/// `ExecStopPost` voids it. The name decides, never a field inside the record.
+fn deadline_is_allowed(record: &SessionRecord, form: &NameForm<'_>) -> bool {
+    match form {
+        NameForm::Service(_) => true,
+        NameForm::Scope => {
             record.deadline != NO_DEADLINE
                 && record
                     .deadline
@@ -433,6 +435,21 @@ mod tests {
         // Not even by its other way of spelling "very far away".
         let far = with_way_and_deadline("session", NO_DEADLINE - 1);
         assert!(parse_session_record(far.as_bytes(), NAME, 1000, "boot-a", 199).is_none());
+    }
+
+    #[test]
+    fn a_scope_name_with_the_service_way_and_no_deadline_is_refused() {
+        // The name decides, not the record's own `way`: a scope has no stop
+        // hook to remove a record that never expires.
+        for deadline in [NO_DEADLINE, 20 + SESSION_MAX_LIFETIME_MS + 1] {
+            let record = with_way_and_deadline("service", deadline);
+            assert!(
+                parse_session_record(record.as_bytes(), NAME, 1000, "boot-a", 199).is_none(),
+                "{deadline}"
+            );
+        }
+        let capped = with_way_and_deadline("service", 20 + SESSION_MAX_LIFETIME_MS);
+        assert!(parse_session_record(capped.as_bytes(), NAME, 1000, "boot-a", 199).is_some());
     }
 
     #[test]

@@ -15,6 +15,8 @@ fn main() -> std::process::ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let exit = xudod::unit_record::run(&args);
     // Ignored on purpose: the refusal stands whether or not anyone can read it.
-    let _ = writeln!(std::io::stderr(), "{}", exit.message);
+    if !exit.message.is_empty() {
+        let _ = writeln!(std::io::stderr(), "{}", exit.message);
+    }
     std::process::ExitCode::from(exit.status)
 }

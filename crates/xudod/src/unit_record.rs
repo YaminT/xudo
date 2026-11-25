@@ -13,10 +13,17 @@
 //! and nothing else: it grants no run, and no caller skips a password because
 //! of it (that gate is a later step).
 //!
+//! `record` replaces an old record by removing it and then publishing the new
+//! one; between the two there is no record, so the unit is unattested, which
+//! fails closed. `void` requires parent pid 1, so a caller that is not the
+//! service manager cannot void: H2c's `agent remove` must stop the unit and
+//! let its `ExecStopPost` void the record.
+//!
 //! | Refused unless | Because |
 //! |---|---|
 //! | uid 0 | only root may write authority |
 //! | parent pid 1 | only the service manager starts a unit's pre-start |
+//! | user, pid, cgroup and mount namespaces are pid 1's | a root in a namespace of its own is not the host's root |
 //! | own cgroup is exactly `/xudo.slice/xudo-agent@<label>.service` | a record for another unit is a record for the wrong harness |
 //! | that directory is root-owned, not group/other writable, populated | a directory an administrator did not make is no unit of ours |
 //! | the registry has `<label>` with `way = service` | no registry entry, no harness |
@@ -28,8 +35,9 @@ use std::path::Path;
 use thiserror::Error;
 use xudo_policy::{HarnessWay, passwd_uid};
 use xudo_sys::{
-    CgroupCalls, Clock, HostCgroup, HostClock, HostOwn, HostSyscalls, OwnFacts, Spool, SpoolDir,
-    SpoolError, SysError, Syscalls, process_cgroup, service_record_name,
+    CgroupCalls, Clock, HostCgroup, HostClock, HostOwn, HostSyscalls, OwnFacts, ProcRef,
+    ProcSource, Spool, SpoolDir, SpoolError, SysError, Syscalls, VerifiedProc, process_cgroup,
+    service_record_name,
 };
 
 use crate::policy::{HostPolicy, PolicySource};
@@ -52,6 +60,10 @@ pub enum UnitRecordError {
     /// Not started by the service manager.
     #[error("refused: not started by pid 1")]
     NotFromInit,
+    /// The helper is in a namespace that is not pid 1's, or `/proc` is not
+    /// the host's.
+    #[error("refused: not in the host's namespaces")]
+    ForeignNamespace,
     /// The helper is not inside the unit it was asked to describe.
     #[error("refused: the process is in {found}, not in {expected}")]
     NotInUnit {
@@ -106,6 +118,8 @@ pub struct Env<'a> {
     pub cgroups: Result<&'a dyn CgroupCalls, &'a SysError>,
     /// The session-record directory, or why it did not open.
     pub sessions: Result<&'a dyn Spool, &'a SpoolError>,
+    /// The pinned `/proc`, or why there is none.
+    pub proc: Result<&'a dyn ProcSource, &'a SysError>,
     /// The boot id.
     pub syscalls: &'a dyn Syscalls,
     /// `CLOCK_BOOTTIME`.
@@ -129,17 +143,27 @@ pub fn run(argv: &[OsString]) -> Exit {
     let cgroups = HostCgroup::open();
     let sessions = SpoolDir::open(Path::new(SESSIONS_DIR));
     let policy = HostPolicy::system();
+    let proc = VerifiedProc::open();
     execute(
         argv,
         &Env {
             own: &HostOwn,
             cgroups: cgroups_seam(&cgroups),
             sessions: xudo_sys::as_seam(&sessions),
+            proc: proc_seam(&proc),
             syscalls: &HostSyscalls,
             clock: &HostClock,
             policy: &policy,
         },
     )
+}
+
+/// The opened `/proc` as the trait object [`Env`] takes.
+fn proc_seam<T: ProcSource>(opened: &Result<T, SysError>) -> Result<&dyn ProcSource, &SysError> {
+    match opened {
+        Ok(proc) => Ok(proc),
+        Err(error) => Err(error),
+    }
 }
 
 /// The opened cgroup tree as the trait object [`Env`] takes. Generic so a test
@@ -191,10 +215,22 @@ fn started_by_the_service_manager(env: &Env<'_>) -> Result<(u32, u64), UnitRecor
     if stat.ppid != SERVICE_MANAGER {
         return Err(UnitRecordError::NotFromInit);
     }
+    // The same check the gate makes of a caller: a root in a user, pid,
+    // cgroup or mount namespace of its own is not the host's root.
+    let proc = env.proc.map_err(|e| unavailable("/proc", &e))?;
+    let process = ProcRef {
+        pid: stat.pid,
+        starttime: stat.starttime,
+        comm: Vec::new(),
+    };
+    if !xudo_gate::live::read(proc, &process).namespaces_match_init {
+        return Err(UnitRecordError::ForeignNamespace);
+    }
     Ok((stat.pid, stat.starttime))
 }
 
-/// Writes `svc-<label>` for the unit the caller is in, replacing any old one.
+/// Writes `svc-<label>` for the unit the caller is in, replacing any old one
+/// (remove, then publish; see the module note).
 ///
 /// # Errors
 ///
@@ -286,9 +322,13 @@ pub fn record(env: &Env<'_>, label: &str) -> Result<(), UnitRecordError> {
     let sessions = env
         .sessions
         .map_err(|e| unavailable("session records", &e))?;
-    sessions
-        .remove(name.as_bytes())
-        .map_err(|e| unavailable("replace the old record", &e))?;
+    // A crash between creating the temporary file and renaming it leaves it
+    // behind, and `publish` creates it exclusively: clear it first.
+    for stale in [format!("{}{name}", xudo_sys::TEMP_PREFIX), name.clone()] {
+        sessions
+            .remove(stale.as_bytes())
+            .map_err(|e| unavailable("replace the old record", &e))?;
+    }
     sessions
         .publish(&name, &bytes)
         .map_err(|e| unavailable("write the record", &e))
@@ -321,7 +361,8 @@ mod tests {
     use xudo_gate::policy::{LoadedPolicy, PolicyError};
     use xudo_policy::{HarnessRegistry, RuleFile, load_rule_files};
     use xudo_sys::{
-        FakeOwn, FakeSpool, FakeSyscalls, FixedClock, ScopeFacts, SpoolCall, unit_dir_name,
+        FakeOwn, FakeSpool, FakeSyscalls, FixedClock, MapSource, ScopeFacts, SpoolCall,
+        unit_dir_name,
     };
 
     use super::*;
@@ -457,9 +498,37 @@ args = [
         own: FakeOwn,
         cgroups: Cgroups,
         spool: FakeSpool,
+        proc: MapSource,
         syscalls: FakeSyscalls,
         clock: FixedClock,
         policy: Policy,
+    }
+
+    /// The helper's own process, in every namespace pid 1 is in.
+    fn host_proc() -> MapSource {
+        host_proc_started(71)
+    }
+
+    fn host_proc_started(starttime: u64) -> MapSource {
+        let mut fields = vec!["S".to_owned(), "1".to_owned()];
+        fields.extend((0..17).map(|_| "0".to_owned()));
+        fields.push(starttime.to_string());
+        let mut proc = MapSource::new()
+            .with(
+                "500/stat",
+                format!("500 (xudo-session) {}", fields.join(" ")),
+            )
+            .with(
+                "500/status",
+                "Name:\txudo-session\nUid:\t0\t0\t0\t0\nNSpid:\t500\n",
+            )
+            .with("500/uid_map", "         0          0 4294967295\n");
+        for kind in ["user", "pid", "cgroup", "mnt"] {
+            proc = proc
+                .with_inode(format!("500/ns/{kind}"), 4_026_531_800)
+                .with_inode(format!("1/ns/{kind}"), 4_026_531_800);
+        }
+        proc
     }
 
     impl World {
@@ -468,6 +537,7 @@ args = [
                 own: FakeOwn::new(0, 500, 1, 71),
                 cgroups: Cgroups::in_unit(UNIT_PATH),
                 spool: FakeSpool::new(),
+                proc: host_proc(),
                 syscalls: FakeSyscalls::new().with_boot_id(Ok(BOOT.to_owned())),
                 clock: FixedClock(1_000),
                 policy: Policy {
@@ -489,6 +559,7 @@ args = [
                 own: &self.own,
                 cgroups: Ok(&self.cgroups),
                 sessions: Ok(&self.spool),
+                proc: Ok(&self.proc),
                 syscalls: &self.syscalls,
                 clock: &self.clock,
                 policy: &self.policy,
@@ -551,6 +622,60 @@ args = [
         assert_eq!(
             unit_dir_name(&service_record_name("codex").unwrap()).as_deref(),
             Some("xudo-agent@codex.service")
+        );
+    }
+
+    #[test]
+    fn a_root_in_a_user_namespace_of_its_own_is_refused_by_both_verbs() {
+        // `unshare -Ur -pf --mount-proc`: uid 0 and parent 1 inside, but not
+        // the host's namespaces.
+        for kind in ["user", "pid", "cgroup", "mnt"] {
+            let world = World {
+                proc: host_proc().with_inode(format!("500/ns/{kind}"), 4_026_539_999),
+                ..World::new()
+            };
+            assert_eq!(
+                refused(world.record()),
+                UnitRecordError::ForeignNamespace,
+                "{kind}"
+            );
+            assert_eq!(
+                refused(void(&world.env(), "codex")),
+                UnitRecordError::ForeignNamespace,
+                "{kind}"
+            );
+            assert_eq!(world.written(), None);
+            assert!(world.spool.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_host_with_no_proc_refuses_and_a_stale_temporary_record_is_cleared() {
+        let world = World::new();
+        let no_proc = SysError::unsupported("procfs");
+        let env = Env {
+            proc: Err(&no_proc),
+            ..world.env()
+        };
+        assert!(refused(record(&env, "codex")).to_string().contains("/proc"));
+        assert!(proc_seam(&Err::<MapSource, _>(no_proc)).is_err());
+        assert!(proc_seam(&Ok::<_, SysError>(MapSource::new())).is_ok());
+
+        let stale = World {
+            spool: FakeSpool::new().with_file(".tmp.svc-codex", b"half".to_vec()),
+            ..World::new()
+        };
+        stale.record().unwrap();
+        assert!(stale.written().is_some());
+        assert!(!stale.spool.files().contains_key(&b".tmp.svc-codex"[..]));
+        let failing = World {
+            spool: FakeSpool::new().failing_remove(broken_spool()),
+            ..World::new()
+        };
+        assert!(
+            refused(failing.record())
+                .to_string()
+                .contains("replace the old record")
         );
     }
 
@@ -741,6 +866,7 @@ args = [
         // A process start time of 0 is no pin, so the gate would refuse it.
         let world = World {
             own: FakeOwn::new(0, 500, 1, 0),
+            proc: host_proc_started(0),
             ..World::new()
         };
         assert_eq!(refused(world.record()), UnitRecordError::Invalid);
