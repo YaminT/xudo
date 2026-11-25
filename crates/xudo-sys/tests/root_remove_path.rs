@@ -27,6 +27,11 @@ const TREE: &str = "/var/lib/xudo-t1-remove-path";
 const SECRET: &str = "/var/lib/xudo-t1-remove-secret";
 const MOVED: &str = "/var/lib/xudo-t1-moved-out";
 const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
+// Docker mounts a tmpfs at `XDEV_TREE/box/mnt`: a mount inside a walked tree.
+// Docker bind-mounts one host directory twice: `BIND_TREE`, and `BIND_TREE/child`
+// from a subdirectory of it. Same filesystem, same `st_dev`, still a mount.
+const BIND_TREE: &str = "/var/lib/xudo-t1-remove-bind";
+const XDEV_TREE: &str = "/var/lib/xudo-t1-remove-xdev";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -192,4 +197,88 @@ fn a_directory_renamed_out_of_the_tree_mid_walk_stops_the_walk() {
     );
     assert!(!Path::new(&format!("{TREE}/box")).exists());
     let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn a_mount_inside_the_walked_tree_is_not_crossed() {
+    if !begin_root_test("a_mount_inside_the_walked_tree_is_not_crossed") {
+        return;
+    }
+    let box_dir = format!("{XDEV_TREE}/box");
+    let mount = format!("{box_dir}/mnt");
+    let inside = format!("{mount}/inside");
+    let sibling = format!("{box_dir}/a");
+    // The lane's tmpfs must be there; a lane without it proves nothing.
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    assert_ne!(
+        fs::metadata(&mount).unwrap().dev(),
+        fs::metadata(&box_dir).unwrap().dev()
+    );
+    fs::write(&inside, b"behind the mount").unwrap();
+    fs::write(&sibling, b"outside the mount").unwrap();
+    for path in [&inside, &sibling, &mount, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    let mut request = request(b"box", true);
+    request.under = XDEV_TREE.as_bytes().to_vec();
+    let outcome = remove_path_on_host(&request);
+    // Whatever the walk reports, nothing behind the mount may be deleted.
+    assert!(
+        outcome.as_ref().map_or(true, |report| report.partial),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    assert!(Path::new(&mount).is_dir());
+    assert!(Path::new(&box_dir).is_dir());
+    let _ = fs::remove_file(&sibling);
+}
+
+#[test]
+fn the_kernel_reports_mount_root_for_a_real_mount() {
+    if !begin_root_test("the_kernel_reports_mount_root_for_a_real_mount") {
+        return;
+    }
+    let dir = fs::File::open(MOUNT_TREE).unwrap();
+    let x = rustix::fs::statx(
+        &dir,
+        c"",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::empty(),
+    )
+    .unwrap();
+    // 0x2000 is STATX_ATTR_MOUNT_ROOT: supported here, and set on the tmpfs.
+    assert_ne!(x.stx_attributes_mask.bits() & 0x2000, 0);
+    assert_ne!(x.stx_attributes.bits() & 0x2000, 0);
+}
+
+#[test]
+fn a_same_device_bind_mount_as_the_tree_is_refused() {
+    if !begin_root_test("a_same_device_bind_mount_as_the_tree_is_refused") {
+        return;
+    }
+    let child = format!("{BIND_TREE}/child");
+    assert_eq!(
+        fs::metadata(BIND_TREE).unwrap().dev(),
+        fs::metadata(&child).unwrap().dev(),
+        "the lane's bind mounts are not on one device"
+    );
+    // The host's temporary directory belongs to whoever ran the lane; the walk
+    // wants root-owned ancestors. Make them root's, and give them back after.
+    let owner = fs::metadata(BIND_TREE).unwrap();
+    for dir in [BIND_TREE, child.as_str()] {
+        std::os::unix::fs::chown(dir, Some(0), Some(0)).unwrap();
+        fs::set_permissions(dir, Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(format!("{child}/stay"), b"secret").unwrap();
+    let mut bound = request(b"stay", false);
+    bound.under = child.as_bytes().to_vec();
+    assert_eq!(
+        remove_path_on_host(&bound).unwrap_err(),
+        RemoveError::MountPoint
+    );
+    assert_eq!(fs::read(format!("{child}/stay")).unwrap(), b"secret");
+    fs::remove_file(format!("{child}/stay")).unwrap();
+    for dir in [child.as_str(), BIND_TREE] {
+        std::os::unix::fs::chown(dir, Some(owner.uid()), Some(owner.gid())).unwrap();
+    }
 }

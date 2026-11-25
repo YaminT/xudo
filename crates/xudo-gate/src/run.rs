@@ -3556,6 +3556,17 @@ max-entries = 10
         assert_eq!(records.len(), 2);
         assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
         assert!(has_line(&records[0].evidence, "planned_count=1"));
+        // The plan and the walk saw the same names: the two digests agree.
+        let planned_digest = records[0]
+            .evidence
+            .iter()
+            .find_map(|line| line.strip_prefix("planned_sha256="))
+            .unwrap();
+        assert_eq!(planned_digest.len(), 64);
+        assert!(has_line(
+            &records[1].evidence,
+            &format!("paths_sha256={planned_digest}")
+        ));
         assert_eq!(records[1].decision, AuditDecision::Allowed);
         assert!(has_line(&records[1].evidence, "op=remove-path"));
         assert!(has_line(&records[1].evidence, "intent_seq=1"));

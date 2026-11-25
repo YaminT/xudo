@@ -160,12 +160,16 @@ pub(crate) fn intent_record(
         caller.facts.classification.label(),
     )
     .with_rule(&work.id, &work.source)
+    // `planned_sha256` is an audit trace of the gate's own dry-run, computed
+    // after the request was consumed. It is not an approval binding: the
+    // broker never approves a digest and nothing requires it to match one.
     .with_evidence(vec![
         "op=remove-path-intent".to_owned(),
         format!("tree={}", work.under.escape_ascii()),
         format!("target={}", work.target.escape_ascii()),
         format!("planned_count={}", planned.removed.len()),
         format!("planned_partial={}", planned.partial),
+        format!("planned_sha256={}", hex_digest(&planned.digest)),
     ])
     .with_outcome(Outcome::NotExecuted)
 }

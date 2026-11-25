@@ -84,9 +84,19 @@ take_machine_lock root-test
 # visible on PID 1 when sudo passes a lower hard limit through.
 # A tmpfs mounted by Docker at a dedicated remove-path test tree exercises mount-point
 # refusal without granting tests the authority to mount arbitrary filesystems.
+# The second one sits inside a tree the walk enters: crossing it must stop the walk.
+# A same-device bind mount: a parent and a child bind-mounted from one host
+# directory, so the child shares st_dev with its parent and only the kernel's
+# mount flags tell it apart.
+bind_host=$(mktemp -d)
+mkdir -p "$bind_host/child"
+trap 'rm -rf "$bind_host"' EXIT
 docker run --rm -i \
     --cap-add SYS_RESOURCE \
+    -v "$bind_host:/var/lib/xudo-t1-remove-bind" \
+    -v "$bind_host/child:/var/lib/xudo-t1-remove-bind/child" \
     --tmpfs /var/lib/xudo-t1-remove-mount:rw,noexec,nosuid,nodev,mode=0755 \
+    --tmpfs /var/lib/xudo-t1-remove-xdev/box/mnt:rw,noexec,nosuid,nodev,mode=0755 \
     -v "$root:/src:ro" \
     -v xudo-linux-cargo:/cache/cargo \
     -v xudo-linux-target:/cache/target \
