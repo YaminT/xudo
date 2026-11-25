@@ -632,6 +632,7 @@ fn proceed(
         .push(format!("lineage={}", ancestors.describe()));
 
     let loaded = load_policy_or_refuse(host)?;
+    progress.evidence.extend(loaded.fault_evidence());
     let spool = stage(Stage::Spool, host.open_spool())?;
     let now = read_clock(host.clock())?;
 
@@ -1431,6 +1432,7 @@ args = [
                     settings: engine::Settings::default(),
                     queue_ttl_secs: 24 * 60 * 60,
                     passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+                    passwd_fault: None,
                 }),
                 spool: Ok(Rc::clone(spool)),
                 queue: Ok(Rc::new(FakeSpool::new())),
@@ -2019,6 +2021,7 @@ all = [{ any-arg = ["restart"] }]
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
             passwd: String::new(),
+            passwd_fault: None,
         });
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_stale_generation");
@@ -2189,6 +2192,29 @@ all = [{ any-arg = ["restart"] }]
         );
         // Not authorized: nothing was recorded as allowed.
         assert_eq!(host.audit.records()[0].decision, AuditDecision::Denied);
+    }
+
+    #[test]
+    fn a_registry_fault_is_in_the_evidence_of_every_gate_record() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.rival = true;
+        let mut loaded = host.policy.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d is writable".to_owned());
+        loaded.passwd_fault = Some("1 unusable and 0 non-UTF-8 line(s)".to_owned());
+        host.policy = Ok(loaded);
+        let _ = run(&mut host, &auth());
+        let evidence = &host.audit.records()[0].evidence;
+        assert!(
+            evidence.contains(&"registry_fault=harnesses.d is writable".to_owned()),
+            "{evidence:?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.starts_with("passwd_fault=1 unusable")),
+            "{evidence:?}"
+        );
     }
 
     #[test]
@@ -3059,6 +3085,7 @@ max-entries = 10
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
             passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+            passwd_fault: None,
         }
     }
 

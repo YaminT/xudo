@@ -266,6 +266,7 @@ max-entries = 10
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: String::new(),
+            passwd_fault: None,
         }
     }
 
@@ -406,6 +407,7 @@ outcome = "ask-human"
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: PASSWD.to_owned(),
+            passwd_fault: None,
         };
         let request = ask("/usr/bin/true", &["upgrade"]);
         let broker_decision = decide(&policy, &broker, &request);

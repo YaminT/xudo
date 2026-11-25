@@ -74,11 +74,11 @@ pub use deny_rule::{DenyClause, DenyRule, DenyRuleMatch, MAX_DENY_RULES, evaluat
 pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{
     Generation, HarnessFile, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError,
-    is_rule_file_name, load_policy, load_rule_files,
+    UnregisteredLabel, is_rule_file_name, load_policy, load_policy_with_registry, load_rule_files,
 };
 pub use harness::{
-    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, passwd_uid, uid_from_passwd_read,
-    valid_account_name, valid_harness_label,
+    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, passwd_fault, passwd_uid,
+    uid_from_passwd_read, valid_account_name, valid_harness_label,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
 pub use operation::{

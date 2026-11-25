@@ -421,18 +421,6 @@ pub enum RuleSetError {
         /// Where it is defined.
         at: Source,
     },
-    /// A harness label is not in the registry this load was given.
-    #[error("{kind} {id} at {at}: harness label {label:?} is not in the registry")]
-    UnknownHarness {
-        /// Whether this is an action or typed operation.
-        kind: &'static str,
-        /// The offending action or operation.
-        id: String,
-        /// The label.
-        label: String,
-        /// Where it is defined.
-        at: Source,
-    },
     /// `outcome = "ask-human"` with no harness would match nobody and, if the
     /// engine fell through, would confirm an enrolled agent instead of denying.
     #[error("action {id} at {at}: outcome \"ask-human\" requires a non-empty harness list")]

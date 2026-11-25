@@ -71,6 +71,34 @@ pub struct LoadedPolicy {
     pub queue_ttl_secs: u64,
     /// Root-owned account records used to match harness accounts to uids.
     pub passwd: String,
+    /// What is wrong with those records, if anything: lines that cannot
+    /// resolve an account, and lines read lossily. A report, not a decision.
+    pub passwd_fault: Option<String>,
+}
+
+impl LoadedPolicy {
+    /// The registry and account-database faults, as audit evidence lines.
+    ///
+    /// Every audit record made under a policy with a fault carries them, so a
+    /// reviewer can tell "no harness was armed" from "no harness asked".
+    #[must_use]
+    pub fn fault_evidence(&self) -> Vec<String> {
+        [
+            ("registry_fault", self.rules.registry_fault.as_deref()),
+            ("passwd_fault", self.passwd_fault.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, fault)| Some(format!("{key}={}", one_line(fault?))))
+        .collect()
+    }
+}
+
+/// `text` with every control character, newlines included, as a space: a
+/// fault carries parser output that root wrote, and evidence is one line.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Why settings bytes could not be interpreted.
@@ -142,10 +170,11 @@ fn attach_passwd(
     // uids, so a replacement character, which is neither a newline nor a
     // colon, cannot change who resolves to which uid. Skipping a bad line
     // instead would let a harness user hide their own uid, so never do that.
-    loaded.passwd = passwd?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .filter(|text| !text.is_empty())
+    let bytes = passwd?
+        .filter(|bytes| !bytes.is_empty())
         .ok_or(PolicyError::PasswdUnusable)?;
+    loaded.passwd_fault = xudo_policy::passwd_fault(&bytes);
+    loaded.passwd = String::from_utf8_lossy(&bytes).into_owned();
     Ok(loaded)
 }
 
@@ -176,6 +205,7 @@ fn load_with(
         settings,
         queue_ttl_secs,
         passwd: String::new(),
+        passwd_fault: None,
     })
 }
 
@@ -397,6 +427,41 @@ mod tests {
         assert_eq!(
             text.lines().count(),
             bytes.split(|b| *b == b'\n').count() - 1
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_passwd_line_is_reported_not_silent() {
+        let bytes = b"root:x:0:0:root:/root:/bin/sh\nmallory:x:1001:1001:\xff:/home/m:/bin/sh\nbad:x:nope:1\n";
+        let attached = attach_passwd(Ok(loaded_policy()), Ok(Some(bytes.to_vec()))).unwrap();
+        assert_eq!(
+            attached.passwd_fault.as_deref(),
+            Some("1 unusable and 1 non-UTF-8 line(s) in the account database")
+        );
+        let clean = attach_passwd(
+            Ok(loaded_policy()),
+            Ok(Some(b"root:x:0:0::/:/bin/sh\n".to_vec())),
+        )
+        .unwrap();
+        assert_eq!(clean.passwd_fault, None);
+        assert!(clean.fault_evidence().is_empty());
+    }
+
+    #[test]
+    fn faults_become_one_line_evidence_each() {
+        let mut loaded = loaded_policy();
+        loaded.rules = xudo_policy::load_policy_with_registry(
+            Vec::new(),
+            Err("line one\nline two\x1b[31m".to_owned()),
+        )
+        .unwrap();
+        loaded.passwd_fault = Some("3 unusable".to_owned());
+        assert_eq!(
+            loaded.fault_evidence(),
+            [
+                "registry_fault=line one line two [31m".to_owned(),
+                "passwd_fault=3 unusable".to_owned()
+            ]
         );
     }
 

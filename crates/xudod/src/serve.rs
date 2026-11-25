@@ -32,7 +32,7 @@ use crate::mint::{
     entry_for_classified, publish,
 };
 use crate::policy::{LoadedPolicy, PolicySource, classify_with_registry, decide, stored_caller};
-use crate::record::{decided, refused};
+use crate::record::{decided_under, refused};
 use crate::refusal::Refusal;
 
 /// The exit status of a broker that could not do its job: `xudo`'s own
@@ -232,14 +232,8 @@ fn serve_confirmation_denial(
     } = evaluated;
     let denied = confirmation_denial(decision, code);
     let _receipt = platform.audit.append(&|previous| {
-        decided(
-            previous,
-            &denied,
-            &caller,
-            &identity,
-            &request,
-            &policy.rules.generation,
-            None,
+        decided_under(
+            previous, &denied, &caller, &identity, &request, &policy, None,
         )
     });
     answer(
@@ -386,14 +380,8 @@ fn serve_request(
         // Nothing is enabled by this record, so a sink that cannot take it
         // does not change the answer.
         let _ = platform.audit.append(&|previous| {
-            decided(
-                previous,
-                &decision,
-                &caller,
-                &identity,
-                &request,
-                &policy.rules.generation,
-                None,
+            decided_under(
+                previous, &decision, &caller, &identity, &request, &policy, None,
             )
         });
         return answer(
@@ -488,15 +476,7 @@ fn queue_ask_human(
     // published. A failed audit leaves the store untouched.
     let record = platform.audit.append(&|previous| {
         crate::record::with_queue_id(
-            decided(
-                previous,
-                decision,
-                caller,
-                identity,
-                request,
-                &policy.rules.generation,
-                None,
-            ),
+            decided_under(previous, decision, caller, identity, request, policy, None),
             &entry.id,
         )
     });
@@ -1944,13 +1924,13 @@ fn mint_approved(
     // Audit first: nothing is swapped without a record, and a failed record
     // leaves the entry Approved.
     let build = |previous: Option<&Record>, grant: &Grant| {
-        decided(
+        decided_under(
             previous,
             &decision,
             &caller,
             &identity,
             &request,
-            &policy.rules.generation,
+            &policy,
             Some(&grant.0),
         )
     };
@@ -2653,13 +2633,25 @@ fn registry_caller(
     registry_caller_with_harness_uid(platform, identity).map(|(caller, _)| caller)
 }
 
+/// Whether a peer's uid belongs to a harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessUid {
+    /// The uid is no registered harness's account or user.
+    No,
+    /// It is the account or a user of a registered harness.
+    Yes,
+    /// The registry failed to load, so no uid can be ruled out.
+    Unknown,
+}
+
 /// As `registry_caller`, and whether the peer's uid is the account or a user
 /// of any registered harness (names resolved through the same passwd the
-/// classification used, so two names for one uid both count).
+/// classification used, so two names for one uid both count). A registry that
+/// failed to load rules nobody out: [`HarnessUid::Unknown`].
 fn registry_caller_with_harness_uid(
     platform: &Platform<'_>,
     identity: &PeerIdentity,
-) -> Result<(CallerFacts, bool), Refusal> {
+) -> Result<(CallerFacts, HarnessUid), Refusal> {
     let policy = platform
         .policy
         .load()
@@ -2674,6 +2666,11 @@ fn registry_caller_with_harness_uid(
         .entries()
         .any(|entry| entry.uid_matches(identity.uid, &resolve));
     let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
+    let harness_uid = match (policy.rules.registry_fault.is_some(), harness_uid) {
+        (true, _) => HarnessUid::Unknown,
+        (false, true) => HarnessUid::Yes,
+        (false, false) => HarnessUid::No,
+    };
     Ok((caller, harness_uid))
 }
 
@@ -2682,14 +2679,23 @@ fn registry_caller_with_harness_uid(
 /// cron, ssh to localhost) and be classed outside. So a non-root peer that
 /// shares a harness uid cannot thaw; `sudo xudo thaw` reaches the broker as
 /// uid 0, which the password already proved.
-fn refuse_harness_uid_thaw(identity: &PeerIdentity, harness_uid: bool) -> Result<(), Refusal> {
-    if identity.uid != 0 && harness_uid {
-        return Err(Refusal::client(
-            RefusalCode::ChannelUntrusted,
-            "this account runs an agent harness: use `sudo xudo thaw`, which lifts ALL freezes (the global one and every user's)",
-        ));
-    }
-    Ok(())
+fn refuse_harness_uid_thaw(
+    identity: &PeerIdentity,
+    harness_uid: HarnessUid,
+) -> Result<(), Refusal> {
+    let what = match harness_uid {
+        _ if identity.uid == 0 => return Ok(()),
+        HarnessUid::No => return Ok(()),
+        HarnessUid::Yes => {
+            "this account runs an agent harness: use `sudo xudo thaw`, which lifts ALL freezes (the global one and every user's)"
+        }
+        // With the registry gone nobody can say which uid is an agent's, and a
+        // thaw lifts a brake, so only the password path may do it.
+        HarnessUid::Unknown => {
+            "the harness registry cannot be loaded, so only `sudo xudo thaw` can lift a freeze"
+        }
+    };
+    Err(Refusal::client(RefusalCode::ChannelUntrusted, what))
 }
 
 /// The most names the state directory is listed to: the audit log, root's
@@ -2905,14 +2911,8 @@ fn deny_pending(
         let _receipt = platform
             .audit
             .append(&|previous| {
-                decided(
-                    previous,
-                    &decision,
-                    &caller,
-                    identity,
-                    request,
-                    &policy.rules.generation,
-                    None,
+                decided_under(
+                    previous, &decision, &caller, identity, request, &policy, None,
                 )
             })
             .map_err(|_| {
@@ -3527,15 +3527,14 @@ fn complete_answer(
     }
     if approve {
         let grant = Grant(entry.clone());
-        let generation = &policy.rules.generation;
         let authorized = authorize(&mut *platform.audit, grant, &|previous, grant| {
-            decided(
+            decided_under(
                 previous,
                 &decision,
                 &caller,
                 identity,
                 request,
-                generation,
+                &policy,
                 Some(&grant.0),
             )
         })
@@ -3555,14 +3554,8 @@ fn complete_answer(
         let record = platform
             .audit
             .append(&|previous| {
-                decided(
-                    previous,
-                    &decision,
-                    &caller,
-                    identity,
-                    request,
-                    &policy.rules.generation,
-                    None,
+                decided_under(
+                    previous, &decision, &caller, identity, request, &policy, None,
                 )
             })
             .map_err(|_| {
@@ -3650,14 +3643,8 @@ fn serve_remove(
     let decision = crate::policy::decide_remove(&policy, &caller, &request);
     if !decision.verdict.is_permitted() {
         let _ = platform.audit.append(&|previous| {
-            decided(
-                previous,
-                &decision,
-                &caller,
-                &identity,
-                &request,
-                &policy.rules.generation,
-                None,
+            decided_under(
+                previous, &decision, &caller, &identity, &request, &policy, None,
             )
         });
         return answer(
@@ -3756,13 +3743,13 @@ fn mint_with_nonce(
 
     // No record, no entry: `publish` takes the authorization.
     let build = |previous: Option<&Record>, grant: &Grant| {
-        decided(
+        decided_under(
             previous,
             &decision,
             &caller,
             &identity,
             &request,
-            &policy.rules.generation,
+            &policy,
             Some(&grant.0),
         )
     };
@@ -4155,6 +4142,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             settings: xudo_policy::engine::Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
             passwd: "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_owned(),
+            passwd_fault: None,
         }
     }
 
@@ -11762,6 +11750,31 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         assert_eq!(served, Served::Refused(Fault::Client));
         assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
         assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn a_thaw_is_refused_to_every_non_root_uid_while_the_registry_is_faulted() {
+        // The registry failed to load, so no uid can be ruled out as an
+        // agent's: bob, who is no harness user, may not thaw either.
+        let mut host = thaw_host(2000, SESSION_HARNESS, &[2000]);
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d failed the trust walk".to_owned());
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 2000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn root_still_thaws_while_the_registry_is_faulted() {
+        let mut host = thaw_host(0, SESSION_HARNESS, &[2000]);
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d failed the trust walk".to_owned());
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 0);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(code, None);
     }
 
     #[test]

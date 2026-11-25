@@ -6,6 +6,7 @@
 //! the caller's own claim beside the classification the broker made.
 
 use xudo_audit::record::{Decision as AuditDecision, Outcome, Record};
+use xudo_gate::policy::LoadedPolicy;
 use xudo_gate::request::PendingRequest;
 use xudo_policy::{CallerFacts, Decision, Generation, Verdict, deny_list_version};
 use xudo_wire::BrokerRequest;
@@ -69,6 +70,31 @@ pub fn decided(
         record = record.with_rule(action.as_str(), source.to_string());
     }
     record
+}
+
+/// [`decided`] under `policy`: its generation, and any registry or passwd
+/// fault in force, which every decision record carries as evidence.
+pub fn decided_under(
+    previous: Option<&Record>,
+    decision: &Decision,
+    caller: &CallerFacts,
+    identity: &PeerIdentity,
+    request: &BrokerRequest,
+    policy: &LoadedPolicy,
+    minted: Option<&PendingRequest>,
+) -> Record {
+    let record = decided(
+        previous,
+        decision,
+        caller,
+        identity,
+        request,
+        &policy.rules.generation,
+        minted,
+    );
+    let mut evidence = record.evidence.clone();
+    evidence.extend(policy.fault_evidence());
+    record.with_evidence(evidence)
 }
 
 /// Adds the queue id to a decision record and reseals it.
@@ -331,6 +357,48 @@ mod tests {
         decision.action = Some(ActionId::new("xudo.svc.restart"));
         decision.rule_source = Some(Source::new("20-services.toml", 3));
         decision
+    }
+
+    #[test]
+    fn a_decision_record_carries_the_registry_and_passwd_faults() {
+        let mut policy = LoadedPolicy {
+            rules: xudo_policy::load_policy_with_registry(Vec::new(), Err("bad\nfile".to_owned()))
+                .unwrap(),
+            settings: xudo_policy::engine::Settings::default(),
+            queue_ttl_secs: 60,
+            passwd: String::new(),
+            passwd_fault: Some("2 unusable".to_owned()),
+        };
+        let build = |policy: &LoadedPolicy| {
+            decided_under(
+                None,
+                &permitted(Verdict::Deny),
+                &caller(),
+                &identity(None),
+                &request(),
+                policy,
+                None,
+            )
+        };
+        let record = build(&policy);
+        assert!(
+            record
+                .evidence
+                .contains(&"registry_fault=bad file".to_owned())
+        );
+        assert!(
+            record
+                .evidence
+                .contains(&"passwd_fault=2 unusable".to_owned())
+        );
+        policy.rules.registry_fault = None;
+        policy.passwd_fault = None;
+        assert!(
+            !build(&policy)
+                .evidence
+                .iter()
+                .any(|line| line.contains("_fault="))
+        );
     }
 
     #[test]

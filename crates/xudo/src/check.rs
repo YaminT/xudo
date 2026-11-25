@@ -237,6 +237,24 @@ pub(crate) fn run(
 }
 
 fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
+    // A rule naming a label nobody registered loads and grants nothing, which
+    // is exactly why it is an error here: the author believes it grants.
+    let unregistered = loaded.unregistered_labels().iter().map(|rule| HarnessRule {
+        action: rule.id.clone(),
+        file: rule.at.file.clone(),
+        line: rule.at.line,
+        message: format!(
+            "{} names harness {:?}, which is not in the registry, so it grants nothing",
+            rule.kind, rule.label
+        ),
+    });
+    // A registry that failed to load disarms every harness for everyone.
+    let fault = loaded.registry_fault().map(|why| HarnessRule {
+        action: "(registry)".to_owned(),
+        file: "harnesses.d".to_owned(),
+        line: 0,
+        message: format!("the harness registry failed to load, so no harness is armed: {why}"),
+    });
     loaded
         .rules()
         .harness_lints(
@@ -253,6 +271,8 @@ fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
             line: lint.source.line,
             message: lint.message,
         })
+        .chain(unregistered)
+        .chain(fault)
         .collect()
 }
 

@@ -264,11 +264,13 @@ user of a registered harness: being outside an agent scope does not prove a
 human, because an agent can start a process outside its scope as its own uid.
 Those users run
 .B sudo xudo thaw
-instead, which reaches the broker as root and lifts ALL freezes: the global one and every user's marker. If the harness registry cannot be read, or /etc/passwd is missing or empty (stray non-UTF-8 bytes in it are read lossily), every
-xudo request refuses, so a broken registry also locks the human out; this only
-withholds, and root can
+instead, which reaches the broker as root and lifts ALL freezes: the global one and every user's marker. If /etc/passwd is missing or empty (stray non-UTF-8 bytes in it are read lossily), every
+xudo request refuses; this only withholds, and root can
 .B touch /var/lib/xudo/frozen
-to freeze or remove it to thaw. A thaw that needs a password proof for ordinary
+to freeze or remove it to thaw. If the harness registry cannot be loaded, the
+rules still decide the human path, no harness is armed, and only
+.B sudo xudo thaw
+lifts a freeze, since no uid can be ruled out as an agent's. A thaw that needs a password proof for ordinary
 users arrives with the passwordless gate. A user who is not a harness uid runs
 it as themselves; do not run it as
 .B sudo
