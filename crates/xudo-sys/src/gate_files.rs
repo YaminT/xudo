@@ -127,7 +127,7 @@ impl GateFiles for HostGateFiles {
                         reason: error.to_string(),
                     })
             },
-            &|path| open_trusted(path),
+            &open_trusted,
             &host_stat,
         )
     }
