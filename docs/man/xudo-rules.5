@@ -175,6 +175,19 @@ through the password-authenticated gate, and
 .B ido
 lists it separately from the user-side queue. The passwordless gate is not
 installed.
+.TP
+.B gtfobins\-waiver
+.RI \(dq technique ": " why \(dq.
+A rule that lists a harness fails to load when it uses a
+.B path\-under
+or
+.B pattern
+matcher, sets
+.BR agent\-allowed\ =\ false ,
+or runs a program on the vendored GTFOBins list (matched by exact basename or name stem, so python3.12 counts; a copy or renamed file is the deny-list's job, not this check). The last is lifted only by this
+key: a technique of at least 20 characters, then why the matchers make it
+unreachable in at least 80. It is part of the ruleset generation, and a waiver
+on a rule with no harness or a program not on the list fails to load.
 .SH OPERATION
 An
 .B [[operation]]

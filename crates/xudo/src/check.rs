@@ -22,7 +22,7 @@ use xudo_policy::{
     TestResult,
     engine::Settings,
     fuzz_check::{Finding, FindingKind, FuzzConfig, FuzzReport, fuzz},
-    gtfobin_sets, run_tests,
+    run_tests,
 };
 
 use crate::cli::{CheckArgs, Cli, Format};
@@ -257,13 +257,7 @@ fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
     });
     loaded
         .rules()
-        .harness_lints(
-            loaded.tests(),
-            &gtfobin_sets(
-                include_str!("../../../ci/gtfobins.txt"),
-                include_str!("../../../ci/gtfobins-waivers.txt"),
-            ),
-        )
+        .harness_lints(loaded.tests())
         .into_iter()
         .map(|lint| HarnessRule {
             action: lint.id.to_string(),

@@ -4022,7 +4022,7 @@ mod tests {
 
     fn ask_human_fixture() -> (Host, PeerIdentity, BrokerRequest) {
         const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
-        const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n";
+        const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n";
         let harness_file = xudo_policy::HarnessFile {
             name: b"codex.toml".to_vec(),
             bytes: HARNESS.as_bytes().to_vec(),
@@ -14285,7 +14285,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let rules = load_policy(
             vec![RuleFile {
                 name: b"10-review.toml".to_vec(),
-                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n".to_vec(),
             }],
             &[
                 HarnessFile {
@@ -14350,7 +14350,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         loaded.rules = load_policy(
             vec![RuleFile {
                 name: b"10-review.toml".to_vec(),
-                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n".to_vec(),
             }],
             &[HarnessFile {
                 name: b"codex.toml".to_vec(),

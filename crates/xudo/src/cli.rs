@@ -3297,53 +3297,63 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         assert_eq!(parsed["lint"]["open_unit_lints"][0]["action"], "x.any");
     }
 
-    #[test]
-    fn check_reports_harness_guardrails_as_lint_errors() {
-        let root = test_tmp_root().join("cli-check-harness-guardrails");
+    const CODEX_FILE: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    fn harness_fixture(name: &str, rule: &str) -> (Fixture, std::path::PathBuf) {
+        let root = test_tmp_root().join(name);
         let _ = std::fs::remove_dir_all(&root);
         let rules = root.join("rules.d");
         let harnesses = root.join("harnesses.d");
         std::fs::create_dir_all(&rules).unwrap();
         std::fs::create_dir_all(&harnesses).unwrap();
-        std::fs::write(
-            rules.join("10-harness.toml"),
+        std::fs::write(rules.join("10-harness.toml"), rule).unwrap();
+        std::fs::write(harnesses.join("codex.toml"), CODEX_FILE).unwrap();
+        (Fixture { dir: rules }, root)
+    }
+
+    #[test]
+    fn check_refuses_a_dangerous_harness_shape_at_load() {
+        let (fixture, root) = harness_fixture(
+            "cli-check-harness-dangerous-shape",
             r#"
 [[action]]
 id = "xudo.harness.broad"
 tier = "diag-read"
-exe = "/usr/bin/awk"
-agent-allowed = false
+exe = "/usr/bin/xudo-demo"
 harness = ["codex"]
 outcome = "allow"
-args = [
-  { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
-  { name = "name", matcher = { pattern = "[a-z]+" } },
-]
+args = [{ name = "path", matcher = { path-under = { prefix = "/tmp" } } }]
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            harnesses.join("codex.toml"),
-            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
-        )
-        .unwrap();
-        let fixture = Fixture { dir: rules };
+        );
+        let (code, out, err) = fixture.run(&["check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        assert!(err.contains("path-under"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_reports_a_missing_near_miss_as_a_lint_error() {
+        let (fixture, root) = harness_fixture(
+            "cli-check-harness-near-miss",
+            r#"
+[[action]]
+id = "xudo.harness.ok"
+tier = "diag-read"
+exe = "/usr/bin/xudo-demo"
+harness = ["codex"]
+outcome = "allow"
+args = [{ name = "verb", matcher = { literal = "status" } }]
+"#,
+        );
         let (code, out, err) = fixture.run(&["--output", "json", "check"]);
         assert_eq!(code, ExitCode::LintError, "{out}{err}");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 21);
         let lints = parsed["lint"]["harness_lints"].as_array().unwrap();
-        assert!(lints.len() >= 5, "{out}");
-        let messages = lints
-            .iter()
-            .filter_map(|item| item["message"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(messages.contains("path-under"), "{messages}");
-        assert!(messages.contains("pattern"), "{messages}");
-        assert!(messages.contains("agent-allowed"), "{messages}");
-        assert!(messages.contains("GTFOBins"), "{messages}");
-        assert!(messages.contains("near-miss"), "{messages}");
+        assert_eq!(lints.len(), 1, "{out}");
+        assert!(
+            lints[0]["message"].as_str().unwrap().contains("near-miss"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

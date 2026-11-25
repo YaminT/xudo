@@ -447,6 +447,7 @@ fn policy_form(action: &Action) -> Vec<u8> {
         env_allow,
         harness,
         outcome,
+        gtfobins_waiver,
         source: _,
     } = action;
     let mut out = Vec::new();
@@ -495,6 +496,10 @@ fn policy_form(action: &Action) -> Vec<u8> {
     if !outcome.is_unset() {
         put(&mut out, b"outcome");
         put(&mut out, outcome.as_str().as_bytes());
+    }
+    if let Some(waiver) = gtfobins_waiver {
+        put(&mut out, b"gtfobins-waiver");
+        put(&mut out, waiver.as_bytes());
     }
     out
 }
@@ -811,6 +816,7 @@ max-entries = 10
     fn a_rule_naming_an_unregistered_label_grants_nothing() {
         let action =
             ONE_ACTION.replace("exe =", "harness = [\"codex\"]\noutcome = \"allow\"\nexe =");
+        let action = action.replace("/usr/bin/systemctl", "/usr/bin/xudo-demo");
         let loaded = load_policy(vec![file("10-a.toml", &action)], &[]).unwrap();
         // No registry entry exists to attest any caller as `codex`.
         assert!(loaded.harnesses.get("codex").is_none());
@@ -862,6 +868,7 @@ max-entries = 10
     fn an_unreadable_registry_withholds_every_label_and_names_why() {
         let action =
             ONE_ACTION.replace("exe =", "harness = [\"codex\"]\noutcome = \"allow\"\nexe =");
+        let action = action.replace("/usr/bin/systemctl", "/usr/bin/xudo-demo");
         let loaded = load_policy_with_registry(
             vec![file("10-a.toml", &action)],
             Err("the registry directory is writable by a non-root user".to_owned()),
@@ -904,6 +911,7 @@ max-entries = 10
     fn an_action_with_a_registered_harness_loads() {
         let action =
             ONE_ACTION.replace("exe =", "harness = [\"codex\"]\noutcome = \"allow\"\nexe =");
+        let action = action.replace("/usr/bin/systemctl", "/usr/bin/xudo-demo");
         let result = load_policy(
             vec![file("10-a.toml", &action)],
             &[harness_file("codex", "agent", 4)],
@@ -926,6 +934,33 @@ max-entries = 10
             assert!(loaded.harnesses.is_empty());
             assert!(loaded.registry_fault.is_some());
         }
+    }
+
+    #[test]
+    fn a_waiver_is_part_of_the_generation() {
+        let waiver = |why: &str| {
+            format!(
+                "gtfobins-waiver = \"pager escape through the unit: {why} and nothing more can be passed to it\"\n"
+            )
+        };
+        let rule = |why: &str| {
+            let action = ONE_ACTION.replace(
+                "exe =",
+                &format!(
+                    "harness = [\"codex\"]\noutcome = \"allow\"\n{}exe =",
+                    waiver(why)
+                ),
+            );
+            load_policy(
+                vec![file("10-a.toml", &action)],
+                &[harness_file("codex", "agent", 4)],
+            )
+            .unwrap()
+            .generation
+        };
+        let long = "the unit is a name matcher and no option can reach the service manager at all";
+        assert_ne!(rule(long), rule(&format!("{long} here")));
+        assert_eq!(rule(long), rule(long));
     }
 
     #[test]
@@ -1405,6 +1440,7 @@ args = [
                         // every platform, independent of proptest sampling.
                         harness: vec!["codex".to_owned()],
                         outcome: Outcome::AskHuman,
+                        gtfobins_waiver: None,
                         source: Source::new("p.toml", line),
                     },
                 )
@@ -1522,6 +1558,7 @@ args = [
                 env_allow: Vec::new(),
                 harness: Vec::new(),
                 outcome: Outcome::Allow,
+                gtfobins_waiver: None,
                 source: Source::new("p.toml", 1),
             }
         }
