@@ -68,6 +68,10 @@ impl ProcSource for VerifiedProc {
     fn namespace_inode(&self, relative: &str) -> Result<u64, SysError> {
         imp::namespace_inode(self, relative)
     }
+
+    fn file_identity(&self, relative: &str) -> Result<crate::FileId, SysError> {
+        imp::file_identity(self, relative)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -152,6 +156,25 @@ mod imp {
         }
     }
 
+    /// Follows the link from the pinned descriptor, as the kernel resolves it
+    /// for this process, and reports the inode it leads to. The target is on
+    /// an ordinary file system, so it is not required to be procfs.
+    pub(super) fn file_identity(
+        proc: &VerifiedProc,
+        relative: &str,
+    ) -> Result<crate::FileId, SysError> {
+        check_relative(relative)?;
+        openat(
+            &proc.root,
+            relative,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .and_then(|fd| rustix::fs::fstat(&fd))
+        .map(|stat| crate::FileId::of(&stat))
+        .map_err(|errno| failed(relative, errno))
+    }
+
     fn read_bounded(fd: OwnedFd, at: &str) -> Result<Vec<u8>, SysError> {
         let mut bytes = Vec::new();
         std::fs::File::from(fd)
@@ -187,6 +210,15 @@ mod imp {
             "reading {relative} from procfs"
         )))
     }
+
+    pub(super) fn file_identity(
+        _proc: &VerifiedProc,
+        relative: &str,
+    ) -> Result<crate::FileId, SysError> {
+        Err(SysError::unsupported(format!(
+            "reading {relative} from procfs"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +243,8 @@ mod tests {
         let err = proc.read("1/stat").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
         let err = proc.namespace_inode("1/ns/user").unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+        let err = proc.file_identity("self/exe").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
         assert!(format!("{proc:?}").contains("VerifiedProc"));
     }
@@ -294,6 +328,20 @@ mod tests {
                 assert!(proc.namespace_inode(bad).is_err(), "{bad:?}");
             }
             assert!(proc.namespace_inode("4194999/ns/user").is_err());
+        }
+
+        #[test]
+        fn self_exe_is_identified_through_the_verified_handle() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let proc = VerifiedProc::open().unwrap();
+            let id = proc.file_identity("self/exe").unwrap();
+            let meta = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+            assert_eq!((id.ino, id.nlink), (meta.ino(), meta.nlink()));
+            for bad in ["", "/proc/self/exe", "self/../self/exe"] {
+                assert!(proc.file_identity(bad).is_err(), "{bad:?}");
+            }
+            assert!(proc.file_identity("4194999/exe").is_err());
         }
 
         #[test]

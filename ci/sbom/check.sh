@@ -28,8 +28,8 @@ debs=(target/deb/*.deb)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 dpkg-deb -x "${debs[0]}" "$tmp/deb"
-bins=("$tmp/deb/usr/bin/xudo" "$tmp/deb/usr/bin/ido" "$tmp/deb/usr/libexec/xudo/xudod" "$tmp/deb/usr/libexec/xudo/xudo-gate-auth" "$tmp/deb/usr/libexec/xudo/xudo-session")
-pkgs=(xudo-bin ido-bin xudod-bin xudo-gate-bin xudo-session-bin)
+bins=("$tmp/deb/usr/bin/xudo" "$tmp/deb/usr/bin/ido" "$tmp/deb/usr/libexec/xudo/xudod" "$tmp/deb/usr/libexec/xudo/xudo-gate-auth" "$tmp/deb/usr/libexec/xudo/xudo-gate-nopass" "$tmp/deb/usr/libexec/xudo/xudo-session")
+pkgs=(xudo-bin ido-bin xudod-bin xudo-gate-bin xudo-gate-bin xudo-session-bin)
 
 ci/sbom/generate.sh "$tmp/sbom.json" >/dev/null
 for p in "${pkgs[@]}"; do

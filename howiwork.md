@@ -159,7 +159,7 @@ M5, with permission sets becoming a construct in the rule files first.
 | `xudo` | user | The front-end agents and humans call. Explains, checks, asks the broker. Decides nothing. |
 | `xudod` | root | The authority. Identifies the peer, classifies, evaluates policy, mints one-use requests, owns confirmation. |
 | `xudo-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
-| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: xudo ships no setuid bit anywhere. Two rules point at two hardlinks of the gate: `xudo-gate-nopass` (`NOPASSWD`, the approved agent path) and `xudo-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. |
+| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: xudo ships no setuid bit anywhere. Two rules point at two files of the gate, copies of one binary with one name each: `xudo-gate-nopass` (`NOPASSWD`, the approved agent path) and `xudo-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. The gate reads which one it is from the executed file (`/proc/self/exe` against the two files under `/usr/libexec/xudo`), never from `argv[0]`, and refuses a gate file with a second name. Today only `xudo-gate-auth` is named by any sudoers rule: the `-nopass` file ships inert and refuses everything, because nothing mints the entry it requires. |
 | `ido` | user | The buffered human-run queue (below). Where the human's password is entered. |
 | `airead` | user | The read-only surface (below). |
 | `pasban` | root (scheduled) | The watchman (below). |
@@ -289,8 +289,8 @@ the gate a real pty (`use_pty`, the TIOCSTI defence), faithful exit status, and
 the operator's existing sudo/doas logging. Take it away and the choice is a
 setuid binary, which this project refuses, or having the root daemon execute
 commands itself, which makes the broker, the parser, and the executor one
-process. Two hardlinks keep the password rule and the passwordless rule from
-ever naming the same command: `NOPASSWD` attaches only to the agent-path name.
+process. Two files keep the password rule and the passwordless rule from
+ever naming the same command: `NOPASSWD` attaches only to the agent-path file.
 
 ## Mismatches resolved (pasted vision → merged truth)
 

@@ -15,7 +15,8 @@
 //!
 //! On Linux an unprivileged test process may be unable to raise its limits to
 //! PID 1's values, so the gate refuses at caller-state reset. A privileged
-//! test host proceeds to the invocation check and then the absent ruleset.
+//! test host proceeds to the invocation check, where the executed file (not
+//! a file under `/usr/libexec/xudo`) is refused before any ruleset is read.
 //! Off Linux `close_range` is refused first.
 
 #![allow(
@@ -42,16 +43,19 @@ const FIRST_STEP: &str = if cfg!(target_os = "linux") {
     "gate_failed_descriptors"
 };
 
-/// What the one name that runs reaches on a host with no xudo installed: the
-/// ruleset on Linux, and `close_range` elsewhere.
+/// What the gate reaches on a host with no xudo installed: the executed file
+/// is neither gate file under `/usr/libexec/xudo`, so the mode step refuses
+/// (before the ruleset is read) on Linux, and `close_range` elsewhere.
 const NO_XUDO_HERE: &str = if cfg!(target_os = "linux") {
-    "gate_failed_rules"
+    "gate_failed_invocation"
 } else {
     "gate_failed_descriptors"
 };
 
-/// A hardlink to the gate under `name`, as the installer makes
-/// `xudo-gate-auth` — in the workspace's target directory, never `/tmp`.
+/// A hardlink to the gate under `name`, the way a hostile user could name it:
+/// in the workspace's target directory, never `/tmp`. The package ships two
+/// files of their own, not links, and the gate refuses a file with a second
+/// name, so this is what an attacker has and the installer does not make.
 fn named(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gate-names");
     std::fs::create_dir_all(&dir).unwrap();
@@ -119,9 +123,10 @@ fn arguments_are_refused() {
 
 #[test]
 fn an_unexpected_argv0_is_refused() {
-    // The installed name, the passwordless name that is not shipped until M4,
-    // and a name that is neither. Only the `-auth` hardlink runs.
-    for name in ["xudo-gate", "xudo-gate-nopass", "sh"] {
+    // The installed name of the binary and a name that is neither gate name.
+    // `-nopass` is a gate name too: it is accepted here and refused on the
+    // executed file instead (the next tests, and `root_invocation_refusals`).
+    for name in ["xudo-gate", "sh"] {
         let output = Command::new(named(name)).output().unwrap();
         assert_eq!(output.status.code(), Some(19), "{name}");
         assert!(output.stdout.is_empty(), "{name}");
@@ -212,5 +217,53 @@ fn the_environment_is_never_read() {
             stderr.contains(NO_XUDO_HERE) || stderr.contains("gate_failed_caller_state"),
             "{key}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn direct_nopass_invocation_with_no_entry_does_nothing() {
+    // The passwordless name, started by a user with nothing minted for them.
+    // Nothing is installed here, so the executed file is neither gate file:
+    // refused at the invocation, high severity, nothing on standard output.
+    let output = Command::new(named("xudo-gate-nopass")).output().unwrap();
+    assert_eq!(output.status.code(), Some(19));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_first_refusal(
+        &stderr,
+        FIRST_STEP,
+        if cfg!(target_os = "linux") {
+            "high"
+        } else {
+            "normal"
+        },
+    );
+}
+
+#[test]
+fn a_symlink_or_copy_under_a_gate_name_is_not_a_gate_file() {
+    // A name is the caller's to choose, and so is a file in a directory they
+    // own. Neither is `/usr/libexec/xudo/xudo-gate-*`, and the mode comes from
+    // which inode runs, so every such name is refused the same way.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gate-impostors");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["xudo-gate-auth", "xudo-gate-nopass"] {
+        let link = dir.join(format!("sym-{name}"));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(GATE, &link).unwrap();
+        let copy = dir.join(format!("copy-{name}"));
+        let _ = std::fs::remove_file(&copy);
+        std::fs::copy(GATE, &copy).unwrap();
+        for impostor in [&link, &copy] {
+            // `argv[0]` is the full path: the last segment must be the name.
+            let renamed = dir.join(name);
+            let _ = std::fs::remove_file(&renamed);
+            std::fs::hard_link(impostor.canonicalize().unwrap(), &renamed).unwrap();
+            let output = Command::new(&renamed).output().unwrap();
+            assert_eq!(output.status.code(), Some(19), "{name}");
+            assert!(output.stdout.is_empty(), "{name}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+        }
     }
 }
