@@ -29,14 +29,29 @@ pub fn freeze_marker_name(uid: u32) -> String {
     }
 }
 
-/// Whether `name` is a freeze marker's name: `frozen` or `frozen-<digits>`.
+/// The marker one harness's freeze is published under: `frozen-h-<label>`.
+/// `None` for a label that is not a registry label, so a name with a `/`, a
+/// `..` or any other text can never become a path. The `h-` cannot be read as
+/// digits, so it never collides with a uid's marker.
+#[must_use]
+pub fn harness_marker_name(label: &str) -> Option<String> {
+    xudo_policy::harness::valid_harness_label(label).then(|| format!("frozen-h-{label}"))
+}
+
+/// Whether `name` is a freeze marker's name: `frozen`, `frozen-<digits>` or
+/// `frozen-h-<harness label>`.
 #[must_use]
 pub fn is_freeze_marker_name(name: &[u8]) -> bool {
     match name.strip_prefix(b"frozen") {
         Some(b"") => true,
         Some(rest) => rest
             .strip_prefix(b"-")
-            .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)),
+            .is_some_and(|tail| match tail.strip_prefix(b"h-") {
+                Some(label) => {
+                    std::str::from_utf8(label).is_ok_and(|l| harness_marker_name(l).is_some())
+                }
+                None => !tail.is_empty() && tail.iter().all(u8::is_ascii_digit),
+            }),
         None => false,
     }
 }
@@ -48,6 +63,17 @@ pub type MarkerRead<'a> = dyn Fn(&Path, usize) -> Result<Option<Vec<u8>>, TrustE
 /// counts as frozen: a marker that is unreadable or malformed freezes.
 pub fn user_frozen(uid: u32, read: &MarkerRead<'_>) -> bool {
     let path = format!("{FREEZE_DIR}/{}", freeze_marker_name(uid));
+    freeze_state(read(Path::new(&path), MAX_FREEZE_BYTES))
+}
+
+/// Whether the harness `label`'s own freeze marker stands. As for a uid:
+/// anything but a clean absence freezes, and so does a label that cannot name
+/// a marker.
+pub fn harness_frozen(label: &str, read: &MarkerRead<'_>) -> bool {
+    let Some(name) = harness_marker_name(label) else {
+        return true;
+    };
+    let path = format!("{FREEZE_DIR}/{name}");
     freeze_state(read(Path::new(&path), MAX_FREEZE_BYTES))
 }
 
@@ -606,6 +632,72 @@ mod tests {
         ] {
             assert!(!is_freeze_marker_name(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn a_harness_marker_name_is_built_only_from_a_valid_label() {
+        assert_eq!(
+            harness_marker_name("codex").as_deref(),
+            Some("frozen-h-codex")
+        );
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "Codex",
+            "1codex",
+            "-x",
+            "a b",
+            "a..b",
+            "x\0y",
+            &"a".repeat(33),
+        ] {
+            assert_eq!(harness_marker_name(bad), None, "{bad:?}");
+        }
+        for name in [&b"frozen-h-codex"[..], b"frozen-h-claude-code"] {
+            assert!(is_freeze_marker_name(name), "{name:?}");
+        }
+        for name in [
+            &b"frozen-h-"[..],
+            b"frozen-h-../x",
+            b"frozen-h-a/b",
+            b"frozen-h-Codex",
+            b"frozen-h-\xff",
+            b"frozen-h",
+            b"frozen-x-codex",
+        ] {
+            assert!(!is_freeze_marker_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_harness_marker_that_is_malformed_unreadable_or_untrusted_freezes_the_harness() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let read = |path: &Path, limit: usize| {
+            seen.borrow_mut().push((path.to_path_buf(), limit));
+            Ok(Some(b"garbage".to_vec()))
+        };
+        assert!(harness_frozen("codex", &read));
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(
+                Path::new("/var/lib/xudo/frozen-h-codex").to_path_buf(),
+                MAX_FREEZE_BYTES
+            )]
+        );
+        assert!(!harness_frozen("codex", &|_, _| Ok(None)));
+        // A marker a non-root user wrote fails the trust walk: frozen.
+        assert!(harness_frozen("codex", &|_, _| Err(
+            TrustError::NotRootOwned {
+                at: "/var/lib/xudo".to_owned(),
+                uid: 1000
+            }
+        )));
+        // A label that cannot name a marker freezes, whatever a reader says.
+        // A reader that would say "absent" is never believed for it.
+        let absent = |_: &Path, _: usize| Ok(None);
+        assert!(harness_frozen("../codex", &absent));
+        assert!(!harness_frozen("codex", &absent));
     }
 
     #[test]
