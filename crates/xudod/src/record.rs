@@ -43,6 +43,7 @@ pub fn decided(
     if let Some(entry) = minted {
         evidence.push(format!("nonce={}", entry.nonce));
         evidence.push(format!("deadline_ms={}", entry.deadline.0));
+        evidence.push(format!("via={}", entry.via.label()));
         if let Some(id) = &entry.queue_id {
             evidence.push(format!("queue_id={id}"));
         }

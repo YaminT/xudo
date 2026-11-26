@@ -51,8 +51,9 @@ pub const REQUEST_SCHEMA_VERSION: u32 = 5;
 /// (`xudo_sys::GateFiles`), never with `argv[0]`. An `auth` entry runs only
 /// under `xudo-gate-auth`, after `sudo` asked a password. A `harness` entry
 /// runs only under `xudo-gate-nopass`, and only for a live enrolled agent the
-/// ruleset grants. The broker writes only `auth` today: nothing mints
-/// `harness`, so `xudo-gate-nopass` refuses every invocation.
+/// ruleset grants. The broker mints `harness` in one place, its exec path for
+/// such a harness; `sudo` runs `xudo-gate-nopass` only once root adds a
+/// sudoers line naming it, which nothing installs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Via {

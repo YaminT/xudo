@@ -4088,6 +4088,118 @@ max-entries = 10
         assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
     }
 
+    // ---- the generation binds the registry ---------------------------------
+
+    /// `codex` as `rules()` registers it, so the scope record still matches.
+    const CODEX_ENTRY: &[u8] = b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    const GRANT_RULE: &str = r#"
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs"
+args = [
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+    /// [`RULES`] and a rule granting `codex`, over these registry files.
+    fn granting_rules(harnesses: &[(&[u8], &[u8])]) -> LoadedRuleSet {
+        let files: Vec<HarnessFile> = harnesses
+            .iter()
+            .map(|(name, bytes)| HarnessFile {
+                name: name.to_vec(),
+                bytes: bytes.to_vec(),
+            })
+            .collect();
+        load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-grant.toml".to_vec(),
+                    bytes: GRANT_RULE.as_bytes().to_vec(),
+                },
+            ],
+            &files,
+        )
+        .unwrap()
+    }
+
+    /// What the broker mints for `codex` running `systemctl status`.
+    fn granted_entry(generation: u64) -> PendingRequest {
+        let mut granted = entry(NONCE_A, XUDO_PID, XUDO_START, &["status", "nginx.service"]);
+        granted.action = "xudo.svc.status".to_owned();
+        granted.generation = generation;
+        granted.via = crate::request::Via::Harness;
+        granted.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        granted.attested_scope_id = Some(90);
+        granted.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        granted.attested_harness = Some("codex".to_owned());
+        granted
+    }
+
+    /// The `-nopass` file run by a live `codex` caller, under `rules`.
+    fn granting_host(granted: PendingRequest, rules: LoadedRuleSet) -> (FakeHost, Rc<FakeSpool>) {
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            granted,
+        );
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.policy = Ok(LoadedPolicy {
+            rules,
+            settings: engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
+            passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+            passwd_fault: None,
+        });
+        (host, spool)
+    }
+
+    #[test]
+    fn a_granted_harness_entry_runs_under_nopass() {
+        // The positive control for the test below: under the registry it was
+        // minted against, the entry runs. `sudo` reaches this file only once
+        // root adds a sudoers line naming it, which nothing installs.
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exec_calls(&host), 1, "{}", exit.message);
+        assert_eq!(consumed(&spool), [NONCE_A]);
+    }
+
+    #[test]
+    fn nopass_refuses_a_registry_change_after_mint() {
+        let minted_under = granting_rules(&[(b"codex.toml", CODEX_ENTRY)])
+            .generation
+            .id();
+        let claude: &[u8] = b"label = \"claude\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let edited: &[u8] = b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"bob\"]\nmax-sessions = 4\n";
+        for changed in [
+            // Another harness beside codex: codex's own entry is untouched,
+            // and only the generation can tell the registry moved.
+            granting_rules(&[(b"codex.toml", CODEX_ENTRY), (b"claude.toml", claude)]),
+            // Codex's own entry edited.
+            granting_rules(&[(b"codex.toml", edited)]),
+        ] {
+            assert_ne!(changed.generation.id(), minted_under);
+            let (mut host, spool) = granting_host(granted_entry(minted_under), changed);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "request_stale_generation");
+        }
+    }
+
     // ---- the -nopass ledger: every invocation counts, before any append ----
 
     /// Runs the `-nopass` gate on `host` with the clock at `at`.

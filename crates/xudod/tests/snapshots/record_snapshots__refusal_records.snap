@@ -648,6 +648,44 @@ expression: text
   "seq": 1
 }
 
+## harness_not_granted with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "harness_not_granted",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=xudod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_sid=1",
+    "peer_tty=0",
+    "diverged=true",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "cgroup_id=77",
+    "question=run",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "1460984ceb97a3885102ad29311a54149ab83efeb9ead71b43e61ccdedd21bf3",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
 ## before anything was known
 {
   "action": null,

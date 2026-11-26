@@ -6,10 +6,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use xudo_backend::Probe;
-use xudo_backend::snippet::GATE_AUTH;
+use xudo_backend::snippet::{GATE_AUTH, GATE_NOPASS};
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
 use xudo_policy::{DenialCode, ExitCode};
-use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question};
+use xudo_wire::{Answer, BrokerRequest, BrokerResponse, Question, RefusalCode};
 
 use crate::cli::{Cli, emit};
 
@@ -34,17 +34,47 @@ fn selected_backend(probe: &dyn Probe, err: &mut dyn Write) -> Option<&'static s
 /// How long a broker gets to answer before we give up on it.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What `main` execs, in place: `backend gate`, nothing else.
+/// What `main` runs: `backend gate`, or `backend -n gate` for `-nopass`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExecPlan {
     /// The backend, one of the compiled-in absolute paths.
     pub backend: &'static str,
-    /// The gate, its only argument.
+    /// The gate, one of the two compiled-in gate files.
     pub gate: &'static str,
     /// Run as a child and wait, instead of exec in place. doas does not fork,
     /// so the pinned process would be the gate itself; the gate only looks at
-    /// its ancestors. sudo forks, so it stays an in-place exec.
+    /// its ancestors. sudo forks, so it stays an in-place exec, except for
+    /// `-nopass`, whose refusal this process explains afterwards.
     pub spawn: bool,
+}
+
+impl ExecPlan {
+    /// The backend's arguments. `-nopass` gets `-n` first: `sudo` then never
+    /// asks a password, it refuses, so an agent that no sudoers line lets
+    /// through is told so and never falls back to a prompt.
+    pub fn backend_args(&self) -> Vec<&'static str> {
+        if self.gate == GATE_NOPASS {
+            vec!["-n", self.gate]
+        } else {
+            vec![self.gate]
+        }
+    }
+}
+
+/// What to tell the caller after a spawned backend exited with `code`.
+///
+/// `sudo -n` exits 1 when it would have to ask a password. For `-nopass` that
+/// means the passwordless agent path is not installed, which is the default:
+/// no sudoers line names the file. Nothing is retried with a password.
+pub fn after_backend(plan: &ExecPlan, code: Option<i32>, err: &mut dyn Write) {
+    if plan.gate == GATE_NOPASS && code == Some(1) {
+        let _ = writeln!(
+            err,
+            "xudo: if sudo said a password is required, the passwordless agent path is not \
+             installed (no sudoers line names {GATE_NOPASS}, the default); nothing was \
+             retried with a password"
+        );
+    }
 }
 
 /// A claimed queue entry, ready for the password gate.
@@ -207,6 +237,19 @@ fn plan_paced(
 
     match response.answer {
         Answer::Refused {
+            code: RefusalCode::HarnessNotGranted,
+            remediation,
+            detail,
+        } => {
+            let action = detail.as_deref().unwrap_or("none");
+            let _ = writeln!(
+                err,
+                "xudo: not granted (action {}): {remediation}",
+                action.escape_debug()
+            );
+            Err(ExitCode::Denied)
+        }
+        Answer::Refused {
             code, remediation, ..
         } => {
             let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
@@ -236,16 +279,28 @@ fn plan_paced(
                 let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
                 return Err(ExitCode::Unusable);
             };
-            // Only ever run the one gate that install put in the sudo rule.
-            if minted.gate != GATE_AUTH {
+            // Only ever run one of the two compiled-in gate files.
+            let gate = if minted.gate == GATE_AUTH {
+                GATE_AUTH
+            } else if minted.gate == GATE_NOPASS {
+                GATE_NOPASS
+            } else {
                 let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
                 return Err(ExitCode::Unusable);
+            };
+            let doas = backend == "/usr/bin/doas";
+            if gate == GATE_NOPASS && doas {
+                let _ = writeln!(
+                    err,
+                    "xudo: the passwordless agent path needs sudo or sudo-rs, and this host \
+                     has doas; refusing"
+                );
+                return Err(ExitCode::Unusable);
             }
-            let spawn = backend == "/usr/bin/doas";
             Ok(ExecPlan {
                 backend,
-                gate: GATE_AUTH,
-                spawn,
+                gate,
+                spawn: doas || gate == GATE_NOPASS,
             })
         }
     }
@@ -2237,6 +2292,89 @@ mod tests {
             "deadline took {elapsed:?}"
         );
         broker.join().unwrap();
+    }
+
+    #[test]
+    fn a_harness_grant_runs_sudo_n_on_the_nopass_gate_as_a_child() {
+        for (probe, backend) in [
+            (Has(&["/usr/bin/sudo"]), "/usr/bin/sudo"),
+            (Has(&["/usr/bin/sudo-rs"]), "/usr/bin/sudo-rs"),
+        ] {
+            let reply = decided(allow(), Some(minted(GATE_NOPASS)));
+            let (result, _, err) = against(reply, &probe, &argv());
+            let plan = expect_plan(result, &err);
+            assert_eq!(
+                plan,
+                ExecPlan {
+                    backend,
+                    gate: GATE_NOPASS,
+                    spawn: true,
+                }
+            );
+            // `-n`: sudo refuses rather than asks, so no prompt ever appears.
+            assert_eq!(plan.backend_args(), ["-n", GATE_NOPASS]);
+        }
+        // The password gate gets its path and nothing else.
+        let human = ExecPlan {
+            backend: "/usr/bin/sudo",
+            gate: GATE_AUTH,
+            spawn: false,
+        };
+        assert_eq!(human.backend_args(), [GATE_AUTH]);
+    }
+
+    #[test]
+    fn the_agent_path_refuses_doas() {
+        let reply = decided(allow(), Some(minted(GATE_NOPASS)));
+        let (result, _, err) = against(reply, &Has(&["/usr/bin/doas"]), &argv());
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(err.contains("needs sudo or sudo-rs"), "{err}");
+    }
+
+    #[test]
+    fn a_nopass_refusal_by_sudo_is_explained_and_never_retried_with_a_password() {
+        let nopass = ExecPlan {
+            backend: "/usr/bin/sudo",
+            gate: GATE_NOPASS,
+            spawn: true,
+        };
+        let mut err = Vec::new();
+        after_backend(&nopass, Some(1), &mut err);
+        let said = String::from_utf8(err).unwrap();
+        assert!(said.contains("not installed"), "{said}");
+        assert!(
+            said.contains("nothing was retried with a password"),
+            "{said}"
+        );
+        // Any other status, or the password gate, adds nothing.
+        let human = ExecPlan {
+            backend: "/usr/bin/doas",
+            gate: GATE_AUTH,
+            spawn: true,
+        };
+        for (plan, code) in [(&nopass, Some(0)), (&nopass, None), (&human, Some(1))] {
+            let mut err = Vec::new();
+            after_backend(plan, code, &mut err);
+            assert!(err.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_harness_not_granted_reply_exits_denied_naming_only_the_action() {
+        for (action, shown) in [
+            (
+                Some("xudo.svc.restart\u{1b}[2J"),
+                "action xudo.svc.restart\\u{1b}[2J",
+            ),
+            (None, "action none"),
+        ] {
+            let reply = BrokerResponse::harness_not_granted(action);
+            let (result, out, err) = against(reply.to_json().into_bytes(), &SUDO, &argv());
+            assert_eq!(result, Err(ExitCode::Denied));
+            assert!(out.is_empty());
+            assert!(err.contains(shown), "{err}");
+            assert!(!err.contains('\u{1b}'), "{err}");
+        }
     }
 
     #[test]

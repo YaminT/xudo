@@ -404,8 +404,9 @@ pub struct Decision {
     /// The action whose rule lists the enrolled agent's harness with
     /// `outcome = "allow"`, and nothing stricter overlapped.
     ///
-    /// A fact about policy and nothing more: G1 will act on it; until then the
-    /// verdict still confirms, and it opens no passwordless path.
+    /// Set only on a plain [`Verdict::Allow`]. The broker mints such a decision
+    /// for the `-nopass` gate, which runs nothing until root adds a sudoers line
+    /// naming it.
     pub harness_grant: Option<ActionId>,
     /// The evaluation trace.
     pub trace: Vec<TraceStep>,

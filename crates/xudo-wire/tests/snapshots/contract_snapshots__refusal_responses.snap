@@ -19,3 +19,4 @@ expression: table
 {"schema_version":2,"answer":{"refused":{"code":"channel_untrusted","remediation":"the peer is not trusted for this broker channel"}}}
 {"schema_version":2,"answer":{"refused":{"code":"request_unknown","remediation":"the request is unknown or this question is not implemented yet"}}}
 {"schema_version":2,"answer":{"refused":{"code":"answer_rejected","remediation":"the broker rejected this confirmation answer"}}}
+{"schema_version":2,"answer":{"refused":{"code":"harness_not_granted","remediation":"no rule grants this harness the command, and a service harness has no password to type; ask root to add a rule that names the harness, or use the queue"}}}

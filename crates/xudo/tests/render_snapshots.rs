@@ -434,7 +434,7 @@ args = [
 
 #[test]
 fn a_decision_carrying_a_harness_grant_is_pinned() {
-    // The grant is recorded and the verdict still confirms until G1.
+    // A grant is a plain allow that names it.
     let decision = evaluate(
         &RuleSet::from_toml("snapshot-grant.toml", GRANT_FIXTURE).unwrap(),
         &agent_caller(),
@@ -445,7 +445,7 @@ fn a_decision_carrying_a_harness_grant_is_pinned() {
         ),
         Settings::default(),
     );
-    assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
+    assert_eq!(decision.verdict, Verdict::Allow);
     assert!(decision.harness_grant.is_some());
     insta::assert_snapshot!("human__harness_grant", render::human(&decision));
     insta::assert_snapshot!("json__harness_grant", render::json(&decision));

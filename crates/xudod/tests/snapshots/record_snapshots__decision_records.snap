@@ -30,9 +30,10 @@ expression: text
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1",
     "nonce=abababababababababababababababababababababababababababababababab",
-    "deadline_ms=1900"
+    "deadline_ms=1900",
+    "via=auth"
   ],
-  "hash": "d5a76f1665fb8c8927abdd708d8ceb50461d6793e033082055ece0207e587651",
+  "hash": "eeafb586bbbd623a8140dbe90a0916a324ba405516d079d0dce268b65c2cb974",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",

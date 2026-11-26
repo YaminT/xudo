@@ -1,0 +1,6 @@
+---
+source: crates/xudo-wire/tests/contract_snapshots.rs
+expression: table
+---
+{"schema_version":2,"answer":{"refused":{"code":"harness_not_granted","remediation":"no rule grants this harness the command, and a service harness has no password to type; ask root to add a rule that names the harness, or use the queue","detail":"xudo.svc.restart"}}}
+{"schema_version":2,"answer":{"refused":{"code":"harness_not_granted","remediation":"no rule grants this harness the command, and a service harness has no password to type; ask root to add a rule that names the harness, or use the queue"}}}

@@ -114,12 +114,24 @@ runs an allowed command as root through the host's
 or
 .BR doas ,
 which asks for your password.
-This beta is that password path only.
-The passwordless agent path is not built: the package has no
+For an enrolled harness that a rule grants, the broker mints the entry for
 .B xudo\-gate\-nopass
-and installs no
+instead, and
+.B xudo
+runs
+.B sudo \-n
+on it: sudo never asks a password there, it refuses.
+The package installs no
 .B NOPASSWD
-rule.
+rule naming that file, so out of the box every such run is refused with
+"a password is required", and
+.B xudo
+says the passwordless agent path is not installed.
+It never retries with a password, and it refuses that path under
+.BR doas .
+A service harness that no rule grants is refused with
+.B harness_not_granted
+and exit status 17: it has no password to type.
 .PP
 This release is a beta and has not been externally audited.
 .SH OPTIONS

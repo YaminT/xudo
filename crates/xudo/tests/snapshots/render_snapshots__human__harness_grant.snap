@@ -2,11 +2,10 @@
 source: crates/xudo/tests/render_snapshots.rs
 expression: "render::human(&decision)"
 ---
-ALLOW, after a human confirms
+ALLOW
   command   /usr/bin/systemctl restart nginx.service
   action    xudo.svc.restart
   rule      snapshot-grant.toml:3
-  confirm   an enrolled agent requested a privileged action and no rule grants it to this harness
 
   trace
     canonicalized: unchanged (restart nginx.service)
