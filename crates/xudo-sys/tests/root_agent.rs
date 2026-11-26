@@ -163,8 +163,13 @@ fn request(account: &str) -> EnrolRequest {
 }
 
 fn enrol(machine: &Machine, account: &str) -> Result<(), AgentError> {
-    let scan =
-        scan_account(&LiveHost, account, &Input::default(), None).map_err(AgentError::Refused)?;
+    // As `xudo agent enrol` calls it: the machine's own sudo is detected, so the
+    // shipped `/etc/sudoers.d/xudo` (which names `%xudo`) is the one exemption.
+    let managed = detect(&HostProbe)
+        .ok()
+        .and_then(|backend| managed_snippet(Some(&backend)));
+    let scan = scan_account(&LiveHost, account, &Input::default(), managed.as_deref())
+        .map_err(AgentError::Refused)?;
     let plan = plan_enrol(&request(account), scan, &machine.real, machine)?;
     apply_enrol(&plan, &machine.real, machine)
 }
