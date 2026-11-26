@@ -496,6 +496,17 @@ fn write_entry_as(
     program: &str,
     argv: Vec<String>,
 ) -> String {
+    write_entry_edited(pin, uid, generation_offset, (action, program, argv), |_| {})
+}
+
+/// [`write_entry_as`], with `edit` applied to the entry before it is written.
+fn write_entry_edited(
+    pin: (u32, u64),
+    uid: u32,
+    generation_offset: u64,
+    (action, program, argv): (&str, &str, Vec<String>),
+    edit: impl FnOnce(&mut PendingRequest),
+) -> String {
     let nonce = format!(
         "{:064x}",
         (u128::from(std::process::id()) << 64)
@@ -536,6 +547,8 @@ fn write_entry_as(
         queue_id: None,
         operation: None,
     };
+    let mut entry = entry;
+    edit(&mut entry);
     let path = format!("{SPOOL_DIR}/{nonce}");
     root_file(&path, entry.to_json().as_bytes(), 0o600);
     nonce
@@ -663,6 +676,157 @@ fn an_agent_flood_leaves_the_human_path_running() {
     assert!(after.contains("/usr/bin/id"), "{after}");
 
     let _ = fs::remove_file(GATE_NOPASS);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    remove_snippet();
+}
+
+const G1E_TREE: &str = "/var/lib/xudo-g1e-nopass";
+const G1E_RULES: &str = "/etc/xudo/rules.d/50-g1e-remove.toml";
+/// A `NOPASSWD` line for the `-nopass` file. It exists only here, in this
+/// throwaway container, and is removed when the test ends: the package and
+/// every install path ship none (`the_package_ships_no_nopasswd_line`).
+const LANE_ONLY_NOPASS_SUDOERS: &str = "/etc/sudoers.d/xudo-g1e-lane-only";
+
+/// `sudo -n` on the `-nopass` file, as the unprivileged account.
+fn through_sudo_n_nopass() -> xudo_sys::Output {
+    run_capture(
+        "/usr/sbin/runuser",
+        &["-u", USER, "--", "/usr/bin/sudo", "-n", GATE_NOPASS],
+        None,
+    )
+    .unwrap()
+}
+
+/// A remove-path entry for `target`, pinned to this test, minted for `via`.
+/// A `harness` entry carries the attestation the broker would have stored for
+/// a `codex` scope.
+fn write_remove_entry(target: &str, via: xudo_gate::request::Via) -> String {
+    write_entry_edited(
+        own_pin(),
+        id_of(&["-u"]),
+        0,
+        (
+            "lane.g1e-clean",
+            xudo_wire::OPERATION_PROGRAM,
+            vec![target.to_owned()],
+        ),
+        |entry| {
+            entry.via = via;
+            entry.operation = Some(xudo_gate::request::RequestedOp {
+                op: "remove-path".to_owned(),
+                target: target.as_bytes().to_vec(),
+                dry_run: false,
+            });
+            if via == xudo_gate::request::Via::Harness {
+                entry.attested_class =
+                    xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 4242 };
+                entry.attested_scope_id = Some(4242);
+                entry.boot_id = Some(
+                    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                        .unwrap()
+                        .trim()
+                        .to_owned(),
+                );
+                entry.attested_harness = Some("codex".to_owned());
+            }
+        },
+    )
+}
+
+/// A remove-path the rule grants to `codex`, through the real `-nopass` file
+/// and a real `sudo -n` that a lane-only `NOPASSWD` line lets through without
+/// a password: the gate still removes nothing, because the kernel does not
+/// attest this caller as a live harness (no scope can be made in this
+/// container; the granted run is the systemd lane's, G1f). A password entry
+/// through `-nopass` is refused too. Then the same password entry through the
+/// password gate removes the file as uid 0, so the refusals are the gate's,
+/// not a broken setup.
+#[test]
+fn a_nopass_remove_path_needs_a_live_granted_harness_even_past_a_nopasswd_line() {
+    if !begin_root_test(
+        "a_nopass_remove_path_needs_a_live_granted_harness_even_past_a_nopasswd_line",
+    ) {
+        return;
+    }
+    let _journal = install_everything();
+    // No watcher on the human path, so the control needs only the password.
+    root_file(CONFIG_FILE, b"", 0o644);
+    let _ = fs::remove_file(GATE_NOPASS);
+    fs::copy(GATE, GATE_NOPASS).unwrap();
+    fs::set_permissions(GATE_NOPASS, Permissions::from_mode(0o755)).unwrap();
+    chown(GATE_NOPASS, Some(0), Some(0)).unwrap();
+    let _gate_guard = DeleteOnDrop(GATE_NOPASS.into());
+    root_dir(RATE_DIR, 0o700);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let _ = fs::remove_dir_all(G1E_TREE);
+    root_dir(G1E_TREE, 0o755);
+    let target = format!("{G1E_TREE}/cache");
+    root_file(&target, b"build output", 0o644);
+    let user = id_of(&["-u", USER]);
+    chown(&target, Some(user), Some(user)).unwrap();
+    root_file(
+        G1E_RULES,
+        format!(
+            "[[operation]]\nid = \"lane.g1e-clean\"\nop = \"remove-path\"\nunder = \"{G1E_TREE}\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"codex\"]\noutcome = \"allow\"\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    let _rules_guard = DeleteOnDrop(G1E_RULES.into());
+    root_file(
+        LANE_ONLY_NOPASS_SUDOERS,
+        format!("{USER} ALL=(root) NOPASSWD: {GATE_NOPASS} \"\"\n").as_bytes(),
+        0o440,
+    );
+    let _sudoers_guard = DeleteOnDrop(LANE_ONLY_NOPASS_SUDOERS.into());
+
+    // The line works: with nothing minted, `sudo -n` reaches the gate without a
+    // password, and the gate itself refuses.
+    let empty = through_sudo_n_nopass();
+    assert!(!empty.success);
+    assert!(
+        empty.stderr.contains("gate_no_pending_request"),
+        "sudo did not reach the gate: {empty:?}"
+    );
+
+    // A harness entry, for a caller the kernel does not attest as one.
+    let harness = write_remove_entry(&target, xudo_gate::request::Via::Harness);
+    let refused = through_sudo_n_nopass();
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.stderr.contains("gate_mode_not_an_enrolled_agent"),
+        "{refused:?}"
+    );
+    assert!(Path::new(&target).exists(), "the walk ran under -nopass");
+    assert!(entry_exists(&harness), "a refused entry was consumed");
+    clear_spool();
+
+    // A password entry through the passwordless file.
+    let password = write_remove_entry(&target, xudo_gate::request::Via::Auth);
+    let wrong = through_sudo_n_nopass();
+    assert!(!wrong.success, "{wrong:?}");
+    assert!(wrong.stderr.contains("gate_mode_wrong_via"), "{wrong:?}");
+    assert!(Path::new(&target).exists());
+    assert!(entry_exists(&password));
+
+    // The control: the same entry through the password gate, with the password.
+    let ran = through_sudo();
+    assert!(ran.success, "{ran:?}");
+    assert!(
+        !Path::new(&target).exists(),
+        "the password path removed nothing"
+    );
+    assert!(Path::new(G1E_TREE).exists(), "the tree root was removed");
+    assert!(!entry_exists(&password));
+    let log = fs::read_to_string(AUDIT_LOG).unwrap();
+    assert!(log.contains("via=auth"), "{log}");
+
+    let _ = fs::remove_dir_all(G1E_TREE);
     for entry in fs::read_dir(RATE_DIR).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
     }

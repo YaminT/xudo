@@ -361,8 +361,8 @@ pub enum TraceStep {
         /// The rule source.
         source: String,
     },
-    /// A typed operation matched. The password path still applies; a harness
-    /// label on the rule is not a grant.
+    /// A typed operation matched. The password path applies unless a
+    /// [`TraceStep::HarnessGranted`] follows.
     OperationMatched {
         /// The operation id.
         action: String,

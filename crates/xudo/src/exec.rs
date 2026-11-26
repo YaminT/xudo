@@ -284,31 +284,42 @@ fn plan_paced(
                 let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
                 return Err(ExitCode::Unusable);
             };
-            // Only ever run one of the two compiled-in gate files.
-            let gate = if minted.gate == GATE_AUTH {
-                GATE_AUTH
-            } else if minted.gate == GATE_NOPASS {
-                GATE_NOPASS
-            } else {
-                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
-                return Err(ExitCode::Unusable);
-            };
-            let doas = backend == "/usr/bin/doas";
-            if gate == GATE_NOPASS && doas {
-                let _ = writeln!(
-                    err,
-                    "xudo: the passwordless agent path needs sudo or sudo-rs, and this host \
-                     has doas; refusing"
-                );
-                return Err(ExitCode::Unusable);
-            }
-            Ok(ExecPlan {
-                backend,
-                gate,
-                spawn: doas || gate == GATE_NOPASS,
-            })
+            gate_plan(&minted.gate, backend, err)
         }
     }
+}
+
+/// The plan for the gate file the broker named.
+///
+/// Only ever one of the two compiled-in gate files, and `-nopass` never
+/// through doas, which has no `-n` that refuses instead of prompting.
+fn gate_plan(
+    named: &str,
+    backend: &'static str,
+    err: &mut dyn Write,
+) -> Result<ExecPlan, ExitCode> {
+    let gate = if named == GATE_AUTH {
+        GATE_AUTH
+    } else if named == GATE_NOPASS {
+        GATE_NOPASS
+    } else {
+        let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
+        return Err(ExitCode::Unusable);
+    };
+    let doas = backend == "/usr/bin/doas";
+    if gate == GATE_NOPASS && doas {
+        let _ = writeln!(
+            err,
+            "xudo: the passwordless agent path needs sudo or sudo-rs, and this host \
+             has doas; refusing"
+        );
+        return Err(ExitCode::Unusable);
+    }
+    Ok(ExecPlan {
+        backend,
+        gate,
+        spawn: doas || gate == GATE_NOPASS,
+    })
 }
 
 fn valid_request_id(id: &str) -> bool {
@@ -928,12 +939,13 @@ pub fn remove_path_request(target: &[u8], dry_run: bool) -> Result<BrokerRequest
     })
 }
 
-/// Turns a broker answer into the password-gate plan.
+/// Turns a broker answer into the gate plan: the password gate, or `-nopass`
+/// for a harness the operation grants.
 ///
 /// # Errors
 ///
-/// A refusal, a denial, a missing mint, an unexpected gate, or an answer that
-/// belongs to another question.
+/// A refusal, a denial, a missing mint, an unexpected gate, `-nopass` through
+/// doas, or an answer that belongs to another question.
 pub fn remove_plan_from_answer(
     cli: &Cli,
     target: &[u8],
@@ -972,18 +984,11 @@ pub fn remove_plan_from_answer(
                 let _ = writeln!(err, "xudo: permitted, but the broker minted no entry");
                 return Err(ExitCode::Unusable);
             };
-            if minted.gate != GATE_AUTH {
-                let _ = writeln!(err, "xudo: the broker named an unexpected gate; refusing");
-                return Err(ExitCode::Unusable);
-            }
             let Some(backend) = selected_backend(probe, err) else {
                 return Err(ExitCode::Unusable);
             };
-            Ok(ExecPlan {
-                backend,
-                gate: GATE_AUTH,
-                spawn: backend == "/usr/bin/doas",
-            })
+            // A harness the operation grants is minted for `-nopass`.
+            gate_plan(&minted.gate, backend, err)
         }
     }
 }
@@ -3618,7 +3623,7 @@ mod tests {
             target,
             &remove_response(Answer::Decided {
                 decision: allow(),
-                minted: Some(minted("/usr/libexec/xudo/xudo-gate-nopass")),
+                minted: Some(minted("/usr/libexec/xudo/xudo-gate-other")),
             }),
             &SUDO,
             &mut out,
@@ -3630,6 +3635,39 @@ mod tests {
                 .unwrap()
                 .contains("unexpected gate")
         );
+
+        // A harness the operation grants: `sudo -n` on `-nopass`, as a child,
+        // so a missing sudoers line is explained and never retried with a
+        // password. Through doas it is refused.
+        err.clear();
+        let nopass = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_NOPASS)),
+            }),
+            &SUDO,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(nopass.gate, GATE_NOPASS);
+        assert_eq!(nopass.backend_args(), ["-n", GATE_NOPASS]);
+        assert!(nopass.spawn);
+        let nopass_doas = remove_plan_from_answer(
+            &cli,
+            target,
+            &remove_response(Answer::Decided {
+                decision: allow(),
+                minted: Some(minted(GATE_NOPASS)),
+            }),
+            &Has(&["/usr/bin/doas"]),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(nopass_doas, Err(ExitCode::Unusable));
+        assert!(String::from_utf8(err.clone()).unwrap().contains("doas"));
 
         err.clear();
         let no_backend = remove_plan_from_answer(

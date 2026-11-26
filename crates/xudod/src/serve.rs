@@ -365,9 +365,10 @@ fn serve_request(
         request,
         policy,
     };
-    // The one place a `via = harness` entry is minted: a run question from a
-    // live harness that a rule grants. Every other question, and every other
-    // caller, mints for the password gate or not at all.
+    // One of the two places a `via = harness` entry is minted, both through
+    // `exec_path`: a run question (here) or a remove-path (`serve_remove`)
+    // from a live harness that a rule grants. Every other question, and every
+    // other caller, mints for the password gate or not at all.
     match path {
         ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
         ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
@@ -3750,8 +3751,10 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
     BrokerRequest::parse(&bytes).map_err(|error| Refusal::from(&error))
 }
 
-/// A remove-path is re-decided from the operation table and minted only for
-/// the password gate. It is not queued and it does not ask for a watch.
+/// A remove-path is re-decided from the operation table. It is minted for
+/// `-nopass` only where [`exec_path`] says so (a live harness the operation
+/// grants), refused for a service harness it does not grant, and otherwise
+/// minted for the password gate. It is never queued.
 fn serve_remove(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
@@ -3774,7 +3777,33 @@ fn serve_remove(
     policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
     let passwd = policy.passwd.as_str();
     let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
+    // The gate re-reads the marker; this is the early, clean refusal.
+    if let xudo_policy::Classification::EnrolledAgent { agent_id, .. } = &caller.classification {
+        policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
+    }
     let decision = crate::policy::decide_remove(&policy, &caller, &request);
+    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
+    let evaluated = Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    };
+    // The other half of the one mint-site family: the same `exec_path`
+    // decides, for an operation the rule grants this live harness.
+    match path {
+        ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
+        ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::Password => {}
+    }
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
     if !decision.verdict.is_permitted() {
         let _ = platform.audit.append(&|previous| {
             decided_under(
@@ -11315,6 +11344,8 @@ under = "/srv/app/build"
 recursive = true
 max-depth = 4
 max-entries = 10
+harness = ["codex"]
+outcome = "allow"
 "#;
 
     /// Root's policy with [`RULES`], [`GRANT_RULES`] and `harness` registered
@@ -11479,6 +11510,23 @@ max-entries = 10
         ]
     }
 
+    /// The work a harness entry carries: the action the rule grants, or the
+    /// operation, for the one target asked and nothing to exec.
+    fn assert_granted_work(kind: usize, entry: &PendingRequest) {
+        if kind == 0 {
+            assert_eq!(entry.action, "xudo.svc.status");
+            assert_eq!(entry.argv, ["status", "nginx.service"]);
+            assert_eq!(entry.operation, None);
+        } else {
+            assert_eq!(entry.action, "web.clean-build");
+            assert_eq!(entry.program, xudo_wire::OPERATION_PROGRAM);
+            assert_eq!(entry.argv, ["/srv/app/build/cache"]);
+            let operation = entry.operation.as_ref().unwrap();
+            assert_eq!(operation.target, b"/srv/app/build/cache");
+            assert!(!operation.dry_run);
+        }
+    }
+
     #[test]
     fn only_the_exec_path_for_a_live_harness_mints_via_harness() {
         let questions = every_question_for_a_grant();
@@ -11522,15 +11570,14 @@ max-entries = 10
                     .iter()
                     .filter(|entry| entry.via == xudo_gate::request::Via::Harness)
                     .collect();
-                if question_kind(question) == 0 {
+                if matches!(question_kind(question), 0 | 12) {
                     assert_eq!(harness_entries.len(), 1, "{question:?}");
                     let entry = harness_entries[0];
                     assert_eq!(entry.deadline.0, NOW + HARNESS_TTL_MILLIS);
                     assert!(!entry.needs_watch);
                     assert_eq!(entry.attested_harness.as_deref(), Some("codex"));
                     assert_eq!(entry.attested_scope_id, Some(44));
-                    assert_eq!(entry.action, "xudo.svc.status");
-                    assert_eq!(entry.argv, ["status", "nginx.service"]);
+                    assert_granted_work(question_kind(question), entry);
                     assert_eq!(
                         entry.generation,
                         host.policy.answer.as_ref().unwrap().rules.generation.id()
@@ -11602,6 +11649,149 @@ max-entries = 10
             "{record:?}"
         );
         assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+    }
+
+    /// [`granting_host`] with the operation's harness list rewritten.
+    fn remove_host(harness: &str, operation_labels: &str) -> (Host, Scope) {
+        let (mut host, scope) = granting_host(Some(harness));
+        let registry: Vec<HarnessFile> = vec![HarnessFile {
+            name: b"codex.toml".to_vec(),
+            bytes: harness.as_bytes().to_vec(),
+        }];
+        let rules = load_policy(
+            vec![RuleFile {
+                name: b"20-grant.toml".to_vec(),
+                bytes: GRANT_RULES
+                    .replace(
+                        "max-entries = 10\nharness = [\"codex\"]",
+                        &format!("max-entries = 10\nharness = [{operation_labels}]"),
+                    )
+                    .into_bytes(),
+            }],
+            &registry,
+        )
+        .unwrap();
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules = rules;
+        host.policy.answer = Ok(loaded);
+        (host, scope)
+    }
+
+    #[test]
+    fn a_live_listed_harness_gets_a_nopass_remove_path_entry() {
+        for harness in [SERVICE_CODEX, SESSION_CODEX] {
+            let (mut host, scope) = granting_host(Some(harness));
+            let (served, answer, entries) = served_by(
+                &mut host,
+                harness_identity(scope),
+                remove_question(b"/srv/app/build/cache", false),
+            );
+            assert_eq!(served, Served::Minted);
+            assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+            let (decision, _) = decision_of(&answer).unwrap();
+            assert_eq!(
+                decision
+                    .harness_grant
+                    .as_ref()
+                    .map(xudo_policy::ActionId::as_str),
+                Some("web.clean-build")
+            );
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].via, xudo_gate::request::Via::Harness);
+            let record = host.audit.records().last().unwrap().clone();
+            assert!(record.evidence.contains(&"via=harness".to_owned()));
+        }
+    }
+
+    #[test]
+    fn an_unlisted_harness_gets_no_nopass_remove_path_entry() {
+        // The operation lists another label: a session harness is minted for
+        // the password gate, a service harness (no password) is refused.
+        for (harness, expect_minted) in [(SESSION_CODEX, true), (SERVICE_CODEX, false)] {
+            let (mut host, scope) = remove_host(harness, "\"claude\"");
+            let (served, answer, entries) = served_by(
+                &mut host,
+                harness_identity(scope),
+                remove_question(b"/srv/app/build/cache", false),
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.via == xudo_gate::request::Via::Auth),
+                "{entries:?}"
+            );
+            assert_ne!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+            if expect_minted {
+                assert_eq!(served, Served::Minted);
+                assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+            } else {
+                assert_eq!(served, Served::Decided);
+                assert!(entries.is_empty());
+                assert_eq!(
+                    answer,
+                    BrokerResponse::harness_not_granted(Some("web.clean-build")).answer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_remove_path_grant_is_withheld_from_nopass_under_confirm_human_path() {
+        // A watch is a confirmation a harness cannot give: a session harness
+        // goes to the password gate with a watch, nothing goes to `-nopass`.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.settings.confirm_human_path = true;
+        host.policy.answer = Ok(loaded);
+        let (served, answer, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/srv/app/build/cache", false),
+        );
+        assert_eq!(served, Served::Minted);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            std::mem::discriminant(&answer),
+            std::mem::discriminant(&xudo_wire::Answer::Pending {
+                id: entries[0].nonce.clone(),
+                expires_in_ms: 0,
+            })
+        );
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+        assert!(entries[0].needs_watch);
+    }
+
+    #[test]
+    fn a_frozen_harness_gets_no_remove_path_entry() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        host.freeze_file
+            .publish(
+                &xudo_gate::policy::harness_marker_name("codex").unwrap(),
+                MARKER,
+            )
+            .unwrap();
+        let (served, answer, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/srv/app/build/cache", false),
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(entries.is_empty());
+        let (decision, minted) = decision_of(&answer).unwrap();
+        assert_eq!(decision.denial, Some(xudo_policy::DenialCode::Frozen));
+        assert!(minted.is_none());
+    }
+
+    #[test]
+    fn a_harness_remove_path_outside_the_tree_mints_nothing() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (served, _, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/etc/passwd", false),
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(entries.is_empty());
     }
 
     #[test]

@@ -16,11 +16,13 @@
 #
 #   owners = ["agent", "www-data"]
 #
-# `harness` is parsed and checked against /etc/xudo/harnesses.d. It is not a
-# grant. Leave it out until that file exists. Harness use is planned. This
-# release runs the operation only through the password path:
+# `harness` with `outcome = "allow"` lets a live enrolled harness from
+# /etc/xudo/harnesses.d run this operation without a password, through the
+# -nopass gate, which does nothing until root adds a sudoers line for it. The
+# walk is the same. Everyone else uses the password path:
 #
 #   harness = ["codex"]
+#   outcome = "allow"
 #
 # Then: xudo op remove-path /srv/app/build/cache
 #       xudo op remove-path --dry-run /srv/app/build/cache

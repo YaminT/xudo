@@ -594,7 +594,7 @@ fn check_verdict(
 }
 
 /// The refusal for an entry that does not belong to the running gate file.
-fn mode_refusal(mode: GateMode, reason: ModeRefusal) -> Refusal {
+pub(crate) fn mode_refusal(mode: GateMode, reason: ModeRefusal) -> Refusal {
     Refusal::Mode {
         mode: match mode {
             GateMode::Auth => "-auth",
