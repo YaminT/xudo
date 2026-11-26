@@ -50,6 +50,9 @@ ProtectHostname=yes
 # No network, and no socket but a Unix one; the connection arrives open.
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
+# Belt and braces with PrivateNetwork=: no IP traffic either way. It also pays
+# back the exposure score RestrictSUIDSGID= used to cover (see below).
+IPAddressDeny=any
 
 RestrictNamespaces=yes
 RestrictRealtime=yes

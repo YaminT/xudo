@@ -312,6 +312,7 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "ProtectHostname",
             "PrivateNetwork",
             "RestrictAddressFamilies",
+            "IPAddressDeny",
             "RestrictNamespaces",
             "RestrictRealtime",
             "LockPersonality",
@@ -410,6 +411,7 @@ fn the_broker_has_no_network_and_no_socket_but_a_unix_one() {
         value(&service, "Service", "RestrictAddressFamilies"),
         "AF_UNIX"
     );
+    assert_eq!(value(&service, "Service", "IPAddressDeny"), "any");
 }
 
 #[test]
