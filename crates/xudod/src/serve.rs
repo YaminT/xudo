@@ -432,7 +432,10 @@ fn harness_not_granted(
     // Nothing is enabled by this record, so a sink that cannot take it does
     // not change the answer.
     let _ = platform.audit.append(&|previous| {
-        decided_under(previous, decision, caller, identity, request, policy, None)
+        let record = decided_under(previous, decision, caller, identity, request, policy, None);
+        let mut evidence = record.evidence.clone();
+        evidence.push("refused=harness_not_granted".to_owned());
+        record.with_evidence(evidence)
     });
     let action = decision.action.as_ref().map(xudo_policy::ActionId::as_str);
     answer(
@@ -11406,7 +11409,32 @@ max-entries = 10
                     schema_version: WIRE_SCHEMA_VERSION,
                     question: question.clone(),
                 };
-                let (_, answer, entries) = served_by(&mut host, harness_identity(scope), request);
+                // The state each question needs to get as far as it can: a
+                // queued item to claim, a pending entry to answer, a freeze
+                // marker to lift.
+                let spool = if question_kind(question) == 4 {
+                    FakeSpool::new().with_file(
+                        NONCE.as_bytes().to_vec(),
+                        shown_entry().to_json().into_bytes(),
+                    )
+                } else {
+                    FakeSpool::new()
+                };
+                let queued = review_entry(&host, UID + 1, NONCE);
+                plant_queue(&mut host, &queued);
+                host.freeze_file
+                    .publish(&xudo_gate::policy::freeze_marker_name(0), MARKER)
+                    .unwrap();
+                let conn = connection(Ok(request.to_json().into_bytes()));
+                let served = serve_request(
+                    &conn,
+                    &mut host.platform(),
+                    &spool,
+                    harness_identity(scope),
+                    request,
+                );
+                let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+                let entries = entries_in(&spool);
                 let harness_entries: Vec<_> = entries
                     .iter()
                     .filter(|entry| entry.via == xudo_gate::request::Via::Harness)
@@ -11431,9 +11459,41 @@ max-entries = 10
                         "{question:?} minted {entries:?}"
                     );
                     assert_ne!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+                    // A harness is no reviewer, watcher or owner: with the
+                    // state in place it is still refused, and nothing it
+                    // asked for was done.
+                    if matches!(question_kind(question), 4 | 6 | 8) {
+                        assert_ne!(served, Served::Minted, "{question:?}");
+                    }
+                    if question_kind(question) == 8 {
+                        assert_eq!(
+                            stored_queue(&host)[0].state,
+                            crate::queue::QueueState::Pending
+                        );
+                    }
+                    if question_kind(question) == 6 {
+                        assert_eq!(
+                            host.freeze_file.files().len(),
+                            1,
+                            "a harness lifted a freeze"
+                        );
+                    }
                 }
             }
         }
+        // A reviewer's claim reaches the mint with the state in place, and
+        // mints for the password gate, never for the harness.
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        assert_eq!(served, Served::Minted);
+        let minted = entries_in(&spool);
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].via, xudo_gate::request::Via::Auth);
         // The same run question from a human, and from an unattested caller,
         // is minted for the password gate.
         for identity in [human_identity(), test_identity(PID, START, 0, 0)] {
@@ -11522,6 +11582,12 @@ max-entries = 10
         let record = host.audit.records().last().unwrap().clone();
         assert_eq!(record.action.as_deref(), Some("xudo.svc.restart"));
         assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&"refused=harness_not_granted".to_owned()),
+            "{record:?}"
+        );
 
         // A session harness runs as a person, who can type the password.
         let (mut host, scope) = granting_host(Some(SESSION_CODEX));

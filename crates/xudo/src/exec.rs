@@ -244,15 +244,20 @@ fn plan_paced(
             let action = detail.as_deref().unwrap_or("none");
             let _ = writeln!(
                 err,
-                "xudo: not granted (action {}): {remediation}",
-                action.escape_debug()
+                "xudo: not granted (action {}): {}",
+                action.escape_debug(),
+                broker_text(&remediation)
             );
             Err(ExitCode::Denied)
         }
         Answer::Refused {
             code, remediation, ..
         } => {
-            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            let _ = writeln!(
+                err,
+                "xudo: the broker refused ({code:?}): {}",
+                broker_text(&remediation)
+            );
             Err(ExitCode::Unusable)
         }
         Answer::Pending { id, expires_in_ms } => await_approval(
@@ -742,7 +747,11 @@ fn queued_plan(
         Answer::Refused {
             code, remediation, ..
         } => {
-            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            let _ = writeln!(
+                err,
+                "xudo: the broker refused ({code:?}): {}",
+                broker_text(&remediation)
+            );
             Err(ExitCode::Unusable)
         }
         Answer::Pending { .. }
@@ -800,6 +809,15 @@ fn claim_secret(minted: &xudo_wire::Minted) -> String {
         Some(token) if !token.is_empty() => token.to_owned(),
         Some(_) | None => minted.nonce.clone(),
     }
+}
+
+/// Broker text bound for the terminal, with control characters made visible.
+fn broker_text(text: &str) -> String {
+    let limits = term_sanitize::Limits {
+        max_cols: 4096,
+        max_lines: 1,
+    };
+    term_sanitize::display_str(text, limits).text
 }
 
 /// Prints the sanitized command and requires the confirm word on `input`.
@@ -928,7 +946,11 @@ pub fn remove_plan_from_answer(
         Answer::Refused {
             code, remediation, ..
         } => {
-            let _ = writeln!(err, "xudo: the broker refused ({code:?}): {remediation}");
+            let _ = writeln!(
+                err,
+                "xudo: the broker refused ({code:?}): {}",
+                broker_text(remediation)
+            );
             Err(ExitCode::Unusable)
         }
         Answer::Pending { .. }
@@ -2373,6 +2395,24 @@ mod tests {
             assert_eq!(result, Err(ExitCode::Denied));
             assert!(out.is_empty());
             assert!(err.contains(shown), "{err}");
+            assert!(!err.contains('\u{1b}'), "{err}");
+        }
+    }
+
+    #[test]
+    fn broker_refusal_text_cannot_inject_terminal_controls() {
+        for code in [RefusalCode::HarnessNotGranted, RefusalCode::BrokerUnusable] {
+            let reply = BrokerResponse {
+                schema_version: xudo_wire::WIRE_SCHEMA_VERSION,
+                answer: Answer::Refused {
+                    code,
+                    remediation: "fix it\u{1b}[2J now".to_owned(),
+                    detail: None,
+                },
+            };
+            let (result, _, err) = against(reply.to_json().into_bytes(), &SUDO, &argv());
+            assert!(result.is_err());
+            assert!(err.contains("fix it"), "{err}");
             assert!(!err.contains('\u{1b}'), "{err}");
         }
     }

@@ -208,7 +208,9 @@ fn sudo_n_on_the_nopass_gate_asks_a_password_until_e8() {
         return;
     }
     execute(&plan(), &HostInstallOps::system(), &NoProbe).unwrap();
-    let _ = run_capture("/usr/sbin/groupadd", &["--system", XUDO_AGENT_GROUP], None);
+    // Only a group this test made is removed again.
+    let made_group = run_capture("/usr/sbin/groupadd", &["--system", XUDO_AGENT_GROUP], None)
+        .is_ok_and(|output| output.success);
     let joined = run_capture("/usr/sbin/usermod", &["-aG", XUDO_AGENT_GROUP, USER], None).unwrap();
     assert!(joined.success, "{}", joined.stderr);
     // A stand-in at the real path, so `sudo` finds a command and refuses on
@@ -229,6 +231,9 @@ fn sudo_n_on_the_nopass_gate_asks_a_password_until_e8() {
         fs::remove_file(GATE_NOPASS).unwrap();
     }
     let _ = run_capture("/usr/bin/gpasswd", &["-d", USER, XUDO_AGENT_GROUP], None);
+    if made_group {
+        let _ = run_capture("/usr/sbin/groupdel", &[XUDO_AGENT_GROUP], None);
+    }
     clean();
     assert!(
         !output.success,
