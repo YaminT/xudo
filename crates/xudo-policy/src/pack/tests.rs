@@ -6,7 +6,7 @@
 )]
 
 use super::*;
-use crate::files::load_rule_files;
+use crate::files::{MAX_TESTS, load_rule_files};
 use crate::rule::{MAX_TESTS_PER_FILE, RuleSetError};
 
 /// A pack for codex: one passwordless restart, its tests and a near miss.
@@ -1007,7 +1007,9 @@ fn matchers_with_too_many_examples_are_too_large_to_review() {
 
 #[test]
 fn rules_naming_too_many_commands_are_too_large_to_review() {
-    // Hand-written files, each with as many `[[test]]` tables as one may hold.
+    // Hand-written files, each with as many `[[test]]` tables as one may hold,
+    // and no more in all than the loader takes.
+    const { assert!((MAX_PROBES.div_ceil(MAX_TESTS_PER_FILE) + 1) * MAX_TESTS_PER_FILE <= MAX_TESTS) };
     let files: Vec<RuleFile> = (0..=MAX_PROBES.div_ceil(MAX_TESTS_PER_FILE))
         .map(|n| {
             let mut tests = String::new();

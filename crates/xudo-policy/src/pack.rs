@@ -391,7 +391,8 @@ pub const MAX_PACK_RULES: usize = if cfg!(miri) { 4 } else { 256 };
 /// The most distinct tokens one side's example commands are drawn from.
 pub const MAX_PROBE_TOKENS: usize = if cfg!(miri) { 64 } else { 4096 };
 /// The most commands the engine is asked about.
-pub const MAX_PROBES: usize = if cfg!(miri) { 64 } else { 4096 };
+// Under miri, below what the loader lets the files' tests reach.
+pub const MAX_PROBES: usize = if cfg!(miri) { 16 } else { 4096 };
 /// The most engine work a review may cost, in matcher steps: for every
 /// command asked about, every argument position of every action on its
 /// program, times the square of the command's length plus one, the bound of
