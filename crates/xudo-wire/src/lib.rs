@@ -184,7 +184,8 @@ pub enum Question {
         /// The last id of the previous page, or empty for the first page.
         after: String,
     },
-    /// Remove one path under a `remove-path` rule. Password path only.
+    /// Remove one path under a `remove-path` rule: the password gate, or
+    /// `-nopass` for a live harness the rule grants.
     ///
     /// The broker mints a spool entry. The gate walks the tree itself and does
     /// not exec [`OPERATION_PROGRAM`].

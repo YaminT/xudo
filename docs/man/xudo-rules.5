@@ -206,12 +206,16 @@ the first unlink. The final record cites that intent. A fatal signal such as
 .B SIGKILL
 can still terminate the gate during the walk; the intent record is the trace
 available for that interrupted walk.
-A
+With
 .B harness
-list is parsed and checked against the registry.
-It is not a grant.
-Harness use is planned.
-This release runs the operation only on the password path.
+and
+.BR "outcome = \(dqallow\(dq" ,
+a live enrolled agent whose label is listed runs the operation through
+.B xudo\-gate\-nopass
+without a password; it is the same walk, with the same tree, depth, entry
+cap and owners. Every other caller uses the password path. While
+.B confirm_human_path
+is on, the grant is withheld and a listed harness uses the password path too.
 .TP
 .B id
 Stable identifier, unique across actions, deny rules, and operations.
@@ -277,6 +281,10 @@ The walk stops before the next removal and reports a partial result.
 .B owners
 Account names whose entries may be removed.
 Omit the key to allow any owner except root.
+A rule that lists a
+.B harness
+must set it: a grant without a password never falls back to any owner, and the
+rule does not load without it.
 An empty list does not load.
 A name that is not an account in the passwd text the broker read fails closed
 when the request is decided.
@@ -284,11 +292,23 @@ An owner that resolves to uid 0 is refused.
 Root-owned entries are kept when the key is omitted.
 .TP
 .B harness
-Labels from the root-owned harness registry.
+Labels from the root-owned harness registry that may run the operation
+without a password.
 A label missing from the registry loads and grants nothing;
 .B "xudo check"
 refuses it.
-The list does not authorize the operation.
+.TP
+.B outcome
+Required when
+.B harness
+is set, and only
+.BR allow :
+no queue runs an operation, so
+.B ask\-human
+does not load, and neither does an
+.B outcome
+with no
+.BR harness .
 .PP
 The target is one absolute path under
 .BR under .

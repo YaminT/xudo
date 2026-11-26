@@ -187,6 +187,7 @@ fn tree(id: &str, under: &str, max_depth: u32) -> xudo_policy::Operation {
         max_entries: 100,
         owners: None,
         harness: Vec::new(),
+        outcome: xudo_policy::rule::Outcome::Unset,
         source: xudo_policy::rule::Source::default(),
     }
 }

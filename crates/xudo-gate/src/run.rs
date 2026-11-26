@@ -903,7 +903,7 @@ fn proceed(
     };
     crate::decide::validate_pending_identity(&pending_entry, &caller, &context)?;
     // A typed operation never opens the marker program and never execs.
-    // The password name was already required by `accept_invocation`.
+    // On `-nopass` it runs only what the rule grants this live harness.
     if let Some(requested) = pending_entry.operation.as_ref() {
         return run_typed_operation(
             host,
@@ -996,7 +996,7 @@ fn run_typed_operation(
         requested.dry_run,
         context.settings,
         passwd,
-        context.password_confirms,
+        context.mode,
     )
     .and_then(|work| count_nopass(&*host, progress).map(|()| work))?;
     // (Counted once, above: after the decision, before the entry is consumed.)
@@ -1025,6 +1025,7 @@ fn run_typed_operation(
             }
         })?;
     work.intent_sequence = Some(intent.seq().get());
+    work.planned_digest = Some(planned.digest);
     let report = match host.remove_path(&work.request) {
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
@@ -1584,6 +1585,8 @@ args = [
         remove: xudo_sys::FakeRemoveFs,
         /// Make the fake unlink seam assert that a durable intent exists.
         assert_intent_before_unlink: bool,
+        /// Add an entry under `cache` just before the real walk, after the dry run.
+        grow_before_walk: bool,
         /// The `-nopass` ledger.
         rate: FakeRate,
     }
@@ -1813,6 +1816,7 @@ args = [
                 harness_freeze_asked: std::cell::RefCell::new(Vec::new()),
                 remove: xudo_sys::FakeRemoveFs::new(),
                 assert_intent_before_unlink: false,
+                grow_before_walk: false,
                 rate: FakeRate::new(),
             }
         }
@@ -1906,6 +1910,16 @@ args = [
                         .records()
                         .iter()
                         .any(|record| { has_line(&record.evidence, "op=remove-path-intent") })
+                );
+            }
+            if self.grow_before_walk && !request.dry_run {
+                self.remove.add(
+                    &[b"srv", b"app", b"build", b"cache"],
+                    b"late",
+                    xudo_sys::remove::NodeKind::File,
+                    1000,
+                    0o644,
+                    1,
                 );
             }
             xudo_sys::remove_path(&mut self.remove, request)
@@ -3804,9 +3818,55 @@ max-entries = 10
         ));
         assert_eq!(records[1].decision, AuditDecision::Allowed);
         assert!(has_line(&records[1].evidence, "op=remove-path"));
+        assert!(has_line(
+            &records[1].evidence,
+            &format!("planned_digest={planned_digest}")
+        ));
+        assert!(has_line(&records[1].evidence, "matches_plan=true"));
         assert!(has_line(&records[1].evidence, "intent_seq=1"));
         assert!(has_line(&records[1].evidence, "severity=normal"));
         assert_eq!(records[1].outcome.kind(), "exited");
+    }
+
+    #[test]
+    fn a_tree_that_gains_an_entry_after_the_dry_run_is_recorded_as_off_plan() {
+        // Attack: the harness owns the target and adds entries between the
+        // gate's dry run and its walk, so the intent understates the removal.
+        use xudo_sys::remove::NodeKind;
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        host.remove.add(&[], b"srv", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv"], b"app", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv", b"app"], b"build", NodeKind::Dir, 0, 0o755, 0);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"cache",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        host.remove.add(
+            &[b"srv", b"app", b"build", b"cache"],
+            b"early",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        host.grow_before_walk = true;
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        let records = host.audit.records();
+        assert!(has_line(&records[0].evidence, "planned_count=2"));
+        assert!(has_line(&records[1].evidence, "count=3"));
+        assert!(has_line(&records[1].evidence, "matches_plan=false"));
     }
 
     #[test]
@@ -4669,5 +4729,347 @@ args = [
             exit.message
         );
         assert_eq!(exec_calls(&human), 1);
+    }
+
+    // ---- G1e: a granted remove-path on the -nopass gate ---------------------
+
+    const GRANTED_REMOVE_RULE: &str = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+owners = ["agent"]
+harness = ["codex"]
+outcome = "allow"
+"#;
+
+    /// `text` as the only rule file, over `harnesses`.
+    fn remove_rules(text: &str, harnesses: &[(&[u8], &[u8])]) -> LoadedRuleSet {
+        load_policy(
+            vec![RuleFile {
+                name: b"50-remove.toml".to_vec(),
+                bytes: text.as_bytes().to_vec(),
+            }],
+            &harnesses
+                .iter()
+                .map(|(name, bytes)| HarnessFile {
+                    name: name.to_vec(),
+                    bytes: bytes.to_vec(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    /// What the broker mints for a live `codex` asking to remove `target`.
+    fn harness_remove_entry(generation: u64, target: &[u8]) -> PendingRequest {
+        let mut entry = remove_entry(GRANTED_REMOVE_RULE, target, false);
+        entry.generation = generation;
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        entry
+    }
+
+    /// The `-nopass` file run by a live `codex`, under `rules`, over the
+    /// planted tree and a sibling of the target the entry must not reach.
+    fn harness_remove_host(
+        entry: PendingRequest,
+        rules: LoadedRuleSet,
+    ) -> (FakeHost, Rc<FakeSpool>) {
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let mut policy = remove_policy(GRANTED_REMOVE_RULE);
+        policy.rules = rules;
+        host.policy = Ok(policy);
+        plant_tree(&mut host);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"keep",
+            xudo_sys::remove::NodeKind::File,
+            1000,
+            0o644,
+            2,
+        );
+        (host, spool)
+    }
+
+    fn codex_registry() -> [(&'static [u8], &'static [u8]); 1] {
+        [(b"codex.toml", CODEX_ENTRY)]
+    }
+
+    /// Nothing under the tree was touched and the entry is still there.
+    fn assert_nothing_removed(host: &FakeHost, spool: &FakeSpool) {
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+        assert!(consumed(spool).is_empty());
+        assert_eq!(exec_calls(host), 0);
+    }
+
+    #[test]
+    fn a_listed_harness_runs_a_granted_remove_path_on_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        // The entry names one path: its sibling stays.
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+        assert_eq!(host.remove.unlinked().len(), 1);
+        // Counted once by the ledger, for codex under its live uid.
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: Some("codex".to_owned())
+            }]
+        );
+        let records = host.audit.records();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert!(has_line(&record.evidence, "via=harness"), "{record:?}");
+        }
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[1].evidence, "count=1"));
+        assert_eq!(*host.harness_freeze_asked.borrow(), ["codex"]);
+    }
+
+    #[test]
+    fn a_password_remove_path_records_via_auth() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        assert_eq!(run(&mut host, &auth()).status, 0);
+        assert!(has_line(&host.audit.records()[1].evidence, "via=auth"));
+    }
+
+    #[test]
+    fn an_unlisted_harness_is_refused_a_remove_path_on_nopass() {
+        for text in [
+            // Another label, the same tree.
+            GRANTED_REMOVE_RULE.replace("[\"codex\"]", "[\"claude\"]"),
+            // No harness at all: the password path only.
+            REMOVE_RULE.to_owned(),
+        ] {
+            let rules = remove_rules(&text, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+            assert_nothing_removed(&host, &spool);
+            assert_eq!(host.rate.keys.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_stale_registry_or_rule_generation_refuses_a_nopass_remove_path() {
+        let minted_under = remove_rules(GRANTED_REMOVE_RULE, &codex_registry())
+            .generation
+            .id();
+        let claude: &[u8] = b"label = \"claude\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        for changed in [
+            remove_rules(
+                GRANTED_REMOVE_RULE,
+                &[(b"codex.toml", CODEX_ENTRY), (b"claude.toml", claude)],
+            ),
+            remove_rules(
+                &GRANTED_REMOVE_RULE.replace("max-entries = 10", "max-entries = 9"),
+                &codex_registry(),
+            ),
+        ] {
+            assert_ne!(changed.generation.id(), minted_under);
+            let entry = harness_remove_entry(minted_under, b"/srv/app/build/cache");
+            let (mut host, spool) = harness_remove_host(entry, changed);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "request_stale_generation");
+            assert_nothing_removed(&host, &spool);
+        }
+    }
+
+    #[test]
+    fn a_nopass_remove_path_outside_its_tree_is_refused() {
+        for target in [
+            &b"/etc/passwd"[..],
+            b"/srv/app/build-evil/x",
+            b"/srv/app/build",
+        ] {
+            let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), target);
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let exit = run(&mut host, &nopass());
+            assert!(exit.message.contains("operation_refused"), "{exit:?}");
+            assert_nothing_removed(&host, &spool);
+        }
+    }
+
+    #[test]
+    fn a_nopass_entry_for_one_path_cannot_remove_another() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let mut entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        // The rendered argv the broker digested names `keep`; the operation
+        // names `cache`. Neither is removed.
+        entry.argv = vec!["/srv/app/build/keep".to_owned()];
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        let exit = run(&mut host, &nopass());
+        assert_ne!(exit.status, 0);
+        assert!(exit.message.contains("gate_failed_rules"), "{exit:?}");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn a_symlink_or_mount_inside_the_tree_is_not_crossed_under_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        // `box/link` is a symlink, `box/mnt` another device: a target through
+        // either is never reached, and a recursive remove of `box` leaves the
+        // mount and what is inside it.
+        let generation = rules.generation.id();
+        let through_link = harness_remove_entry(generation, b"/srv/app/build/box/link/x");
+        let (mut host, spool) = harness_remove_host(through_link, rules.clone());
+        plant_box(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(
+            host.remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"link"])
+        );
+        assert_eq!(consumed(&spool).len(), 1);
+
+        let whole = harness_remove_entry(generation, b"/srv/app/build/box");
+        let (mut host, _spool) = harness_remove_host(whole, rules);
+        plant_box(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 1, "{exit:?}");
+        assert!(exit.message.contains("partial"));
+        assert!(
+            host.remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"mnt", b"inside"])
+        );
+        assert!(
+            !host
+                .remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"link"])
+        );
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+    }
+
+    fn plant_box(host: &mut FakeHost) {
+        use xudo_sys::remove::NodeKind;
+        let fs = &mut host.remove;
+        fs.add(
+            &[b"srv", b"app", b"build"],
+            b"box",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"link",
+            NodeKind::Symlink,
+            1000,
+            0o777,
+            4,
+        );
+        let mnt = fs.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"mnt",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.set_device(mnt, 9);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"mnt"],
+            b"inside",
+            NodeKind::File,
+            1000,
+            0o644,
+            5,
+        );
+    }
+
+    #[test]
+    fn a_frozen_harness_cannot_remove_a_path_on_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_nothing_removed(&host, &spool);
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_nopass_remove_path_is_withheld_under_confirm_human_path() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.policy.as_mut().unwrap().settings.confirm_human_path = true;
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+        assert_nothing_removed(&host, &spool);
+        // An entry that waits on a watcher is not one a harness can hold.
+        let mut waiting = harness_remove_entry(1, b"/srv/app/build/cache");
+        waiting.needs_watch = true;
+        let (mut host, spool) = harness_remove_host(
+            waiting,
+            remove_rules(GRANTED_REMOVE_RULE, &codex_registry()),
+        );
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "request_invalid_confirmation_state");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn the_wrong_gate_file_never_runs_a_remove_path_entry() {
+        // A password entry under `-nopass`, and a harness entry under `-auth`.
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let mut auth_entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        auth_entry.via = crate::request::Via::Auth;
+        let (mut host, spool) = harness_remove_host(auth_entry, rules.clone());
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+        assert_nothing_removed(&host, &spool);
+
+        let harness_entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(harness_entry, rules);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Auth);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn a_nopass_remove_path_for_a_caller_that_left_its_scope_is_refused() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_an_enrolled_agent");
+        assert_nothing_removed(&host, &spool);
     }
 }

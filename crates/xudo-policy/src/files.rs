@@ -518,6 +518,7 @@ fn policy_form_operation(operation: &Operation) -> Vec<u8> {
         max_entries,
         owners,
         harness,
+        outcome,
         source: _,
     } = operation;
     let mut out = Vec::new();
@@ -542,6 +543,12 @@ fn policy_form_operation(operation: &Operation) -> Vec<u8> {
     put_len(&mut out, harness.len());
     for label in harness {
         put(&mut out, label.as_bytes());
+    }
+    // Written only when set, so an operation with no harness keeps the
+    // generation it had before operations could grant.
+    if !outcome.is_unset() {
+        put(&mut out, b"outcome");
+        put(&mut out, outcome.as_str().as_bytes());
     }
     out
 }
@@ -792,13 +799,16 @@ max-entries = 10
         let plain = of(base);
         let owned = of(&format!("{base}owners = [\"agent\"]\n"));
         let other = of(&format!("{base}owners = [\"agent\", \"www-data\"]\n"));
-        let labelled = of(&format!("{base}harness = [\"codex\"]\n"));
+        let labelled = of(&format!(
+            "{base}owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
+        ));
         assert_ne!(plain, owned);
         assert_ne!(owned, other);
         assert_ne!(plain, labelled);
+        assert_ne!(owned, labelled);
     }
 
-    const GHOST_OPERATION: &str = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"ghost\"]\n";
+    const GHOST_OPERATION: &str = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nowners = [\"agent\"]\nharness = [\"ghost\"]\noutcome = \"allow\"\n";
 
     #[test]
     fn an_operation_naming_an_unregistered_harness_loads_and_is_reported() {
