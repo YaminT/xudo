@@ -2,6 +2,8 @@
 # Inside a container whose PID 1 is systemd. Installs /opt/xudo.deb, drives
 # xudo exec on a pty (ci/differential/exec.exp, user xudotest), and removes it.
 # The unit files are the ones the package shipped. This script does not edit them.
+# grant.sh, sourced near the end, proves the passwordless grant through a live
+# enrolled unit; it alone writes a NOPASSWD line, and deletes it again.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -706,6 +708,9 @@ else
     bad "agent remove left files"
 fi
 [ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
+# The passwordless grant end to end, with a lane-only NOPASSWD line that the
+# script removes before it returns (G1f).
+. /harness/grant.sh
 # Enrol again, and leave it running for the package removal below.
 if enrol_agent && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
     good "xudo-agent@t enrolled again and running"
