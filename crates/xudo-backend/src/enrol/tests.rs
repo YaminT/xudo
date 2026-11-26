@@ -1645,90 +1645,6 @@ fn denies_a_bracket_control_that_skips_the_deny_line() {
 }
 
 #[test]
-fn allows_stock_pam_stacks_that_only_check_a_password() {
-    // Debian's `[success=1 default=ignore] pam_unix`, and RHEL's
-    // `requisite pam_succeed_if` in system-auth: neither passes anyone.
-    for line in [
-        "auth [success=1 default=ignore] pam_unix.so nullok",
-        "auth requisite pam_succeed_if.so uid >= 1000 quiet_success",
-        "auth required pam_exec.so /usr/bin/true",
-        "auth required pam_listfile.so item=user sense=deny file=/etc/no onerr=succeed",
-        "auth [default=die] pam_succeed_if.so uid >= 1000",
-    ] {
-        let sudo = format!("auth include common-auth\n{line}\n");
-        let blocked = blockers(&pam_host(&sudo, Some(DEBIAN_COMMON_AUTH)), None);
-        assert_eq!(blocked, Vec::<String>::new(), "{line}");
-    }
-}
-
-#[test]
-fn refuses_an_auth_line_too_short_to_name_a_module() {
-    // libpam rejects the line; xudo cannot tell what the stack then does.
-    for line in [
-        "auth",
-        "auth required",
-        "auth [success=1 default=ignore]",
-        "auth [success=1",
-    ] {
-        let sudo = format!("{line}\n");
-        let blocked = blockers(&pam_host(&sudo, None), None);
-        assert!(
-            blocked.iter().any(|found| found.contains("cannot be read")),
-            "{line}: {blocked:?}"
-        );
-    }
-    // Blank lines, comments and other types are not auth lines.
-    let sudo = "\n# auth\nsession\naccount required pam_permit.so\n";
-    assert_eq!(blockers(&pam_host(sudo, None), None), Vec::<String>::new());
-}
-
-#[test]
-fn denies_pam_shapes_that_libpam_passes_without_a_password() {
-    // Each was run through real libpam with no password and passed.
-    let probes = [
-        // a bracket ends at `]`: no space before the module
-        "auth [success=1 default=ignore]pam_permit.so\nauth requisite pam_deny.so\n",
-        // a pass falls to `default`
-        "auth [default=1] pam_permit.so\nauth requisite pam_deny.so\n",
-        "auth [default=1] pam_exec.so /bin/true\n",
-        "auth [default=ok] pam_exec.so /bin/true\n",
-        "auth [default=done] pam_exec.so /bin/true\n",
-        // the words are case-insensitive
-        "AUTH sufficient pam_permit.so\n",
-        "auth Sufficient pam_permit.so\n",
-        "auth [SUCCESS=1 default=ignore] pam_permit.so\n",
-        // a trailing backslash joins the next line
-        "auth \\\nsufficient pam_permit.so\n",
-        "auth sufficient \\\npam_permit.so\n",
-        // pam_permit with no `requisite pam_deny` before it
-        "auth required pam_permit.so\n",
-        "auth required pam_permit.so\nauth requisite pam_deny.so\n",
-    ];
-    for sudo in probes {
-        let blocked = blockers(&pam_host(sudo, None), None);
-        assert!(!blocked.is_empty(), "{sudo:?}: {blocked:?}");
-    }
-    // The joined line is reported at the line it starts on.
-    let blocked = blockers(
-        &pam_host("#x\nauth \\\nsufficient pam_permit.so\n", None),
-        None,
-    );
-    assert!(
-        blocked.iter().any(|line| line.contains("sudo line 2")),
-        "{blocked:?}"
-    );
-    // A comment ending in a backslash does not swallow the next line.
-    let blocked = blockers(
-        &pam_host("# note \\\nauth sufficient pam_permit.so\n", None),
-        None,
-    );
-    assert!(
-        blocked.iter().any(|line| line.contains("sudo line 2")),
-        "{blocked:?}"
-    );
-}
-
-#[test]
 fn denies_a_pam_include_spelled_in_another_case() {
     let sudo = "auth Include common-auth\nAuth SUBSTACK common-auth\n";
     let blocked = blockers(&pam_host(sudo, Some("auth sufficient pam_u2f.so\n")), None);
@@ -1857,13 +1773,13 @@ fn denies_enrol_when_an_included_pam_file_hides_the_module() {
             .any(|line| line.contains("/etc/pam.d/common-auth line 1")),
         "{blocked:?}"
     );
-    // By absolute path, and through `substack`; a loop ends.
-    let sudo = "auth substack /etc/pam.d/common-auth\nauth include sudo\n";
-    let blocked = blockers(&pam_host(sudo, Some(bad)), None);
+    // An include loop ends, as a blocker.
+    let sudo = "auth include common-auth\n";
+    let blocked = blockers(&pam_host(sudo, Some("auth include sudo\n")), None);
     assert!(
         blocked
             .iter()
-            .any(|line| line.contains("pam_u2f") && line.contains("common-auth")),
+            .any(|line| line == "could not examine /etc/pam.d/sudo: it includes itself"),
         "{blocked:?}"
     );
 }
@@ -1907,16 +1823,331 @@ fn enrol_refuses_when_sudos_pam_stack_cannot_be_read() {
     );
 }
 
+/// A host whose PAM files are exactly the Debian base plus `files`, by name in
+/// `/etc/pam.d` or by absolute path.
+fn pam_files(files: &[(&str, &str)]) -> MemoryHost {
+    let host = sudoers_host(NOT_YET, None)
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/lib", 0, 0, 0o755)
+        .dir("/usr/lib/pam.d", 0, 0, 0o755);
+    files.iter().fold(host, |host, (name, text)| {
+        let path = if name.starts_with('/') {
+            (*name).to_owned()
+        } else {
+            format!("/etc/pam.d/{name}")
+        };
+        host.file(&path, 0, 0, 0o644, text.as_bytes())
+    })
+}
+
+/// Debian 13's `/etc/pam.d/sudo` and `sudo-i`, as the sudo package ships them.
+const DEBIAN_SUDO: &str = "#%PAM-1.0
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+session    required   pam_env.so readenv=1 user_readenv=0
+session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
+
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+";
+const DEBIAN_SUDO_I: &str = "#%PAM-1.0
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+session    required   pam_env.so readenv=1 user_readenv=0
+session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
+
+@include common-auth
+@include common-account
+@include common-session
+";
+/// What `pam-auth-update` writes on Debian 13 with only `pam_unix`.
+const DEBIAN_STOCK_COMMON_AUTH: &str = "#
+# /etc/pam.d/common-auth - authentication settings common to all services
+#
+# As of pam 1.0.1-6, this file is managed by pam-auth-update by default.
+
+# here are the per-package modules (the \"Primary\" block)
+auth\t[success=1 default=ignore]\tpam_unix.so nullok
+# here's the fallback if no module succeeds
+auth\trequisite\t\t\tpam_deny.so
+# prime the stack with a positive return value if there isn't one already;
+# this avoids us returning an error just because nothing sets a success code
+# since the modules above will each just jump around
+auth\trequired\t\t\tpam_permit.so
+# and here are more per-package modules (the \"Additional\" block)
+# end of pam-auth-update config
+";
+/// Ubuntu 24.04's and 26.04's: the same, and `pam_cap` after it.
+const UBUNTU_STOCK_COMMON_AUTH: &str = "# here are the per-package modules (the \"Primary\" block)
+auth\t[success=1 default=ignore]\tpam_unix.so nullok
+# here's the fallback if no module succeeds
+auth\trequisite\t\t\tpam_deny.so
+auth\trequired\t\t\tpam_permit.so
+# and here are more per-package modules (the \"Additional\" block)
+auth\toptional\t\t\tpam_cap.so 
+# end of pam-auth-update config
+";
+const DEBIAN_OTHER: &str = "#
+# /etc/pam.d/other - specify the PAM fallback behaviour
+#
+#used.  If you really want nothing to happen then use pam_permit.so or
+#pam_deny.so as appropriate.
+
+# We fall back to the system default in /etc/pam.d/common-*
+# 
+
+@include common-auth
+@include common-account
+@include common-password
+@include common-session
+";
+const DEBIAN_COMMON_REST: [(&str, &str); 3] = [
+    (
+        "common-password",
+        "password\t[success=1 default=ignore]\tpam_unix.so obscure yescrypt\npassword\trequisite\t\t\tpam_deny.so\npassword\trequired\t\t\tpam_permit.so\n",
+    ),
+    (
+        "common-session",
+        "session\t[default=1]\t\t\tpam_permit.so\nsession\trequisite\t\t\tpam_deny.so\nsession\trequired\t\t\tpam_permit.so\nsession\trequired\tpam_unix.so \nsession\toptional\tpam_systemd.so \n",
+    ),
+    (
+        "common-account",
+        "account\t[success=1 new_authtok_reqd=done default=ignore]\tpam_unix.so \naccount\trequisite\t\t\tpam_deny.so\naccount\trequired\t\t\tpam_permit.so\n",
+    ),
+];
+/// RHEL's and Fedora's `/etc/pam.d/sudo` and `sudo-i`.
+const RHEL_SUDO: &str = "#%PAM-1.0
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    optional     pam_keyinit.so revoke
+session    required     pam_limits.so
+session    include      system-auth
+";
+const RHEL_SUDO_I: &str = "#%PAM-1.0
+auth       include      sudo
+account    include      sudo
+password   include      sudo
+session    optional     pam_keyinit.so force revoke
+session    include      sudo
+";
+/// authselect's `local` profile (Fedora 40, RHEL 10).
+const RHEL_LOCAL_SYSTEM_AUTH: &str = "# Generated by authselect
+# Do not modify this file manually, use authselect instead. Any user changes will be destroyed.
+# For more information see authselect(8).
+
+auth        required                                     pam_env.so
+auth        required                                     pam_faildelay.so delay=2000000
+auth        sufficient                                   pam_unix.so nullok
+auth        required                                     pam_deny.so
+
+account     required                                     pam_unix.so
+
+password    sufficient                                   pam_unix.so yescrypt shadow nullok use_authtok
+password    required                                     pam_deny.so
+
+session     optional                                     pam_keyinit.so revoke
+session     required                                     pam_limits.so
+-session    optional                                     pam_systemd.so
+session     [success=1 default=ignore]                   pam_succeed_if.so service in crond quiet use_uid
+session     required                                     pam_unix.so
+";
+/// authselect's user-type checks (RHEL 8 and 9), without a remote module.
+const RHEL_USERTYPE_SYSTEM_AUTH: &str =
+    "auth        required                                     pam_env.so
+auth        required                                     pam_faildelay.so delay=2000000
+auth        [default=1 ignore=ignore success=ok]         pam_usertype.so isregular
+auth        [default=1 ignore=ignore success=ok]         pam_localuser.so
+auth        sufficient                                   pam_unix.so nullok try_first_pass
+auth        requisite                                    pam_succeed_if.so uid >= 1000 quiet_success
+auth        required                                     pam_deny.so
+";
+
 #[test]
-fn debian_s_own_pam_stack_does_not_block_enrol() {
-    // `pam_permit` after a `requisite` `pam_deny`, `session` and `account`
-    // lines, comments and a commented-out module are all fine.
-    let sudo = "# auth sufficient pam_u2f.so\nsession sufficient pam_succeed_if.so quiet\naccount sufficient pam_permit.so\n@include common-auth\n";
-    let common = "auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\nauth sufficient pam_systemd_home.so\nauth sufficient pam_unix.so\n";
-    assert_eq!(
-        blockers(&pam_host(sudo, Some(common)), None),
-        Vec::<String>::new()
-    );
+fn accepts_the_stock_debian_ubuntu_and_rhel_pam_stacks() {
+    let debian = |common_auth: &'static str| {
+        let mut files = vec![
+            ("sudo", DEBIAN_SUDO),
+            ("sudo-i", DEBIAN_SUDO_I),
+            ("other", DEBIAN_OTHER),
+            ("common-auth", common_auth),
+        ];
+        files.extend(DEBIAN_COMMON_REST);
+        files
+    };
+    let rhel = |system_auth: &'static str| {
+        vec![
+            ("sudo", RHEL_SUDO),
+            ("sudo-i", RHEL_SUDO_I),
+            (
+                "other",
+                "#%PAM-1.0\nauth     required       pam_deny.so\naccount  required       pam_deny.so\npassword required       pam_deny.so\nsession  required       pam_deny.so\n",
+            ),
+            ("system-auth", system_auth),
+        ]
+    };
+    for (name, files) in [
+        ("debian 13", debian(DEBIAN_STOCK_COMMON_AUTH)),
+        ("ubuntu 24.04 and 26.04", debian(UBUNTU_STOCK_COMMON_AUTH)),
+        ("rhel local", rhel(RHEL_LOCAL_SYSTEM_AUTH)),
+        ("rhel user types", rhel(RHEL_USERTYPE_SYSTEM_AUTH)),
+    ] {
+        assert_eq!(
+            blockers(&pam_files(&files), None),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn accepts_the_other_spellings_of_a_recognized_stack() {
+    for sudo in [
+        // Words in any case, a `-` before the type, a jump of more than one.
+        "AUTH Sufficient pam_unix.so\n-auth REQUIRED pam_deny.so\n",
+        "auth [success=2 default=ignore] pam_unix.so\nauth [default=ignore success=done] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n",
+        "auth [success=ok default=ignore] pam_unix.so\nauth requisite pam_deny.so\n",
+        // `required` spelled out, a continued line, a comment after a line.
+        "auth [success=ok new_authtok_reqd=ok ignore=ignore default=bad] pam_unix.so\n",
+        "auth \\\n# note\n\n   requisite pam_deny.so # the end \\\n",
+        // Each allowed module in an allowed control.
+        "auth optional pam_env.so\nauth requisite pam_nologin.so\nauth optional pam_limits.so\nauth optional pam_systemd.so\nauth optional pam_keyinit.so\nauth optional pam_loginuid.so\nauth optional pam_localuser.so\nauth required pam_usertype.so\nauth requisite pam_succeed_if.so uid >= 1000\nauth sufficient pam_deny.so\nauth required pam_deny.so\n",
+        // `@include` in any case, after spaces, with a tab.
+        "   @INCLUDE\tcommon-auth\n",
+        "-auth include common-auth\n",
+    ] {
+        let host = pam_files(&[("sudo", sudo), ("common-auth", DEBIAN_STOCK_COMMON_AUTH)]);
+        assert_eq!(blockers(&host, None), Vec::<String>::new(), "{sudo:?}");
+    }
+    // No `sudo-i` and no `other` anywhere: libpam cannot start `sudo -i`.
+    let host = pam_files(&[("sudo", "auth required pam_unix.so\n")]);
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+/// Each `(files, blocker)`: `files` passed real libpam 1.5.3 with no password,
+/// or is a spelling libpam reads differently from how it looks, and the scan
+/// must refuse it with exactly `blocker` among its findings.
+#[test]
+fn refuses_every_pam_stack_that_libpam_passed_without_a_password() {
+    const PERMIT: &str = "`pam_permit` without a `requisite pam_deny` before it";
+    let sudo = |line: u32, why: &str| {
+        format!("/etc/pam.d/sudo line {line}: PAM stack not recognized: {why}")
+    };
+    let evil = |why: &str| format!("/etc/pam.d/evil line 1: PAM stack not recognized: {why}");
+    let control = |text: &str| format!("control `{text}` is not one xudo recognizes");
+    let passes = |at: &str, module: &str| {
+        format!("{at}: PAM can pass sudo without the account's password from here ({module})")
+    };
+    let probes: Vec<(Vec<(&str, &str)>, String)> = vec![
+        // Second round.
+        (vec![("sudo", "auth [success=1 default=ignore]pam_permit.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth [default=1] pam_permit.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [default=1] pam_exec.so /bin/true\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [default=ok] pam_exec.so /bin/true\n")], sudo(1, &control("[default=ok]"))),
+        (vec![("sudo", "auth [default=done] pam_exec.so /bin/true\n")], sudo(1, &control("[default=done]"))),
+        (vec![("sudo", "AUTH sufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth Sufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth [SUCCESS=1 default=ignore] pam_permit.so\n")], sudo(1, &control("[SUCCESS=1 default=ignore]"))),
+        (vec![("sudo", "auth Include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "auth required pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth required pam_permit.so\nauth requisite pam_deny.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "account required pam_permit.so\n"), ("other", "auth sufficient pam_permit.so\n")], "/etc/pam.d/other line 1: PAM stack not recognized: `pam_permit` without a `requisite pam_deny` before it".to_owned()),
+        (vec![("sudo", "auth [success=ok default=bad] pam_permit.so\n")], sudo(1, &control("[success=ok default=bad]"))),
+        (vec![("sudo", "auth [authinfo_unavail=ignore default=done] pam_exec.so /bin/true\n")], sudo(1, &control("[authinfo_unavail=ignore default=done]"))),
+        (vec![("sudo", "auth optional pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth\t\tsufficient\tpam_permit.so\n")], sudo(1, PERMIT)),
+        // Third round: `@include` in any case and spacing.
+        (vec![("sudo", "@include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@INCLUDE evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@Include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@include\tevil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "   @include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@INCLUDE evil\n"), ("evil", "auth sufficient pam_permit.so\n"), ("other", "auth requisite pam_deny.so\n")], evil(PERMIT)),
+        // Continued lines: each is read as the one line libpam makes of it,
+        // so the blocker is the joined line's and not "control ``".
+        (vec![("sudo", "auth \\\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "#x\nauth \\\nsufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth sufficient \\\npam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\ \nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth sufficient \\\t\npam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n# note\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n   # c\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth\\\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        // A comment, whole or after a line, continues nothing.
+        (vec![("sudo", "# note \\\nauth sufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth sufficient pam_deny.so # x \\\nauth sufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth \\ # c\nsufficient pam_permit.so\n")], sudo(1, &control("\\"))),
+        // A jump keyed on a failure, or a failure that jumps.
+        (vec![("sudo", "auth [auth_err=1 default=ignore] pam_deny.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[auth_err=1 default=ignore]"))),
+        (vec![("sudo", "auth [success=ignore default=ignore ignore=1] pam_exec.so /bin/false\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=ignore default=ignore ignore=1]"))),
+        (vec![("sudo", "auth [success=1 default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=1 default=1]"))),
+        (vec![("sudo", "auth [default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [success=1 auth_err=1 default=ignore] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=1 auth_err=1 default=ignore]"))),
+        (vec![("sudo", "auth [auth_err=done] pam_deny.so\n")], sudo(1, &control("[auth_err=done]"))),
+        (vec![("sudo", "@include common-auth\n"), ("common-auth", "auth [success=1 default=ignore] pam_unix.so\nauth [auth_err=1 default=ignore] pam_deny.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], "/etc/pam.d/common-auth line 2: PAM stack not recognized: control `[auth_err=1 default=ignore]` is not one xudo recognizes".to_owned()),
+        // A module by path, or one that is not on the list.
+        (vec![("sudo", "-auth requisite /nonexistent/pam_deny.so\nauth required pam_permit.so\n")], sudo(1, "module `/nonexistent/pam_deny.so` is not one xudo recognizes")),
+        (vec![("sudo", "-auth requisite /nonexistent/pam_foo.so\nauth required pam_permit.so\n")], sudo(1, "module `/nonexistent/pam_foo.so` is not one xudo recognizes")),
+        (vec![("sudo", "auth required pam_exec.so /bin/true\n")], sudo(1, "module `pam_exec.so` is not one xudo recognizes")),
+        // A module that can pass alone, or a failure that jumps past the deny
+        // after one that passed: the walk through every path finds them.
+        (vec![("sudo", "auth required pam_succeed_if.so uid >= 0\n")], passes("/etc/pam.d/sudo line 1", "pam_succeed_if")),
+        (vec![("sudo", "auth optional pam_cap.so\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_cap")),
+        (vec![("sudo", "auth required pam_succeed_if.so uid >= 0\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_succeed_if")),
+        (vec![("sudo", "auth required pam_localuser.so\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_localuser")),
+        // A line of an unknown type is a failing `auth` line to libpam, and
+        // its jump skips the deny.
+        (vec![("sudo", "xauth [default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, "unknown type `xauth`")),
+        (vec![("sudo", "@include a\nauth requisite pam_deny.so\nauth required pam_permit.so\n"), ("a", "foo [default=1] pam_unix.so\n")], "/etc/pam.d/a line 1: PAM stack not recognized: unknown type `foo`".to_owned()),
+        (vec![("sudo", "-@include evil\n")], sudo(1, "unknown type `-@include`")),
+        // Includes that are not one bare name, and `substack`.
+        (vec![("sudo", "@include evil other\n")], sudo(1, "`@include` must name exactly one file")),
+        (vec![("sudo", "auth include evil other\n")], sudo(1, "`include` must name exactly one file")),
+        (vec![("sudo", "auth include /etc/pam.d/common-auth\n")], sudo(1, "include `/etc/pam.d/common-auth` is not a bare file name")),
+        (vec![("sudo", "@include ../evil\n")], sudo(1, "include `../evil` is not a bare file name")),
+        (vec![("sudo", "auth substack common-auth\n")], sudo(1, &control("substack"))),
+        // Lines libpam cannot read, or reads with a byte xudo does not expect.
+        (vec![("sudo", "auth\n")], sudo(1, &control(""))),
+        (vec![("sudo", "auth required\n")], sudo(1, "the line names no module")),
+        (vec![("sudo", "auth [success=1 default=ignore]\n")], sudo(1, "the line names no module")),
+        (vec![("sudo", "auth [success=1 pam_unix.so\n")], sudo(1, "a `[` control has no `]`")),
+        (vec![("sudo", "auth sufficient pam_unix.so\r\n")], sudo(1, "module `pam_unix.so\r` is not one xudo recognizes")),
+        (vec![("sudo", "auth\x0bsufficient pam_unix.so\n")], sudo(1, "unknown type `auth\x0bsufficient`")),
+        (vec![("sudo", "auth [success=+1 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=+1 default=ignore]"))),
+        (vec![("sudo", "auth [success=99999999999999999999999 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=99999999999999999999999 default=ignore]"))),
+        (vec![("sudo", "auth [success=bad default=ignore] pam_unix.so\n")], sudo(1, &control("[success=bad default=ignore]"))),
+        (vec![("sudo", "auth [default=ignore new_authtok_reqd=1] pam_unix.so\n")], sudo(1, &control("[default=ignore new_authtok_reqd=1]"))),
+        (vec![("sudo", "auth sufficient pam_unix.so \\")], "could not examine /etc/pam.d/sudo: line 1 is continued past the end".to_owned()),
+        (vec![("sudo", "auth required pam_deny.so\0\nauth sufficient pam_permit.so\n")], "could not examine /etc/pam.d/sudo: not text".to_owned()),
+        // libpam reads a bracket case-sensitively, and no jump of 0.
+        (vec![("sudo", "auth [SUCCESS=OK DEFAULT=IGNORE] pam_unix.so\n")], sudo(1, &control("[SUCCESS=OK DEFAULT=IGNORE]"))),
+        (vec![("sudo", "auth [success=0 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=0 default=ignore]"))),
+        // A recognized module in a control it never needs.
+        (vec![("sudo", "auth [default=1 ignore=ignore success=ok] pam_unix.so\n")], sudo(1, "`pam_unix` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [success=1 default=ignore] pam_deny.so\n")], sudo(1, "`pam_deny` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [default=1 ignore=ignore success=ok] pam_deny.so\n")], sudo(1, "`pam_deny` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth requisite pam_deny.so\nauth sufficient pam_permit.so\n")], sudo(2, "`pam_permit` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth optional pam_succeed_if.so uid >= 0\n")], sudo(1, "`pam_succeed_if` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth sufficient pam_usertype.so\n")], sudo(1, "`pam_usertype` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth sufficient pam_env.so\n")], sudo(1, "`pam_env` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [success=1 default=ignore] pam_env.so\n")], sudo(1, "`pam_env` with that control is not a form xudo recognizes")),
+        // `sudo-i` from libpam's vendor directory when `/etc` has none.
+        (vec![("sudo", "auth required pam_unix.so\n"), ("/usr/lib/pam.d/sudo-i", "auth sufficient pam_permit.so\n")], "/usr/lib/pam.d/sudo-i line 1: PAM stack not recognized: `pam_permit` without a `requisite pam_deny` before it".to_owned()),
+        (vec![("sudo", "@include evil\n"), ("/usr/lib/pam.d/evil", "auth sufficient pam_succeed_if.so\n")], "/usr/lib/pam.d/evil line 1: PAM stack not recognized: `pam_succeed_if` with that control is not a form xudo recognizes".to_owned()),
+    ];
+    for (files, expected) in probes {
+        let blocked = blockers(&pam_files(&files), None);
+        assert!(
+            blocked.contains(&expected),
+            "{files:?}: want {expected:?}, got {blocked:?}"
+        );
+    }
 }
 
 #[test]

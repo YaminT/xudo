@@ -525,6 +525,38 @@ already used by another harness, or that is its own reviewer; a drop-in
 directory for the label that is not root's or is not empty; and a unit whose
 .B User=
 systemd does not report as the account.
+It also refuses, naming the file and line, when sudo's PAM
+.B auth
+stack is not one it recognizes: the account joins
+.BR xudo ,
+so the password prompt is all that stands in its way.
+It reads
+.IR /etc/pam.d/sudo ,
+.I sudo\-i
+and, where libpam would,
+.IR other ,
+with every file they include, as libpam does.
+Each
+.B auth
+line must be a stock form on a stock module
+.RB ( pam_unix ,
+.BR pam_deny ,
+.B pam_permit
+after a
+.BR "requisite pam_deny" ,
+.BR pam_env ,
+.BR pam_faildelay ,
+.BR pam_usertype ,
+.B pam_succeed_if
+and a few others), and no path through the stack may pass when
+.B pam_unix
+does not.
+The stock Debian, Ubuntu and RHEL stacks pass this check.
+Anything else, such as
+.BR pam_u2f ,
+.BR pam_sss ,
+.B pam_systemd_home
+or a bracket control of the operator's own, makes it refuse.
 It grants nothing: no rule names the harness, so every command it asks for
 still asks for the sudo password.
 On a machine whose escalator is doas it refuses: the agent path is sudo and

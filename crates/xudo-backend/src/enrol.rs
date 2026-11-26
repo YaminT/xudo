@@ -463,7 +463,7 @@ pub fn scan_account(
         numeric_groups,
         exempt,
     ));
-    blockers.extend(pam_blockers(host));
+    blockers.extend(pam::blockers(host));
     Ok(AccountScan {
         uid: entry.uid,
         blockers,
@@ -677,188 +677,6 @@ fn lines_naming(
         }
     }
     found
-}
-
-/// How deep PAM includes may nest before the scan gives up.
-const PAM_MAX_DEPTH: usize = 8;
-/// Where sudo's PAM stack starts.
-const PAM_SUDO: &str = "/etc/pam.d/sudo";
-/// Modules that may be `sufficient`: they authenticate a password or a login
-/// session and nothing else.
-const PAM_PLAIN: [&str; 3] = ["pam_unix", "pam_systemd", "pam_systemd_home"];
-/// Modules that can pass authentication for the agent without its password.
-///
-/// `pam_succeed_if`, `pam_exec` and `pam_listfile` are not here: they only
-/// pass someone when their control lets a pass end the stack, so they are
-/// judged by that alone (`requisite pam_succeed_if` is stock RHEL).
-const PAM_GRANTING: [&str; 4] = ["pam_ssh_agent_auth", "pam_u2f", "pam_rhosts", "pam_permit"];
-/// Where `sudo -i` starts.
-const PAM_SUDO_I: &str = "/etc/pam.d/sudo-i";
-/// What libpam reads for a service whose file is missing or has no `auth` line.
-const PAM_OTHER: &str = "/etc/pam.d/other";
-
-/// The agent will be in `xudo`, so it can run sudo and reach the password
-/// gate; only PAM stands in the way. The `auth` lines of `/etc/pam.d/sudo`
-/// and of every file it includes are read, and the stack is refused when it
-/// cannot be read, or when a module that can pass without the account's
-/// password is in it: one of [`PAM_GRANTING`] in any control that can end the
-/// stack as a success (`pam_permit` as `required` or `requisite` is Debian's
-/// own `common-auth` and ends nothing), or any `sufficient` module that is not
-/// a plain password or session one.
-fn pam_blockers(host: &dyn HostView) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = Vec::new();
-    pam_walk(host, PAM_SUDO, 0, &mut seen, &mut out);
-    // Not every sudo has the `sudo-i` service; one that has it reads it.
-    if !matches!(host.read(Path::new(PAM_SUDO_I)), Lookup::Missing) {
-        pam_walk(host, PAM_SUDO_I, 0, &mut seen, &mut out);
-    }
-    // libpam falls back to `other` for a service with no `auth` lines.
-    if !matches!(host.read(Path::new(PAM_OTHER)), Lookup::Missing) {
-        pam_walk(host, PAM_OTHER, 0, &mut seen, &mut out);
-    }
-    out
-}
-
-fn pam_walk(
-    host: &dyn HostView,
-    file: &str,
-    depth: usize,
-    seen: &mut Vec<String>,
-    out: &mut Vec<String>,
-) {
-    if seen.iter().any(|done| done == file) {
-        return;
-    }
-    if depth > PAM_MAX_DEPTH {
-        out.push(format!(
-            "could not examine {file}: includes nest deeper than {PAM_MAX_DEPTH}"
-        ));
-        return;
-    }
-    seen.push(file.to_owned());
-    let bytes = match host.read(Path::new(file)) {
-        Lookup::Found(bytes) => bytes,
-        Lookup::Missing => {
-            out.push(format!("could not examine {file}: no such file"));
-            return;
-        }
-        Lookup::Unreadable(why) => {
-            out.push(format!("could not examine {file}: {why}"));
-            return;
-        }
-    };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        out.push(format!("could not examine {file}: not text"));
-        return;
-    };
-    // `requisite pam_deny` seen in this file: a later `pam_permit` is then
-    // only reached by a stack that already passed.
-    let mut denied = false;
-    for (line_no, line) in pam_lines(text) {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let include = match words.as_slice() {
-            ["@include", target, ..] => Some(*target),
-            [kind, word, target, ..]
-                if kind.trim_start_matches('-').eq_ignore_ascii_case("auth")
-                    && (word.eq_ignore_ascii_case("include")
-                        || word.eq_ignore_ascii_case("substack")) =>
-            {
-                Some(*target)
-            }
-            _ => None,
-        };
-        if let Some(target) = include {
-            let path = if target.starts_with('/') {
-                target.to_owned()
-            } else {
-                format!("/etc/pam.d/{target}")
-            };
-            pam_walk(host, &path, depth.saturating_add(1), seen, out);
-            continue;
-        }
-        // `#` starts a comment; only `auth` lines decide who passes.
-        let kind = words.first().copied().unwrap_or("");
-        if !kind.trim_start_matches('-').eq_ignore_ascii_case("auth") {
-            continue;
-        }
-        let Some((control, module)) = pam_fields(&line) else {
-            out.push(format!("{file} line {line_no}: auth line cannot be read"));
-            continue;
-        };
-        let module = module.rsplit('/').next().unwrap_or(module);
-        let module = module.strip_suffix(".so").unwrap_or(module);
-        let can_end = control == "sufficient" || bracket_can_end(&control);
-        if module == "pam_deny" && control == "requisite" {
-            denied = true;
-        }
-        let bad = if PAM_GRANTING.contains(&module) {
-            module != "pam_permit" || can_end || !denied
-        } else {
-            can_end && !PAM_PLAIN.contains(&module)
-        };
-        if bad {
-            out.push(format!(
-                "{file} line {line_no}: PAM module {module} ({control}) can pass sudo without the account's password"
-            ));
-        }
-    }
-}
-
-/// The lines of a PAM file as libpam reads them: a line ending in a backslash
-/// continues on the next, and a comment line never does. Numbered by the line
-/// each starts on.
-fn pam_lines(text: &str) -> Vec<(usize, String)> {
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let mut open = false;
-    for (index, raw) in text.lines().enumerate() {
-        let line_no = index.saturating_add(1);
-        let comment = raw.trim_start().starts_with('#');
-        let (body, more) = match raw.strip_suffix('\\') {
-            Some(body) if !comment => (body, true),
-            _ => (raw, false),
-        };
-        match out.last_mut() {
-            Some((_, last)) if open => {
-                last.push(' ');
-                last.push_str(body);
-            }
-            _ => out.push((line_no, body.to_owned())),
-        }
-        open = more;
-    }
-    out
-}
-
-/// The control (lower case) and module of a PAM line after its type. A
-/// bracket control ends at the first `]`, with no space needed after it.
-fn pam_fields(line: &str) -> Option<(String, &str)> {
-    let rest = line.trim_start();
-    let rest = rest[rest.find(char::is_whitespace)?..].trim_start();
-    let (control, after) = if rest.starts_with('[') {
-        let end = rest.find(']')?.saturating_add(1);
-        rest.split_at(end)
-    } else {
-        rest.split_at(rest.find(char::is_whitespace)?)
-    };
-    let module = after.split_whitespace().next()?;
-    Some((control.to_ascii_lowercase(), module))
-}
-
-/// Whether a control can end the stack on a pass or skip lines after it:
-/// `done` or `ok`, or a number of lines to jump, on `success` or on
-/// `default` (a pass falls to `default` when `success` is not listed).
-fn bracket_can_end(control: &str) -> bool {
-    control.starts_with('[')
-        && control
-            .trim_matches(|c| c == '[' || c == ']')
-            .split_whitespace()
-            .any(|pair| {
-                pair.split_once('=').is_some_and(|(key, action)| {
-                    (key == "success" || key == "default")
-                        && (action == "done" || action == "ok" || action.parse::<u32>().is_ok())
-                })
-            })
 }
 
 /// Whether `token` occurs in `line` as a whole word: not followed by another
@@ -1635,5 +1453,6 @@ pub fn listed(files: &[(String, String)]) -> Result<Vec<Listed>, Refusal> {
         .collect())
 }
 
+mod pam;
 #[cfg(test)]
 mod tests;
