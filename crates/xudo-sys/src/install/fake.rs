@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{FileIdentity, InstallError, InstallOps, Removal, substitute};
+use super::{DirLock, FileIdentity, InstallError, InstallOps, Removal, substitute};
 
 /// The inode every candidate this fake writes has.
 const WRITTEN: FileIdentity = FileIdentity {
@@ -161,6 +161,17 @@ impl InstallOps for FakeInstallOps {
         self.record("remove_block", path)?;
         Ok(self.removal(path))
     }
+
+    fn lock_dir(&self, path: &str) -> Result<DirLock, InstallError> {
+        self.record("lock_dir", path).map(|()| DirLock::default())
+    }
+}
+
+#[test]
+fn the_fake_records_a_directory_lock() {
+    let ops = FakeInstallOps::root();
+    assert!(ops.lock_dir("/etc/xudo/rules.d").is_ok());
+    assert_eq!(ops.calls(), ["lock_dir /etc/xudo/rules.d"]);
 }
 
 #[test]

@@ -104,10 +104,11 @@ pub use gate_files::{
 };
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
-    AgentError, AgentRow, Effect, EnrolOps, HostInstallOps, HostInstaller, InstallError,
-    InstallOps, InstallProbe, InstallReport, Installer, ProbeResult, RefusingInstaller, Removal,
-    Systemctl, Verification, apply_enrol, check_effect, execute, list_agents, plan_enrol,
-    remove_agent,
+    AgentError, AgentRow, DirLock, Effect, EnrolOps, HostInstallOps, HostInstaller,
+    HostWhereabouts, InstallError, InstallOps, InstallProbe, InstallReport, Installer,
+    MAX_PACK_BYTES, PackError, PackReport, PackRequest, ProbeResult, RULES_DIR, RefusingInstaller,
+    Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol, check_effect, execute,
+    list_agents, plan_enrol, remove_agent, remove_pack,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;

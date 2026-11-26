@@ -546,4 +546,4 @@ pub fn remove_agent(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -35,6 +35,7 @@ pub mod doctor;
 mod exchange;
 pub mod exec;
 mod lifecycle_note;
+pub mod packs;
 pub mod probe;
 pub mod render;
 pub mod rules;

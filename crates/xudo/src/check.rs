@@ -614,7 +614,7 @@ fn result_json(result: &TestResult) -> Value {
 /// The sentence is the whole warning: the match is lexical only, nothing in
 /// xudo enforces containment for argument paths, and it must not be used for
 /// a program that opens the path as root.
-fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
+pub(crate) fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
     let mut warnings = Vec::new();
     for action in rules.actions() {
         for (index, spec) in action.args.iter().enumerate() {
@@ -633,7 +633,7 @@ fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
 
 /// Text from a rule file, made safe for a terminal and flagged when anything
 /// was removed.
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     let Clean { text, findings } = term_sanitize::display_str(text, LIMITS);
     if findings.is_empty() {
         return text;

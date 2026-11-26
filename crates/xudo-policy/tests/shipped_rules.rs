@@ -13,8 +13,8 @@
 
 use proptest::prelude::*;
 use xudo_policy::{
-    Arg, Argv, CallerFacts, CapabilityClass, Classification, DenialCode, Matcher, NameKind,
-    Request, RuleSet, Verdict, engine::Settings, evaluate_command,
+    Arg, Argv, CallerFacts, CapabilityClass, Classification, DenialCode, HarnessFile, Matcher,
+    NameKind, Request, RuleFile, RuleSet, Verdict, engine::Settings, evaluate_command,
 };
 
 /// Each shipped file, paired with the name it has on disk.
@@ -2108,4 +2108,72 @@ fn check_fuzz_finds_nothing_in_the_shipped_rules() {
         .map(|f| format!("{}: {}", f.summary(), f.escaped()))
         .collect();
     assert!(report.clean(), "the fuzz found:\n{}", found.join("\n"));
+}
+
+/// The example rule pack: a file nobody installs, attacked like a shipped one.
+const PACK_EXAMPLE: &str = include_str!("../../../rules/examples/pack-web-ops.toml.example");
+
+fn shipped_files() -> Vec<RuleFile> {
+    SHIPPED
+        .iter()
+        .map(|(name, text)| RuleFile {
+            name: name.as_bytes().to_vec(),
+            bytes: text.as_bytes().to_vec(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_example_pack_passes_the_review_rules_add_makes() {
+    let parsed = RuleSet::parse_file("pack-web-ops.toml", PACK_EXAMPLE)
+        .unwrap_or_else(|e| panic!("the example pack does not load: {e}"));
+    let header = parsed.pack.unwrap();
+    assert_eq!(header.harnesses, vec!["codex".to_owned()]);
+    for action in parsed.rules.actions() {
+        assert_eq!(action.harness, header.harnesses, "{}", action.id);
+    }
+    // The same review `xudo rules add` makes, against the shipped rules and a
+    // registry that has the harness the pack is for.
+    let shipped = shipped_files();
+    let mut with_pack = shipped.clone();
+    with_pack.push(RuleFile {
+        name: header.file_name().into_bytes(),
+        bytes: PACK_EXAMPLE.as_bytes().to_vec(),
+    });
+    let codex = Ok(vec![HarnessFile {
+        name: b"codex.toml".to_vec(),
+        bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n".to_vec(),
+    }]);
+    let change = xudo_policy::pack::Change::Add {
+        pack: PACK_EXAMPLE.as_bytes(),
+        allow_waivers: true,
+    };
+    let review = xudo_policy::pack::review(shipped, with_pack, &codex, change)
+        .unwrap_or_else(|e| panic!("the example pack is refused: {e}"));
+    let lines = review.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.first().unwrap().starts_with("codex gains (no password): pack.web.restart: /usr/bin/systemctl --no-pager --no-ask-password restart"),
+        "{lines:?}"
+    );
+    assert!(review.losses.is_empty());
+    // The waiver is shown, and the engine finds only gains.
+    assert_eq!(review.waivers.len(), 1, "{:?}", review.waivers);
+    assert!(
+        review.effects.iter().all(|e| e.widens),
+        "{:?}",
+        review.effects
+    );
+    assert!(!review.effects.is_empty());
+
+    // The placeholder is not a unit the shipped rules pin as refused: the
+    // review would refuse a pack that breaks a shipped `[[test]]`, as it did
+    // when this example restarted nginx.service.
+    let clash = PACK_EXAMPLE.replace("example-web.service", "nginx.service");
+    let mut clashing = shipped_files();
+    clashing.push(RuleFile {
+        name: b"pack-web-ops.toml".to_vec(),
+        bytes: clash.into_bytes(),
+    });
+    assert!(xudo_policy::pack::review(shipped_files(), clashing, &codex, change).is_err());
 }

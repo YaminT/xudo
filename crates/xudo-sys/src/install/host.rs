@@ -35,7 +35,7 @@ use rustix::fs::{
 use rustix::io::Errno;
 use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END, MANAGED_MARKER};
 
-use super::{FileIdentity, InstallError, InstallOps, Removal, split, substitute};
+use super::{DirLock, FileIdentity, InstallError, InstallOps, Removal, split, substitute};
 use crate::exec::{HostRunner, Runner};
 use crate::trust::{Kind, TRUSTED_UID, TrustError, facts_of, open_trusted};
 
@@ -728,6 +728,16 @@ impl InstallOps for HostInstallOps {
         } else {
             Removal::Absent
         })
+    }
+
+    fn lock_dir(&self, path: &str) -> Result<DirLock, InstallError> {
+        let fd = (self.open_dir)(Path::new(path))
+            .map_err(InstallError::Untrusted)?
+            .ok_or_else(|| InstallError::Missing {
+                path: path.to_owned(),
+            })?;
+        self.lock(fd.as_fd(), path)?;
+        Ok(DirLock { _fd: Some(fd) })
     }
 }
 

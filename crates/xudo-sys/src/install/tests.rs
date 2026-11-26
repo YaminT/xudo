@@ -807,6 +807,17 @@ fn the_refusing_installer_enrols_nothing() {
     );
     assert_eq!(RefusingInstaller.agent_list().unwrap_err(), none());
     assert_eq!(RefusingInstaller.agent_remove("codex").unwrap_err(), none());
+    let request = PackRequest {
+        bytes: Vec::new(),
+        reviewed: String::new(),
+        allow_waivers: false,
+    };
+    let no_pack = || PackError::Install(InstallError::NoInstaller);
+    assert_eq!(RefusingInstaller.pack_add(&request).unwrap_err(), no_pack());
+    assert_eq!(
+        RefusingInstaller.pack_remove("x", "t").unwrap_err(),
+        no_pack()
+    );
 }
 
 #[test]
@@ -823,6 +834,14 @@ fn the_host_installer_refuses_to_enrol_or_remove_when_not_root() {
     ));
     assert!(not_root(installer.agent_apply(&agent_plan()).unwrap_err()));
     assert!(not_root(installer.agent_remove("codex").unwrap_err()));
+    let request = PackRequest {
+        bytes: Vec::new(),
+        reviewed: String::new(),
+        allow_waivers: false,
+    };
+    let pack_not_root = |error: PackError| matches!(error, PackError::NotRoot { .. });
+    assert!(pack_not_root(installer.pack_add(&request).unwrap_err()));
+    assert!(pack_not_root(installer.pack_remove("x", "t").unwrap_err()));
     // Listing reads only, so it is not refused; what it finds is the machine's.
     let _ = installer.agent_list();
 }
