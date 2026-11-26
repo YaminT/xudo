@@ -284,6 +284,72 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     remove_snippet();
 }
 
+/// The real files of the per-harness freeze: the gate's reader sees a root
+/// marker as frozen for that label alone, treats a marker that is not root's
+/// (owned by someone else, or a symlink) as frozen too, and root's thaw
+/// through the real broker lifts every harness marker.
+#[test]
+fn the_root_lane_reads_and_thaws_real_harness_freeze_markers() {
+    if !begin_root_test("the_root_lane_reads_and_thaws_real_harness_freeze_markers") {
+        return;
+    }
+    let _journal = install_everything();
+    start_broker();
+    let dir = Path::new("/var/lib/xudo");
+    let codex = dir.join("frozen-h-codex");
+    let claude = dir.join("frozen-h-claude");
+    for path in [&codex, &claude] {
+        let _ = fs::remove_file(path);
+    }
+    let _guards = [DeleteOnDrop(codex.clone()), DeleteOnDrop(claude.clone())];
+    let frozen =
+        |label: &str| xudo_gate::policy::harness_frozen(label, &xudo_sys::read_trusted_file);
+    assert!(!frozen("codex"));
+
+    let record = br#"{"reason":"reviewer","uid":2000,"time":1}"#;
+    root_file(codex.to_str().unwrap(), record, 0o600);
+    assert!(frozen("codex"));
+    assert!(!frozen("claude"), "codex's marker froze another label");
+
+    // A marker an unprivileged account owns is not root's word: frozen.
+    let user: u32 = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .args(["-u", USER])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    root_file(claude.to_str().unwrap(), record, 0o600);
+    chown(&claude, Some(user), None).unwrap();
+    assert!(frozen("claude"), "a marker not owned by root must freeze");
+    fs::remove_file(&claude).unwrap();
+    // A symlink in its place is refused by the walk, so it freezes as well.
+    std::os::unix::fs::symlink("/dev/null", &claude).unwrap();
+    assert!(frozen("claude"));
+    fs::remove_file(&claude).unwrap();
+    assert!(!frozen("claude"));
+    // A label that could name another path never reads one.
+    assert!(frozen("../frozen"));
+
+    // The agent's account cannot lift it: the broker takes no thaw from it,
+    // and root's thaw clears the marker.
+    let as_user = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo_binary())
+        .args(["--output", "json", "thaw"])
+        .output()
+        .unwrap();
+    assert!(!as_user.status.success(), "{as_user:?}");
+    assert!(codex.exists());
+    assert_eq!(ask_broker(xudo_wire::Question::Thaw).answer, Answer::Done);
+    assert!(!codex.exists());
+    assert!(!frozen("codex"));
+}
+
 fn root_dir(path: &str, mode: u32) {
     fs::create_dir_all(path).unwrap();
     fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();

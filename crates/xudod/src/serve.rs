@@ -352,6 +352,10 @@ fn serve_request(
 
     let passwd = policy.passwd.as_str();
     let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
+    // The gate re-reads the marker; this is the early, clean refusal.
+    if let xudo_policy::Classification::EnrolledAgent { agent_id, .. } = &caller.classification {
+        policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
+    }
     let decision = decide(&policy, &caller, &request);
     let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
     let evaluated = Evaluated {
@@ -2663,27 +2667,55 @@ fn freeze(
     request: &BrokerRequest,
     reason: &str,
 ) -> Result<BrokerResponse, Refusal> {
-    let caller = registry_caller(platform, identity)?;
+    let policy = platform
+        .policy
+        .load()
+        .map_err(|error| Refusal::from(&error))?;
+    let (caller, harness_uid) = registry_caller_with_harness_uid(platform, identity)?;
+    // Which harnesses this peer reviews comes from the registry loaded for
+    // this very request, never from anything the peer sent. Only a peer the
+    // broker positively classes human, and whose uid is no harness's account
+    // or user, gets any: a harness uid outside its scope (a second passwd name
+    // for the same uid, say) is classed human but keeps the uid marker alone.
+    let labels = if matches!(caller.classification, xudo_policy::Classification::Human)
+        && harness_uid == HarnessUid::No
+    {
+        reviewed_markers(&policy, identity)
+    } else {
+        Vec::new()
+    };
     freeze_with(
         platform,
         spool,
         identity,
         &caller,
+        &labels,
         request,
         reason,
         &serde_json::to_vec,
     )
 }
 
-/// Classifies the peer against the registry the broker loads for this very
-/// request, as a run does. An empty registry would call an enrolled agent
-/// unattested and let it lift its owner's freeze. A ruleset that cannot be
-/// loaded cannot say who is an agent, so the request is refused.
-fn registry_caller(
-    platform: &Platform<'_>,
-    identity: &PeerIdentity,
-) -> Result<CallerFacts, Refusal> {
-    registry_caller_with_harness_uid(platform, identity).map(|(caller, _)| caller)
+/// The marker names (`frozen-h-<label>`) of the harnesses whose `reviewers`
+/// name `identity`'s uid, names resolved through the passwd the classification
+/// used. Root reviews none by name: its own marker is the global one. A
+/// registry that failed to load names no one (the caller refuses first). A label that
+/// cannot name a marker is dropped, so no marker is ever built from text.
+fn reviewed_markers(policy: &crate::policy::LoadedPolicy, identity: &PeerIdentity) -> Vec<String> {
+    if identity.uid == 0 {
+        return Vec::new();
+    }
+    policy
+        .rules
+        .harnesses
+        .entries()
+        .filter(|entry| {
+            entry.reviewers.iter().any(|name| {
+                xudo_policy::harness::passwd_uid(&policy.passwd, name) == Some(identity.uid)
+            })
+        })
+        .filter_map(|entry| xudo_gate::policy::harness_marker_name(&entry.label))
+        .collect()
 }
 
 /// Whether a peer's uid belongs to a harness.
@@ -2697,7 +2729,7 @@ enum HarnessUid {
     Unknown,
 }
 
-/// As `registry_caller`, and whether the peer's uid is the account or a user
+/// The caller facts, and whether the peer's uid is the account or a user
 /// of any registered harness (names resolved through the same passwd the
 /// classification used, so two names for one uid both count). A registry that
 /// failed to load rules nobody out: [`HarnessUid::Unknown`].
@@ -2756,6 +2788,12 @@ fn refuse_harness_uid_thaw(
 /// thaw walks and the markers a group member can make the directory hold.
 const MAX_STATE_NAMES: usize = 128;
 
+/// The most names root's thaw and the `*_freeze_stands` readers list. A
+/// reviewer's marker skips `MAX_STATE_NAMES` (its brake is never refused for
+/// room) but stops at this bound, so the directory can never grow past what
+/// root's thaw can list: reviewer markers cannot lock root's thaw out.
+const MAX_LISTED_NAMES: usize = 2 * MAX_STATE_NAMES;
+
 /// A freeze or a thaw is a lever over every agent in its scope, so an
 /// attested agent never pulls it: the class is the broker's, from kernel
 /// facts, and an agent that could freeze could stop its owner's other agents.
@@ -2793,11 +2831,11 @@ fn user_freeze_stands(platform: &Platform<'_>, uid: u32) -> bool {
     let Some(state) = platform.freeze_file else {
         return true;
     };
-    let Ok(names) = state.names_up_to(MAX_STATE_NAMES + 1) else {
+    let Ok(names) = state.names_up_to(MAX_LISTED_NAMES + 1) else {
         return true;
     };
     // A listing cut off one past the bound may have cut the marker off too.
-    if names.len() > MAX_STATE_NAMES {
+    if names.len() > MAX_LISTED_NAMES {
         return true;
     }
     let marker = xudo_gate::policy::freeze_marker_name(uid);
@@ -2806,11 +2844,31 @@ fn user_freeze_stands(platform: &Platform<'_>, uid: u32) -> bool {
         .any(|name| name.as_slice() == marker.as_bytes())
 }
 
+/// Whether the harness `label`'s own freeze marker stands. The same terms as
+/// [`user_freeze_stands`]: storage that cannot be listed counts as frozen.
+fn harness_freeze_stands(platform: &Platform<'_>, label: &str) -> bool {
+    let Some(marker) = xudo_gate::policy::harness_marker_name(label) else {
+        return true;
+    };
+    let Some(state) = platform.freeze_file else {
+        return true;
+    };
+    let Ok(names) = state.names_up_to(MAX_LISTED_NAMES + 1) else {
+        return true;
+    };
+    names.len() > MAX_LISTED_NAMES
+        || names
+            .iter()
+            .any(|name| name.as_slice() == marker.as_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn freeze_with(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     identity: &PeerIdentity,
     caller: &CallerFacts,
+    markers: &[String],
     request: &BrokerRequest,
     reason: &str,
     encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
@@ -2848,6 +2906,7 @@ fn freeze_with(
                 "broker=xudod".to_owned(),
                 format!("uid={}", identity.uid),
                 format!("reason={}", reason.escape_debug()),
+                format!("harness_markers={}", markers.join(",")),
             ])
             .with_outcome(xudo_audit::record::Outcome::NotExecuted)
         })
@@ -2858,10 +2917,18 @@ fn freeze_with(
             )
         })?;
     drop(record);
+    // One marker per reviewed harness, each stopping that harness alone,
+    // first: a reviewer's brake is never refused for room. Root named the
+    // reviewer in the registry and the names are bounded by it, so the
+    // reviewer's own uid marker keeps the same room.
+    for name in markers {
+        publish_freeze(state, name, &bytes, true)?;
+    }
     publish_freeze(
         state,
         &xudo_gate::policy::freeze_marker_name(identity.uid),
         &bytes,
+        !markers.is_empty(),
     )?;
     deny_pending(platform, spool, identity, request)?;
     Ok(done())
@@ -2870,16 +2937,28 @@ fn freeze_with(
 /// A killed broker can leave the temporary name behind, and the publish would
 /// then fail on it for ever. Under the directory lock no other freeze is
 /// mid-publish, so a name found here is stale.
-fn publish_freeze(state: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), Refusal> {
+fn publish_freeze(
+    state: &dyn Spool,
+    name: &str,
+    bytes: &[u8],
+    reserved: bool,
+) -> Result<(), Refusal> {
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
     let names = state
-        .names_up_to(MAX_STATE_NAMES + 1)
+        .names_up_to(MAX_LISTED_NAMES + 1)
         .map_err(|e| Refusal::from(&e))?;
     // Root's global marker is never refused for room: one slot is held back
     // for it, so a full directory of user markers cannot disable root's freeze.
-    let is_roots = name == xudo_gate::policy::freeze_marker_name(0);
+    // A reviewer's marker skips the user bound but not the listing bound, so
+    // root's thaw can always list what it must remove.
     let present = names.iter().any(|n| n.as_slice() == name.as_bytes());
-    if !is_roots && !present && names.len() >= MAX_STATE_NAMES - 1 {
+    let is_roots = name == xudo_gate::policy::freeze_marker_name(0);
+    let limit = if reserved {
+        MAX_LISTED_NAMES - 1
+    } else {
+        MAX_STATE_NAMES - 1
+    };
+    if !is_roots && !present && names.len() >= limit {
         return Err(Refusal::client(
             RefusalCode::SpoolFull,
             "too many freeze markers; root can free room by removing the extra files in /var/lib/xudo by hand",
@@ -2918,6 +2997,8 @@ fn encoded_freeze_record(
     })
 }
 
+// The harness's own entries are left in the spool on purpose: the gate
+// refuses them while its marker stands, so they cannot run.
 fn deny_pending(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
@@ -3057,9 +3138,9 @@ fn thaw(
     }
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
     let names = state
-        .names_up_to(MAX_STATE_NAMES + 1)
+        .names_up_to(MAX_LISTED_NAMES + 1)
         .map_err(|e| Refusal::from(&e))?;
-    if names.len() > MAX_STATE_NAMES {
+    if names.len() > MAX_LISTED_NAMES {
         return Err(Refusal::broker(
             RefusalCode::SpoolFull,
             "the state directory holds too many names to thaw",
@@ -7017,6 +7098,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &spool,
                 &identity,
                 &an_attested_agent(),
+                &[],
                 &freeze_request(),
                 "maintenance",
                 &serde_json::to_vec,
@@ -7117,7 +7199,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn an_overflowing_state_listing_counts_as_frozen_and_blocks_a_thaw_all() {
         let junk = || {
-            (0..=MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            (0..=MAX_LISTED_NAMES).fold(FakeSpool::new(), |state, index| {
                 state.with_file(format!("junk-{index:04}"), MARKER)
             })
         };
@@ -7505,6 +7587,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &FakeSpool::new(),
             &identity,
             &classify_for_test(&identity),
+            &[],
             &request,
             "x",
             &|_| Err(serde_json::from_str::<()>("invalid").unwrap_err()),
@@ -12641,6 +12724,326 @@ max-entries = 10
                 .files()
                 .contains_key(b"frozen-1000".as_slice())
         );
+    }
+
+    const CAROL_REVIEWED: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 2\n";
+    const REVIEW_PASSWD: &str = "alice:x:1000:1000::/home/alice:/bin/sh\nagent:x:1500:1500::/home/agent:/bin/sh\nbob:x:2000:2000::/home/bob:/bin/sh\ncarol:x:3000:3000::/home/carol:/bin/sh\nroot:x:0:0::/root:/bin/sh\n";
+
+    /// `codex` (reviewer bob, 2000) and `claude` (reviewer carol, 3000), seen
+    /// by a peer `uid` outside any agent scope.
+    fn review_host(uid: u32) -> Host {
+        let mut host = Host::honest_as(uid);
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[
+                HarnessFile {
+                    name: b"claude.toml".to_vec(),
+                    bytes: CAROL_REVIEWED.as_bytes().to_vec(),
+                },
+                HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: SERVICE_HARNESS.as_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        loaded.passwd = REVIEW_PASSWD.to_owned();
+        host.policy.answer = Ok(loaded);
+        host
+    }
+
+    fn markers_of(host: &Host) -> Vec<String> {
+        host.freeze_file
+            .files()
+            .into_keys()
+            .map(|name| String::from_utf8(name).unwrap())
+            .collect()
+    }
+
+    /// A freeze from `uid`, positively classed human.
+    fn freeze_served(host: &mut Host, uid: u32) -> Answer {
+        let mut identity = human_identity();
+        identity.uid = uid;
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Decided);
+        BrokerResponse::parse(&conn.written()).unwrap().answer
+    }
+
+    #[test]
+    fn a_reviewer_freeze_stops_that_harness_only() {
+        let mut host = review_host(2000);
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        // bob reviews codex: codex's marker and bob's own, never claude's.
+        assert_eq!(markers_of(&host), ["frozen-2000", "frozen-h-codex"]);
+        let platform = host.platform();
+        assert!(harness_freeze_stands(&platform, "codex"));
+        assert!(!harness_freeze_stands(&platform, "claude"));
+        // The audit record names the harness the freeze covered.
+        let evidence = host.audit.records().last().unwrap().evidence.clone();
+        assert!(evidence.contains(&"harness_markers=frozen-h-codex".to_owned()));
+    }
+
+    #[test]
+    fn a_marker_for_label_a_does_not_freeze_label_b() {
+        let mut host = review_host(3000);
+        assert_eq!(freeze_served(&mut host, 3000), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen-3000", "frozen-h-claude"]);
+        assert!(!harness_freeze_stands(&host.platform(), "codex"));
+    }
+
+    #[test]
+    fn a_freeze_by_someone_who_reviews_nothing_writes_no_harness_marker() {
+        for uid in [1000, 1500, 4000] {
+            let mut host = review_host(uid);
+            assert_eq!(freeze_served(&mut host, uid), Answer::Done);
+            assert_eq!(markers_of(&host), [format!("frozen-{uid}")]);
+        }
+    }
+
+    #[test]
+    fn a_harness_account_cannot_write_a_harness_marker() {
+        // The agent's own account (1500) is outside any scope here, the way a
+        // process it started elsewhere is. It is no reviewer, and the registry
+        // keeps reviewers disjoint from harness accounts.
+        let mut host = review_host(1500);
+        let _ = freeze_served(&mut host, 1500);
+        assert!(
+            markers_of(&host)
+                .iter()
+                .all(|name| !name.starts_with("frozen-h-"))
+        );
+    }
+
+    #[test]
+    fn an_unattested_reviewer_gets_no_harness_marker() {
+        // A caller whose cgroup facts cannot be read is not positively human,
+        // so even a registered reviewer's freeze names no harness.
+        let mut host = review_host(2000);
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.uid = 2000;
+        let _ = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity,
+            &freeze_request(),
+            "maintenance",
+        );
+        drop(conn);
+        assert!(
+            markers_of(&host)
+                .iter()
+                .all(|name| !name.starts_with("frozen-h-"))
+        );
+    }
+
+    #[test]
+    fn a_harness_uid_under_a_reviewers_name_gets_no_harness_marker() {
+        // `twin` is a second passwd name for the codex account's uid. Named a
+        // reviewer of claude, the names differ, so the registry loads; the
+        // uids do not, and the broker gives that uid its own marker alone.
+        let mut host = review_host(1500);
+        let claude = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"twin\"]\nmax-sessions = 2\n";
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[
+                HarnessFile {
+                    name: b"claude.toml".to_vec(),
+                    bytes: claude.as_bytes().to_vec(),
+                },
+                HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: SERVICE_HARNESS.as_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        loaded.passwd = format!("{REVIEW_PASSWD}twin:x:1500:1500::/home/agent:/bin/sh\n");
+        host.policy.answer = Ok(loaded);
+        assert_eq!(freeze_served(&mut host, 1500), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen-1500"]);
+    }
+
+    #[test]
+    fn reviewer_markers_cannot_lock_roots_thaw_out() {
+        // 126 uid markers and the audit log, then a reviewer's freeze (its
+        // harness marker and its own): 129 names, past the user bound.
+        let mut host = review_host(2000);
+        host.freeze_file = (0..126).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        host.freeze_file.publish("audit.jsonl", MARKER).unwrap();
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        assert_eq!(markers_of(&host).len(), 126 + 1 + 2);
+        // The agent's side still reads the marker: the directory is listed
+        // past the user bound.
+        assert!(harness_freeze_stands(&host.platform(), "codex"));
+        assert!(user_freeze_stands(&host.platform(), 2000));
+        let (served, code) = thaw_outside(&mut host, 0);
+        assert_eq!(served, Served::Decided, "{code:?}");
+        assert_eq!(markers_of(&host), ["audit.jsonl"]);
+    }
+
+    #[test]
+    fn a_reviewers_markers_stop_at_the_listing_bound() {
+        let mut host = review_host(2000);
+        host.freeze_file = (0..MAX_LISTED_NAMES - 1).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("junk-{index}"), MARKER)
+        });
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = human_identity();
+        identity.uid = 2000;
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(refusal_code_written(&conn), Some(RefusalCode::SpoolFull));
+        assert!(!markers_of(&host).contains(&"frozen-h-codex".to_owned()));
+    }
+
+    #[test]
+    fn a_reviewers_freeze_is_not_refused_for_room() {
+        let mut host = review_host(2000);
+        host.freeze_file = (0..MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        assert!(markers_of(&host).contains(&"frozen-h-codex".to_owned()));
+        // A stranger's freeze in the same full directory is still refused.
+        let mut host = review_host(4000);
+        host.freeze_file = (0..MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = human_identity();
+        identity.uid = 4000;
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(refusal_code_written(&conn), Some(RefusalCode::SpoolFull));
+    }
+
+    #[test]
+    fn a_reviewer_cannot_thaw_with_the_marker_of_the_harness_they_froze() {
+        // Thaw by a non-root peer removes only that peer's own uid marker:
+        // the harness marker stands, and so do another label's.
+        let mut host = review_host(2000);
+        let _ = freeze_served(&mut host, 2000);
+        host.freeze_file.publish("frozen-h-claude", MARKER).unwrap();
+        let (served, _) = thaw_outside(&mut host, 2000);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(markers_of(&host), ["frozen-h-claude", "frozen-h-codex"]);
+    }
+
+    #[test]
+    fn a_harness_uid_cannot_thaw_a_harness_marker() {
+        let mut host = review_host(1500);
+        host.freeze_file.publish("frozen-h-codex", MARKER).unwrap();
+        let (served, code) = thaw_outside(&mut host, 1500);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(markers_of(&host), ["frozen-h-codex"]);
+    }
+
+    #[test]
+    fn root_thaw_lifts_every_harness_marker_and_no_other_name() {
+        let mut host = review_host(0);
+        for name in [
+            "frozen",
+            "frozen-h-codex",
+            "frozen-h-claude",
+            "frozen-h-../x",
+            "frozen-h-",
+            "audit.jsonl",
+        ] {
+            host.freeze_file.publish(name, MARKER).unwrap();
+        }
+        let _ = serve_with(
+            &mut host,
+            &connection(Ok(thaw_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(
+            markers_of(&host),
+            ["audit.jsonl", "frozen-h-", "frozen-h-../x"]
+        );
+    }
+
+    #[test]
+    fn the_broker_early_refusal_reads_only_the_harness_marker_it_names() {
+        let mut host = review_host(0);
+        host.freeze_file.publish("frozen-h-codex", MARKER).unwrap();
+        let platform = host.platform();
+        assert!(harness_freeze_stands(&platform, "codex"));
+        assert!(!harness_freeze_stands(&platform, "claude"));
+        // A label that cannot name a marker is frozen, never a path.
+        assert!(harness_freeze_stands(&platform, "../frozen"));
+        // Storage that cannot be listed, or is over the bound, freezes.
+        let mut missing = review_host(0);
+        let full = (0..=MAX_LISTED_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("junk-{index}"), MARKER)
+        });
+        missing.freeze_file = full;
+        assert!(harness_freeze_stands(&missing.platform(), "claude"));
+        let mut gone = review_host(0);
+        gone.freeze_available = false;
+        assert!(harness_freeze_stands(&gone.platform(), "claude"));
+        let mut broken = review_host(0);
+        broken.freeze_file = FakeSpool::new().failing_names(SpoolError::InvalidName {
+            name: "state".to_owned(),
+        });
+        assert!(harness_freeze_stands(&broken.platform(), "claude"));
+    }
+
+    #[test]
+    fn a_reviewer_freeze_that_cannot_publish_a_marker_is_refused() {
+        let mut host = review_host(2000);
+        host.freeze_file = FakeSpool::new().failing_publish(SpoolError::InvalidName {
+            name: "state".to_owned(),
+        });
+        let mut identity = human_identity();
+        identity.uid = 2000;
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity,
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Broker));
+        assert!(markers_of(&host).is_empty());
+    }
+
+    #[test]
+    fn root_freeze_names_no_harness_and_writes_the_global_marker_only() {
+        let mut host = review_host(0);
+        assert_eq!(freeze_served(&mut host, 0), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen"]);
     }
 
     const SESSION_HARNESS: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\", \"alias\"]\nreviewers = [\"bob\"]\nmax-sessions = 2\n";
