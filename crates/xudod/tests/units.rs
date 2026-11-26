@@ -312,9 +312,9 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "ProtectHostname",
             "PrivateNetwork",
             "RestrictAddressFamilies",
-            "IPAddressDeny",
             "RestrictNamespaces",
             "RestrictRealtime",
+            "RestrictSUIDSGID",
             "LockPersonality",
             "MemoryDenyWriteExecute",
             "SystemCallArchitectures",
@@ -411,7 +411,6 @@ fn the_broker_has_no_network_and_no_socket_but_a_unix_one() {
         value(&service, "Service", "RestrictAddressFamilies"),
         "AF_UNIX"
     );
-    assert_eq!(value(&service, "Service", "IPAddressDeny"), "any");
 }
 
 #[test]
@@ -447,6 +446,7 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     for key in [
         "RestrictNamespaces",
         "RestrictRealtime",
+        "RestrictSUIDSGID",
         "LockPersonality",
         "MemoryDenyWriteExecute",
     ] {
@@ -454,20 +454,17 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     }
 }
 
-/// systemd's `RestrictSUIDSGID=` filter cannot read openat2's flags, so it
-/// answers every openat2 with ENOSYS. The broker attests a peer's cgroup
-/// through openat2 (`xudo_sys::cgroup`), so with that line no enrolled harness
-/// is ever attested: the systemd lane saw every live unit come out unattested.
+/// systemd's `RestrictSUIDSGID=` filter cannot read `openat2`'s flags, so it
+/// answers every `openat2` with ENOSYS. The broker keeps the directive (a uid 0
+/// broker owns `/var/lib/xudo` and could otherwise leave a setuid file there)
+/// and tolerates ENOSYS instead: `xudo_sys::beneath` walks one component at a
+/// time when `openat2` is missing. The systemd lane's grant and queue rows run
+/// under this very unit, so losing either half shows there.
 #[test]
-fn the_broker_unit_never_answers_openat2_with_enosys() {
+fn the_broker_keeps_restrict_suidsgid_and_must_tolerate_enosys_from_openat2() {
     let service = parse(SERVICE);
-    assert!(values(&service, "Service", "RestrictSUIDSGID").is_empty());
-    assert!(
-        SERVICE_KEYS
-            .iter()
-            .all(|(_, keys)| !keys.contains(&"RestrictSUIDSGID")),
-        "the key must stay unknown, so adding it back fails only_known_keys"
-    );
+    assert_eq!(value(&service, "Service", "RestrictSUIDSGID"), "yes");
+    assert!(values(&service, "Service", "IPAddressDeny").is_empty());
 }
 
 #[test]

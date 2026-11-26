@@ -709,7 +709,16 @@ else
 fi
 [ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
 # The passwordless grant end to end, with a lane-only NOPASSWD line that the
-# script removes before it returns (G1f).
+# script removes before it returns (G1f). If it aborts first, this undoes both
+# of its edits to the system on the way out.
+g1f_cleanup() {
+    rm -f /etc/sudoers.d/xudo-g1f-lane-only
+    if [ -f /var/tmp/g1f-pam-sudo ]; then
+        cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
+        rm -f /var/tmp/g1f-pam-sudo
+    fi
+}
+trap g1f_cleanup EXIT
 . /harness/grant.sh
 # Enrol again, and leave it running for the package removal below.
 if enrol_agent && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then

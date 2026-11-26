@@ -44,12 +44,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use bstr::ByteSlice;
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, fchmod, flock, fstat,
     openat, renameat_with, unlinkat,
 };
-#[cfg(target_os = "linux")]
-use rustix::fs::{ResolveFlags, openat2};
 
 use crate::mounts::{HostMounts, MountView};
 use crate::trust::{TRUSTED_UID, TrustError, open_trusted_with};
@@ -380,7 +380,13 @@ impl SpoolDir {
         if self.resolve_beneath {
             #[cfg(target_os = "linux")]
             {
-                return openat2(&self.dir, name, flags, mode, RESOLVE_ENTRY);
+                return crate::beneath::open_beneath(
+                    &self.dir,
+                    name.as_bytes(),
+                    flags,
+                    mode,
+                    RESOLVE_ENTRY,
+                );
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1696,6 +1702,33 @@ mod tests {
         // RESOLVE_NO_SYMLINKS: an entry that is a link to a real file is refused.
         std::os::unix::fs::symlink(dir.join("entry"), dir.join("link")).unwrap();
         assert!(spool.read(b"link", 64).is_err());
+    }
+
+    /// The broker unit's `RestrictSUIDSGID=yes` answers openat2 with ENOSYS.
+    /// The persistent queue must still publish and read, and still refuse a
+    /// link, a parent, and a path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_queue_works_and_refuses_links_where_openat2_is_enosys() {
+        crate::beneath::without_openat2(|| {
+            let (dir, owner) = scratch("beneath-enosys");
+            let spool = SpoolDir::from_dir_with(open_dir(&dir), &dir, owner, true).unwrap();
+            spool.publish("entry", b"payload").unwrap();
+            assert_eq!(spool.read(b"entry", 64).unwrap(), b"payload");
+            std::fs::write(dir.join("outside"), b"secret").unwrap();
+            std::os::unix::fs::symlink(dir.join("outside"), dir.join("link")).unwrap();
+            assert!(spool.read(b"link", 64).is_err());
+            assert!(
+                spool
+                    .open_entry(OsStr::new("../x"), OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+            assert!(
+                spool
+                    .open_entry(OsStr::new("/etc/passwd"), OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+        });
     }
 
     #[cfg(not(target_os = "linux"))]

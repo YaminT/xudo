@@ -241,7 +241,6 @@ mod imp {
 
     use rustix::fs::{
         Dir, FileType, Mode, OFlags, ResolveFlags, fstat, fstatfs, open as open_path, openat,
-        openat2,
     };
 
     use super::{HostCgroup, ScopeFacts, is_record_name, record_of_unit_dir};
@@ -387,7 +386,7 @@ mod imp {
     ) -> Result<OwnedFd, SysError> {
         inject(operation)?;
         rustix_result(
-            openat2(dir, path, DIR_FLAGS, Mode::empty(), RESOLVE),
+            crate::beneath::open_beneath(dir, path.as_bytes(), DIR_FLAGS, Mode::empty(), RESOLVE),
             operation,
         )
     }
@@ -1299,6 +1298,26 @@ mod tests {
             Err(SysError::Os { operation, .. }) if operation == "test"
         ));
         assert!(imp::finish_cgroup_root(Err(rustix::io::Errno::NOENT)).is_err());
+    }
+
+    /// The broker unit's `RestrictSUIDSGID=yes` answers openat2 with ENOSYS.
+    /// A peer's cgroup and the session records must still open, the same
+    /// directories as through openat2, and a missing one must still refuse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peers_cgroup_is_attested_where_openat2_is_enosys() {
+        use crate::beneath::without_openat2;
+        let host = fixture_host();
+        let path = "/xudo.slice/xudo-agent@codex.service";
+        let kernel = imp::cgroup_inode(&host, path).unwrap();
+        assert_eq!(
+            without_openat2(|| imp::cgroup_inode(&host, path)).unwrap(),
+            kernel
+        );
+        assert!(without_openat2(|| imp::cgroup_inode(&host, "/missing.scope")).is_err());
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let run = open_dir(&fixture.join("run"));
+        assert!(without_openat2(|| imp::sessions_dir_from(Some(&host), Ok(run))).is_ok());
     }
 
     #[cfg(target_os = "linux")]

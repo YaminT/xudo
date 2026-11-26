@@ -10,6 +10,15 @@
 # A PAM hook lets a case act between the broker's mint and the gate: sudo
 # runs it (account and session, as root) after xudo has its entry and before
 # sudo execs the gate. It does nothing unless a case armed it, and runs once.
+#
+# Both edits to the system (the NOPASSWD line and /etc/pam.d/sudo) are undone
+# by g1f_cleanup, which row.sh runs on EXIT, if this script aborts first.
+
+# Never outside the throwaway container: this writes a NOPASSWD line.
+systemd-detect-virt --container -q || {
+    bad "g1f: not inside a container; refusing to write a NOPASSWD line"
+    return 1
+}
 
 g1f=/run/xudo-g1f
 tree=/var/lib/xudo-g1f-tree
@@ -89,6 +98,14 @@ args = [{ name = "name", matcher = { literal = "-un" } }]
 harness = ["lane"]
 outcome = "allow"
 
+[[action]]
+id = "g1f.ask"
+tier = "diag-read"
+exe = "$gate_exe"
+args = [{ name = "group", matcher = { literal = "-g" } }]
+harness = ["lane"]
+outcome = "ask-human"
+
 [[operation]]
 id = "g1f.clean"
 op = "remove-path"
@@ -160,6 +177,7 @@ mark=$(trail_len)
 as_harness lane default "$run_whoami"
 case_name=the_default_install_refuses_nopass_with_a_password_required
 if [ "$hrc" = 1 ] && ! has_root_line "$hout" &&
+    ! grep -rqs xudo-gate-nopass /etc/sudoers /etc/sudoers.d &&
     printf '%s\n' "$hout" | grep -q 'passwordless agent path is not installed' &&
     [ "$(spool_vias)" = harness ] &&
     ! trail_since "$mark" | grep -q 'gate_mode='; then
@@ -239,10 +257,13 @@ chown xudograntee:xudograntee "$tree/mixed/mine.o"
 printf 'theirs\n' >"$tree/mixed/theirs.o"
 chown xudotest:xudotest "$tree/mixed/theirs.o"
 printf 'roots\n' >"$tree/mixed/roots.o"
+mark=$(trail_len)
 as_harness lane mixed "/usr/bin/xudo op remove-path $tree/mixed"
 case_name=a_granted_remove_path_leaves_what_the_account_does_not_own
-if [ ! -e "$tree/mixed/mine.o" ] && [ "$(cat "$tree/mixed/theirs.o" 2>/dev/null)" = theirs ] &&
-    [ "$(cat "$tree/mixed/roots.o" 2>/dev/null)" = roots ]; then
+if [ "$hrc" = 0 ] && [ ! -e "$tree/mixed/mine.o" ] &&
+    [ "$(cat "$tree/mixed/theirs.o" 2>/dev/null)" = theirs ] &&
+    [ "$(cat "$tree/mixed/roots.o" 2>/dev/null)" = roots ] &&
+    trail_since "$mark" | grep -q '^allowed - g1f.clean .*via=harness'; then
     good "$case_name (rc=$hrc)"
 else
     bad "$case_name"
@@ -276,6 +297,87 @@ else
     bad "$case_name"
     show "$case_name"
 fi
+
+# (10) The broker's root-held queue, under the shipped unit: an ask-human
+# rule queues the harness's request (the unit's RestrictSUIDSGID= answers the
+# queue's openat2 with ENOSYS, which once refused every entry), its reviewer
+# lists it with ido, and claims and runs it with the password.
+root_held() {
+    su -s /bin/sh -c 'ido list --json' xudotest 2>/dev/null | python3 -c '
+import json, sys
+for entry in json.load(sys.stdin)["root_held"]:
+    print(entry["id"], entry["state"], entry["harness"], " ".join(entry["argv"]))
+'
+}
+mark=$(trail_len)
+as_harness lane ask '/usr/bin/xudo exec -- '"$gate_exe"' -g'
+queued=$(find /var/lib/xudo/queue -maxdepth 1 -type f -name '*.json' | wc -l)
+held=$(root_held || true)
+qid=$(printf '%s\n' "$held" |
+    awk -v exe="$gate_exe" '$2 == "pending" && $3 == "lane" && $4 == exe && $5 == "-g" && NF == 5 { print $1 }')
+case_name=an_ask_human_request_is_queued_under_the_shipped_unit
+if [ "$hrc" != 0 ] && ! printf '%s\n' "$hout" | grep -qx 0 &&
+    printf '%s\n' "$hout" | grep -q 'root-held queue' && [ "$queued" -eq 1 ] &&
+    ! trail_since "$mark" | grep -q 'gate_mode='; then
+    good "$case_name"
+else
+    bad "$case_name (queued=$queued)"
+    show "$case_name"
+    journalctl -u 'xudod@*' --no-pager -n 20 >&2 || true
+fi
+case_name=the_reviewer_lists_the_queued_entry
+if printf '%s\n' "$qid" | grep -Eqx '[0-9a-f]{64}'; then
+    good "$case_name"
+else
+    bad "$case_name"
+    printf '%s\n' "$held" >&2
+fi
+set +e
+XUDO_G1F_ID=$qid expect -c '
+set timeout 60
+spawn su --pty -s /bin/sh -c "/usr/bin/xudo exec --queued $env(XUDO_G1F_ID)" xudotest
+expect {
+    "press enter: " { send "run\r"; exp_continue }
+    -nocase "password" { send "pw\r"; exp_continue }
+    timeout { exit 124 }
+    eof
+}
+catch wait result
+exit [lindex $result 3]
+' >/var/tmp/g1f-claim.raw 2>&1
+hrc=$?
+set -e
+hout=$(tr -d '\r' </var/tmp/g1f-claim.raw |
+    sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b\][^\x1b]*\x1b\\//g')
+case_name=the_reviewer_claims_and_runs_the_queued_entry_with_the_password
+if [ "$hrc" = 0 ] && printf '%s\n' "$hout" | grep -qx 0 &&
+    trail_since "$mark" | grep -q '^allowed - g1f.ask .*gate_mode=Auth via=auth' &&
+    ! root_held | grep -q "^$qid pending"; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    show "$case_name"
+    root_held >&2 || true
+fi
+rm -f /run/xudo/req/*
+
+# A reviewer's own thaw lifts their marker and leaves a harness's freeze,
+# which only root lifts.
+printf '{"reason":"g1f lane","uid":0,"time":0}' >/var/lib/xudo/frozen-h-lane
+reviewer_frozen=/var/lib/xudo/frozen-$(id -u xudotest)
+set +e
+su -s /bin/sh -c '/usr/bin/xudo freeze --reason "g1f reviewer"' xudotest >/var/tmp/g1f-thaw.out 2>&1
+su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >>/var/tmp/g1f-thaw.out 2>&1
+rc=$?
+set -e
+case_name=a_reviewers_thaw_leaves_a_harness_freeze_in_place
+if [ "$rc" -eq 0 ] && [ ! -e "$reviewer_frozen" ] && [ -f /var/lib/xudo/frozen-h-lane ]; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$rc, harness: $([ -f /var/lib/xudo/frozen-h-lane ] && echo present || echo gone))"
+    cat /var/tmp/g1f-thaw.out >&2
+fi
+rm -f /var/lib/xudo/frozen-h-lane "$reviewer_frozen"
 
 # (2) A process that left the scope is not the harness: the broker mints a
 # password entry, and sudo asks a password nobody here can type. First a
@@ -394,8 +496,10 @@ rm -f /run/xudo/req/* "$g1f/once"
 mark=$(trail_len)
 as_harness lane human "$run_whoami"
 case_name=a_removed_harness_is_human_at_once
-if [ "$hrc" != 0 ] && ! has_root_line "$hout" && [ "$(spool_vias)" != harness ] &&
-    ! trail_since "$mark" | grep -q 'via=harness'; then
+trail=$(trail_since "$mark")
+if [ "$hrc" != 0 ] && ! has_root_line "$hout" && [ "$(spool_vias)" = auth ] &&
+    printf '%s\n' "$trail" | grep -q 'via=auth' &&
+    ! printf '%s\n' "$trail" | grep -q 'via=harness'; then
     good "$case_name (rc=$hrc)"
 else
     bad "$case_name"
@@ -415,14 +519,16 @@ else
     show "$case_name"
 fi
 cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
-rm -f "$g1f/once"
+rm -f "$g1f/once" /var/tmp/g1f-pam-sudo
 
 # (6) The ceiling under load: 200 calls of the passwordless door with nothing
-# minted. The trail grows by at most the ceiling (60 a minute) plus one
-# coalesced record per minute, the chain stays intact, and a human's password
+# minted. The trail grows by at most the ceiling (60 in any minute) plus one
+# coalesced record a minute, the chain stays intact, and a human's password
 # run still works afterwards. Each call prints its exit status and the gate's
-# refusal code.
+# refusal code. The bound scales with the minutes the flood took, so a slow
+# runner whose calls span more than one window does not fail the row.
 mark=$(trail_len)
+started=$(date +%s)
 as_harness lane flood 'i=0
 while [ "$i" -lt 200 ]; do
     out=$(/usr/bin/sudo -n '"$nopass"' 2>&1)
@@ -430,16 +536,20 @@ while [ "$i" -lt 200 ]; do
     i=$((i + 1))
 done'
 added=$(($(trail_len) - mark))
+minutes=$((($(date +%s) - started) / 60 + 1))
+record_limit=$((63 * minutes))
+throttle_floor=$((200 - 70 * minutes))
+[ "$throttle_floor" -gt 0 ] || throttle_floor=1
 calls=$(printf '%s\n' "$hout" | grep -c . || true)
 throttled=$(printf '%s\n' "$hout" | grep -cx '19 gate_rate_ceiling' || true)
 unentered=$(printf '%s\n' "$hout" | grep -cx '19 gate_no_pending_request' || true)
 case_name=two_hundred_nopass_refusals_leave_a_bounded_trail
 if [ "$calls" -eq 200 ] && [ "$((throttled + unentered))" -eq 200 ] &&
-    [ "$throttled" -ge 130 ] && [ "$added" -le 63 ] &&
+    [ "$throttled" -ge "$throttle_floor" ] && [ "$added" -le "$record_limit" ] &&
     xudo audit --log "$audit" 2>/dev/null | grep -q 'chain intact'; then
-    good "$case_name (records=$added throttled=$throttled)"
+    good "$case_name (records=$added throttled=$throttled minutes=$minutes)"
 else
-    bad "$case_name (calls=$calls records=$added throttled=$throttled)"
+    bad "$case_name (calls=$calls records=$added throttled=$throttled minutes=$minutes)"
     printf '%s\n' "$hout" | sort | uniq -c >&2
 fi
 rc=$(pty pw "$gate_exe" -u)
