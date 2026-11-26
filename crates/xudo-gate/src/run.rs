@@ -892,6 +892,7 @@ fn proceed(
         settings,
         password_confirms: mode == GateMode::Auth,
         mode,
+        caller_is_agent_account: is_agent_account(&loaded.rules.harnesses, passwd, live_uid),
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -1783,6 +1784,12 @@ args = [
     }
 
     impl FakeHost {
+        /// The registered account is the caller's own uid, as for a live agent.
+        fn agent_has_the_callers_uid(&mut self) {
+            let policy = self.policy.as_mut().unwrap();
+            policy.passwd = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned();
+        }
+
         fn new(spool: &Rc<FakeSpool>) -> Self {
             let (path, owner) = program_file("tool", b"the program that would run as root");
             Self {
@@ -1796,7 +1803,7 @@ args = [
                     rules: rules(),
                     settings: engine::Settings::default(),
                     queue_ttl_secs: 24 * 60 * 60,
-                    passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+                    passwd: "agent:x:2000:2000:agent:/home/agent:/bin/sh\n".to_owned(),
                     passwd_fault: None,
                 }),
                 spool: Ok(Rc::clone(spool)),
@@ -2223,6 +2230,7 @@ args = [
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -2531,6 +2539,7 @@ args = [
             settings: engine::Settings::default(),
             password_confirms: true,
             mode: GateMode::Auth,
+            caller_is_agent_account: false,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -3023,6 +3032,24 @@ all = [{ any-arg = ["restart"] }]
         request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
         request.attested_harness = Some("codex".to_owned());
         refused_for_class(request);
+    }
+
+    #[test]
+    fn an_agent_account_process_outside_its_scope_is_refused_on_the_auth_gate() {
+        // A crontab or ssh login of the agent account reads as a human, and
+        // may have passed PAM; its uid is the registry's account.
+        let mut request = ours();
+        request.attested_class = crate::request::AttestedClass::Human;
+        let spool = Rc::new(holding(&[(NONCE_A, request)]));
+        let mut host = FakeHost::new(&spool);
+        host.agent_has_the_callers_uid();
+        let exit = run(&mut host, &auth());
+        assert!(
+            exit.message.contains("gate_mode_agent_without_approval"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(exec_calls(&host), 0);
     }
 
     #[test]
@@ -4108,6 +4135,7 @@ max-entries = 10
         let (mut host, spool) =
             host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -4180,6 +4208,7 @@ args = [
             granted,
         );
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -4243,6 +4272,7 @@ args = [
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -4289,6 +4319,7 @@ args = [
         let mut host = FakeHost::new(&spool);
         host.policy = Ok(policy);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -4449,6 +4480,7 @@ args = [
         let (mut host, _spool) =
             host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         script_human(&mut host);
         let _ = run(&mut host, &nopass());
         assert_eq!(
@@ -4669,5 +4701,47 @@ args = [
             exit.message
         );
         assert_eq!(exec_calls(&human), 1);
+    }
+}
+
+/// Whether `uid` is the account of a registered service harness.
+fn is_agent_account(
+    registry: &xudo_policy::HarnessRegistry,
+    passwd: &str,
+    uid: Option<u32>,
+) -> bool {
+    let Some(uid) = uid else {
+        return false;
+    };
+    registry.entries().any(|entry| {
+        entry
+            .account
+            .as_deref()
+            .is_some_and(|name| xudo_policy::passwd_uid(passwd, name) == Some(uid))
+    })
+}
+
+#[cfg(test)]
+mod agent_account_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::is_agent_account;
+
+    const REGISTRY: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
+    const SESSION: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
+    const PASSWD: &str =
+        "agent:x:1000:1000::/home/agent:/bin/sh\nalice:x:1001:1001::/home/alice:/bin/sh\n";
+
+    #[test]
+    fn the_account_of_a_service_harness_is_an_agent_account() {
+        let registry = xudo_policy::HarnessRegistry::from_files([
+            ("codex.toml", REGISTRY),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
+        assert!(is_agent_account(&registry, PASSWD, Some(1000)));
+        assert!(!is_agent_account(&registry, PASSWD, Some(1001)));
+        assert!(!is_agent_account(&registry, PASSWD, None));
+        let empty = xudo_policy::HarnessRegistry::empty();
+        assert!(!is_agent_account(&empty, PASSWD, Some(1000)));
     }
 }

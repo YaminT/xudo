@@ -451,7 +451,18 @@ pub fn scan_account(
         .iter()
         .filter_map(|group| group_gid(&as_account, group))
         .collect();
-    blockers.extend(rules_naming(host, name, entry.uid, &group_gids, exempt));
+    // A group enrol will create takes a gid no rule can be told apart by yet:
+    // a leftover `%#996` would name it. Until it exists, any numeric group
+    // in a rule counts.
+    let numeric_groups = group_gids.len() < AGENT_GROUPS.len();
+    blockers.extend(rules_naming(
+        host,
+        name,
+        entry.uid,
+        &group_gids,
+        numeric_groups,
+        exempt,
+    ));
     blockers.extend(pam_blockers(host));
     Ok(AccountScan {
         uid: entry.uid,
@@ -569,6 +580,7 @@ fn rules_naming(
     name: &str,
     uid: u32,
     group_gids: &[u32],
+    numeric_groups: bool,
     exempt: bool,
 ) -> Vec<String> {
     let mut files: Vec<std::path::PathBuf> =
@@ -588,7 +600,7 @@ fn rules_naming(
         }
         match host.read(&file) {
             Lookup::Found(bytes) => out.extend(
-                lines_naming(&bytes, name, uid, group_gids)
+                lines_naming(&bytes, name, uid, group_gids, numeric_groups)
                     .into_iter()
                     .map(|line| format!("{} line {line} names the account", file.display())),
             ),
@@ -601,7 +613,13 @@ fn rules_naming(
     out
 }
 
-fn lines_naming(bytes: &[u8], name: &str, uid: u32, group_gids: &[u32]) -> Vec<usize> {
+fn lines_naming(
+    bytes: &[u8],
+    name: &str,
+    uid: u32,
+    group_gids: &[u32],
+    numeric_groups: bool,
+) -> Vec<usize> {
     let uid_hash = format!("#{uid}");
     // The agent groups by name and by gid, and the account's own gid hash.
     let group_tokens: Vec<String> = AGENT_GROUPS
@@ -653,7 +671,8 @@ fn lines_naming(bytes: &[u8], name: &str, uid: u32, group_gids: &[u32]) -> Vec<u
             || group_tokens
                 .iter()
                 .any(|token| names_token(line, token.as_bytes(), &is_word));
-        if names_account || names_everyone || names_agent_path {
+        let names_future_group = numeric_groups && names_numeric_group(line);
+        if names_account || names_everyone || names_agent_path || names_future_group {
             found.push(line_no);
         }
     }
@@ -661,20 +680,20 @@ fn lines_naming(bytes: &[u8], name: &str, uid: u32, group_gids: &[u32]) -> Vec<u
 }
 
 /// Where sudo's PAM stack starts.
+const PAM_MAX_DEPTH: usize = 8;
+/// Where sudo's PAM stack starts.
 const PAM_SUDO: &str = "/etc/pam.d/sudo";
 /// Modules that may be `sufficient`: they authenticate a password or a login
 /// session and nothing else.
 const PAM_PLAIN: [&str; 3] = ["pam_unix", "pam_systemd", "pam_systemd_home"];
 /// Modules that can pass authentication for the agent without its password.
-const PAM_GRANTING: [&str; 7] = [
-    "pam_ssh_agent_auth",
-    "pam_u2f",
-    "pam_rhosts",
-    "pam_permit",
-    "pam_succeed_if",
-    "pam_exec",
-    "pam_listfile",
-];
+///
+/// `pam_succeed_if`, `pam_exec` and `pam_listfile` are not here: they only
+/// pass someone when their control lets a pass end the stack, so they are
+/// judged by that alone (`requisite pam_succeed_if` is stock RHEL).
+const PAM_GRANTING: [&str; 4] = ["pam_ssh_agent_auth", "pam_u2f", "pam_rhosts", "pam_permit"];
+/// Where `sudo -i` starts.
+const PAM_SUDO_I: &str = "/etc/pam.d/sudo-i";
 
 /// The agent will be in `xudo`, so it can run sudo and reach the password
 /// gate; only PAM stands in the way. The `auth` lines of `/etc/pam.d/sudo`
@@ -688,6 +707,10 @@ fn pam_blockers(host: &dyn HostView) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
     pam_walk(host, PAM_SUDO, 0, &mut seen, &mut out);
+    // Not every sudo has the `sudo-i` service; one that has it reads it.
+    if !matches!(host.read(Path::new(PAM_SUDO_I)), Lookup::Missing) {
+        pam_walk(host, PAM_SUDO_I, 0, &mut seen, &mut out);
+    }
     out
 }
 
@@ -698,7 +721,13 @@ fn pam_walk(
     seen: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
-    if depth > 8 || seen.iter().any(|done| done == file) {
+    if seen.iter().any(|done| done == file) {
+        return;
+    }
+    if depth > PAM_MAX_DEPTH {
+        out.push(format!(
+            "could not examine {file}: includes nest deeper than {PAM_MAX_DEPTH}"
+        ));
         return;
     }
     seen.push(file.to_owned());
@@ -739,7 +768,7 @@ fn pam_walk(
             continue;
         }
         // `#` starts a comment; only `auth` lines decide who passes.
-        let [kind, control, module, ..] = words.as_slice() else {
+        let Some((kind, control, module)) = pam_fields(line) else {
             continue;
         };
         if kind.trim_start_matches('-') != "auth" {
@@ -747,8 +776,7 @@ fn pam_walk(
         }
         let module = module.rsplit('/').next().unwrap_or(module);
         let module = module.strip_suffix(".so").unwrap_or(module);
-        let can_end = *control == "sufficient"
-            || control.starts_with('[') && (control.contains("=done") || control.contains("=ok"));
+        let can_end = control == "sufficient" || bracket_can_end(&control);
         let bad = if PAM_GRANTING.contains(&module) {
             module != "pam_permit" || can_end
         } else {
@@ -762,6 +790,45 @@ fn pam_walk(
     }
 }
 
+/// The type, control and module of a PAM line. A bracket control runs from
+/// `[` through `]` as one token, spaces inside it included.
+fn pam_fields(line: &str) -> Option<(&str, String, &str)> {
+    let mut rest = line.trim_start();
+    let mut next = || {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        rest = after.trim_start();
+        (!word.is_empty()).then_some(word)
+    };
+    let kind = next()?;
+    let first = next()?;
+    if !first.starts_with('[') {
+        return Some((kind, first.to_owned(), next()?));
+    }
+    let mut control = first.to_owned();
+    while !control.contains(']') {
+        control.push(' ');
+        control.push_str(next()?);
+    }
+    Some((kind, control, next()?))
+}
+
+/// Whether a bracket control lets a pass end the stack or skip lines after
+/// it: a `success=<N>`, or any `=done` or `=ok`, in any position.
+fn bracket_can_end(control: &str) -> bool {
+    control.starts_with('[')
+        && control
+            .trim_matches(|c| c == '[' || c == ']')
+            .split_whitespace()
+            .any(|pair| {
+                pair.split_once('=').is_some_and(|(key, action)| {
+                    action == "done"
+                        || action == "ok"
+                        || (key == "success" && action.parse::<u32>().is_ok())
+                })
+            })
+}
+
 /// Whether `token` occurs in `line` as a whole word: not followed by another
 /// word byte, so `%xudo` is not `%xudo-agent` and `%#99` is not `%#998`.
 fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
@@ -773,6 +840,14 @@ fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool
                     .get(at.saturating_add(token.len()))
                     .is_some_and(is_word)
         })
+}
+
+/// Whether `line` has a `%#N` or `%N` group, `N` being digits.
+fn names_numeric_group(line: &[u8]) -> bool {
+    line.split(|byte| *byte == b'%').skip(1).any(|rest| {
+        let rest = rest.strip_prefix(b"#").unwrap_or(rest);
+        rest.first().is_some_and(u8::is_ascii_digit)
+    })
 }
 
 /// Whether `needle` occurs in `haystack`.
@@ -1440,14 +1515,21 @@ fn drop_in_content_problems(file: &str, text: &str, account: &str) -> Vec<String
 /// Unit files and drop-in directories, besides ours, that systemd would merge
 /// into `xudo-agent@<label>.service`: any one could change the user.
 fn other_unit_sources(host: &dyn HostView, label: &str) -> Vec<String> {
-    const ROOTS: [&str; 6] = [
+    const ROOTS: [&str; 11] = [
+        "/etc/systemd/system.control",
+        "/run/systemd/system.control",
+        "/run/systemd/transient",
+        "/run/systemd/generator.early",
         "/etc/systemd/system",
         "/run/systemd/system",
+        "/run/systemd/generator",
         "/usr/local/lib/systemd/system",
         "/usr/lib/systemd/system",
         "/lib/systemd/system",
-        "/run/systemd/generator",
+        "/run/systemd/generator.late",
     ];
+    // Where the packaged template itself lives: a template there is ours.
+    const PACKAGED: [&str; 2] = ["/usr/lib/systemd/system", "/lib/systemd/system"];
     let unit = unit_name(label);
     let mut out = Vec::new();
     for root in ROOTS {
@@ -1473,9 +1555,12 @@ fn other_unit_sources(host: &dyn HostView, label: &str) -> Vec<String> {
             }
         }
         // A whole unit file by the instance's name replaces the template.
-        let file = format!("{root}/{unit}");
-        if !matches!(host.stat(Path::new(&file)), Lookup::Missing) {
-            out.push(format!("{file} would replace the packaged template"));
+        // So does a template file anywhere but where the package puts it.
+        let template = (!PACKAGED.contains(&root)).then(|| format!("{root}/xudo-agent@.service"));
+        for file in std::iter::once(format!("{root}/{unit}")).chain(template) {
+            if !matches!(host.stat(Path::new(&file)), Lookup::Missing) {
+                out.push(format!("{file} would replace the packaged template"));
+            }
         }
     }
     out

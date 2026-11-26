@@ -112,6 +112,12 @@ pub struct GateContext {
     /// password half of a confirmation and so asks for more, not less: see
     /// [`ModeRefusal`] and [`decide`].
     pub mode: GateMode,
+    /// Whether the caller's live uid is a registered agent account.
+    ///
+    /// Read by the gate from the registry and `/etc/passwd`, whatever class
+    /// the lineage gave: a process of the account that left its scope reads
+    /// as a human, and the password it passed PAM with is not a human's.
+    pub caller_is_agent_account: bool,
 }
 
 /// How loudly a refusal should be reported.
@@ -603,14 +609,15 @@ fn check_verdict(
 
 /// The agent account is in `xudo`, so it can reach `-auth`: whatever PAM does
 /// with a password, only the broker's record of a human's decision lets a live
-/// enrolled agent through the password gate.
+/// enrolled agent, or any process of an agent's account, through the password
+/// gate.
 fn require_human_for_agent(
     caller: &GateCaller,
     pending: &PendingRequest,
     context: &GateContext,
 ) -> Result<(), Refusal> {
     if context.mode == GateMode::Auth
-        && caller.facts.classification.is_enrolled_agent()
+        && (caller.facts.classification.is_enrolled_agent() || context.caller_is_agent_account)
         && !pending.confirmed
     {
         return Err(mode_refusal(
@@ -984,6 +991,7 @@ all = [
             settings: engine::Settings::default(),
             password_confirms: false,
             mode: GateMode::Auth,
+            caller_is_agent_account: false,
         }
     }
 
@@ -2100,6 +2108,34 @@ args = [
                 "gate_mode_agent_without_approval"
             );
         }
+    }
+
+    #[test]
+    fn auth_refuses_an_agent_account_process_outside_its_scope() {
+        // A crontab job or ssh login of the agent account reads as a human:
+        // the uid is what gives it away.
+        let mut ctx = context();
+        ctx.password_confirms = true;
+        ctx.caller_is_agent_account = true;
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &human(77),
+                Some(&status_request(77)),
+                ctx
+            )),
+            "gate_mode_agent_without_approval"
+        );
+        let mut approved = status_request(77);
+        approved.confirmed = true;
+        let result = decide(&grant_rules(), &human(77), Some(&approved), ctx);
+        let refused: Vec<&str> = result
+            .as_ref()
+            .err()
+            .into_iter()
+            .map(Refusal::code)
+            .collect();
+        assert!(!refused.contains(&"gate_mode_agent_without_approval"));
     }
 
     #[test]

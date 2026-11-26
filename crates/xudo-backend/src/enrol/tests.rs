@@ -1603,8 +1603,14 @@ fn denies_enrol_when_pam_can_pass_sudo_without_the_password() {
         "auth sufficient pam_permit.so",
         "auth [success=done default=ignore] pam_permit.so",
         "auth sufficient pam_succeed_if.so user = agent",
-        "auth requisite pam_exec.so /usr/bin/true",
-        "-auth optional pam_listfile.so item=user sense=allow file=/etc/ok onerr=fail",
+        "auth sufficient pam_exec.so /usr/bin/true",
+        "-auth [success=2 default=ignore] pam_listfile.so item=user sense=allow file=/etc/ok onerr=fail",
+        "auth [success=1 default=ignore] pam_ssh_agent_auth.so file=%h/.ssh/authorized_keys",
+        "auth [success=1 default=ignore] pam_u2f.so",
+        "auth [success=1 default=ignore] pam_permit.so",
+        "auth [default=ignore success=done] pam_rssh.so",
+        "auth [success=2 default=ignore] pam_rssh.so",
+        "auth [default=ignore\tsuccess=1]\tpam_rssh.so",
         "auth sufficient pam_sss.so",
         "auth [success=ok default=ignore] pam_krb5.so",
     ] {
@@ -1617,6 +1623,111 @@ fn denies_enrol_when_pam_can_pass_sudo_without_the_password() {
             "{line}: {blocked:?}"
         );
     }
+}
+
+#[test]
+fn denies_a_bracket_control_that_skips_the_deny_line() {
+    // The `pam-auth-update` shape: the success jumps over `pam_deny`.
+    for module in [
+        "pam_ssh_agent_auth.so file=%h/.ssh/authorized_keys",
+        "pam_u2f.so",
+        "pam_permit.so",
+    ] {
+        let sudo = format!(
+            "auth [success=1 default=ignore] {module}\nauth requisite pam_deny.so\nauth required pam_permit.so\n"
+        );
+        let blocked = blockers(&pam_host(&sudo, None), None);
+        assert!(
+            blocked.iter().any(|found| found.contains("line 1")),
+            "{module}: {blocked:?}"
+        );
+    }
+}
+
+#[test]
+fn allows_stock_pam_stacks_that_only_check_a_password() {
+    // Debian's `[success=1 default=ignore] pam_unix`, and RHEL's
+    // `requisite pam_succeed_if` in system-auth: neither passes anyone.
+    for line in [
+        "auth [success=1 default=ignore] pam_unix.so nullok",
+        "auth requisite pam_succeed_if.so uid >= 1000 quiet_success",
+        "auth required pam_exec.so /usr/bin/true",
+        "auth required pam_listfile.so item=user sense=deny file=/etc/no onerr=succeed",
+        "auth [default=die] pam_succeed_if.so uid >= 1000",
+    ] {
+        let sudo = format!("auth include common-auth\n{line}\n");
+        let blocked = blockers(&pam_host(&sudo, Some(DEBIAN_COMMON_AUTH)), None);
+        assert_eq!(blocked, Vec::<String>::new(), "{line}");
+    }
+}
+
+#[test]
+fn ignores_pam_lines_too_short_to_name_a_module() {
+    let sudo = "auth\nauth required\nauth [success=1 default=ignore]\nauth [success=1\n\n";
+    assert_eq!(blockers(&pam_host(sudo, None), None), Vec::<String>::new());
+}
+
+#[test]
+fn refuses_enrol_when_pam_includes_nest_too_deep_to_read() {
+    let mut host = pam_host("auth include p0\n", None);
+    for n in 0..12 {
+        host = host.file(
+            &format!("/etc/pam.d/p{n}"),
+            0,
+            0,
+            0o644,
+            format!("auth include p{}\n", n + 1).as_bytes(),
+        );
+    }
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|line| line.contains("nest deeper than 8"))
+    );
+}
+
+#[test]
+fn reads_the_sudo_i_pam_service_too() {
+    let host = pam_host("auth include common-auth\n", Some(DEBIAN_COMMON_AUTH)).file(
+        "/etc/pam.d/sudo-i",
+        0,
+        0,
+        0o644,
+        b"auth sufficient pam_u2f.so\n",
+    );
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|line| line.contains("/etc/pam.d/sudo-i line 1"))
+    );
+}
+
+#[test]
+fn a_rule_naming_a_gid_enrol_has_yet_to_allocate_blocks() {
+    // Neither group exists, so `groupadd --system` picks the gid a leftover
+    // `%#996` already names.
+    let none = "root:x:0:\nagent:x:990:\nalice:x:1000:\n";
+    for rule in [
+        "%#996 ALL=(ALL) NOPASSWD: ALL",
+        "%996 ALL=(ALL) NOPASSWD: ALL",
+    ] {
+        let host = sudoers_host(none, None).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            format!("{rule}\n").as_bytes(),
+        );
+        assert!(
+            blockers(&host, None)
+                .iter()
+                .any(|line| line.contains("90-local line 1")),
+            "{rule}"
+        );
+    }
+    // Both groups allocated: a numeric group is judged by its gid.
+    let host = not_yet_host("%#4242 ALL=(ALL) ALL\n");
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
 }
 
 #[test]
@@ -1770,17 +1881,60 @@ fn recheck_finds_another_unit_source_that_could_change_the_user() {
             "x.conf",
         ),
         ("/etc/systemd/system/xudo-agent-.service.d", "x.conf"),
+        (
+            "/etc/systemd/system.control/xudo-agent@.service.d",
+            "x.conf",
+        ),
+        ("/run/systemd/system.control/service.d", "x.conf"),
+        (
+            "/run/systemd/transient/xudo-agent@codex.service.d",
+            "x.conf",
+        ),
+        ("/run/systemd/generator.early/service.d", "x.conf"),
+        (
+            "/run/systemd/generator.late/xudo-agent@.service.d",
+            "x.conf",
+        ),
     ] {
-        let host = ancestors(base()).dir(dir, 0, 0, 0o755).file(
-            &format!("{dir}/{file}"),
+        let parent = dir.rsplit_once('/').map_or("/", |(parent, _)| parent);
+        let host = ancestors(base())
+            .dir(parent, 0, 0, 0o755)
+            .dir(dir, 0, 0, 0o755)
+            .file(
+                &format!("{dir}/{file}"),
+                0,
+                0,
+                0o644,
+                b"[Service]\nUser=root\n",
+            );
+        let found = recheck(&host).remove(0).problems.join(" | ");
+        assert!(found.contains(dir), "{dir}: {found}");
+    }
+    // A template file that overrides the packaged one, anywhere but where the
+    // package puts it.
+    for file in [
+        "/etc/systemd/system/xudo-agent@.service",
+        "/run/systemd/generator.late/xudo-agent@.service",
+    ] {
+        let parent = file.rsplit_once('/').map_or("/", |(parent, _)| parent);
+        let host = ancestors(base()).dir(parent, 0, 0, 0o755).file(
+            file,
             0,
             0,
             0o644,
             b"[Service]\nUser=root\n",
         );
         let found = recheck(&host).remove(0).problems.join(" | ");
-        assert!(found.contains(dir), "{dir}: {found}");
+        assert!(found.contains(file), "{file}: {found}");
     }
+    let packaged = ancestors(base()).file(
+        "/usr/lib/systemd/system/xudo-agent@.service",
+        0,
+        0,
+        0o644,
+        b"[Service]\n",
+    );
+    assert_eq!(recheck(&packaged).remove(0).problems, Vec::<String>::new());
     // An empty one adds nothing; a whole unit file by the instance's name does.
     let empty = base().dir("/etc/systemd/system/service.d", 0, 0, 0o755);
     assert_eq!(recheck(&empty).remove(0).problems, Vec::<String>::new());
