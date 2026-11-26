@@ -10,7 +10,8 @@
 # login), a rule file, and two bind mounts. row.sh's EXIT trap unmounts them
 # and restores the PAM file if this aborts first; the rows undo the rest.
 #
-# Not here: rule packs (`xudo rules add`, P1) are not on main yet. The walk's
+# The rule-pack rows add a lane-only sudoers line letting xudotest run
+# /usr/bin/xudo as root with their password, and remove it. Not here: the walk's
 # refusals on a real kernel without systemd (a planted link, a tmpfs mount)
 # are root tests in crates/xudo-sys/tests/root_remove_path.rs (just root-test).
 
@@ -396,6 +397,46 @@ else
     bad "$case_name"
     printf '%s\n' "$hout" >&2
 fi
+# The broker records the requester's comm as a hint (`hint_comm=`) and
+# decides without it: a copy of xudo named `claude`, asked from the impostor
+# and from the real harness, is recorded under that name and classified as
+# before, human and harness.
+install -m 0755 /usr/bin/xudo "$e7/claude"
+# hints_since <mark>: classification, decision and hint of each broker record.
+hints_since() {
+    tail -n +"$(($1 + 1))" "$audit" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    r = json.loads(line)
+    hints = [e for e in r["evidence"] if e.startswith("hint_")]
+    if hints:
+        print(r["classification"], r["decision"], " ".join(hints))
+'
+}
+mark=$(trail_len)
+as_harness e7-lane hint-human "$e7/claude exec -- $gate_exe -un"
+claude_trail=$(hints_since "$mark")
+human_path an_impostor_named_claude_is_human human
+case_name=an_impostors_comm_is_recorded_as_a_hint_and_not_trusted
+if [ "$claude_trail" = "human allowed hint_comm=claude" ]; then
+    good "$case_name"
+else
+    bad "$case_name"
+    printf '%s\n' "$claude_trail" >&2
+fi
+mark=$(trail_len)
+as_harness lane hint-harness "$e7/claude exec -- $gate_exe -un"
+case_name=a_harness_named_claude_is_still_only_its_scope
+if [ "$hrc" = 0 ] && has_root_line "$hout" &&
+    [ "$(hints_since "$mark")" = "enrolled-agent allowed hint_comm=claude" ] &&
+    e7_trail "$mark" | grep -q '^enrolled-agent allowed - g1f.whoami gate_mode=Nopass via=harness'; then
+    good "$case_name"
+else
+    bad "$case_name"
+    show "$case_name"
+    hints_since "$mark" >&2
+fi
+rm -f "$e7/claude"
 systemctl stop e7-impostor.service
 rm -rf /var/lib/xudo-g1f/e7-lane
 
@@ -698,6 +739,336 @@ else
     find "$victim" "$outside" "$home" -printf '%u %p\n' >&2 || true
 fi
 rm -rf "$tree" "$outside" "$victim" "$home/out" "$home/in"
+
+# --- Rule packs (P1). A human with a password reviews a pack as themself and
+# installs it through the machine's own sudo; the harness cannot, a stale
+# token, a failing [[test]], an unallowed waiver and an unregistered harness
+# are each refused with nothing written, and removing the pack takes the
+# grant back. xudotest stands for the operator: a lane-only sudoers line lets
+# them run /usr/bin/xudo as root with their password, which the installed
+# drop-in asks every time (timestamp_timeout=0 on XUDO_SELF).
+pack_dir=$e7/packs
+install -d -m 0755 "$pack_dir"
+admin_sudoers=/etc/sudoers.d/xudo-e7-admin
+cat >"$admin_sudoers" <<EOF
+# LANE ONLY: ci/systemd/attack.sh writes this in a throwaway container and removes it.
+xudotest ALL=(root) /usr/bin/xudo
+EOF
+chmod 0440 "$admin_sudoers"
+visudo -cf "$admin_sudoers" >/dev/null || bad "e7: the lane-only admin line parses"
+installed=/etc/xudo/rules.d/pack-e7-ops.toml
+# The pack: `id -gn` for lane, and a refusal of `id -g` for everyone (which
+# makes removing it a gain the preview must show).
+write_pack() {
+    cat >"$pack_dir/$1.toml"
+    chmod 0644 "$pack_dir/$1.toml"
+}
+write_pack ops <<EOF
+[pack]
+name = "e7-ops"
+version = "1.0.0"
+for = ["lane"]
+
+[[action]]
+id = "pack.e7.gn"
+tier = "diag-read"
+exe = "$gate_exe"
+args = [{ name = "group-name", matcher = { literal = "-gn" } }]
+outcome = "allow"
+
+[[deny]]
+id = "pack.e7.no-groups"
+reason = "no group listing while the pack is in"
+program = ["$(basename "$gate_exe")"]
+all = [{ any-arg = ["-g"] }]
+
+[[test]]
+argv = ["$gate_exe", "-gn"]
+expect = "allow"
+action = "pack.e7.gn"
+
+[[test]]
+argv = ["$gate_exe", "-Gn"]
+expect = "deny"
+action = "pack.e7.gn"
+reason = "near miss: one operand off the allow test"
+EOF
+# The same grant whose allow test does not hold.
+sed -e 's/^name = "e7-ops"/name = "e7-bad"/' -e 's/^argv = \["\([^"]*\)", "-gn"\]$/argv = ["\1", "-Gn"]/' \
+    "$pack_dir/ops.toml" | write_pack bad
+# The same grant for a harness nobody registered.
+sed -e 's/^name = "e7-ops"/name = "e7-ghost"/' -e 's/^for = \["lane"\]/for = ["ghost"]/' \
+    "$pack_dir/ops.toml" | write_pack ghost
+# A GTFOBins program for lane, with its waiver.
+write_pack waiver <<'EOF'
+[pack]
+name = "e7-waiver"
+version = "1.0.0"
+for = ["lane"]
+
+[[action]]
+id = "pack.e7.restart"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+outcome = "allow"
+gtfobins-waiver = "pager and unit-file shell escapes via systemctl: the rule pins --no-pager and --no-ask-password, the verb restart and the single unit e7-web.service, so no pager, no editor and no caller-written unit file is reachable"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { literal = "restart" } },
+  { name = "unit", matcher = { one-of = ["e7-web.service"] } },
+]
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "restart", "e7-web.service"]
+expect = "allow"
+action = "pack.e7.restart"
+
+[[test]]
+argv = ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "restart", "ssh.service"]
+expect = "deny"
+action = "pack.e7.restart"
+reason = "near miss: one operand off the allow test"
+EOF
+# as_operator <command>: xudotest, unprivileged, no terminal (the review).
+as_operator() { capture su -s /bin/sh -c "$1" xudotest; }
+# as_admin <command>: xudotest on a pty, typing the password at each prompt,
+# in a system unit of its own, so root's ancestor walk ends at pid 1 and not
+# at this script's `docker exec` (a bare `/`, which root refuses). The status
+# is the command's, printed last as rc=.
+as_admin() {
+    printf '%s\necho "rc=$?"\n' "$1" >"$e7/admin"
+    chmod 0644 "$e7/admin"
+    set +e
+    timeout 180 systemd-run --quiet --wait --pipe --collect \
+        expect /opt/exec.exp "su --pty" pw "sh $e7/admin" </dev/null >/var/tmp/e7-admin.raw 2>&1
+    set -e
+    hout=$(tr -d '\r' </var/tmp/e7-admin.raw |
+        sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b\][^\x1b]*\x1b\\//g')
+    hrc=$(printf '%s\n' "$hout" | sed -n 's/^rc=//p' | tail -n 1)
+}
+# token_of <output>: the token the review printed in its sudo line.
+token_of() { printf '%s\n' "$1" | sed -n 's/^  sudo xudo rules [a-z]*.* --reviewed \([0-9a-f]*\) .*/\1/p'; }
+rules_now() { find /etc/xudo/rules.d -type f -printf '%f %U:%G %m\n' | sort; }
+rules_before=$(rules_now)
+# The lane's own grant file has no near-miss tests and allows `id -un`, which
+# a shipped [[test]] denies, so every review would refuse on it, as it
+# should. It is set aside while packs are judged and put back after.
+mv "$grant_rules" /var/tmp/e7-g1f-grant.toml
+sudo_add="/usr/bin/sudo /usr/bin/xudo rules add"
+bogus=$(printf '0%.0s' $(seq 1 64))
+
+# Baseline: no rule gives lane `id -gn`.
+as_harness lane pack-none "/usr/bin/xudo exec -- $gate_exe -gn"
+case_name=without_the_pack_the_harness_is_denied_the_packs_command
+if [ "$hrc" = 17 ] && ! has_root_line "$hout"; then good "$case_name"; else bad "$case_name"; show "$case_name"; fi
+
+# A stale token: the rules change between the review and the sudo step.
+as_operator "/usr/bin/xudo rules add $pack_dir/ops.toml"
+stale=$(token_of "$hout")
+cat >/etc/xudo/rules.d/92-e7-stale.toml <<EOF
+[[action]]
+id = "e7.stale"
+tier = "diag-read"
+exe = "$gate_exe"
+args = [{ name = "real", matcher = { literal = "-rn" } }]
+EOF
+chmod 0644 /etc/xudo/rules.d/92-e7-stale.toml
+as_admin "$sudo_add --reviewed $stale $pack_dir/ops.toml"
+case_name=a_pack_reviewed_against_other_rules_is_refused_at_the_sudo_step
+if [ -n "$stale" ] && [ "$hrc" = 19 ] && [ ! -e "$installed" ] &&
+    printf '%s\n' "$hout" | grep -qi password &&
+    printf '%s\n' "$hout" | grep -q "this is not the change that was reviewed (token $stale, now "; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc token=$stale)"
+    printf '%s\n' "$hout" >&2
+fi
+rm -f /etc/xudo/rules.d/92-e7-stale.toml
+
+# Refused at review, and never written: a failing [[test]], an unregistered
+# harness, a waiver without --allow-waivers. Root, handed any token for them,
+# reviews them itself first and refuses them for the same reason.
+# refused_pack <case> <pack> <what the review says>
+refused_pack() {
+    as_operator "/usr/bin/xudo rules add $pack_dir/$2.toml"
+    review_out=$hout
+    review_rc=$hrc
+    as_admin "$sudo_add --reviewed $bogus $pack_dir/$2.toml"
+    if [ "$review_rc" = 21 ] && [ -z "$(token_of "$review_out")" ] &&
+        printf '%s\n' "$review_out" | grep -qF "$3" && printf '%s\n' "$hout" | grep -qi password &&
+        [ "$hrc" = 21 ] && printf '%s\n' "$hout" | grep -qF "$3" &&
+        [ ! -e "/etc/xudo/rules.d/pack-e7-$2.toml" ]; then
+        good "$1"
+    else
+        bad "$1 (review rc=$review_rc, sudo rc=$hrc)"
+        printf '%s\n' "$review_out" "$hout" >&2
+    fi
+}
+refused_pack a_pack_with_a_failing_test_is_never_installed bad 'does not hold'
+refused_pack a_pack_naming_an_unregistered_harness_is_never_installed ghost \
+    'names harness "ghost", which is not in the registry'
+refused_pack a_waiver_is_refused_without_allow_waivers waiver 'pass --allow-waivers to both'
+# With the flag the review shows the waiver and a token; that token, handed
+# to sudo without the flag, is refused.
+as_operator "/usr/bin/xudo rules add --allow-waivers $pack_dir/waiver.toml"
+review_out=$hout
+review_rc=$hrc
+waived=$(token_of "$review_out")
+as_admin "$sudo_add --reviewed $waived $pack_dir/waiver.toml"
+case_name=a_waiver_reviewed_with_the_flag_needs_it_at_the_sudo_step_too
+if [ "$review_rc" = 0 ] && [ -n "$waived" ] &&
+    printf '%s\n' "$review_out" | grep -q '^GTFOBins waivers: ' &&
+    printf '%s\n' "$review_out" | grep -q '^  pack.e7.restart: pager and unit-file shell escapes via systemctl: ' &&
+    printf '%s\n' "$review_out" | grep -q '^  sudo xudo rules add --allow-waivers --reviewed ' &&
+    [ "$hrc" = 21 ] && printf '%s\n' "$hout" | grep -qF 'pass --allow-waivers to both' &&
+    [ ! -e /etc/xudo/rules.d/pack-e7-waiver.toml ]; then
+    good "$case_name"
+else
+    bad "$case_name (review rc=$review_rc, sudo rc=$hrc)"
+    printf '%s\n' "$review_out" "$hout" >&2
+fi
+
+# The human installs it: review as themself, then sudo with the password.
+as_operator "/usr/bin/xudo rules add $pack_dir/ops.toml"
+review_out=$hout
+review_rc=$hrc
+token=$(token_of "$review_out")
+case_name=the_operators_review_names_the_harness_gain_and_prints_a_token
+if [ "$review_rc" = 0 ] && printf '%s\n' "$token" | grep -Eqx '[0-9a-f]{64}' &&
+    printf '%s\n' "$review_out" | grep -q '^  lane gains (no password): ' &&
+    printf '%s\n' "$review_out" | grep -q '^  everyone loses, a new refusal: pack.e7.no-groups: ' &&
+    [ ! -e "$installed" ]; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$review_rc)"
+    printf '%s\n' "$review_out" >&2
+fi
+
+# The agent cannot install it. From its unit, sudo wants the password the
+# account does not have; root's own xudo in a scope under xudo.slice, and
+# root's xudo whose parent is in one, are refused before anything is read.
+as_harness lane pack-sudo "/usr/bin/sudo -n /usr/bin/xudo rules add --reviewed $token $pack_dir/ops.toml"
+case_name=an_agent_cannot_install_a_pack_without_a_password
+if [ "$hrc" = 1 ] && [ ! -e "$installed" ] && printf '%s\n' "$hout" | grep -q '^sudo' &&
+    ! printf '%s\n' "$hout" | grep -q '^installed'; then
+    good "$case_name ($(printf '%s\n' "$hout" | head -n 1))"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+capture systemd-run --quiet --wait --pipe --collect --slice=xudo.slice --unit="e7-pack-$hex.service" \
+    /usr/bin/xudo rules add --reviewed "$token" "$pack_dir/ops.toml"
+case_name=root_inside_the_slice_cannot_install_a_pack
+if [ "$hrc" != 0 ] && [ ! -e "$installed" ] &&
+    printf '%s\n' "$hout" | grep -q 'this runs inside xudo.slice, an agent.s box'; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+mkdir -p /sys/fs/cgroup/xudo-e7-out
+printf '%s\n' "echo \$\$ >/sys/fs/cgroup/xudo-e7-out/cgroup.procs" "sed -n 's/^0::/moved=/p' /proc/self/cgroup" \
+    "exec /usr/bin/xudo rules add --reviewed $token $pack_dir/ops.toml" >"$e7/out-of-box"
+capture systemd-run --quiet --wait --pipe --collect --slice=xudo.slice --unit="e7-pack-parent-$hex.service" \
+    sh -c "sh $e7/out-of-box; echo child=done"
+case_name=root_whose_parent_is_in_the_slice_cannot_install_a_pack
+if printf '%s\n' "$hout" | grep -qx 'moved=/xudo-e7-out' && [ ! -e "$installed" ] &&
+    printf '%s\n' "$hout" | grep -q 'this runs inside xudo.slice, an agent.s box'; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+rmdir /sys/fs/cgroup/xudo-e7-out 2>/dev/null || true
+
+as_admin "$sudo_add --reviewed $token $pack_dir/ops.toml"
+case_name=a_human_installs_a_reviewed_pack_with_the_password
+if [ "$hrc" = 0 ] && printf '%s\n' "$hout" | grep -qi password &&
+    printf '%s\n' "$hout" | grep -qx "installed $installed" &&
+    [ "$(stat -c '%U:%G %a' "$installed")" = 'root:root 644' ] &&
+    head -n 1 "$installed" | grep -q '^# Managed by xudo. Rule pack:'; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+    ls -l /etc/xudo/rules.d >&2
+fi
+capture /usr/bin/xudo rules list
+case_name=rules_list_shows_the_installed_pack
+if [ "$hrc" = 0 ] &&
+    printf '%s\n' "$hout" | grep -qx 'e7-ops 1.0.0 for=lane pack-e7-ops.toml (installed by xudo rules add)'; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+mark=$(trail_len)
+as_harness lane pack-grant "/usr/bin/xudo exec -- $gate_exe -gn"
+case_name=the_packs_grant_runs_through_the_passwordless_door
+if [ "$hrc" = 0 ] && has_root_line "$hout" &&
+    e7_trail "$mark" | grep -q '^enrolled-agent allowed - pack.e7.gn gate_mode=Nopass via=harness'; then
+    good "$case_name"
+else
+    bad "$case_name"
+    show "$case_name"
+fi
+as_harness other pack-other "/usr/bin/xudo exec -- $gate_exe -gn"
+case_name=the_packs_grant_is_only_for_the_harness_it_names
+if [ "$hrc" = 17 ] && ! has_root_line "$hout" && [ -z "$(spool_vias)" ]; then
+    good "$case_name"
+else
+    bad "$case_name"
+    show "$case_name"
+fi
+
+# Removal: the preview shows the grant lost and the refusal gone (a gain for
+# everyone), the sudo step removes it, and the harness is denied again.
+as_operator "/usr/bin/xudo rules remove e7-ops"
+review_out=$hout
+review_rc=$hrc
+token=$(token_of "$review_out")
+case_name=a_pack_removal_that_widens_is_shown_in_the_preview
+if [ "$review_rc" = 0 ] && [ -n "$token" ] && [ -e "$installed" ] &&
+    printf '%s\n' "$review_out" | grep -q '^  everyone gains, a refusal goes: pack.e7.no-groups: ' &&
+    printf '%s\n' "$review_out" | grep -q '^  lane loses (no password): '; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$review_rc)"
+    printf '%s\n' "$review_out" >&2
+fi
+as_harness lane pack-remove "/usr/bin/sudo -n /usr/bin/xudo rules remove --reviewed $token e7-ops"
+case_name=an_agent_cannot_remove_a_pack
+if [ "$hrc" = 1 ] && [ -e "$installed" ] && printf '%s\n' "$hout" | grep -q '^sudo'; then good "$case_name"; else bad "$case_name (rc=$hrc)"; printf '%s\n' "$hout" >&2; fi
+as_admin "/usr/bin/sudo /usr/bin/xudo rules remove --reviewed $token e7-ops"
+case_name=a_human_removes_the_pack_with_the_password
+if [ "$hrc" = 0 ] && printf '%s\n' "$hout" | grep -qx "removed $installed" && [ ! -e "$installed" ]; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+mark=$(trail_len)
+as_harness lane pack-gone "/usr/bin/xudo exec -- $gate_exe -gn"
+case_name=removing_the_pack_restores_the_refusal
+if [ "$hrc" = 17 ] && ! has_root_line "$hout" && [ -z "$(spool_vias)" ] &&
+    ! e7_trail "$mark" | grep -q ' allowed '; then
+    good "$case_name"
+else
+    bad "$case_name"
+    show "$case_name"
+fi
+mv /var/tmp/e7-g1f-grant.toml "$grant_rules"
+case_name=the_pack_rows_leave_the_rules_as_they_found_them
+if [ "$(rules_now)" = "$rules_before" ]; then
+    good "$case_name"
+else
+    bad "$case_name"
+    rules_now >&2
+fi
+rm -f "$admin_sudoers" "$e7/admin" "$e7/out-of-box" /var/tmp/e7-admin.raw
+rm -rf "$pack_dir"
+rm -f /run/xudo/req/*
 
 # --- Freeze under load. Root's global freeze, then the harness's own marker:
 # ten concurrent requests, every one denied at the broker or, past the

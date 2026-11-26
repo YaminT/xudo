@@ -11288,6 +11288,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             starttime,
             sid,
             tty,
+            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id: None,

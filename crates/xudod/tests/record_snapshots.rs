@@ -32,6 +32,7 @@ fn identity() -> PeerIdentity {
         starttime: 998_877,
         sid: 1,
         tty: 0,
+        comm: b"xudo".to_vec(),
         diverged: true,
         pinned: true,
         cgroup_id: Some(77),

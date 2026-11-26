@@ -185,6 +185,9 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
         format!("peer_gid={}", identity.gid),
         format!("pinned={}", identity.pinned),
         format!("euid_from={}", identity.euid_source.label()),
+        // A hint, never a fact: escaped, so any byte the peer named itself
+        // with reads as itself and cannot pose as another field.
+        format!("hint_comm={}", identity.comm.escape_ascii()),
     ];
     if let Some(id) = identity.cgroup_id {
         evidence.push(format!("cgroup_id={id}"));
@@ -238,6 +241,7 @@ mod tests {
             starttime: 998_877,
             sid: 1,
             tty: 0,
+            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id,
@@ -485,6 +489,33 @@ mod tests {
                 .iter()
                 .any(|item| item.starts_with("claimed_classification="))
         );
+    }
+
+    #[test]
+    fn the_peers_comm_is_recorded_as_a_hint() {
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let record = decided(
+            None,
+            &decision,
+            &caller(),
+            &identity(None),
+            &request(),
+            &generation(),
+            None,
+        );
+        assert!(record.evidence.contains(&"hint_comm=xudo".to_owned()));
+    }
+
+    #[test]
+    fn a_comm_posing_as_another_field_is_recorded_escaped_under_its_prefix() {
+        let mut peer = identity(None);
+        peer.comm = b"via=harness\x1b[2J\n\xff".to_vec();
+        let evidence = identity_evidence(&peer);
+        assert_eq!(
+            evidence.last().unwrap(),
+            "hint_comm=via=harness\\x1b[2J\\n\\xff"
+        );
+        assert!(!evidence.iter().any(|line| line.starts_with("via=")));
     }
 
     #[test]
