@@ -4253,6 +4253,55 @@ args = [
     }
 
     #[test]
+    fn a_frozen_refusal_at_the_nopass_gate_is_counted_once_by_the_ledger() {
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_harness_marker_stops_a_typed_remove_path_for_that_harness() {
+        // The typed operation is gated like an exec: the marker refuses it
+        // before the walk, and nothing is unlinked.
+        let mut policy = remove_policy(REMOVE_RULE);
+        policy.rules = load_policy(
+            vec![RuleFile {
+                name: b"50-remove.toml".to_vec(),
+                bytes: REMOVE_RULE.as_bytes().to_vec(),
+            }],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: CODEX_ENTRY.to_vec(),
+            }],
+        )
+        .unwrap();
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build", false);
+        entry.generation = policy.rules.generation.id();
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(policy);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.harness_freezes = vec!["codex".to_owned()];
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+    }
+
+    #[test]
     fn a_harness_marker_is_never_asked_about_for_a_human() {
         let spool = Rc::new(holding(&[(NONCE_A, ours())]));
         let mut host = FakeHost::new(&spool);
