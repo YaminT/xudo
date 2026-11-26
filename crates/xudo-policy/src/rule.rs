@@ -148,8 +148,8 @@ pub enum ConfirmPolicy {
     /// Confirm an enrolled agent, and not a human. The default.
     ///
     /// No configuration key turns this off. An agent whose harness the rule
-    /// lists with `outcome = "allow"` is recorded as granted; until G1 the
-    /// verdict still confirms.
+    /// lists with `outcome = "allow"` is granted: a plain allow, which only the
+    /// `-nopass` gate acts on.
     #[default]
     Default,
     /// Always confirm, for every caller.

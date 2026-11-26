@@ -129,8 +129,9 @@ is never passwordless, and an enrolled agent is still confirmed under
 .BR never ;
 only a rule that lists the agent's harness with
 .B outcome = "allow"
-records a grant, and until the passwordless step ships the verdict still
-confirms.
+grants it: a plain allow, which the broker mints for the passwordless gate
+file, and which sudo runs only once root adds a sudoers line naming that file.
+The package adds none.
 It is not a grant against a stricter overlapping action, and a
 .B critical
 action cannot set it.

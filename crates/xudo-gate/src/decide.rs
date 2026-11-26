@@ -2215,9 +2215,9 @@ args = [
         );
     }
 
-    /// What the engine says today for a listed harness on an allow rule: the
-    /// grant is recorded and the verdict still confirms.
-    fn confirming_decision() -> Decision {
+    /// What the engine says for a listed harness on an allow rule: a plain
+    /// allow that names the grant.
+    fn granted_decision() -> Decision {
         let decision = engine::evaluate(
             &grant_rules(),
             &live_agent(77, "claude-code", 44).facts,
@@ -2228,26 +2228,145 @@ args = [
             ),
             engine::Settings::default(),
         );
-        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
+        assert_eq!(decision.verdict, Verdict::Allow);
         assert!(decision.harness_grant.is_some());
         decision
     }
 
+    /// The granted decision as if something stricter had demanded a
+    /// confirmation while the grant stayed recorded: never the engine's own
+    /// output, and what `-nopass` must refuse if it ever were.
+    fn confirming_decision() -> Decision {
+        let mut decision = granted_decision();
+        decision.verdict = Verdict::AllowWithConfirmation;
+        decision.confirm = xudo_policy::Confirm::Required {
+            reason: xudo_policy::ConfirmReason::AgentActionsConfirmed,
+        };
+        decision
+    }
+
     #[test]
-    fn nopass_stays_inert_while_the_engine_still_confirms_a_granted_harness() {
-        // Everything about the caller is right and a rule grants the harness,
-        // and the `-nopass` gate still refuses: the engine's verdict for a
-        // granted agent is `AllowWithConfirmation` until the broker mints
-        // `harness` entries. Nothing in this change makes a caller passwordless.
+    fn a_live_granted_harness_entry_passes_the_nopass_decision() {
+        // Every fact holds and a rule grants the harness: `-nopass` would run
+        // it. `sudo` still asks a password for this file until root adds a
+        // sudoers line naming it, which nothing installs.
+        let approved = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            Some(&harness_entry(77)),
+            nopass_context(),
+        )
+        .unwrap();
+        assert_eq!(approved.program, "/usr/bin/systemctl");
+        assert_eq!(approved.action, "xudo.svc.status");
+        // The same entry under another label, or as a human, is refused.
         assert_eq!(
             mode_code(decide(
                 &grant_rules(),
-                &live_agent(77, "claude-code", 44),
+                &live_agent(77, "codex", 44),
                 Some(&harness_entry(77)),
                 nopass_context()
             )),
-            "gate_mode_not_granted"
+            "gate_mode_label_differs"
         );
+        assert_eq!(
+            mode_code(decide(
+                &grant_rules(),
+                &human(77),
+                Some(&harness_entry(77)),
+                nopass_context()
+            )),
+            "gate_mode_not_an_enrolled_agent"
+        );
+    }
+
+    /// Wherever `-nopass` would run an entry, `-auth` runs the same command
+    /// for a human after the password: the agent path never reaches what the
+    /// human path cannot. Exhaustive rather than sampled, over the granting
+    /// action's tier and `confirm`, a second action on the same command (none,
+    /// plain, always-confirming, granting another harness, human-only), and
+    /// argvs inside and outside the matchers.
+    #[test]
+    fn every_action_nopass_can_run_auth_can_run_too() {
+        const ARGS: &str = r#"args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+        const WAIVER: &str = "gtfobins-waiver = \"service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs\"\n";
+        let tiers = [
+            "diag-read",
+            "svc-control",
+            "pkg-install",
+            "pkg-remove",
+            "sys-tunable",
+            "net-filter",
+            "critical",
+        ];
+        let confirms = ["", "confirm = \"never\"\n", "confirm = \"always\"\n"];
+        let seconds = [
+            String::new(),
+            format!(
+                "[[action]]\nid = \"b.plain\"\ntier = \"diag-read\"\nexe = \"/usr/bin/systemctl\"\n{ARGS}"
+            ),
+            format!(
+                "[[action]]\nid = \"b.always\"\ntier = \"diag-read\"\nconfirm = \"always\"\nexe = \"/usr/bin/systemctl\"\n{ARGS}"
+            ),
+            format!(
+                "[[action]]\nid = \"b.codex\"\ntier = \"diag-read\"\nharness = [\"codex\"]\noutcome = \"allow\"\n{WAIVER}exe = \"/usr/bin/systemctl\"\n{ARGS}"
+            ),
+            format!(
+                "[[action]]\nid = \"b.human\"\ntier = \"diag-read\"\nagent-allowed = false\nexe = \"/usr/bin/systemctl\"\n{ARGS}"
+            ),
+        ];
+        let argvs: [&[&str]; 5] = [
+            &["--no-pager", "status", "nginx.service"],
+            &["--no-pager", "status", "ssh.service"],
+            &["--no-pager", "status", "../x"],
+            &["--no-pager", "status", "nginx.service", "--now"],
+            &["status"],
+        ];
+        let (mut loaded, mut refused_at_load, mut granted) = (0_u32, 0_u32, 0_u32);
+        for tier in tiers {
+            for confirm in confirms {
+                for second in &seconds {
+                    let text = format!(
+                        "[[action]]\nid = \"xudo.svc.status\"\ntier = \"{tier}\"\n{confirm}harness = [\"claude-code\"]\noutcome = \"allow\"\n{WAIVER}exe = \"/usr/bin/systemctl\"\n{ARGS}\n{second}"
+                    );
+                    let Ok(rules) = RuleSet::from_toml("grant.toml", &text) else {
+                        refused_at_load += 1;
+                        continue;
+                    };
+                    loaded += 1;
+                    for argv in argvs {
+                        let mut entry = harness_entry(77);
+                        entry.argv = argv.iter().map(|a| (*a).to_owned()).collect();
+                        let Ok(agent) = decide(
+                            &rules,
+                            &live_agent(77, "claude-code", 44),
+                            Some(&entry),
+                            nopass_context(),
+                        ) else {
+                            continue;
+                        };
+                        granted += 1;
+                        let mut human_entry = status_request(77);
+                        human_entry.argv.clone_from(&entry.argv);
+                        let mut auth = context();
+                        auth.password_confirms = true;
+                        let human_run =
+                            decide(&rules, &human(77), Some(&human_entry), auth).unwrap();
+                        assert_eq!(human_run.program, agent.program, "{text}");
+                        assert_eq!(human_run.exec_argv, agent.exec_argv, "{text}");
+                    }
+                }
+            }
+        }
+        // The space holds rules the loader refuses, rules that grant, and
+        // rules that do not.
+        assert!(refused_at_load > 0 && loaded > 0 && granted > 0);
+        assert!(granted < loaded * 5);
     }
 
     #[test]

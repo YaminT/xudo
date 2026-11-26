@@ -548,6 +548,59 @@ mod tests {
     }
 
     #[test]
+    fn the_nopass_line_names_only_the_agent_group_and_the_nopass_file() {
+        let snippet = SudoersSnippet::with_agent_path(&sudo()).unwrap();
+        let lines: Vec<&str> = snippet
+            .contents
+            .lines()
+            .filter(|l| l.contains("XUDO_NOPASS") || l.contains(GATE_NOPASS))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Cmnd_Alias XUDO_NOPASS = /usr/libexec/xudo/xudo-gate-nopass \"\"",
+                "Defaults!XUDO_NOPASS env_reset, !setenv, secure_path=\"/usr/sbin:/usr/bin:/sbin:/bin\", timestamp_timeout=0, use_pty, !visiblepw",
+                "%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS",
+            ]
+        );
+        // The human-only snippet, the one install writes, has none of it.
+        let human = SudoersSnippet::human_only(&sudo()).unwrap();
+        assert!(!human.contents.contains("NOPASSWD"));
+        assert!(!human.contents.contains(GATE_NOPASS));
+        assert!(!human.contents.contains(XUDO_AGENT_GROUP));
+    }
+
+    /// The agent-path snippet stays unreachable from install: nothing outside
+    /// this file builds it. E8 is the step that may change this, on purpose.
+    #[test]
+    fn nothing_outside_the_snippet_builds_the_agent_path() {
+        fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        rust_files(&crates, &mut files);
+        let users: Vec<_> = files
+            .iter()
+            .filter(|path| !path.ends_with("xudo-backend/src/snippet.rs"))
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .contains("with_agent_path")
+            })
+            .collect();
+        assert!(files.len() > 50, "the walk found too few files");
+        assert!(users.is_empty(), "{users:?}");
+    }
+
+    #[test]
     fn a_backend_missing_a_required_control_gets_no_snippet_at_all() {
         let crippled = Backend {
             exe: "/usr/bin/sudo".to_owned(),

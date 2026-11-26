@@ -36,3 +36,5 @@ expression: table
     the request is unknown or this question is not implemented yet
 17  answer_rejected
     the broker rejected this confirmation answer
+18  harness_not_granted
+    no rule grants this harness the command, and a service harness has no password to type; ask root to add a rule that names the harness, or use the queue

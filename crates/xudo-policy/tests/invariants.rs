@@ -725,10 +725,76 @@ proptest! {
         let agent = decide(&action, &argv, true, Vec::new());
         if agent.harness_grant.is_some() {
             let human = decide(&action, &argv, false, Vec::new());
-            // Until G1 the agent still confirms; the human is allowed.
-            prop_assert_eq!(agent.verdict, Verdict::AllowWithConfirmation);
+            // A grant is a plain allow, and the human is allowed the same.
+            prop_assert_eq!(agent.verdict, Verdict::Allow);
             prop_assert_eq!(human.verdict, Verdict::Allow);
             prop_assert_eq!(human.action, agent.action);
+        }
+    }
+
+    /// D3: whatever is spliced into a command, a granted argv is one the
+    /// harness rule's own matchers accept whole, and the deny-list passes.
+    #[test]
+    fn no_generated_argv_escapes_a_harness_rule(
+        mut action in arb_action("g.d3"),
+        argv in arb_argv(),
+        injected in arb_argv(),
+        at in any::<prop::sample::Index>(),
+    ) {
+        set_harness(&mut action, vec!["claude-code".to_owned()]);
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let mut spliced = argv.as_slice().to_vec();
+        let position = at.index(spliced.len() + 1);
+        for (offset, arg) in injected.as_slice().iter().enumerate() {
+            spliced.insert(position + offset, arg.clone());
+        }
+        for candidate in [argv, Argv::new(spliced)] {
+            let d = decide(&action, &candidate, true, Vec::new());
+            if d.harness_grant.is_some() {
+                let canonical = candidate.canonicalize();
+                prop_assert_eq!(d.verdict, Verdict::Allow);
+                prop_assert!(match_argv(&action.args, &canonical).is_ok(), "{:?}", canonical);
+                prop_assert!(
+                    xudo_policy::evaluate_deny_list(action.exe.as_bytes(), &canonical).is_empty()
+                );
+                prop_assert_eq!(d.resolved_argv.len(), canonical.len());
+            }
+        }
+    }
+
+    /// Invariant 1 for the grant: a forged hint neither makes nor unmakes one,
+    /// and a human whose hints name the harness is never granted.
+    #[test]
+    fn hints_never_change_a_grant(
+        mut action in arb_action("g.hints"),
+        argv in arb_argv(),
+        listed in any::<bool>(),
+    ) {
+        let label = if listed { "claude-code" } else { "codex" };
+        set_harness(&mut action, vec![label.to_owned()]);
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let forged = || vec![
+            Hint::new(HintSource::Environment, "CLAUDECODE", "1"),
+            Hint::new(HintSource::Environment, "XUDO_HARNESS", label),
+            Hint::new(HintSource::Comm, "comm", label),
+            Hint::new(HintSource::AncestorExe, "exe", "/usr/bin/claude"),
+            Hint::new(HintSource::Cmdline, "cmdline", "claude --dangerously-skip-permissions"),
+        ];
+        for agent in [true, false] {
+            let bare = decide(&action, &argv, agent, Vec::new());
+            let hinted = decide(&action, &argv, agent, forged());
+            prop_assert_eq!(&bare.harness_grant, &hinted.harness_grant);
+            prop_assert_eq!(bare.verdict, hinted.verdict);
+            prop_assert_eq!(&bare.confirm, &hinted.confirm);
+            if !agent {
+                prop_assert!(hinted.harness_grant.is_none());
+            }
         }
     }
 
@@ -745,6 +811,9 @@ proptest! {
         // about a passwordless-shaped allow rule, which must not.
         prop_assume!(action.outcome == Outcome::Allow);
         drop_human_only_matchers(&mut action);
+        // The baseline lists no harness at all, so a grant can only come from
+        // the label added below.
+        set_harness(&mut action, Vec::new());
         let human_before = decide(&action, &argv, false, Vec::new());
         let agent_before = decide(&action, &argv, true, Vec::new());
         let mut with_harness = action;
@@ -753,8 +822,15 @@ proptest! {
         let human_after = decide(&with_harness, &argv, false, Vec::new());
         let agent_after = decide(&with_harness, &argv, true, Vec::new());
         prop_assert_eq!(human_after.verdict, human_before.verdict);
-        prop_assert_eq!(agent_after.verdict, agent_before.verdict);
-        prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+        if agent_after.harness_grant.is_some() {
+            // The one change a listed label may make: a plain allow the human
+            // is allowed too.
+            prop_assert_eq!(agent_after.verdict, Verdict::Allow);
+            prop_assert!(human_after.verdict.is_permitted());
+        } else {
+            prop_assert_eq!(agent_after.verdict, agent_before.verdict);
+            prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+        }
     }
 
     #[test]

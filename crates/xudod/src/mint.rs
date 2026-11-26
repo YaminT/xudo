@@ -53,14 +53,14 @@ use xudo_audit::Approval;
 use xudo_gate::request::{
     AttestedClass, BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_boot_id, is_nonce,
 };
-use xudo_policy::{CallerFacts, Classification, Decision};
+use xudo_policy::{CallerFacts, Classification, Decision, HarnessRegistry, HarnessWay, Verdict};
 use xudo_sys::{
     Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
     parse_stat, parse_status_uids,
 };
 use xudo_wire::BrokerRequest;
 
-use crate::identify::PeerIdentity;
+use crate::identify::{CgroupAttestation, PeerIdentity};
 
 /// How long a minted entry lives in the test-only short-TTL build: twenty seconds.
 #[cfg(feature = "lane-short-ttl")]
@@ -123,6 +123,64 @@ pub const MAX_HARNESS_ENTRIES_PER_UID: usize = 4;
 
 /// The most bytes of live harness entries: apart from [`MAX_SPOOL_BYTES`].
 pub const MAX_HARNESS_BYTES: usize = 256 * 1024;
+
+/// How long a `via = harness` entry lives: thirty seconds.
+///
+/// The client runs `sudo -n` at once and nobody types anything, so a short
+/// life costs nothing and leaves little to race.
+pub const HARNESS_TTL_MILLIS: u64 = 30_000;
+
+/// Where the exec path sends a decision for one caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecPath {
+    /// The password gate, `-auth`.
+    Password,
+    /// The passwordless gate, `-nopass`: a live harness a rule grants.
+    Harness,
+    /// A service harness no rule grants. It has no password to type, so it is
+    /// refused and nothing is minted.
+    NotGranted,
+}
+
+/// Which gate a run question's decision is minted for.
+///
+/// `Harness` only when every fact holds: the caller is an enrolled agent, the
+/// kernel handed over its pidfd from the socket, the pidfd held it while it
+/// was read, its namespaces are the broker's, its scope is a live one, and
+/// the decision is a plain allow whose grant is the action it cites. Anything
+/// weaker keeps the password path, or refuses a service harness.
+pub fn exec_path(
+    identity: &PeerIdentity,
+    caller: &CallerFacts,
+    decision: &Decision,
+    registry: &HarnessRegistry,
+) -> ExecPath {
+    let Classification::EnrolledAgent { agent_id, .. } = &caller.classification else {
+        return ExecPath::Password;
+    };
+    let live = identity.rung.can_attest_an_agent()
+        && identity.pinned
+        && !identity.diverged
+        && identity.cgroup_id.is_some()
+        && matches!(
+            identity.cgroup_attestation,
+            CgroupAttestation::UnregisteredScope(_)
+        );
+    let granted = decision.verdict == Verdict::Allow
+        && decision.harness_grant.is_some()
+        && decision.harness_grant == decision.action;
+    if live && granted {
+        return ExecPath::Harness;
+    }
+    let service = registry
+        .get(agent_id)
+        .is_some_and(|entry| entry.way == HarnessWay::Service);
+    if service && decision.verdict.is_permitted() {
+        ExecPath::NotGranted
+    } else {
+        ExecPath::Password
+    }
+}
 
 /// Number of spool names broker scans must request to cover every live entry
 /// and distinguish a spool that exceeds the broker's own limits.

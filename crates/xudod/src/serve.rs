@@ -28,8 +28,8 @@ use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, Refusa
 
 use crate::identify::{Fault, PeerIdentity, identify_classified};
 use crate::mint::{
-    AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
-    entry_for_classified, publish,
+    AttestedCaller, ExecPath, Grant, HARNESS_TTL_MILLIS, MintError, Minting, REQUEST_TTL_MILLIS,
+    draw_nonce, entry_for_classified, exec_path, publish,
 };
 use crate::policy::{LoadedPolicy, PolicySource, classify_with_registry, decide, stored_caller};
 use crate::record::{decided_under, refused};
@@ -353,6 +353,7 @@ fn serve_request(
     let passwd = policy.passwd.as_str();
     let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
     let decision = decide(&policy, &caller, &request);
+    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
     let evaluated = Evaluated {
         decision,
         caller,
@@ -360,6 +361,14 @@ fn serve_request(
         request,
         policy,
     };
+    // The one place a `via = harness` entry is minted: a run question from a
+    // live harness that a rule grants. Every other question, and every other
+    // caller, mints for the password gate or not at all.
+    match path {
+        ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
+        ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::Password => {}
+    }
     let evaluated = match confirm_run(conn, platform, spool, evaluated) {
         ConfirmRun::Served(served) => return served,
         ConfirmRun::Continue(evaluated) => *evaluated,
@@ -401,6 +410,38 @@ fn serve_request(
             request,
             policy,
         },
+        MintFor::Password(None),
+    )
+}
+
+/// Refuses a service harness that no rule grants: it has no password to type,
+/// so nothing is minted. The record keeps the whole decision; the reply carries
+/// the code and the action id only.
+fn harness_not_granted(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    evaluated: &Evaluated,
+) -> Served {
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
+    // Nothing is enabled by this record, so a sink that cannot take it does
+    // not change the answer.
+    let _ = platform.audit.append(&|previous| {
+        let record = decided_under(previous, decision, caller, identity, request, policy, None);
+        let mut evidence = record.evidence.clone();
+        evidence.push("refused=harness_not_granted".to_owned());
+        record.with_evidence(evidence)
+    });
+    let action = decision.action.as_ref().map(xudo_policy::ActionId::as_str);
+    answer(
+        conn,
+        &BrokerResponse::harness_not_granted(action),
+        Served::Decided,
     )
 }
 
@@ -1204,10 +1245,10 @@ fn serve_queue_claim(
         spool,
         evaluated,
         nonce.clone(),
-        Some(QueuedMint {
+        MintFor::Password(Some(QueuedMint {
             id,
             harness: &harness,
-        }),
+        })),
     );
     if served != Served::Minted {
         let _ = release_claimed(
@@ -3676,6 +3717,7 @@ fn serve_remove(
             request,
             policy,
         },
+        MintFor::Password(None),
     )
 }
 
@@ -3685,6 +3727,7 @@ fn mint(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     evaluated: Evaluated,
+    mint_for: MintFor<'_>,
 ) -> Served {
     let nonce = match draw_nonce(platform.entropy) {
         Ok(nonce) => nonce,
@@ -3702,7 +3745,7 @@ fn mint(
             );
         }
     };
-    mint_with_nonce(conn, platform, spool, evaluated, nonce, None)
+    mint_with_nonce(conn, platform, spool, evaluated, nonce, mint_for)
 }
 
 /// A queued claim's id and harness, carried onto the minted spool and the answer.
@@ -3712,23 +3755,47 @@ struct QueuedMint<'a> {
     harness: &'a str,
 }
 
+/// Which gate file an entry is minted for.
+#[derive(Clone, Copy)]
+enum MintFor<'a> {
+    /// `-auth`, after `sudo` asks the password; a queued claim carries its id.
+    Password(Option<QueuedMint<'a>>),
+    /// `-nopass`: built only where [`exec_path`] says [`ExecPath::Harness`].
+    Harness,
+}
+
 /// Mints `evaluated` under a nonce the caller already drew.
 ///
 /// A queued claim binds this nonce on the queue record before calling here,
-/// so the gate record and the queue entry name the same run. `queue` is set
-/// only for that path; an ordinary human-path mint passes [`None`].
+/// so the gate record and the queue entry name the same run: it passes
+/// [`MintFor::Password`] with the queue item. An ordinary human-path mint
+/// passes `Password(None)`.
 fn mint_with_nonce(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     evaluated: Evaluated,
     nonce: String,
-    queue: Option<QueuedMint<'_>>,
+    mint_for: MintFor<'_>,
 ) -> Served {
+    let (queue, ttl, via, gate) = match mint_for {
+        MintFor::Password(queue) => (
+            queue,
+            REQUEST_TTL_MILLIS,
+            xudo_gate::request::Via::Auth,
+            xudo_backend::snippet::GATE_AUTH,
+        ),
+        MintFor::Harness => (
+            None,
+            HARNESS_TTL_MILLIS,
+            xudo_gate::request::Via::Harness,
+            xudo_backend::snippet::GATE_NOPASS,
+        ),
+    };
     let queue_id = queue.map(|item| item.id);
     let harness_label = queue.map(|item| item.harness);
     let now = platform.clock.boottime_millis();
-    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
+    let deadline = now.saturating_add(ttl);
     let mut entry = match mint_entry(platform, &evaluated, deadline, nonce) {
         Ok(entry) => entry,
         Err(refusal) => {
@@ -3744,6 +3811,10 @@ fn mint_with_nonce(
     if let Some(id) = queue_id {
         entry.queue_id = Some(id.to_owned());
     }
+    // `needs_watch` stays as computed: a grant is a plain allow, so it is
+    // false, and if it ever were not, the gate refuses a harness entry that
+    // waits on a watcher.
+    entry.via = via;
     let Evaluated {
         decision,
         caller,
@@ -3805,7 +3876,7 @@ fn mint_with_nonce(
     let minted = Minted {
         nonce: nonce.clone(),
         expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
-        gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+        gate: gate.to_owned(),
         claim_token: queue_id.map(|_| nonce.clone()),
         harness: harness_label.map(str::to_owned),
     };
@@ -11134,6 +11205,605 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    // ---- G1b: the one place `via = harness` is minted ----------------------
+
+    const SERVICE_CODEX: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+    const SESSION_CODEX: &str = "label = \"codex\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    /// A rule that grants the `codex` harness `systemctl status <unit>`, and a
+    /// remove-path operation, beside [`RULES`].
+    const GRANT_RULES: &str = r#"
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs"
+args = [
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+"#;
+
+    /// Root's policy with [`RULES`], [`GRANT_RULES`] and `harness` registered
+    /// (none when `None`), and a scope record for `codex` written against it.
+    fn granting_host(harness: Option<&str>) -> (Host, Scope) {
+        let mut host = Host::honest();
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok(TEST_BOOT.to_owned()));
+        let files: Vec<HarnessFile> = harness
+            .map(|text| HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: text.as_bytes().to_vec(),
+            })
+            .into_iter()
+            .collect();
+        let rules = load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-grant.toml".to_vec(),
+                    bytes: GRANT_RULES.as_bytes().to_vec(),
+                },
+            ],
+            &files,
+        )
+        .unwrap();
+        let (way, entry_hash) = match harness {
+            Some(text) => {
+                let registry =
+                    xudo_policy::HarnessRegistry::from_files([("codex.toml", text)]).unwrap();
+                let entry = registry.get("codex").unwrap();
+                let way = if entry.way == xudo_policy::HarnessWay::Service {
+                    "service"
+                } else {
+                    "session"
+                };
+                (way, entry.hash_hex())
+            }
+            None => ("service", "0".repeat(64)),
+        };
+        let mut loaded = policy();
+        loaded.rules = rules;
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
+        host.policy.answer = Ok(loaded);
+        let scope = Scope {
+            kind: ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: serde_json::json!({
+                "uid": UID,
+                "label": "codex",
+                "way": way,
+                "registry_entry_hash": entry_hash,
+                "boot_id": TEST_BOOT,
+                "created_at_boottime_ms": 1,
+                "deadline": 20_000,
+                "pid": PID,
+                "starttime": START,
+                "cgroup_id": 44,
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        (host, scope)
+    }
+
+    /// A caller in `scope` on the top rung, every fact as strong as it gets.
+    fn harness_identity(scope: Scope) -> PeerIdentity {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
+        identity
+    }
+
+    fn status_question(claimed: &str) -> BrokerRequest {
+        BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["status".to_owned(), "nginx.service".to_owned()],
+            claimed,
+        )
+    }
+
+    /// Every entry the spool holds, parsed.
+    fn entries_in(spool: &FakeSpool) -> Vec<PendingRequest> {
+        spool
+            .files()
+            .values()
+            .map(|bytes| PendingRequest::parse(std::str::from_utf8(bytes).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Serves `request` from `identity` and returns the answer and the spool.
+    fn served_by(
+        host: &mut Host,
+        identity: PeerIdentity,
+        request: BrokerRequest,
+    ) -> (Served, Answer, Vec<PendingRequest>) {
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        (served, answer, entries_in(&spool))
+    }
+
+    /// One question of each kind, and the index of its kind: no wildcard arm,
+    /// so a new question kind fails to compile here until it has a row.
+    fn question_kind(question: &xudo_wire::Question) -> usize {
+        match question {
+            xudo_wire::Question::Run { .. } => 0,
+            xudo_wire::Question::Status { .. } => 1,
+            xudo_wire::Question::Watch => 2,
+            xudo_wire::Question::Pending => 3,
+            xudo_wire::Question::Answer { .. } => 4,
+            xudo_wire::Question::Freeze { .. } => 5,
+            xudo_wire::Question::Thaw => 6,
+            xudo_wire::Question::QueueList => 7,
+            xudo_wire::Question::QueueClaim { .. } => 8,
+            xudo_wire::Question::QueueComplete { .. } => 9,
+            xudo_wire::Question::QueueRelease { .. } => 10,
+            xudo_wire::Question::QueueListPage { .. } => 11,
+            xudo_wire::Question::RemovePath { .. } => 12,
+        }
+    }
+
+    fn every_question_for_a_grant() -> Vec<xudo_wire::Question> {
+        use xudo_wire::Question;
+        let id = NONCE.to_owned();
+        vec![
+            status_question("enrolled-agent-yolo").question,
+            Question::Status { id: id.clone() },
+            Question::Watch,
+            Question::Pending,
+            Question::Answer {
+                id: id.clone(),
+                token: id.clone(),
+                approve: true,
+            },
+            Question::Freeze {
+                reason: "stop".to_owned(),
+            },
+            Question::Thaw,
+            Question::QueueList,
+            Question::QueueClaim { id: id.clone() },
+            Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 0,
+                claim_token: id.clone(),
+            },
+            Question::QueueRelease {
+                id: id.clone(),
+                claim_token: id,
+            },
+            Question::QueueListPage {
+                after: String::new(),
+            },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn only_the_exec_path_for_a_live_harness_mints_via_harness() {
+        let questions = every_question_for_a_grant();
+        let kinds: std::collections::BTreeSet<usize> =
+            questions.iter().map(question_kind).collect();
+        assert_eq!(kinds, (0..=12).collect(), "a question kind has no row");
+        for harness in [SERVICE_CODEX, SESSION_CODEX] {
+            for question in &questions {
+                let (mut host, scope) = granting_host(Some(harness));
+                let request = BrokerRequest {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    question: question.clone(),
+                };
+                // The state each question needs to get as far as it can: a
+                // queued item to claim, a pending entry to answer, a freeze
+                // marker to lift.
+                let spool = if question_kind(question) == 4 {
+                    FakeSpool::new().with_file(
+                        NONCE.as_bytes().to_vec(),
+                        shown_entry().to_json().into_bytes(),
+                    )
+                } else {
+                    FakeSpool::new()
+                };
+                let queued = review_entry(&host, UID + 1, NONCE);
+                plant_queue(&mut host, &queued);
+                host.freeze_file
+                    .publish(&xudo_gate::policy::freeze_marker_name(0), MARKER)
+                    .unwrap();
+                let conn = connection(Ok(request.to_json().into_bytes()));
+                let served = serve_request(
+                    &conn,
+                    &mut host.platform(),
+                    &spool,
+                    harness_identity(scope),
+                    request,
+                );
+                let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+                let entries = entries_in(&spool);
+                let harness_entries: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.via == xudo_gate::request::Via::Harness)
+                    .collect();
+                if question_kind(question) == 0 {
+                    assert_eq!(harness_entries.len(), 1, "{question:?}");
+                    let entry = harness_entries[0];
+                    assert_eq!(entry.deadline.0, NOW + HARNESS_TTL_MILLIS);
+                    assert!(!entry.needs_watch);
+                    assert_eq!(entry.attested_harness.as_deref(), Some("codex"));
+                    assert_eq!(entry.attested_scope_id, Some(44));
+                    assert_eq!(entry.action, "xudo.svc.status");
+                    assert_eq!(entry.argv, ["status", "nginx.service"]);
+                    assert_eq!(
+                        entry.generation,
+                        host.policy.answer.as_ref().unwrap().rules.generation.id()
+                    );
+                    assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+                } else {
+                    assert!(
+                        harness_entries.is_empty(),
+                        "{question:?} minted {entries:?}"
+                    );
+                    assert_ne!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+                    // A harness is no reviewer, watcher or owner: with the
+                    // state in place it is still refused, and nothing it
+                    // asked for was done.
+                    if matches!(question_kind(question), 4 | 6 | 8) {
+                        assert_ne!(served, Served::Minted, "{question:?}");
+                    }
+                    if question_kind(question) == 8 {
+                        assert_eq!(
+                            stored_queue(&host)[0].state,
+                            crate::queue::QueueState::Pending
+                        );
+                    }
+                    if question_kind(question) == 6 {
+                        assert_eq!(
+                            host.freeze_file.files().len(),
+                            1,
+                            "a harness lifted a freeze"
+                        );
+                    }
+                }
+            }
+        }
+        // A reviewer's claim reaches the mint with the state in place, and
+        // mints for the password gate, never for the harness.
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        assert_eq!(served, Served::Minted);
+        let minted = entries_in(&spool);
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].via, xudo_gate::request::Via::Auth);
+        // The same run question from a human, and from an unattested caller,
+        // is minted for the password gate.
+        for identity in [human_identity(), test_identity(PID, START, 0, 0)] {
+            let (mut host, _) = granting_host(Some(SERVICE_CODEX));
+            let (served, answer, entries) =
+                served_by(&mut host, identity, status_question("enrolled-agent-yolo"));
+            assert_eq!(served, Served::Minted);
+            assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+            assert_eq!(entries[0].deadline.0, NOW + REQUEST_TTL_MILLIS);
+        }
+    }
+
+    #[test]
+    fn a_grant_mints_its_record_with_the_via() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (served, _, _) = served_by(&mut host, harness_identity(scope), status_question("x"));
+        assert_eq!(served, Served::Minted);
+        let record = host.audit.records().last().unwrap().clone();
+        assert!(
+            record.evidence.contains(&"via=harness".to_owned()),
+            "{record:?}"
+        );
+        assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+    }
+
+    #[test]
+    fn a_grant_is_unchanged_by_confirm_human_path() {
+        let mut seen = Vec::new();
+        for confirm_human_path in [false, true] {
+            let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+            let mut loaded = host.policy.answer.clone().unwrap();
+            loaded.settings.confirm_human_path = confirm_human_path;
+            host.policy.answer = Ok(loaded);
+            let (served, answer, entries) =
+                served_by(&mut host, harness_identity(scope), status_question("x"));
+            assert_eq!(served, Served::Minted);
+            let (decision, minted) = decision_of(&answer).unwrap();
+            assert_eq!(decision.verdict, Verdict::Allow);
+            assert_eq!(
+                decision
+                    .harness_grant
+                    .as_ref()
+                    .map(xudo_policy::ActionId::as_str),
+                Some("xudo.svc.status")
+            );
+            assert_eq!(minted.unwrap().gate, xudo_backend::snippet::GATE_NOPASS);
+            assert_eq!(entries.len(), 1);
+            let mut entry = entries[0].clone();
+            assert!(!entry.needs_watch);
+            entry.nonce = String::new();
+            seen.push(entry);
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[test]
+    fn a_service_harness_no_rule_grants_gets_harness_not_granted() {
+        // `restart` is allowed with confirmation: a password the service
+        // account does not have. Refused, nothing minted, no trace sent.
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            harness_identity(scope),
+            request,
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(spool.files().is_empty());
+        let written = String::from_utf8(conn.written()).unwrap();
+        assert!(!written.contains("trace"), "{written}");
+        assert_eq!(
+            BrokerResponse::parse(written.as_bytes()).unwrap(),
+            BrokerResponse::harness_not_granted(Some("xudo.svc.restart"))
+        );
+        // The record keeps the whole decision for the operator.
+        let record = host.audit.records().last().unwrap().clone();
+        assert_eq!(record.action.as_deref(), Some("xudo.svc.restart"));
+        assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&"refused=harness_not_granted".to_owned()),
+            "{record:?}"
+        );
+
+        // A session harness runs as a person, who can type the password.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let (served, answer, entries) = served_by(&mut host, harness_identity(scope), request);
+        assert_eq!(served, Served::Minted);
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+    }
+
+    #[test]
+    fn claimed_classification_never_reaches_via() {
+        let claims = [
+            "human",
+            "unattested",
+            "enrolled-agent",
+            "enrolled-agent-yolo",
+            "harness",
+            "codex",
+            "harness:codex",
+            "via=harness",
+        ];
+        for harness_caller in [true, false] {
+            let mut vias = std::collections::BTreeSet::new();
+            for claimed in claims {
+                let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+                let identity = if harness_caller {
+                    harness_identity(scope)
+                } else {
+                    human_identity()
+                };
+                let (_, answer, entries) = served_by(&mut host, identity, status_question(claimed));
+                assert_eq!(entries.len(), 1, "{claimed}");
+                vias.insert((entries[0].via.label(), gate_of(&answer).map(str::to_owned)));
+            }
+            let expected = if harness_caller {
+                ("harness", xudo_backend::snippet::GATE_NOPASS)
+            } else {
+                ("auth", xudo_backend::snippet::GATE_AUTH)
+            };
+            assert_eq!(
+                vias.into_iter().collect::<Vec<_>>(),
+                [(expected.0, Some(expected.1.to_owned()))]
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_harness_is_human_at_once() {
+        // Granted while registered...
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (_, _, entries) = served_by(
+            &mut host,
+            harness_identity(scope.clone()),
+            status_question("x"),
+        );
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Harness);
+        // ...and on the very next question after root removes the file, the
+        // same live scope takes the password path: no grant, no -nopass.
+        let (mut removed, _) = granting_host(None);
+        let (_, answer, entries) =
+            served_by(&mut removed, harness_identity(scope), status_question("x"));
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+        assert_ne!(
+            entries[0].attested_class,
+            xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 }
+        );
+        assert!(entries[0].attested_harness.is_none());
+    }
+
+    #[test]
+    fn exec_path_needs_a_plain_allow_that_cites_its_grant() {
+        let (host, scope) = granting_host(Some(SERVICE_CODEX));
+        let identity = harness_identity(scope);
+        let request = status_question("x");
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let registry = &policy.rules.harnesses;
+        assert_eq!(
+            exec_path(&identity, &caller, &decision, registry),
+            ExecPath::Harness
+        );
+        let mut other_action = decision.clone();
+        other_action.harness_grant = Some(xudo_policy::ActionId::new("xudo.svc.restart"));
+        let mut no_grant = decision.clone();
+        no_grant.harness_grant = None;
+        let mut confirming = decision.clone();
+        confirming.verdict = Verdict::AllowWithConfirmation;
+        for weaker in [&other_action, &no_grant, &confirming] {
+            assert_eq!(
+                exec_path(&identity, &caller, weaker, registry),
+                ExecPath::NotGranted
+            );
+        }
+        // Facts that say agent beside a peer that is not in a live scope:
+        // `classify_with_registry` never builds this, and `exec_path` does not
+        // trust that it cannot.
+        let mut outside = identity.clone();
+        outside.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        assert_eq!(
+            exec_path(&outside, &caller, &decision, registry),
+            ExecPath::NotGranted
+        );
+        let mut denied = decision;
+        denied.verdict = Verdict::Deny;
+        assert_eq!(
+            exec_path(&identity, &caller, &denied, registry),
+            ExecPath::Password
+        );
+    }
+
+    /// The facts a harness grant rests on, each strong or weakened: the rung
+    /// (0 to 3, `PeerCredOnly` to `PeerPidfdInfo`), the cgroup attestation
+    /// (0 is the live scope), and one bit per other fact.
+    #[derive(Clone, Copy, Debug)]
+    struct Weakening {
+        rung: u8,
+        attestation: u8,
+        bits: u8,
+    }
+
+    const UNPINNED: u8 = 1;
+    const DIVERGED: u8 = 2;
+    const NO_CGROUP_ID: u8 = 4;
+    const STALE_HASH: u8 = 8;
+    const WRONG_UID: u8 = 16;
+
+    impl Weakening {
+        /// Both `SO_PEERPIDFD` rungs are strong; the two below them are not.
+        fn none(self) -> bool {
+            self.rung >= 2 && self.attestation == 0 && self.bits == 0
+        }
+
+        fn has(self, bit: u8) -> bool {
+            self.bits & bit != 0
+        }
+
+        fn apply(self, scope: Scope) -> PeerIdentity {
+            use crate::identify::CgroupAttestation;
+            let mut scope = scope;
+            if self.has(STALE_HASH) {
+                let mut record: serde_json::Value = serde_json::from_slice(&scope.record).unwrap();
+                record["registry_entry_hash"] = serde_json::json!("1".repeat(64));
+                scope.record = record.to_string().into_bytes();
+            }
+            let mut identity = harness_identity(scope.clone());
+            identity.rung = [
+                xudo_sys::Attestation::PeerCredOnly,
+                xudo_sys::Attestation::PidfdOpen,
+                xudo_sys::Attestation::PeerPidfd,
+                xudo_sys::Attestation::PeerPidfdInfo,
+            ][usize::from(self.rung)];
+            identity.pinned = !self.has(UNPINNED);
+            identity.diverged = self.has(DIVERGED);
+            if self.has(NO_CGROUP_ID) {
+                identity.cgroup_id = None;
+            }
+            identity.cgroup_attestation = match self.attestation {
+                0 => CgroupAttestation::UnregisteredScope(scope),
+                1 => CgroupAttestation::Outside,
+                2 => CgroupAttestation::OtherScope(scope),
+                3 => CgroupAttestation::Recordless,
+                4 => CgroupAttestation::Unattested,
+                _ => CgroupAttestation::NotChecked,
+            };
+            if self.has(WRONG_UID) {
+                identity.uid = UID + 1;
+            }
+            identity
+        }
+    }
+
+    /// Misclassification may only withhold: from a fully attested harness,
+    /// weakening any live fact, alone or together, never mints for
+    /// `-nopass`. Every combination, for both ways of harness (1536 cases).
+    #[test]
+    fn weakening_any_live_fact_never_adds_a_grant() {
+        let mut granted = 0_u32;
+        for session in [false, true] {
+            for rung in 0_u8..4 {
+                for attestation in 0_u8..6 {
+                    for bits in 0_u8..32 {
+                        let weakening = Weakening {
+                            rung,
+                            attestation,
+                            bits,
+                        };
+                        let (mut host, scope) = granting_host(Some(if session {
+                            SESSION_CODEX
+                        } else {
+                            SERVICE_CODEX
+                        }));
+                        let (_, answer, entries) =
+                            served_by(&mut host, weakening.apply(scope), status_question("x"));
+                        let harness = entries
+                            .iter()
+                            .any(|entry| entry.via == xudo_gate::request::Via::Harness);
+                        assert_eq!(harness, weakening.none(), "{weakening:?}");
+                        assert_eq!(
+                            gate_of(&answer) == Some(xudo_backend::snippet::GATE_NOPASS),
+                            weakening.none()
+                        );
+                        granted += u32::from(harness);
+                    }
+                }
+            }
+        }
+        // The two `SO_PEERPIDFD` rungs, for each way: nothing else.
+        assert_eq!(granted, 4);
+    }
+
     fn shown_entry() -> PendingRequest {
         let policy = policy();
         let request = BrokerRequest::new(
@@ -12217,8 +12887,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
-        let mut host = Host::honest();
-        let scope = registered_harness_scope(&mut host);
+        // A session harness: a person can type the password a service
+        // account does not have, so an ungranted command takes the -auth path.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
         host.syscalls =
             FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
@@ -12238,14 +12909,15 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let response = BrokerResponse::parse(&conn.written()).unwrap();
         let (decision, minted) = decision_of(&response.answer).unwrap();
         assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
-        assert!(minted.is_some());
-        assert_eq!(spool.files().len(), 1);
+        assert_eq!(minted.unwrap().gate, xudo_backend::snippet::GATE_AUTH);
+        assert_eq!(entries_in(&spool)[0].via, xudo_gate::request::Via::Auth);
     }
 
     #[test]
     fn an_enrolled_entry_with_an_unavailable_live_boot_id_is_not_minted() {
-        let mut host = Host::honest();
-        let scope = registered_harness_scope(&mut host);
+        // A session harness: a person can type the password a service
+        // account does not have, so an ungranted command takes the -auth path.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
         host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
@@ -12822,7 +13494,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             request,
             policy: policy(),
         };
-        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
+        let served = mint(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            MintFor::Password(None),
+        );
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -12864,7 +13542,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             request,
             policy: loaded,
         };
-        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
+        let served = mint(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            MintFor::Password(None),
+        );
         assert_eq!(served, Served::Refused(Fault::Client));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;

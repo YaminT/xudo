@@ -98,3 +98,20 @@ fn public_queue_list_responses_keep_their_bounds() {
         Err(ResponseError::Malformed { .. })
     ));
 }
+
+/// Which gate runs is the broker's to decide: a request that tries to name a
+/// gate, a `via`, or a grant, anywhere, does not parse.
+#[test]
+fn a_request_naming_a_gate_or_a_via_is_rejected() {
+    for json in [
+        r#"{"schema_version":2,"question":"watch","via":"harness"}"#,
+        r#"{"schema_version":2,"question":"watch","gate":"/usr/libexec/xudo/xudo-gate-nopass"}"#,
+        r#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/systemctl","argv":[],"claimed_classification":"x","via":"harness"}}}"#,
+        r#"{"schema_version":2,"question":{"run":{"program":"/usr/bin/systemctl","argv":[],"claimed_classification":"x","harness_grant":"a.b"}}}"#,
+    ] {
+        assert!(
+            xudo_wire::BrokerRequest::parse(json.as_bytes()).is_err(),
+            "{json}"
+        );
+    }
+}

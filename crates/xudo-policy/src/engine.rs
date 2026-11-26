@@ -395,14 +395,9 @@ impl<'c> Run<'c> {
             _ => None,
         };
 
-        // G1 will act on the grant; until then the verdict still confirms, so a
-        // grant never lifts the operator's `confirm_human_path` approval.
-        // G1b deletes the next statement. G1a keeps it as a second lock that
-        // leaves `-nopass` inert.
-        let reason = reason.or(harness_grant
-            .as_ref()
-            .map(|_| ConfirmReason::AgentActionsConfirmed));
-
+        // A grant is a plain `Allow`: the harness has no password to type. The
+        // broker mints it for `-nopass`, which still does nothing until root
+        // adds a sudoers line naming that file.
         let (verdict, confirm) = match reason {
             Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
             None => (Verdict::Allow, Confirm::NotRequired),
@@ -695,13 +690,10 @@ mod tests {
             && d.harness_grant.is_none()
     }
 
-    /// A grant is recorded and the verdict still confirms (until G1).
-    fn confirmed_with_grant(d: &Decision) -> bool {
-        d.verdict == Verdict::AllowWithConfirmation
-            && d.confirm
-                == Confirm::Required {
-                    reason: ConfirmReason::AgentActionsConfirmed,
-                }
+    /// A grant is a plain allow that names it.
+    fn granted_allow(d: &Decision) -> bool {
+        d.verdict == Verdict::Allow
+            && d.confirm == Confirm::NotRequired
             && d.harness_grant.is_some()
     }
 
@@ -737,7 +729,7 @@ mod tests {
         let set =
             RuleSet::load(vec![granted(&["claude-code"], crate::rule::Outcome::Allow)]).unwrap();
         let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert!(confirmed_with_grant(&d), "{d:?}");
+        assert!(granted_allow(&d), "{d:?}");
         assert_eq!(d.harness_grant, Some(ActionId::new("xudo.svc.restart")));
         assert!(d.trace.iter().any(|step| matches!(
             step,
