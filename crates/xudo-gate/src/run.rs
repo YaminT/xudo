@@ -1015,6 +1015,7 @@ fn run_typed_operation(
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
     };
+    crate::operate::refuse_a_planned_escape(&planned)?;
     let intent = host
         .audit()
         .append(&|previous| crate::operate::intent_record(previous, caller, &work, &planned))
@@ -4937,6 +4938,106 @@ outcome = "allow"
     }
 
     #[test]
+    fn denies_a_granted_remove_path_through_a_planted_link_or_mount_as_a_walk_escape() {
+        // Attack: the harness owns the tree, plants `hop -> /victim` or bind
+        // mounts /victim on `mnt`, and asks for a name behind it. The gate's
+        // dry run meets the crossing: nothing is removed, not even the names
+        // the walk reached first, and the refusal is its own, at high.
+        use xudo_sys::remove::NodeKind;
+        for (target, mount) in [
+            (&b"/srv/app/build/hop/v"[..], false),
+            (b"/srv/app/build/mnt/v", true),
+            (b"/srv/app/build/mnt", true),
+            (b"/srv/app/build/box", true),
+        ] {
+            let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), target);
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let fs = &mut host.remove;
+            fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+            fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"hop",
+                NodeKind::Symlink,
+                1000,
+                0o777,
+                7,
+            );
+            let mnt = fs.add(
+                &[b"srv", b"app", b"build"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"mnt"],
+                b"v",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            fs.set_device(mnt, 9);
+            // `box/a` sorts before `box/mnt`: reached first, kept all the same.
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"box",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"box"],
+                b"a",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            let inner = fs.add(
+                &[b"srv", b"app", b"build", b"box"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.set_device(inner, 9);
+            let exit = run(&mut host, &nopass());
+            assert_eq!(exit.status, 19, "{exit:?}");
+            assert!(
+                exit.message.contains("gate_walk_escape, severity high"),
+                "{exit:?}"
+            );
+            let reason = if mount {
+                "detail=the walk would cross a mount"
+            } else {
+                "detail=a directory on the way to the target is a symbolic link"
+            };
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"victim", b"v"]));
+            assert!(
+                host.remove
+                    .exists(&[b"srv", b"app", b"build", b"box", b"a"])
+            );
+            assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+            assert_eq!(exec_calls(&host), 0);
+            assert_eq!(
+                denial_codes(&host),
+                vec![Some("gate_walk_escape".to_owned())]
+            );
+            let record = &host.audit.records()[0];
+            assert_eq!(record.decision, AuditDecision::Denied);
+            assert!(has_line(&record.evidence, "severity=high"), "{record:?}");
+            assert!(has_line(&record.evidence, reason), "{record:?}");
+        }
+    }
+
+    #[test]
     fn a_nopass_remove_path_outside_its_tree_is_refused() {
         for target in [
             &b"/etc/passwd"[..],
@@ -4978,6 +5079,7 @@ outcome = "allow"
         plant_box(&mut host);
         let exit = run(&mut host, &nopass());
         assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(exit.message.contains("gate_walk_escape"), "{exit:?}");
         assert!(host.remove.unlinked().is_empty());
         assert!(
             host.remove
@@ -4985,19 +5087,21 @@ outcome = "allow"
         );
         assert_eq!(consumed(&spool).len(), 1);
 
+        // The mount inside `box` refuses the whole removal: the link the
+        // walk would have reached first stays too.
         let whole = harness_remove_entry(generation, b"/srv/app/build/box");
         let (mut host, _spool) = harness_remove_host(whole, rules);
         plant_box(&mut host);
         let exit = run(&mut host, &nopass());
-        assert_eq!(exit.status, 1, "{exit:?}");
-        assert!(exit.message.contains("partial"));
+        assert_eq!(exit.status, 19, "{exit:?}");
+        assert!(exit.message.contains("gate_walk_escape"), "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
         assert!(
             host.remove
                 .exists(&[b"srv", b"app", b"build", b"box", b"mnt", b"inside"])
         );
         assert!(
-            !host
-                .remove
+            host.remove
                 .exists(&[b"srv", b"app", b"build", b"box", b"link"])
         );
         assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));

@@ -26,6 +26,11 @@ const ELOOP: i32 = 40;
 /// `EBADF`.
 const EBADF: i32 = 9;
 
+/// A directory on the way to the target is a link.
+const THROUGH_A_LINK: &str = "a directory on the way to the target is a symbolic link";
+/// A directory or file the walk reached is another mount.
+const ACROSS_A_MOUNT: &str = "the walk would cross a mount";
+
 /// Group and other write bits. An ancestor with either is not a safe tree.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
@@ -102,6 +107,11 @@ pub enum RemoveError {
     /// device with its opened parent at execution time.
     #[error("the operation tree is a mount point")]
     MountPoint,
+    /// The walk would have to follow a symbolic link or cross a mount to
+    /// reach the target or to walk inside it. Nobody plants either in a tree
+    /// by accident: the gate refuses it loudly and removes nothing.
+    #[error("{0}")]
+    WalkEscape(&'static str),
     /// `recursive` is false and the target is a directory.
     #[error("a directory target needs recursive = true")]
     DirectoryRequiresRecursive,
@@ -262,8 +272,10 @@ pub fn audit_path_head(paths: &[Vec<u8>]) -> &[Vec<u8>] {
 /// # Errors
 ///
 /// A grammar failure, a refused ancestor, or an `under` that will not open
-/// returns [`Err`] and removes nothing. A mismatch, mount, or limit during
-/// the walk returns [`Ok`] with [`RemoveReport::partial`].
+/// returns [`Err`] and removes nothing. So does a symbolic link or a mount the
+/// walk would cross ([`RemoveError::WalkEscape`]) before it removed a name.
+/// A mismatch or limit during the walk, or an escape met after some names
+/// went, returns [`Ok`] with [`RemoveReport::partial`].
 pub fn remove_path(
     fs: &mut dyn RemoveFs,
     req: &RemoveRequest,
@@ -443,16 +455,17 @@ impl Walk<'_> {
             let parent = dir;
             dir = match self.fs.open_dir(parent, name, true) {
                 Ok(fd) => fd,
-                Err(error) if stop_errno(&error) => {
+                Err(error) => {
+                    let crossed = self.crossing(parent, name, &error);
                     if parent != under_fd {
                         let _ = self.fs.close(parent);
                     }
-                    self.partial = true;
-                    return Ok(());
-                }
-                Err(error) => {
-                    if parent != under_fd {
-                        let _ = self.fs.close(parent);
+                    if let Some(escape) = crossed {
+                        return Err(escape);
+                    }
+                    if stop_errno(&error) {
+                        self.partial = true;
+                        return Ok(());
                     }
                     return Err(error);
                 }
@@ -461,9 +474,8 @@ impl Walk<'_> {
             if parent != under_fd {
                 self.fs.close(parent)?;
             }
-            if dir_stat.dev != self.tree_dev || dir_stat.kind != NodeKind::Dir {
-                self.partial = true;
-                return Ok(());
+            if off_the_tree(&dir_stat, self.tree_dev) {
+                return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
             }
             push_component(&mut path, name);
         }
@@ -492,10 +504,13 @@ impl Walk<'_> {
             Ok(child) => {
                 self.remove_directory(parent, parent_stat, child, name, &path, (depth, is_target))
             }
+            Err(error) if matches_errno(&error, EXDEV) => {
+                Err(RemoveError::WalkEscape(ACROSS_A_MOUNT))
+            }
             Err(error) if matches_errno(&error, ENOTDIR) || matches_errno(&error, ELOOP) => {
                 self.remove_leaf(parent, parent_stat, name, &path)
             }
-            Err(error) if stop_errno(&error) => {
+            Err(error) if matches_errno(&error, ENOENT) => {
                 self.partial = true;
                 Ok(())
             }
@@ -534,9 +549,8 @@ impl Walk<'_> {
         (depth, is_target): (u32, bool),
     ) -> Result<(), RemoveError> {
         let stat = self.fs.fstat(child)?;
-        if stat.dev != self.tree_dev || stat.kind != NodeKind::Dir {
-            self.partial = true;
-            return Ok(());
+        if off_the_tree(&stat, self.tree_dev) {
+            return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
         }
         if !self.owner_ok(stat.uid) {
             return Ok(());
@@ -602,8 +616,7 @@ impl Walk<'_> {
             return Ok(());
         }
         if stat.dev != self.tree_dev && stat.kind != NodeKind::Symlink {
-            self.partial = true;
-            return Ok(());
+            return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
         }
         if !self.owner_ok(stat.uid) {
             return Ok(());
@@ -618,6 +631,25 @@ impl Walk<'_> {
             directory,
             (stat.dev, stat.ino, size),
         )
+    }
+
+    /// Whether a directory on the way to the target failed to open because
+    /// it is another mount or a symbolic link. A missing name or a plain file
+    /// is not an escape: the caller handles those as before.
+    fn crossing(&mut self, parent: u64, name: &[u8], error: &RemoveError) -> Option<RemoveError> {
+        if matches_errno(error, EXDEV) {
+            return Some(RemoveError::WalkEscape(ACROSS_A_MOUNT));
+        }
+        // The kernel answers ENOTDIR for a link opened with O_NOFOLLOW and
+        // O_DIRECTORY, and ELOOP under RESOLVE_NO_SYMLINKS: ask what it is.
+        if !(matches_errno(error, ELOOP) || matches_errno(error, ENOTDIR)) {
+            return None;
+        }
+        let kind = self.fs.lstat(parent, name).map(|stat| stat.kind);
+        if kind == Ok(NodeKind::Symlink) {
+            return Some(RemoveError::WalkEscape(THROUGH_A_LINK));
+        }
+        None
     }
 
     fn commit(
@@ -675,6 +707,12 @@ impl Walk<'_> {
         self.removed.push(path.to_vec());
         Ok(())
     }
+}
+
+/// A directory that is not on the tree's own mount: another device, a bind
+/// mount's root, or not a directory at all after an open that asked for one.
+fn off_the_tree(stat: &NodeStat, tree_dev: u64) -> bool {
+    stat.dev != tree_dev || stat.mount_root || stat.kind != NodeKind::Dir
 }
 
 fn stop_errno(error: &RemoveError) -> bool {
@@ -1629,8 +1667,10 @@ mod tests {
         fs.nodes
             .entry(link)
             .and_modify(|node| node.link = b"/secret".to_vec());
-        let planted = remove_path(&mut fs, &req("link/secret"));
-        assert!(planted.is_err() || planted.unwrap().removed.is_empty());
+        assert_eq!(
+            remove_path(&mut fs, &req("link/secret")).unwrap_err(),
+            RemoveError::WalkEscape(THROUGH_A_LINK)
+        );
         assert!(fs.exists(&[b"secret"]));
         assert_eq!(fs.node(&[b"secret"]).unwrap().ino, secret);
         assert!(fs.exists(&[b"srv", b"app", b"build", b"link"]));
@@ -1708,6 +1748,7 @@ mod tests {
         );
         let report = remove_path(&mut fs, &req("box")).unwrap();
         assert!(report.partial);
+        assert_eq!(report.error, Some(RemoveError::WalkEscape(ACROSS_A_MOUNT)));
         assert!(!fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt"]));
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt", b"inside"]));
@@ -2388,17 +2429,19 @@ mod tests {
 
     #[test]
     fn a_walk_that_loses_its_way_to_the_target_stops_or_fails() {
-        // A vanished or crossed directory is a stop. Anything else is an error.
-        for (errno, stops) in [(ENOENT, true), (EXDEV, true), (5, false)] {
+        // A vanished directory, or a loop that is not a link, is a stop. A
+        // crossed mount is an escape. Anything else is an error.
+        for (errno, outcome) in [
+            (ENOENT, Ok(true)),
+            (ELOOP, Ok(true)),
+            (EXDEV, Err(RemoveError::WalkEscape(ACROSS_A_MOUNT))),
+            (5, Err(os("openat2", 5))),
+        ] {
             let (mut fs, _) = boxed(&[b"a"]);
             // `/`, `srv`, `app`, `build`; the fifth open is `box`.
             fs.fail_at("openat2", 4, errno);
             let result = remove_path(&mut fs, &req("box/a"));
-            if stops {
-                assert!(result.unwrap().partial);
-            } else {
-                assert_eq!(result.unwrap_err(), os("openat2", errno));
-            }
+            assert_eq!(result.map(|report| report.partial), outcome);
             assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
         }
         // Four fstats open the tree (`/`, `srv`, `app`, `build`); the fifth
@@ -2412,24 +2455,122 @@ mod tests {
     }
 
     #[test]
-    fn an_intermediate_directory_on_another_device_stops_the_walk() {
+    fn an_intermediate_directory_on_another_device_is_a_walk_escape() {
         let (mut fs, dir) = boxed(&[b"a"]);
         fs.remount_on_open(dir, 2);
         // The remount lands after `openat2` resolved `box`: only the fstat
         // sees it.
-        let report = remove_path(&mut fs, &req("box/a")).unwrap();
-        assert!(report.partial);
-        assert!(report.removed.is_empty());
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+        assert!(fs.unlinked().is_empty());
     }
 
     #[test]
-    fn a_target_directory_that_moves_device_after_the_open_is_not_walked() {
+    fn a_target_directory_that_moves_device_after_the_open_is_a_walk_escape() {
         let (mut fs, dir) = boxed(&[b"a"]);
         fs.remount_on_open(dir, 2);
-        let report = remove_path(&mut fs, &req("box")).unwrap();
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_bind_mount_as_a_parent_of_the_target() {
+        // The kernel's NO_XDEV refuses the open; without it, the stat does.
+        for (open_checks_mounts, same_device) in [(true, false), (false, false), (false, true)] {
+            let (mut fs, dir) = boxed(&[b"a"]);
+            if same_device {
+                fs.set_mount_root(dir);
+            } else {
+                fs.set_device(dir, 9);
+            }
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("box/a")).unwrap_err(),
+                RemoveError::WalkEscape(ACROSS_A_MOUNT)
+            );
+            assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+            assert!(fs.unlinked().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_target_that_vanishes_before_its_open_stops_the_walk() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        // `/`, `srv`, `app`, `build`, `box`; the sixth open is `a`.
+        fs.fail_at("openat2", 5, ENOENT);
+        let report = remove_path(&mut fs, &req("box/a")).unwrap();
         assert!(report.partial);
         assert!(report.removed.is_empty());
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_bind_mount_as_the_target() {
+        let (mut fs, dir) = boxed(&[b"a"]);
+        fs.set_device(dir, 9);
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    /// `build/hop -> /victim`, the agent asks for `build/hop/v`.
+    fn hop() -> FakeRemoveFs {
+        let (mut fs, _) = tree();
+        fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+        let link = fs.add(
+            &[b"srv", b"app", b"build"],
+            b"hop",
+            NodeKind::Symlink,
+            1000,
+            0o777,
+            7,
+        );
+        fs.nodes
+            .entry(link)
+            .and_modify(|node| node.link = b"/victim".to_vec());
+        fs
+    }
+
+    #[test]
+    fn denies_a_symlink_planted_as_a_parent_of_the_target() {
+        // ELOOP is RESOLVE_NO_SYMLINKS' answer, ENOTDIR plain O_NOFOLLOW's.
+        for errno in [None, Some(ENOTDIR)] {
+            let mut fs = hop();
+            if let Some(errno) = errno {
+                fs.fail_at("openat2", 4, errno);
+            }
+            assert_eq!(
+                remove_path(&mut fs, &req("hop/v")).unwrap_err(),
+                RemoveError::WalkEscape(THROUGH_A_LINK)
+            );
+            assert!(fs.exists(&[b"victim", b"v"]));
+            assert!(fs.exists(&[b"srv", b"app", b"build", b"hop"]));
+            assert!(fs.unlinked().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_plain_file_as_a_parent_is_an_error_not_an_escape() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a/x")).unwrap_err(),
+            os("openat2", ENOTDIR)
+        );
+        // A link that cannot be told from a file, because its lstat fails,
+        // is not called an escape either: the walk only stops.
+        let mut fs = hop();
+        fs.fail_at("lstat", 0, 5);
+        assert!(remove_path(&mut fs, &req("hop/v")).unwrap().partial);
+        assert!(fs.exists(&[b"victim", b"v"]));
     }
 
     #[test]
@@ -2481,8 +2622,10 @@ mod tests {
         let (mut fs, _) = boxed(&[]);
         let mounted = fs.add(&BOX, b"mnt", NodeKind::File, 1000, 0o644, 0);
         fs.set_device(mounted, 2);
-        let report = remove_path(&mut fs, &req("box")).unwrap();
-        assert!(report.partial);
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt"]));
     }
 

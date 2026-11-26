@@ -282,3 +282,51 @@ fn a_same_device_bind_mount_as_the_tree_is_refused() {
         std::os::unix::fs::chown(dir, Some(owner.uid()), Some(owner.gid())).unwrap();
     }
 }
+
+#[test]
+fn denies_a_real_symlink_planted_as_a_parent_of_the_target() {
+    if !begin_root_test("denies_a_real_symlink_planted_as_a_parent_of_the_target") {
+        return;
+    }
+    // Attack: `hop -> MOVED` in the tree, and a removal of `hop/v`. The
+    // kernel answers ENOTDIR or ELOOP; either is an escape, nothing goes.
+    fs::create_dir_all(MOVED).unwrap();
+    let victim = format!("{MOVED}/v");
+    fs::write(&victim, b"keep").unwrap();
+    chown_unprivileged(&victim, false);
+    let link = format!("{TREE}/hop");
+    std::os::unix::fs::symlink(MOVED, &link).unwrap();
+    chown_unprivileged(&link, true);
+    assert_eq!(
+        walk(b"hop/v", false).unwrap_err(),
+        RemoveError::WalkEscape("a directory on the way to the target is a symbolic link")
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn denies_a_real_mount_as_a_parent_or_as_the_target() {
+    if !begin_root_test("denies_a_real_mount_as_a_parent_or_as_the_target") {
+        return;
+    }
+    let mount = format!("{XDEV_TREE}/box/mnt");
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    let inside = format!("{mount}/kept");
+    fs::write(&inside, b"behind the mount").unwrap();
+    chown_unprivileged(&inside, false);
+    chown_unprivileged(&mount, false);
+    for relative in [&b"box/mnt/kept"[..], b"box/mnt"] {
+        let mut request = request(relative, true);
+        request.under = XDEV_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    let _ = fs::remove_file(&inside);
+}

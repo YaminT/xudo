@@ -190,6 +190,13 @@ pub enum Refusal {
         /// What the audit record stands for, when this one is written.
         suppressed: Option<u64>,
     },
+    /// A `remove-path` walk would have followed a symbolic link or crossed a
+    /// mount: someone planted it in the tree. Nothing was removed.
+    #[error("the remove-path walk refused an escape: {reason}")]
+    WalkEscape {
+        /// What the walk met. Display only.
+        reason: &'static str,
+    },
     /// The gate could not do one of the steps that come before or after the
     /// decision, and so did not run anything.
     ///
@@ -362,6 +369,7 @@ impl Refusal {
             Self::ConfirmationMissing(_) => "gate_confirmation_missing",
             Self::Mode { reason, .. } => reason.code(),
             Self::RateCeiling { .. } => "gate_rate_ceiling",
+            Self::WalkEscape { .. } => "gate_walk_escape",
             Self::Failed { stage, .. } => stage.code(),
         }
     }
@@ -380,6 +388,7 @@ impl Refusal {
             | Self::Request(_)
             | Self::ConfirmationMissing(_)
             | Self::RateCeiling { .. }
+            | Self::WalkEscape { .. }
             | Self::Mode { .. } => Severity::High,
         }
     }
@@ -404,6 +413,7 @@ impl Refusal {
             | Self::Request(_)
             | Self::Mode { .. }
             | Self::RateCeiling { .. }
+            | Self::WalkEscape { .. }
             | Self::Failed { .. } => ExitCode::Unusable,
         }
     }
@@ -724,7 +734,13 @@ pub fn refusal_record(
     }
     // What the gate could not do, and why, in the operating system's words:
     // the code says which step, and this says what the step reported.
-    if let Refusal::Failed { reason, .. } = refusal {
+    // A walk escape names what the walk met, the same way.
+    let detail = match refusal {
+        Refusal::Failed { reason, .. } => Some(reason.as_str()),
+        Refusal::WalkEscape { reason } => Some(*reason),
+        _ => None,
+    };
+    if let Some(reason) = detail {
         evidence.push(format!(
             "detail={}",
             reason
@@ -1047,6 +1063,7 @@ all = [
             | Refusal::Request(_)
             | Refusal::Mode { .. }
             | Refusal::RateCeiling { .. }
+            | Refusal::WalkEscape { .. }
             | Refusal::Failed { .. } => None,
         }
     }

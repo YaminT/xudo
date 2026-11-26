@@ -101,3 +101,17 @@ fn the_rate_ceiling_refusal_is_pinned() {
     );
     insta::assert_snapshot!("gate_rate_ceiling", snapshot);
 }
+
+#[test]
+fn the_walk_escape_refusal_is_pinned() {
+    let escape = xudo_gate::Refusal::WalkEscape {
+        reason: "the walk would cross a mount",
+    };
+    let snapshot = format!(
+        "{} {:?} {:?}\n{escape}\n",
+        escape.code(),
+        escape.severity(),
+        escape.exit_code()
+    );
+    insta::assert_snapshot!("gate_walk_escape", snapshot);
+}
