@@ -772,7 +772,7 @@ fn a_nopass_remove_path_needs_a_live_granted_harness_even_past_a_nopasswd_line()
     root_file(
         G1E_RULES,
         format!(
-            "[[operation]]\nid = \"lane.g1e-clean\"\nop = \"remove-path\"\nunder = \"{G1E_TREE}\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nowners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
+            "[[operation]]\nid = \"lane.g1e-clean\"\nop = \"remove-path\"\nunder = \"{G1E_TREE}\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nowners = [\"{USER}\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
         )
         .as_bytes(),
         0o644,
