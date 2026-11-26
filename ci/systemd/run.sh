@@ -4,7 +4,8 @@
 # then execs /sbin/init. Privileged lets it manage its own private cgroup namespace.
 # Nothing else on the host is changed. ci/systemd/row.sh asserts inside, and
 # sources grant.sh: the passwordless grant through a live enrolled unit, behind
-# a NOPASSWD line written only in the container and removed by the row.
+# a NOPASSWD line written only in the container and removed by the row, and
+# grant.sh sources attack.sh, the attack rows against it (E7).
 #
 #   ci/systemd/run.sh <musl triple>       (or: just systemd-test)
 #
