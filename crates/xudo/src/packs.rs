@@ -325,6 +325,9 @@ fn finish(
         Ok(report) => {
             print_review(&report.review, out);
             let _ = writeln!(out, "{done} {}", report.path);
+            for warning in &report.warnings {
+                let _ = writeln!(err, "xudo: warning: {}", safe(warning));
+            }
             ExitCode::Delegated
         }
         Err(PackError::Refused(refusal)) => refused(err, &refusal),

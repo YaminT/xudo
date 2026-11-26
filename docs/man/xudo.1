@@ -650,6 +650,14 @@ what the engine decides differently for the commands the rules' tests and
 examples name, every
 .B gtfobins\-waiver
 in the pack, and the lint warnings it adds.
+A harness that keeps a rule on the program a lost rule covered gets a
+.I "may widen"
+line of its own, because the engine applies the strictest of every rule that
+accepts a command.
+At most 64 engine lines are printed, gains first, and the rest are counted.
+A pack with more than 256 actions, operations and deny rules, or rules whose
+review would ask the engine too much, is refused as too large to review; root
+applies the same bounds.
 It ends with a token that binds the pack's bytes,
 .B \-\-allow\-waivers
 and the generation of the rules and harness registry it judged.
@@ -657,16 +665,14 @@ Any failure refuses the pack, and so does a waiver without
 .BR \-\-allow\-waivers .
 .B sudo xudo rules add \-\-reviewed
 .I token file
-installs it: as root, with sudo's own prompt (the drop-in xudo installs sets
-.B timestamp_timeout=0
-for
-.I /usr/bin/xudo
-itself, so no cached credential carries a caller here), it refuses a process
-inside
+installs it: as root, after sudo's own prompt, it refuses a process inside
 .B xudo.slice
-or under an ancestor that is, a cgroup namespace other than pid 1's and a bare
+or under an ancestor below pid 1 that is, a cgroup namespace other than pid
+1's and a bare
 .B /
-cgroup, takes a lock on the rules directory, checks everything again from
+on the unified
+.B 0::
+cgroup line, takes a lock on the rules directory, checks everything again from
 root's own reading of
 .IR /etc/xudo ,
 refuses unless the token it computes is the reviewed one (the same
@@ -675,6 +681,25 @@ is needed), and renames the pack into
 .IR /etc/xudo/rules.d/pack\-name.toml
 (root:root 0644, starting with xudo's rule-pack marker).
 It never replaces a file xudo did not write.
+The real boundary is that an enrolled harness account has no password, so it
+cannot answer sudo's prompt: run every harness as an account of its own
+.RB ( "xudo agent enrol" ).
+The drop-in xudo installs sets
+.B timestamp_timeout=0
+for
+.I /usr/bin/xudo
+itself, but that is a speed bump, not a wall: a harness that shares your
+account and terminal can ride a warm sudo ticket through
+.BR "sudo env xudo" ,
+.B sudo \-s
+or a copy of the binary.
+If a harness must share your account, give it a terminal of its own, so the
+ticket (per terminal by default,
+.BR timestamp_type=tty )
+is not yours.
+When the drop-in predates that line, root says so after the change and does
+not block it; reinstall the drop-in with
+.BR "sudo xudo install" .
 .B rules list
 shows each pack and whether
 .B rules add

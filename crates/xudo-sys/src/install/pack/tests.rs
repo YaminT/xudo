@@ -7,6 +7,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use xudo_backend::enrol::MANAGED_MARKER;
 use xudo_policy::pack::PACK_MARKER;
@@ -333,6 +334,105 @@ fn where_this_runs_cannot_be_told_refuses() {
 }
 
 #[test]
+fn a_cgroup_v1_or_hybrid_host_is_not_refused_for_its_root_hierarchies() {
+    // Every process on a v1 or hybrid host sits at `/` in some controller.
+    let hybrid = "12:cpuset:/\n11:pids:/user.slice/user-1000.slice/session-3.scope\n\
+                  1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n\
+                  0::/user.slice/user-1000.slice/session-3.scope\n";
+    let v1 = "12:cpuset:/\n3:cpu,cpuacct:/\n\
+              1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n";
+    for cgroup in [hybrid, v1] {
+        let machine = host();
+        let tree = session()
+            .file("self", "cgroup", cgroup)
+            .file("300", "cgroup", cgroup)
+            .file("200", "cgroup", cgroup);
+        assert!(
+            add_pack(&request_on(&machine, NGINX), &tree, &machine, &machine).is_ok(),
+            "{cgroup:?}"
+        );
+    }
+    // On v1 the box shows in systemd's named hierarchy, beside a bare `/`.
+    let boxed = "12:cpuset:/\n1:name=systemd:/xudo.slice/xudo-agent@codex.service\n";
+    let machine = host();
+    assert_eq!(
+        add_pack(
+            &request(NGINX),
+            &session().file("200", "cgroup", boxed),
+            &machine,
+            &machine
+        )
+        .unwrap_err(),
+        PackError::AgentBox
+    );
+    // The unified line's bare `/` still says nothing about where this is.
+    let hidden = "12:cpuset:/user.slice\n0::/\n";
+    let error = add_pack(
+        &request(NGINX),
+        &session().file("self", "cgroup", hidden),
+        &machine,
+        &machine,
+    )
+    .unwrap_err();
+    assert!(matches!(error, PackError::CgroupUnknown(_)), "{error}");
+}
+
+#[test]
+fn a_host_without_systemd_is_not_refused_for_pid_1_at_the_root() {
+    // Without systemd, pid 1 sits at `/`; the walk stops below it.
+    let machine = host();
+    let tree = session().file("1", "cgroup", "0::/\n");
+    assert!(add_pack(&request_on(&machine, NGINX), &tree, &machine, &machine).is_ok());
+    // Its files are not read at all, so they cannot refuse either.
+    let tree = session().without("1", "cgroup").without("1", "status");
+    assert!(add_pack(&request_on(&machine, NGINX), &tree, &machine, &machine).is_ok());
+}
+
+#[test]
+fn a_drop_in_without_xudo_self_is_reported_and_does_not_block() {
+    let current = "Cmnd_Alias XUDO_SELF = /usr/bin/xudo\nDefaults!XUDO_SELF timestamp_timeout=0\n";
+    let installed = |machine: &Machine| {
+        let report = add_pack(&request_on(machine, NGINX), &session(), machine, machine).unwrap();
+        assert!(machine.files.borrow().contains_key(PATH));
+        report.warnings
+    };
+    // A current drop-in: nothing to say.
+    assert!(installed(&host().with_file(SUDOERS_PATH, current)).is_empty());
+    // An older one, none, or one that cannot be read: one warning each.
+    let older = host().with_file(SUDOERS_PATH, "Cmnd_Alias XUDO_AUTH = x\n");
+    let unread = host().with_file(SUDOERS_PATH, current);
+    unread
+        .unreadable
+        .borrow_mut()
+        .insert(SUDOERS_PATH.to_owned());
+    for (machine, why) in [
+        (older, "does not have"),
+        (host(), "is not there"),
+        (unread, "cannot be read"),
+    ] {
+        let warnings = installed(&machine);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(&format!("{SUDOERS_PATH} {why}")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].ends_with(
+                "`Defaults!XUDO_SELF timestamp_timeout=0`, so a cached sudo credential can \
+                 reach `sudo xudo rules`; reinstall the sudoers drop-in with `sudo xudo install`"
+            ),
+            "{warnings:?}"
+        );
+    }
+    // Removing says so too.
+    let machine = host();
+    add_pack(&request_on(&machine, NGINX), &session(), &machine, &machine).unwrap();
+    let token = removal_token(&machine, "nginx-ops");
+    let report = remove_pack("nginx-ops", &token, &session(), &machine, &machine).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+}
+
+#[test]
 fn the_host_reads_proc_and_its_namespace_link() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-tmp")
@@ -610,4 +710,25 @@ fn removing_a_pack_other_rules_depend_on_is_refused() {
         remove_pack("nginx-ops", &token, &session(), &machine, &machine).unwrap_err(),
         PackError::Install(_)
     ));
+}
+
+#[test]
+fn root_refuses_a_pack_too_large_to_review_before_writing() {
+    // The same bounds hold as root, under the lock: nothing is written.
+    let mut text = String::from("[pack]\nname = \"big\"\nversion = \"1\"\n");
+    for i in 0..=xudo_policy::pack::MAX_PACK_RULES {
+        let _ = write!(
+            text,
+            "\n[[action]]\nid = \"pack.{i}\"\ntier = \"diag-read\"\nexe = \"/usr/bin/uptime\"\n\
+             args = [{{ name = \"f\", matcher = {{ literal = \"--f{i}\" }} }}]\n"
+        );
+    }
+    let machine = host();
+    let error = add_pack(&request(&text), &session(), &machine, &machine).unwrap_err();
+    assert!(
+        matches!(error, PackError::Refused(PackRefusal::TooLarge(_))),
+        "{error}"
+    );
+    assert!(error.to_string().contains("too large to review"), "{error}");
+    assert!(wrote_nothing(&machine));
 }

@@ -9,15 +9,22 @@
 //!
 //! * **Not from an agent's box.** A process inside `xudo.slice` (an enrolled
 //!   harness unit or an agent scope) is refused, from the kernel's own
-//!   `/proc/<pid>/cgroup`, for this process and every ancestor up to pid 1, so
+//!   `/proc/<pid>/cgroup`, for this process and every ancestor below pid 1, so
 //!   a `sudo` that PAM moved into a login session of its own is still caught
 //!   by its parent. A process that double-forks and lets its parent die is
-//!   reparented out of the chain, so this is a hint, not the wall. So is the
-//!   refusal of a cgroup namespace other than pid 1's, and of a bare `/`
-//!   cgroup, which says nothing about where the process is.
-//! * **The wall is sudo's password.** The sudoers drop-in xudo installs sets
-//!   `timestamp_timeout=0` for xudo itself, so no cached credential carries a
-//!   harness here, and an enrolled account has no password at all.
+//!   reparented out of the chain, and `systemd-run --user` makes the user's
+//!   manager the parent, so this is a hint, not the wall. So is the refusal of
+//!   a cgroup namespace other than pid 1's, and of a bare `/` on the unified
+//!   (`0::`) line, which says nothing about where the process is.
+//! * **The wall is that an enrolled account has no password.** Run every
+//!   harness as an account of its own (`xudo agent enrol`): it cannot answer
+//!   sudo's prompt, so it never gets here. The sudoers drop-in sets
+//!   `timestamp_timeout=0` for `/usr/bin/xudo`, which is only a speed bump: a
+//!   harness that shares the human's account and terminal can still ride a
+//!   warm sudo ticket through `sudo env xudo`, `sudo -s` or a copy of the
+//!   binary. Give such a harness a terminal of its own, so the ticket (per
+//!   terminal by default, `timestamp_type=tty`) is not the human's. A drop-in
+//!   older than that line is reported, and does not block.
 //! * **The change the operator reviewed.** The token binds the pack's bytes
 //!   (or the name removed), `--allow-waivers`, and the generation of the rules
 //!   and harness registry it was judged against. Root computes it again from
@@ -34,6 +41,7 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::path::PathBuf;
 
 use xudo_backend::enrol::REGISTRY_DIR;
+use xudo_backend::snippet::{SUDOERS_PATH, XUDO_SELF_DEFAULTS, sets_self_timeout};
 use xudo_policy::pack::{
     Change, PackRefusal, Review, file_name, header_of, installed_by_xudo, installed_bytes, review,
     with_pack, without_pack,
@@ -73,6 +81,8 @@ pub struct PackReport {
     pub path: String,
     /// What changed.
     pub review: Review,
+    /// What the operator should fix, which did not block the change.
+    pub warnings: Vec<String>,
 }
 
 /// Why a pack was not installed or removed. Nothing was changed.
@@ -164,28 +174,34 @@ impl Whereabouts for HostWhereabouts {
 
 /// Refuses one process's cgroup list when a line is under `xudo.slice`, and
 /// when it says nothing: unreadable, empty, a line with no absolute path, or
-/// a bare `/`, which a cgroup namespace shows whatever the real path is.
+/// a bare `/` on the unified `0::` line, which a cgroup namespace shows
+/// whatever the real path is. A cgroup v1 line at `/` (`12:cpuset:/`) is
+/// where most processes sit on a v1 or hybrid host, and says nothing either
+/// way.
 fn outside_slice(pid: &str, cgroup: std::io::Result<Vec<u8>>) -> Result<(), PackError> {
     let unknown = |why: String| PackError::CgroupUnknown(format!("/proc/{pid}/cgroup {why}"));
     let bytes = cgroup.map_err(|error| unknown(error.to_string()))?;
-    let paths: Vec<&[u8]> = bytes
+    let lines: Vec<(bool, &[u8])> = bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         // `hierarchy:controllers:path`; a line without two colons is no path.
-        .map(|line| line.splitn(3, |byte| *byte == b':').nth(2).unwrap_or(b""))
+        .map(|line| {
+            let path = line.splitn(3, |byte| *byte == b':').nth(2).unwrap_or(b"");
+            (line.starts_with(b"0::"), path)
+        })
         .collect();
-    if paths.is_empty()
-        || paths
+    if lines.is_empty()
+        || lines
             .iter()
-            .any(|path| !path.starts_with(b"/") || *path == b"/")
+            .any(|(unified, path)| !path.starts_with(b"/") || (*unified && *path == b"/"))
     {
         return Err(unknown(
             "is not a list of cgroups below the root".to_owned(),
         ));
     }
-    if paths
+    if lines
         .iter()
-        .any(|path| *path == b"/xudo.slice" || path.starts_with(b"/xudo.slice/"))
+        .any(|(_, path)| *path == b"/xudo.slice" || path.starts_with(b"/xudo.slice/"))
     {
         Err(PackError::AgentBox)
     } else {
@@ -201,8 +217,10 @@ fn parent_of(status: &[u8]) -> Option<u32> {
     std::str::from_utf8(line).ok()?.trim().parse().ok()
 }
 
-/// Refuses a process that runs, or whose ancestor runs, inside `xudo.slice`,
-/// or in a cgroup namespace other than pid 1's, or that cannot tell.
+/// Refuses a process that runs, or whose ancestor below pid 1 runs, inside
+/// `xudo.slice`, or in a cgroup namespace other than pid 1's, or that cannot
+/// tell. Pid 1 is never in the slice, and on a host without systemd it sits
+/// at `/`, so its cgroup is not read.
 fn outside_agent_box(at: &dyn Whereabouts) -> Result<(), PackError> {
     let ns = |pid: &str| {
         at.cgroup_ns(pid)
@@ -220,7 +238,7 @@ fn outside_agent_box(at: &dyn Whereabouts) -> Result<(), PackError> {
             .read(&pid, "status")
             .map_err(|error| PackError::CgroupUnknown(format!("/proc/{pid}/status: {error}")))?;
         match parent_of(&status) {
-            Some(0) => return Ok(()),
+            Some(0 | 1) => return Ok(()),
             Some(parent) => pid = parent.to_string(),
             None => {
                 return Err(PackError::CgroupUnknown(format!(
@@ -284,6 +302,21 @@ fn registry(host: &dyn EnrolOps) -> Result<Vec<HarnessFile>, String> {
     Ok(files)
 }
 
+/// What the operator should know about the sudoers drop-in: nothing when it
+/// sets [`XUDO_SELF_DEFAULTS`]. Never a refusal: the line is a speed bump.
+fn drop_in_warnings(host: &dyn EnrolOps) -> Vec<String> {
+    let why = match host.read_file(SUDOERS_PATH) {
+        Ok(Some(bytes)) if sets_self_timeout(&bytes) => return Vec::new(),
+        Ok(Some(_)) => "does not have".to_owned(),
+        Ok(None) => "is not there, so it does not have".to_owned(),
+        Err(error) => format!("cannot be read ({error}), so it may not have"),
+    };
+    vec![format!(
+        "{SUDOERS_PATH} {why} `{XUDO_SELF_DEFAULTS}`, so a cached sudo credential can reach \
+         `sudo xudo rules`; reinstall the sudoers drop-in with `sudo xudo install`"
+    )]
+}
+
 /// Refuses a change whose token is not the one the operator was shown.
 fn reviewed(review: &Review, token: &str) -> Result<(), PackError> {
     if review.token == token {
@@ -338,7 +371,12 @@ pub fn add_pack(
         let _ = ops.discard(&candidate, identity);
         return Err(error.into());
     }
-    Ok(PackReport { path, review })
+    let warnings = drop_in_warnings(host);
+    Ok(PackReport {
+        path,
+        review,
+        warnings,
+    })
 }
 
 /// Removes a pack `rules add` installed, if the rules without it still pass
@@ -364,7 +402,12 @@ pub fn remove_pack(
     reviewed(&review, token)?;
     let path = format!("{RULES_DIR}/{}", file_name(name));
     ops.remove_managed(&path)?;
-    Ok(PackReport { path, review })
+    let warnings = drop_in_warnings(host);
+    Ok(PackReport {
+        path,
+        review,
+        warnings,
+    })
 }
 
 #[cfg(test)]

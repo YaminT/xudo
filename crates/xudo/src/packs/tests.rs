@@ -449,6 +449,7 @@ fn report(path: &str) -> PackReport {
     PackReport {
         path: path.to_owned(),
         review,
+        warnings: vec!["the drop-in is old; reinstall it".to_owned()],
     }
 }
 
@@ -462,11 +463,16 @@ fn reviewed_hands_root_the_bytes_and_the_digest() {
         allow_waivers: true,
     };
     let script = Script::answering(Ok(report("/etc/xudo/rules.d/pack-ids.toml")));
-    let (code, out, _) = go(&etc, &script, &reviewed(&file));
+    let (code, out, err) = go(&etc, &script, &reviewed(&file));
     assert_eq!(code, ExitCode::Delegated);
     assert!(
         out.ends_with("installed /etc/xudo/rules.d/pack-ids.toml\n"),
         "{out}"
+    );
+    // Root's warnings reach the operator and do not change the outcome.
+    assert_eq!(
+        err, "xudo: warning: the drop-in is old; reinstall it\n",
+        "{err}"
     );
     assert!(
         out.starts_with("  password path gains (password): pack.id: /usr/bin/id\n"),

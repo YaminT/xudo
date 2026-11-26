@@ -32,7 +32,7 @@
 //! it from its own reading and refuses on any difference, so nothing installs
 //! an effect nobody saw.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::Deserialize;
@@ -46,7 +46,7 @@ use crate::engine::{Settings, evaluate_command};
 use crate::files::{
     Generation, HarnessFile, LoadedRuleSet, RuleFile, RuleFilesError, load_policy_with_registry,
 };
-use crate::fuzz_check::witnesses;
+use crate::fuzz_check::{dictionary, witnesses_from};
 use crate::harness::valid_harness_label;
 use crate::matcher::{ArgSpec, Matcher, Repeat};
 use crate::operation::Operation;
@@ -157,6 +157,10 @@ pub enum PackRefusal {
     /// The rules after the change load and fail a check.
     #[error("after the change the rules fail {} check(s): {}", .0.len(), .0.join("; "))]
     Problems(Vec<String>),
+    /// The review would cost too much to make, here and again as root under
+    /// the lock on the rules directory.
+    #[error("the pack is too large to review: {0}; split it into smaller packs")]
+    TooLarge(String),
     /// The pack waives a `GTFOBins` refusal and the operator did not allow it.
     #[error(
         "the pack waives {} GTFOBins refusal(s) ({}); read each and pass --allow-waivers to both \
@@ -227,26 +231,46 @@ fn shape(spec: &ArgSpec) -> String {
 
 /// An action as the diff shows it: the command shape, then every setting that
 /// changes what it allows, so changing any of them is a loss and a gain.
+///
+/// Every field is named, so a field added to [`Action`] does not compile here
+/// until someone decides whether it changes what the action allows.
 fn action_text(action: &Action) -> String {
-    let mut text = std::iter::once(action.exe.clone())
-        .chain(action.args.iter().map(shape))
+    let Action {
+        id,
+        tier,
+        exe,
+        args,
+        confirm,
+        agent_allowed,
+        env_allow,
+        // The audience and the how of the capability, not its text.
+        harness: _,
+        outcome: _,
+        // Allows nothing: a reason, shown with the waivers.
+        gtfobins_waiver: _,
+        // Where, not what.
+        source: _,
+    } = action;
+    let mut text = std::iter::once(exe.clone())
+        .chain(args.iter().map(shape))
         .collect::<Vec<_>>()
         .join(" ");
-    if !action.env_allow.is_empty() {
-        let _ = write!(text, "; env-allow {:?}", action.env_allow);
+    if !env_allow.is_empty() {
+        let _ = write!(text, "; env-allow {env_allow:?}");
     }
-    match action.confirm {
+    match confirm {
         ConfirmPolicy::Default => {}
         ConfirmPolicy::Always => text.push_str("; confirm always"),
         ConfirmPolicy::Never => text.push_str("; confirm never"),
     }
-    if !action.agent_allowed {
+    if !agent_allowed {
         text.push_str("; agent-allowed false");
     }
-    if action.tier.always_confirms() {
+    // No other tier changes a decision.
+    if tier.always_confirms() {
         text.push_str("; tier critical");
     }
-    format!("{}: {text}", action.id)
+    format!("{id}: {text}")
 }
 
 fn operation_text(op: &Operation) -> String {
@@ -357,9 +381,34 @@ fn decided(decision: &Decision, agent: bool) -> (&'static str, u8) {
 /// How many example commands each action gives the engine probe.
 const WITNESSES_PER_ACTION: usize = 3;
 
+// A review runs twice, the second time as root holding the lock on the rules
+// directory, so its cost is bounded. Miri interprets the review some thousand
+// times slower, so under it the bounds are small; the tests state them
+// through these constants, never as literals.
+
+/// The most actions, operations and `[[deny]]` rules one pack may hold.
+pub const MAX_PACK_RULES: usize = if cfg!(miri) { 4 } else { 256 };
+/// The most distinct tokens one side's example commands are drawn from.
+pub const MAX_PROBE_TOKENS: usize = if cfg!(miri) { 64 } else { 4096 };
+/// The most commands the engine is asked about.
+pub const MAX_PROBES: usize = if cfg!(miri) { 64 } else { 4096 };
+/// The most engine work a review may cost, in matcher steps: for every
+/// command asked about, every argument position of every action on its
+/// program, times the square of the command's length plus one, the bound of
+/// the argv matcher's table, for each audience and the test run. Measured on
+/// rules built to be slow, a few seconds in a release build.
+pub const MAX_REVIEW_WORK: usize = if cfg!(miri) { 1 << 16 } else { 1 << 28 };
+/// The most engine lines a review prints; the rest are counted.
+pub const MAX_EFFECT_LINES: usize = if cfg!(miri) { 2 } else { 64 };
+
+/// A command the engine is asked about: the program and its operands.
+type Probe = (Arg, Vec<Arg>);
+
 /// Every command worth asking the engine about: each `[[test]]` argv, and a
-/// few each action of either side accepts.
-fn probes(sides: [&LoadedRuleSet; 2]) -> BTreeSet<(Arg, Vec<Arg>)> {
+/// few each action of either side accepts, drawn from one dictionary per side.
+/// Refused when asking the engine about them all, for `audiences` callers and
+/// the test run, would cost more than [`MAX_REVIEW_WORK`].
+fn probes(sides: [&LoadedRuleSet; 2], audiences: usize) -> Result<BTreeSet<Probe>, PackRefusal> {
     let mut found = BTreeSet::new();
     for side in sides {
         found.extend(side.tests.iter().filter_map(|test| {
@@ -370,20 +419,60 @@ fn probes(sides: [&LoadedRuleSet; 2]) -> BTreeSet<(Arg, Vec<Arg>)> {
                 )
             })
         }));
+        let tokens = dictionary(&side.rules);
+        if tokens.len() > MAX_PROBE_TOKENS {
+            return Err(PackRefusal::TooLarge(format!(
+                "the rules' matchers give {} example arguments, more than {MAX_PROBE_TOKENS}",
+                tokens.len()
+            )));
+        }
         for action in side.rules.actions() {
             found.extend(
-                witnesses(&side.rules, action, 1, WITNESSES_PER_ACTION)
+                witnesses_from(&tokens, action, 1, WITNESSES_PER_ACTION)
                     .into_iter()
                     .map(|argv| (Arg::from(action.exe.as_str()), argv.as_slice().to_vec())),
             );
         }
     }
-    found
+    if found.len() > MAX_PROBES {
+        return Err(PackRefusal::TooLarge(format!(
+            "the engine would be asked about {} commands, more than {MAX_PROBES}",
+            found.len()
+        )));
+    }
+    let work = work(sides, &found).saturating_mul(audiences.saturating_add(1));
+    if work > MAX_REVIEW_WORK {
+        return Err(PackRefusal::TooLarge(format!(
+            "asking the engine about every command would take {work} matcher steps, more than \
+             {MAX_REVIEW_WORK}"
+        )));
+    }
+    Ok(found)
 }
 
-/// What the engine decides differently after the change, per audience, for
-/// every probe command: the real effect of the change, overlaps included.
-fn effects(old: &LoadedRuleSet, new: &LoadedRuleSet) -> Vec<Effect> {
+/// What asking both sides about every probe once costs, in matcher steps.
+fn work(sides: [&LoadedRuleSet; 2], probes: &BTreeSet<Probe>) -> usize {
+    let mut positions: BTreeMap<&[u8], usize> = BTreeMap::new();
+    for action in sides.iter().flat_map(|side| side.rules.actions()) {
+        let count = positions.entry(action.exe.as_bytes()).or_default();
+        *count = count.saturating_add(action.args.len().saturating_add(1));
+    }
+    probes
+        .iter()
+        .map(|(program, operands)| {
+            let length = operands.len().saturating_add(1);
+            positions
+                .get(program.as_bytes())
+                .copied()
+                .unwrap_or_default()
+                .saturating_mul(length.saturating_mul(length))
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// Who the engine is asked as: every harness either side names, and the
+/// password path.
+fn callers(old: &LoadedRuleSet, new: &LoadedRuleSet) -> Vec<(String, CallerFacts)> {
     let labels: BTreeSet<&String> = [&old.rules, &new.rules]
         .into_iter()
         .flat_map(|rules| {
@@ -391,7 +480,7 @@ fn effects(old: &LoadedRuleSet, new: &LoadedRuleSet) -> Vec<Effect> {
             actions.chain(rules.operations().iter().flat_map(|op| &op.harness))
         })
         .collect();
-    let callers: Vec<(String, CallerFacts)> = labels
+    labels
         .into_iter()
         .map(|label| {
             let agent = Classification::EnrolledAgent {
@@ -405,11 +494,20 @@ fn effects(old: &LoadedRuleSet, new: &LoadedRuleSet) -> Vec<Effect> {
             PASSWORD_PATH.to_owned(),
             CallerFacts::new(Classification::Human, 1000),
         )))
-        .collect();
+        .collect()
+}
+
+/// What the engine decides differently after the change, per audience, for
+/// every probe command: the real effect of the change, overlaps included.
+fn effects(
+    [old, new]: [&LoadedRuleSet; 2],
+    callers: &[(String, CallerFacts)],
+    probes: BTreeSet<Probe>,
+) -> Vec<Effect> {
     let mut found = Vec::new();
-    for (program, operands) in probes([old, new]) {
+    for (program, operands) in probes {
         let argv = Argv::new(operands);
-        for (audience, caller) in &callers {
+        for (audience, caller) in callers {
             let agent = caller.classification.is_enrolled_agent();
             let ask = |rules: &RuleSet| {
                 decided(
@@ -488,6 +586,10 @@ pub struct Review {
     /// For a loss, the actions still on the same program for that audience:
     /// the loss may widen, because the strictest of them now applies.
     pub overlaps: Vec<(Capability, Vec<String>)>,
+    /// For a lost action, each harness with an action on the same program
+    /// that did not lose it itself, and those actions: the lost one applied to
+    /// that harness's commands too, being the strictest, so it may widen.
+    pub spills: Vec<(String, Capability, Vec<String>)>,
     /// What the engine decides differently, for every probe command.
     pub effects: Vec<Effect>,
     /// Each `gtfobins-waiver` the added pack carries, as `id: waiver`.
@@ -519,14 +621,24 @@ impl Review {
                 None => line,
             }
         };
+        let spill = |(label, lost, now): &(String, Capability, Vec<String>)| {
+            format!(
+                "{label} may widen: {} goes, which also bound {label}'s own rules on that \
+                 program; now {} applies",
+                lost.what,
+                now.join(", ")
+            )
+        };
         self.gains
             .iter()
             .map(gain)
             .chain(self.losses.iter().map(loss))
+            .chain(self.spills.iter().map(spill))
             .collect()
     }
 
-    /// One line per command the engine decides differently, gains first.
+    /// One line per command the engine decides differently, gains first, at
+    /// most [`MAX_EFFECT_LINES`] of them and then how many more there are.
     pub fn effect_lines(&self) -> Vec<String> {
         let line = |e: &Effect| {
             format!(
@@ -540,7 +652,20 @@ impl Review {
         };
         let (wider, narrower): (Vec<&Effect>, Vec<&Effect>) =
             self.effects.iter().partition(|e| e.widens);
-        wider.into_iter().chain(narrower).map(line).collect()
+        let more = self.effects.len().saturating_sub(MAX_EFFECT_LINES);
+        let hidden = wider.len().saturating_sub(MAX_EFFECT_LINES);
+        let mut lines: Vec<String> = wider
+            .into_iter()
+            .chain(narrower)
+            .take(MAX_EFFECT_LINES)
+            .map(line)
+            .collect();
+        if more > 0 {
+            lines.push(format!(
+                "and {more} more commands decided differently, {hidden} of them gains"
+            ));
+        }
+        lines
     }
 }
 
@@ -593,12 +718,37 @@ fn problems(loaded: &LoadedRuleSet) -> Vec<String> {
         .collect()
 }
 
-/// The waivers of the actions the added pack defines.
-fn waivers(change: Change<'_>, new: &LoadedRuleSet) -> Vec<String> {
-    let file = match change {
+/// The file an added pack is installed as; nothing for a removal.
+fn pack_file(change: Change<'_>) -> Option<String> {
+    match change {
         Change::Add { pack, .. } => header_of(pack).ok().map(|header| header.file_name()),
         Change::Remove { .. } => None,
-    };
+    }
+}
+
+/// Refuses an added pack with more rules than a review may judge.
+fn small_enough(change: Change<'_>, new: &RuleSet) -> Result<(), PackRefusal> {
+    let file = pack_file(change);
+    let ours = |source: &crate::rule::Source| file.as_deref() == Some(source.file.as_str());
+    let count = new
+        .actions()
+        .iter()
+        .map(|a| &a.source)
+        .chain(new.operations().iter().map(|op| &op.source))
+        .chain(new.deny_rules().iter().map(|d| &d.source))
+        .filter(|source| ours(source))
+        .count();
+    if count > MAX_PACK_RULES {
+        return Err(PackRefusal::TooLarge(format!(
+            "it holds {count} actions, operations and deny rules, more than {MAX_PACK_RULES}"
+        )));
+    }
+    Ok(())
+}
+
+/// The waivers of the actions the added pack defines.
+fn waivers(change: Change<'_>, new: &LoadedRuleSet) -> Vec<String> {
+    let file = pack_file(change);
     new.rules
         .actions()
         .iter()
@@ -610,6 +760,38 @@ fn waivers(change: Change<'_>, new: &LoadedRuleSet) -> Vec<String> {
                 .map(|waiver| format!("{}: {waiver}", action.id))
         })
         .collect()
+}
+
+/// For each lost action, the harnesses that keep an action on its program
+/// without having lost the action themselves: the engine applies the
+/// strictest of every action that accepts a command, whoever it names, so
+/// the lost one may have held those harnesses back too.
+fn spills(losses: &[Capability], new: &RuleSet) -> Vec<(String, Capability, Vec<String>)> {
+    let mut found = Vec::new();
+    // Every action has a password-path line, so this visits each lost one once.
+    for lost in losses.iter().filter(|c| c.audience == PASSWORD_PATH) {
+        let on_program: Vec<&Action> = new
+            .actions()
+            .iter()
+            .filter(|action| action.exe == lost.program)
+            .collect();
+        let labels: BTreeSet<&String> = on_program.iter().flat_map(|a| &a.harness).collect();
+        for label in labels {
+            let own = losses
+                .iter()
+                .any(|c| &c.audience == label && c.what == lost.what);
+            if own {
+                continue;
+            }
+            let now = on_program
+                .iter()
+                .filter(|action| action.harness.contains(label))
+                .map(|action| action.id.to_string())
+                .collect();
+            found.push((label.clone(), lost.clone(), now));
+        }
+    }
+    found
 }
 
 /// Judges `change`, from the rule files `before` to the rule files `after`.
@@ -629,6 +811,10 @@ pub fn review(
     let registry = || registry.as_deref().map_err(Clone::clone);
     let old = load_policy_with_registry(before, registry()).map_err(PackRefusal::Current)?;
     let new = load_policy_with_registry(after, registry()).map_err(PackRefusal::Load)?;
+    small_enough(change, &new.rules)?;
+    // Bounded before anything is asked of the engine, the tests included.
+    let callers = callers(&old, &new);
+    let probes = probes([&old, &new], callers.len())?;
     let found = problems(&new);
     if !found.is_empty() {
         return Err(PackRefusal::Problems(found));
@@ -676,11 +862,14 @@ pub fn review(
             (!now.is_empty()).then(|| (lost.clone(), now))
         })
         .collect();
+    let spills = spills(&losses, &new.rules);
+    let effects = effects([&old, &new], &callers, probes);
     Ok(Review {
         gains,
         losses,
         overlaps,
-        effects: effects(&old, &new),
+        spills,
+        effects,
         waivers,
         generation: new.generation,
         token: token(change, &old.generation),

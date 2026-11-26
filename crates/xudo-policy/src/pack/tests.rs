@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::files::load_rule_files;
-use crate::rule::RuleSetError;
+use crate::rule::{MAX_TESTS_PER_FILE, RuleSetError};
 
 /// A pack for codex: one passwordless restart, its tests and a near miss.
 const NGINX: &str = r#"
@@ -918,4 +918,275 @@ fn only_a_pack_xudo_installed_is_taken_away() {
     let installed = with_pack(&[file("10.toml", BASE), old], &header, REFUSALS.as_bytes());
     assert_eq!(installed.len(), 2);
     assert_eq!(installed[1].bytes, installed_bytes(REFUSALS.as_bytes()));
+}
+
+/// A password-only pack of `count` actions, each one literal flag of uptime.
+fn many_actions(name: &str, count: usize) -> String {
+    let mut text = format!("[pack]\nname = \"{name}\"\nversion = \"1\"\n");
+    for i in 0..count {
+        let _ = write!(
+            text,
+            "\n[[action]]\nid = \"pack.{i}\"\ntier = \"diag-read\"\nexe = \"/usr/bin/uptime\"\n\
+             args = [{{ name = \"f\", matcher = {{ literal = \"--f{i}\" }} }}]\n"
+        );
+    }
+    text
+}
+
+fn too_large(refusal: &PackRefusal) -> &str {
+    let PackRefusal::TooLarge(why) = refusal else {
+        panic!("{refusal}");
+    };
+    why
+}
+
+#[test]
+fn a_pack_over_the_rule_cap_is_refused_as_too_large_to_review() {
+    let pack = many_actions("big", MAX_PACK_RULES + 1);
+    let after = vec![file("pack-big.toml", &pack)];
+    let refusal = review(vec![], after, &registry(&[]), adding(&pack)).unwrap_err();
+    assert_eq!(
+        too_large(&refusal),
+        format!(
+            "it holds {} actions, operations and deny rules, more than {MAX_PACK_RULES}",
+            MAX_PACK_RULES + 1
+        )
+    );
+    assert!(
+        refusal
+            .to_string()
+            .starts_with("the pack is too large to review: it holds"),
+        "{refusal}"
+    );
+    // Operations and deny rules count too.
+    let mixed = format!(
+        "{}\n[[deny]]\nid = \"pack.no-groups\"\nreason = \"r\"\nprogram = [\"id\"]\n\
+         all = [{{ any-arg = [\"-g\"] }}]\n\n[[operation]]\nid = \"tmp\"\nop = \"remove-path\"\n\
+         under = \"/srv/scratch\"\nrecursive = false\nmax-depth = 1\nmax-entries = 1\n",
+        many_actions("mixed", MAX_PACK_RULES - 1)
+    );
+    let after = vec![file("pack-mixed.toml", &mixed)];
+    let refusal = review(vec![], after, &registry(&[]), adding(&mixed)).unwrap_err();
+    assert!(too_large(&refusal).starts_with(&format!("it holds {}", MAX_PACK_RULES + 1)));
+}
+
+#[test]
+fn a_pack_at_the_rule_cap_reviews_quickly() {
+    let pack = many_actions("big", MAX_PACK_RULES);
+    let after = vec![file("pack-big.toml", &pack)];
+    let started = std::time::Instant::now();
+    let change = review(vec![], after, &registry(&[]), adding(&pack)).unwrap();
+    let took = started.elapsed();
+    assert_eq!(change.gains.len(), MAX_PACK_RULES);
+    assert_eq!(change.effects.len(), MAX_PACK_RULES);
+    // Loose: a debug build with coverage counters, on a loaded machine. The
+    // square of the actions took seconds in a release build.
+    if !cfg!(miri) {
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+    }
+}
+
+#[test]
+fn matchers_with_too_many_examples_are_too_large_to_review() {
+    let options: Vec<String> = (0..=MAX_PROBE_TOKENS)
+        .map(|i| format!("\"u{i}\""))
+        .collect();
+    let pack = format!(
+        "[pack]\nname = \"wide\"\nversion = \"1\"\n\n[[action]]\nid = \"pack.wide\"\n\
+         tier = \"diag-read\"\nexe = \"/usr/bin/uptime\"\n\
+         args = [{{ name = \"u\", matcher = {{ one-of = [{}] }} }}]\n",
+        options.join(", ")
+    );
+    let after = vec![file("pack-wide.toml", &pack)];
+    let refusal = review(vec![], after, &registry(&[]), adding(&pack)).unwrap_err();
+    assert!(
+        too_large(&refusal).starts_with("the rules' matchers give"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn rules_naming_too_many_commands_are_too_large_to_review() {
+    // Hand-written files, each with as many `[[test]]` tables as one may hold.
+    let files: Vec<RuleFile> = (0..=MAX_PROBES.div_ceil(MAX_TESTS_PER_FILE))
+        .map(|n| {
+            let mut tests = String::new();
+            for i in 0..MAX_TESTS_PER_FILE {
+                let _ = write!(
+                    tests,
+                    "[[test]]\nargv = [\"/usr/bin/uptime\", \"--t{n}-{i}\"]\nexpect = \"deny\"\n"
+                );
+            }
+            file(&format!("{n}.toml"), &tests)
+        })
+        .collect();
+    let pack = many_actions("one", 1);
+    let mut after = files.clone();
+    after.push(file("pack-one.toml", &pack));
+    let refusal = review(files, after, &registry(&[]), adding(&pack)).unwrap_err();
+    assert!(
+        too_large(&refusal).starts_with("the engine would be asked about"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_engine_lines_are_capped_with_wider_ones_first_and_the_rest_counted() {
+    let effect = |widens: bool| Effect {
+        audience: "codex".to_owned(),
+        command: "/usr/bin/uptime".to_owned(),
+        before: REFUSED,
+        after: NO_PASSWORD,
+        widens,
+    };
+    let mut change = review(vec![], vec![], &registry(&[]), REMOVING).unwrap();
+    change.effects = std::iter::repeat_n(effect(false), MAX_EFFECT_LINES)
+        .chain(std::iter::repeat_n(effect(true), MAX_EFFECT_LINES + 3))
+        .collect();
+    let lines = change.effect_lines();
+    assert_eq!(lines.len(), MAX_EFFECT_LINES + 1);
+    assert!(
+        lines[..MAX_EFFECT_LINES]
+            .iter()
+            .all(|l| l.starts_with("codex gains"))
+    );
+    assert_eq!(
+        lines[MAX_EFFECT_LINES],
+        format!(
+            "and {} more commands decided differently, 3 of them gains",
+            MAX_EFFECT_LINES + 3
+        )
+    );
+    // Under the cap, nothing is counted.
+    change.effects.truncate(MAX_EFFECT_LINES);
+    assert_eq!(change.effect_lines().len(), MAX_EFFECT_LINES);
+}
+
+/// A password-only rule that makes every uptime -p wait for a human.
+const WATCH: &str = r#"
+[pack]
+name = "watch"
+version = "1"
+
+[[action]]
+id = "pack.watch"
+tier = "diag-read"
+exe = "/usr/bin/uptime"
+confirm = "always"
+args = [{ name = "p", matcher = { literal = "-p" } }]
+"#;
+
+#[test]
+fn removing_a_password_only_rule_that_bound_a_harness_says_so_on_its_line() {
+    let codex = registry(&["codex"]);
+    let base = vec![file("10-base.toml", UPTIME)];
+    let mut both = base.clone();
+    both.push(file("pack-watch.toml", WATCH));
+    let removed = review(both, base, &codex, Change::Remove { name: "watch" }).unwrap();
+    assert_eq!(
+        removed.lines(),
+        vec![
+            "password path loses (password): pack.watch: /usr/bin/uptime -p; confirm always; \
+             may widen: now base.uptime applies",
+            "codex may widen: pack.watch: /usr/bin/uptime -p; confirm always goes, which also \
+             bound codex's own rules on that program; now base.uptime applies",
+        ]
+    );
+    assert_eq!(
+        removed.effect_lines(),
+        vec![
+            "codex gains: /usr/bin/uptime -p was confirmed by a human, now no password",
+            "password path gains: /usr/bin/uptime -p was confirmed by a human, now password",
+        ]
+    );
+}
+
+#[test]
+fn every_field_of_an_action_is_in_its_line_or_named_as_not_what_it_allows() {
+    // A struct literal: a field added to `Action` fails to compile here, as in
+    // `action_text`, until someone decides which list it belongs in.
+    let base = Action {
+        id: crate::rule::ActionId::new("a"),
+        tier: crate::rule::Tier::DiagRead,
+        exe: "/usr/bin/uptime".to_owned(),
+        args: Vec::new(),
+        confirm: ConfirmPolicy::Default,
+        agent_allowed: true,
+        env_allow: Vec::new(),
+        harness: Vec::new(),
+        outcome: Outcome::Unset,
+        gtfobins_waiver: None,
+        source: crate::rule::Source::default(),
+    };
+    let text = action_text(&base);
+    assert_eq!(text, "a: /usr/bin/uptime");
+    let with = |change: fn(&mut Action)| {
+        let mut action = base.clone();
+        change(&mut action);
+        action_text(&action)
+    };
+    let shown: [fn(&mut Action); 8] = [
+        |a| a.id = crate::rule::ActionId::new("b"),
+        |a| a.tier = crate::rule::Tier::Critical,
+        |a| a.exe = "/usr/bin/id".to_owned(),
+        |a| {
+            a.args
+                .push(ArgSpec::one("p", Matcher::Literal("-p".to_owned())));
+        },
+        |a| a.confirm = ConfirmPolicy::Always,
+        |a| a.confirm = ConfirmPolicy::Never,
+        |a| a.agent_allowed = false,
+        |a| a.env_allow.push("LANG".to_owned()),
+    ];
+    for change in shown {
+        assert_ne!(with(change), text);
+    }
+    // The audience and the how of the line, a reason, and where it is.
+    let elsewhere: [fn(&mut Action); 5] = [
+        |a| a.harness.push("codex".to_owned()),
+        |a| a.outcome = Outcome::Allow,
+        |a| a.gtfobins_waiver = Some("why".to_owned()),
+        |a| a.source.line = 9,
+        // No tier but critical changes a decision.
+        |a| a.tier = crate::rule::Tier::NetFilter,
+    ];
+    for change in elsewhere {
+        assert_eq!(with(change), text);
+    }
+}
+
+#[test]
+fn long_commands_against_many_positions_are_too_large_to_review() {
+    // Each test's 511 operands meet the matcher's table at every position of
+    // every uptime action, for each audience and the test run.
+    let mut tests = String::new();
+    for t in 0..if cfg!(miri) { 1 } else { 300 } {
+        let args: Vec<String> = (0..511).map(|k| format!("\"a{t}-{k}\"")).collect();
+        let _ = write!(
+            tests,
+            "\n[[test]]\nargv = [\"/usr/bin/uptime\", {}]\nexpect = \"deny\"\n",
+            args.join(", ")
+        );
+    }
+    let pack = format!("{}{tests}", many_actions("long", 1));
+    let after = vec![file("pack-long.toml", &pack)];
+    let started = std::time::Instant::now();
+    let refusal = review(vec![], after, &registry(&[]), adding(&pack)).unwrap_err();
+    assert!(
+        too_large(&refusal).starts_with("asking the engine about every command would take"),
+        "{refusal}"
+    );
+    assert!(too_large(&refusal).ends_with(&format!("more than {MAX_REVIEW_WORK}")));
+    // Refused before any of it is asked.
+    if !cfg!(miri) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+    // The packs people write are far below the release bound.
+    let nginx = vec![file("pack-nginx-ops.toml", NGINX)];
+    let old = load_policy_with_registry(vec![], Ok(&[])).unwrap();
+    let new =
+        load_policy_with_registry(nginx, registry(&["codex"]).as_deref().map_err(Clone::clone))
+            .unwrap();
+    let probes = probes([&old, &new], 2).unwrap();
+    assert!(work([&old, &new], &probes) * 3 * 1000 < 1 << 28);
 }
