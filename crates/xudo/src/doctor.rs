@@ -3028,6 +3028,23 @@ mod tests {
             .file("/etc/passwd", 0, 0, 0o644, ENROLLED_PASSWD)
             .file("/etc/group", 0, 0, 0o644, ENROLLED_GROUPS)
             .file("/etc/sudoers.d/xudo", 0, 0, 0o440, snippet.as_bytes())
+            // Debian's stock PAM stack for sudo.
+            .dir("/etc/pam.d", 0, 0, 0o755)
+            .file(
+                "/etc/pam.d/sudo",
+                0,
+                0,
+                0o644,
+                b"@include common-auth\n@include common-account\n",
+            )
+            .file(
+                "/etc/pam.d/common-auth",
+                0,
+                0,
+                0o644,
+                b"auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n",
+            )
+            .file("/etc/pam.d/common-account", 0, 0, 0o644, b"account required pam_unix.so\n")
             .dir("/etc/xudo", 0, 0, 0o755)
             .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
             .file(

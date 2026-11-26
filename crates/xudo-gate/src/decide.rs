@@ -225,6 +225,11 @@ pub enum ModeRefusal {
     /// confirmation.
     #[error("no rule grants this command to this harness without a password")]
     NotGranted,
+    /// A live enrolled agent reached `-auth` with no broker-recorded human
+    /// approval: a password typed through sudo is not one, because the agent
+    /// is in the group that may run `-auth` and PAM is not the boundary.
+    #[error("an enrolled agent cannot pass the password gate without a recorded human approval")]
+    AgentWithoutApproval,
 }
 
 impl ModeRefusal {
@@ -235,6 +240,7 @@ impl ModeRefusal {
             Self::NotAnEnrolledAgent => "gate_mode_not_an_enrolled_agent",
             Self::LabelDiffers => "gate_mode_label_differs",
             Self::NotGranted => "gate_mode_not_granted",
+            Self::AgentWithoutApproval => "gate_mode_agent_without_approval",
         }
     }
 }
@@ -508,6 +514,8 @@ pub fn decide(
     let decision = engine::evaluate(rules, &caller.facts, &request, context.settings);
 
     check_verdict(&decision, pending, &context)?;
+    // After the verdict, so a denial or a freeze still names its own reason.
+    require_human_for_agent(caller, pending, &context)?;
 
     // The engine cites the governing action on every allowing decision. The
     // defaults are the requested action, eagerly built, so there is no arm
@@ -591,6 +599,26 @@ fn check_verdict(
         }
         (GateMode::Auth, Verdict::Allow | Verdict::AllowWithConfirmation) => Ok(()),
     }
+}
+
+/// The agent account is in `xudo`, so it can reach `-auth`: whatever PAM does
+/// with a password, only the broker's record of a human's decision lets a live
+/// enrolled agent through the password gate.
+fn require_human_for_agent(
+    caller: &GateCaller,
+    pending: &PendingRequest,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    if context.mode == GateMode::Auth
+        && caller.facts.classification.is_enrolled_agent()
+        && !pending.confirmed
+    {
+        return Err(mode_refusal(
+            context.mode,
+            ModeRefusal::AgentWithoutApproval,
+        ));
+    }
+    Ok(())
 }
 
 /// The refusal for an entry that does not belong to the running gate file.
@@ -2049,6 +2077,63 @@ args = [
             )),
             "gate_mode_wrong_via"
         );
+    }
+
+    #[test]
+    fn auth_refuses_an_enrolled_agent_whose_password_got_through_pam() {
+        // The agent account is in `xudo`; if PAM let it pass sudo, the typed
+        // password still is not a human approval, so an unconfirmed entry
+        // for a live agent is refused even when the gate counts the password.
+        for password_confirms in [false, true] {
+            let mut ctx = context();
+            ctx.password_confirms = password_confirms;
+            let mut pending = harness_entry(77);
+            pending.via = Via::Auth;
+            assert!(!pending.confirmed);
+            assert_eq!(
+                mode_code(decide(
+                    &grant_rules(),
+                    &live_agent(77, "claude-code", 44),
+                    Some(&pending),
+                    ctx
+                )),
+                "gate_mode_agent_without_approval"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_lets_an_enrolled_agent_through_only_with_a_recorded_approval() {
+        let mut pending = harness_entry(77);
+        pending.via = Via::Auth;
+        pending.confirmed = true;
+        let result = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            Some(&pending),
+            context(),
+        );
+        let refused: Vec<&str> = result
+            .as_ref()
+            .err()
+            .into_iter()
+            .map(Refusal::code)
+            .collect();
+        assert!(!refused.contains(&"gate_mode_agent_without_approval"));
+    }
+
+    #[test]
+    fn auth_still_runs_a_human_for_whom_the_password_is_the_approval() {
+        let mut ctx = context();
+        ctx.password_confirms = true;
+        let result = decide(&grant_rules(), &human(77), Some(&status_request(77)), ctx);
+        let refused: Vec<&str> = result
+            .as_ref()
+            .err()
+            .into_iter()
+            .map(Refusal::code)
+            .collect();
+        assert!(!refused.contains(&"gate_mode_agent_without_approval"));
     }
 
     #[test]

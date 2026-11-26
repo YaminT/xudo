@@ -1054,20 +1054,49 @@ fn enrol_leaves_a_membership_that_was_already_there_alone() {
     let plan = enrol(&machine).unwrap();
     assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
     assert!(!machine.files.borrow()[&plan.registry.path].contains("xudo-joined-groups"));
-    // The account joined between the plan and the apply: still no second add.
+    // The account joined between the plan and the apply: the registry would
+    // claim a membership that is the operator's, so the run refuses, and
+    // nothing is added or left behind.
     let machine = bare_groups();
     let plan = plan_enrol(&request(), scan(), &machine, &machine).unwrap();
     machine.files.borrow_mut().insert(
         "/etc/group".to_owned(),
         "root:x:0:\nagent:x:990:\nxudo:x:55:agent\nxudo-agent:x:56:agent\n".to_owned(),
     );
-    apply_enrol(&plan, &machine, &machine).unwrap();
+    let error = apply_enrol(&plan, &machine, &machine).unwrap_err();
+    assert!(matches!(
+        error,
+        AgentError::MembershipChanged { ref group, .. } if group == "xudo"
+    ));
+    assert!(error.to_string().contains("not enrol's"), "{error}");
     assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+    assert!(
+        !machine
+            .files
+            .borrow()
+            .contains_key("/etc/xudo/harnesses.d/codex.toml")
+    );
+}
+
+#[test]
+fn remove_does_not_try_to_take_out_a_primary_group_it_never_listed() {
+    // The registry says enrol added `xudo`; the account's primary gid has since
+    // become `xudo`, and it is no longer listed. `gpasswd` could not remove a
+    // primary group, so nothing is asked of it and the removal completes.
+    let machine = Machine::root().with_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        &format!("{MANAGED_MARKER}\n# xudo-joined-groups: xudo\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n"),
+    );
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:990:\n".to_owned(),
+    );
+    remove_agent("codex", &machine, &machine).unwrap();
     assert!(
         !machine
             .calls()
             .iter()
-            .any(|c| c.starts_with("create_group"))
+            .any(|c| c.starts_with("remove_member"))
     );
 }
 
@@ -1242,19 +1271,21 @@ fn an_account_database_that_cannot_be_read_stops_the_join_and_the_leave() {
         .insert("/etc/passwd".to_owned());
     assert!(apply_enrol(&plan, &machine, &machine).is_err());
     assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
-    // And remove stops, keeping the entry, on either file.
-    for path in ["/etc/group", "/etc/passwd"] {
-        let machine = bare_groups();
-        enrol(&machine).unwrap();
-        machine.unreadable.borrow_mut().insert(path.to_owned());
-        assert!(remove_agent("codex", &machine, &machine).is_err(), "{path}");
-        assert!(
-            machine
-                .files
-                .borrow()
-                .contains_key("/etc/xudo/harnesses.d/codex.toml")
-        );
-    }
+    // And remove stops, keeping the entry, when the group file cannot be read
+    // (it asks about listed membership only, so passwd is not consulted).
+    let machine = bare_groups();
+    enrol(&machine).unwrap();
+    machine
+        .unreadable
+        .borrow_mut()
+        .insert("/etc/group".to_owned());
+    assert!(remove_agent("codex", &machine, &machine).is_err());
+    assert!(
+        machine
+            .files
+            .borrow()
+            .contains_key("/etc/xudo/harnesses.d/codex.toml")
+    );
 }
 
 #[test]

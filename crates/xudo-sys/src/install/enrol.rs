@@ -23,8 +23,8 @@
 
 use xudo_backend::enrol::{
     AGENTS_DIR, AccountScan, DropInState, EnrolPlan, EnrolRequest, Facts, Listed, MANAGED_MARKER,
-    Membership, REGISTRY_DIR, Refusal, drop_in_dir, env_path, is_member, joined_groups, listed,
-    plan, registry_path, unit_name,
+    Membership, REGISTRY_DIR, Refusal, drop_in_dir, env_path, is_listed, is_member, joined_groups,
+    listed, plan, registry_path, unit_name,
 };
 use xudo_policy::valid_harness_label;
 
@@ -151,6 +151,17 @@ pub enum AgentError {
         expected: String,
         /// What `systemctl show` said.
         found: String,
+    },
+    /// The account joined a group by other means between the plan and the join.
+    #[error(
+        "{account} is already in group {group}, though the plan said enrol would add it: \
+         the registry would claim a membership that is not enrol's; nothing was left in place"
+    )]
+    MembershipChanged {
+        /// The group.
+        group: String,
+        /// The account.
+        account: String,
     },
     /// A systemctl call failed.
     #[error("systemctl {args} failed: {detail}")]
@@ -412,10 +423,17 @@ fn join_groups(
         if *join {
             let file = host.read_file("/etc/group")?.unwrap_or_default();
             let passwd = host.read_file("/etc/passwd")?.unwrap_or_default();
-            if !is_member(&passwd, &file, &plan.account, group) {
-                host.add_member(group, &plan.account)?;
-                made.joined.push((group.clone(), plan.account.clone()));
+            // The registry already says enrol made this membership. If the
+            // account got it some other way since the plan, `remove` would
+            // later take away what is not ours: refuse, and roll back.
+            if is_member(&passwd, &file, &plan.account, group) {
+                return Err(AgentError::MembershipChanged {
+                    group: group.clone(),
+                    account: plan.account.clone(),
+                });
             }
+            host.add_member(group, &plan.account)?;
+            made.joined.push((group.clone(), plan.account.clone()));
         }
     }
     Ok(())
@@ -511,8 +529,7 @@ pub fn remove_agent(
     if let Some(account) = account {
         for group in joined_groups(&registry_text) {
             let file = host.read_file("/etc/group")?.unwrap_or_default();
-            let passwd = host.read_file("/etc/passwd")?.unwrap_or_default();
-            if is_member(&passwd, &file, &account, &group) {
+            if is_listed(&file, &account, &group) {
                 host.remove_member(&group, &account)?;
                 lines.push(format!("removed {account} from group {group}"));
             }

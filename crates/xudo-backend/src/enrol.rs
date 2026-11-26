@@ -21,7 +21,7 @@ use std::path::Path;
 use xudo_policy::{HarnessError, HarnessRegistry, valid_account_name, valid_harness_label};
 
 use crate::paths_to_root::{
-    Applies, Caller, Check, CheckId, Finding, HostView, Input, Lookup, Meta, Writer, assess,
+    Applies, Caller, Check, CheckId, Finding, HostView, Input, Kind, Lookup, Meta, Writer, assess,
 };
 use crate::snippet::{GATE_NOPASS, SUDOERS_PATH, XUDO_AGENT_GROUP, XUDO_GROUP};
 
@@ -415,15 +415,23 @@ pub fn scan_account(
             Refusal::AccountUnknown(name.to_owned())
         });
     };
+    // The account is judged as the agent it is about to be: already a member
+    // of both agent groups. A grant that only membership of `xudo` or
+    // `xudo-agent` gives it would otherwise look like nobody's.
+    let group_file = match host.read(Path::new("/etc/group")) {
+        Lookup::Found(group) => Some(with_membership(&group, name)),
+        _ => None,
+    };
     let as_account = AsAccount {
         inner: host,
         uid: entry.uid,
         gid: entry.gid,
+        group: group_file.clone(),
     };
     let report = assess(&as_account, input);
-    let (held, mut gaps) = match host.read(Path::new("/etc/group")) {
-        Lookup::Found(group) => (held_gids(name, entry.gid, &group), Vec::new()),
-        _ => (
+    let (held, mut gaps) = match &group_file {
+        Some(group) => (held_gids(name, entry.gid, group), Vec::new()),
+        None => (
             vec![entry.gid],
             vec!["could not examine /etc/group: unreadable or missing".to_owned()],
         ),
@@ -439,8 +447,12 @@ pub fn scan_account(
         .flat_map(|check| blockers_of(check, name, entry.uid, &held, exempt))
         .collect();
     blockers.append(&mut gaps);
-    let agent_gid = group_gid(host, XUDO_AGENT_GROUP);
-    blockers.extend(rules_naming(host, name, entry.uid, agent_gid, exempt));
+    let group_gids: Vec<u32> = AGENT_GROUPS
+        .iter()
+        .filter_map(|group| group_gid(&as_account, group))
+        .collect();
+    blockers.extend(rules_naming(host, name, entry.uid, &group_gids, exempt));
+    blockers.extend(pam_blockers(host));
     Ok(AccountScan {
         uid: entry.uid,
         blockers,
@@ -448,14 +460,55 @@ pub fn scan_account(
     })
 }
 
+/// `group_file` with `account` listed in each agent group that exists.
+fn with_membership(group_file: &[u8], account: &str) -> Vec<u8> {
+    let lines: Vec<Vec<u8>> = group_file
+        .split(|byte| *byte == b'\n')
+        .map(|line| {
+            let mut fields: Vec<Vec<u8>> = line
+                .split(|byte| *byte == b':')
+                .map(<[u8]>::to_vec)
+                .collect();
+            let agent = fields
+                .first()
+                .is_some_and(|name| AGENT_GROUPS.iter().any(|g| g.as_bytes() == name.as_slice()));
+            if agent && let Some(members) = fields.get_mut(3) {
+                let listed = members
+                    .split(|byte| *byte == b',')
+                    .any(|member| member == account.as_bytes());
+                if !listed {
+                    if !members.is_empty() {
+                        members.push(b',');
+                    }
+                    members.extend_from_slice(account.as_bytes());
+                }
+            }
+            fields.join(&b':')
+        })
+        .collect();
+    lines.join(&b'\n')
+}
+
 /// The exact text [`scan_account`] exempts; see [`crate::snippet::managed_agent_snippet`].
 pub use crate::snippet::managed_agent_snippet as managed_snippet;
 
-/// Whether the sudoers file xudo manages holds exactly `managed`.
+/// Whether the sudoers file xudo manages is root's alone (a regular file, uid
+/// 0, no group or world write) and holds exactly `managed` or the human-only
+/// text that ships. Both name `%xudo`; nothing else is exempt.
 fn managed_installed(host: &dyn HostView, managed: Option<&str>) -> bool {
-    managed.is_some_and(|text| {
-        matches!(host.read(Path::new(SUDOERS_PATH)), Lookup::Found(bytes) if bytes == text.as_bytes())
-    })
+    let Some(text) = managed else {
+        return false;
+    };
+    let trusted = matches!(
+        host.stat(Path::new(SUDOERS_PATH)),
+        Lookup::Found(meta) if meta.kind == Kind::File && meta.uid == 0 && meta.mode & 0o022 == 0
+    );
+    trusted
+        && matches!(
+            host.read(Path::new(SUDOERS_PATH)),
+            Lookup::Found(bytes)
+                if bytes == text.as_bytes() || bytes == crate::snippet::human_only_form(text).as_bytes()
+        )
 }
 
 /// The gid of the group named `group` in `/etc/group`, when it appears once.
@@ -515,7 +568,7 @@ fn rules_naming(
     host: &dyn HostView,
     name: &str,
     uid: u32,
-    agent_gid: Option<u32>,
+    group_gids: &[u32],
     exempt: bool,
 ) -> Vec<String> {
     let mut files: Vec<std::path::PathBuf> =
@@ -535,7 +588,7 @@ fn rules_naming(
         }
         match host.read(&file) {
             Lookup::Found(bytes) => out.extend(
-                lines_naming(&bytes, name, uid, agent_gid)
+                lines_naming(&bytes, name, uid, group_gids)
                     .into_iter()
                     .map(|line| format!("{} line {line} names the account", file.display())),
             ),
@@ -548,10 +601,18 @@ fn rules_naming(
     out
 }
 
-fn lines_naming(bytes: &[u8], name: &str, uid: u32, agent_gid: Option<u32>) -> Vec<usize> {
+fn lines_naming(bytes: &[u8], name: &str, uid: u32, group_gids: &[u32]) -> Vec<usize> {
     let uid_hash = format!("#{uid}");
-    let group_hash = agent_gid.map(|gid| format!("#{gid}"));
-    let agent_group = format!("%{XUDO_AGENT_GROUP}");
+    // The agent groups by name and by gid, and the account's own gid hash.
+    let group_tokens: Vec<String> = AGENT_GROUPS
+        .iter()
+        .map(|group| format!("%{group}"))
+        .chain(
+            group_gids
+                .iter()
+                .flat_map(|gid| [format!("%#{gid}"), format!("%{gid}")]),
+        )
+        .collect();
     let is_word = |byte: &u8| byte.is_ascii_alphanumeric() || b"_.-#".contains(byte);
     let mut found = Vec::new();
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
@@ -586,18 +647,132 @@ fn lines_naming(bytes: &[u8], name: &str, uid: u32, agent_gid: Option<u32>) -> V
             .any(|word| *word == name.as_bytes() || *word == uid_hash.as_bytes());
         // `ALL ALL=(ALL) ALL`: the first field of a sudoers rule is everyone.
         let names_everyone = words.first() == Some(&&b"ALL"[..]);
-        // The agent group (`%xudo-agent`, or by gid), and the passwordless
-        // helper by its path: either is the agent path, hand-written.
-        let names_agent_path = contains(line, agent_group.as_bytes())
-            || contains(line, GATE_NOPASS.as_bytes())
-            || group_hash
-                .as_ref()
-                .is_some_and(|gid| contains(line, format!("%{gid}").as_bytes()));
+        // Either agent group, by name or by gid, and the passwordless helper
+        // by its path: the agent path, hand-written. The account joins both.
+        let names_agent_path = contains(line, GATE_NOPASS.as_bytes())
+            || group_tokens
+                .iter()
+                .any(|token| names_token(line, token.as_bytes(), &is_word));
         if names_account || names_everyone || names_agent_path {
             found.push(line_no);
         }
     }
     found
+}
+
+/// Where sudo's PAM stack starts.
+const PAM_SUDO: &str = "/etc/pam.d/sudo";
+/// Modules that may be `sufficient`: they authenticate a password or a login
+/// session and nothing else.
+const PAM_PLAIN: [&str; 3] = ["pam_unix", "pam_systemd", "pam_systemd_home"];
+/// Modules that can pass authentication for the agent without its password.
+const PAM_GRANTING: [&str; 7] = [
+    "pam_ssh_agent_auth",
+    "pam_u2f",
+    "pam_rhosts",
+    "pam_permit",
+    "pam_succeed_if",
+    "pam_exec",
+    "pam_listfile",
+];
+
+/// The agent will be in `xudo`, so it can run sudo and reach the password
+/// gate; only PAM stands in the way. The `auth` lines of `/etc/pam.d/sudo`
+/// and of every file it includes are read, and the stack is refused when it
+/// cannot be read, or when a module that can pass without the account's
+/// password is in it: one of [`PAM_GRANTING`] in any control that can end the
+/// stack as a success (`pam_permit` as `required` or `requisite` is Debian's
+/// own `common-auth` and ends nothing), or any `sufficient` module that is not
+/// a plain password or session one.
+fn pam_blockers(host: &dyn HostView) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    pam_walk(host, PAM_SUDO, 0, &mut seen, &mut out);
+    out
+}
+
+fn pam_walk(
+    host: &dyn HostView,
+    file: &str,
+    depth: usize,
+    seen: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    if depth > 8 || seen.iter().any(|done| done == file) {
+        return;
+    }
+    seen.push(file.to_owned());
+    let bytes = match host.read(Path::new(file)) {
+        Lookup::Found(bytes) => bytes,
+        Lookup::Missing => {
+            out.push(format!("could not examine {file}: no such file"));
+            return;
+        }
+        Lookup::Unreadable(why) => {
+            out.push(format!("could not examine {file}: {why}"));
+            return;
+        }
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        out.push(format!("could not examine {file}: not text"));
+        return;
+    };
+    for (index, line) in text.lines().enumerate() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let line_no = index.saturating_add(1);
+        let include = match words.as_slice() {
+            ["@include", target, ..] => Some(*target),
+            [kind, "include" | "substack", target, ..]
+                if kind.trim_start_matches('-') == "auth" =>
+            {
+                Some(*target)
+            }
+            _ => None,
+        };
+        if let Some(target) = include {
+            let path = if target.starts_with('/') {
+                target.to_owned()
+            } else {
+                format!("/etc/pam.d/{target}")
+            };
+            pam_walk(host, &path, depth.saturating_add(1), seen, out);
+            continue;
+        }
+        // `#` starts a comment; only `auth` lines decide who passes.
+        let [kind, control, module, ..] = words.as_slice() else {
+            continue;
+        };
+        if kind.trim_start_matches('-') != "auth" {
+            continue;
+        }
+        let module = module.rsplit('/').next().unwrap_or(module);
+        let module = module.strip_suffix(".so").unwrap_or(module);
+        let can_end = *control == "sufficient"
+            || control.starts_with('[') && (control.contains("=done") || control.contains("=ok"));
+        let bad = if PAM_GRANTING.contains(&module) {
+            module != "pam_permit" || can_end
+        } else {
+            can_end && !PAM_PLAIN.contains(&module)
+        };
+        if bad {
+            out.push(format!(
+                "{file} line {line_no}: PAM module {module} ({control}) can pass sudo without the account's password"
+            ));
+        }
+    }
+}
+
+/// Whether `token` occurs in `line` as a whole word: not followed by another
+/// word byte, so `%xudo` is not `%xudo-agent` and `%#99` is not `%#998`.
+fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
+    line.windows(token.len().max(1))
+        .enumerate()
+        .any(|(at, window)| {
+            window == token
+                && !line
+                    .get(at.saturating_add(token.len()))
+                    .is_some_and(is_word)
+        })
 }
 
 /// Whether `needle` occurs in `haystack`.
@@ -667,6 +842,8 @@ struct AsAccount<'a> {
     inner: &'a dyn HostView,
     uid: u32,
     gid: u32,
+    /// `/etc/group` as the account will see it, with the agent groups joined.
+    group: Option<Vec<u8>>,
 }
 
 impl HostView for AsAccount<'_> {
@@ -683,7 +860,10 @@ impl HostView for AsAccount<'_> {
     }
 
     fn read(&self, path: &Path) -> Lookup<Vec<u8>> {
-        self.inner.read(path)
+        match &self.group {
+            Some(group) if path == Path::new("/etc/group") => Lookup::Found(group.clone()),
+            _ => self.inner.read(path),
+        }
     }
 
     fn list(&self, path: &Path) -> Lookup<Vec<std::ffi::OsString>> {
@@ -889,16 +1069,32 @@ pub fn is_member(passwd: &[u8], group_file: &[u8], account: &str, group: &str) -
         .iter()
         .find(|entry| entry.name == account.as_bytes())
         .map(|entry| entry.gid);
+    is_listed(group_file, account, group)
+        || group_file.split(|byte| *byte == b'\n').any(|line| {
+            let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
+            matches!(
+                fields.as_slice(),
+                [name, _, gid, ..]
+                    if *name == group.as_bytes()
+                        && primary.is_some_and(|primary| number(gid) == Some(primary))
+            )
+        })
+}
+
+/// Whether `/etc/group` lists `account` among the members of `group`. A
+/// primary group is not a listing: `gpasswd --delete` cannot remove it.
+#[must_use]
+pub fn is_listed(group_file: &[u8], account: &str, group: &str) -> bool {
     group_file.split(|byte| *byte == b'\n').any(|line| {
         let fields: Vec<&[u8]> = line.split(|byte| *byte == b':').collect();
-        let [name, _, gid, members, ..] = fields.as_slice() else {
-            return false;
-        };
-        *name == group.as_bytes()
-            && (primary.is_some_and(|primary| number(gid) == Some(primary))
-                || members
-                    .split(|byte| *byte == b',')
-                    .any(|member| member == account.as_bytes()))
+        matches!(
+            fields.as_slice(),
+            [name, _, _, members, ..]
+                if *name == group.as_bytes()
+                    && members
+                        .split(|byte| *byte == b',')
+                        .any(|member| member == account.as_bytes())
+        )
     })
 }
 
@@ -1198,16 +1394,88 @@ fn drop_in_problems(host: &dyn HostView, agent: &Listed) -> Vec<String> {
     root_alone(&file, &mut out);
     if let Lookup::Found(bytes) = host.read(Path::new(&file)) {
         let text = std::str::from_utf8(&bytes).unwrap_or_default();
-        let users: Vec<&str> = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("User="))
-            .collect();
-        // Not text is no `User=` at all, and so a mismatch.
-        if users != [agent.account.as_str()] {
-            out.push(format!(
-                "{file} does not run the unit as {} alone (User= says {users:?})",
-                agent.account
-            ));
+        out.extend(drop_in_content_problems(&file, text, &agent.account));
+    }
+    out.extend(other_unit_sources(host, &agent.label));
+    out
+}
+
+/// systemd's own reading of the drop-in: keys and values are trimmed, `User=`
+/// is last-wins, and nothing but `User=` and an `ExecStart=` that keeps the
+/// unit's privileges may be set. A key that could change who the unit runs as
+/// or what it keeps (another section, `DynamicUser=`, `ExecStart=+`) is a
+/// problem, and so is text that is not text at all.
+fn drop_in_content_problems(file: &str, text: &str, account: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut user: Option<&str> = None;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line == "[Service]" {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            out.push(format!("{file} has a line xudo did not write: {line:?}"));
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        match key {
+            "User" => user = Some(value),
+            "ExecStart" if !value.starts_with(['+', '!', ':', '@', '-']) => {}
+            _ => out.push(format!(
+                "{file} sets {key}= beyond User= and a plain ExecStart=: it could change what the unit keeps"
+            )),
+        }
+    }
+    // Not text is no `User=` at all, and so a mismatch.
+    if user != Some(account) {
+        out.push(format!(
+            "{file} does not run the unit as {account} alone (User= says {user:?})"
+        ));
+    }
+    out
+}
+
+/// Unit files and drop-in directories, besides ours, that systemd would merge
+/// into `xudo-agent@<label>.service`: any one could change the user.
+fn other_unit_sources(host: &dyn HostView, label: &str) -> Vec<String> {
+    const ROOTS: [&str; 6] = [
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/local/lib/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+        "/run/systemd/generator",
+    ];
+    let unit = unit_name(label);
+    let mut out = Vec::new();
+    for root in ROOTS {
+        let dirs = [
+            format!("{unit}.d"),
+            "xudo-agent@.service.d".to_owned(),
+            "xudo-agent-.service.d".to_owned(),
+            "xudo-.service.d".to_owned(),
+            "service.d".to_owned(),
+        ];
+        for dir in dirs {
+            let path = format!("{root}/{dir}");
+            if path == drop_in_dir(label) {
+                continue;
+            }
+            match host.list(Path::new(&path)) {
+                Lookup::Found(names) if names.is_empty() => {}
+                Lookup::Found(_) => out.push(format!(
+                    "{path} holds drop-ins that could change who the unit runs as"
+                )),
+                Lookup::Missing => {}
+                Lookup::Unreadable(why) => out.push(format!("could not examine {path}: {why}")),
+            }
+        }
+        // A whole unit file by the instance's name replaces the template.
+        let file = format!("{root}/{unit}");
+        if !matches!(host.stat(Path::new(&file)), Lookup::Missing) {
+            out.push(format!("{file} would replace the packaged template"));
         }
     }
     out
