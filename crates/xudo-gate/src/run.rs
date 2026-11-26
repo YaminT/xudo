@@ -1025,6 +1025,7 @@ fn run_typed_operation(
             }
         })?;
     work.intent_sequence = Some(intent.seq().get());
+    work.planned_digest = Some(planned.digest);
     let report = match host.remove_path(&work.request) {
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
@@ -1584,6 +1585,8 @@ args = [
         remove: xudo_sys::FakeRemoveFs,
         /// Make the fake unlink seam assert that a durable intent exists.
         assert_intent_before_unlink: bool,
+        /// Add an entry under `cache` just before the real walk, after the dry run.
+        grow_before_walk: bool,
         /// The `-nopass` ledger.
         rate: FakeRate,
     }
@@ -1813,6 +1816,7 @@ args = [
                 harness_freeze_asked: std::cell::RefCell::new(Vec::new()),
                 remove: xudo_sys::FakeRemoveFs::new(),
                 assert_intent_before_unlink: false,
+                grow_before_walk: false,
                 rate: FakeRate::new(),
             }
         }
@@ -1906,6 +1910,16 @@ args = [
                         .records()
                         .iter()
                         .any(|record| { has_line(&record.evidence, "op=remove-path-intent") })
+                );
+            }
+            if self.grow_before_walk && !request.dry_run {
+                self.remove.add(
+                    &[b"srv", b"app", b"build", b"cache"],
+                    b"late",
+                    xudo_sys::remove::NodeKind::File,
+                    1000,
+                    0o644,
+                    1,
                 );
             }
             xudo_sys::remove_path(&mut self.remove, request)
@@ -3804,9 +3818,55 @@ max-entries = 10
         ));
         assert_eq!(records[1].decision, AuditDecision::Allowed);
         assert!(has_line(&records[1].evidence, "op=remove-path"));
+        assert!(has_line(
+            &records[1].evidence,
+            &format!("planned_digest={planned_digest}")
+        ));
+        assert!(has_line(&records[1].evidence, "matches_plan=true"));
         assert!(has_line(&records[1].evidence, "intent_seq=1"));
         assert!(has_line(&records[1].evidence, "severity=normal"));
         assert_eq!(records[1].outcome.kind(), "exited");
+    }
+
+    #[test]
+    fn a_tree_that_gains_an_entry_after_the_dry_run_is_recorded_as_off_plan() {
+        // Attack: the harness owns the target and adds entries between the
+        // gate's dry run and its walk, so the intent understates the removal.
+        use xudo_sys::remove::NodeKind;
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        host.remove.add(&[], b"srv", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv"], b"app", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv", b"app"], b"build", NodeKind::Dir, 0, 0o755, 0);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"cache",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        host.remove.add(
+            &[b"srv", b"app", b"build", b"cache"],
+            b"early",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        host.grow_before_walk = true;
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        let records = host.audit.records();
+        assert!(has_line(&records[0].evidence, "planned_count=2"));
+        assert!(has_line(&records[1].evidence, "count=3"));
+        assert!(has_line(&records[1].evidence, "matches_plan=false"));
     }
 
     #[test]
@@ -4681,6 +4741,7 @@ under = "/srv/app/build"
 recursive = true
 max-depth = 4
 max-entries = 10
+owners = ["agent"]
 harness = ["codex"]
 outcome = "allow"
 "#;

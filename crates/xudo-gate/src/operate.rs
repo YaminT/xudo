@@ -31,6 +31,8 @@ pub(crate) struct OperationWork {
     pub(crate) target: Vec<u8>,
     /// Sequence number of the pre-walk intent record.
     pub(crate) intent_sequence: Option<u64>,
+    /// Digest of the gate's own dry run, taken before the walk.
+    pub(crate) planned_digest: Option<[u8; 32]>,
     /// The entry's `via`: `auth` after a password, `harness` for a grant.
     pub(crate) via: &'static str,
 }
@@ -73,7 +75,9 @@ pub(crate) fn prepare_remove(
         Err(decision) => return Err(Refusal::Policy(decision)),
     };
     // No password was asked: only the rule's grant to this live harness, the
-    // label the broker minted the entry for, lets the walk run.
+    // label the broker minted the entry for, lets the walk run. This check is
+    // the gate's own, second engine: it must stay here and never move into
+    // the broker, whose mint is advisory and is not what the gate trusts.
     if mode == GateMode::Nopass
         && (grant.harness.is_none() || grant.harness != pending.attested_harness)
     {
@@ -111,6 +115,7 @@ pub(crate) fn prepare_remove(
         under: grant.under,
         target: target.to_vec(),
         intent_sequence: None,
+        planned_digest: None,
         via: pending.via.label(),
     })
 }
@@ -146,6 +151,11 @@ pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Ve
     }
     if let Some(sequence) = work.intent_sequence {
         evidence.push(format!("intent_seq={sequence}"));
+    }
+    if let Some(planned) = work.planned_digest {
+        // The tree may change between the dry run and the walk: say so.
+        evidence.push(format!("planned_digest={}", hex_digest(&planned)));
+        evidence.push(format!("matches_plan={}", planned == report.digest));
     }
     for path in xudo_sys::remove::audit_path_head(&report.removed) {
         evidence.push(format!("path={}", path.escape_ascii()));
@@ -436,6 +446,7 @@ under = "/srv/app/build"
 recursive = true
 max-depth = 4
 max-entries = 10
+owners = ["agent"]
 harness = ["codex"]
 outcome = "allow"
 "#,
@@ -491,7 +502,7 @@ outcome = "allow"
         assert_eq!(work.request.relative, b"cache");
         assert_eq!(work.request.max_depth, 4);
         assert_eq!(work.request.max_entries, 10);
-        assert_eq!(work.request.owners, RemoveOwnerPolicy::AnyButRoot);
+        assert_eq!(work.request.owners, RemoveOwnerPolicy::Only(vec![1000]));
     }
 
     #[test]
@@ -733,6 +744,25 @@ outcome = "allow"
             attested_scope_id: None,
             boot_id: None,
         }
+    }
+
+    #[test]
+    fn final_evidence_says_whether_the_walk_matched_the_plan() {
+        let mut work =
+            prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        let walked = report(&[b"/srv/app/build/cache"], false, false);
+        // No plan recorded: no claim either way.
+        assert!(
+            !remove_evidence(&work, &walked)
+                .iter()
+                .any(|line| line.starts_with("matches_plan="))
+        );
+        work.planned_digest = Some(walked.digest);
+        let same = remove_evidence(&work, &walked);
+        assert!(same.contains(&"matches_plan=true".to_owned()));
+        assert!(same.contains(&format!("planned_digest={}", hex_digest(&walked.digest))));
+        work.planned_digest = Some([7; 32]);
+        assert!(remove_evidence(&work, &walked).contains(&"matches_plan=false".to_owned()));
     }
 
     #[test]

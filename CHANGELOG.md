@@ -7,6 +7,8 @@ All notable changes to xudo are documented here. This project follows
 
 ### Added
 
+- G1e review fixes. An `[[operation]]` that lists a `harness` must set `owners`, or it fails to load (`a_harness_operation_without_owners_fails_to_load`): a grant without a password no longer falls back to "any owner except root". The final `remove-path` audit record now carries `planned_digest=` and `matches_plan=true|false`, the gate's dry-run digest against the executed one (`a_tree_that_gains_an_entry_after_the_dry_run_is_recorded_as_off_plan`). The gate's `-nopass` grant check stays in the gate and never moves into the broker. **G1f must include a named exit criterion, `granted_remove_path_runs_as_root_through_a_live_harness_scope`, in a systemd-test row**: today the root lane proves only refusals.
+
 - `xudo op remove-path <target>` removes a path under an `[[operation]]` rule
   through the password-authenticated gate (or, for a harness the rule grants,
   the `-nopass` gate: see Changed). `--dry-run` lists the paths and removes

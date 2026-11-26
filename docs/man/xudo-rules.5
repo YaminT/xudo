@@ -281,6 +281,10 @@ The walk stops before the next removal and reports a partial result.
 .B owners
 Account names whose entries may be removed.
 Omit the key to allow any owner except root.
+A rule that lists a
+.B harness
+must set it: a grant without a password never falls back to any owner, and the
+rule does not load without it.
 An empty list does not load.
 A name that is not an account in the passwd text the broker read fails closed
 when the request is decided.

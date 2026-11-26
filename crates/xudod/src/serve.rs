@@ -11344,6 +11344,7 @@ under = "/srv/app/build"
 recursive = true
 max-depth = 4
 max-entries = 10
+owners = ["agent"]
 harness = ["codex"]
 outcome = "allow"
 "#;
@@ -11663,8 +11664,10 @@ outcome = "allow"
                 name: b"20-grant.toml".to_vec(),
                 bytes: GRANT_RULES
                     .replace(
-                        "max-entries = 10\nharness = [\"codex\"]",
-                        &format!("max-entries = 10\nharness = [{operation_labels}]"),
+                        "max-entries = 10\nowners = [\"agent\"]\nharness = [\"codex\"]",
+                        &format!(
+                            "max-entries = 10\nowners = [\"agent\"]\nharness = [{operation_labels}]"
+                        ),
                     )
                     .into_bytes(),
             }],

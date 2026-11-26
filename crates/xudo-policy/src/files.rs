@@ -800,14 +800,15 @@ max-entries = 10
         let owned = of(&format!("{base}owners = [\"agent\"]\n"));
         let other = of(&format!("{base}owners = [\"agent\", \"www-data\"]\n"));
         let labelled = of(&format!(
-            "{base}harness = [\"codex\"]\noutcome = \"allow\"\n"
+            "{base}owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
         ));
         assert_ne!(plain, owned);
         assert_ne!(owned, other);
         assert_ne!(plain, labelled);
+        assert_ne!(owned, labelled);
     }
 
-    const GHOST_OPERATION: &str = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nharness = [\"ghost\"]\noutcome = \"allow\"\n";
+    const GHOST_OPERATION: &str = "[[operation]]\nid = \"o\"\nop = \"remove-path\"\nunder = \"/srv/a\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nowners = [\"agent\"]\nharness = [\"ghost\"]\noutcome = \"allow\"\n";
 
     #[test]
     fn an_operation_naming_an_unregistered_harness_loads_and_is_reported() {

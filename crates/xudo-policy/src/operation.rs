@@ -230,13 +230,18 @@ pub fn check_operation(op: &Operation) -> Result<(), String> {
             return Err(format!("harness label {label:?} is listed twice"));
         }
     }
-    // A grant is written, never implied, and only `allow` means anything here.
+    // Only `allow` means anything here.
     match (op.harness.is_empty(), op.outcome) {
         (false, Outcome::Unset) => Err("a rule that lists a harness must set outcome".to_owned()),
         (_, Outcome::AskHuman) => {
             Err("outcome \"ask-human\" is not supported: no queue runs an operation".to_owned())
         }
         (true, Outcome::Allow) => Err("outcome is set but no harness is listed".to_owned()),
+        // A grant is written, never implied: a harness may delete only what
+        // the rule's named owners own, never the "any non-root owner" default.
+        (false, Outcome::Allow) if op.owners.is_none() => {
+            Err("a rule that lists a harness must set owners".to_owned())
+        }
         (true, Outcome::Unset) | (false, Outcome::Allow) => Ok(()),
     }
 }
@@ -1276,11 +1281,28 @@ max-entries = 4
                 &op_toml(
                     "a",
                     "/srv/a",
-                    "harness = [\"codex\"]\noutcome = \"allow\"\n"
+                    "owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
                 ),
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_harness_operation_without_owners_fails_to_load() {
+        // Attack: a harness grant that falls back to "any non-root owner" would
+        // let the harness delete www-data's or another user's files as root.
+        let message = load_err(&op_toml(
+            "a",
+            "/srv/a",
+            "harness = [\"codex\"]\noutcome = \"allow\"\n",
+        ));
+        assert!(
+            message.contains("a rule that lists a harness must set owners"),
+            "{message}"
+        );
+        // A rule with no harness keeps the human-path default.
+        assert!(RuleSet::from_toml("ok.toml", &op_toml("a", "/srv/a", "")).is_ok());
     }
 
     #[test]
@@ -1302,7 +1324,11 @@ max-entries = 4
     #[test]
     fn a_harness_operation_keeps_the_refused_trees() {
         for under in ["/", "/etc", "/usr/lib", "/var/lib/xudo", "/home", "/root/x"] {
-            let text = op_toml("a", under, "harness = [\"codex\"]\noutcome = \"allow\"\n");
+            let text = op_toml(
+                "a",
+                under,
+                "owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n",
+            );
             assert!(RuleSet::from_toml("bad.toml", &text).is_err(), "{under}");
         }
     }
@@ -1345,7 +1371,7 @@ max-entries = 4
                 String::new()
             } else {
                 format!(
-                    "harness = [{}]\noutcome = \"allow\"\n",
+                    "owners = [\"agent\"]\nharness = [{}]\noutcome = \"allow\"\n",
                     labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ")
                 )
             };
