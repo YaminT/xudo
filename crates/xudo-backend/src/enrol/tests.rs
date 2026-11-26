@@ -1662,9 +1662,123 @@ fn allows_stock_pam_stacks_that_only_check_a_password() {
 }
 
 #[test]
-fn ignores_pam_lines_too_short_to_name_a_module() {
-    let sudo = "auth\nauth required\nauth [success=1 default=ignore]\nauth [success=1\n\n";
+fn refuses_an_auth_line_too_short_to_name_a_module() {
+    // libpam rejects the line; xudo cannot tell what the stack then does.
+    for line in [
+        "auth",
+        "auth required",
+        "auth [success=1 default=ignore]",
+        "auth [success=1",
+    ] {
+        let sudo = format!("{line}\n");
+        let blocked = blockers(&pam_host(&sudo, None), None);
+        assert!(
+            blocked.iter().any(|found| found.contains("cannot be read")),
+            "{line}: {blocked:?}"
+        );
+    }
+    // Blank lines, comments and other types are not auth lines.
+    let sudo = "\n# auth\nsession\naccount required pam_permit.so\n";
     assert_eq!(blockers(&pam_host(sudo, None), None), Vec::<String>::new());
+}
+
+#[test]
+fn denies_pam_shapes_that_libpam_passes_without_a_password() {
+    // Each was run through real libpam with no password and passed.
+    let probes = [
+        // a bracket ends at `]`: no space before the module
+        "auth [success=1 default=ignore]pam_permit.so\nauth requisite pam_deny.so\n",
+        // a pass falls to `default`
+        "auth [default=1] pam_permit.so\nauth requisite pam_deny.so\n",
+        "auth [default=1] pam_exec.so /bin/true\n",
+        "auth [default=ok] pam_exec.so /bin/true\n",
+        "auth [default=done] pam_exec.so /bin/true\n",
+        // the words are case-insensitive
+        "AUTH sufficient pam_permit.so\n",
+        "auth Sufficient pam_permit.so\n",
+        "auth [SUCCESS=1 default=ignore] pam_permit.so\n",
+        // a trailing backslash joins the next line
+        "auth \\\nsufficient pam_permit.so\n",
+        "auth sufficient \\\npam_permit.so\n",
+        // pam_permit with no `requisite pam_deny` before it
+        "auth required pam_permit.so\n",
+        "auth required pam_permit.so\nauth requisite pam_deny.so\n",
+    ];
+    for sudo in probes {
+        let blocked = blockers(&pam_host(sudo, None), None);
+        assert!(!blocked.is_empty(), "{sudo:?}: {blocked:?}");
+    }
+    // The joined line is reported at the line it starts on.
+    let blocked = blockers(
+        &pam_host("#x\nauth \\\nsufficient pam_permit.so\n", None),
+        None,
+    );
+    assert!(
+        blocked.iter().any(|line| line.contains("sudo line 2")),
+        "{blocked:?}"
+    );
+    // A comment ending in a backslash does not swallow the next line.
+    let blocked = blockers(
+        &pam_host("# note \\\nauth sufficient pam_permit.so\n", None),
+        None,
+    );
+    assert!(
+        blocked.iter().any(|line| line.contains("sudo line 2")),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn denies_a_pam_include_spelled_in_another_case() {
+    let sudo = "auth Include common-auth\nAuth SUBSTACK common-auth\n";
+    let blocked = blockers(&pam_host(sudo, Some("auth sufficient pam_u2f.so\n")), None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line.contains("common-auth line 1")),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn allows_pam_permit_after_a_requisite_pam_deny() {
+    let sudo = "auth [success=1 default=ignore] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n";
+    assert_eq!(blockers(&pam_host(sudo, None), None), Vec::<String>::new());
+}
+
+#[test]
+fn reads_pam_other_when_the_service_has_no_auth_line() {
+    // libpam answers for a service with no `auth` line from `other`.
+    let host = pam_host("session required pam_env.so\n", None).file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o644,
+        b"auth sufficient pam_permit.so\n",
+    );
+    let blocked = blockers(&host, None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line.contains("/etc/pam.d/other line 1")),
+        "{blocked:?}"
+    );
+    // An unreadable `other` is a blocker; a stock one is not.
+    let host = pam_host("auth required pam_unix.so\n", None).unreadable_file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o600,
+    );
+    assert!(!blockers(&host, None).is_empty());
+    let host = pam_host("auth required pam_unix.so\n", None).file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o644,
+        b"auth required pam_deny.so\n",
+    );
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
 }
 
 #[test]
@@ -1710,6 +1824,8 @@ fn a_rule_naming_a_gid_enrol_has_yet_to_allocate_blocks() {
     for rule in [
         "%#996 ALL=(ALL) NOPASSWD: ALL",
         "%996 ALL=(ALL) NOPASSWD: ALL",
+        "%:#996 ALL=(ALL) NOPASSWD: ALL",
+        "%:996 ALL=(ALL) NOPASSWD: ALL",
     ] {
         let host = sudoers_host(none, None).file(
             "/etc/sudoers.d/90-local",

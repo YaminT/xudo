@@ -679,7 +679,7 @@ fn lines_naming(
     found
 }
 
-/// Where sudo's PAM stack starts.
+/// How deep PAM includes may nest before the scan gives up.
 const PAM_MAX_DEPTH: usize = 8;
 /// Where sudo's PAM stack starts.
 const PAM_SUDO: &str = "/etc/pam.d/sudo";
@@ -694,6 +694,8 @@ const PAM_PLAIN: [&str; 3] = ["pam_unix", "pam_systemd", "pam_systemd_home"];
 const PAM_GRANTING: [&str; 4] = ["pam_ssh_agent_auth", "pam_u2f", "pam_rhosts", "pam_permit"];
 /// Where `sudo -i` starts.
 const PAM_SUDO_I: &str = "/etc/pam.d/sudo-i";
+/// What libpam reads for a service whose file is missing or has no `auth` line.
+const PAM_OTHER: &str = "/etc/pam.d/other";
 
 /// The agent will be in `xudo`, so it can run sudo and reach the password
 /// gate; only PAM stands in the way. The `auth` lines of `/etc/pam.d/sudo`
@@ -710,6 +712,10 @@ fn pam_blockers(host: &dyn HostView) -> Vec<String> {
     // Not every sudo has the `sudo-i` service; one that has it reads it.
     if !matches!(host.read(Path::new(PAM_SUDO_I)), Lookup::Missing) {
         pam_walk(host, PAM_SUDO_I, 0, &mut seen, &mut out);
+    }
+    // libpam falls back to `other` for a service with no `auth` lines.
+    if !matches!(host.read(Path::new(PAM_OTHER)), Lookup::Missing) {
+        pam_walk(host, PAM_OTHER, 0, &mut seen, &mut out);
     }
     out
 }
@@ -746,13 +752,17 @@ fn pam_walk(
         out.push(format!("could not examine {file}: not text"));
         return;
     };
-    for (index, line) in text.lines().enumerate() {
+    // `requisite pam_deny` seen in this file: a later `pam_permit` is then
+    // only reached by a stack that already passed.
+    let mut denied = false;
+    for (line_no, line) in pam_lines(text) {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let line_no = index.saturating_add(1);
         let include = match words.as_slice() {
             ["@include", target, ..] => Some(*target),
-            [kind, "include" | "substack", target, ..]
-                if kind.trim_start_matches('-') == "auth" =>
+            [kind, word, target, ..]
+                if kind.trim_start_matches('-').eq_ignore_ascii_case("auth")
+                    && (word.eq_ignore_ascii_case("include")
+                        || word.eq_ignore_ascii_case("substack")) =>
             {
                 Some(*target)
             }
@@ -768,17 +778,22 @@ fn pam_walk(
             continue;
         }
         // `#` starts a comment; only `auth` lines decide who passes.
-        let Some((kind, control, module)) = pam_fields(line) else {
-            continue;
-        };
-        if kind.trim_start_matches('-') != "auth" {
+        let kind = words.first().copied().unwrap_or("");
+        if !kind.trim_start_matches('-').eq_ignore_ascii_case("auth") {
             continue;
         }
+        let Some((control, module)) = pam_fields(&line) else {
+            out.push(format!("{file} line {line_no}: auth line cannot be read"));
+            continue;
+        };
         let module = module.rsplit('/').next().unwrap_or(module);
         let module = module.strip_suffix(".so").unwrap_or(module);
         let can_end = control == "sufficient" || bracket_can_end(&control);
+        if module == "pam_deny" && control == "requisite" {
+            denied = true;
+        }
         let bad = if PAM_GRANTING.contains(&module) {
-            module != "pam_permit" || can_end
+            module != "pam_permit" || can_end || !denied
         } else {
             can_end && !PAM_PLAIN.contains(&module)
         };
@@ -790,31 +805,49 @@ fn pam_walk(
     }
 }
 
-/// The type, control and module of a PAM line. A bracket control runs from
-/// `[` through `]` as one token, spaces inside it included.
-fn pam_fields(line: &str) -> Option<(&str, String, &str)> {
-    let mut rest = line.trim_start();
-    let mut next = || {
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let (word, after) = rest.split_at(end);
-        rest = after.trim_start();
-        (!word.is_empty()).then_some(word)
-    };
-    let kind = next()?;
-    let first = next()?;
-    if !first.starts_with('[') {
-        return Some((kind, first.to_owned(), next()?));
+/// The lines of a PAM file as libpam reads them: a line ending in a backslash
+/// continues on the next, and a comment line never does. Numbered by the line
+/// each starts on.
+fn pam_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut open = false;
+    for (index, raw) in text.lines().enumerate() {
+        let line_no = index.saturating_add(1);
+        let comment = raw.trim_start().starts_with('#');
+        let (body, more) = match raw.strip_suffix('\\') {
+            Some(body) if !comment => (body, true),
+            _ => (raw, false),
+        };
+        match out.last_mut() {
+            Some((_, last)) if open => {
+                last.push(' ');
+                last.push_str(body);
+            }
+            _ => out.push((line_no, body.to_owned())),
+        }
+        open = more;
     }
-    let mut control = first.to_owned();
-    while !control.contains(']') {
-        control.push(' ');
-        control.push_str(next()?);
-    }
-    Some((kind, control, next()?))
+    out
 }
 
-/// Whether a bracket control lets a pass end the stack or skip lines after
-/// it: a `success=<N>`, or any `=done` or `=ok`, in any position.
+/// The control (lower case) and module of a PAM line after its type. A
+/// bracket control ends at the first `]`, with no space needed after it.
+fn pam_fields(line: &str) -> Option<(String, &str)> {
+    let rest = line.trim_start();
+    let rest = rest[rest.find(char::is_whitespace)?..].trim_start();
+    let (control, after) = if rest.starts_with('[') {
+        let end = rest.find(']')?.saturating_add(1);
+        rest.split_at(end)
+    } else {
+        rest.split_at(rest.find(char::is_whitespace)?)
+    };
+    let module = after.split_whitespace().next()?;
+    Some((control.to_ascii_lowercase(), module))
+}
+
+/// Whether a control can end the stack on a pass or skip lines after it:
+/// `done` or `ok`, or a number of lines to jump, on `success` or on
+/// `default` (a pass falls to `default` when `success` is not listed).
 fn bracket_can_end(control: &str) -> bool {
     control.starts_with('[')
         && control
@@ -822,9 +855,8 @@ fn bracket_can_end(control: &str) -> bool {
             .split_whitespace()
             .any(|pair| {
                 pair.split_once('=').is_some_and(|(key, action)| {
-                    action == "done"
-                        || action == "ok"
-                        || (key == "success" && action.parse::<u32>().is_ok())
+                    (key == "success" || key == "default")
+                        && (action == "done" || action == "ok" || action.parse::<u32>().is_ok())
                 })
             })
 }
@@ -845,6 +877,7 @@ fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool
 /// Whether `line` has a `%#N` or `%N` group, `N` being digits.
 fn names_numeric_group(line: &[u8]) -> bool {
     line.split(|byte| *byte == b'%').skip(1).any(|rest| {
+        let rest = rest.strip_prefix(b":").unwrap_or(rest);
         let rest = rest.strip_prefix(b"#").unwrap_or(rest);
         rest.first().is_some_and(u8::is_ascii_digit)
     })
