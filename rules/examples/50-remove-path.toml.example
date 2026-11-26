@@ -11,16 +11,22 @@
 # owned by root and must not be writable by group or other. The walk refuses
 # a symlink component, a mount point, and another filesystem.
 #
-# Omit `owners` to allow any uid except root. A listed name that is not in
-# the passwd text the broker reads fails closed:
+# Omit `owners` to allow any uid except root on the password path. A listed
+# name that is not in the passwd text the broker reads fails closed:
 #
 #   owners = ["agent", "www-data"]
 #
-# `harness` is parsed and checked against /etc/xudo/harnesses.d. It is not a
-# grant. Leave it out until that file exists. Harness use is planned. This
-# release runs the operation only through the password path:
+# A rule that lists a `harness` MUST set `owners`: a grant without a password
+# never falls back to "any owner", or it could delete other accounts' files.
 #
+# `harness` with `outcome = "allow"` lets a live enrolled harness from
+# /etc/xudo/harnesses.d run this operation without a password, through the
+# -nopass gate, which does nothing until root adds a sudoers line for it. The
+# walk is the same. Everyone else uses the password path:
+#
+#   owners = ["agent"]
 #   harness = ["codex"]
+#   outcome = "allow"
 #
 # Then: xudo op remove-path /srv/app/build/cache
 #       xudo op remove-path --dry-run /srv/app/build/cache

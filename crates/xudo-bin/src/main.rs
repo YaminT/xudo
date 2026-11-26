@@ -21,7 +21,8 @@ fn caller_path() -> Option<std::ffi::OsString> {
     std::env::var_os("PATH")
 }
 
-/// `xudo op remove-path`: if the broker said yes, become the password gate.
+/// `xudo op remove-path`: if the broker said yes, run the gate it named: the
+/// password gate, or `sudo -n` on `-nopass` for a harness the rule grants.
 ///
 /// The gate performs the walk. This process does not unlink anything.
 fn exec_operation(
@@ -43,6 +44,7 @@ fn exec_operation(
     if plan.spawn {
         return match command.status() {
             Ok(status) => {
+                xudo::exec::after_backend(&plan, status.code(), err);
                 let code = status
                     .code()
                     .or(status.signal().and_then(|n| n.checked_add(128)));

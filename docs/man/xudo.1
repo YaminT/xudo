@@ -191,7 +191,12 @@ Executes nothing.
 .TP
 .B op
 Run a typed operation as root, if a rule permits it.
-Asks for your password through the host backend.
+Asks for your password through the host backend, except for an enrolled
+harness the rule grants, which runs it through
+.B xudo\-gate\-nopass
+as
+.B xudo exec
+does.
 .B remove\-path
 .I target
 removes
@@ -203,13 +208,13 @@ It does not run
 .BR rm .
 .B \-\-dry\-run
 lists the paths and removes nothing.
-A
+See
+.BR xudo\-rules (5)
+for the
 .B harness
-label on the rule is parsed and checked against the registry.
-It is not a grant.
-Harness use is planned.
-This command uses the password path only.
-The passwordless gate is not in this release.
+and
+.B outcome
+keys.
 .TP
 .B exec
 Run the command as root, if the broker permits it.
