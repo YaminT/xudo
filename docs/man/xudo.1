@@ -628,6 +628,93 @@ A damaged log exits
 A log that cannot be read, or a journal check that cannot run, exits
 .BR 19 .
 .TP
+.B rules
+Check, install, list or remove a rule pack: one rule file with a
+.B [pack]
+header (see
+.BR xudo\-rules (5)).
+.B rules add
+.I file
+runs as you and writes nothing: it loads the installed rules with the pack,
+runs every
+.B [[test]]
+table, requires a near-miss deny test for every harness action, refuses a
+harness nobody registered and every lint error
+.B xudo check
+reports, then prints what each harness, the password path and everyone gain
+and lose: every setting of a rule that widens access, a
+.B [[deny]]
+rule that goes as a gain, a lost rule that still overlaps another as
+.IR "may widen" ,
+what the engine decides differently for the commands the rules' tests and
+examples name, every
+.B gtfobins\-waiver
+in the pack, and the lint warnings it adds.
+A harness that keeps a rule on the program a lost rule covered gets a
+.I "may widen"
+line of its own, because the engine applies the strictest of every rule that
+accepts a command.
+At most 64 engine lines are printed, gains first, and the rest are counted.
+A pack with more than 256 actions, operations and deny rules, or rules whose
+review would ask the engine too much, is refused as too large to review; root
+applies the same bounds.
+It ends with a token that binds the pack's bytes,
+.B \-\-allow\-waivers
+and the generation of the rules and harness registry it judged.
+Any failure refuses the pack, and so does a waiver without
+.BR \-\-allow\-waivers .
+.B sudo xudo rules add \-\-reviewed
+.I token file
+installs it: as root, after sudo's own prompt, it refuses a process inside
+.B xudo.slice
+or under an ancestor below pid 1 that is, a cgroup namespace other than pid
+1's and a bare
+.B /
+on the unified
+.B 0::
+cgroup line, takes a lock on the rules directory, checks everything again from
+root's own reading of
+.IR /etc/xudo ,
+refuses unless the token it computes is the reviewed one (the same
+.B \-\-allow\-waivers
+is needed), and renames the pack into
+.IR /etc/xudo/rules.d/pack\-name.toml
+(root:root 0644, starting with xudo's rule-pack marker).
+It never replaces a file xudo did not write.
+The real boundary is that an enrolled harness account has no password, so it
+cannot answer sudo's prompt: run every harness as an account of its own
+.RB ( "xudo agent enrol" ).
+The drop-in xudo installs sets
+.B timestamp_timeout=0
+for
+.I /usr/bin/xudo
+itself, but that is a speed bump, not a wall: a harness that shares your
+account and terminal can ride a warm sudo ticket through
+.BR "sudo env xudo" ,
+.B sudo \-s
+or a copy of the binary.
+If a harness must share your account, give it a terminal of its own, so the
+ticket (per terminal by default,
+.BR timestamp_type=tty )
+is not yours.
+When the drop-in predates that line, root says so after the change and does
+not block it; reinstall the drop-in with
+.BR "sudo xudo install" .
+.B rules list
+shows each pack and whether
+.B rules add
+installed it.
+.B rules remove
+.I name
+works the same way: as you it prints what the removal changes and a token,
+and
+.B sudo xudo rules remove \-\-reviewed
+.I token name
+removes only a pack
+.B rules add
+installed, only if the rules left still pass and the token still matches.
+Nothing is fetched and nothing updates itself.
+.TP
 .B agentdoc
 Print the block that tells an agent what the loaded rules permit.
 .B \-\-format

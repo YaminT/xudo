@@ -17,10 +17,10 @@ const DROP_IN: &str = "/etc/systemd/system/xudo-agent@codex.service.d";
 
 /// A machine in memory: files, directories, a unit that is on or off, and a
 /// list of every call it was asked to make.
-struct Machine {
-    uid: u32,
-    files: RefCell<BTreeMap<String, String>>,
-    dirs: RefCell<BTreeSet<String>>,
+pub(crate) struct Machine {
+    pub(crate) uid: u32,
+    pub(crate) files: RefCell<BTreeMap<String, String>>,
+    pub(crate) dirs: RefCell<BTreeSet<String>>,
     calls: RefCell<Vec<String>>,
     /// The first call whose text starts with this fails.
     fail: RefCell<Option<String>>,
@@ -34,7 +34,7 @@ struct Machine {
     stuck: Cell<bool>,
     /// What `is-active` says instead, when set.
     state: RefCell<Option<String>>,
-    unreadable: RefCell<BTreeSet<String>>,
+    pub(crate) unreadable: RefCell<BTreeSet<String>>,
     /// A `systemctl` whose arguments start with this cannot be run at all.
     cannot_run: RefCell<Option<String>>,
     /// Listed in `/etc/xudo/harnesses.d` and gone before it is read.
@@ -44,7 +44,7 @@ struct Machine {
 }
 
 impl Machine {
-    fn root() -> Self {
+    pub(crate) fn root() -> Self {
         let files = [
             ("/etc/passwd", PASSWD),
             ("/etc/shadow", SHADOW),
@@ -80,12 +80,12 @@ impl Machine {
         }
     }
 
-    fn failing(self, call: &str) -> Self {
+    pub(crate) fn failing(self, call: &str) -> Self {
         *self.fail.borrow_mut() = Some(call.to_owned());
         self
     }
 
-    fn with_file(self, path: &str, text: &str) -> Self {
+    pub(crate) fn with_file(self, path: &str, text: &str) -> Self {
         self.files
             .borrow_mut()
             .insert(path.to_owned(), text.to_owned());
@@ -94,7 +94,7 @@ impl Machine {
         self
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
 
@@ -264,6 +264,16 @@ impl InstallOps for Machine {
 
     fn remove_block(&self, _path: &str) -> Result<Removal, InstallError> {
         Ok(Removal::Absent)
+    }
+
+    fn lock_dir(&self, path: &str) -> Result<crate::install::DirLock, InstallError> {
+        if !self.dirs.borrow().contains(path) {
+            return Err(InstallError::Missing {
+                path: path.to_owned(),
+            });
+        }
+        self.step(format!("lock_dir {path}"))?;
+        Ok(crate::install::DirLock::default())
     }
 }
 

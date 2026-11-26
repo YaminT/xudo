@@ -110,3 +110,10 @@ path = "fuzz_targets/remove_path_target.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rule_pack"
+path = "fuzz_targets/rule_pack.rs"
+test = false
+doc = false
+bench = false

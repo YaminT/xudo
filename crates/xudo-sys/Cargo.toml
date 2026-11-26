@@ -98,6 +98,10 @@ required-features = ["root-tests"]
 name = "root_remove_path"
 required-features = ["root-tests"]
 
+[[test]]
+name = "root_pack"
+required-features = ["root-tests"]
+
 [dev-dependencies]
 # The root-lane guard every `tests/root_*.rs` begins with.
 xudo-tests = { path = "../xudo-tests", version = "0.1.0-beta.1" }
