@@ -641,29 +641,53 @@ runs every
 table, requires a near-miss deny test for every harness action, refuses a
 harness nobody registered and every lint error
 .B xudo check
-reports, then prints what each harness and the password path gain and lose,
-and the pack's SHA\-256.
-Any failure refuses the pack.
+reports, then prints what each harness, the password path and everyone gain
+and lose: every setting of a rule that widens access, a
+.B [[deny]]
+rule that goes as a gain, a lost rule that still overlaps another as
+.IR "may widen" ,
+what the engine decides differently for the commands the rules' tests and
+examples name, every
+.B gtfobins\-waiver
+in the pack, and the lint warnings it adds.
+It ends with a token that binds the pack's bytes,
+.B \-\-allow\-waivers
+and the generation of the rules and harness registry it judged.
+Any failure refuses the pack, and so does a waiver without
+.BR \-\-allow\-waivers .
 .B sudo xudo rules add \-\-reviewed
-.I sha256 file
-installs it: as root, with sudo's own prompt, it refuses a process inside
-.BR xudo.slice ,
-refuses bytes whose digest is not the reviewed one, checks everything again
-from root's own reading of
+.I token file
+installs it: as root, with sudo's own prompt (the drop-in xudo installs sets
+.B timestamp_timeout=0
+for
+.I /usr/bin/xudo
+itself, so no cached credential carries a caller here), it refuses a process
+inside
+.B xudo.slice
+or under an ancestor that is, a cgroup namespace other than pid 1's and a bare
+.B /
+cgroup, takes a lock on the rules directory, checks everything again from
+root's own reading of
 .IR /etc/xudo ,
-and renames the pack into
+refuses unless the token it computes is the reviewed one (the same
+.B \-\-allow\-waivers
+is needed), and renames the pack into
 .IR /etc/xudo/rules.d/pack\-name.toml
-(root:root 0644, starting with xudo's marker).
+(root:root 0644, starting with xudo's rule-pack marker).
 It never replaces a file xudo did not write.
 .B rules list
 shows each pack and whether
 .B rules add
 installed it.
-.B sudo xudo rules remove
+.B rules remove
 .I name
+works the same way: as you it prints what the removal changes and a token,
+and
+.B sudo xudo rules remove \-\-reviewed
+.I token name
 removes only a pack
 .B rules add
-installed, and only if the rules left still pass.
+installed, only if the rules left still pass and the token still matches.
 Nothing is fetched and nothing updates itself.
 .TP
 .B agentdoc

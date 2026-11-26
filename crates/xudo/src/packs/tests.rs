@@ -9,6 +9,7 @@ use std::cell::RefCell;
 
 use xudo_backend::InstallPlan;
 use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest, PlannedFile};
+use xudo_policy::pack::installed_bytes;
 use xudo_sys::{AgentError, AgentRow, InstallError, InstallReport, PackReport};
 
 use super::*;
@@ -126,15 +127,18 @@ impl Installer for Script {
 
     fn pack_add(&self, request: &PackRequest) -> Result<PackReport, PackError> {
         self.asked.borrow_mut().push(format!(
-            "add {} {}",
+            "add {} {} {}",
             request.reviewed,
+            request.allow_waivers,
             String::from_utf8(request.bytes.clone()).unwrap()
         ));
         self.take()
     }
 
-    fn pack_remove(&self, name: &str) -> Result<PackReport, PackError> {
-        self.asked.borrow_mut().push(format!("remove {name}"));
+    fn pack_remove(&self, name: &str, reviewed: &str) -> Result<PackReport, PackError> {
+        self.asked
+            .borrow_mut()
+            .push(format!("remove {reviewed} {name}"));
         self.take()
     }
 }
@@ -153,7 +157,27 @@ fn add(file: PathBuf) -> RulesAction {
     RulesAction::Add {
         file,
         reviewed: None,
+        allow_waivers: false,
     }
+}
+
+fn add_allowing_waivers(file: PathBuf) -> RulesAction {
+    RulesAction::Add {
+        file,
+        reviewed: None,
+        allow_waivers: true,
+    }
+}
+
+/// The token in a review's last line.
+fn token_in(out: &str) -> String {
+    out.split("--reviewed ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -192,7 +216,7 @@ fn the_double_refuses_everything_but_packs() {
     assert!(script.agent_apply(&enrol).is_err());
     assert!(script.agent_list().is_err());
     assert!(script.agent_remove("a").is_err());
-    assert!(script.pack_remove("a").is_err());
+    assert!(script.pack_remove("a", "t").is_err());
 }
 
 #[test]
@@ -200,7 +224,7 @@ fn a_review_shows_every_new_capability_and_installs_nothing() {
     let etc = Etc::new("preview");
     let file = etc.write("nginx.toml", NGINX.as_bytes());
     let script = Script::default();
-    let (code, out, err) = go(&etc, &script, &add(file.clone()));
+    let (code, out, err) = go(&etc, &script, &add_allowing_waivers(file.clone()));
     assert_eq!(code, ExitCode::Delegated, "{err}");
     assert!(out.starts_with("pack nginx-ops 1.0.0 for codex\n"), "{out}");
     assert!(
@@ -213,16 +237,131 @@ fn a_review_shows_every_new_capability_and_installs_nothing() {
         out.contains("  password path gains (password): pack.nginx.restart"),
         "{out}"
     );
-    let hash = digest(NGINX.as_bytes());
+    // What the engine says, and the waiver, each read out.
+    assert!(
+        out.contains("what the engine decides differently")
+            && out.contains("  codex gains: /usr/bin/systemctl --no-pager restart nginx.service was refused, now no password"),
+        "{out}"
+    );
+    assert!(
+        out.contains("GTFOBins waivers: each lets a harness run a program with a known way out; read each:\n  pack.nginx.restart: pager and unit-file shell escapes"),
+        "{out}"
+    );
+    // The token is the one root computes for the same files and flag.
+    let token = token_in(&out);
+    let header = header_of(NGINX.as_bytes()).unwrap();
+    let expected = review(
+        vec![],
+        with_pack(&[], &header, NGINX.as_bytes()),
+        &registry_beside(&etc.rules()),
+        Change::Add {
+            pack: NGINX.as_bytes(),
+            allow_waivers: true,
+        },
+    )
+    .unwrap()
+    .token;
+    assert_eq!(token, expected);
     assert!(
         out.contains(&format!(
-            "sudo xudo rules add --reviewed {hash} {}",
+            "sudo xudo rules add --allow-waivers --reviewed {token} {}",
             file.display()
         )),
         "{out}"
     );
     assert!(script.asked.borrow().is_empty());
     assert_eq!(std::fs::read_dir(etc.rules()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_pack_with_a_waiver_is_refused_without_the_flag() {
+    let etc = Etc::new("waiver");
+    let file = etc.write("nginx.toml", NGINX.as_bytes());
+    let (code, out, err) = go(&etc, &Script::default(), &add(file));
+    assert_eq!((code, out.as_str()), (ExitCode::LintError, ""));
+    assert!(
+        err.starts_with(
+            "xudo: the pack waives GTFOBins refusals; read each, then pass --allow-waivers"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("\n  pack.nginx.restart: pager"), "{err}");
+}
+
+#[test]
+fn a_review_prints_the_lint_warnings_the_change_adds() {
+    let etc = Etc::new("warnings");
+    std::fs::write(
+        etc.rules().join("10-base.toml"),
+        "[[action]]\nid = \"base.id\"\ntier = \"diag-read\"\nexe = \"/usr/bin/id\"\n",
+    )
+    .unwrap();
+    let pack = "[pack]\nname = \"cat\"\nversion = \"1\"\n\n[[action]]\nid = \"pack.id\"\ntier = \"diag-read\"\nexe = \"/usr/bin/id\"\n\n[[action]]\nid = \"pack.ls\"\ntier = \"diag-read\"\nexe = \"/usr/bin/ls\"\nargs = [{ name = \"dir\", matcher = { path-under = { prefix = \"/srv\" } } }]\n";
+    let file = etc.write("cat.toml", pack.as_bytes());
+    let (code, out, err) = go(&etc, &Script::default(), &add(file));
+    assert_eq!(code, ExitCode::Delegated, "{err}");
+    let warnings = out
+        .split("new lint warnings (they do not block):\n")
+        .nth(1)
+        .unwrap();
+    assert!(
+        warnings.contains("base.id") && warnings.contains("pack.id"),
+        "{out}"
+    );
+    assert!(warnings.contains("path-under: pack.ls"), "{out}");
+}
+
+#[test]
+fn remove_shows_what_goes_and_a_token_and_changes_nothing() {
+    let etc = Etc::new("remove-preview");
+    let installed = etc.rules().join("pack-ids.toml");
+    std::fs::write(&installed, installed_bytes(IDS.as_bytes())).unwrap();
+    let remove = |name: &str| RulesAction::Remove {
+        name: name.to_owned(),
+        reviewed: None,
+    };
+    let script = Script::default();
+    let (code, out, err) = go(&etc, &script, &remove("ids"));
+    assert_eq!(code, ExitCode::Delegated, "{err}");
+    assert!(
+        out.starts_with(
+            "removing pack ids\n  password path loses (password): pack.id: /usr/bin/id\n"
+        ),
+        "{out}"
+    );
+    let token = token_in(&out);
+    assert!(
+        out.ends_with(&format!(
+            "  sudo xudo rules remove --reviewed {token} ids\n"
+        )),
+        "{out}"
+    );
+    assert!(installed.exists());
+    assert!(script.asked.borrow().is_empty());
+
+    // Not a pack xudo installed: absent, or written by hand.
+    let (code, _, err) = go(&etc, &script, &remove("web"));
+    assert_eq!(code, ExitCode::Unusable);
+    assert!(err.contains("web is not a pack xudo installed"), "{err}");
+    std::fs::write(&installed, IDS).unwrap();
+    let (code, _, err) = go(&etc, &script, &remove("ids"));
+    assert_eq!(code, ExitCode::Unusable);
+    assert!(err.contains("ids is not a pack xudo installed"), "{err}");
+    // Rules that a removal would break are refused.
+    std::fs::write(&installed, installed_bytes(IDS.as_bytes())).unwrap();
+    std::fs::write(
+        etc.rules().join("90-tests.toml"),
+        "[[test]]\nargv = [\"/usr/bin/id\"]\nexpect = \"allow\"\naction = \"pack.id\"\n",
+    )
+    .unwrap();
+    let (code, _, err) = go(&etc, &script, &remove("ids"));
+    assert_eq!(code, ExitCode::LintError);
+    assert!(err.starts_with("xudo: the change is refused"), "{err}");
+    // No rules directory at all.
+    std::fs::remove_dir_all(etc.rules()).unwrap();
+    let (code, _, err) = go(&etc, &script, &remove("ids"));
+    assert_eq!(code, ExitCode::Unusable);
+    assert!(err.contains("cannot read the rules directory"), "{err}");
 }
 
 #[test]
@@ -249,11 +388,11 @@ fn a_pack_with_a_failing_test_is_never_offered_for_install() {
         "{NGINX}\n[[test]]\nargv = [\"/usr/bin/systemctl\", \"--no-pager\", \"restart\", \"php.service\"]\nexpect = \"allow\"\n"
     );
     let file = etc.write("bad.toml", failing.as_bytes());
-    let (code, out, err) = go(&etc, &Script::default(), &add(file));
+    let (code, out, err) = go(&etc, &Script::default(), &add_allowing_waivers(file));
     assert_eq!(code, ExitCode::LintError);
     assert_eq!(out, "");
     assert!(
-        err.starts_with("xudo: the pack is refused; nothing was installed:\n  the [[test]]"),
+        err.starts_with("xudo: the change is refused; nothing was changed:\n  the [[test]]"),
         "{err}"
     );
 }
@@ -301,6 +440,10 @@ fn report(path: &str) -> PackReport {
             bytes: IDS.as_bytes().to_vec(),
         }],
         &Ok(vec![]),
+        Change::Add {
+            pack: IDS.as_bytes(),
+            allow_waivers: false,
+        },
     )
     .unwrap();
     PackReport {
@@ -316,6 +459,7 @@ fn reviewed_hands_root_the_bytes_and_the_digest() {
     let reviewed = |file: &Path| RulesAction::Add {
         file: file.to_path_buf(),
         reviewed: Some("abc".to_owned()),
+        allow_waivers: true,
     };
     let script = Script::answering(Ok(report("/etc/xudo/rules.d/pack-ids.toml")));
     let (code, out, _) = go(&etc, &script, &reviewed(&file));
@@ -328,7 +472,7 @@ fn reviewed_hands_root_the_bytes_and_the_digest() {
         out.starts_with("  password path gains (password): pack.id: /usr/bin/id\n"),
         "{out}"
     );
-    assert_eq!(script.asked.borrow()[0], format!("add abc {IDS}"));
+    assert_eq!(script.asked.borrow()[0], format!("add abc true {IDS}"));
 
     // Root's refusals come back with their reasons.
     let problems = Script::answering(Err(PackError::Refused(PackRefusal::Problems(vec![
@@ -356,6 +500,7 @@ fn remove_reports_what_root_did() {
     let etc = Etc::new("remove");
     let action = RulesAction::Remove {
         name: "ids".to_owned(),
+        reviewed: Some("abc".to_owned()),
     };
     let script = Script::answering(Ok(report("/etc/xudo/rules.d/pack-ids.toml")));
     let (code, out, _) = go(&etc, &script, &action);
@@ -364,7 +509,7 @@ fn remove_reports_what_root_did() {
         out.ends_with("removed /etc/xudo/rules.d/pack-ids.toml\n"),
         "{out}"
     );
-    assert_eq!(script.asked.borrow()[0], "remove ids");
+    assert_eq!(script.asked.borrow()[0], "remove abc ids");
     let (code, _, err) = go(&etc, &Script::default(), &action);
     assert_eq!(code, ExitCode::Unusable);
     assert!(err.contains("cannot modify the machine"), "{err}");

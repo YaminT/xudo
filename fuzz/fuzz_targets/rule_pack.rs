@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use xudo_policy::pack::{capabilities, digest, header_of, review, PASSWORD_PATH};
+use xudo_policy::pack::{capabilities, digest, header_of, review, Change, EVERYONE, PASSWORD_PATH};
 use xudo_policy::{HarnessFile, RuleFile, RuleSet};
 
 fuzz_target!(|data: &[u8]| {
@@ -30,7 +30,9 @@ fuzz_target!(|data: &[u8]| {
 
     for capability in capabilities(&parsed.rules) {
         assert!(
-            capability.audience == PASSWORD_PATH || pack.harnesses.contains(&capability.audience),
+            capability.audience == PASSWORD_PATH
+                || capability.audience == EVERYONE
+                || pack.harnesses.contains(&capability.audience),
             "a pack reached harness {} outside its for",
             capability.audience
         );
@@ -42,9 +44,19 @@ fuzz_target!(|data: &[u8]| {
         name: pack.file_name().into_bytes(),
         bytes: data.to_vec(),
     };
-    if let Ok(change) = review(Vec::new(), vec![file], &registry) {
-        assert!(change.losses.is_empty(), "adding to nothing took something away");
+    let adding = Change::Add {
+        pack: data,
+        allow_waivers: true,
+    };
+    if let Ok(change) = review(Vec::new(), vec![file], &registry, adding) {
+        // Adding to nothing takes nothing away but what a new refusal does.
+        assert!(
+            change.losses.iter().all(|c| c.restricts()),
+            "adding to nothing took something away"
+        );
         // With an empty registry no harness can be named, so nothing is granted.
         assert!(change.gains.iter().all(|c| c.audience == PASSWORD_PATH));
+        assert!(change.effects.iter().all(|e| e.widens && e.audience == PASSWORD_PATH));
+        assert_eq!(change.token.len(), 64);
     }
 });

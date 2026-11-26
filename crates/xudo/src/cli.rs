@@ -4240,7 +4240,11 @@ expect = "deny"
             Err(xudo_sys::InstallError::NoInstaller.into())
         }
 
-        fn pack_remove(&self, _name: &str) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
+        fn pack_remove(
+            &self,
+            _name: &str,
+            _reviewed: &str,
+        ) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
             Err(xudo_sys::InstallError::NoInstaller.into())
         }
     }
@@ -5708,9 +5712,10 @@ expect = "deny"
         let pack = xudo_sys::PackRequest {
             bytes: Vec::new(),
             reviewed: String::new(),
+            allow_waivers: false,
         };
         assert!(installer.pack_add(&pack).is_err());
-        assert!(installer.pack_remove("a").is_err());
+        assert!(installer.pack_remove("a", "t").is_err());
     }
 
     #[test]
@@ -5721,9 +5726,13 @@ expect = "deny"
         let (code, out, err) = fx.run(&["rules", "add", "--reviewed", "00", "/nonexistent"]);
         assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
         assert!(err.contains("cannot read /nonexistent"), "{err}");
-        let (code, _, err) = fx.run(&["rules", "remove", "x"]);
+        let (code, _, err) = fx.run(&["rules", "remove", "--reviewed", "t", "x"]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(err.contains("cannot modify the machine"), "{err}");
+        // Without a token, remove only shows what it would change.
+        let (code, _, err) = fx.run(&["rules", "remove", "x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("x is not a pack xudo installed"), "{err}");
         let (code, out, _) = fx.run(&["rules", "list"]);
         assert_eq!(
             (code, out.as_str()),

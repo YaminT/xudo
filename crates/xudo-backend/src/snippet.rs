@@ -54,6 +54,12 @@ pub const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 /// ships in the package, inert, and no sudoers rule names it.
 pub const GATE_NOPASS: &str = "/usr/libexec/xudo/xudo-gate-nopass";
 
+/// The `xudo` front-end, as the package installs it. Named in the drop-in only
+/// so sudo never uses a cached credential for it: `sudo xudo rules add` and
+/// `sudo xudo rules remove` always ask the password, so a harness running as
+/// the human cannot ride a sudo the human just typed into changing the rules.
+pub const XUDO_FRONT_END: &str = "/usr/bin/xudo";
+
 /// The `secure_path` given to the privileged child.
 const SECURE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -153,12 +159,15 @@ impl SudoersSnippet {
         if includes_nopass {
             let _ = writeln!(out, "Cmnd_Alias XUDO_NOPASS = {GATE_NOPASS} \"\"");
         }
+        // Any arguments: this alias grants nothing, it only scopes a Default.
+        let _ = writeln!(out, "Cmnd_Alias XUDO_SELF = {XUDO_FRONT_END}");
         out.push('\n');
 
         out.push_str(&defaults_line("XUDO_AUTH"));
         if includes_nopass {
             out.push_str(&defaults_line("XUDO_NOPASS"));
         }
+        out.push_str("Defaults!XUDO_SELF timestamp_timeout=0\n");
         out.push('\n');
 
         let _ = writeln!(out, "%{XUDO_GROUP} ALL=(root) PASSWD:   XUDO_AUTH");
@@ -218,6 +227,8 @@ fn header(backend: &Backend) -> String {
          #   env_reset, !setenv    the child environment is rebuilt, and the caller\n\
          #                         cannot inject one on the command line.\n\
          #   secure_path           the caller's PATH never influences resolution.\n\
+         #   XUDO_SELF             grants nothing: xudo itself never rides a cached\n\
+         #                         credential, so `sudo xudo rules add` always asks.\n\
          #\n\
          # The helper takes no arguments and reads nothing from its environment. It is\n\
          # safe to invoke directly, because it is itself the policy engine.\n\
@@ -480,6 +491,37 @@ mod tests {
     }
 
     #[test]
+    fn xudo_itself_never_rides_a_cached_sudo_credential() {
+        // A harness that runs as the human must not turn the human's warm sudo
+        // ticket into `sudo xudo rules add`: the drop-in disables the cache for
+        // xudo itself, and grants it nothing.
+        for agent in [false, true] {
+            let backend = sudo();
+            let snippet = if agent {
+                SudoersSnippet::with_agent_path(&backend)
+            } else {
+                SudoersSnippet::human_only(&backend)
+            }
+            .unwrap();
+            let lines: Vec<&str> = snippet
+                .contents
+                .lines()
+                .filter(|l| !l.starts_with('#') && l.contains("XUDO_SELF"))
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    "Cmnd_Alias XUDO_SELF = /usr/bin/xudo",
+                    "Defaults!XUDO_SELF timestamp_timeout=0",
+                ],
+                "{}",
+                snippet.contents
+            );
+        }
+        assert_eq!(XUDO_FRONT_END, "/usr/bin/xudo");
+    }
+
+    #[test]
     fn the_defaults_are_scoped_to_xudos_own_commands() {
         // `Defaults!ALIAS`, not a bare `Defaults`: xudo's settings must not leak
         // onto an operator's unrelated rules.
@@ -567,7 +609,7 @@ mod tests {
                 .lines()
                 .filter(|l| l.starts_with("Defaults!") && l.contains("timestamp_timeout=0"))
                 .count(),
-            2
+            3
         );
     }
 

@@ -2144,7 +2144,11 @@ fn the_example_pack_passes_the_review_rules_add_makes() {
         name: b"codex.toml".to_vec(),
         bytes: b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n".to_vec(),
     }]);
-    let review = xudo_policy::pack::review(shipped, with_pack, &codex)
+    let change = xudo_policy::pack::Change::Add {
+        pack: PACK_EXAMPLE.as_bytes(),
+        allow_waivers: true,
+    };
+    let review = xudo_policy::pack::review(shipped, with_pack, &codex, change)
         .unwrap_or_else(|e| panic!("the example pack is refused: {e}"));
     let lines = review.lines();
     assert_eq!(lines.len(), 2, "{lines:?}");
@@ -2153,6 +2157,14 @@ fn the_example_pack_passes_the_review_rules_add_makes() {
         "{lines:?}"
     );
     assert!(review.losses.is_empty());
+    // The waiver is shown, and the engine finds only gains.
+    assert_eq!(review.waivers.len(), 1, "{:?}", review.waivers);
+    assert!(
+        review.effects.iter().all(|e| e.widens),
+        "{:?}",
+        review.effects
+    );
+    assert!(!review.effects.is_empty());
 
     // The placeholder is not a unit the shipped rules pin as refused: the
     // review would refuse a pack that breaks a shipped `[[test]]`, as it did
@@ -2163,5 +2175,5 @@ fn the_example_pack_passes_the_review_rules_add_makes() {
         name: b"pack-web-ops.toml".to_vec(),
         bytes: clash.into_bytes(),
     });
-    assert!(xudo_policy::pack::review(shipped_files(), clashing, &codex).is_err());
+    assert!(xudo_policy::pack::review(shipped_files(), clashing, &codex, change).is_err());
 }

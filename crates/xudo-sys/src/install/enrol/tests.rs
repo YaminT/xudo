@@ -265,6 +265,16 @@ impl InstallOps for Machine {
     fn remove_block(&self, _path: &str) -> Result<Removal, InstallError> {
         Ok(Removal::Absent)
     }
+
+    fn lock_dir(&self, path: &str) -> Result<crate::install::DirLock, InstallError> {
+        if !self.dirs.borrow().contains(path) {
+            return Err(InstallError::Missing {
+                path: path.to_owned(),
+            });
+        }
+        self.step(format!("lock_dir {path}"))?;
+        Ok(crate::install::DirLock::default())
+    }
 }
 
 impl EnrolOps for Machine {

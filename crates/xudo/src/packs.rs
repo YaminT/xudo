@@ -1,24 +1,28 @@
 //! `xudo rules`: add, list and remove rule packs.
 //!
-//! `add` without `--reviewed` runs as the operator: it reads the pack, judges
-//! the rules with it ([`xudo_policy::pack::review`]: every test, a near miss
-//! per harness action, registered labels, the lint errors of `xudo check`),
-//! prints what each harness and the password path gain and lose, and the
-//! pack's SHA-256. It writes nothing. Only that digest, handed back with
-//! `--reviewed` through the machine's own sudo, installs: the root side checks
-//! everything again from root's own reading of `/etc/xudo` before the rename
-//! (see `xudo_sys::add_pack`). Nothing is fetched and nothing updates itself.
+//! `add` and `remove` without `--reviewed` run as the operator: they judge the
+//! rules with and without the pack ([`xudo_policy::pack::review`]: every test,
+//! a near miss per harness action, registered labels, the lint errors of
+//! `xudo check`), print what each harness, the password path and everyone gain
+//! and lose, by rule and on the engine, every `gtfobins-waiver` and every new
+//! lint warning, and a token. They write nothing. Only that token, handed back
+//! with `--reviewed` through the machine's own sudo, changes anything: the root
+//! side checks everything again from root's own reading of `/etc/xudo` and
+//! refuses when the token it computes differs, because the pack, the rules,
+//! the registry or `--allow-waivers` are not what was reviewed (see
+//! `xudo_sys::add_pack`). Nothing is fetched and nothing updates itself.
 
 use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
-use xudo_backend::snippet::MANAGED_MARKER;
-use xudo_policy::pack::{PackRefusal, Review, digest, header_of, review};
-use xudo_policy::{ExitCode, RuleFile};
-use xudo_sys::{Installer, MAX_PACK_BYTES, PackError, PackRequest, installed_bytes};
+use xudo_policy::pack::{
+    Change, PackRefusal, Review, header_of, installed_by_xudo, review, with_pack, without_pack,
+};
+use xudo_policy::{ExitCode, RuleFile, load_policy_with_registry};
+use xudo_sys::{Installer, MAX_PACK_BYTES, PackError, PackRequest};
 
-use crate::check::safe;
+use crate::check::{path_under_warnings, safe};
 use crate::rules::{LoadedRules, read_rule_files, registry_beside};
 
 /// What `xudo rules` can do.
@@ -32,18 +36,31 @@ pub enum RulesAction {
         /// The pack: a rule file with a `[pack]` header.
         file: PathBuf,
 
-        /// The SHA-256 the review printed. Installs only these exact bytes.
-        #[arg(long, value_name = "SHA256")]
+        /// The token the review printed. Installs only this change: these
+        /// bytes, onto the rules the review saw.
+        #[arg(long, value_name = "TOKEN")]
         reviewed: Option<String>,
+
+        /// Accept a pack whose rules carry a `gtfobins-waiver`. Needed for
+        /// the review and the sudo step alike; read every waiver it prints.
+        #[arg(long)]
+        allow_waivers: bool,
     },
 
     /// List the rule packs in the rules directory.
     List,
 
-    /// Remove a rule pack `xudo rules add` installed. Needs root.
+    /// Show what removing a rule pack `xudo rules add` installed changes.
+    /// Writes nothing.
+    ///
+    /// With `--reviewed`, and as root, remove it.
     Remove {
         /// The pack's name.
         name: String,
+
+        /// The token the review printed.
+        #[arg(long, value_name = "TOKEN")]
+        reviewed: Option<String>,
     },
 }
 
@@ -59,22 +76,32 @@ pub(crate) fn run(
         RulesAction::Add {
             file,
             reviewed: None,
-        } => preview(dir, file, out, err),
+            allow_waivers,
+        } => preview_add(dir, file, *allow_waivers, out, err),
         RulesAction::Add {
             file,
             reviewed: Some(reviewed),
+            allow_waivers,
         } => match read_pack(file) {
             Ok(bytes) => {
                 let request = PackRequest {
                     bytes,
                     reviewed: reviewed.clone(),
+                    allow_waivers: *allow_waivers,
                 };
                 finish(installer.pack_add(&request), "installed", out, err)
             }
             Err(why) => refuse(err, &why, ExitCode::Unusable),
         },
         RulesAction::List => list(dir, out, err),
-        RulesAction::Remove { name } => finish(installer.pack_remove(name), "removed", out, err),
+        RulesAction::Remove {
+            name,
+            reviewed: None,
+        } => preview_remove(dir, name, out, err),
+        RulesAction::Remove {
+            name,
+            reviewed: Some(reviewed),
+        } => finish(installer.pack_remove(name, reviewed), "removed", out, err),
     }
 }
 
@@ -104,16 +131,106 @@ fn read_pack(file: &Path) -> Result<Vec<u8>, String> {
 
 fn print_review(review: &Review, out: &mut dyn Write) {
     let lines = review.lines();
-    if lines.is_empty() {
+    let effects = review.effect_lines();
+    if lines.is_empty() && effects.is_empty() {
         let _ = writeln!(out, "no caller gains or loses anything");
     }
     for line in lines {
         let _ = writeln!(out, "  {}", safe(&line));
     }
+    if !effects.is_empty() {
+        let _ = writeln!(
+            out,
+            "what the engine decides differently, for the commands the rules' tests and \
+             examples name:"
+        );
+    }
+    for line in effects {
+        let _ = writeln!(out, "  {}", safe(&line));
+    }
+    if !review.waivers.is_empty() {
+        let _ = writeln!(
+            out,
+            "GTFOBins waivers: each lets a harness run a program with a known way out; read each:"
+        );
+    }
+    for waiver in &review.waivers {
+        let _ = writeln!(out, "  {}", safe(waiver));
+    }
+}
+
+/// The lint warnings of `xudo check` the change adds: overlaps and
+/// `path-under` matchers. They do not block; the operator should read them.
+fn new_warnings(
+    before: &[RuleFile],
+    after: &[RuleFile],
+    registry: &Result<Vec<xudo_policy::HarnessFile>, String>,
+) -> Vec<String> {
+    let warnings = |files: &[RuleFile]| -> Vec<String> {
+        load_policy_with_registry(files.to_vec(), registry.as_deref().map_err(Clone::clone))
+            .map(|loaded| {
+                let rules = &loaded.rules;
+                let mut found: Vec<String> =
+                    rules.overlaps().iter().map(ToString::to_string).collect();
+                found.extend(path_under_warnings(rules));
+                found
+            })
+            .unwrap_or_default()
+    };
+    let old = warnings(before);
+    warnings(after)
+        .into_iter()
+        .filter(|warning| !old.contains(warning))
+        .collect()
+}
+
+/// Judges a change, prints it and the command that makes it, writes nothing.
+fn show(
+    dir: &Path,
+    before: Vec<RuleFile>,
+    after: Vec<RuleFile>,
+    change: Change<'_>,
+    [title, command]: [&str; 2],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let registry = registry_beside(dir);
+    let warnings = new_warnings(&before, &after, &registry);
+    let review = match review(before, after, &registry, change) {
+        Ok(review) => review,
+        Err(refusal) => return refused(err, &refusal),
+    };
+    let _ = writeln!(out, "{title}");
+    print_review(&review, out);
+    if !warnings.is_empty() {
+        let _ = writeln!(out, "new lint warnings (they do not block):");
+    }
+    for warning in &warnings {
+        let _ = writeln!(out, "  {}", safe(warning));
+    }
+    let _ = writeln!(
+        out,
+        "\nEvery check passed. Nothing was changed. To make exactly this change, onto exactly \
+         these rules, run as root:\n  {}",
+        command.replace("{token}", &review.token)
+    );
+    ExitCode::Delegated
+}
+
+fn rule_files(dir: &Path) -> Result<Vec<RuleFile>, String> {
+    read_rule_files(dir)
+        .map(|files| files.into_iter().map(|(_, file)| file).collect())
+        .map_err(|error| error.to_string())
 }
 
 /// `add` as the operator: judge and show, write nothing.
-fn preview(dir: &Path, file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+fn preview_add(
+    dir: &Path,
+    file: &Path,
+    allow_waivers: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let bytes = match read_pack(file) {
         Ok(bytes) => bytes,
         Err(why) => return refuse(err, &why, ExitCode::Unusable),
@@ -122,27 +239,12 @@ fn preview(dir: &Path, file: &Path, out: &mut dyn Write, err: &mut dyn Write) ->
         Ok(header) => header,
         Err(refusal) => return refuse(err, &refusal.to_string(), ExitCode::LintError),
     };
-    let before: Vec<RuleFile> = match read_rule_files(dir) {
-        Ok(files) => files.into_iter().map(|(_, file)| file).collect(),
-        Err(error) => return refuse(err, &error.to_string(), ExitCode::Unusable),
+    let before = match rule_files(dir) {
+        Ok(files) => files,
+        Err(why) => return refuse(err, &why, ExitCode::Unusable),
     };
-    let name = header.file_name().into_bytes();
-    let after = before
-        .iter()
-        .filter(|found| found.name != name)
-        .cloned()
-        .chain(std::iter::once(RuleFile {
-            name: name.clone(),
-            bytes: installed_bytes(&bytes),
-        }))
-        .collect();
-    let review = match review(before, after, &registry_beside(dir)) {
-        Ok(review) => review,
-        Err(refusal) => return refused(err, &refusal),
-    };
-    let hash = digest(&bytes);
-    let _ = writeln!(
-        out,
+    let after = with_pack(&before, &header, &bytes);
+    let title = format!(
         "pack {} {} for {}",
         header.name,
         header.version,
@@ -152,23 +254,59 @@ fn preview(dir: &Path, file: &Path, out: &mut dyn Write, err: &mut dyn Write) ->
             header.harnesses.join(", ")
         }
     );
-    print_review(&review, out);
-    let _ = writeln!(
-        out,
-        "\nEvery check passed. Nothing was installed. To install exactly this file, run as root:\n  \
-         sudo xudo rules add --reviewed {hash} {}",
+    let command = format!(
+        "sudo xudo rules add{} --reviewed {{token}} {}",
+        if allow_waivers {
+            " --allow-waivers"
+        } else {
+            ""
+        },
         safe(&file.display().to_string())
     );
-    ExitCode::Delegated
+    let change = Change::Add {
+        pack: &bytes,
+        allow_waivers,
+    };
+    show(dir, before, after, change, [&title, &command], out, err)
+}
+
+/// `remove` as the operator: judge and show, write nothing.
+fn preview_remove(dir: &Path, name: &str, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let before = match rule_files(dir) {
+        Ok(files) => files,
+        Err(why) => return refuse(err, &why, ExitCode::Unusable),
+    };
+    let Some(after) = without_pack(&before, name) else {
+        return refuse(
+            err,
+            &PackError::NotInstalled(name.to_owned()).to_string(),
+            ExitCode::Unusable,
+        );
+    };
+    let title = format!("removing pack {}", safe(name));
+    let command = format!("sudo xudo rules remove --reviewed {{token}} {}", safe(name));
+    let change = Change::Remove { name };
+    show(dir, before, after, change, [&title, &command], out, err)
 }
 
 /// Prints a refusal that came from a check, one problem per line.
 fn refused(err: &mut dyn Write, refusal: &PackRefusal) -> ExitCode {
     match refusal {
         PackRefusal::Problems(found) => {
-            let _ = writeln!(err, "xudo: the pack is refused; nothing was installed:");
+            let _ = writeln!(err, "xudo: the change is refused; nothing was changed:");
             for problem in found {
                 let _ = writeln!(err, "  {}", safe(problem));
+            }
+            ExitCode::LintError
+        }
+        PackRefusal::Waivers(found) => {
+            let _ = writeln!(
+                err,
+                "xudo: the pack waives GTFOBins refusals; read each, then pass --allow-waivers to \
+                 both `xudo rules add` and the sudo step; nothing was changed:"
+            );
+            for waiver in found {
+                let _ = writeln!(err, "  {}", safe(waiver));
             }
             ExitCode::LintError
         }
@@ -204,8 +342,7 @@ fn list(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         let _ = writeln!(out, "No rule packs.");
     }
     for pack in loaded.packs() {
-        let ours = std::fs::read(dir.join(&pack.file))
-            .is_ok_and(|bytes| bytes.starts_with(MANAGED_MARKER.as_bytes()));
+        let ours = std::fs::read(dir.join(&pack.file)).is_ok_and(|bytes| installed_by_xudo(&bytes));
         let header = &pack.header;
         let _ = writeln!(
             out,

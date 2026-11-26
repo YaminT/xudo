@@ -1686,3 +1686,30 @@ fn a_directory_the_walk_refuses_is_neither_made_nor_removed_through() {
         InstallError::Untrusted(_)
     ));
 }
+
+#[test]
+fn two_pack_installs_cannot_judge_the_rules_directory_at_once() {
+    let dir = scratch("lock-dir");
+    let ops = ops_in(&dir, &Script::new());
+    let held = ops.lock_dir("/etc/xudo/rules.d").unwrap();
+    // A second writer waits its bounded time, then is refused.
+    let second = ops_in(&dir, &Script::new());
+    let error = second.lock_dir("/etc/xudo/rules.d").unwrap_err();
+    assert!(matches!(error, InstallError::Locked { .. }), "{error}");
+    drop(held);
+    assert!(second.lock_dir("/etc/xudo/rules.d").is_ok());
+    // No directory, or one the walk refuses: nothing to lock.
+    let missing = without_dirs(ops_in(&dir, &Script::new()))
+        .lock_dir("/etc/xudo/rules.d")
+        .unwrap_err();
+    assert_eq!(
+        missing,
+        InstallError::Missing {
+            path: "/etc/xudo/rules.d".to_owned()
+        }
+    );
+    let refused = refusing_dirs(ops_in(&dir, &Script::new()))
+        .lock_dir("/etc/xudo/rules.d")
+        .unwrap_err();
+    assert!(matches!(refused, InstallError::Untrusted(_)), "{refused}");
+}

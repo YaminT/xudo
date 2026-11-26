@@ -67,8 +67,8 @@ pub use enrol::{
 };
 pub use host::HostInstallOps;
 pub use pack::{
-    MAX_PACK_BYTES, OWN_CGROUP, PackError, PackReport, PackRequest, RULES_DIR, add_pack,
-    installed_bytes, remove_pack,
+    HostWhereabouts, MAX_PACK_BYTES, PackError, PackReport, PackRequest, RULES_DIR, Whereabouts,
+    add_pack, remove_pack,
 };
 pub use xudo_backend::blocks::BlockError;
 
@@ -417,6 +417,21 @@ pub trait InstallOps {
     ///
     /// Anything that stopped it; the shared file is unchanged.
     fn remove_block(&self, path: &str) -> Result<Removal, InstallError>;
+
+    /// Takes the exclusive lock on a directory xudo writes into, waiting a
+    /// bounded time, and holds it until the returned value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::Missing`], an untrusted directory, or
+    /// [`InstallError::Locked`].
+    fn lock_dir(&self, path: &str) -> Result<DirLock, InstallError>;
+}
+
+/// A held lock on a directory, released when dropped.
+#[derive(Debug, Default)]
+pub struct DirLock {
+    _fd: Option<std::os::fd::OwnedFd>,
 }
 
 /// Something that executes a plan: the seam the front-end holds.
@@ -469,12 +484,13 @@ pub trait Installer {
     /// Whatever refused or stopped it; nothing is left changed.
     fn pack_add(&self, request: &PackRequest) -> Result<PackReport, PackError>;
 
-    /// Removes a rule pack `pack_add` installed.
+    /// Removes a rule pack `pack_add` installed, when `reviewed` is the token
+    /// the operator's review of the removal printed.
     ///
     /// # Errors
     ///
     /// Whatever refused or stopped it; nothing is left changed.
-    fn pack_remove(&self, name: &str) -> Result<PackReport, PackError>;
+    fn pack_remove(&self, name: &str, reviewed: &str) -> Result<PackReport, PackError>;
 }
 
 /// The installer for a real machine: real file operations and the given probe.
@@ -524,12 +540,12 @@ impl Installer for HostInstaller<'_> {
 
     fn pack_add(&self, request: &PackRequest) -> Result<PackReport, PackError> {
         let ops = HostInstallOps::system();
-        add_pack(request, std::fs::read(OWN_CGROUP), &ops, &ops)
+        add_pack(request, &HostWhereabouts::system(), &ops, &ops)
     }
 
-    fn pack_remove(&self, name: &str) -> Result<PackReport, PackError> {
+    fn pack_remove(&self, name: &str, reviewed: &str) -> Result<PackReport, PackError> {
         let ops = HostInstallOps::system();
-        remove_pack(name, std::fs::read(OWN_CGROUP), &ops, &ops)
+        remove_pack(name, reviewed, &HostWhereabouts::system(), &ops, &ops)
     }
 }
 
@@ -592,7 +608,7 @@ impl Installer for RefusingInstaller {
         Err(InstallError::NoInstaller.into())
     }
 
-    fn pack_remove(&self, _name: &str) -> Result<PackReport, PackError> {
+    fn pack_remove(&self, _name: &str, _reviewed: &str) -> Result<PackReport, PackError> {
         Err(InstallError::NoInstaller.into())
     }
 }
