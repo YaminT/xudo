@@ -16,6 +16,15 @@
 //! returned, so a component renamed or swapped after it was opened changes
 //! nothing.
 //!
+//! The walk refuses `O_PATH` without `O_DIRECTORY` (a final link would come
+//! back as the link, not `ELOOP`) and, with `RESOLVE_NO_XDEV`, any flag that
+//! makes the open itself act (`O_CREAT`, `O_TRUNC`, write access), because it
+//! opens before it can compare mounts. Both are `EINVAL`.
+//!
+//! On kernels 5.6 and 5.7, `statx` has no `STATX_ATTR_MOUNT_ROOT`. Where a
+//! filter forces the walk there, every `RESOLVE_NO_XDEV` open fails closed
+//! with `EXDEV`, so `remove-path` does not work. `openat2` itself is fine.
+//!
 //! The walk only ever withholds compared with `openat2`. An empty component
 //! (`a//b`, a trailing `/`) or a `.` is refused, where `openat2` would accept
 //! it. No caller sends one.
@@ -36,6 +45,9 @@ pub(crate) trait Resolve {
     /// Whether `dir/name` is a link, to answer as `openat2` does: `O_NOFOLLOW`
     /// with `O_DIRECTORY` says `ENOTDIR` for a link where `openat2` says `ELOOP`.
     fn is_link(&mut self, dir: &Self::Fd, name: &[u8]) -> bool;
+    /// Whether the walk can honour this open's flags: not `O_PATH` without
+    /// `O_DIRECTORY`, and no side-effecting flag under `RESOLVE_NO_XDEV`.
+    fn walkable(&self) -> bool;
     /// Whether the open must stay on one mount (`RESOLVE_NO_XDEV`).
     fn no_xdev(&self) -> bool;
     /// Whether `child` is on another mount than `parent`.
@@ -61,6 +73,9 @@ pub(crate) fn on_nosys<T>(
 
 /// The component walk, on its own.
 pub(crate) fn walk<R: Resolve>(host: &mut R, dir: &R::Fd, path: &[u8]) -> Result<R::Fd, Errno> {
+    if !host.walkable() {
+        return Err(Errno::INVAL);
+    }
     let (last, parents) = components(path)?;
     let mut held: Option<R::Fd> = None;
     for name in parents {
@@ -163,6 +178,19 @@ mod host {
 
     use super::{Resolve, crossed, on_nosys};
 
+    /// Whether the walk can open with `flags` and keep what `openat2` promises.
+    /// `O_PATH` on a final link returns the link where `openat2` says `ELOOP`, so
+    /// it needs `O_DIRECTORY`. With `NO_XDEV`, `openat2` refuses a crossing before
+    /// it opens; the walk opens first, so no flag with a side effect on the open
+    /// (`O_CREAT`, `O_TRUNC`, write access) may reach it.
+    pub(super) fn walkable(flags: OFlags, no_xdev: bool) -> bool {
+        let path_without_directory =
+            flags.contains(OFlags::PATH) && !flags.contains(OFlags::DIRECTORY);
+        let side_effects =
+            flags.intersects(OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR);
+        !(path_without_directory || no_xdev && side_effects)
+    }
+
     /// Opens `/` with `RESOLVE_NO_SYMLINKS`. `/` has no component to be a
     /// link, so where `openat2` is `ENOSYS` a plain open is the same open.
     pub(crate) fn open_root(flags: OFlags, mode: Mode) -> Result<OwnedFd, Errno> {
@@ -250,6 +278,10 @@ mod host {
                 .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
         }
 
+        fn walkable(&self) -> bool {
+            walkable(self.flags, self.no_xdev())
+        }
+
         fn no_xdev(&self) -> bool {
             self.resolve.contains(ResolveFlags::NO_XDEV)
         }
@@ -280,7 +312,7 @@ mod tests {
     use proptest::prelude::*;
     use rustix::io::Errno;
 
-    use super::{Resolve, components, crossed, open, walk};
+    use super::{Resolve, components, crossed, on_nosys, open, walk};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Node {
@@ -294,6 +326,7 @@ mod tests {
 
     /// A tree in memory. `openat2` is the kernel's resolution as the man page
     /// states it; `step` and `last` are `openat` with `O_NOFOLLOW`.
+    #[allow(clippy::struct_excessive_bools)]
     struct Tree {
         nodes: Vec<Node>,
         edges: BTreeMap<(usize, Vec<u8>), usize>,
@@ -304,6 +337,8 @@ mod tests {
         swap: Option<Swap>,
         /// `crosses` fails, as `fstat` would on a closed descriptor.
         broken_stat: bool,
+        /// The caller's flags are ones the walk refuses.
+        unwalkable: bool,
     }
 
     impl Tree {
@@ -330,6 +365,7 @@ mod tests {
                 steps: 0,
                 swap: None,
                 broken_stat: false,
+                unwalkable: false,
             };
             let a = tree.add(0, b"a", dir(1, false));
             let b = tree.add(a, b"b", dir(1, false));
@@ -448,6 +484,10 @@ mod tests {
             matches!(self.child(*dir, name), Ok((_, Node::Link | Node::Magic)))
         }
 
+        fn walkable(&self) -> bool {
+            !self.unwalkable
+        }
+
         fn no_xdev(&self) -> bool {
             self.xdev
         }
@@ -509,6 +549,37 @@ mod tests {
         assert_eq!(open(&mut tree, &0, b"a/b/f"), Ok(node_at(&tree, "a/b/f")));
         assert_eq!(tree.steps, 2);
         assert_eq!(open(&mut tree, &0, b"a/./b"), Err(Errno::INVAL));
+    }
+
+    #[test]
+    fn the_walk_refuses_flags_it_cannot_keep_openat2s_promises_for() {
+        let mut tree = Tree::sample();
+        tree.unwalkable = true;
+        assert_eq!(walked(&mut tree, "a/f"), Err(Errno::INVAL));
+        tree.openat2 = false;
+        assert_eq!(open(&mut tree, &0, b"a/f"), Err(Errno::INVAL));
+        tree.openat2 = true;
+        assert_eq!(open(&mut tree, &0, b"a/f"), Ok(node_at(&tree, "a/f")));
+    }
+
+    #[test]
+    fn the_fallback_runs_only_on_enosys() {
+        for errno in [
+            Errno::PERM,
+            Errno::ACCESS,
+            Errno::INVAL,
+            Errno::LOOP,
+            Errno::XDEV,
+            Errno::NOENT,
+            Errno::AGAIN,
+            Errno::TOOBIG,
+            Errno::NOTDIR,
+            Errno::BADF,
+        ] {
+            assert_eq!(on_nosys(Err(errno), || Ok(7)), Err(errno), "{errno:?}");
+        }
+        assert_eq!(on_nosys(Err(Errno::NOSYS), || Ok(7)), Ok(7));
+        assert_eq!(on_nosys(Ok(1), || Ok(7)), Ok(1));
     }
 
     #[test]
@@ -680,7 +751,7 @@ mod tests {
         use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstat, open as open_path};
         use rustix::io::Errno;
 
-        use super::super::host::openat2_or_nosys;
+        use super::super::host::{openat2_or_nosys, walkable};
         use super::super::{open_beneath, open_root, without_openat2};
         use super::{any_path, plain};
 
@@ -688,6 +759,31 @@ mod tests {
             .union(ResolveFlags::NO_SYMLINKS)
             .union(ResolveFlags::NO_MAGICLINKS);
         const FLAGS: OFlags = OFlags::RDONLY.union(OFlags::CLOEXEC);
+
+        #[test]
+        fn the_walk_refuses_o_path_on_a_possible_link_and_side_effects_under_no_xdev() {
+            let ok = [
+                (OFlags::RDONLY, false),
+                (OFlags::PATH | OFlags::DIRECTORY, false),
+                (OFlags::PATH | OFlags::DIRECTORY, true),
+                (OFlags::RDONLY | OFlags::DIRECTORY, true),
+                (OFlags::CREATE | OFlags::TRUNC | OFlags::RDWR, false),
+            ];
+            for (flags, xdev) in ok {
+                assert!(walkable(flags, xdev), "{flags:?} {xdev}");
+            }
+            let refused = [
+                (OFlags::PATH, false),
+                (OFlags::PATH | OFlags::NOFOLLOW, true),
+                (OFlags::CREATE, true),
+                (OFlags::TRUNC, true),
+                (OFlags::WRONLY, true),
+                (OFlags::RDWR, true),
+            ];
+            for (flags, xdev) in refused {
+                assert!(!walkable(flags, xdev), "{flags:?} {xdev}");
+            }
+        }
 
         fn scratch(label: &str) -> PathBuf {
             let dir = std::env::temp_dir().join(format!(
