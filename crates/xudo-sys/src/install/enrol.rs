@@ -23,7 +23,8 @@
 
 use xudo_backend::enrol::{
     AGENTS_DIR, AccountScan, DropInState, EnrolPlan, EnrolRequest, Facts, Listed, MANAGED_MARKER,
-    REGISTRY_DIR, Refusal, drop_in_dir, env_path, listed, plan, registry_path, unit_name,
+    Membership, REGISTRY_DIR, Refusal, drop_in_dir, env_path, is_member, joined_groups, listed,
+    plan, registry_path, unit_name,
 };
 use xudo_policy::valid_harness_label;
 
@@ -81,6 +82,22 @@ pub trait EnrolOps {
     ///
     /// A directory that is not empty, or a refused call.
     fn remove_dir(&self, path: &str) -> Result<Removal, InstallError>;
+
+    /// Adds `account` to the existing group `group` and changes nothing else
+    /// about the group. The caller has checked it is not a member yet.
+    ///
+    /// # Errors
+    ///
+    /// When the tool could not be run or refused.
+    fn add_member(&self, group: &str, account: &str) -> Result<(), InstallError>;
+
+    /// Removes `account` from `group` and changes nothing else about the group.
+    /// The caller has checked it is a listed member.
+    ///
+    /// # Errors
+    ///
+    /// When the tool could not be run or refused.
+    fn remove_member(&self, group: &str, account: &str) -> Result<(), InstallError>;
 
     /// Runs `/usr/bin/systemctl` with `args`.
     ///
@@ -244,6 +261,9 @@ pub fn plan_enrol(
 struct Made {
     files: Vec<String>,
     dirs: Vec<String>,
+    /// Memberships this run added: group and account. Groups this run created
+    /// stay, empty: nothing in one grants anything.
+    joined: Vec<(String, String)>,
 }
 
 impl Made {
@@ -255,6 +275,9 @@ impl Made {
         }
         for path in self.dirs.iter().rev() {
             let _ = host.remove_dir(path);
+        }
+        for (group, account) in self.joined.iter().rev() {
+            let _ = host.remove_member(group, account);
         }
         let _ = host.systemctl(&["daemon-reload"]);
     }
@@ -360,7 +383,41 @@ fn perform(
             fragment: fragment.stdout,
         });
     }
+    // The last write, before the unit starts so it starts holding its groups.
+    // Nothing above checked a group: the groups carry no rule of their own.
+    join_groups(plan, ops, host, made)?;
     systemctl_ok(host, &["enable", "--now", plan.unit.as_str()])?;
+    Ok(())
+}
+
+/// Creates the agent groups that are missing and adds the account to the
+/// ones it is not in. A group that exists keeps its definition: only a member
+/// is added, and only if `/etc/group` does not already list it.
+fn join_groups(
+    plan: &EnrolPlan,
+    ops: &dyn InstallOps,
+    host: &dyn EnrolOps,
+    made: &mut Made,
+) -> Result<(), AgentError> {
+    for Membership {
+        group,
+        create,
+        join,
+    } in &plan.memberships
+    {
+        // The plan was made earlier; the machine may have moved on.
+        if *create && !ops.group_exists(group)? {
+            ops.create_group(group)?;
+        }
+        if *join {
+            let file = host.read_file("/etc/group")?.unwrap_or_default();
+            let passwd = host.read_file("/etc/passwd")?.unwrap_or_default();
+            if !is_member(&passwd, &file, &plan.account, group) {
+                host.add_member(group, &plan.account)?;
+                made.joined.push((group.clone(), plan.account.clone()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -428,6 +485,11 @@ pub fn remove_agent(
         return Err(not_enrolled());
     }
     let unit = unit_name(label);
+    let registry_text = text(&registry, current)?;
+    let account = listed(&[(format!("{label}.toml"), registry_text.clone())])?
+        .into_iter()
+        .next()
+        .map(|agent| agent.account);
     systemctl_ok(host, &["disable", "--now", unit.as_str()])?;
     // Only a unit that is down: `activating`, `deactivating` and `reloading`
     // are not.
@@ -445,6 +507,17 @@ pub fn remove_agent(
     host.remove_dir(&drop_in_dir(label))?;
     lines.push(format!("removed {}", drop_in_dir(label)));
     systemctl_ok(host, &["daemon-reload"])?;
+    // Only the memberships enrol recorded as its own; a group is never deleted.
+    if let Some(account) = account {
+        for group in joined_groups(&registry_text) {
+            let file = host.read_file("/etc/group")?.unwrap_or_default();
+            let passwd = host.read_file("/etc/passwd")?.unwrap_or_default();
+            if is_member(&passwd, &file, &account, &group) {
+                host.remove_member(&group, &account)?;
+                lines.push(format!("removed {account} from group {group}"));
+            }
+        }
+    }
     // Last: until this, the entry that attests the harness is still there.
     ops.remove_managed(&registry)?;
     lines.push(format!("removed {registry}"));

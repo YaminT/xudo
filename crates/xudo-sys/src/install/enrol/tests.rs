@@ -123,6 +123,49 @@ impl Machine {
         }
     }
 
+    /// Edits the member list of one group line in `/etc/group`.
+    fn edit_group(&self, group: &str, edit: impl FnOnce(&mut Vec<String>)) {
+        let mut files = self.files.borrow_mut();
+        let file = files.get_mut("/etc/group").unwrap();
+        let mut lines: Vec<String> = file.lines().map(str::to_owned).collect();
+        for line in &mut lines {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields[0] == group {
+                let mut members: Vec<String> = fields[3]
+                    .split(',')
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                edit(&mut members);
+                *line = format!(
+                    "{}:{}:{}:{}",
+                    fields[0],
+                    fields[1],
+                    fields[2],
+                    members.join(",")
+                );
+                break;
+            }
+        }
+        *file = lines.join("\n") + "\n";
+    }
+
+    fn members(&self, group: &str) -> Vec<String> {
+        self.files.borrow()["/etc/group"]
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<&str> = line.split(':').collect();
+                (fields[0] == group).then(|| {
+                    fields[3]
+                        .split(',')
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
     fn marked(&self, path: &str) -> bool {
         self.files
             .borrow()
@@ -136,11 +179,21 @@ impl InstallOps for Machine {
         self.uid
     }
 
-    fn group_exists(&self, _name: &str) -> Result<bool, InstallError> {
-        Ok(true)
+    fn group_exists(&self, name: &str) -> Result<bool, InstallError> {
+        self.step(format!("group_exists {name}"))?;
+        let prefix = format!("{name}:");
+        Ok(self.files.borrow()["/etc/group"]
+            .lines()
+            .any(|line| line.starts_with(&prefix)))
     }
 
-    fn create_group(&self, _name: &str) -> Result<(), InstallError> {
+    fn create_group(&self, name: &str) -> Result<(), InstallError> {
+        self.step(format!("create_group {name}"))?;
+        let mut files = self.files.borrow_mut();
+        let group = files.get_mut("/etc/group").unwrap();
+        let gid = 800_usize.saturating_add(group.lines().count());
+        let line = format!("{name}:x:{gid}:\n");
+        group.push_str(&line);
         Ok(())
     }
 
@@ -223,7 +276,9 @@ impl EnrolOps for Machine {
             });
         }
         if self.binary.borrow().contains(path) {
-            return Ok(Some(vec![0xff, 0xfe]));
+            let mut bytes = MANAGED_MARKER.as_bytes().to_vec();
+            bytes.extend([0xff, 0xfe]);
+            return Ok(Some(bytes));
         }
         Ok(self.files.borrow().get(path).map(|t| t.as_bytes().to_vec()))
     }
@@ -261,6 +316,20 @@ impl EnrolOps for Machine {
             names.extend(self.ghosts.borrow().iter().cloned());
         }
         Ok(Some(names))
+    }
+
+    fn add_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.step(format!("add_member {group} {account}"))?;
+        self.edit_group(group, |members| {
+            members.push(account.to_owned());
+        });
+        Ok(())
+    }
+
+    fn remove_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.step(format!("remove_member {group} {account}"))?;
+        self.edit_group(group, |members| members.retain(|m| m != account));
+        Ok(())
     }
 
     fn make_dir(&self, path: &str, _mode: u32) -> Result<bool, InstallError> {
@@ -349,6 +418,7 @@ fn scan() -> AccountScan {
     AccountScan {
         uid: 990,
         blockers: Vec::new(),
+        doas: false,
     }
 }
 
@@ -787,8 +857,9 @@ fn remove_stops_at_a_failed_stop_or_removal() {
 #[test]
 fn the_test_machine_answers_every_question_the_traits_ask() {
     let machine = Machine::root();
-    assert!(machine.group_exists("x").unwrap());
+    assert!(!machine.group_exists("x").unwrap());
     machine.create_group("x").unwrap();
+    assert!(machine.group_exists("x").unwrap());
     machine.validate(&[]).unwrap();
     assert_eq!(machine.identity("/p").unwrap().inode, 1);
     machine.append_block("/p", "b", &[]).unwrap();
@@ -907,4 +978,310 @@ fn a_failed_question_about_the_unit_sources_stops_the_enrol() {
         );
         assert!(machine.files.borrow().keys().all(|p| !p.contains("codex")));
     }
+}
+
+// ---- H2d: the agent groups ----
+
+fn bare_groups() -> Machine {
+    let machine = Machine::root();
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nalice:x:1000:\n".to_owned(),
+    );
+    machine
+}
+
+#[test]
+fn enrol_joins_the_account_to_both_groups_as_its_last_write() {
+    let machine = bare_groups();
+    let plan = enrol(&machine).unwrap();
+    assert_eq!(machine.members("xudo"), ["agent"]);
+    assert_eq!(machine.members("xudo-agent"), ["agent"]);
+    // Both groups were created, empty, before anyone was added.
+    assert!(machine.position("create_group xudo") < machine.position("add_member xudo agent"));
+    assert!(
+        machine.position("create_group xudo-agent")
+            < machine.position("add_member xudo-agent agent")
+    );
+    // Every file and every check comes first: the membership is the last write,
+    // and the unit is started after it so it starts holding its groups.
+    let join = machine.position("add_member xudo agent");
+    for before in [
+        "install /etc/xudo/harnesses.d",
+        "install /etc/systemd",
+        "install /etc/xudo/agents",
+        "systemctl daemon-reload",
+        "systemctl show",
+    ] {
+        assert!(machine.position(before) < join, "{before}");
+    }
+    assert!(machine.position("add_member xudo-agent agent") < machine.position("systemctl enable"));
+    // The registry says which groups enrol itself added, for `remove`.
+    assert!(
+        machine.files.borrow()[&plan.registry.path]
+            .contains("# xudo-joined-groups: xudo xudo-agent\n")
+    );
+}
+
+#[test]
+fn enrol_adds_a_member_to_a_group_that_exists_and_never_redefines_it() {
+    let machine = Machine::root();
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:55:alice\nxudo-agent:x:56:\n".to_owned(),
+    );
+    enrol(&machine).unwrap();
+    // Nothing was created, and the existing member and gid are untouched.
+    assert!(
+        !machine
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_group"))
+    );
+    assert_eq!(machine.members("xudo"), ["alice", "agent"]);
+    assert_eq!(machine.members("xudo-agent"), ["agent"]);
+    assert!(machine.files.borrow()["/etc/group"].contains("xudo:x:55:"));
+}
+
+#[test]
+fn enrol_leaves_a_membership_that_was_already_there_alone() {
+    // Already in both: no tool runs, and the registry claims nothing as its own.
+    let machine = Machine::root();
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:55:agent\nxudo-agent:x:56:agent\n".to_owned(),
+    );
+    let plan = enrol(&machine).unwrap();
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+    assert!(!machine.files.borrow()[&plan.registry.path].contains("xudo-joined-groups"));
+    // The account joined between the plan and the apply: still no second add.
+    let machine = bare_groups();
+    let plan = plan_enrol(&request(), scan(), &machine, &machine).unwrap();
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:55:agent\nxudo-agent:x:56:agent\n".to_owned(),
+    );
+    apply_enrol(&plan, &machine, &machine).unwrap();
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+    assert!(
+        !machine
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_group"))
+    );
+}
+
+#[test]
+fn a_failed_group_join_takes_back_what_the_run_added() {
+    // The second add fails: the first membership is taken out, the files and
+    // the unit go, and the groups this run created stay, empty.
+    let machine = bare_groups().failing("add_member xudo-agent");
+    let error = enrol(&machine).unwrap_err();
+    assert!(error.to_string().contains("scripted"), "{error}");
+    assert!(machine.members("xudo").is_empty());
+    assert!(
+        machine.position("remove_member xudo agent") > machine.position("add_member xudo-agent")
+    );
+    assert!(
+        !machine
+            .files
+            .borrow()
+            .contains_key("/etc/xudo/harnesses.d/codex.toml")
+    );
+    assert!(!machine.active.get());
+    // A group that cannot be created stops before any member is added.
+    let machine = bare_groups().failing("create_group xudo");
+    assert!(enrol(&machine).is_err());
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+    // A group file that cannot be read stops the join too.
+    let machine = bare_groups();
+    let plan = plan_enrol(&request(), scan(), &machine, &machine).unwrap();
+    machine
+        .unreadable
+        .borrow_mut()
+        .insert("/etc/group".to_owned());
+    assert!(apply_enrol(&plan, &machine, &machine).is_err());
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+}
+
+#[test]
+fn enrol_on_doas_enrols_nothing() {
+    let machine = bare_groups();
+    let mut doas = scan();
+    doas.doas = true;
+    let error = plan_enrol(&request(), doas, &machine, &machine).unwrap_err();
+    assert_eq!(error, AgentError::Refused(Refusal::AgentPathNeedsSudo));
+    assert!(machine.calls().is_empty());
+}
+
+#[test]
+fn remove_takes_the_account_out_of_the_groups_enrol_added_and_never_deletes_a_group() {
+    let machine = bare_groups();
+    enrol(&machine).unwrap();
+    let lines = remove_agent("codex", &machine, &machine).unwrap();
+    assert!(machine.members("xudo").is_empty());
+    assert!(machine.members("xudo-agent").is_empty());
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "removed agent from group xudo-agent")
+    );
+    // Groups stay; the registry entry still goes last.
+    assert!(machine.files.borrow()["/etc/group"].contains("xudo-agent:x:"));
+    assert!(
+        machine.position("remove_member xudo-agent agent")
+            < machine.position("remove_managed /etc/xudo/harnesses.d")
+    );
+    assert!(machine.position("systemctl disable") < machine.position("remove_member"));
+}
+
+#[test]
+fn remove_leaves_the_groups_an_operator_had_the_account_in() {
+    // The operator put the account in `xudo` first; enrol added it to
+    // `xudo-agent` only, and only that one is taken out.
+    let machine = Machine::root();
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:55:agent,alice\n".to_owned(),
+    );
+    enrol(&machine).unwrap();
+    remove_agent("codex", &machine, &machine).unwrap();
+    assert_eq!(machine.members("xudo"), ["agent", "alice"]);
+    assert!(machine.members("xudo-agent").is_empty());
+    assert!(
+        !machine
+            .calls()
+            .iter()
+            .any(|c| c == "remove_member xudo agent")
+    );
+    // An entry written before groups were recorded takes nothing out.
+    let machine = Machine::root().with_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        &format!("{MANAGED_MARKER}\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n"),
+    );
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\nxudo:x:55:agent\n".to_owned(),
+    );
+    remove_agent("codex", &machine, &machine).unwrap();
+    assert_eq!(machine.members("xudo"), ["agent"]);
+    // A recorded group the account already left is not asked about again, and a
+    // comment naming a group that is not an agent group is ignored.
+    let machine = Machine::root().with_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        &format!("{MANAGED_MARKER}\n# xudo-joined-groups: xudo docker\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n"),
+    );
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nagent:x:990:\ndocker:x:9:agent\nxudo:x:55:\n".to_owned(),
+    );
+    remove_agent("codex", &machine, &machine).unwrap();
+    assert!(
+        !machine
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_member"))
+    );
+    assert_eq!(machine.members("docker"), ["agent"]);
+}
+
+#[test]
+fn a_membership_that_cannot_be_removed_keeps_the_registry_entry() {
+    let machine = bare_groups();
+    enrol(&machine).unwrap();
+    *machine.fail.borrow_mut() = Some("remove_member xudo agent".to_owned());
+    assert!(remove_agent("codex", &machine, &machine).is_err());
+    assert!(
+        machine
+            .files
+            .borrow()
+            .contains_key("/etc/xudo/harnesses.d/codex.toml")
+    );
+    // A retry finishes the job.
+    *machine.fail.borrow_mut() = None;
+    remove_agent("codex", &machine, &machine).unwrap();
+    assert!(
+        !machine
+            .files
+            .borrow()
+            .contains_key("/etc/xudo/harnesses.d/codex.toml")
+    );
+}
+
+#[test]
+fn remove_of_an_entry_with_no_account_takes_no_membership_out() {
+    // A hand-marked session entry names users, not an account.
+    let machine = Machine::root().with_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        &format!(
+            "{MANAGED_MARKER}\n# xudo-joined-groups: xudo\nlabel = \"codex\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n"
+        ),
+    );
+    machine.files.borrow_mut().insert(
+        "/etc/group".to_owned(),
+        "root:x:0:\nxudo:x:55:alice\n".to_owned(),
+    );
+    remove_agent("codex", &machine, &machine).unwrap();
+    assert!(
+        !machine
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_member"))
+    );
+    assert_eq!(machine.members("xudo"), ["alice"]);
+}
+
+#[test]
+fn an_account_database_that_cannot_be_read_stops_the_join_and_the_leave() {
+    // The passwd file goes unreadable between the plan and the apply.
+    let machine = bare_groups();
+    let plan = plan_enrol(&request(), scan(), &machine, &machine).unwrap();
+    machine
+        .unreadable
+        .borrow_mut()
+        .insert("/etc/passwd".to_owned());
+    assert!(apply_enrol(&plan, &machine, &machine).is_err());
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+    // And remove stops, keeping the entry, on either file.
+    for path in ["/etc/group", "/etc/passwd"] {
+        let machine = bare_groups();
+        enrol(&machine).unwrap();
+        machine.unreadable.borrow_mut().insert(path.to_owned());
+        assert!(remove_agent("codex", &machine, &machine).is_err(), "{path}");
+        assert!(
+            machine
+                .files
+                .borrow()
+                .contains_key("/etc/xudo/harnesses.d/codex.toml")
+        );
+    }
+}
+
+#[test]
+fn a_registry_entry_that_is_not_text_or_does_not_load_stops_remove_untouched() {
+    let machine = Machine::root().with_file("/etc/xudo/harnesses.d/codex.toml", "x");
+    machine
+        .binary
+        .borrow_mut()
+        .insert("/etc/xudo/harnesses.d/codex.toml".to_owned());
+    assert!(matches!(
+        remove_agent("codex", &machine, &machine).unwrap_err(),
+        AgentError::NotText(_)
+    ));
+    let machine = Machine::root().with_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        &format!("{MANAGED_MARKER}\nnope = 1\n"),
+    );
+    assert!(matches!(
+        remove_agent("codex", &machine, &machine).unwrap_err(),
+        AgentError::Refused(Refusal::Registry(_))
+    ));
+    assert!(!machine.calls().iter().any(|c| c.starts_with("systemctl")));
+}
+
+#[test]
+fn a_group_lookup_that_fails_stops_the_join() {
+    let machine = bare_groups().failing("group_exists xudo");
+    assert!(enrol(&machine).is_err());
+    assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
 }

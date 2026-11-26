@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use term_sanitize::Limits;
+use xudo_backend::enrol::{managed_snippet, recheck_accounts};
 use xudo_backend::paths_to_root::{
     self, Applies, Check, CheckId, Finding, Grant, HostView, Input, Lookup, Proposal, Status,
     Unverified, Via, Writer, assess, propose,
@@ -98,6 +99,57 @@ pub struct Report {
     pub paths_to_root: paths_to_root::Report,
     /// What `--fix` proposes; `None` when it was not asked.
     pub proposals: Option<Vec<Proposal>>,
+    /// The enrol checks, run again for every enrolled agent account.
+    pub enrolled_accounts: EnrolledAccountsReport,
+}
+
+/// The account checks `enrol` ran, run again for each registry entry. An
+/// account that was clean when it was enrolled can gain a way to root later:
+/// a sudoers line, a group, a password, a drop-in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EnrolledAccountsReport {
+    /// One row per enrolled agent.
+    pub accounts: Vec<EnrolledAccountRow>,
+    /// Why the registry could not be read, when it could not.
+    pub unreadable: Option<String>,
+}
+
+/// One enrolled account's standing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EnrolledAccountRow {
+    /// The harness label.
+    pub label: String,
+    /// The account it runs as.
+    pub account: String,
+    /// Each way to root it has gained. Empty is clean.
+    pub problems: Vec<String>,
+    /// What could not be checked from here, such as a password as a non-root user.
+    pub unverified: Vec<String>,
+}
+
+fn enrolled_accounts(
+    host: &dyn HostView,
+    input: &Input<'_>,
+    managed: Option<&str>,
+) -> EnrolledAccountsReport {
+    match recheck_accounts(host, input, managed) {
+        Ok(rows) => EnrolledAccountsReport {
+            accounts: rows
+                .into_iter()
+                .map(|row| EnrolledAccountRow {
+                    label: row.label,
+                    account: row.account,
+                    problems: row.problems,
+                    unverified: row.unverified,
+                })
+                .collect(),
+            unreadable: None,
+        },
+        Err(why) => EnrolledAccountsReport {
+            accounts: Vec::new(),
+            unreadable: Some(why),
+        },
+    }
 }
 
 /// What the kernel offers the broker.
@@ -396,21 +448,29 @@ pub(crate) fn gather(
 ) -> Report {
     let backend = identify(platform.probe);
     let backend_exe = backend.as_ref().map(|found| Path::new(found.exe.as_str()));
-    let paths = assess(
+    let input = Input {
+        user_path: platform.path,
+        backend_exe,
+        sudo_exe: backend
+            .as_ref()
+            .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
+            .map(|found| found.exe.as_str()),
+        doas_exe: backend
+            .as_ref()
+            .filter(|found| matches!(found.kind, BackendKind::Doas))
+            .map(|found| found.exe.as_str()),
+        doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
+    };
+    let paths = assess(platform.host, &input);
+    // Each enrolled account is held to what enrol held it to; the user `PATH`
+    // is about this caller, not the account.
+    let enrolled = enrolled_accounts(
         platform.host,
         &Input {
-            user_path: platform.path,
-            backend_exe,
-            sudo_exe: backend
-                .as_ref()
-                .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
-                .map(|found| found.exe.as_str()),
-            doas_exe: backend
-                .as_ref()
-                .filter(|found| matches!(found.kind, BackendKind::Doas))
-                .map(|found| found.exe.as_str()),
-            doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
+            user_path: None,
+            ..input
         },
+        managed_snippet(backend.as_ref()).as_deref(),
     );
     // Root commands go through the backend, where the human types their
     // password; a root caller needs no prefix.
@@ -434,6 +494,7 @@ pub(crate) fn gather(
         backend: BackendReport::of(backend),
         paths_to_root: paths,
         proposals,
+        enrolled_accounts: enrolled,
     }
 }
 
@@ -943,6 +1004,7 @@ pub(crate) fn human(report: &Report) -> String {
             line("sudoers xudo", &format!("unknown: {}", safe(reason)));
         }
     }
+    enrolled_lines(&report.enrolled_accounts, &mut line);
     if let Some(label) = report.caller.classification {
         line("classified", label);
         line(
@@ -989,6 +1051,29 @@ pub(crate) fn human(report: &Report) -> String {
 }
 
 /// The registry and account-database faults, when there are any.
+/// The standing of each enrolled account, or why it could not be read. Nothing
+/// at all when no agent is enrolled.
+fn enrolled_lines(report: &EnrolledAccountsReport, line: &mut dyn FnMut(&str, &str)) {
+    if let Some(why) = &report.unreadable {
+        line("enrolled", &format!("unknown: {}", safe(why)));
+    }
+    for row in &report.accounts {
+        let who = format!("{} ({})", safe(&row.label), safe(&row.account));
+        if row.problems.is_empty() {
+            line("enrolled", &format!("{who}: no other way to root found"));
+        }
+        for problem in &row.problems {
+            line(
+                "enrolled",
+                &format!("{who} HAS A WAY TO ROOT: {}", safe(problem)),
+            );
+        }
+        for gap in &row.unverified {
+            line("enrolled", &format!("{who} unverified: {}", safe(gap)));
+        }
+    }
+}
+
 fn fault_lines(ruleset: &RulesetReport, line: &mut dyn FnMut(&str, &str)) {
     if let Some(why) = &ruleset.registry_fault {
         line(
@@ -2920,5 +3005,160 @@ mod tests {
         assert!(report.kernel.withheld_because.is_some());
         assert_eq!(report.caller.classification, None);
         assert!(report.caller.password_required);
+    }
+    // ---- H2d: the enrol checks, run again for every enrolled agent ----
+
+    const ENROLLED_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
+        yamin:x:1000:1000::/home/yamin:/bin/sh\n\
+        alice:x:1001:1001::/home/alice:/bin/sh\n\
+        agent:x:990:990::/var/lib/agent:/usr/sbin/nologin\n";
+    const ENROLLED_GROUPS: &[u8] =
+        b"xudo:x:998:yamin,agent\nxudo-agent:x:997:agent\nyamin:x:1000:\nagent:x:990:\n";
+
+    /// What xudo itself would write for the passwordless line on this machine.
+    fn managed_text() -> String {
+        let backend = identify(&SUDO).unwrap();
+        xudo_backend::enrol::managed_snippet(Some(&backend)).unwrap()
+    }
+
+    /// `clean_host` with one agent enrolled the way `xudo agent enrol` leaves it.
+    fn enrolled_host(snippet: &str) -> MemoryHost {
+        let dir = "/etc/systemd/system/xudo-agent@codex.service.d";
+        clean_host()
+            .file("/etc/passwd", 0, 0, 0o644, ENROLLED_PASSWD)
+            .file("/etc/group", 0, 0, 0o644, ENROLLED_GROUPS)
+            .file("/etc/sudoers.d/xudo", 0, 0, 0o440, snippet.as_bytes())
+            .dir("/etc/xudo", 0, 0, 0o755)
+            .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+            .file(
+                "/etc/xudo/harnesses.d/codex.toml",
+                0,
+                0,
+                0o644,
+                b"# Managed by xudo.\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n",
+            )
+            .dir("/etc/systemd", 0, 0, 0o755)
+            .dir("/etc/systemd/system", 0, 0, 0o755)
+            .dir(dir, 0, 0, 0o755)
+            .file(
+                &format!("{dir}/10-xudo.conf"),
+                0,
+                0,
+                0o644,
+                b"# Managed by xudo.\n[Service]\nUser=agent\nExecStart=\"/usr/bin/codex\"\n",
+            )
+    }
+
+    fn enrolled_report(host: &MemoryHost) -> Report {
+        gathered(
+            host,
+            "/usr/bin",
+            &TestOps {
+                release: "6.13.0",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&fixture_rules("4")),
+            false,
+        )
+    }
+
+    #[test]
+    fn doctor_reports_an_enrolled_account_that_gained_a_root_path() {
+        // Enrolled clean, with the managed passwordless line in place.
+        let clean = enrolled_report(&enrolled_host(&managed_text()));
+        let row = &clean.enrolled_accounts.accounts[0];
+        assert_eq!(
+            (row.label.as_str(), row.account.as_str()),
+            ("codex", "agent")
+        );
+        assert!(row.problems.is_empty(), "{:?}", row.problems);
+        // The shadow file is root's, and this caller is not: said, not guessed.
+        assert!(row.unverified.iter().any(|gap| gap.contains("/etc/shadow")));
+        let text = human(&clean);
+        assert!(
+            text.contains("codex (agent): no other way to root found"),
+            "{text}"
+        );
+        assert!(text.contains("unverified"), "{text}");
+        assert!(!text.contains("HAS A WAY TO ROOT"));
+
+        // Later, root hand-writes a rule for the account.
+        let gained = enrolled_host(&managed_text()).file(
+            "/etc/sudoers.d/90-agent",
+            0,
+            0,
+            0o440,
+            b"agent ALL=(ALL) NOPASSWD: ALL\n",
+        );
+        let report = enrolled_report(&gained);
+        let row = &report.enrolled_accounts.accounts[0];
+        assert!(
+            row.problems
+                .iter()
+                .any(|p| p.contains("/etc/sudoers.d/90-agent")),
+            "{:?}",
+            row.problems
+        );
+        assert!(human(&report).contains("codex (agent) HAS A WAY TO ROOT"));
+        // The envelope carries the same rows.
+        let json: serde_json::Value = serde_json::from_str(&render::json_of(&report)).unwrap();
+        assert_eq!(json["enrolled_accounts"]["accounts"][0]["label"], "codex");
+        assert!(json["enrolled_accounts"]["accounts"][0]["problems"][0].is_string());
+
+        // The managed line altered by one byte is not exempt any more.
+        let altered = enrolled_host(&format!("{}\n", managed_text()));
+        assert!(
+            !enrolled_report(&altered).enrolled_accounts.accounts[0]
+                .problems
+                .is_empty()
+        );
+        // A group that is root by another name, gained after enrolment.
+        let grouped = enrolled_host(&managed_text()).file(
+            "/etc/group",
+            0,
+            0,
+            0o644,
+            b"xudo:x:998:yamin,agent\nxudo-agent:x:997:agent\ndocker:x:999:agent\nyamin:x:1000:\nagent:x:990:\n",
+        );
+        let report = enrolled_report(&grouped);
+        assert!(
+            report.enrolled_accounts.accounts[0]
+                .problems
+                .iter()
+                .any(|p| p.contains("docker"))
+        );
+        // A second drop-in beside ours.
+        let dropped = enrolled_host(&managed_text()).file(
+            "/etc/systemd/system/xudo-agent@codex.service.d/50-more.conf",
+            0,
+            0,
+            0o644,
+            b"[Service]\nUser=root\n",
+        );
+        let report = enrolled_report(&dropped);
+        assert!(
+            report.enrolled_accounts.accounts[0]
+                .problems
+                .iter()
+                .any(|p| p.contains("50-more") || p.contains("holds more"))
+        );
+    }
+
+    #[test]
+    fn doctor_says_nothing_about_agents_when_none_is_enrolled_and_why_when_it_cannot_look() {
+        let none = enrolled_report(&clean_host());
+        assert!(none.enrolled_accounts.accounts.is_empty());
+        assert!(none.enrolled_accounts.unreadable.is_none());
+        assert!(!human(&none).contains("enrolled "));
+        let unreadable = enrolled_host(&managed_text()).unreadable_file(
+            "/etc/xudo/harnesses.d/codex.toml",
+            0,
+            0,
+            0o644,
+        );
+        let report = enrolled_report(&unreadable);
+        assert!(report.enrolled_accounts.unreadable.is_some());
+        assert!(human(&report).contains("enrolled     unknown:"));
     }
 }

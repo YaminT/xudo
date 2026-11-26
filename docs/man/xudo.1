@@ -485,7 +485,12 @@ for
 .IR xudo\-agent@label.service ,
 and an empty environment file in
 .I /etc/xudo/agents
-(mode 0600, root, never replaced), and enables the unit.
+(mode 0600, root, never replaced), then adds the account to the groups
+.B xudo
+and
+.B xudo\-agent
+(creating a group that does not exist, and only adding a member to one that
+does) as its last write, and enables the unit.
 The program is an absolute path and is written quoted, with
 .B %
 and
@@ -504,13 +509,21 @@ It refuses an account that is root, has a usable password, is in
 .B adm
 or
 .BR systemd\-journal ,
-that the scan of other paths to root finds a sudo or doas rule for, that is
+that the scan of other paths to root finds a sudo or doas rule for (the one
+exemption is
+.I /etc/sudoers.d/xudo
+when it holds, byte for byte, the passwordless snippet xudo itself writes; any
+other line naming
+.BR %xudo\-agent ,
+the account or the passwordless helper is a refusal), that is
 already used by another harness, or that is its own reviewer; a drop-in
 directory for the label that is not root's or is not empty; and a unit whose
 .B User=
 systemd does not report as the account.
 It grants nothing: no rule names the harness, so every command it asks for
 still asks for the sudo password.
+On a machine whose escalator is doas it refuses: the agent path is sudo and
+sudo\-rs only.
 .B \-\-dry\-run
 prints the files and writes nothing.
 .B list
@@ -519,6 +532,13 @@ shows each enrolled agent and whether its unit is active.
 stops the unit (its own stop hook voids the record), removes the drop-in and
 then the registry entry, and keeps the environment file, which may hold
 credentials.
+It also takes the account out of the groups
+.B enrol
+itself added it to (the registry entry records them), leaves any group an
+operator had it in, and never deletes a group.
+.B xudo doctor
+runs the account checks again for every registry entry and reports an enrolled
+account that has since gained a way to root.
 .TP
 .B install
 Integrate xudo with the local

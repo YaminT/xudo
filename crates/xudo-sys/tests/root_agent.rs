@@ -25,11 +25,12 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
-use xudo_backend::enrol::{EnrolRequest, Refusal, scan_account};
+use xudo_backend::detect;
+use xudo_backend::enrol::{EnrolRequest, Refusal, managed_snippet, scan_account};
 use xudo_backend::paths_to_root::Input;
 use xudo_sys::{
-    AgentError, EnrolOps, HostInstallOps, InstallError, LiveHost, Removal, Systemctl, apply_enrol,
-    plan_enrol, remove_agent,
+    AgentError, EnrolOps, HostInstallOps, HostProbe, InstallError, LiveHost, Removal, Systemctl,
+    apply_enrol, plan_enrol, remove_agent, run_capture,
 };
 use xudo_tests::root_lane::root_guard;
 
@@ -67,6 +68,14 @@ impl EnrolOps for Machine {
         self.real.remove_dir(path)
     }
 
+    fn add_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.real.add_member(group, account)
+    }
+
+    fn remove_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.real.remove_member(group, account)
+    }
+
     fn systemctl(&self, args: &[&str]) -> Result<Systemctl, InstallError> {
         let stdout = match args[0] {
             "show" if args.iter().any(|a| a.contains("DropInPaths")) => DROP_IN,
@@ -100,6 +109,14 @@ fn machine() -> Machine {
     }
 }
 
+/// Leaves the account in no agent group: `root_sudo_names` asks sudo about the
+/// first member of `xudo`, which must be its own account. Every test ends with it.
+fn leave_groups() {
+    for group in ["xudo", "xudo-agent"] {
+        let _ = run_capture("/usr/bin/gpasswd", &["-d", ACCOUNT, group], None);
+    }
+}
+
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
         return false;
@@ -108,6 +125,10 @@ fn begin_root_test(test: &str) -> bool {
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_dir(DROP_IN_DIR);
+    // Whatever an earlier test joined the account to.
+    for group in ["xudo", "xudo-agent"] {
+        let _ = run_capture("/usr/bin/gpasswd", &["-d", ACCOUNT, group], None);
+    }
     fs::create_dir_all("/etc/xudo").unwrap();
     fs::create_dir_all("/etc/systemd/system").unwrap();
     let exists = Command::new("/usr/bin/id")
@@ -142,7 +163,8 @@ fn request(account: &str) -> EnrolRequest {
 }
 
 fn enrol(machine: &Machine, account: &str) -> Result<(), AgentError> {
-    let scan = scan_account(&LiveHost, account, &Input::default()).map_err(AgentError::Refused)?;
+    let scan =
+        scan_account(&LiveHost, account, &Input::default(), None).map_err(AgentError::Refused)?;
     let plan = plan_enrol(&request(account), scan, &machine.real, machine)?;
     apply_enrol(&plan, &machine.real, machine)
 }
@@ -185,6 +207,7 @@ fn enrolled_files_are_root_owned_with_the_modes_the_plan_names() {
             .collect();
         assert!(stray.is_empty(), "{dir}: {stray:?}");
     }
+    leave_groups();
 }
 
 #[test]
@@ -201,6 +224,7 @@ fn enrolling_the_same_label_twice_changes_nothing_the_second_time() {
         "{error}"
     );
     assert_eq!(fs::read(REGISTRY).unwrap(), before);
+    leave_groups();
 }
 
 #[test]
@@ -228,6 +252,7 @@ fn remove_takes_back_every_file_and_keeps_the_credentials() {
         fs::read_to_string(ENV).unwrap().lines().last(),
         Some("KEY=secret")
     );
+    leave_groups();
 }
 
 #[test]
@@ -246,6 +271,7 @@ fn remove_refuses_a_registry_entry_an_operator_wrote() {
     assert!(matches!(error, AgentError::NotEnrolled(_)), "{error}");
     assert!(Path::new(REGISTRY).exists());
     assert!(!machine.active.get());
+    leave_groups();
 }
 
 #[test]
@@ -267,6 +293,7 @@ fn enrol_refuses_an_account_with_a_password_and_root() {
     );
     assert!(!Path::new(REGISTRY).exists());
     assert!(!Path::new(DROP_IN_DIR).exists());
+    leave_groups();
 }
 
 #[test]
@@ -285,6 +312,7 @@ fn enrol_refuses_a_drop_in_directory_anyone_can_write() {
     );
     assert!(!Path::new(REGISTRY).exists());
     fs::remove_dir(DROP_IN_DIR).unwrap();
+    leave_groups();
 }
 
 #[test]
@@ -307,4 +335,184 @@ fn enrol_refuses_a_drop_in_that_could_set_user_after_ours() {
     assert!(!Path::new(REGISTRY).exists());
     fs::remove_file(format!("{DROP_IN_DIR}/99-evil.conf")).unwrap();
     fs::remove_dir(DROP_IN_DIR).unwrap();
+    leave_groups();
+}
+
+/// The members of a group, read from the real `/etc/group`; `None` when the
+/// group does not exist.
+fn members(group: &str) -> Option<Vec<String>> {
+    let prefix = format!("{group}:");
+    fs::read_to_string("/etc/group")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .map(|line| {
+            line.rsplit(':')
+                .next()
+                .unwrap()
+                .split(',')
+                .filter(|member| !member.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+}
+
+fn gid_of(group: &str) -> String {
+    let prefix = format!("{group}:");
+    fs::read_to_string("/etc/group")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap()
+        .split(':')
+        .nth(2)
+        .unwrap()
+        .to_owned()
+}
+
+/// Starts a group test from no `xudo` and no `xudo-agent` group at all.
+fn without_agent_groups() {
+    for group in ["xudo", "xudo-agent"] {
+        let _ = run_capture("/usr/sbin/groupdel", &[group], None);
+    }
+}
+
+#[test]
+fn enrol_creates_and_joins_the_real_groups_and_remove_leaves_them_empty() {
+    if !begin_root_test("enrol_creates_and_joins_the_real_groups_and_remove_leaves_them_empty") {
+        return;
+    }
+    without_agent_groups();
+    let machine = machine();
+    enrol(&machine, ACCOUNT).unwrap();
+    assert_eq!(members("xudo").unwrap(), [ACCOUNT]);
+    assert_eq!(members("xudo-agent").unwrap(), [ACCOUNT]);
+    // The kernel's own view: the groups a login of the account would get.
+    let groups = run_capture("/usr/bin/id", &["-Gn", ACCOUNT], None).unwrap();
+    let groups: Vec<&str> = groups.stdout.split_whitespace().collect();
+    assert!(
+        groups.contains(&"xudo") && groups.contains(&"xudo-agent"),
+        "{groups:?}"
+    );
+    assert!(
+        fs::read_to_string(REGISTRY)
+            .unwrap()
+            .contains("# xudo-joined-groups: xudo xudo-agent\n")
+    );
+    remove_agent(LABEL, &machine.real, &machine).unwrap();
+    // Out of both, and neither group is deleted.
+    assert_eq!(members("xudo").unwrap(), Vec::<String>::new());
+    assert_eq!(members("xudo-agent").unwrap(), Vec::<String>::new());
+    without_agent_groups();
+    leave_groups();
+}
+
+#[test]
+fn enrol_adds_to_an_operators_groups_without_redefining_them_and_remove_leaves_them() {
+    if !begin_root_test(
+        "enrol_adds_to_an_operators_groups_without_redefining_them_and_remove_leaves_them",
+    ) {
+        return;
+    }
+    without_agent_groups();
+    // The operator made both groups, with their own gids and members, and
+    // already put the account in `xudo`.
+    for (group, gid) in [("xudo", "4241"), ("xudo-agent", "4242")] {
+        let made = run_capture("/usr/sbin/groupadd", &["-g", gid, group], None).unwrap();
+        assert!(made.success, "{}", made.stderr);
+    }
+    for (group, member) in [
+        ("xudo", "xudotest"),
+        ("xudo-agent", "xudotest"),
+        ("xudo", ACCOUNT),
+    ] {
+        let added = run_capture("/usr/sbin/usermod", &["-aG", group, member], None).unwrap();
+        assert!(added.success, "{}", added.stderr);
+    }
+    let machine = machine();
+    enrol(&machine, ACCOUNT).unwrap();
+    assert_eq!(
+        (gid_of("xudo").as_str(), gid_of("xudo-agent").as_str()),
+        ("4241", "4242")
+    );
+    assert!(members("xudo-agent").unwrap().contains(&ACCOUNT.to_owned()));
+    assert!(
+        members("xudo-agent")
+            .unwrap()
+            .contains(&"xudotest".to_owned())
+    );
+    // Only `xudo-agent` was added by enrol, so only that is taken back.
+    assert!(
+        fs::read_to_string(REGISTRY)
+            .unwrap()
+            .contains("# xudo-joined-groups: xudo-agent\n")
+    );
+    remove_agent(LABEL, &machine.real, &machine).unwrap();
+    assert!(members("xudo").unwrap().contains(&ACCOUNT.to_owned()));
+    assert!(members("xudo").unwrap().contains(&"xudotest".to_owned()));
+    assert_eq!(members("xudo-agent").unwrap(), ["xudotest"]);
+    assert_eq!(
+        (gid_of("xudo").as_str(), gid_of("xudo-agent").as_str()),
+        ("4241", "4242")
+    );
+    without_agent_groups();
+    leave_groups();
+}
+
+#[test]
+fn a_real_sudo_lists_only_the_managed_helper_and_enrol_exempts_only_those_bytes() {
+    if !begin_root_test(
+        "a_real_sudo_lists_only_the_managed_helper_and_enrol_exempts_only_those_bytes",
+    ) {
+        return;
+    }
+    without_agent_groups();
+    let backend = detect(&HostProbe).expect("the lane installs sudo before it runs");
+    let managed = managed_snippet(Some(&backend)).unwrap();
+    let machine = machine();
+    enrol(&machine, ACCOUNT).unwrap();
+    // The passwordless line, as the later step installs it; here, by hand.
+    let snippet = "/etc/sudoers.d/xudo";
+    let hand_written = "/etc/sudoers.d/90-xudoagent";
+    let install = |text: &str| {
+        fs::write(snippet, text).unwrap();
+        fs::set_permissions(snippet, Permissions::from_mode(0o440)).unwrap();
+    };
+    let scan = || {
+        let input = Input {
+            sudo_exe: Some("/usr/bin/sudo"),
+            ..Input::default()
+        };
+        scan_account(&LiveHost, ACCOUNT, &input, Some(&managed))
+            .unwrap()
+            .blockers
+    };
+    install(&managed);
+    // The account is in `xudo-agent`, the line grants `-nopass`, and real sudo
+    // says so in its listing: that exact file is the one thing not a blocker.
+    let listing = run_capture("/usr/bin/sudo", &["-l", "-U", ACCOUNT], None).unwrap();
+    assert!(
+        listing.stdout.contains("NOPASSWD"),
+        "{}{}",
+        listing.stdout,
+        listing.stderr
+    );
+    assert_eq!(scan(), Vec::<String>::new());
+    // The same file with one byte more.
+    install(&format!("{managed}\n"));
+    assert!(!scan().is_empty());
+    // The exact file, and a hand-written line beside it.
+    install(&managed);
+    fs::write(hand_written, "%xudo-agent ALL=(ALL) ALL\n").unwrap();
+    fs::set_permissions(hand_written, Permissions::from_mode(0o440)).unwrap();
+    let blockers = scan();
+    assert!(
+        blockers.iter().any(|b| b.contains("90-xudoagent")),
+        "{blockers:?}"
+    );
+    fs::remove_file(hand_written).unwrap();
+    fs::remove_file(snippet).unwrap();
+    remove_agent(LABEL, &machine.real, &machine).unwrap();
+    without_agent_groups();
+    leave_groups();
 }

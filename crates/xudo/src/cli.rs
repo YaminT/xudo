@@ -5426,6 +5426,7 @@ expect = "deny"
                 "User=agent\n",
             ),
             env: file("/etc/xudo/agents/codex.env", "# stub\n"),
+            memberships: Vec::new(),
         }
     }
 
@@ -5672,6 +5673,7 @@ expect = "deny"
         let scan = AccountScan {
             uid: 1,
             blockers: vec![],
+            doas: false,
         };
         assert!(installer.agent_plan(&request, scan).is_err());
         assert!(installer.agent_apply(&enrol_plan()).is_err());

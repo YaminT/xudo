@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use clap::Subcommand;
-use xudo_backend::enrol::{EnrolRequest, Listed, scan_account};
+use xudo_backend::enrol::{EnrolRequest, Listed, managed_snippet, scan_account};
 use xudo_backend::paths_to_root::Input;
 use xudo_backend::{Backend, BackendKind, identify};
 use xudo_policy::ExitCode;
@@ -23,8 +23,9 @@ pub enum AgentAction {
     /// Enrol a harness that runs headless as an existing account.
     ///
     /// Needs root. Prints exactly what it will write, then writes a registry
-    /// entry, a systemd drop-in and a private environment file, and enables
-    /// `xudo-agent@<label>.service`. Refuses an account that is root, has a
+    /// entry, a systemd drop-in and a private environment file, adds the
+    /// account to the groups `xudo` and `xudo-agent` (creating them if absent),
+    /// and enables `xudo-agent@<label>.service`. Refuses an account that is root, has a
     /// password, is in a group that is root by another name, or has a sudo or
     /// doas rule of its own. Grants nothing: the harness still asks for the
     /// password for every command.
@@ -114,7 +115,10 @@ fn enrol(
         doas_exe: exe_of(|kind| matches!(kind, BackendKind::Doas)),
         doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
     };
-    let scan = match scan_account(platform.host, &request.account, &input) {
+    // The one passwordless line that is not a blocker: the snippet xudo would
+    // write itself, byte for byte. Only sudo and sudo-rs have one.
+    let managed = managed_snippet(backend.as_ref());
+    let scan = match scan_account(platform.host, &request.account, &input, managed.as_deref()) {
         Ok(scan) => scan,
         Err(refusal) => return refuse(err, &refusal.to_string()),
     };
@@ -134,8 +138,8 @@ fn enrol(
         out,
         "\nenrolled {label}: {unit} runs as {account}.\n\
          It grants nothing: no rule names this harness, so every command it asks for\n\
-         still asks for the sudo password. Put its credentials in {env} (root only),\n\
-         and add {account} to the xudo group so it can reach the broker.",
+         still asks for the sudo password. Put its credentials in {env} (root only).\n\
+         {account} is in the groups xudo and xudo-agent, so it can reach the broker.",
         label = plan.label,
         unit = plan.unit,
         account = plan.account,

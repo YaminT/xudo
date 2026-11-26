@@ -9,6 +9,7 @@
 )]
 
 use super::*;
+use crate::paths_to_root::Answer;
 use crate::paths_to_root::MemoryHost;
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
@@ -39,6 +40,7 @@ fn facts() -> Facts {
         scan: AccountScan {
             uid: 990,
             blockers: Vec::new(),
+            doas: false,
         },
     }
 }
@@ -270,7 +272,7 @@ fn enrol_refuses_an_account_with_any_sudo_rule() {
         0o440,
         b"agent ALL=(ALL) NOPASSWD: ALL\n",
     );
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&host, "agent", &Input::default(), None).unwrap();
     assert_eq!(scan.uid, 990);
     assert!(
         scan.blockers.iter().any(|line| line.contains("NOPASSWD")),
@@ -300,7 +302,7 @@ fn enrol_refuses_an_account_with_any_sudo_rule() {
         0o440,
         b"alice ALL=(ALL) NOPASSWD: ALL\n",
     );
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&host, "agent", &Input::default(), None).unwrap();
     assert_eq!(scan.blockers, Vec::<String>::new());
 }
 
@@ -315,7 +317,7 @@ fn the_scan_reports_what_it_could_not_read_as_a_blocker() {
     .dir("/etc", 0, 0, 0o755)
     .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
     .unreadable_file("/etc/sudoers", 0, 0, 0o440);
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&host, "agent", &Input::default(), None).unwrap();
     assert!(
         scan.blockers
             .iter()
@@ -375,7 +377,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/passwd", 0, 0, 0o644, passwd)
     };
-    let missing = scan_account(&host(PASSWD.as_bytes()), "ghost", &Input::default());
+    let missing = scan_account(&host(PASSWD.as_bytes()), "ghost", &Input::default(), None);
     assert_eq!(
         missing.unwrap_err(),
         Refusal::AccountUnknown("ghost".to_owned())
@@ -384,6 +386,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         &host(b"a:x:5:5::/h:/s\na:x:6:6::/h:/s\n"),
         "a",
         &Input::default(),
+        None,
     );
     assert_eq!(
         twice.unwrap_err(),
@@ -395,7 +398,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         groups: Lookup::Found(vec![]),
     });
     assert_eq!(
-        scan_account(&none, "a", &Input::default()).unwrap_err(),
+        scan_account(&none, "a", &Input::default(), None).unwrap_err(),
         Refusal::AccountUnknown("a".to_owned())
     );
 }
@@ -634,7 +637,7 @@ fn host_with(group: &str, sudoers: &[u8]) -> MemoryHost {
 
 /// What the scan says and what the plan then does, for a described host.
 fn through(host: &MemoryHost) -> (AccountScan, Result<EnrolPlan, Refusal>) {
-    let scan = scan_account(host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(host, "agent", &Input::default(), None).unwrap();
     let mut facts = facts();
     facts.group = match host.read(Path::new("/etc/group")) {
         Lookup::Found(bytes) => bytes,
@@ -805,4 +808,626 @@ fn enrol_refuses_a_world_writable_unit_directory() {
         0o777,
     );
     assert!(denied(&host).contains("Everyone"));
+}
+
+// ---- H2d: the agent groups, the managed snippet, the standing re-check ----
+
+use crate::capability::{Capability, CapabilityMatrix};
+use crate::{Backend, BackendKind};
+
+fn sudo_backend() -> Backend {
+    Backend {
+        exe: "/usr/bin/sudo".to_owned(),
+        kind: BackendKind::Sudo,
+        version: "Sudo version 1.9.17p2".to_owned(),
+        capabilities: CapabilityMatrix::from_supported([
+            Capability::DisableCredentialCache,
+            Capability::AllocatePty,
+            Capability::PerCommandDefaults,
+            Capability::DropInDirectory,
+            Capability::ValidateNamedFile,
+        ]),
+    }
+}
+
+/// The text enrol exempts: what xudo itself would write for the agent path.
+fn managed() -> String {
+    managed_snippet(Some(&sudo_backend())).unwrap()
+}
+
+/// The account is already in both agent groups, as it is once enrolled.
+const ENROLLED_GROUP: &str =
+    "root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:agent\nxudo-agent:x:997:agent\n";
+
+fn sudoers_host(group: &str, xudo_snippet: Option<&str>) -> MemoryHost {
+    let host = host_with(
+        group,
+        b"root ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n",
+    )
+    .dir("/etc/sudoers.d", 0, 0, 0o755);
+    match xudo_snippet {
+        Some(text) => host.file("/etc/sudoers.d/xudo", 0, 0, 0o440, text.as_bytes()),
+        None => host,
+    }
+}
+
+fn blockers(host: &MemoryHost, managed: Option<&str>) -> Vec<String> {
+    scan_account(host, "agent", &Input::default(), managed)
+        .unwrap()
+        .blockers
+}
+
+#[test]
+fn enrol_exempts_only_the_byte_exact_managed_snippet() {
+    let text = managed();
+    assert!(
+        text.contains("NOPASSWD"),
+        "the snippet under test has the line"
+    );
+    let exact = sudoers_host(ENROLLED_GROUP, Some(&text));
+    assert_eq!(blockers(&exact, Some(&text)), Vec::<String>::new());
+
+    // One byte more or less, and nothing is exempt.
+    for altered in [
+        format!("{text}\n"),
+        text.replacen("root", "ro0t", 1),
+        text.trim_end().to_owned(),
+    ] {
+        let host = sudoers_host(ENROLLED_GROUP, Some(&altered));
+        let found = blockers(&host, Some(&text));
+        assert!(
+            found.iter().any(|line| line.contains("NOPASSWD")),
+            "an altered snippet was exempted: {found:?}"
+        );
+    }
+    // No expected text (a doas machine, no backend): the same exact bytes are a blocker.
+    assert!(!blockers(&exact, None).is_empty());
+    // The file is absent: there is nothing to exempt, and nothing found.
+    let absent = sudoers_host(ENROLLED_GROUP, None);
+    assert_eq!(blockers(&absent, Some(&text)), Vec::<String>::new());
+    // The plan goes through on the exempt host, and the same host is refused
+    // once the file is altered.
+    let mut facts = facts();
+    facts.group = ENROLLED_GROUP.as_bytes().to_vec();
+    facts.scan = scan_account(&exact, "agent", &Input::default(), Some(&text)).unwrap();
+    plan(&request(), &facts).unwrap();
+}
+
+#[test]
+fn a_hand_written_xudo_agent_line_blocks_enrol() {
+    let text = managed();
+    let hand_written = [
+        // Asks for a password, so only a name match can find it.
+        "%xudo-agent ALL=(ALL) ALL\n",
+        "%xudo-agent ALL=(root) NOPASSWD: ALL\n",
+        // By gid.
+        "%#997 ALL=(ALL) ALL\n",
+        // The passwordless helper by its path, under any user.
+        "Cmnd_Alias G = /usr/libexec/xudo/xudo-gate-nopass \"\"\nalice ALL=(root) G\n",
+        // The account by name and by uid.
+        "agent ALL=(ALL) ALL\n",
+        "#990 ALL=(ALL) ALL\n",
+    ];
+    for line in hand_written {
+        // In a file beside the exempt snippet, in the drop-in directory...
+        let host = sudoers_host(ENROLLED_GROUP, Some(&text)).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            line.as_bytes(),
+        );
+        let found = blockers(&host, Some(&text));
+        assert!(
+            found.iter().any(|b| b.contains("/etc/sudoers.d/90-local")),
+            "{line:?} was not a blocker: {found:?}"
+        );
+        // ... and with no managed snippet at all.
+        let host = sudoers_host(ENROLLED_GROUP, None).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            line.as_bytes(),
+        );
+        assert!(!blockers(&host, Some(&text)).is_empty(), "{line:?}");
+    }
+    // Appended to /etc/sudoers itself.
+    let host = host_with(
+        ENROLLED_GROUP,
+        b"root ALL=(ALL:ALL) ALL\n%xudo-agent ALL=(ALL) ALL\n",
+    );
+    assert!(!blockers(&host, Some(&text)).is_empty());
+    // The refusal reaches the plan.
+    let mut facts = facts();
+    facts.scan = scan_account(&host, "agent", &Input::default(), Some(&text)).unwrap();
+    assert!(matches!(
+        refusal(&request(), &facts),
+        Refusal::OtherPathToRoot { .. }
+    ));
+}
+
+#[test]
+fn a_line_naming_the_group_is_not_found_by_a_substring_of_another_name() {
+    // `%xudo-agents` is some other group's line.
+    let host = sudoers_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/90-local",
+        0,
+        0,
+        0o440,
+        b"%xudo-agents ALL=(ALL) ALL\n",
+    );
+    // A superset name still contains the text; the scan errs towards refusing.
+    assert!(!blockers(&host, None).is_empty());
+}
+
+#[test]
+fn the_backend_listing_of_the_managed_helper_is_exempt_for_the_account_only() {
+    let text = managed();
+    let listing = "(root) NOPASSWD: /usr/libexec/xudo/xudo-gate-nopass \"\"";
+    let sudo = Input {
+        sudo_exe: Some("/usr/bin/sudo"),
+        ..Input::default()
+    };
+    let group =
+        "root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:agent,alice\nxudo-agent:x:997:agent\n";
+    let run = |user_listing: &[(&str, &str)], managed: Option<&str>| {
+        let mut host = sudoers_host(group, Some(&text));
+        for (user, listing) in user_listing {
+            host = host.sudo_says(user, Answer::Passwordless((*listing).to_owned()));
+        }
+        scan_account(&host, "agent", &sudo, managed)
+            .unwrap()
+            .blockers
+    };
+    // The account's own listing is the helper and nothing else.
+    assert_eq!(
+        run(&[("agent", listing)], Some(&text)),
+        Vec::<String>::new()
+    );
+    // Anything more in the listing, a blocker.
+    let more = format!("{listing}\n(root) NOPASSWD: /bin/sh");
+    assert!(!run(&[("agent", &more)], Some(&text)).is_empty());
+    assert!(!run(&[("agent", "(ALL) NOPASSWD: ALL")], Some(&text)).is_empty());
+    // A human who joined the agent group is not the account: not exempt.
+    // The scan asks about the account alone; if a listing for someone else
+    // ever reached the filter, it would not be exempt.
+    let someone_else = Finding::BackendListing {
+        user: "alice".to_owned(),
+        listing: listing.to_owned(),
+    };
+    assert!(!is_managed(&someone_else, "agent", true));
+    assert!(is_managed(
+        &Finding::BackendListing {
+            user: "agent".to_owned(),
+            listing: listing.to_owned()
+        },
+        "agent",
+        true
+    ));
+    // An empty listing is not "only the helper".
+    assert!(!is_managed(
+        &Finding::BackendListing {
+            user: "agent".to_owned(),
+            listing: String::new()
+        },
+        "agent",
+        true
+    ));
+    // Not exempt when the file is not the managed one.
+    assert!(!run(&[("agent", listing)], None).is_empty());
+}
+
+#[test]
+fn the_agent_path_refuses_doas() {
+    // Plan level: a doas machine enrols nothing.
+    let mut facts = facts();
+    facts.scan.doas = true;
+    assert_eq!(refusal(&request(), &facts), Refusal::AgentPathNeedsSudo);
+    let message = Refusal::AgentPathNeedsSudo.to_string();
+    assert!(message.contains("sudo or sudo-rs only") && message.contains("doas"));
+    // Scan level: the flag comes from the identified escalator.
+    let host = sudoers_host(GROUP, None);
+    let doas = Input {
+        doas_exe: Some("/usr/bin/doas"),
+        ..Input::default()
+    };
+    assert!(scan_account(&host, "agent", &doas, None).unwrap().doas);
+    assert!(
+        !scan_account(&host, "agent", &Input::default(), None)
+            .unwrap()
+            .doas
+    );
+    // There is no passwordless snippet for doas to exempt.
+    let doas_backend = Backend {
+        kind: BackendKind::Doas,
+        ..sudo_backend()
+    };
+    assert_eq!(managed_snippet(Some(&doas_backend)), None);
+    assert_eq!(managed_snippet(None), None);
+}
+
+#[test]
+fn enrol_joins_both_agent_groups_and_records_what_it_added() {
+    // `xudo` exists with the account in it; `xudo-agent` does not exist.
+    let planned = plan(&request(), &facts()).unwrap();
+    assert_eq!(
+        planned.memberships,
+        vec![
+            Membership {
+                group: "xudo".to_owned(),
+                create: false,
+                join: false
+            },
+            Membership {
+                group: "xudo-agent".to_owned(),
+                create: true,
+                join: true
+            },
+        ]
+    );
+    // Only the group this run added is recorded as its own.
+    assert_eq!(
+        joined_groups(&planned.registry.contents),
+        vec!["xudo-agent".to_owned()]
+    );
+    assert!(
+        planned
+            .render()
+            .contains("group xudo-agent: create the group, then add agent")
+    );
+    assert!(planned.render().contains("group xudo: already a member"));
+
+    // Neither exists, and the account is in neither: both are added.
+    let mut bare = facts();
+    bare.group = b"root:x:0:\nagent:x:990:\nalice:x:1000:\n".to_vec();
+    let planned = plan(&request(), &bare).unwrap();
+    assert!(planned.memberships.iter().all(|m| m.create && m.join));
+    assert_eq!(
+        joined_groups(&planned.registry.contents),
+        vec!["xudo".to_owned(), "xudo-agent".to_owned()]
+    );
+    assert!(
+        planned
+            .render()
+            .contains("group xudo: create the group, then add agent")
+    );
+
+    // Existing groups, the account in neither: a member is added, never a redefinition.
+    let mut existing = facts();
+    existing.group =
+        b"root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:alice\nxudo-agent:x:997:\n".to_vec();
+    let planned = plan(&request(), &existing).unwrap();
+    assert!(planned.memberships.iter().all(|m| !m.create && m.join));
+    assert!(planned.render().contains("group xudo: add agent"));
+    // Already in both: nothing is recorded, so `remove` takes nothing out.
+    let mut both = facts();
+    both.group = ENROLLED_GROUP.as_bytes().to_vec();
+    let planned = plan(&request(), &both).unwrap();
+    assert!(planned.memberships.iter().all(|m| !m.create && !m.join));
+    assert!(!planned.registry.contents.contains(JOINED_MARKER));
+    // The registry still loads with the comment in it.
+    check_loads(&plan(&request(), &existing).unwrap(), &existing).unwrap();
+}
+
+#[test]
+fn an_account_whose_primary_group_is_an_agent_group_is_already_a_member() {
+    let mut facts = facts();
+    facts.passwd = b"root:x:0:0::/root:/bin/sh\nagent:x:997:997::/h:/sbin/nologin\nalice:x:1000:1000::/h:/bin/sh\n".to_vec();
+    facts.scan.uid = 997;
+    facts.shadow = Some(b"agent:!:1::::::\n".to_vec());
+    facts.group = b"root:x:0:\nagent:x:996:\nxudo:x:998:\nxudo-agent:x:997:\n".to_vec();
+    let planned = plan(&request(), &facts).unwrap();
+    let agent = planned
+        .memberships
+        .iter()
+        .find(|m| m.group == "xudo-agent")
+        .unwrap();
+    assert!(!agent.join);
+    assert!(is_member(
+        &facts.passwd,
+        &facts.group,
+        "agent",
+        "xudo-agent"
+    ));
+    assert!(!is_member(&facts.passwd, &facts.group, "agent", "xudo"));
+    assert!(!is_member(
+        &facts.passwd,
+        &facts.group,
+        "ghost",
+        "xudo-agent"
+    ));
+    // A malformed group line is no group.
+    assert!(!is_member(&facts.passwd, b"xudo", "agent", "xudo"));
+}
+
+#[test]
+fn enrol_refuses_an_agent_group_that_shares_a_privileged_gid() {
+    for (group, alias) in [
+        ("xudo-agent:x:999:\ndocker:x:999:\n", "docker"),
+        ("xudo:x:27:\nsudo:x:27:\n", "sudo"),
+        ("xudo-agent:x:0:\n", "root"),
+    ] {
+        let mut facts = facts();
+        facts.group =
+            format!("garbage\nroot:x:0:\nagent:x:990:\nalice:x:1000:\n{group}").into_bytes();
+        let refusal = refusal(&request(), &facts);
+        assert!(
+            matches!(&refusal, Refusal::AgentGroupIsRoot { alias: a, .. } if a == alias),
+            "{group:?} gave {refusal:?}"
+        );
+        assert!(refusal.to_string().contains("joining"));
+    }
+}
+
+#[test]
+fn joined_groups_reads_only_the_agent_groups_from_a_root_written_comment() {
+    let text =
+        format!("{MANAGED_MARKER}\n{JOINED_MARKER} xudo docker xudo-agent root\nlabel = \"x\"\n");
+    assert_eq!(
+        joined_groups(&text),
+        vec!["xudo".to_owned(), "xudo-agent".to_owned()]
+    );
+    assert_eq!(joined_groups("label = \"x\"\n"), Vec::<String>::new());
+}
+
+// ---- the standing re-check, for `doctor` ----
+
+const REGISTRY_TEXT: &str = "# Managed by xudo.\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+const DROP_IN_TEXT: &str =
+    "# Managed by xudo.\n[Service]\nUser=agent\nExecStart=\"/usr/bin/codex\"\n";
+
+fn enrolled_host(group: &str, shadow: Option<&str>) -> MemoryHost {
+    sudoers_host(group, Some(&managed()))
+        .file(
+            "/etc/shadow",
+            0,
+            0,
+            0o640,
+            shadow.unwrap_or("agent:!:1::::::\n").as_bytes(),
+        )
+        .dir("/etc/xudo", 0, 0, 0o755)
+        .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+        .file(
+            "/etc/xudo/harnesses.d/codex.toml",
+            0,
+            0,
+            0o644,
+            REGISTRY_TEXT.as_bytes(),
+        )
+        .dir("/etc/systemd", 0, 0, 0o755)
+        .dir("/etc/systemd/system", 0, 0, 0o755)
+        .dir(
+            "/etc/systemd/system/xudo-agent@codex.service.d",
+            0,
+            0,
+            0o755,
+        )
+        .file(
+            "/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf",
+            0,
+            0,
+            0o644,
+            DROP_IN_TEXT.as_bytes(),
+        )
+}
+
+fn recheck(host: &MemoryHost) -> Vec<AccountReport> {
+    let text = managed();
+    recheck_accounts(host, &Input::default(), Some(&text)).unwrap()
+}
+
+#[test]
+fn recheck_finds_an_enrolled_account_clean_and_reports_nothing_for_an_empty_registry() {
+    let rows = recheck(&enrolled_host(ENROLLED_GROUP, None));
+    assert_eq!(
+        rows,
+        vec![AccountReport {
+            label: "codex".to_owned(),
+            account: "agent".to_owned(),
+            problems: Vec::new(),
+            unverified: Vec::new(),
+        }]
+    );
+    let none = sudoers_host(GROUP, None);
+    assert_eq!(recheck(&none), Vec::new());
+}
+
+#[test]
+fn recheck_reports_each_way_an_enrolled_account_can_gain_root() {
+    let text = managed();
+    let problems = |host: &MemoryHost| recheck(host).remove(0).problems.join(" | ");
+    // A sudoers line of its own.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/90-agent",
+        0,
+        0,
+        0o440,
+        b"agent ALL=(ALL) NOPASSWD: ALL\n",
+    );
+    assert!(problems(&host).contains("/etc/sudoers.d/90-agent"));
+    // The managed snippet altered by a byte.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/xudo",
+        0,
+        0,
+        0o440,
+        format!("{text}\n").as_bytes(),
+    );
+    assert!(problems(&host).contains("NOPASSWD"));
+    // A root-equivalent group.
+    let host = enrolled_host(&format!("{ENROLLED_GROUP}docker:x:999:agent\n"), None);
+    assert!(problems(&host).contains("docker"));
+    // A password.
+    let host = enrolled_host(ENROLLED_GROUP, Some("agent:$6$abc:1::::::\n"));
+    assert!(problems(&host).contains("usable password"));
+    // Uid 0 behind the same name.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/passwd",
+        0,
+        0,
+        0o644,
+        b"agent:x:0:0::/root:/bin/sh\n",
+    );
+    assert!(problems(&host).contains("is root"));
+    // The account vanished from passwd.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/passwd",
+        0,
+        0,
+        0o644,
+        b"root:x:0:0::/r:/bin/sh\n",
+    );
+    assert!(problems(&host).contains("not in /etc/passwd"));
+}
+
+#[test]
+fn recheck_reports_a_drop_in_that_could_change_who_the_unit_runs_as() {
+    let problems = |host: &MemoryHost| recheck(host).remove(0).problems.join(" | ");
+    let dir = "/etc/systemd/system/xudo-agent@codex.service.d";
+    // A second file.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/20-user.conf"),
+        0,
+        0,
+        0o644,
+        b"[Service]\nUser=root\n",
+    );
+    assert!(problems(&host).contains("holds more than 10-xudo.conf"));
+    // Our file, with another User=.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/10-xudo.conf"),
+        0,
+        0,
+        0o644,
+        b"[Service]\nUser=agent\nUser=root\n",
+    );
+    assert!(problems(&host).contains("does not run the unit as agent alone"));
+    // Not text at all.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/10-xudo.conf"),
+        0,
+        0,
+        0o644,
+        &[0xff, 0xfe],
+    );
+    assert!(problems(&host).contains("does not run the unit as agent alone"));
+    // Not root's alone.
+    let host = enrolled_host(ENROLLED_GROUP, None).dir(dir, 990, 990, 0o755);
+    assert!(problems(&host).contains("is not root's alone"));
+    // Gone.
+    let host = enrolled_host(ENROLLED_GROUP, None);
+    let missing = MemoryHost::new(Caller {
+        uid: 0,
+        gid: 0,
+        groups: Lookup::Found(vec![0]),
+    })
+    .dir("/", 0, 0, 0o755)
+    .dir("/etc", 0, 0, 0o755)
+    .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
+    .file("/etc/group", 0, 0, 0o644, ENROLLED_GROUP.as_bytes())
+    .file("/etc/shadow", 0, 0, 0o640, SHADOW.as_bytes())
+    .dir("/etc/xudo", 0, 0, 0o755)
+    .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+    .file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        REGISTRY_TEXT.as_bytes(),
+    );
+    let _ = host;
+    assert!(problems(&missing).contains("does not exist"));
+}
+
+#[test]
+fn recheck_says_so_when_the_shadow_file_or_the_registry_cannot_be_read() {
+    // Not root: shadow is not readable, and that is "unverified", not "gained root".
+    let host = enrolled_host(ENROLLED_GROUP, None).unreadable_file("/etc/shadow", 0, 0, 0o640);
+    let row = recheck(&host).remove(0);
+    assert!(row.problems.is_empty(), "{:?}", row.problems);
+    assert!(row.unverified.iter().any(|gap| gap.contains("/etc/shadow")));
+    let text = managed();
+    // An unreadable registry directory, file, or one that is not text or does not load.
+    let unreadable =
+        enrolled_host(ENROLLED_GROUP, None).unlistable_dir("/etc/xudo/harnesses.d", 0, 0, 0o755);
+    assert!(
+        recheck_accounts(&unreadable, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("cannot be read")
+    );
+    let file = enrolled_host(ENROLLED_GROUP, None).unreadable_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+    );
+    assert!(
+        recheck_accounts(&file, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("codex.toml cannot be read")
+    );
+    let binary = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        &[0xff],
+    );
+    assert!(
+        recheck_accounts(&binary, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("not UTF-8")
+    );
+    let broken = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        b"nope = 1\n",
+    );
+    assert!(recheck_accounts(&broken, &Input::default(), Some(&text)).is_err());
+    // A file that is not a registry file is skipped.
+    let other =
+        enrolled_host(ENROLLED_GROUP, None).file("/etc/xudo/harnesses.d/README", 0, 0, 0o644, b"x");
+    assert_eq!(recheck(&other).len(), 1);
+}
+
+#[test]
+fn recheck_flags_a_doas_machine_for_an_enrolled_account() {
+    let doas = Input {
+        doas_exe: Some("/usr/bin/doas"),
+        ..Input::default()
+    };
+    let rows = recheck_accounts(&enrolled_host(ENROLLED_GROUP, None), &doas, None).unwrap();
+    assert!(rows[0].problems.iter().any(|p| p.contains("doas")));
+}
+
+#[test]
+fn recheck_reports_a_drop_in_directory_it_cannot_examine() {
+    let host = enrolled_host(ENROLLED_GROUP, None).fault(
+        "/etc/systemd/system/xudo-agent@codex.service.d",
+        "permission denied",
+    );
+    let problems = recheck(&host).remove(0).problems.join(" | ");
+    assert!(problems.contains("could not examine"), "{problems}");
+    assert!(problems.contains("permission denied"), "{problems}");
+}
+
+#[test]
+fn recheck_skips_a_registry_name_that_vanished_between_the_listing_and_the_read() {
+    // A dangling link lists, and reads as missing.
+    let host = enrolled_host(ENROLLED_GROUP, None)
+        .link("/etc/xudo/harnesses.d/gone.toml", "/etc/xudo/nowhere");
+    assert_eq!(recheck(&host).len(), 1);
+}
+
+#[test]
+fn enrol_refuses_an_agent_group_with_gid_zero_even_with_no_root_group_line() {
+    let mut facts = facts();
+    facts.group = b"agent:x:990:\nxudo-agent:x:0:\n".to_vec();
+    assert!(matches!(
+        refusal(&request(), &facts),
+        Refusal::AgentGroupIsRoot { gid: 0, .. }
+    ));
 }

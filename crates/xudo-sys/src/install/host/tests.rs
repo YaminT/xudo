@@ -712,6 +712,61 @@ fn the_group_is_created_with_whichever_tool_the_distribution_has() {
     );
 }
 
+#[test]
+fn a_group_is_created_under_the_name_it_was_asked_for() {
+    let dir = scratch("group-create-name");
+    let debian = Script::new();
+    debian.reply("/usr/sbin/groupadd", 0, "");
+    ops_in(&dir, &debian).create_group("xudo-agent").unwrap();
+    assert_eq!(
+        debian.seen(),
+        [vec!["/usr/sbin/groupadd", "--system", "xudo-agent"]]
+    );
+}
+
+#[test]
+fn a_member_is_added_and_removed_with_the_absolute_group_tools() {
+    let dir = scratch("agent-members");
+    let script = Script::new();
+    script.reply("/usr/sbin/usermod", 0, "");
+    script.reply("/usr/bin/gpasswd", 0, "");
+    let ops = ops_in(&dir, &script);
+    ops.add_member("xudo-agent", "agent").unwrap();
+    ops.remove_member("xudo-agent", "agent").unwrap();
+    // `--append` is the whole point: a plain `--groups` would drop the rest.
+    assert_eq!(
+        script.seen(),
+        [
+            vec![
+                "/usr/sbin/usermod",
+                "--append",
+                "--groups",
+                "xudo-agent",
+                "agent"
+            ],
+            vec!["/usr/bin/gpasswd", "--delete", "agent", "xudo-agent"],
+        ]
+    );
+    // A tool that ran and refused, and one that is not there, are both errors
+    // that name the group and say why.
+    let refused = Script::new();
+    refused.reply("/usr/sbin/usermod", 6, "user 'agent' does not exist");
+    let text = ops_in(&dir, &refused)
+        .add_member("xudo", "agent")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("does not exist") && text.contains("xudo"),
+        "{text}"
+    );
+    let missing = Script::new();
+    let text = ops_in(&dir, &missing)
+        .remove_member("xudo", "agent")
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("/usr/bin/gpasswd"), "{text}");
+}
+
 // --- a shared file -------------------------------------------------------
 
 #[test]
