@@ -53,7 +53,10 @@ RestrictAddressFamilies=AF_UNIX
 
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID=: its filter cannot read openat2's flags, so it answers
+# every openat2 with ENOSYS, and the broker reads a peer's cgroup through
+# openat2. With it, no enrolled harness was ever attested. What it guards is
+# covered anyway: /var/lib/xudo is 0700 root and /run is nosuid.
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native

@@ -314,7 +314,6 @@ const SERVICE_KEYS: &[(&str, &[&str])] = &[
             "RestrictAddressFamilies",
             "RestrictNamespaces",
             "RestrictRealtime",
-            "RestrictSUIDSGID",
             "LockPersonality",
             "MemoryDenyWriteExecute",
             "SystemCallArchitectures",
@@ -446,12 +445,27 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     for key in [
         "RestrictNamespaces",
         "RestrictRealtime",
-        "RestrictSUIDSGID",
         "LockPersonality",
         "MemoryDenyWriteExecute",
     ] {
         assert_eq!(value(&service, "Service", key), "yes", "{key}");
     }
+}
+
+/// systemd's `RestrictSUIDSGID=` filter cannot read openat2's flags, so it
+/// answers every openat2 with ENOSYS. The broker attests a peer's cgroup
+/// through openat2 (`xudo_sys::cgroup`), so with that line no enrolled harness
+/// is ever attested: the systemd lane saw every live unit come out unattested.
+#[test]
+fn the_broker_unit_never_answers_openat2_with_enosys() {
+    let service = parse(SERVICE);
+    assert!(values(&service, "Service", "RestrictSUIDSGID").is_empty());
+    assert!(
+        SERVICE_KEYS
+            .iter()
+            .all(|(_, keys)| !keys.contains(&"RestrictSUIDSGID")),
+        "the key must stay unknown, so adding it back fails only_known_keys"
+    );
 }
 
 #[test]
