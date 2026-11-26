@@ -715,7 +715,7 @@ fi
 g1f_cleanup() {
     rm -f /etc/sudoers.d/xudo-g1f-lane-only
     for mnt in /var/lib/xudo-g1f-tree/cache/deep/m2 /var/lib/xudo-g1f-tree/mnt; do
-        if mountpoint -q "$mnt"; then umount "$mnt"; fi
+        if mountpoint -q "$mnt"; then umount "$mnt" || umount -l "$mnt" || true; fi
     done
     if [ -f /var/tmp/g1f-pam-sudo ]; then
         cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
