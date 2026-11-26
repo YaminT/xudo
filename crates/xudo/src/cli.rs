@@ -27,6 +27,7 @@ use crate::agentdoc::{self, DocFormat};
 use crate::check;
 use crate::doctor;
 use crate::exec;
+use crate::packs::{self, RulesAction};
 use crate::probe::BrokerProbe;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
@@ -290,6 +291,18 @@ pub enum Command {
         /// What to do.
         #[command(subcommand)]
         action: AgentAction,
+    },
+
+    /// Check, install, list or remove a rule pack: one rule file with a
+    /// `[pack]` header.
+    ///
+    /// `add` shows what the pack changes and installs nothing; installing
+    /// takes `--reviewed` and root, through sudo's own prompt. Nothing is
+    /// fetched and nothing updates itself.
+    Rules {
+        /// What to do.
+        #[command(subcommand)]
+        action: RulesAction,
     },
 
     /// Verify that the audit log has not been edited.
@@ -561,6 +574,7 @@ pub fn run_with_installer_at_socket(
         ),
         Command::Config { schema, action } => config(cli, *schema, action.as_ref(), out, err),
         Command::Agent { action } => agent::run(platform, installer, action, out, err),
+        Command::Rules { action } => packs::run(&cli.rules, installer, action, out, err),
         Command::Install {
             dry_run,
             show_contents,
@@ -4218,6 +4232,17 @@ expect = "deny"
                 .push(format!("remove {label}"));
             self.agent.remove.borrow_mut().take().unwrap_or_else(nobody)
         }
+
+        fn pack_add(
+            &self,
+            _request: &xudo_sys::PackRequest,
+        ) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
+            Err(xudo_sys::InstallError::NoInstaller.into())
+        }
+
+        fn pack_remove(&self, _name: &str) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
+            Err(xudo_sys::InstallError::NoInstaller.into())
+        }
     }
 
     fn report(backend: BackendKind, verification: Verification) -> InstallReport {
@@ -5680,6 +5705,30 @@ expect = "deny"
         assert!(installer.agent_list().is_err());
         assert!(installer.agent_remove("a").is_err());
         assert_eq!(installer.agent.asked.borrow().len(), 4);
+        let pack = xudo_sys::PackRequest {
+            bytes: Vec::new(),
+            reviewed: String::new(),
+        };
+        assert!(installer.pack_add(&pack).is_err());
+        assert!(installer.pack_remove("a").is_err());
+    }
+
+    #[test]
+    fn an_agent_cannot_install_a_pack_without_root() {
+        // `run_with` refuses every write; the real installer refuses a caller
+        // that is not root or that runs inside xudo.slice (see xudo_sys).
+        let fx = fixture("cli-rules-refusing");
+        let (code, out, err) = fx.run(&["rules", "add", "--reviewed", "00", "/nonexistent"]);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("cannot read /nonexistent"), "{err}");
+        let (code, _, err) = fx.run(&["rules", "remove", "x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("cannot modify the machine"), "{err}");
+        let (code, out, _) = fx.run(&["rules", "list"]);
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::Delegated, "No rule packs.\n")
+        );
     }
 
     #[test]

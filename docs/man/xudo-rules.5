@@ -759,6 +759,38 @@ or one
 of plain applet names that the deny-list accepts.
 Pin the applet; an open matcher there hands the caller every applet the list
 does not know.
+.SH PACKS
+A rule pack is a rule file with a header:
+.PP
+.EX
+[pack]
+name = "web\-ops"           # [a\-z][a\-z0\-9\-]{0,31}
+version = "1.0.0"          # [0\-9A\-Za\-z.+_\-]{1,32}
+for = ["codex"]            # harness labels; absent: none
+.EE
+.PP
+.B for
+fills the
+.B harness
+of every action and operation that does not name one.
+An action that names one may only narrow it: a label outside
+.B for
+fails to load.
+A pack with no
+.B for
+applies to no harness, so an action in it that names one fails to load.
+Every other rule still holds: a rule that names a harness must set
+.BR outcome ,
+and the dangerous shapes fail to load.
+The header's name and version enter the generation, and no two files may be
+the same pack.
+Install one with
+.BR "xudo rules add" ;
+see
+.BR xudo (1).
+An example is
+.IR rules/examples/pack\-web\-ops.toml.example
+in the source.
 .SH EXAMPLE
 From the shipped
 .IR 20\-services.toml .

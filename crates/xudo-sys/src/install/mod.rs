@@ -53,6 +53,7 @@ mod enrol;
 #[cfg(test)]
 mod fake;
 mod host;
+mod pack;
 
 use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest};
 use xudo_backend::snippet::{
@@ -65,6 +66,10 @@ pub use enrol::{
     AgentError, AgentRow, EnrolOps, Systemctl, apply_enrol, list_agents, plan_enrol, remove_agent,
 };
 pub use host::HostInstallOps;
+pub use pack::{
+    MAX_PACK_BYTES, OWN_CGROUP, PackError, PackReport, PackRequest, RULES_DIR, add_pack,
+    installed_bytes, remove_pack,
+};
 pub use xudo_backend::blocks::BlockError;
 
 use crate::exec::{HostRunner, Runner};
@@ -456,6 +461,20 @@ pub trait Installer {
     ///
     /// Whatever stopped it.
     fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError>;
+
+    /// Checks a reviewed rule pack again as root and installs it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever refused or stopped it; nothing is left changed.
+    fn pack_add(&self, request: &PackRequest) -> Result<PackReport, PackError>;
+
+    /// Removes a rule pack `pack_add` installed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever refused or stopped it; nothing is left changed.
+    fn pack_remove(&self, name: &str) -> Result<PackReport, PackError>;
 }
 
 /// The installer for a real machine: real file operations and the given probe.
@@ -501,6 +520,16 @@ impl Installer for HostInstaller<'_> {
     fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError> {
         let ops = HostInstallOps::system();
         remove_agent(label, &ops, &ops)
+    }
+
+    fn pack_add(&self, request: &PackRequest) -> Result<PackReport, PackError> {
+        let ops = HostInstallOps::system();
+        add_pack(request, std::fs::read(OWN_CGROUP), &ops, &ops)
+    }
+
+    fn pack_remove(&self, name: &str) -> Result<PackReport, PackError> {
+        let ops = HostInstallOps::system();
+        remove_pack(name, std::fs::read(OWN_CGROUP), &ops, &ops)
     }
 }
 
@@ -556,6 +585,14 @@ impl Installer for RefusingInstaller {
     }
 
     fn agent_remove(&self, _label: &str) -> Result<Vec<String>, AgentError> {
+        Err(InstallError::NoInstaller.into())
+    }
+
+    fn pack_add(&self, _request: &PackRequest) -> Result<PackReport, PackError> {
+        Err(InstallError::NoInstaller.into())
+    }
+
+    fn pack_remove(&self, _name: &str) -> Result<PackReport, PackError> {
         Err(InstallError::NoInstaller.into())
     }
 }

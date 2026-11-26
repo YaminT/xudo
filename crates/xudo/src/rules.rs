@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use xudo_policy::load_rule_files;
 use xudo_policy::{
-    HarnessFile, HarnessRegistry, RuleFile, RuleFilesError, RuleSet, RuleTest, UnregisteredLabel,
-    is_rule_file_name, load_policy_with_registry,
+    HarnessFile, HarnessRegistry, LoadedPack, RuleFile, RuleFilesError, RuleSet, RuleTest,
+    UnregisteredLabel, is_rule_file_name, load_policy_with_registry,
 };
 
 /// The default location of the root-owned rule files.
@@ -81,6 +81,7 @@ pub struct LoadedRules {
     harnesses: HarnessRegistry,
     registry_fault: Option<String>,
     unregistered: Vec<UnregisteredLabel>,
+    packs: Vec<LoadedPack>,
 }
 
 /// Every `*.toml` registry file in `dir`, or why the registry cannot be read.
@@ -173,48 +174,69 @@ impl LoadedRules {
     /// a file name or contents that are not UTF-8 or anything the policy engine
     /// rejects.
     pub fn from_dir(dir: &Path) -> Result<Self, LoadError> {
-        // Rendered with `Path::display`, which is this project's one permitted
-        // lossy conversion and only ever for text shown to a human. The bytes
-        // that are compared and hashed are the entry's own name, untouched.
-        let mut entries: Vec<(PathBuf, OsString)> = std::fs::read_dir(dir)
-            .map_err(|e| LoadError::Directory {
-                dir: dir.display().to_string(),
-                reason: e.to_string(),
-            })?
-            .filter_map(Result::ok)
-            .map(|entry| (entry.path(), entry.file_name()))
-            .filter(|(_, name)| is_rule_file_name(name.as_bytes()))
-            .collect();
-        entries.sort();
-
-        let mut files = Vec::new();
-        for (path, name) in &entries {
-            let bytes = std::fs::read(path).map_err(|e| LoadError::Read {
-                file: path.display().to_string(),
-                reason: e.to_string(),
-            })?;
-            files.push(RuleFile {
-                name: name.as_bytes().to_vec(),
-                bytes,
-            });
-        }
-
-        let harness_dir = dir.parent().unwrap_or(dir).join("harnesses.d");
-        let harness_files = read_registry(&harness_dir);
+        let (paths, files): (Vec<PathBuf>, Vec<RuleFile>) =
+            read_rule_files(dir)?.into_iter().unzip();
+        let harness_files = registry_beside(dir);
 
         let loaded =
             load_policy_with_registry(files, harness_files.as_deref().map_err(Clone::clone))?;
         let unregistered = loaded.unregistered_labels();
         Ok(Self {
             rules: loaded.rules,
-            files: entries.into_iter().map(|(path, _)| path).collect(),
+            files: paths,
             generation: loaded.generation.hex(),
             tests: loaded.tests,
             harnesses: loaded.harnesses,
             unregistered,
             registry_fault: loaded.registry_fault,
+            packs: loaded.packs,
         })
     }
+
+    /// The rule files that are packs, in load order.
+    pub fn packs(&self) -> &[LoadedPack] {
+        &self.packs
+    }
+}
+
+/// Every rule file in `dir`, by path, in the order the loader takes them.
+///
+/// # Errors
+///
+/// [`LoadError::Directory`] or [`LoadError::Read`].
+pub(crate) fn read_rule_files(dir: &Path) -> Result<Vec<(PathBuf, RuleFile)>, LoadError> {
+    // Rendered with `Path::display`, which is this project's one permitted
+    // lossy conversion and only ever for text shown to a human. The bytes
+    // that are compared and hashed are the entry's own name, untouched.
+    let mut entries: Vec<(PathBuf, OsString)> = std::fs::read_dir(dir)
+        .map_err(|e| LoadError::Directory {
+            dir: dir.display().to_string(),
+            reason: e.to_string(),
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| (entry.path(), entry.file_name()))
+        .filter(|(_, name)| is_rule_file_name(name.as_bytes()))
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|(path, name)| {
+            let bytes = std::fs::read(&path).map_err(|e| LoadError::Read {
+                file: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            let file = RuleFile {
+                name: name.as_bytes().to_vec(),
+                bytes,
+            };
+            Ok((path, file))
+        })
+        .collect()
+}
+
+/// The harness registry in the `harnesses.d` beside a rules directory.
+pub(crate) fn registry_beside(dir: &Path) -> Result<Vec<HarnessFile>, String> {
+    read_registry(&dir.parent().unwrap_or(dir).join("harnesses.d"))
 }
 
 /// Why a ruleset could not be loaded. Every variant fails closed.

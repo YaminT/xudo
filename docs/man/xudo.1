@@ -628,6 +628,44 @@ A damaged log exits
 A log that cannot be read, or a journal check that cannot run, exits
 .BR 19 .
 .TP
+.B rules
+Check, install, list or remove a rule pack: one rule file with a
+.B [pack]
+header (see
+.BR xudo\-rules (5)).
+.B rules add
+.I file
+runs as you and writes nothing: it loads the installed rules with the pack,
+runs every
+.B [[test]]
+table, requires a near-miss deny test for every harness action, refuses a
+harness nobody registered and every lint error
+.B xudo check
+reports, then prints what each harness and the password path gain and lose,
+and the pack's SHA\-256.
+Any failure refuses the pack.
+.B sudo xudo rules add \-\-reviewed
+.I sha256 file
+installs it: as root, with sudo's own prompt, it refuses a process inside
+.BR xudo.slice ,
+refuses bytes whose digest is not the reviewed one, checks everything again
+from root's own reading of
+.IR /etc/xudo ,
+and renames the pack into
+.IR /etc/xudo/rules.d/pack\-name.toml
+(root:root 0644, starting with xudo's marker).
+It never replaces a file xudo did not write.
+.B rules list
+shows each pack and whether
+.B rules add
+installed it.
+.B sudo xudo rules remove
+.I name
+removes only a pack
+.B rules add
+installed, and only if the rules left still pass.
+Nothing is fetched and nothing updates itself.
+.TP
 .B agentdoc
 Print the block that tells an agent what the loaded rules permit.
 .B \-\-format

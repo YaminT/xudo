@@ -24,7 +24,8 @@ use crate::deny_rule::{DenyClause, DenyRule};
 use crate::harness::HarnessRegistry;
 use crate::matcher::{ArgSpec, Matcher, NameKind, Repeat};
 use crate::operation::{OpKind, Operation};
-use crate::rule::{Action, ConfirmPolicy, RuleSet, RuleSetError, Source, Tier};
+use crate::pack::PackHeader;
+use crate::rule::{Action, ConfirmPolicy, ParsedFile, RuleSet, RuleSetError, Source, Tier};
 use crate::rule_test::RuleTest;
 
 /// The suffix that makes a directory entry a rule file.
@@ -91,6 +92,12 @@ pub struct HarnessFile {
 pub struct Generation([u8; 32]);
 
 impl Generation {
+    /// A generation from a finished SHA-256, for another digest that wants
+    /// the same rendering.
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     /// The whole digest, as 64 lowercase hex characters.
     ///
     /// What the front-end prints and stamps into generated agent
@@ -144,6 +151,8 @@ pub struct LoadedRuleSet {
     /// harness, and only harnesses: the rules still load, so a human keeps the
     /// password path. Recorded in audit evidence and shown by `doctor`.
     pub registry_fault: Option<String>,
+    /// The rule files that are packs, in load order.
+    pub packs: Vec<LoadedPack>,
 }
 
 /// A rule that names a harness label the registry does not have.
@@ -234,6 +243,26 @@ pub enum RuleFilesError {
     /// line it is about.
     #[error(transparent)]
     Rules(#[from] RuleSetError),
+    /// Two files are the same pack, so `xudo rules remove` could not tell
+    /// which one it means.
+    #[error("pack {name} is in both {first} and {second}")]
+    DuplicatePack {
+        /// The pack's name.
+        name: String,
+        /// The file that sorts first.
+        first: String,
+        /// The other one.
+        second: String,
+    },
+}
+
+/// A pack the ruleset was built from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedPack {
+    /// The file it is in.
+    pub file: String,
+    /// Its header.
+    pub header: PackHeader,
 }
 
 /// Builds the ruleset and its generation from rule files.
@@ -295,6 +324,7 @@ pub fn load_policy_with_registry(
     let mut deny_rules: Vec<DenyRule> = Vec::new();
     let mut operations: Vec<Operation> = Vec::new();
     let mut tests: Vec<RuleTest> = Vec::new();
+    let mut packs: Vec<LoadedPack> = Vec::new();
 
     for file in &files {
         if !is_rule_file_name(&file.name) {
@@ -309,18 +339,38 @@ pub fn load_policy_with_registry(
             file: name.to_owned(),
         })?;
 
-        let (parsed, file_tests) = RuleSet::from_toml_with_tests(name, text)?;
+        let ParsedFile {
+            rules: parsed,
+            tests: file_tests,
+            pack,
+        } = RuleSet::parse_file(name, text)?;
+        if let Some(header) = &pack {
+            if let Some(first) = packs.iter().find(|p| p.header.name == header.name) {
+                return Err(RuleFilesError::DuplicatePack {
+                    name: header.name.clone(),
+                    first: first.file.clone(),
+                    second: name.to_owned(),
+                });
+            }
+        }
 
-        // A file with no actions, deny rules, or operations is not policy, so
-        // it is not hashed: a file of tests alone must not move the generation.
-        // The operations frame is written only when the file has operations, so
-        // an action-only file keeps the generation it had before operations
-        // existed.
+        // A file with no actions, deny rules, operations, or pack header is
+        // not policy, so it is not hashed: a file of tests alone must not move
+        // the generation. The operations and pack frames are written only when
+        // present, so a file without them keeps the generation it had before
+        // they existed.
         if !parsed.actions().is_empty()
             || !parsed.deny_rules().is_empty()
             || !parsed.operations().is_empty()
+            || pack.is_some()
         {
             framed(&mut hasher, &file.name);
+            if let Some(header) = &pack {
+                framed(&mut hasher, b"pack-v1");
+                framed(&mut hasher, header.name.as_bytes());
+                framed(&mut hasher, header.version.as_bytes());
+                put_framed_list(&mut hasher, &header.harnesses);
+            }
             for action in parsed.actions() {
                 framed(&mut hasher, &policy_form(action));
             }
@@ -345,6 +395,10 @@ pub fn load_policy_with_registry(
         deny_rules.extend(parsed.deny_rules().iter().cloned());
         operations.extend(parsed.operations().iter().cloned());
         tests.extend(file_tests);
+        packs.extend(pack.map(|header| LoadedPack {
+            file: name.to_owned(),
+            header,
+        }));
         if tests.len() > MAX_TESTS {
             return Err(RuleFilesError::TooManyTests { limit: MAX_TESTS });
         }
@@ -365,7 +419,18 @@ pub fn load_policy_with_registry(
         tests,
         harnesses: registry,
         registry_fault,
+        packs,
     })
+}
+
+/// Frames a list: its length, then each entry.
+fn put_framed_list(hasher: &mut Sha256, items: &[String]) {
+    let mut out = Vec::new();
+    put_len(&mut out, items.len());
+    for item in items {
+        put(&mut out, item.as_bytes());
+    }
+    framed(hasher, &out);
 }
 
 /// Why the registry cannot be built, as the text a fault carries.

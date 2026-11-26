@@ -1,0 +1,64 @@
+# EXAMPLE rule pack. Not a shipped rule, and installed by nobody.
+#
+# A pack is one rule file with a [pack] header. `for` names the harnesses it is
+# for and fills the `harness` of every action below; an action may narrow it,
+# never widen it. Review what it changes, then install it through sudo:
+#
+#   xudo rules add pack-web-ops.toml          # checks, prints the diff and a sha256
+#   sudo xudo rules add --reviewed <sha256> pack-web-ops.toml
+#
+# It grants nothing until the harness `codex` is enrolled (`xudo agent enrol`),
+# and the passwordless gate is not armed in this release: until it is, codex
+# still asks for the sudo password like everyone else.
+
+[pack]
+name = "web-ops"
+version = "1.0.0"
+for = ["codex"]
+
+[[action]]
+id = "pack.web.restart"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+outcome = "allow"
+gtfobins-waiver = "pager and unit-file shell escapes via systemctl: the rule pins --no-pager and --no-ask-password, the verb restart and the single unit example-web.service, so no pager, no editor and no caller-written unit file is reachable through these operands"
+args = [
+  { name = "no-pager", matcher = { literal = "--no-pager" } },
+  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
+  { name = "verb", matcher = { literal = "restart" } },
+  { name = "unit", matcher = { one-of = ["example-web.service"] } },
+]
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "example-web.service",
+]
+expect = "allow"
+action = "pack.web.restart"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "restart",
+  "ssh.service",
+]
+expect = "deny"
+action = "pack.web.restart"
+reason = "near miss: one operand off the allow test, refused by the unit matcher"
+
+[[test]]
+argv = [
+  "/usr/bin/systemctl",
+  "--no-pager",
+  "--no-ask-password",
+  "stop",
+  "example-web.service",
+]
+expect = "deny"
+reason = "only restart is in the pack"

@@ -28,6 +28,7 @@ use crate::deny::{LIFECYCLE_OR_POWER_VERBS, exe_is_systemctl, unit_literal_is_re
 use crate::deny_rule::{DenyRule, MAX_DENY_RULES};
 use crate::matcher::{ArgSpec, Matcher, Repeat};
 use crate::operation::{Operation, check_operation};
+use crate::pack::{PackHeader, narrow};
 use crate::rule_test::RuleTest;
 
 /// An action's stable identifier, e.g. `xudo.svc.restart`.
@@ -284,6 +285,20 @@ struct RuleFile {
     /// policy and never reaches the compiled ruleset.
     #[serde(default)]
     test: Vec<toml::Spanned<RuleTest>>,
+    /// The header that makes the file a rule pack. See [`crate::pack`].
+    #[serde(default)]
+    pack: Option<PackHeader>,
+}
+
+/// One rule file, parsed and validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedFile {
+    /// Its actions, deny rules and operations, with a pack's `for` applied.
+    pub rules: RuleSet,
+    /// Its `[[test]]` tables.
+    pub tests: Vec<RuleTest>,
+    /// Its `[pack]` header, if it is a pack.
+    pub pack: Option<PackHeader>,
 }
 
 /// The most `[[test]]` tables one rule file may carry.
@@ -466,6 +481,28 @@ pub enum RuleSetError {
     HarnessWithoutOutcome {
         /// The offending action.
         id: String,
+        /// Where it is defined.
+        at: Source,
+    },
+    /// A `[pack]` header that is not one.
+    #[error("rule file {file}: {reason}")]
+    BadPack {
+        /// The file.
+        file: String,
+        /// What is wrong with the header.
+        reason: String,
+    },
+    /// A rule in a pack names a harness its pack's `for` does not list.
+    #[error(
+        "{kind} {id} at {at}: harness {label:?} is not in its pack's for: a rule may only narrow it"
+    )]
+    PackWidened {
+        /// `action` or `operation`.
+        kind: &'static str,
+        /// The rule.
+        id: String,
+        /// The label outside `for`.
+        label: String,
         /// Where it is defined.
         at: Source,
     },
@@ -793,18 +830,47 @@ impl RuleSet {
         file: &str,
         contents: &str,
     ) -> Result<(Self, Vec<RuleTest>), RuleSetError> {
+        Self::parse_file(file, contents).map(|parsed| (parsed.rules, parsed.tests))
+    }
+
+    /// [`Self::from_toml_with_tests`], and the file's `[pack]` header.
+    ///
+    /// A pack's `for` is applied here, before validation: an action or
+    /// operation with no `harness` takes `for`, and one that lists a label
+    /// `for` does not is refused. So everything downstream (the outcome rule,
+    /// the dangerous shapes, the generation) sees the filled-in list.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_toml`], plus [`RuleSetError::BadPack`] and
+    /// [`RuleSetError::PackWidened`].
+    pub fn parse_file(file: &str, contents: &str) -> Result<ParsedFile, RuleSetError> {
         let parsed: RuleFile = toml::from_str(contents).map_err(|e| RuleSetError::Parse {
             file: file.to_owned(),
             reason: e.to_string(),
         })?;
-        let actions = parsed
-            .action
-            .into_iter()
-            .map(|mut action| {
-                action.source = Source::new(file, line_of_id(contents, action.id.as_str()));
-                action
-            })
-            .collect();
+        if let Some(pack) = &parsed.pack {
+            pack.validate().map_err(|reason| RuleSetError::BadPack {
+                file: file.to_owned(),
+                reason,
+            })?;
+        }
+        let pack_for = parsed.pack.as_ref().map(|pack| pack.harnesses.as_slice());
+        let mut actions = Vec::with_capacity(parsed.action.len());
+        for mut action in parsed.action {
+            action.source = Source::new(file, line_of_id(contents, action.id.as_str()));
+            if let Some(pack_for) = pack_for {
+                narrow(&mut action.harness, pack_for).map_err(|label| {
+                    RuleSetError::PackWidened {
+                        kind: "action",
+                        id: action.id.as_str().to_owned(),
+                        label,
+                        at: action.source.clone(),
+                    }
+                })?;
+            }
+            actions.push(action);
+        }
         let deny_rules = parsed
             .deny
             .into_iter()
@@ -813,14 +879,21 @@ impl RuleSet {
                 deny
             })
             .collect();
-        let operations = parsed
-            .operation
-            .into_iter()
-            .map(|mut operation| {
-                operation.source = Source::new(file, line_of_id(contents, operation.id.as_str()));
-                operation
-            })
-            .collect();
+        let mut operations = Vec::with_capacity(parsed.operation.len());
+        for mut operation in parsed.operation {
+            operation.source = Source::new(file, line_of_id(contents, operation.id.as_str()));
+            if let Some(pack_for) = pack_for {
+                narrow(&mut operation.harness, pack_for).map_err(|label| {
+                    RuleSetError::PackWidened {
+                        kind: "operation",
+                        id: operation.id.as_str().to_owned(),
+                        label,
+                        at: operation.source.clone(),
+                    }
+                })?;
+            }
+            operations.push(operation);
+        }
         if parsed.test.len() > MAX_TESTS_PER_FILE {
             return Err(RuleSetError::TooManyTests {
                 file: file.to_owned(),
@@ -841,7 +914,11 @@ impl RuleSet {
                 test
             })
             .collect();
-        Ok((Self::load_all(actions, deny_rules, operations)?, tests))
+        Ok(ParsedFile {
+            rules: Self::load_all(actions, deny_rules, operations)?,
+            tests,
+            pack: parsed.pack,
+        })
     }
 
     /// Looks up an action by id.

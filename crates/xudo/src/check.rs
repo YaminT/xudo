@@ -633,7 +633,7 @@ fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
 
 /// Text from a rule file, made safe for a terminal and flagged when anything
 /// was removed.
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     let Clean { text, findings } = term_sanitize::display_str(text, LIMITS);
     if findings.is_empty() {
         return text;
