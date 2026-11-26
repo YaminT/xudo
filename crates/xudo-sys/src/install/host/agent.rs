@@ -16,6 +16,10 @@ use crate::trust::{Kind, facts_of};
 /// systemd's control program. Absolute: nothing is searched for.
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
+/// The tools that add a member to a group, and remove one. Absolute.
+const USERMOD: &str = "/usr/sbin/usermod";
+const GPASSWD: &str = "/usr/bin/gpasswd";
+
 impl HostInstallOps {
     /// `Err` unless `stat` describes a directory of the trusted owner that
     /// nobody else can write.
@@ -90,6 +94,25 @@ impl HostInstallOps {
                     Ok(bytes)
                 }
             })
+        }
+    }
+}
+
+impl HostInstallOps {
+    /// Runs a group tool; its refusal is shown to the operator, never parsed.
+    fn group_tool(&self, exe: &str, args: &[&str], group: &str) -> Result<(), InstallError> {
+        let group_error = |reason: String| InstallError::Group {
+            name: group.to_owned(),
+            reason,
+        };
+        let output = self
+            .runner
+            .run(exe, args, None)
+            .map_err(|source| group_error(format!("{exe}: {source}")))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(group_error(format!("{exe}: {}", output.stderr.trim())))
         }
     }
 }
@@ -183,6 +206,14 @@ impl EnrolOps for HostInstallOps {
         unlinkat(&dir, name, AtFlags::REMOVEDIR)
             .map_err(io("rmdir", path))
             .map(|()| Removal::Removed)
+    }
+
+    fn add_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.group_tool(USERMOD, &["--append", "--groups", group, account], group)
+    }
+
+    fn remove_member(&self, group: &str, account: &str) -> Result<(), InstallError> {
+        self.group_tool(GPASSWD, &["--delete", account, group], group)
     }
 
     fn systemctl(&self, args: &[&str]) -> Result<Systemctl, InstallError> {

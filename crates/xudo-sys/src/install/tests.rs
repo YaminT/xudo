@@ -769,6 +769,7 @@ fn agent_scan() -> xudo_backend::enrol::AccountScan {
     xudo_backend::enrol::AccountScan {
         uid: 990,
         blockers: Vec::new(),
+        doas: false,
     }
 }
 
@@ -787,6 +788,7 @@ fn agent_plan() -> xudo_backend::enrol::EnrolPlan {
         drop_in_dir: "/etc/systemd/system/xudo-agent@codex.service.d".to_owned(),
         drop_in: file("/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf"),
         env: file("/etc/xudo/agents/codex.env"),
+        memberships: Vec::new(),
     }
 }
 

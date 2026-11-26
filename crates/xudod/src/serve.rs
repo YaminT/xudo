@@ -3323,6 +3323,24 @@ fn status_outcome(
     ))
 }
 
+/// A human decision is made where the requester cannot answer it: a peer
+/// whose uid is a registered harness's account or user could be the agent
+/// itself on its own pty, so it may neither watch nor answer. With the
+/// registry unreadable nobody can be ruled out, so nobody watches.
+fn refuse_harness_uid_watcher(
+    platform: &Platform<'_>,
+    identity: &PeerIdentity,
+) -> Result<(), Refusal> {
+    let (_, harness_uid) = registry_caller_with_harness_uid(platform, identity)?;
+    match harness_uid {
+        HarnessUid::No => Ok(()),
+        HarnessUid::Yes | HarnessUid::Unknown => Err(Refusal::client(
+            RefusalCode::ChannelUntrusted,
+            "an agent harness account cannot watch or answer confirmations",
+        )),
+    }
+}
+
 fn watch(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
@@ -3334,6 +3352,7 @@ fn watch(
             "watch requires a checked terminal",
         ));
     }
+    refuse_harness_uid_watcher(platform, identity)?;
     let now = platform.clock.boottime_millis();
     save_heartbeat(platform, spool, identity, now)?;
     let watcher = crate::confirm::WatcherFacts {
@@ -3570,6 +3589,7 @@ fn answer_confirmation(
         ));
     };
     let (id, token, approve) = (id.as_str(), token.as_str(), *approve);
+    refuse_harness_uid_watcher(platform, identity)?;
     let _confirm_guard = if approve {
         None
     } else {
@@ -13287,6 +13307,88 @@ outcome = "allow"
             thaw_request(),
         );
         (served, refusal_code_written(&conn))
+    }
+
+    #[test]
+    fn an_agent_account_cannot_answer_its_own_confirmation() {
+        // The agent opens its own pty and runs a watcher as its own uid: the
+        // broker refuses it both the prompt and the answer, and the entry
+        // stays as it was.
+        for harness in [SERVICE_HARNESS, SESSION_HARNESS] {
+            let uid = if harness == SERVICE_HARNESS {
+                1500
+            } else {
+                1000
+            };
+            let mut host = thaw_host(uid, harness, &[]);
+            let mut agent = test_identity(5000, 77, 2, 34816);
+            agent.uid = uid;
+            let mut entry = shown_entry();
+            entry.caller_uid = uid;
+            let spool =
+                FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+            let before = spool.files();
+            let watched = watch(&mut host.platform(), &spool, &agent).unwrap_err();
+            assert_eq!(watched.code, RefusalCode::ChannelUntrusted);
+            for approve in [true, false] {
+                host.clock.0 = NOW + 2_000;
+                let refused = answer_confirmation(
+                    &mut host.platform(),
+                    &spool,
+                    &agent,
+                    &answer_request(NONCE, "remove", approve),
+                )
+                .unwrap_err();
+                assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            }
+            assert_eq!(spool.files(), before);
+        }
+        // A registry that cannot be loaded rules nobody out.
+        let mut host = thaw_host(1500, SERVICE_HARNESS, &[]);
+        let mut broken = host.policy.answer.clone().unwrap();
+        broken.rules.registry_fault = Some("unreadable".into());
+        host.policy.answer = Ok(broken);
+        let mut agent = test_identity(5000, 77, 2, 34816);
+        agent.uid = 2000;
+        let refused = watch(&mut host.platform(), &FakeSpool::new(), &agent).unwrap_err();
+        assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+        // So does a policy that cannot be loaded at all.
+        host.policy.answer = Err(PolicyError::PasswdUnusable);
+        let refused = watch(&mut host.platform(), &FakeSpool::new(), &agent).unwrap_err();
+        assert_ne!(refused.code, RefusalCode::ChannelUntrusted);
+        let refused = answer_confirmation(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &agent,
+            &answer_request(NONCE, "remove", true),
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_human_uid_that_is_no_harness_account_can_still_watch_and_answer() {
+        let mut host = thaw_host(1500, SERVICE_HARNESS, &[]);
+        let mut human = test_identity(5000, 77, 2, 34816);
+        human.uid = 2000;
+        let mut entry = shown_entry();
+        entry.caller_uid = 2000;
+        entry.shown_at_ms = None;
+        entry.shown_to = None;
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let response = watch(&mut host.platform(), &spool, &human).unwrap();
+        assert_eq!(watching_prompts(&response.answer).unwrap().len(), 1);
+        host.clock.0 = NOW + 2_000;
+        let answered = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &human,
+            &answer_request(NONCE, "remove", false),
+        );
+        assert_ne!(
+            answered.map_err(|refusal| refusal.code),
+            Err(RefusalCode::ChannelUntrusted)
+        );
     }
 
     #[test]

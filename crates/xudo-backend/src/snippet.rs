@@ -174,6 +174,30 @@ impl SudoersSnippet {
     }
 }
 
+/// The exact text of the passwordless snippet xudo itself would install for
+/// this backend: what enrol's scan exempts, byte for byte, and nothing else.
+/// `None` for no backend or one with no such snippet (doas).
+#[must_use]
+pub fn managed_agent_snippet(backend: Option<&Backend>) -> Option<String> {
+    backend
+        .and_then(|found| SudoersSnippet::with_agent_path(found).ok())
+        .map(|snippet| snippet.contents)
+}
+
+/// The human-only text that goes with `agent_text`: the same file without the
+/// passwordless alias, its `Defaults` line and the `%xudo-agent` rule. A test
+/// holds it byte-equal to [`SudoersSnippet::human_only`]; enrol's scan exempts
+/// that file too, since it names `%xudo` as well.
+#[must_use]
+pub fn human_only_form(agent_text: &str) -> String {
+    agent_text
+        .split_inclusive('\n')
+        .filter(|line| {
+            !line.contains("XUDO_NOPASS") && !line.starts_with(&format!("%{XUDO_AGENT_GROUP} "))
+        })
+        .collect()
+}
+
 /// The explanatory header. An operator who opens this file mid-incident should
 /// not have to guess what it is or why each directive is there.
 fn header(backend: &Backend) -> String {

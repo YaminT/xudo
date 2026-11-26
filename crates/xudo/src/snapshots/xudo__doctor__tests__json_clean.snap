@@ -187,5 +187,9 @@ expression: "render::json_of(&report)"
       "member": true
     }
   },
-  "proposals": null
+  "proposals": null,
+  "enrolled_accounts": {
+    "accounts": [],
+    "unreadable": null
+  }
 }

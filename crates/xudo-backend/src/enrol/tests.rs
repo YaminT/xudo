@@ -9,6 +9,7 @@
 )]
 
 use super::*;
+use crate::paths_to_root::Answer;
 use crate::paths_to_root::MemoryHost;
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
@@ -39,6 +40,7 @@ fn facts() -> Facts {
         scan: AccountScan {
             uid: 990,
             blockers: Vec::new(),
+            doas: false,
         },
     }
 }
@@ -270,7 +272,7 @@ fn enrol_refuses_an_account_with_any_sudo_rule() {
         0o440,
         b"agent ALL=(ALL) NOPASSWD: ALL\n",
     );
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&with_pam(host), "agent", &Input::default(), None).unwrap();
     assert_eq!(scan.uid, 990);
     assert!(
         scan.blockers.iter().any(|line| line.contains("NOPASSWD")),
@@ -300,7 +302,7 @@ fn enrol_refuses_an_account_with_any_sudo_rule() {
         0o440,
         b"alice ALL=(ALL) NOPASSWD: ALL\n",
     );
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&with_pam(host), "agent", &Input::default(), None).unwrap();
     assert_eq!(scan.blockers, Vec::<String>::new());
 }
 
@@ -315,7 +317,7 @@ fn the_scan_reports_what_it_could_not_read_as_a_blocker() {
     .dir("/etc", 0, 0, 0o755)
     .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
     .unreadable_file("/etc/sudoers", 0, 0, 0o440);
-    let scan = scan_account(&host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(&host, "agent", &Input::default(), None).unwrap();
     assert!(
         scan.blockers
             .iter()
@@ -341,7 +343,22 @@ fn the_scan_answers_as_the_account_not_as_the_host_it_runs_on() {
         inner: &host,
         uid: 990,
         gid: 990,
+        group: None,
     };
+    let joined = AsAccount {
+        group: Some(b"xudo:x:1:agent\n".to_vec()),
+        ..AsAccount {
+            inner: &host,
+            uid: 990,
+            gid: 990,
+            group: None,
+        }
+    };
+    assert_eq!(
+        joined.read(Path::new("/etc/group")),
+        Lookup::Found(b"xudo:x:1:agent\n".to_vec())
+    );
+    assert_eq!(joined.read(Path::new("/p")), Lookup::Found(b"x".to_vec()));
     let caller = account.caller();
     assert_eq!((caller.uid, caller.gid), (990, 990));
     assert_eq!(caller.groups, Lookup::Found(vec![]));
@@ -375,7 +392,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/passwd", 0, 0, 0o644, passwd)
     };
-    let missing = scan_account(&host(PASSWD.as_bytes()), "ghost", &Input::default());
+    let missing = scan_account(&host(PASSWD.as_bytes()), "ghost", &Input::default(), None);
     assert_eq!(
         missing.unwrap_err(),
         Refusal::AccountUnknown("ghost".to_owned())
@@ -384,6 +401,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         &host(b"a:x:5:5::/h:/s\na:x:6:6::/h:/s\n"),
         "a",
         &Input::default(),
+        None,
     );
     assert_eq!(
         twice.unwrap_err(),
@@ -395,7 +413,7 @@ fn the_scan_refuses_an_account_passwd_cannot_name_once() {
         groups: Lookup::Found(vec![]),
     });
     assert_eq!(
-        scan_account(&none, "a", &Input::default()).unwrap_err(),
+        scan_account(&none, "a", &Input::default(), None).unwrap_err(),
         Refusal::AccountUnknown("a".to_owned())
     );
 }
@@ -620,7 +638,7 @@ fn a_passwd_line_that_is_not_an_account_names_no_one() {
 }
 
 fn host_with(group: &str, sudoers: &[u8]) -> MemoryHost {
-    MemoryHost::new(Caller {
+    let host = MemoryHost::new(Caller {
         uid: 0,
         gid: 0,
         groups: Lookup::Found(vec![0]),
@@ -629,12 +647,45 @@ fn host_with(group: &str, sudoers: &[u8]) -> MemoryHost {
     .dir("/etc", 0, 0, 0o755)
     .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
     .file("/etc/group", 0, 0, 0o644, group.as_bytes())
-    .file("/etc/sudoers", 0, 0, 0o440, sudoers)
+    .file("/etc/sudoers", 0, 0, 0o440, sudoers);
+    with_pam(host)
 }
+
+/// The host with Debian's stock PAM stack for sudo.
+fn with_pam(host: MemoryHost) -> MemoryHost {
+    host.dir("/etc/pam.d", 0, 0, 0o755)
+        .file("/etc/pam.d/sudo", 0, 0, 0o644, DEBIAN_PAM_SUDO.as_bytes())
+        .file(
+            "/etc/pam.d/common-auth",
+            0,
+            0,
+            0o644,
+            DEBIAN_COMMON_AUTH.as_bytes(),
+        )
+        .file(
+            "/etc/pam.d/common-account",
+            0,
+            0,
+            0o644,
+            b"account required pam_unix.so\n",
+        )
+        .file(
+            "/etc/pam.d/common-session-noninteractive",
+            0,
+            0,
+            0o644,
+            b"session required pam_unix.so\n",
+        )
+}
+
+/// Debian's own `/etc/pam.d/sudo`, and its `common-auth`, which ends in
+/// `pam_permit` after a `requisite` `pam_deny`.
+const DEBIAN_PAM_SUDO: &str = "#%PAM-1.0\nsession required pam_env.so readenv=1 user_readenv=0\n@include common-auth\n@include common-account\n@include common-session-noninteractive\n";
+const DEBIAN_COMMON_AUTH: &str = "auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\nauth optional pam_cap.so\n";
 
 /// What the scan says and what the plan then does, for a described host.
 fn through(host: &MemoryHost) -> (AccountScan, Result<EnrolPlan, Refusal>) {
-    let scan = scan_account(host, "agent", &Input::default()).unwrap();
+    let scan = scan_account(host, "agent", &Input::default(), None).unwrap();
     let mut facts = facts();
     facts.group = match host.read(Path::new("/etc/group")) {
         Lookup::Found(bytes) => bytes,
@@ -737,7 +788,7 @@ fn enrol_refuses_a_rule_in_a_drop_in_or_in_doas() {
 fn a_rule_naming_someone_else_or_a_comment_is_not_the_accounts() {
     let host = host_with(
         GROUP,
-        b"# agent was here\nalice ALL=(ALL) ALL\n%xudo ALL=(root) /usr/libexec/xudo/xudo-gate-auth\nDefaults env_reset\nagentx ALL=(ALL) ALL\n",
+        b"# agent was here\nalice ALL=(ALL) ALL\n%xudoers ALL=(ALL) ALL\nDefaults env_reset\nagentx ALL=(ALL) ALL\n",
     );
     let (scan, planned) = through(&host);
     assert_eq!(scan.blockers, Vec::<String>::new());
@@ -805,4 +856,1482 @@ fn enrol_refuses_a_world_writable_unit_directory() {
         0o777,
     );
     assert!(denied(&host).contains("Everyone"));
+}
+
+// ---- H2d: the agent groups, the managed snippet, the standing re-check ----
+
+use crate::capability::{Capability, CapabilityMatrix};
+use crate::{Backend, BackendKind};
+
+fn sudo_backend() -> Backend {
+    Backend {
+        exe: "/usr/bin/sudo".to_owned(),
+        kind: BackendKind::Sudo,
+        version: "Sudo version 1.9.17p2".to_owned(),
+        capabilities: CapabilityMatrix::from_supported([
+            Capability::DisableCredentialCache,
+            Capability::AllocatePty,
+            Capability::PerCommandDefaults,
+            Capability::DropInDirectory,
+            Capability::ValidateNamedFile,
+        ]),
+    }
+}
+
+/// The text enrol exempts: what xudo itself would write for the agent path.
+fn managed() -> String {
+    managed_snippet(Some(&sudo_backend())).unwrap()
+}
+
+/// The account is already in both agent groups, as it is once enrolled.
+const ENROLLED_GROUP: &str =
+    "root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:agent\nxudo-agent:x:997:agent\n";
+
+fn sudoers_host(group: &str, xudo_snippet: Option<&str>) -> MemoryHost {
+    let host = host_with(
+        group,
+        b"root ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n",
+    )
+    .dir("/etc/sudoers.d", 0, 0, 0o755);
+    match xudo_snippet {
+        Some(text) => host.file("/etc/sudoers.d/xudo", 0, 0, 0o440, text.as_bytes()),
+        None => host,
+    }
+}
+
+fn blockers(host: &MemoryHost, managed: Option<&str>) -> Vec<String> {
+    scan_account(host, "agent", &Input::default(), managed)
+        .unwrap()
+        .blockers
+}
+
+#[test]
+fn enrol_exempts_only_the_byte_exact_managed_snippet() {
+    let text = managed();
+    assert!(
+        text.contains("NOPASSWD"),
+        "the snippet under test has the line"
+    );
+    let exact = sudoers_host(ENROLLED_GROUP, Some(&text));
+    assert_eq!(blockers(&exact, Some(&text)), Vec::<String>::new());
+
+    // One byte more or less, and nothing is exempt.
+    for altered in [
+        format!("{text}\n"),
+        text.replacen("root", "ro0t", 1),
+        text.trim_end().to_owned(),
+    ] {
+        let host = sudoers_host(ENROLLED_GROUP, Some(&altered));
+        let found = blockers(&host, Some(&text));
+        assert!(
+            found.iter().any(|line| line.contains("NOPASSWD")),
+            "an altered snippet was exempted: {found:?}"
+        );
+    }
+    // No expected text (a doas machine, no backend): the same exact bytes are a blocker.
+    assert!(!blockers(&exact, None).is_empty());
+    // The file is absent: there is nothing to exempt, and nothing found.
+    let absent = sudoers_host(ENROLLED_GROUP, None);
+    assert_eq!(blockers(&absent, Some(&text)), Vec::<String>::new());
+    // The plan goes through on the exempt host, and the same host is refused
+    // once the file is altered.
+    let mut facts = facts();
+    facts.group = ENROLLED_GROUP.as_bytes().to_vec();
+    facts.scan = scan_account(&exact, "agent", &Input::default(), Some(&text)).unwrap();
+    plan(&request(), &facts).unwrap();
+}
+
+#[test]
+fn a_hand_written_xudo_agent_line_blocks_enrol() {
+    let text = managed();
+    let hand_written = [
+        // Asks for a password, so only a name match can find it.
+        "%xudo-agent ALL=(ALL) ALL\n",
+        "%xudo-agent ALL=(root) NOPASSWD: ALL\n",
+        // By gid.
+        "%#997 ALL=(ALL) ALL\n",
+        // The passwordless helper by its path, under any user.
+        "Cmnd_Alias G = /usr/libexec/xudo/xudo-gate-nopass \"\"\nalice ALL=(root) G\n",
+        // The account by name and by uid.
+        "agent ALL=(ALL) ALL\n",
+        "#990 ALL=(ALL) ALL\n",
+    ];
+    for line in hand_written {
+        // In a file beside the exempt snippet, in the drop-in directory...
+        let host = sudoers_host(ENROLLED_GROUP, Some(&text)).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            line.as_bytes(),
+        );
+        let found = blockers(&host, Some(&text));
+        assert!(
+            found.iter().any(|b| b.contains("/etc/sudoers.d/90-local")),
+            "{line:?} was not a blocker: {found:?}"
+        );
+        // ... and with no managed snippet at all.
+        let host = sudoers_host(ENROLLED_GROUP, None).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            line.as_bytes(),
+        );
+        assert!(!blockers(&host, Some(&text)).is_empty(), "{line:?}");
+    }
+    // Appended to /etc/sudoers itself.
+    let host = host_with(
+        ENROLLED_GROUP,
+        b"root ALL=(ALL:ALL) ALL\n%xudo-agent ALL=(ALL) ALL\n",
+    );
+    assert!(!blockers(&host, Some(&text)).is_empty());
+    // The refusal reaches the plan.
+    let mut facts = facts();
+    facts.scan = scan_account(&host, "agent", &Input::default(), Some(&text)).unwrap();
+    assert!(matches!(
+        refusal(&request(), &facts),
+        Refusal::OtherPathToRoot { .. }
+    ));
+}
+
+#[test]
+fn a_line_naming_the_group_is_not_found_by_a_substring_of_another_name() {
+    // `%xudo-agents` is some other group's line.
+    let host = sudoers_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/90-local",
+        0,
+        0,
+        0o440,
+        b"%xudo-agents ALL=(ALL) ALL\n",
+    );
+    // The whole word is compared: another group's name is not the agent group's.
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+#[test]
+fn the_backend_listing_of_the_managed_helper_is_exempt_for_the_account_only() {
+    let text = managed();
+    let listing = "(root) NOPASSWD: /usr/libexec/xudo/xudo-gate-nopass \"\"";
+    let sudo = Input {
+        sudo_exe: Some("/usr/bin/sudo"),
+        ..Input::default()
+    };
+    let group =
+        "root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:agent,alice\nxudo-agent:x:997:agent\n";
+    let run = |user_listing: &[(&str, &str)], managed: Option<&str>| {
+        let mut host = sudoers_host(group, Some(&text));
+        for (user, listing) in user_listing {
+            host = host.sudo_says(user, Answer::Passwordless((*listing).to_owned()));
+        }
+        scan_account(&host, "agent", &sudo, managed)
+            .unwrap()
+            .blockers
+    };
+    // The account's own listing is the helper and nothing else.
+    assert_eq!(
+        run(&[("agent", listing)], Some(&text)),
+        Vec::<String>::new()
+    );
+    // Anything more in the listing, a blocker.
+    let more = format!("{listing}\n(root) NOPASSWD: /bin/sh");
+    assert!(!run(&[("agent", &more)], Some(&text)).is_empty());
+    assert!(!run(&[("agent", "(ALL) NOPASSWD: ALL")], Some(&text)).is_empty());
+    // A human who joined the agent group is not the account: not exempt.
+    // The scan asks about the account alone; if a listing for someone else
+    // ever reached the filter, it would not be exempt.
+    let someone_else = Finding::BackendListing {
+        user: "alice".to_owned(),
+        listing: listing.to_owned(),
+    };
+    assert!(!is_managed(&someone_else, "agent", true));
+    assert!(is_managed(
+        &Finding::BackendListing {
+            user: "agent".to_owned(),
+            listing: listing.to_owned()
+        },
+        "agent",
+        true
+    ));
+    // An empty listing is not "only the helper".
+    assert!(!is_managed(
+        &Finding::BackendListing {
+            user: "agent".to_owned(),
+            listing: String::new()
+        },
+        "agent",
+        true
+    ));
+    // Not exempt when the file is not the managed one.
+    assert!(!run(&[("agent", listing)], None).is_empty());
+}
+
+#[test]
+fn the_agent_path_refuses_doas() {
+    // Plan level: a doas machine enrols nothing.
+    let mut facts = facts();
+    facts.scan.doas = true;
+    assert_eq!(refusal(&request(), &facts), Refusal::AgentPathNeedsSudo);
+    let message = Refusal::AgentPathNeedsSudo.to_string();
+    assert!(message.contains("sudo or sudo-rs only") && message.contains("doas"));
+    // Scan level: the flag comes from the identified escalator.
+    let host = sudoers_host(GROUP, None);
+    let doas = Input {
+        doas_exe: Some("/usr/bin/doas"),
+        ..Input::default()
+    };
+    assert!(scan_account(&host, "agent", &doas, None).unwrap().doas);
+    assert!(
+        !scan_account(&host, "agent", &Input::default(), None)
+            .unwrap()
+            .doas
+    );
+    // There is no passwordless snippet for doas to exempt.
+    let doas_backend = Backend {
+        kind: BackendKind::Doas,
+        ..sudo_backend()
+    };
+    assert_eq!(managed_snippet(Some(&doas_backend)), None);
+    assert_eq!(managed_snippet(None), None);
+}
+
+#[test]
+fn enrol_joins_both_agent_groups_and_records_what_it_added() {
+    // `xudo` exists with the account in it; `xudo-agent` does not exist.
+    let planned = plan(&request(), &facts()).unwrap();
+    assert_eq!(
+        planned.memberships,
+        vec![
+            Membership {
+                group: "xudo".to_owned(),
+                create: false,
+                join: false
+            },
+            Membership {
+                group: "xudo-agent".to_owned(),
+                create: true,
+                join: true
+            },
+        ]
+    );
+    // Only the group this run added is recorded as its own.
+    assert_eq!(
+        joined_groups(&planned.registry.contents),
+        vec!["xudo-agent".to_owned()]
+    );
+    assert!(
+        planned
+            .render()
+            .contains("group xudo-agent: create the group, then add agent")
+    );
+    assert!(planned.render().contains("group xudo: already a member"));
+
+    // Neither exists, and the account is in neither: both are added.
+    let mut bare = facts();
+    bare.group = b"root:x:0:\nagent:x:990:\nalice:x:1000:\n".to_vec();
+    let planned = plan(&request(), &bare).unwrap();
+    assert!(planned.memberships.iter().all(|m| m.create && m.join));
+    assert_eq!(
+        joined_groups(&planned.registry.contents),
+        vec!["xudo".to_owned(), "xudo-agent".to_owned()]
+    );
+    assert!(
+        planned
+            .render()
+            .contains("group xudo: create the group, then add agent")
+    );
+
+    // Existing groups, the account in neither: a member is added, never a redefinition.
+    let mut existing = facts();
+    existing.group =
+        b"root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:alice\nxudo-agent:x:997:\n".to_vec();
+    let planned = plan(&request(), &existing).unwrap();
+    assert!(planned.memberships.iter().all(|m| !m.create && m.join));
+    assert!(planned.render().contains("group xudo: add agent"));
+    // Already in both: nothing is recorded, so `remove` takes nothing out.
+    let mut both = facts();
+    both.group = ENROLLED_GROUP.as_bytes().to_vec();
+    let planned = plan(&request(), &both).unwrap();
+    assert!(planned.memberships.iter().all(|m| !m.create && !m.join));
+    assert!(!planned.registry.contents.contains(JOINED_MARKER));
+    // The registry still loads with the comment in it.
+    check_loads(&plan(&request(), &existing).unwrap(), &existing).unwrap();
+}
+
+#[test]
+fn an_account_whose_primary_group_is_an_agent_group_is_already_a_member() {
+    let mut facts = facts();
+    facts.passwd = b"root:x:0:0::/root:/bin/sh\nagent:x:997:997::/h:/sbin/nologin\nalice:x:1000:1000::/h:/bin/sh\n".to_vec();
+    facts.scan.uid = 997;
+    facts.shadow = Some(b"agent:!:1::::::\n".to_vec());
+    facts.group = b"root:x:0:\nagent:x:996:\nxudo:x:998:\nxudo-agent:x:997:\n".to_vec();
+    let planned = plan(&request(), &facts).unwrap();
+    let agent = planned
+        .memberships
+        .iter()
+        .find(|m| m.group == "xudo-agent")
+        .unwrap();
+    assert!(!agent.join);
+    assert!(is_member(
+        &facts.passwd,
+        &facts.group,
+        "agent",
+        "xudo-agent"
+    ));
+    assert!(!is_member(&facts.passwd, &facts.group, "agent", "xudo"));
+    assert!(!is_member(
+        &facts.passwd,
+        &facts.group,
+        "ghost",
+        "xudo-agent"
+    ));
+    // A malformed group line is no group.
+    assert!(!is_member(&facts.passwd, b"xudo", "agent", "xudo"));
+}
+
+#[test]
+fn enrol_refuses_an_agent_group_that_shares_a_privileged_gid() {
+    for (group, alias) in [
+        ("xudo-agent:x:999:\ndocker:x:999:\n", "docker"),
+        ("xudo:x:27:\nsudo:x:27:\n", "sudo"),
+        ("xudo-agent:x:0:\n", "root"),
+    ] {
+        let mut facts = facts();
+        facts.group =
+            format!("garbage\nroot:x:0:\nagent:x:990:\nalice:x:1000:\n{group}").into_bytes();
+        let refusal = refusal(&request(), &facts);
+        assert!(
+            matches!(&refusal, Refusal::AgentGroupIsRoot { alias: a, .. } if a == alias),
+            "{group:?} gave {refusal:?}"
+        );
+        assert!(refusal.to_string().contains("joining"));
+    }
+}
+
+#[test]
+fn joined_groups_reads_only_the_agent_groups_from_a_root_written_comment() {
+    let text =
+        format!("{MANAGED_MARKER}\n{JOINED_MARKER} xudo docker xudo-agent root\nlabel = \"x\"\n");
+    assert_eq!(
+        joined_groups(&text),
+        vec!["xudo".to_owned(), "xudo-agent".to_owned()]
+    );
+    assert_eq!(joined_groups("label = \"x\"\n"), Vec::<String>::new());
+}
+
+// ---- the standing re-check, for `doctor` ----
+
+const REGISTRY_TEXT: &str = "# Managed by xudo.\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+const DROP_IN_TEXT: &str =
+    "# Managed by xudo.\n[Service]\nUser=agent\nExecStart=\"/usr/bin/codex\"\n";
+
+fn enrolled_host(group: &str, shadow: Option<&str>) -> MemoryHost {
+    sudoers_host(group, Some(&managed()))
+        .file(
+            "/etc/shadow",
+            0,
+            0,
+            0o640,
+            shadow.unwrap_or("agent:!:1::::::\n").as_bytes(),
+        )
+        .dir("/etc/xudo", 0, 0, 0o755)
+        .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+        .file(
+            "/etc/xudo/harnesses.d/codex.toml",
+            0,
+            0,
+            0o644,
+            REGISTRY_TEXT.as_bytes(),
+        )
+        .dir("/etc/systemd", 0, 0, 0o755)
+        .dir("/etc/systemd/system", 0, 0, 0o755)
+        .dir(
+            "/etc/systemd/system/xudo-agent@codex.service.d",
+            0,
+            0,
+            0o755,
+        )
+        .file(
+            "/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf",
+            0,
+            0,
+            0o644,
+            DROP_IN_TEXT.as_bytes(),
+        )
+}
+
+fn recheck(host: &MemoryHost) -> Vec<AccountReport> {
+    let text = managed();
+    recheck_accounts(host, &Input::default(), Some(&text)).unwrap()
+}
+
+#[test]
+fn recheck_finds_an_enrolled_account_clean_and_reports_nothing_for_an_empty_registry() {
+    let rows = recheck(&enrolled_host(ENROLLED_GROUP, None));
+    assert_eq!(
+        rows,
+        vec![AccountReport {
+            label: "codex".to_owned(),
+            account: "agent".to_owned(),
+            problems: Vec::new(),
+            unverified: Vec::new(),
+        }]
+    );
+    let none = sudoers_host(GROUP, None);
+    assert_eq!(recheck(&none), Vec::new());
+}
+
+#[test]
+fn recheck_reports_each_way_an_enrolled_account_can_gain_root() {
+    let text = managed();
+    let problems = |host: &MemoryHost| recheck(host).remove(0).problems.join(" | ");
+    // A sudoers line of its own.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/90-agent",
+        0,
+        0,
+        0o440,
+        b"agent ALL=(ALL) NOPASSWD: ALL\n",
+    );
+    assert!(problems(&host).contains("/etc/sudoers.d/90-agent"));
+    // The managed snippet altered by a byte.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/sudoers.d/xudo",
+        0,
+        0,
+        0o440,
+        format!("{text}\n").as_bytes(),
+    );
+    assert!(problems(&host).contains("NOPASSWD"));
+    // A root-equivalent group.
+    let host = enrolled_host(&format!("{ENROLLED_GROUP}docker:x:999:agent\n"), None);
+    assert!(problems(&host).contains("docker"));
+    // A password.
+    let host = enrolled_host(ENROLLED_GROUP, Some("agent:$6$abc:1::::::\n"));
+    assert!(problems(&host).contains("usable password"));
+    // Uid 0 behind the same name.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/passwd",
+        0,
+        0,
+        0o644,
+        b"agent:x:0:0::/root:/bin/sh\n",
+    );
+    assert!(problems(&host).contains("is root"));
+    // The account vanished from passwd.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/passwd",
+        0,
+        0,
+        0o644,
+        b"root:x:0:0::/r:/bin/sh\n",
+    );
+    assert!(problems(&host).contains("not in /etc/passwd"));
+}
+
+#[test]
+fn recheck_reports_a_drop_in_that_could_change_who_the_unit_runs_as() {
+    let problems = |host: &MemoryHost| recheck(host).remove(0).problems.join(" | ");
+    let dir = "/etc/systemd/system/xudo-agent@codex.service.d";
+    // A second file.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/20-user.conf"),
+        0,
+        0,
+        0o644,
+        b"[Service]\nUser=root\n",
+    );
+    assert!(problems(&host).contains("holds more than 10-xudo.conf"));
+    // Our file, with another User=.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/10-xudo.conf"),
+        0,
+        0,
+        0o644,
+        b"[Service]\nUser=agent\nUser=root\n",
+    );
+    assert!(problems(&host).contains("does not run the unit as agent alone"));
+    // Not text at all.
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        &format!("{dir}/10-xudo.conf"),
+        0,
+        0,
+        0o644,
+        &[0xff, 0xfe],
+    );
+    assert!(problems(&host).contains("does not run the unit as agent alone"));
+    // Not root's alone.
+    let host = enrolled_host(ENROLLED_GROUP, None).dir(dir, 990, 990, 0o755);
+    assert!(problems(&host).contains("is not root's alone"));
+    // Gone.
+    let host = enrolled_host(ENROLLED_GROUP, None);
+    let missing = MemoryHost::new(Caller {
+        uid: 0,
+        gid: 0,
+        groups: Lookup::Found(vec![0]),
+    })
+    .dir("/", 0, 0, 0o755)
+    .dir("/etc", 0, 0, 0o755)
+    .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
+    .file("/etc/group", 0, 0, 0o644, ENROLLED_GROUP.as_bytes())
+    .file("/etc/shadow", 0, 0, 0o640, SHADOW.as_bytes())
+    .dir("/etc/xudo", 0, 0, 0o755)
+    .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+    .file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        REGISTRY_TEXT.as_bytes(),
+    );
+    let _ = host;
+    assert!(problems(&missing).contains("does not exist"));
+}
+
+#[test]
+fn recheck_says_so_when_the_shadow_file_or_the_registry_cannot_be_read() {
+    // Not root: shadow is not readable, and that is "unverified", not "gained root".
+    let host = enrolled_host(ENROLLED_GROUP, None).unreadable_file("/etc/shadow", 0, 0, 0o640);
+    let row = recheck(&host).remove(0);
+    assert!(row.problems.is_empty(), "{:?}", row.problems);
+    assert!(row.unverified.iter().any(|gap| gap.contains("/etc/shadow")));
+    let text = managed();
+    // An unreadable registry directory, file, or one that is not text or does not load.
+    let unreadable =
+        enrolled_host(ENROLLED_GROUP, None).unlistable_dir("/etc/xudo/harnesses.d", 0, 0, 0o755);
+    assert!(
+        recheck_accounts(&unreadable, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("cannot be read")
+    );
+    let file = enrolled_host(ENROLLED_GROUP, None).unreadable_file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+    );
+    assert!(
+        recheck_accounts(&file, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("codex.toml cannot be read")
+    );
+    let binary = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        &[0xff],
+    );
+    assert!(
+        recheck_accounts(&binary, &Input::default(), Some(&text))
+            .unwrap_err()
+            .contains("not UTF-8")
+    );
+    let broken = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/xudo/harnesses.d/codex.toml",
+        0,
+        0,
+        0o644,
+        b"nope = 1\n",
+    );
+    assert!(recheck_accounts(&broken, &Input::default(), Some(&text)).is_err());
+    // A file that is not a registry file is skipped.
+    let other =
+        enrolled_host(ENROLLED_GROUP, None).file("/etc/xudo/harnesses.d/README", 0, 0, 0o644, b"x");
+    assert_eq!(recheck(&other).len(), 1);
+}
+
+#[test]
+fn recheck_flags_a_doas_machine_for_an_enrolled_account() {
+    let doas = Input {
+        doas_exe: Some("/usr/bin/doas"),
+        ..Input::default()
+    };
+    let rows = recheck_accounts(&enrolled_host(ENROLLED_GROUP, None), &doas, None).unwrap();
+    assert!(rows[0].problems.iter().any(|p| p.contains("doas")));
+}
+
+#[test]
+fn recheck_reports_a_drop_in_directory_it_cannot_examine() {
+    let host = enrolled_host(ENROLLED_GROUP, None).fault(
+        "/etc/systemd/system/xudo-agent@codex.service.d",
+        "permission denied",
+    );
+    let problems = recheck(&host).remove(0).problems.join(" | ");
+    assert!(problems.contains("could not examine"), "{problems}");
+    assert!(problems.contains("permission denied"), "{problems}");
+}
+
+#[test]
+fn recheck_skips_a_registry_name_that_vanished_between_the_listing_and_the_read() {
+    // A dangling link lists, and reads as missing.
+    let host = enrolled_host(ENROLLED_GROUP, None)
+        .link("/etc/xudo/harnesses.d/gone.toml", "/etc/xudo/nowhere");
+    assert_eq!(recheck(&host).len(), 1);
+}
+
+#[test]
+fn enrol_refuses_an_agent_group_with_gid_zero_even_with_no_root_group_line() {
+    let mut facts = facts();
+    facts.group = b"agent:x:990:\nxudo-agent:x:0:\n".to_vec();
+    assert!(matches!(
+        refusal(&request(), &facts),
+        Refusal::AgentGroupIsRoot { gid: 0, .. }
+    ));
+}
+
+// ---- H2d review: the account is judged as the agent it is about to be ----
+
+/// Neither agent group lists the account yet: it is not a member of either.
+const NOT_YET: &str = "root:x:0:\nagent:x:990:\nalice:x:1000:\nxudo:x:998:\nxudo-agent:x:997:\n";
+
+fn not_yet_host(extra: &str) -> MemoryHost {
+    sudoers_host(NOT_YET, None).file("/etc/sudoers.d/90-local", 0, 0, 0o440, extra.as_bytes())
+}
+
+#[test]
+fn denies_enrol_when_a_rule_for_group_xudo_would_hand_the_agent_root() {
+    let blocked = blockers(&not_yet_host("%xudo ALL=(ALL) NOPASSWD: ALL\n"), None);
+    assert!(
+        blocked.iter().any(|line| line.contains("90-local line 1")),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn denies_enrol_when_a_rule_names_the_xudo_gid_the_agent_will_hold() {
+    for rule in [
+        "%#998 ALL=(ALL) NOPASSWD: ALL\n",
+        "%#997 ALL=(ALL) NOPASSWD: ALL\n",
+    ] {
+        let blocked = blockers(&not_yet_host(rule), None);
+        assert!(!blocked.is_empty(), "{rule}: {blocked:?}");
+    }
+    // The whole gid, not a prefix of a longer one.
+    let other = blockers(&not_yet_host("%#9981 ALL=(ALL) NOPASSWD: ALL\n"), None);
+    assert_eq!(other, Vec::<String>::new());
+}
+
+#[test]
+fn denies_enrol_when_a_root_trusted_directory_is_writable_by_the_group_the_agent_will_join() {
+    // The unit directory is writable by group `xudo` (gid 998), which lists
+    // nobody yet; the agent holds it the moment enrol adds it.
+    for gid in [998, 997] {
+        let host = host_with(
+            NOT_YET,
+            b"root ALL=(ALL:ALL) ALL
+",
+        )
+        .dir("/etc/systemd", 0, 0, 0o755)
+        .dir("/etc/systemd/system", 0, gid, 0o775);
+        let blocked = blockers(&host, None);
+        assert!(
+            blocked.iter().any(|line| line.contains("Writable")),
+            "gid {gid}: {blocked:?}"
+        );
+    }
+    // A group the account never joins is still not its own.
+    let other = "root:x:0:\nagent:x:990:\nxudo:x:998:\nxudo-agent:x:997:\nops:x:2000:\n";
+    let host = host_with(other, b"root ALL=(ALL:ALL) ALL\n")
+        .dir("/etc/systemd", 0, 0, 0o755)
+        .dir("/etc/systemd/system", 0, 2000, 0o775);
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+#[test]
+fn denies_enrol_for_a_user_alias_that_expands_to_the_agent_groups() {
+    let blocked = blockers(
+        &not_yet_host("User_Alias A = %xudo\nA ALL=(ALL) NOPASSWD: ALL\n"),
+        None,
+    );
+    assert!(!blocked.is_empty(), "{blocked:?}");
+}
+
+#[test]
+fn enrol_exempts_the_shipped_human_only_snippet_and_nothing_else() {
+    let agent_text = managed();
+    let human_text = crate::snippet::SudoersSnippet::human_only(&sudo_backend())
+        .unwrap()
+        .contents;
+    // The derivation the scan uses is the shipped text, byte for byte.
+    assert_eq!(crate::snippet::human_only_form(&agent_text), human_text);
+    assert!(human_text.contains("%xudo ALL=(root) PASSWD"));
+    let shipped = sudoers_host(NOT_YET, Some(&human_text));
+    assert_eq!(blockers(&shipped, Some(&agent_text)), Vec::<String>::new());
+    // One byte more, and the `%xudo` line is a blocker again.
+    let altered = sudoers_host(NOT_YET, Some(&format!("{human_text}\n")));
+    assert!(!blockers(&altered, Some(&agent_text)).is_empty());
+}
+
+#[test]
+fn enrol_trusts_the_managed_file_only_when_it_is_root_s_regular_file() {
+    let text = managed();
+    let base =
+        || host_with(NOT_YET, b"root ALL=(ALL:ALL) ALL\n").dir("/etc/sudoers.d", 0, 0, 0o755);
+    let good = base().file("/etc/sudoers.d/xudo", 0, 0, 0o440, text.as_bytes());
+    assert_eq!(blockers(&good, Some(&text)), Vec::<String>::new());
+    for (uid, mode) in [(1000, 0o440), (0, 0o464), (0, 0o442)] {
+        let host = base().file("/etc/sudoers.d/xudo", uid, 0, mode, text.as_bytes());
+        assert!(
+            !blockers(&host, Some(&text)).is_empty(),
+            "uid {uid} mode {mode:o}"
+        );
+    }
+    let link = base()
+        .file("/elsewhere", 0, 0, 0o440, text.as_bytes())
+        .link("/etc/sudoers.d/xudo", "/elsewhere");
+    assert!(!blockers(&link, Some(&text)).is_empty());
+}
+
+// ---- PAM: the agent will be in `xudo`, so it can reach the password gate ----
+
+fn pam_host(sudo: &str, common_auth: Option<&str>) -> MemoryHost {
+    let host = sudoers_host(NOT_YET, None).file("/etc/pam.d/sudo", 0, 0, 0o644, sudo.as_bytes());
+    match common_auth {
+        Some(text) => host.file("/etc/pam.d/common-auth", 0, 0, 0o644, text.as_bytes()),
+        None => host,
+    }
+}
+
+#[test]
+fn denies_enrol_when_pam_can_pass_sudo_without_the_password() {
+    for line in [
+        "auth sufficient pam_ssh_agent_auth.so file=%h/.ssh/authorized_keys",
+        "auth sufficient /lib/security/pam_u2f.so",
+        "auth required pam_u2f.so",
+        "auth sufficient pam_rhosts.so",
+        "auth sufficient pam_permit.so",
+        "auth [success=done default=ignore] pam_permit.so",
+        "auth sufficient pam_succeed_if.so user = agent",
+        "auth sufficient pam_exec.so /usr/bin/true",
+        "-auth [success=2 default=ignore] pam_listfile.so item=user sense=allow file=/etc/ok onerr=fail",
+        "auth [success=1 default=ignore] pam_ssh_agent_auth.so file=%h/.ssh/authorized_keys",
+        "auth [success=1 default=ignore] pam_u2f.so",
+        "auth [success=1 default=ignore] pam_permit.so",
+        "auth [default=ignore success=done] pam_rssh.so",
+        "auth [success=2 default=ignore] pam_rssh.so",
+        "auth [default=ignore\tsuccess=1]\tpam_rssh.so",
+        "auth sufficient pam_sss.so",
+        "auth [success=ok default=ignore] pam_krb5.so",
+    ] {
+        let sudo = format!("#%PAM-1.0\n{line}\n@include common-auth\n");
+        let blocked = blockers(&pam_host(&sudo, Some(DEBIAN_COMMON_AUTH)), None);
+        assert!(
+            blocked
+                .iter()
+                .any(|found| found.contains("/etc/pam.d/sudo line 2")),
+            "{line}: {blocked:?}"
+        );
+    }
+}
+
+#[test]
+fn denies_a_bracket_control_that_skips_the_deny_line() {
+    // The `pam-auth-update` shape: the success jumps over `pam_deny`.
+    for module in [
+        "pam_ssh_agent_auth.so file=%h/.ssh/authorized_keys",
+        "pam_u2f.so",
+        "pam_permit.so",
+    ] {
+        let sudo = format!(
+            "auth [success=1 default=ignore] {module}\nauth requisite pam_deny.so\nauth required pam_permit.so\n"
+        );
+        let blocked = blockers(&pam_host(&sudo, None), None);
+        assert!(
+            blocked.iter().any(|found| found.contains("line 1")),
+            "{module}: {blocked:?}"
+        );
+    }
+}
+
+#[test]
+fn denies_a_pam_include_spelled_in_another_case() {
+    let sudo = "auth Include common-auth\nAuth SUBSTACK common-auth\n";
+    let blocked = blockers(&pam_host(sudo, Some("auth sufficient pam_u2f.so\n")), None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line.contains("common-auth line 1")),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn allows_pam_permit_after_a_requisite_pam_deny() {
+    let sudo = "auth [success=1 default=ignore] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n";
+    assert_eq!(blockers(&pam_host(sudo, None), None), Vec::<String>::new());
+}
+
+#[test]
+fn reads_pam_other_when_the_service_has_no_auth_line() {
+    // libpam answers for a service with no `auth` line from `other`.
+    let host = pam_host("session required pam_env.so\n", None).file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o644,
+        b"auth sufficient pam_permit.so\n",
+    );
+    let blocked = blockers(&host, None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line.contains("/etc/pam.d/other line 1")),
+        "{blocked:?}"
+    );
+    // An unreadable `other` is a blocker; a stock one is not.
+    let host = pam_host("auth required pam_unix.so\n", None).unreadable_file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o600,
+    );
+    assert!(!blockers(&host, None).is_empty());
+    let host = pam_host("auth required pam_unix.so\n", None).file(
+        "/etc/pam.d/other",
+        0,
+        0,
+        0o644,
+        b"auth required pam_deny.so\n",
+    );
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+#[test]
+fn refuses_enrol_when_pam_includes_nest_too_deep_to_read() {
+    let mut host = pam_host("auth include p0\n", None);
+    for n in 0..12 {
+        host = host.file(
+            &format!("/etc/pam.d/p{n}"),
+            0,
+            0,
+            0o644,
+            format!("auth include p{}\n", n + 1).as_bytes(),
+        );
+    }
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|line| line.contains("nest deeper than 8"))
+    );
+}
+
+#[test]
+fn reads_the_sudo_i_pam_service_too() {
+    let host = pam_host("auth include common-auth\n", Some(DEBIAN_COMMON_AUTH)).file(
+        "/etc/pam.d/sudo-i",
+        0,
+        0,
+        0o644,
+        b"auth sufficient pam_u2f.so\n",
+    );
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|line| line.contains("/etc/pam.d/sudo-i line 1"))
+    );
+}
+
+#[test]
+fn a_rule_naming_a_gid_enrol_has_yet_to_allocate_blocks() {
+    // Neither group exists, so `groupadd --system` picks the gid a leftover
+    // `%#996` already names.
+    let none = "root:x:0:\nagent:x:990:\nalice:x:1000:\n";
+    for rule in [
+        "%#996 ALL=(ALL) NOPASSWD: ALL",
+        "%996 ALL=(ALL) NOPASSWD: ALL",
+        "%:#996 ALL=(ALL) NOPASSWD: ALL",
+        "%:996 ALL=(ALL) NOPASSWD: ALL",
+    ] {
+        let host = sudoers_host(none, None).file(
+            "/etc/sudoers.d/90-local",
+            0,
+            0,
+            0o440,
+            format!("{rule}\n").as_bytes(),
+        );
+        assert!(
+            blockers(&host, None)
+                .iter()
+                .any(|line| line.contains("90-local line 1")),
+            "{rule}"
+        );
+    }
+    // Both groups allocated: a numeric group is judged by its gid.
+    let host = not_yet_host("%#4242 ALL=(ALL) ALL\n");
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+#[test]
+fn denies_enrol_when_an_included_pam_file_hides_the_module() {
+    let sudo = "auth include common-auth\n@include common-account\n@include common-session-noninteractive\n";
+    let bad = "auth sufficient pam_u2f.so\n";
+    let blocked = blockers(&pam_host(sudo, Some(bad)), None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line.contains("/etc/pam.d/common-auth line 1")),
+        "{blocked:?}"
+    );
+    // An include loop ends, as a blocker.
+    let sudo = "auth include common-auth\n";
+    let blocked = blockers(&pam_host(sudo, Some("auth include sudo\n")), None);
+    assert!(
+        blocked
+            .iter()
+            .any(|line| line == "could not examine /etc/pam.d/sudo: it includes itself"),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn enrol_refuses_when_sudos_pam_stack_cannot_be_read() {
+    let missing = sudoers_host(NOT_YET, None).file("/etc/pam.d/sudo", 0, 0, 0o644, b"");
+    assert_eq!(blockers(&missing, None), Vec::<String>::new());
+    let host = host_with(NOT_YET, b"").unreadable_file("/etc/pam.d/sudo", 0, 0, 0o600);
+    let blocked = blockers(&host, None);
+    assert!(
+        blocked.iter().any(|l| l.contains("/etc/pam.d/sudo")),
+        "{blocked:?}"
+    );
+    let host = pam_host("@include nowhere\n", None);
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|l| l.contains("/etc/pam.d/nowhere: no such file"))
+    );
+    let binary = pam_host("", None).file("/etc/pam.d/sudo", 0, 0, 0o644, &[0xff, 0xfe]);
+    assert!(
+        blockers(&binary, None)
+            .iter()
+            .any(|l| l.contains("not text"))
+    );
+    // No PAM directory at all: nothing says how sudo authenticates.
+    let bare = MemoryHost::new(Caller {
+        uid: 0,
+        gid: 0,
+        groups: Lookup::Found(vec![0]),
+    })
+    .dir("/", 0, 0, 0o755)
+    .dir("/etc", 0, 0, 0o755)
+    .file("/etc/passwd", 0, 0, 0o644, PASSWD.as_bytes())
+    .file("/etc/group", 0, 0, 0o644, NOT_YET.as_bytes());
+    assert!(
+        blockers(&bare, None)
+            .iter()
+            .any(|l| l.contains("/etc/pam.d/sudo: no such file"))
+    );
+}
+
+/// A host whose PAM files are exactly the Debian base plus `files`, by name in
+/// `/etc/pam.d` or by absolute path.
+fn pam_files(files: &[(&str, &str)]) -> MemoryHost {
+    let host = sudoers_host(NOT_YET, None)
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/lib", 0, 0, 0o755)
+        .dir("/usr/lib/pam.d", 0, 0, 0o755);
+    files.iter().fold(host, |host, (name, text)| {
+        let path = if name.starts_with('/') {
+            (*name).to_owned()
+        } else {
+            format!("/etc/pam.d/{name}")
+        };
+        host.file(&path, 0, 0, 0o644, text.as_bytes())
+    })
+}
+
+/// Debian 13's `/etc/pam.d/sudo` and `sudo-i`, as the sudo package ships them.
+const DEBIAN_SUDO: &str = "#%PAM-1.0
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+session    required   pam_env.so readenv=1 user_readenv=0
+session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
+
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+";
+const DEBIAN_SUDO_I: &str = "#%PAM-1.0
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+session    required   pam_env.so readenv=1 user_readenv=0
+session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
+
+@include common-auth
+@include common-account
+@include common-session
+";
+/// What `pam-auth-update` writes on Debian 13 with only `pam_unix`.
+const DEBIAN_STOCK_COMMON_AUTH: &str = "#
+# /etc/pam.d/common-auth - authentication settings common to all services
+#
+# As of pam 1.0.1-6, this file is managed by pam-auth-update by default.
+
+# here are the per-package modules (the \"Primary\" block)
+auth\t[success=1 default=ignore]\tpam_unix.so nullok
+# here's the fallback if no module succeeds
+auth\trequisite\t\t\tpam_deny.so
+# prime the stack with a positive return value if there isn't one already;
+# this avoids us returning an error just because nothing sets a success code
+# since the modules above will each just jump around
+auth\trequired\t\t\tpam_permit.so
+# and here are more per-package modules (the \"Additional\" block)
+# end of pam-auth-update config
+";
+/// Ubuntu 24.04's and 26.04's: the same, and `pam_cap` after it.
+const UBUNTU_STOCK_COMMON_AUTH: &str = "# here are the per-package modules (the \"Primary\" block)
+auth\t[success=1 default=ignore]\tpam_unix.so nullok
+# here's the fallback if no module succeeds
+auth\trequisite\t\t\tpam_deny.so
+auth\trequired\t\t\tpam_permit.so
+# and here are more per-package modules (the \"Additional\" block)
+auth\toptional\t\t\tpam_cap.so 
+# end of pam-auth-update config
+";
+const DEBIAN_OTHER: &str = "#
+# /etc/pam.d/other - specify the PAM fallback behaviour
+#
+#used.  If you really want nothing to happen then use pam_permit.so or
+#pam_deny.so as appropriate.
+
+# We fall back to the system default in /etc/pam.d/common-*
+# 
+
+@include common-auth
+@include common-account
+@include common-password
+@include common-session
+";
+const DEBIAN_COMMON_REST: [(&str, &str); 3] = [
+    (
+        "common-password",
+        "password\t[success=1 default=ignore]\tpam_unix.so obscure yescrypt\npassword\trequisite\t\t\tpam_deny.so\npassword\trequired\t\t\tpam_permit.so\n",
+    ),
+    (
+        "common-session",
+        "session\t[default=1]\t\t\tpam_permit.so\nsession\trequisite\t\t\tpam_deny.so\nsession\trequired\t\t\tpam_permit.so\nsession\trequired\tpam_unix.so \nsession\toptional\tpam_systemd.so \n",
+    ),
+    (
+        "common-account",
+        "account\t[success=1 new_authtok_reqd=done default=ignore]\tpam_unix.so \naccount\trequisite\t\t\tpam_deny.so\naccount\trequired\t\t\tpam_permit.so\n",
+    ),
+];
+/// RHEL's and Fedora's `/etc/pam.d/sudo` and `sudo-i`.
+const RHEL_SUDO: &str = "#%PAM-1.0
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    optional     pam_keyinit.so revoke
+session    required     pam_limits.so
+session    include      system-auth
+";
+const RHEL_SUDO_I: &str = "#%PAM-1.0
+auth       include      sudo
+account    include      sudo
+password   include      sudo
+session    optional     pam_keyinit.so force revoke
+session    include      sudo
+";
+/// authselect's `local` profile (Fedora 40, RHEL 10).
+const RHEL_LOCAL_SYSTEM_AUTH: &str = "# Generated by authselect
+# Do not modify this file manually, use authselect instead. Any user changes will be destroyed.
+# For more information see authselect(8).
+
+auth        required                                     pam_env.so
+auth        required                                     pam_faildelay.so delay=2000000
+auth        sufficient                                   pam_unix.so nullok
+auth        required                                     pam_deny.so
+
+account     required                                     pam_unix.so
+
+password    sufficient                                   pam_unix.so yescrypt shadow nullok use_authtok
+password    required                                     pam_deny.so
+
+session     optional                                     pam_keyinit.so revoke
+session     required                                     pam_limits.so
+-session    optional                                     pam_systemd.so
+session     [success=1 default=ignore]                   pam_succeed_if.so service in crond quiet use_uid
+session     required                                     pam_unix.so
+";
+/// authselect's user-type checks (RHEL 8 and 9), without a remote module.
+const RHEL_USERTYPE_SYSTEM_AUTH: &str =
+    "auth        required                                     pam_env.so
+auth        required                                     pam_faildelay.so delay=2000000
+auth        [default=1 ignore=ignore success=ok]         pam_usertype.so isregular
+auth        [default=1 ignore=ignore success=ok]         pam_localuser.so
+auth        sufficient                                   pam_unix.so nullok try_first_pass
+auth        requisite                                    pam_succeed_if.so uid >= 1000 quiet_success
+auth        required                                     pam_deny.so
+";
+
+#[test]
+fn accepts_the_stock_debian_ubuntu_and_rhel_pam_stacks() {
+    let debian = |common_auth: &'static str| {
+        let mut files = vec![
+            ("sudo", DEBIAN_SUDO),
+            ("sudo-i", DEBIAN_SUDO_I),
+            ("other", DEBIAN_OTHER),
+            ("common-auth", common_auth),
+        ];
+        files.extend(DEBIAN_COMMON_REST);
+        files
+    };
+    let rhel = |system_auth: &'static str| {
+        vec![
+            ("sudo", RHEL_SUDO),
+            ("sudo-i", RHEL_SUDO_I),
+            (
+                "other",
+                "#%PAM-1.0\nauth     required       pam_deny.so\naccount  required       pam_deny.so\npassword required       pam_deny.so\nsession  required       pam_deny.so\n",
+            ),
+            ("system-auth", system_auth),
+        ]
+    };
+    for (name, files) in [
+        ("debian 13", debian(DEBIAN_STOCK_COMMON_AUTH)),
+        ("ubuntu 24.04 and 26.04", debian(UBUNTU_STOCK_COMMON_AUTH)),
+        ("rhel local", rhel(RHEL_LOCAL_SYSTEM_AUTH)),
+        ("rhel user types", rhel(RHEL_USERTYPE_SYSTEM_AUTH)),
+    ] {
+        assert_eq!(
+            blockers(&pam_files(&files), None),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn accepts_the_other_spellings_of_a_recognized_stack() {
+    for sudo in [
+        // Words in any case, a `-` before the type, a jump of more than one.
+        "AUTH Sufficient pam_unix.so\n-auth REQUIRED pam_deny.so\n",
+        "auth [success=2 default=ignore] pam_unix.so\nauth [default=ignore success=done] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n",
+        "auth [success=ok default=ignore] pam_unix.so\nauth requisite pam_deny.so\n",
+        // `required` spelled out, a continued line, a comment after a line.
+        "auth [success=ok new_authtok_reqd=ok ignore=ignore default=bad] pam_unix.so\n",
+        "auth \\\n# note\n\n   requisite pam_deny.so # the end \\\n",
+        // Each allowed module in an allowed control.
+        "auth optional pam_env.so\nauth requisite pam_nologin.so\nauth optional pam_limits.so\nauth optional pam_systemd.so\nauth optional pam_keyinit.so\nauth optional pam_loginuid.so\nauth optional pam_localuser.so\nauth required pam_usertype.so\nauth requisite pam_succeed_if.so uid >= 1000\nauth sufficient pam_deny.so\nauth required pam_deny.so\n",
+        // `@include` in any case, after spaces, with a tab.
+        "   @INCLUDE\tcommon-auth\n",
+        "-auth include common-auth\n",
+    ] {
+        let host = pam_files(&[("sudo", sudo), ("common-auth", DEBIAN_STOCK_COMMON_AUTH)]);
+        assert_eq!(blockers(&host, None), Vec::<String>::new(), "{sudo:?}");
+    }
+    // No `sudo-i` and no `other` anywhere: libpam cannot start `sudo -i`.
+    let host = pam_files(&[("sudo", "auth required pam_unix.so\n")]);
+    assert_eq!(blockers(&host, None), Vec::<String>::new());
+}
+
+/// Each `(files, blocker)`: `files` passed real libpam 1.5.3 with no password,
+/// or is a spelling libpam reads differently from how it looks, and the scan
+/// must refuse it with exactly `blocker` among its findings.
+#[test]
+fn refuses_every_pam_stack_that_libpam_passed_without_a_password() {
+    const PERMIT: &str = "`pam_permit` without a `requisite pam_deny` before it";
+    let sudo = |line: u32, why: &str| {
+        format!("/etc/pam.d/sudo line {line}: PAM stack not recognized: {why}")
+    };
+    let evil = |why: &str| format!("/etc/pam.d/evil line 1: PAM stack not recognized: {why}");
+    let control = |text: &str| format!("control `{text}` is not one xudo recognizes");
+    let passes = |at: &str, module: &str| {
+        format!("{at}: PAM can pass sudo without the account's password from here ({module})")
+    };
+    let probes: Vec<(Vec<(&str, &str)>, String)> = vec![
+        // Second round.
+        (vec![("sudo", "auth [success=1 default=ignore]pam_permit.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth [default=1] pam_permit.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [default=1] pam_exec.so /bin/true\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [default=ok] pam_exec.so /bin/true\n")], sudo(1, &control("[default=ok]"))),
+        (vec![("sudo", "auth [default=done] pam_exec.so /bin/true\n")], sudo(1, &control("[default=done]"))),
+        (vec![("sudo", "AUTH sufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth Sufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth [SUCCESS=1 default=ignore] pam_permit.so\n")], sudo(1, &control("[SUCCESS=1 default=ignore]"))),
+        (vec![("sudo", "auth Include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "auth required pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth required pam_permit.so\nauth requisite pam_deny.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "account required pam_permit.so\n"), ("other", "auth sufficient pam_permit.so\n")], "/etc/pam.d/other line 1: PAM stack not recognized: `pam_permit` without a `requisite pam_deny` before it".to_owned()),
+        (vec![("sudo", "auth [success=ok default=bad] pam_permit.so\n")], sudo(1, &control("[success=ok default=bad]"))),
+        (vec![("sudo", "auth [authinfo_unavail=ignore default=done] pam_exec.so /bin/true\n")], sudo(1, &control("[authinfo_unavail=ignore default=done]"))),
+        (vec![("sudo", "auth optional pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth\t\tsufficient\tpam_permit.so\n")], sudo(1, PERMIT)),
+        // Third round: `@include` in any case and spacing.
+        (vec![("sudo", "@include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@INCLUDE evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@Include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@include\tevil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "   @include evil\n"), ("evil", "auth sufficient pam_permit.so\n")], evil(PERMIT)),
+        (vec![("sudo", "@INCLUDE evil\n"), ("evil", "auth sufficient pam_permit.so\n"), ("other", "auth requisite pam_deny.so\n")], evil(PERMIT)),
+        // Continued lines: each is read as the one line libpam makes of it,
+        // so the blocker is the joined line's and not "control ``".
+        (vec![("sudo", "auth \\\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "#x\nauth \\\nsufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth sufficient \\\npam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\ \nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth sufficient \\\t\npam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n# note\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth \\\n   # c\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        (vec![("sudo", "auth\\\nsufficient pam_permit.so\n")], sudo(1, PERMIT)),
+        // A comment, whole or after a line, continues nothing.
+        (vec![("sudo", "# note \\\nauth sufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth sufficient pam_deny.so # x \\\nauth sufficient pam_permit.so\n")], sudo(2, PERMIT)),
+        (vec![("sudo", "auth \\ # c\nsufficient pam_permit.so\n")], sudo(1, &control("\\"))),
+        // A jump keyed on a failure, or a failure that jumps.
+        (vec![("sudo", "auth [auth_err=1 default=ignore] pam_deny.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[auth_err=1 default=ignore]"))),
+        (vec![("sudo", "auth [success=ignore default=ignore ignore=1] pam_exec.so /bin/false\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=ignore default=ignore ignore=1]"))),
+        (vec![("sudo", "auth [success=1 default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=1 default=1]"))),
+        (vec![("sudo", "auth [default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[default=1]"))),
+        (vec![("sudo", "auth [success=1 auth_err=1 default=ignore] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, &control("[success=1 auth_err=1 default=ignore]"))),
+        (vec![("sudo", "auth [auth_err=done] pam_deny.so\n")], sudo(1, &control("[auth_err=done]"))),
+        (vec![("sudo", "@include common-auth\n"), ("common-auth", "auth [success=1 default=ignore] pam_unix.so\nauth [auth_err=1 default=ignore] pam_deny.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], "/etc/pam.d/common-auth line 2: PAM stack not recognized: control `[auth_err=1 default=ignore]` is not one xudo recognizes".to_owned()),
+        // A module by path, or one that is not on the list.
+        (vec![("sudo", "-auth requisite /nonexistent/pam_deny.so\nauth required pam_permit.so\n")], sudo(1, "module `/nonexistent/pam_deny.so` is not one xudo recognizes")),
+        (vec![("sudo", "-auth requisite /nonexistent/pam_foo.so\nauth required pam_permit.so\n")], sudo(1, "module `/nonexistent/pam_foo.so` is not one xudo recognizes")),
+        (vec![("sudo", "auth required pam_exec.so /bin/true\n")], sudo(1, "module `pam_exec.so` is not one xudo recognizes")),
+        // A module that can pass alone, or a failure that jumps past the deny
+        // after one that passed: the walk through every path finds them.
+        (vec![("sudo", "auth required pam_succeed_if.so uid >= 0\n")], passes("/etc/pam.d/sudo line 1", "pam_succeed_if")),
+        (vec![("sudo", "auth optional pam_cap.so\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_cap")),
+        (vec![("sudo", "auth required pam_succeed_if.so uid >= 0\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_succeed_if")),
+        (vec![("sudo", "auth required pam_localuser.so\nauth [default=1 ignore=ignore success=ok] pam_usertype.so isregular\nauth required pam_deny.so\n")], passes("/etc/pam.d/sudo line 1", "pam_localuser")),
+        // A line of an unknown type is a failing `auth` line to libpam, and
+        // its jump skips the deny.
+        (vec![("sudo", "xauth [default=1] pam_unix.so\nauth requisite pam_deny.so\nauth required pam_permit.so\n")], sudo(1, "unknown type `xauth`")),
+        (vec![("sudo", "@include a\nauth requisite pam_deny.so\nauth required pam_permit.so\n"), ("a", "foo [default=1] pam_unix.so\n")], "/etc/pam.d/a line 1: PAM stack not recognized: unknown type `foo`".to_owned()),
+        (vec![("sudo", "-@include evil\n")], sudo(1, "unknown type `-@include`")),
+        // Includes that are not one bare name, and `substack`.
+        (vec![("sudo", "@include evil other\n")], sudo(1, "`@include` must name exactly one file")),
+        (vec![("sudo", "auth include evil other\n")], sudo(1, "`include` must name exactly one file")),
+        (vec![("sudo", "auth include /etc/pam.d/common-auth\n")], sudo(1, "include `/etc/pam.d/common-auth` is not a bare file name")),
+        (vec![("sudo", "@include ../evil\n")], sudo(1, "include `../evil` is not a bare file name")),
+        (vec![("sudo", "auth substack common-auth\n")], sudo(1, &control("substack"))),
+        // Lines libpam cannot read, or reads with a byte xudo does not expect.
+        (vec![("sudo", "auth\n")], sudo(1, &control(""))),
+        (vec![("sudo", "auth required\n")], sudo(1, "the line names no module")),
+        (vec![("sudo", "auth [success=1 default=ignore]\n")], sudo(1, "the line names no module")),
+        (vec![("sudo", "auth [success=1 pam_unix.so\n")], sudo(1, "a `[` control has no `]`")),
+        (vec![("sudo", "auth sufficient pam_unix.so\r\n")], sudo(1, "module `pam_unix.so\r` is not one xudo recognizes")),
+        (vec![("sudo", "auth\x0bsufficient pam_unix.so\n")], sudo(1, "unknown type `auth\x0bsufficient`")),
+        (vec![("sudo", "auth [success=+1 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=+1 default=ignore]"))),
+        (vec![("sudo", "auth [success=99999999999999999999999 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=99999999999999999999999 default=ignore]"))),
+        (vec![("sudo", "auth [success=bad default=ignore] pam_unix.so\n")], sudo(1, &control("[success=bad default=ignore]"))),
+        (vec![("sudo", "auth [default=ignore new_authtok_reqd=1] pam_unix.so\n")], sudo(1, &control("[default=ignore new_authtok_reqd=1]"))),
+        (vec![("sudo", "auth sufficient pam_unix.so \\")], "could not examine /etc/pam.d/sudo: line 1 is continued past the end".to_owned()),
+        (vec![("sudo", "auth required pam_deny.so\0\nauth sufficient pam_permit.so\n")], "could not examine /etc/pam.d/sudo: not text".to_owned()),
+        // libpam reads a bracket case-sensitively, and no jump of 0.
+        (vec![("sudo", "auth [SUCCESS=OK DEFAULT=IGNORE] pam_unix.so\n")], sudo(1, &control("[SUCCESS=OK DEFAULT=IGNORE]"))),
+        (vec![("sudo", "auth [success=0 default=ignore] pam_unix.so\n")], sudo(1, &control("[success=0 default=ignore]"))),
+        // A recognized module in a control it never needs.
+        (vec![("sudo", "auth [default=1 ignore=ignore success=ok] pam_unix.so\n")], sudo(1, "`pam_unix` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [success=1 default=ignore] pam_deny.so\n")], sudo(1, "`pam_deny` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [default=1 ignore=ignore success=ok] pam_deny.so\n")], sudo(1, "`pam_deny` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth requisite pam_deny.so\nauth sufficient pam_permit.so\n")], sudo(2, "`pam_permit` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth optional pam_succeed_if.so uid >= 0\n")], sudo(1, "`pam_succeed_if` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth sufficient pam_usertype.so\n")], sudo(1, "`pam_usertype` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth sufficient pam_env.so\n")], sudo(1, "`pam_env` with that control is not a form xudo recognizes")),
+        (vec![("sudo", "auth [success=1 default=ignore] pam_env.so\n")], sudo(1, "`pam_env` with that control is not a form xudo recognizes")),
+        // `sudo-i` from libpam's vendor directory when `/etc` has none.
+        (vec![("sudo", "auth required pam_unix.so\n"), ("/usr/lib/pam.d/sudo-i", "auth sufficient pam_permit.so\n")], "/usr/lib/pam.d/sudo-i line 1: PAM stack not recognized: `pam_permit` without a `requisite pam_deny` before it".to_owned()),
+        (vec![("sudo", "@include evil\n"), ("/usr/lib/pam.d/evil", "auth sufficient pam_succeed_if.so\n")], "/usr/lib/pam.d/evil line 1: PAM stack not recognized: `pam_succeed_if` with that control is not a form xudo recognizes".to_owned()),
+    ];
+    for (files, expected) in probes {
+        let blocked = blockers(&pam_files(&files), None);
+        assert!(
+            blocked.contains(&expected),
+            "{files:?}: want {expected:?}, got {blocked:?}"
+        );
+    }
+}
+
+#[test]
+fn recheck_reports_the_pam_stack_of_an_enrolled_account() {
+    let host = enrolled_host(ENROLLED_GROUP, None).file(
+        "/etc/pam.d/common-auth",
+        0,
+        0,
+        0o644,
+        b"auth sufficient pam_u2f.so\n",
+    );
+    assert!(
+        recheck(&host)
+            .remove(0)
+            .problems
+            .join(" | ")
+            .contains("pam_u2f")
+    );
+}
+
+// ---- the unit's user, as systemd reads the drop-in ----
+
+#[test]
+fn recheck_reads_user_the_way_systemd_does() {
+    let drop_in = "/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf";
+    let problems = |body: &str| {
+        let host = enrolled_host(ENROLLED_GROUP, None).file(drop_in, 0, 0, 0o644, body.as_bytes());
+        recheck(&host).remove(0).problems.join(" | ")
+    };
+    // Spaces around the key and the value, and the last `User=` wins.
+    assert!(problems("[Service]\nUser = root\nExecStart=\"/bin/x\"\n").contains("User="));
+    assert!(problems("[Service]\n  User=agent\n User = root \n").contains("Some(\"root\")"));
+    assert!(problems("[Service]\nUser=root\n User=agent\nExecStart=\"/bin/x\"\n").is_empty());
+    assert!(problems("[Service]\nUser = agent\nExecStart=\"/bin/x\"\n").is_empty());
+    // Anything else that changes what the unit keeps or who it runs as.
+    for line in [
+        "DynamicUser=yes",
+        "ExecStart=+/bin/sh",
+        "ExecStart=!/bin/sh",
+        "ExecStartPost=+/bin/sh",
+        "SupplementaryGroups=root",
+        "Group=root",
+        "[Install]",
+        "nonsense",
+    ] {
+        let found = problems(&format!(
+            "[Service]\nUser=agent\nExecStart=\"/bin/x\"\n{line}\n"
+        ));
+        assert!(!found.is_empty(), "{line}");
+    }
+    // A comment and a blank line are not settings.
+    assert!(problems("# c\n; c\n\n[Service]\nUser=agent\nExecStart=\"/bin/x\"\n").is_empty());
+}
+
+fn ancestors(host: MemoryHost) -> MemoryHost {
+    [
+        "/run",
+        "/run/systemd",
+        "/run/systemd/system",
+        "/usr",
+        "/usr/lib",
+        "/usr/lib/systemd",
+        "/usr/lib/systemd/system",
+    ]
+    .iter()
+    .fold(host, |host, parent| host.dir(parent, 0, 0, 0o755))
+}
+
+#[test]
+fn recheck_finds_another_unit_source_that_could_change_the_user() {
+    let base = || enrolled_host(ENROLLED_GROUP, None);
+    for (dir, file) in [
+        ("/run/systemd/system/xudo-agent@.service.d", "x.conf"),
+        ("/etc/systemd/system/xudo-agent@.service.d", "x.conf"),
+        ("/etc/systemd/system/service.d", "x.conf"),
+        (
+            "/usr/lib/systemd/system/xudo-agent@codex.service.d",
+            "x.conf",
+        ),
+        ("/etc/systemd/system/xudo-agent-.service.d", "x.conf"),
+        (
+            "/etc/systemd/system.control/xudo-agent@.service.d",
+            "x.conf",
+        ),
+        ("/run/systemd/system.control/service.d", "x.conf"),
+        (
+            "/run/systemd/transient/xudo-agent@codex.service.d",
+            "x.conf",
+        ),
+        ("/run/systemd/generator.early/service.d", "x.conf"),
+        (
+            "/run/systemd/generator.late/xudo-agent@.service.d",
+            "x.conf",
+        ),
+    ] {
+        let parent = dir.rsplit_once('/').map_or("/", |(parent, _)| parent);
+        let host = ancestors(base())
+            .dir(parent, 0, 0, 0o755)
+            .dir(dir, 0, 0, 0o755)
+            .file(
+                &format!("{dir}/{file}"),
+                0,
+                0,
+                0o644,
+                b"[Service]\nUser=root\n",
+            );
+        let found = recheck(&host).remove(0).problems.join(" | ");
+        assert!(found.contains(dir), "{dir}: {found}");
+    }
+    // A template file that overrides the packaged one, anywhere but where the
+    // package puts it.
+    for file in [
+        "/etc/systemd/system/xudo-agent@.service",
+        "/run/systemd/generator.late/xudo-agent@.service",
+    ] {
+        let parent = file.rsplit_once('/').map_or("/", |(parent, _)| parent);
+        let host = ancestors(base()).dir(parent, 0, 0, 0o755).file(
+            file,
+            0,
+            0,
+            0o644,
+            b"[Service]\nUser=root\n",
+        );
+        let found = recheck(&host).remove(0).problems.join(" | ");
+        assert!(found.contains(file), "{file}: {found}");
+    }
+    let packaged = ancestors(base()).file(
+        "/usr/lib/systemd/system/xudo-agent@.service",
+        0,
+        0,
+        0o644,
+        b"[Service]\n",
+    );
+    assert_eq!(recheck(&packaged).remove(0).problems, Vec::<String>::new());
+    // An empty one adds nothing; a whole unit file by the instance's name does.
+    let empty = base().dir("/etc/systemd/system/service.d", 0, 0, 0o755);
+    assert_eq!(recheck(&empty).remove(0).problems, Vec::<String>::new());
+    let whole = ancestors(base()).file(
+        "/run/systemd/system/xudo-agent@codex.service",
+        0,
+        0,
+        0o644,
+        b"[Service]\nUser=root\n",
+    );
+    assert!(
+        recheck(&whole)
+            .remove(0)
+            .problems
+            .join(" | ")
+            .contains("replace the packaged template")
+    );
+    let unreadable = ancestors(base()).unlistable_dir("/run/systemd/system/service.d", 0, 0, 0o711);
+    assert!(
+        recheck(&unreadable)
+            .remove(0)
+            .problems
+            .join(" | ")
+            .contains("could not examine /run/systemd/system/service.d")
+    );
+}
+
+#[test]
+fn is_listed_ignores_a_primary_group() {
+    let passwd = b"agent:x:990:998::/h:/bin/false\n";
+    let group = b"xudo:x:998:\nxudo-agent:x:997:agent,alice\n";
+    assert!(is_member(passwd, group, "agent", "xudo"));
+    assert!(!is_listed(group, "agent", "xudo"));
+    assert!(is_listed(group, "agent", "xudo-agent"));
+    assert!(!is_listed(group, "agen", "xudo-agent"));
+}
+
+#[test]
+fn the_account_is_added_after_an_existing_member_of_an_agent_group() {
+    let group = "root:x:0:\nagent:x:990:\nxudo:x:998:alice\nxudo-agent:x:997:\n";
+    let host = sudoers_host(group, None).file(
+        "/etc/sudoers.d/90-local",
+        0,
+        0,
+        0o440,
+        b"%#998 ALL=(ALL) NOPASSWD: ALL\n",
+    );
+    assert!(!blockers(&host, None).is_empty());
+    assert_eq!(
+        with_membership(b"xudo:x:998:alice\nother:x:5:bob\n", "agent"),
+        b"xudo:x:998:alice,agent\nother:x:5:bob\n".to_vec()
+    );
 }

@@ -59,9 +59,9 @@ const CANDIDATE_SUFFIX: &str = ".candidate";
 const COPY_SUFFIX: &str = ".xudo-new";
 
 /// The system group tools, tried in order.
-const GROUP_TOOLS: [(&str, &[&str]); 2] = [
-    ("/usr/sbin/groupadd", &["--system", "xudo"]),
-    ("/usr/sbin/addgroup", &["-S", "xudo"]),
+const GROUP_TOOLS: [(&str, &str); 2] = [
+    ("/usr/sbin/groupadd", "--system"),
+    ("/usr/sbin/addgroup", "-S"),
 ];
 
 /// How a directory is opened: production walks it from `/` as root's, and
@@ -613,8 +613,8 @@ impl InstallOps for HostInstallOps {
 
     fn create_group(&self, name: &str) -> Result<(), InstallError> {
         let mut failures = Vec::new();
-        for (exe, args) in GROUP_TOOLS {
-            match self.runner.run(exe, args, None) {
+        for (exe, flag) in GROUP_TOOLS {
+            match self.runner.run(exe, &[flag, name], None) {
                 Ok(output) if output.success => return Ok(()),
                 Ok(output) => failures.push(format!("{exe}: {}", output.stderr.trim())),
                 // A tool this distribution does not have: try the next.
