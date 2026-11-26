@@ -852,7 +852,7 @@ fn open_at(
     name: &[u8],
     beneath: bool,
 ) -> Result<std::os::fd::OwnedFd, RemoveError> {
-    rustix::fs::openat2(
+    crate::beneath::open_beneath(
         parent,
         name,
         rustix::fs::OFlags::RDONLY
@@ -868,15 +868,12 @@ fn open_at(
 #[cfg(target_os = "linux")]
 impl RemoveFs for LinuxRemoveFs {
     fn open_root(&mut self) -> Result<u64, RemoveError> {
-        rustix::fs::openat2(
-            rustix::fs::CWD,
-            "/",
+        crate::beneath::open_root(
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::DIRECTORY
                 | rustix::fs::OFlags::CLOEXEC
                 | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
-            rustix::fs::ResolveFlags::NO_SYMLINKS,
         )
         .map(|fd| self.insert(fd))
         .map_err(host_err("openat2"))
@@ -2591,6 +2588,50 @@ mod tests {
             fs.unlink(root, b"d", false).unwrap_err(),
             os("unlinkat", 21)
         );
+    }
+
+    /// A gate started under a unit with `RestrictSUIDSGID=yes` inherits its
+    /// filter, which answers openat2 with ENOSYS. The walk opens the same
+    /// directories one component at a time and still refuses a link, a
+    /// parent, and a mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_walk_holds_its_refusals_where_openat2_is_enosys() {
+        let dir = host_dir("xudo-t1-enosys");
+        std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
+        std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
+        crate::beneath::without_openat2(|| {
+            let mut host = LinuxRemoveFs::default();
+            let root = host.open_root().unwrap();
+            assert!(host.fstat(root).unwrap().mount_root);
+            let tree = open_components(&mut host, &dir);
+            let sub = host.open_dir(tree, b"sub", true).unwrap();
+            let sub_stat = host.fstat(sub).unwrap();
+            assert!(host.verify_dir(tree, b"sub", sub_stat).unwrap());
+            let deep = host.open_dir(sub, b"deep", true).unwrap();
+            let deep_stat = host.fstat(deep).unwrap();
+            assert!(host.verify_dir(tree, b"sub/deep", deep_stat).unwrap());
+            assert!(!host.verify_dir(tree, b"sub", deep_stat).unwrap());
+            for beneath in [true, false] {
+                assert_eq!(
+                    host.open_dir(tree, b"link", beneath).unwrap_err(),
+                    os("openat2", ELOOP)
+                );
+                assert_eq!(
+                    host.open_dir(tree, b"..", beneath).unwrap_err(),
+                    os("openat2", EXDEV)
+                );
+            }
+            assert_eq!(
+                host.verify_dir(tree, b"link/deep", deep_stat).unwrap_err(),
+                os("openat2", ELOOP)
+            );
+            assert_eq!(
+                open_under(&mut host, b"/proc").unwrap_err(),
+                RemoveError::MountPoint
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]

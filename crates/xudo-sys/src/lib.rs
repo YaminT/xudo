@@ -42,6 +42,8 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+#[cfg(any(target_os = "linux", test))]
+mod beneath;
 pub mod cgroup;
 pub mod clock;
 pub mod connection;

@@ -454,6 +454,19 @@ fn the_system_calls_are_filtered_and_a_filtered_call_fails_closed() {
     }
 }
 
+/// systemd's `RestrictSUIDSGID=` filter cannot read `openat2`'s flags, so it
+/// answers every `openat2` with ENOSYS. The broker keeps the directive (a uid 0
+/// broker owns `/var/lib/xudo` and could otherwise leave a setuid file there)
+/// and tolerates ENOSYS instead: `xudo_sys::beneath` walks one component at a
+/// time when `openat2` is missing. The systemd lane's grant and queue rows run
+/// under this very unit, so losing either half shows there.
+#[test]
+fn the_broker_keeps_restrict_suidsgid_and_must_tolerate_enosys_from_openat2() {
+    let service = parse(SERVICE);
+    assert_eq!(value(&service, "Service", "RestrictSUIDSGID"), "yes");
+    assert!(values(&service, "Service", "IPAddressDeny").is_empty());
+}
+
 #[test]
 fn a_connection_ends_on_its_own_timeouts_before_the_unit_kills_it() {
     let service = parse(SERVICE);

@@ -2,6 +2,8 @@
 # Inside a container whose PID 1 is systemd. Installs /opt/xudo.deb, drives
 # xudo exec on a pty (ci/differential/exec.exp, user xudotest), and removes it.
 # The unit files are the ones the package shipped. This script does not edit them.
+# grant.sh, sourced near the end, proves the passwordless grant through a live
+# enrolled unit; it alone writes a NOPASSWD line, and deletes it again.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -406,9 +408,10 @@ else
     cat /var/tmp/freeze.out >&2
 fi
 clear_confirm freeze_approve none
-# Only a positively human, non-harness caller may thaw. In this lane an
-# ordinary user is unattested, so the broker refuses (exit 17) and removes
-# nothing; root's thaw (what `sudo xudo thaw` runs) lifts every marker.
+# Only a positively human, non-harness caller may thaw, and only its own
+# marker. su gives xudotest a login session the broker attests as human, so
+# its thaw lifts frozen-<uid> and leaves root's global freeze in place; root's
+# thaw (what `sudo xudo thaw` runs) lifts every marker.
 user_frozen=/var/lib/xudo/frozen-$test_uid
 set +e
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/var/tmp/user-freeze.out 2>&1
@@ -424,10 +427,10 @@ set +e
 su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 17 ] && [ -f "$frozen" ] && [ -f "$user_frozen" ]; then
-    good "an_unattested_users_thaw_is_refused_and_removes_nothing (rc=$rc)"
+if [ "$rc" -eq 0 ] && [ -f "$frozen" ] && [ ! -e "$user_frozen" ]; then
+    good "a_human_users_thaw_lifts_only_their_own_marker (rc=$rc)"
 else
-    bad "an_unattested_users_thaw_is_refused_and_removes_nothing (rc=$rc, global: $([ -f "$frozen" ] && echo present || echo gone), user: $([ -f "$user_frozen" ] && echo present || echo gone))"
+    bad "a_human_users_thaw_lifts_only_their_own_marker (rc=$rc, global: $([ -f "$frozen" ] && echo present || echo gone), user: $([ -f "$user_frozen" ] && echo present || echo gone))"
     cat /var/tmp/nonroot-thaw.out >&2
 fi
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/dev/null 2>&1 || true
@@ -705,6 +708,18 @@ else
     bad "agent remove left files"
 fi
 [ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
+# The passwordless grant end to end, with a lane-only NOPASSWD line that the
+# script removes before it returns (G1f). If it aborts first, this undoes both
+# of its edits to the system on the way out.
+g1f_cleanup() {
+    rm -f /etc/sudoers.d/xudo-g1f-lane-only
+    if [ -f /var/tmp/g1f-pam-sudo ]; then
+        cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
+        rm -f /var/tmp/g1f-pam-sudo
+    fi
+}
+trap g1f_cleanup EXIT
+. /harness/grant.sh
 # Enrol again, and leave it running for the package removal below.
 if enrol_agent && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
     good "xudo-agent@t enrolled again and running"

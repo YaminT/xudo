@@ -2,7 +2,9 @@
 # The installed .deb with the broker under real systemd, one container per
 # distribution. systemd is PID 1: the image installs systemd and systemd-sysv,
 # then execs /sbin/init. Privileged lets it manage its own private cgroup namespace.
-# Nothing else on the host is changed. ci/systemd/row.sh asserts inside.
+# Nothing else on the host is changed. ci/systemd/row.sh asserts inside, and
+# sources grant.sh: the passwordless grant through a live enrolled unit, behind
+# a NOPASSWD line written only in the container and removed by the row.
 #
 #   ci/systemd/run.sh <musl triple>       (or: just systemd-test)
 #
