@@ -85,8 +85,8 @@ pub use enrol::{
 };
 pub use host::HostInstallOps;
 pub use pack::{
-    HostWhereabouts, MAX_PACK_BYTES, PackError, PackReport, PackRequest, RULES_DIR, Whereabouts,
-    add_pack, remove_pack,
+    HostWhereabouts, MAX_PACK_BYTES, PackError, PackFileError, PackReport, PackRequest, RULES_DIR,
+    Whereabouts, add_pack, read_pack_file, remove_pack,
 };
 pub use xudo_backend::blocks::BlockError;
 

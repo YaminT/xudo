@@ -916,9 +916,27 @@ else
 fi
 rm -f /etc/xudo/rules.d/92-e7-stale.toml
 
+# Swapped after the review: the path the human was told to type now links to
+# /etc/shadow. Root never follows it, and prints no line of what it names.
+as_operator "/usr/bin/xudo rules add $pack_dir/ops.toml"
+swapped_token=$(token_of "$hout")
+install -d -m 0755 "$pack_dir/swap"
+ln -sfn /etc/shadow "$pack_dir/swap/ops.toml"
+as_admin "$sudo_add --reviewed $swapped_token $pack_dir/swap/ops.toml"
+case_name=a_pack_swapped_for_a_symlink_to_shadow_is_never_read_as_root
+if [ -n "$swapped_token" ] && [ "$hrc" = 19 ] && [ ! -e "$installed" ] &&
+    printf '%s\n' "$hout" | grep -q 'a symbolic link is never followed' &&
+    ! printf '%s\n' "$hout" | grep -q '^root:\|1 | root\|TOML parse error'; then
+    good "$case_name"
+else
+    bad "$case_name (rc=$hrc)"
+    printf '%s\n' "$hout" >&2
+fi
+rm -rf "$pack_dir/swap"
+
 # Refused at review, and never written: a failing [[test]], an unregistered
-# harness, a waiver without --allow-waivers. Root, handed any token for them,
-# reviews them itself first and refuses them for the same reason.
+# harness, a waiver without --allow-waivers. The review prints no token, and
+# root, handed any other, refuses on the token before it parses the pack.
 # refused_pack <case> <pack> <what the review says>
 refused_pack() {
     as_operator "/usr/bin/xudo rules add $pack_dir/$2.toml"
@@ -927,7 +945,7 @@ refused_pack() {
     as_admin "$sudo_add --reviewed $bogus $pack_dir/$2.toml"
     if [ "$review_rc" = 21 ] && [ -z "$(token_of "$review_out")" ] &&
         printf '%s\n' "$review_out" | grep -qF "$3" && printf '%s\n' "$hout" | grep -qi password &&
-        [ "$hrc" = 21 ] && printf '%s\n' "$hout" | grep -qF "$3" &&
+        [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed (token $bogus, now " &&
         [ ! -e "/etc/xudo/rules.d/pack-e7-$2.toml" ]; then
         good "$1"
     else
@@ -951,7 +969,7 @@ if [ "$review_rc" = 0 ] && [ -n "$waived" ] &&
     printf '%s\n' "$review_out" | grep -q '^GTFOBins waivers: ' &&
     printf '%s\n' "$review_out" | grep -q '^  pack.e7.restart: pager and unit-file shell escapes via systemctl: ' &&
     printf '%s\n' "$review_out" | grep -q '^  sudo xudo rules add --allow-waivers --reviewed ' &&
-    [ "$hrc" = 21 ] && printf '%s\n' "$hout" | grep -qF 'pass --allow-waivers to both' &&
+    [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed (token $waived, now " &&
     [ ! -e /etc/xudo/rules.d/pack-e7-waiver.toml ]; then
     good "$case_name"
 else

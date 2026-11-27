@@ -108,9 +108,9 @@ pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
     AgentError, AgentRow, DirLock, Effect, EnrolOps, HostInstallOps, HostInstaller,
     HostWhereabouts, InstallError, InstallOps, InstallProbe, InstallReport, Installer,
-    MAX_PACK_BYTES, PackError, PackReport, PackRequest, ProbeResult, RULES_DIR, RefusingInstaller,
-    Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol, check_effect, execute,
-    list_agents, plan_enrol, remove_agent, remove_pack,
+    MAX_PACK_BYTES, PackError, PackFileError, PackReport, PackRequest, ProbeResult, RULES_DIR,
+    RefusingInstaller, Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol,
+    check_effect, execute, list_agents, plan_enrol, read_pack_file, remove_agent, remove_pack,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;

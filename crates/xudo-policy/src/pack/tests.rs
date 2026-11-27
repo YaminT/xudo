@@ -887,6 +887,33 @@ fn the_token_binds_the_pack_the_flag_and_the_rules_it_was_judged_against() {
 }
 
 #[test]
+fn the_token_is_known_before_the_pack_is_parsed() {
+    // Root checks the token before it parses a byte, so a file swapped after
+    // the review never reaches the parser, whose errors quote the source.
+    let codex = registry(&["codex"]);
+    let before = vec![file("10.toml", IDS_BASE)];
+    let mut after = before.clone();
+    after.push(file("pack-refusals.toml", REFUSALS));
+    let change = Change::Add {
+        pack: REFUSALS.as_bytes(),
+        allow_waivers: false,
+    };
+    let reviewed = review(before.clone(), after, &codex, change).unwrap().token;
+    assert_eq!(token_of(before.clone(), &codex, change).unwrap(), reviewed);
+    let secret = Change::Add {
+        pack: b"root:$y$j9T$secret:20000:0:99999:7:::\n",
+        allow_waivers: false,
+    };
+    assert_ne!(token_of(before, &codex, secret).unwrap(), reviewed);
+    // Rules that do not load have no token, and say so as they always did.
+    let broken = vec![file("10.toml", "[[action]]\n")];
+    assert!(matches!(
+        token_of(broken, &codex, change).unwrap_err(),
+        PackRefusal::Current(_)
+    ));
+}
+
+#[test]
 fn only_a_pack_xudo_installed_is_taken_away() {
     let ours = RuleFile {
         name: b"pack-ids.toml".to_vec(),

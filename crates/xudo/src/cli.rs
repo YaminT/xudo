@@ -5999,7 +5999,7 @@ expect = "deny"
         let fx = fixture("cli-rules-refusing");
         let (code, out, err) = fx.run(&["rules", "add", "--reviewed", "00", "/nonexistent"]);
         assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
-        assert!(err.contains("cannot read /nonexistent"), "{err}");
+        assert!(err.contains("cannot open /nonexistent"), "{err}");
         let (code, _, err) = fx.run(&["rules", "remove", "--reviewed", "t", "x"]);
         assert_eq!(code, ExitCode::Unusable);
         assert!(err.contains("cannot modify the machine"), "{err}");
