@@ -1,7 +1,8 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rule format — xudo</title><meta name="description" content="TOML action rules for xudo."><link rel="canonical" href="https://yamint.github.io/xudo/rules.html"><link rel="stylesheet" href="style.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rule format — xudo</title><meta name="description" content="TOML action rules and reviewed rule packs for xudo."><link rel="canonical" href="https://yamint.github.io/xudo/rules.html"><link rel="stylesheet" href="style.css"></head>
 <body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
-<h1>Rule format</h1><p>Native rules are TOML files. Each action fixes one executable and constrains each argument by position. There are no globs.</p>
+<h1>Rule format</h1>
+<p>Root-owned rules are TOML. Each action names one absolute executable and constrains every argument by position with typed matchers.</p>
 <pre><code>[[action]]
 id = "xudo.svc.status"
 tier = "diag-read"
@@ -12,22 +13,19 @@ args = [
   { name = "verb", matcher = { literal = "status" } },
   { name = "unit", matcher = { name = "unit-name" } },
 ]</code></pre>
-<p>This read-only action is from <code>rules/10-diagnostics.toml</code>. The shipped rules do not start or stop a service. To allow that on one host, copy the package's example, <code>/usr/share/xudo/examples/20-services-lifecycle.toml</code>, to <code>/etc/xudo/rules.d/</code> and list your units in an enumerated <code>one-of</code>. Leave a unit out and the command is refused:</p>
+<p>Harness rules also name registered labels and select the result. A passwordless allow still needs the operator's explicit agent-path opt-in. An <code>ask-human</code> result goes to the broker's root-held queue for a separate reviewer.</p>
 <pre><code>[[action]]
-id = "xudo.svc.lifecycle"
+id = "web.restart"
 tier = "svc-control"
 exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "allow"
 args = [
-  { name = "no-pager", matcher = { literal = "--no-pager" } },
-  { name = "no-ask", matcher = { literal = "--no-ask-password" } },
-  { name = "verb", matcher = { one-of = ["start", "stop", "restart", "try-restart", "reload", "reload-or-restart", "try-reload-or-restart"] } },
-  { name = "unit", matcher = { one-of = ["example.service", "example-other.service"] } },
+  { name = "verb", matcher = { literal = "restart" } },
+  { name = "unit", matcher = { one-of = ["web.service"] } },
 ]</code></pre>
-<p>A rule file can also hold <code>[[deny]]</code> tables, which refuse a command an action would accept, and <code>[[test]]</code> tables that state the expected decision. A near-miss test from the lifecycle example:</p>
-<pre><code>[[test]]
-argv = ["/usr/bin/systemctl", "--no-pager", "--no-ask-password", "restart", "nginx.service"]
-expect = "deny"
-reason = "near miss: nginx.service is not in the operator's list"</code></pre>
-<p><code>xudo check</code> lints and tests the rules and exits 20 for a warning, 21 for an error and 22 for a failing test.</p>
-<p>See the repository's <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rule files</a> and <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">behavior source</a>.</p>
+<p>Rule files can also declare deny rules and test cases. <code>xudo check</code> lints the files and runs their tests. See the <a href="https://github.com/YaminT/xudo/tree/main/rules">shipped rules and examples</a> and the <a href="https://github.com/YaminT/xudo/blob/main/docs/man/xudo-rules.5">xudo-rules(5) manual</a>.</p>
+<h2>Rule packs</h2>
+<p>A local pack is one TOML rule file with a <code>[pack]</code> header. <code>xudo rules add FILE</code> prints its effects and a review token without writing. Root installs only after a reviewer runs the command with <code>--reviewed TOKEN</code>; the token is checked against the pack bytes, rules, registry, and waiver choice again. Nothing downloads or updates itself.</p>
+<p><code>path-under</code> is a lexical matcher, not filesystem containment. Use the typed <code>remove-path</code> operation for bounded removal under a root-configured tree.</p>
 </main><footer><a href="./">xudo documentation</a></footer></body></html>

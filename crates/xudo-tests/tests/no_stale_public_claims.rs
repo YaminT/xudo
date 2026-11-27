@@ -60,6 +60,27 @@ fn stale_probe_claim(text: &str) -> bool {
     gnu_id_workaround(&flat) || ubuntu_2604_near_not_verified(&flat)
 }
 
+/// Claims made obsolete by the service enrollment, broker queue, agent path,
+/// and reviewed rule packs shipped in beta.2.
+fn stale_shipped_feature_claim(text: &str) -> bool {
+    let flat = flatten_claim(text);
+    [
+        "every caller is unattested",
+        "no caller can be a registered agent",
+        "nothing in this release creates such a scope",
+        "empty until agents can be registered",
+        "enrollment is not built",
+        "enrolment is not built",
+        "rule packs are not built",
+        "rule packs are not in this release",
+        "passwordless agent path is not in this release",
+        "passwordless agent path is not yet shipped",
+        "does not enroll or authenticate agents",
+    ]
+    .iter()
+    .any(|claim| flat.contains(claim))
+}
+
 fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
@@ -75,12 +96,13 @@ fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
 }
 
 #[test]
-fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
+fn public_docs_do_not_claim_built_checks_or_features_are_absent() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = vec![
         "README.md".to_owned(),
         "SECURITY.md".to_owned(),
         "CHANGELOG.md".to_owned(),
+        "llms.txt".to_owned(),
     ];
     markdown_and_html_files(&root.join("site"), &mut files);
 
@@ -91,15 +113,13 @@ fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
             let text = fs::read_to_string(&path).unwrap();
             (stale_confirmation_claim(&text)
                 || stale_telemetry_claim(&text)
-                || stale_probe_claim(&text))
+                || stale_probe_claim(&text)
+                || (file != "CHANGELOG.md" && stale_shipped_feature_claim(&text)))
             .then(|| file.clone())
         })
         .collect();
 
-    assert!(
-        stale.is_empty(),
-        "stale public release claims in: {stale:?}"
-    );
+    assert!(stale.is_empty(), "stale public status claims in: {stale:?}");
 }
 
 #[test]
@@ -167,9 +187,9 @@ fn the_check_catches_stale_claims_and_allows_current_status() {
     assert!(stale_confirmation_claim(
         "Out-of-band confirmation is not in this beta."
     ));
-    assert!(!stale_confirmation_claim(
-        "Out-of-band confirmation is built and off by default. The passwordless path is not in this beta."
-    ));
+    let current_status = "Out-of-band confirmation is built and off by default. The passwordless path is built and off by default.";
+    assert!(!stale_confirmation_claim(current_status));
+    assert!(!stale_shipped_feature_claim(current_status));
     assert!(stale_confirmation_claim(
         "The passwordless path and out-of-band confirmation are not in this release."
     ));
@@ -284,7 +304,7 @@ fn stale_approval_claim(text: &str) -> bool {
 }
 
 #[test]
-fn public_docs_do_not_state_the_replaced_approval_model() {
+fn public_docs_describe_the_current_approval_model() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // CHANGELOG.md is excluded: shipped sections are history and say
     // "Every request uses the human password path" about their own release.
@@ -292,16 +312,21 @@ fn public_docs_do_not_state_the_replaced_approval_model() {
         "README.md".to_owned(),
         "SECURITY.md".to_owned(),
         "howiwork.md".to_owned(),
+        "llms.txt".to_owned(),
         "packaging/deb/first-install-notice".to_owned(),
         "docs/man/xudo.1".to_owned(),
         "docs/man/xudo-rules.5".to_owned(),
         "docs/man/ido.1".to_owned(),
         "docs/man/ido-queue.5".to_owned(),
+        "site/llms.txt".to_owned(),
     ];
     markdown_and_html_files(&root.join("site"), &mut files);
     let stale: Vec<_> = files
         .iter()
-        .filter(|file| stale_approval_claim(&fs::read_to_string(root.join(file)).unwrap()))
+        .filter(|file| {
+            let text = fs::read_to_string(root.join(file)).unwrap();
+            stale_approval_claim(&text) || stale_shipped_feature_claim(&text)
+        })
         .cloned()
         .collect();
     assert!(
@@ -332,9 +357,24 @@ fn the_approval_check_catches_permanent_claims_and_allows_the_beta_status() {
         "This beta always prompts for a password."
     ));
     assert!(!stale_approval_claim(
-        "Today's beta builds the password half only: every request, from anyone, asks for a password."
+        "Today's beta builds both the passwordless harness path and the human password path."
     ));
     assert!(!stale_approval_claim(
         "A command runs without a password only for a verified harness."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "No caller can be a registered agent in this release."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "The passwordless agent path is not in this release."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "The root-held queue is empty until agents can be registered."
+    ));
+    assert!(!stale_shipped_feature_claim(
+        "Session start and attach are not implemented in this beta."
+    ));
+    assert!(!stale_shipped_feature_claim(
+        "Passwordless execution is off by default and can be enabled by root."
     ));
 }

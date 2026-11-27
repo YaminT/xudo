@@ -1,4 +1,4 @@
-.TH IDO 1 "2026-11-21" "ido 0.1.0-beta.2" "User Commands"
+.TH IDO 1 "2026-11-27" "ido 0.1.0-beta.2" "User Commands"
 .SH NAME
 ido \- a queue of commands an agent asked you to run
 .SH SYNOPSIS
@@ -62,7 +62,11 @@ You run
 see the queue, and choose what to run, in your own terminal.
 Nothing runs without a keystroke from you.
 .B ido
-shows two lists: your own queue, which the agent writes and can edit, and the broker's root\-held review queue, which only root writes (empty until agents can be registered).
+shows two lists: your own queue, which the agent writes and can edit, and the
+broker's root-held review queue. Only the broker writes the latter; entries
+appear there when a verified, listed harness matches an
+.B ask-human
+rule and its configured reviewer is allowed to see it.
 .PP
 .B ido
 holds no privilege.
@@ -71,7 +75,7 @@ It gates on consequence, not on uid: a queued
 command asks for your password as it always would, and a cloud command that
 needs no root is shown with the profile, region, or project it would act on.
 .PP
-Every field in the queue was written by the agent.
+Every field in the user-side queue was written by the agent.
 Before anything is shown, escape sequences, control characters,
 bidirectional overrides, and invisible characters are removed, and a command
 name containing non-ASCII characters is flagged as a possible lookalike.

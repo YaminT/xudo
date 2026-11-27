@@ -1,6 +1,6 @@
 //! The public site is HTML. A Markdown backtick is shown as a character, so a
 //! name belongs in `code`. The index also states, in one sentence, what this
-//! release does not ship.
+//! passwordless execution is opt-in and names the current confinement limits.
 
 #![allow(clippy::unwrap_used)]
 
@@ -16,8 +16,8 @@ fn shows_markdown_backtick(html: &str) -> bool {
     html.contains('`')
 }
 
-/// One sentence names both absences. A roadmap mention of either is not that.
-fn states_passwordless_and_landlock_absent(text: &str) -> bool {
+/// The old claim conflated a disabled-by-default path with an unimplemented one.
+fn claims_passwordless_path_unavailable(text: &str) -> bool {
     text.to_ascii_lowercase()
         .split(['.', '!', '?'])
         .any(|sentence| {
@@ -57,30 +57,37 @@ fn site_pages_do_not_show_markdown_backticks() {
 }
 
 #[test]
-fn index_states_passwordless_path_and_landlock_are_not_in_this_release() {
+fn index_states_the_opt_in_and_security_page_states_the_landlock_limit() {
     let index = fs::read_to_string(workspace_root().join("site/index.html")).unwrap();
     assert!(
-        states_passwordless_and_landlock_absent(&index),
-        "index.html must say the passwordless agent path and Landlock are not in this release"
+        index.contains("The agent path is off by default")
+            && index.contains("sudo xudo install --agent-path"),
+        "index.html must state the default and the opt-in"
     );
+    let security = fs::read_to_string(workspace_root().join("site/security.html")).unwrap();
+    assert!(security.contains("does not confine code inside the account with Landlock"));
+    assert!(!claims_passwordless_path_unavailable(&index));
 }
 
 #[test]
-fn the_checks_catch_a_backtick_and_a_split_absence() {
+fn the_checks_catch_a_backtick_and_the_old_unavailable_claim() {
     assert!(!shows_markdown_backtick(
         "<p>Use <code>xudo exec</code>.</p>"
     ));
     assert!(shows_markdown_backtick("<p>Run `xudo exec`.</p>"));
-    assert!(states_passwordless_and_landlock_absent(
+    assert!(claims_passwordless_path_unavailable(
         "The passwordless agent path and Landlock are not in this release."
     ));
-    assert!(states_passwordless_and_landlock_absent(
+    assert!(claims_passwordless_path_unavailable(
         "The passwordless agent path and Landlock confinement are not in this release."
     ));
-    assert!(!states_passwordless_and_landlock_absent(
+    assert!(!claims_passwordless_path_unavailable(
         "Next: M4 enrollment and the passwordless path. Landlock is later."
     ));
-    assert!(!states_passwordless_and_landlock_absent(
+    assert!(!claims_passwordless_path_unavailable(
         "The passwordless agent path is not in this release. Landlock confinement comes after."
+    ));
+    assert!(!claims_passwordless_path_unavailable(
+        "The agent path is off by default. Landlock is not implemented."
     ));
 }

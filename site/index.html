@@ -3,43 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>xudo — Linux privilege broker</title>
-  <meta name="description" content="sudo for AI agents: root's rules decide what a verified agent may run. This beta asks a password for every request.">
+  <title>xudo — sudo for AI harnesses</title>
+  <meta name="description" content="xudo checks privileged commands against root-owned rules for AI harnesses.">
   <link rel="canonical" href="https://yamint.github.io/xudo/">
   <link rel="stylesheet" href="style.css">
-  <script type="application/ld+json">
-  {"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"xudo","applicationCategory":"SecurityApplication","operatingSystem":"Linux","url":"https://yamint.github.io/xudo/","description":"sudo for AI agents: root's rules decide what a verified agent may run. This beta asks a password for every request."},{"@type":"SoftwareSourceCode","name":"xudo","codeRepository":"https://github.com/YaminT/xudo","programmingLanguage":"Rust","runtimePlatform":"Linux","license":"https://www.apache.org/licenses/LICENSE-2.0"}]}
-  </script>
 </head>
 <body>
 <header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header>
 <main>
 <h1>xudo</h1>
-<p><strong>xudo is sudo for AI agents.</strong> Your agent (Claude Code, Codex, Grok…) calls <code>xudo</code> where it would call <code>sudo</code>. It checks two things: is this an agent harness you verified on this machine, and does a rule you wrote allow this exact command with these exact arguments? If yes, it runs as root with no password prompt. If a rule says a person must decide, the command waits in the <code>ido</code> queue until you review and run it. Anyone else gets the normal <code>sudo</code> password prompt, and a command no rule allows is refused. xudo itself never asks for or handles a password. Every decision goes into a tamper-evident log.</p>
-<p>The design, in five steps:</p>
-<ol>
-<li>You install one package and choose rule files: what agents may run, down to each argument.</li>
-<li>You verify a harness once (not built yet): on a server the admin registers it; on a laptop you type your sudo password once per session.</li>
-<li>The agent runs <code>xudo exec -- &lt;command&gt;</code>. A root service checks who is asking (from the kernel, not from names) and matches the command against the rules.</li>
-<li>Allowed: runs as root now, with no password (not built yet). Needs a person: waits in <code>ido</code>. Anyone else: the normal <code>sudo</code> password prompt. A command no rule allows: refused. A built-in deny-list refuses shells and other escapes whatever the rules say.</li>
-<li>Everything is recorded in a log that shows any tampering.</li>
-</ol>
-<p><strong>Beta. Not externally audited.</strong> Today's beta asks your password for every request. The passwordless agent path and Landlock confinement are not in this release. See <a href="security.html">security status and limits</a>.</p>
-<p><strong>Works today.</strong> <code>xudo exec</code> sends your command to a root service, the broker. The broker checks it against the rules in <code>/etc/xudo/rules.d</code> and a built-in refusal list, and writes the decision to a hash-chained audit log. It then hands the command through <code>sudo</code> to a separate root program, the gate. <code>sudo</code> asks for the password, and the gate checks the rules again before it runs anything. Other tools: <code>xudo check</code> tests rule files, <code>xudo doctor</code> lists other ways to get root on the machine, and a daily job (Pasban) verifies the audit log.</p>
-<p><strong>In the code, not usable yet.</strong> A harness registry, the rule keys <code>harness</code> and <code>outcome</code>, and a root-held review queue shown by <code>ido</code>. They act only for a caller that the kernel places in a scope root made for a registered agent. Nothing in this release creates such a scope.</p>
-<p><strong>Not built yet.</strong> Agent enrolment, passwordless runs for a registered agent, rule packs, temporary permissions and an apt repository.</p>
+<p><strong>sudo for AI harnesses.</strong> xudo checks each privileged command and its exact arguments against rules written by root. A verified harness may run an allowed command without a password after the operator explicitly enables the agent path. A request needing a person waits in <code>ido</code> for a separate reviewer. A denied command never runs.</p>
+<p><strong>Beta; not externally audited.</strong> Read the <a href="security.html">security limits</a> before using it.</p>
 <h2>Install</h2>
-<p>v0.1.0-beta.2 is a pre-release. Download the <code>.deb</code>, <code>SHA256SUMS</code>, and its <code>.cosign.bundle</code> from the GitHub Release. GitHub shows the <code>~</code> in the Debian version as <code>.</code>, so verify the checksum with <code>sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing</code>. Replace <code>&lt;ver&gt;</code> with the Debian version, <code>&lt;arch&gt;</code> with <code>amd64</code> or <code>arm64</code>, and <code>&lt;tag&gt;</code> with the Git tag; for example, <code>&lt;ver&gt;</code> <code>0.1.0~beta.2</code> corresponds to <code>&lt;tag&gt;</code> <code>v0.1.0-beta.2</code>.</p>
-<pre><code>sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing
-cosign verify-blob --bundle xudo_&lt;ver&gt;_&lt;arch&gt;.deb.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/&lt;tag&gt; --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo_&lt;ver&gt;_&lt;arch&gt;.deb
-sudo apt install ./xudo_&lt;ver&gt;_&lt;arch&gt;.deb</code></pre>
-<p>xudo has no <code>curl | sh</code> installer because a privileged shell script is difficult to inspect before execution.</p>
-<h2>Example</h2><p>From a checkout, <code>--rules ./rules</code> applies to <code>explain</code>. <code>exec</code> ignores <code>--rules</code>; the broker loads root's <code>/etc/xudo/rules.d</code>.</p>
-<pre><code>xudo --rules ./rules explain -- /usr/bin/systemctl --no-pager --full status nginx.service
-xudo doctor
-ido queue -m "show listeners after review" -- /usr/bin/ss -tulpnH</code></pre>
-<p><code>explain</code> reports a decision without execution. After installing the package, add your user to the <code>xudo</code> group with <code>sudo usermod -aG xudo YOUR_USER</code>, then log out and back in. This is a deliberate privilege grant: group members can invoke the privileged gate. Then run <code>xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service</code>; it uses the host password prompt and gate.</p>
-<p>Read <a href="how-it-works.html">how requests flow</a>, the <a href="rules.html">rule format</a>, and the <a href="faq.html">FAQ</a>. The repository's <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">howiwork.md</a> is the source of truth for behavior.</p>
+<p>For Debian 13, Ubuntu 24.04 or 26.04, amd64 or arm64. Download the <code>.deb</code>, checksum file, and signature bundle from a GitHub Release. Follow the checksum and signature verification steps in <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">howiwork.md</a>, then install:</p>
+<pre><code>sudo apt install ./xudo_&lt;ver&gt;_&lt;arch&gt;.deb</code></pre>
+<p>The package installs no passwordless rule. The agent path is off by default; enabling it requires a service harness, a matching rule, and the explicit <code>sudo xudo install --agent-path</code> opt-in on sudo or sudo-rs.</p>
+<h2>Example</h2>
+<pre><code>xudo explain -- /usr/bin/systemctl --no-pager --full status nginx.service
+xudo exec -- /usr/bin/systemctl --no-pager --full status nginx.service</code></pre>
+<p><code>explain</code> runs nothing. A human's <code>exec</code> request uses the host's password prompt. An agent request follows its root-owned rule and the installed backend path.</p>
+<p>Read <a href="how-it-works.html">how requests flow</a>, <a href="rules.html">how rules work</a>, and <a href="security.html">the security limits</a>. The repository's <a href="https://github.com/YaminT/xudo/blob/main/howiwork.md">howiwork.md</a> is the product source of truth.</p>
 </main>
 <footer><a href="https://github.com/YaminT/xudo">Source repository</a> · <a href="security.html">Security</a></footer>
 </body>

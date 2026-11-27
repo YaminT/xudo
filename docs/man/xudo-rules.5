@@ -1,4 +1,4 @@
-.TH XUDO-RULES 5 "2026-11-22" "xudo 0.1.0-beta.2" "File Formats"
+.TH XUDO-RULES 5 "2026-11-27" "xudo 0.1.0-beta.2" "File Formats"
 .SH NAME
 xudo-rules \- rule files for xudo
 .SH DESCRIPTION
@@ -125,13 +125,12 @@ confirms for every caller.
 skips confirmation for this action.
 A rule that lists no
 .B harness
-is never passwordless, and an enrolled agent is still confirmed under
-.BR never ;
-only a rule that lists the agent's harness with
+cannot authorize a passwordless harness run. A verified harness must be named
+by the action and have a matching
 .B outcome = "allow"
-grants it: a plain allow, which the broker mints for the passwordless gate
-file, and which sudo runs only once root adds a sudoers line naming that file.
-The package adds none.
+to use the passwordless gate. The package adds no sudoers rule for that gate;
+root must explicitly install it with
+.BR "xudo install --agent-path" .
 It is not a grant against a stricter overlapping action, and a
 .B critical
 action cannot set it.
@@ -151,18 +150,16 @@ The child's environment is built from scratch, so a name on no list does not
 exist for the child.
 .TP
 .B harness
-Labels from the root-owned harness registry. Without this key, an enrolled
-agent's request is always confirmed, whatever
-.B confirm
-says. A listed label is not proof of
-identity by itself.
+Labels from the root-owned harness registry. A listed label is not proof of
+identity by itself; the broker also requires kernel-attested membership in
+the registered service scope.
 .TP
 .B outcome
 The outcome for a verified harness named by
 .B harness :
 .B allow
-lifts the agent confirmation for the listed harness only; there is no default,
-and an action that lists a harness without an
+permits the listed verified harness when its exact command matches; there is
+no default, and an action that lists a harness without an
 .B outcome
 fails to load. The password path is unchanged. The
 .B ask-human
@@ -170,12 +167,13 @@ outcome submits the request to the broker's root-held queue and denies the
 current request. For this outcome, the action must list the caller's verified
 harness label; an empty or different list does not queue it. A human-path
 denial is never queued. A command with no matching rule is denied. A human
-reviewer runs the queued entry with
+reviewer reads the queued entry through
+.B ido
+and runs it with
 .B xudo exec \-\-queued
 through the password-authenticated gate, and
-.B ido
-lists it separately from the user-side queue. The passwordless gate is not
-installed.
+lists it separately from the user-side queue. The passwordless gate runs only
+when root has installed the opt-in agent path.
 .TP
 .B gtfobins\-waiver
 .RI \(dq technique ": " why \(dq.
@@ -213,9 +211,11 @@ and
 a live enrolled agent whose label is listed runs the operation through
 .B xudo\-gate\-nopass
 without a password; it is the same walk, with the same tree, depth, entry
-cap and owners. Every other caller uses the password path. While
+cap and owners, and refuses mount boundaries. Other permitted human requests use the password path; an
+unattested or out-of-scope caller is refused or sent through the human path.
+When
 .B confirm_human_path
-is on, the grant is withheld and a listed harness uses the password path too.
+is on, the remove-path harness grant is withheld.
 .TP
 .B id
 Stable identifier, unique across actions, deny rules, and operations.
