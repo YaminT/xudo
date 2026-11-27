@@ -20,8 +20,8 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use xudo_sys::{
-    HostInstallOps, HostInstaller, InstallError, InstallProbe, Installer, PackError, PackReport,
-    PackRequest, ProbeResult, Whereabouts, add_pack, remove_pack,
+    HostInstallOps, HostInstaller, InstallError, InstallProbe, Installer, PackError, PackFileError,
+    PackReport, PackRequest, ProbeResult, Whereabouts, add_pack, read_pack_file, remove_pack,
 };
 use xudo_tests::root_lane::root_guard;
 
@@ -126,8 +126,10 @@ fn a_pack_lands_root_owned_0644_and_leaves_an_operators_file_alone() {
     // An operator's own file under the pack's name is never replaced or removed.
     fs::write(PATH, PACK).unwrap();
     fs::set_permissions(PATH, fs::Permissions::from_mode(0o644)).unwrap();
+    // The token is checked first, so the refusal comes with the right one.
     let ops = HostInstallOps::system();
-    let error = add_pack(&request(PACK, "?"), &Session, &ops, &ops).unwrap_err();
+    let token = token_of(add_pack(&request(PACK, "?"), &Session, &ops, &ops));
+    let error = add_pack(&request(PACK, &token), &Session, &ops, &ops).unwrap_err();
     assert!(
         matches!(error, PackError::Install(InstallError::NotOurs { .. })),
         "{error}"
@@ -167,4 +169,32 @@ fn the_real_proc_walk_refuses_where_it_cannot_tell_where_it_runs() {
         );
     }
     assert!(!fs::exists(PATH).unwrap());
+}
+
+#[test]
+fn root_never_reads_a_pack_swapped_for_a_symlink_to_shadow() {
+    if !begin_root_test("root_never_reads_a_pack_swapped_for_a_symlink_to_shadow") {
+        return;
+    }
+    // The agent's directory, the agent's link to a file only root can read:
+    // root refuses the link, and its refusal holds no byte of the target.
+    let dir = "/var/tmp/xudo-root-pack-swap";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let secret = format!("{dir}/shadow");
+    fs::write(&secret, "root:$y$j9T$secretsecret:20000:0:99999:7:::\n").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    for target in [secret.as_str(), "/etc/shadow"] {
+        let link = format!("{dir}/pack.toml");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let error = read_pack_file(std::path::Path::new(&link)).unwrap_err();
+        assert!(matches!(error, PackFileError::Open { .. }), "{error}");
+        let text = error.to_string();
+        assert!(
+            !text.contains("secret") && !text.contains("root:"),
+            "{text}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
