@@ -13,6 +13,7 @@
 #
 # Both edits to the system (the NOPASSWD line and /etc/pam.d/sudo) are undone
 # by g1f_cleanup, which row.sh runs on EXIT, if this script aborts first.
+# attack.sh, sourced before the flood, holds E7's attack rows.
 
 # Never outside the throwaway container: this writes a NOPASSWD line.
 systemd-detect-virt --container -q || {
@@ -520,6 +521,10 @@ else
 fi
 cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
 rm -f "$g1f/once" /var/tmp/g1f-pam-sudo
+
+# E7's attack rows, with the lane-only line still in place and before the
+# flood below fills the account's uid-only ledger.
+. /harness/attack.sh
 
 # (6) The ceiling under load: 200 calls of the passwordless door with nothing
 # minted. The trail grows by at most the ceiling (60 in any minute) plus one

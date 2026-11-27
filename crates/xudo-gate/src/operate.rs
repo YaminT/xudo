@@ -129,7 +129,11 @@ fn walk_owners(owners: OwnerPolicy) -> RemoveOwnerPolicy {
 
 /// Evidence for the one record of a finished walk.
 pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Vec<String> {
-    let severity = if report.dry_run {
+    // An escape met after some names went (the tree changed after the dry
+    // run) is still somebody's planted link or mount.
+    let severity = if escaped(report) {
+        Severity::High
+    } else if report.dry_run {
         Severity::Low
     } else {
         Severity::Normal
@@ -258,12 +262,31 @@ fn hex_digit(nibble: u8) -> char {
 }
 
 /// A walk error before any name was removed. The caller has already consumed
-/// the spool entry.
+/// the spool entry. A link or mount the walk would cross is its own, loud
+/// refusal: it is planted, never a host that could not take a step.
 pub(crate) fn walk_refusal(error: &RemoveError) -> Refusal {
+    if let RemoveError::WalkEscape(reason) = error {
+        return Refusal::WalkEscape { reason };
+    }
     Refusal::Failed {
         stage: Stage::Exec,
         reason: error.to_string(),
     }
+}
+
+/// The gate's dry run met a link or mount it would cross: refuse the whole
+/// operation before the walk that unlinks, even where names before the
+/// escape could have gone.
+pub(crate) fn refuse_a_planned_escape(planned: &RemoveReport) -> Result<(), Refusal> {
+    match &planned.error {
+        Some(error @ RemoveError::WalkEscape(_)) => Err(walk_refusal(error)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the walk stopped at a link or mount it would cross.
+fn escaped(report: &RemoveReport) -> bool {
+    matches!(report.error, Some(RemoveError::WalkEscape(_)))
 }
 
 /// Whether a policy denial from this path is `DenialCode::OperationRefused`.
@@ -278,6 +301,7 @@ pub(crate) fn is_operation_refusal(refusal: &Refusal) -> bool {
         | Refusal::ConfirmationMissing(_)
         | Refusal::Mode { .. }
         | Refusal::RateCeiling { .. }
+        | Refusal::WalkEscape { .. }
         | Refusal::Failed { .. } => false,
     }
 }
@@ -292,6 +316,13 @@ pub(crate) fn operation_status(report: &RemoveReport) -> i32 {
 pub(crate) fn operation_message(report: &RemoveReport) -> String {
     if report.dry_run {
         format!("xudo-gate: dry-run listed {} paths", report.removed.len())
+    } else if let Some(RemoveError::WalkEscape(reason)) = &report.error {
+        // The tree changed after the dry run and the real walk met a planted
+        // link or mount: say so, not only how many names went first.
+        format!(
+            "xudo-gate: partial remove of {} paths, stopped by gate_walk_escape: {reason}",
+            report.removed.len()
+        )
     } else if report.partial {
         format!(
             "xudo-gate: partial remove of {} paths",
@@ -708,6 +739,7 @@ outcome = "allow"
             | Refusal::ConfirmationMissing(_)
             | Refusal::Mode { .. }
             | Refusal::RateCeiling { .. }
+            | Refusal::WalkEscape { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -720,6 +752,7 @@ outcome = "allow"
             | Refusal::ConfirmationMissing(_)
             | Refusal::Mode { .. }
             | Refusal::RateCeiling { .. }
+            | Refusal::WalkEscape { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -855,11 +888,80 @@ outcome = "allow"
             stage: Stage::Audit,
             reason: "audit".to_owned(),
         };
-        for case in [&request, &missing, &confirm, &failed, &refusal] {
+        let escape = walk_refusal(&RemoveError::WalkEscape("a link"));
+        for case in [&request, &missing, &confirm, &failed, &refusal, &escape] {
             assert!(!is_operation_refusal(case));
             assert_eq!(denial_of(case), None);
             assert_eq!(verdict_of(case), None);
         }
+    }
+
+    #[test]
+    fn a_planted_link_or_mount_is_a_loud_walk_escape_and_never_a_plain_exec_failure() {
+        // Attack: a link or bind mount planted in the tree, to make the
+        // walk reach outside it. Its trace must not read as a broken host.
+        let escape = RemoveError::WalkEscape("the walk would cross a mount");
+        let refusal = walk_refusal(&escape);
+        assert_eq!(
+            refusal,
+            Refusal::WalkEscape {
+                reason: "the walk would cross a mount"
+            }
+        );
+        assert_eq!(refusal.code(), "gate_walk_escape");
+        assert_eq!(refusal.severity(), Severity::High);
+        assert_eq!(
+            refusal.to_string(),
+            "the remove-path walk refused an escape: the walk would cross a mount"
+        );
+        // A plan that met one refuses the whole operation, even with names
+        // listed before it; a plan that stopped for another reason does not.
+        let mut planned = report(&[b"/srv/app/build/cache/a"], true, true);
+        assert_eq!(refuse_a_planned_escape(&planned), Ok(()));
+        planned.error = Some(RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        assert_eq!(refuse_a_planned_escape(&planned), Ok(()));
+        planned.error = Some(escape.clone());
+        assert_eq!(refuse_a_planned_escape(&planned), Err(refusal));
+        // One met by the unlinking walk, after the tree changed under the
+        // plan, still reads as an escape: high, with its reason.
+        let work = prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        let mut walked = report(&[b"/srv/app/build/cache/a"], false, true);
+        walked.error = Some(escape);
+        let record = remove_record(None, &caller(), &work, &walked);
+        for line in [
+            "severity=high",
+            "partial=true",
+            "error=the walk would cross a mount",
+        ] {
+            assert!(record.evidence.iter().any(|seen| seen == line), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_escape_met_only_by_the_real_walk_is_named_in_the_message() {
+        // Attack: the tree is clean for the dry run, then a link or mount is
+        // planted before the walk that unlinks. The caller's line names the
+        // escape, not only the count of names that went before it.
+        let mut walked = report(&[b"/srv/app/build/cache/a"], false, true);
+        walked.error = Some(RemoveError::WalkEscape("the walk would cross a mount"));
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths, stopped by gate_walk_escape: \
+             the walk would cross a mount"
+        );
+        assert_eq!(operation_status(&walked), 1);
+        // Another stop keeps the plain partial line.
+        walked.error = Some(RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths"
+        );
     }
 
     fn report_owned(paths: &[Vec<u8>], dry_run: bool, partial: bool) -> RemoveReport {

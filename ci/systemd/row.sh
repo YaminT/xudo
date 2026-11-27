@@ -3,7 +3,8 @@
 # xudo exec on a pty (ci/differential/exec.exp, user xudotest), and removes it.
 # The unit files are the ones the package shipped. This script does not edit them.
 # grant.sh, sourced near the end, proves the passwordless grant through a live
-# enrolled unit; it alone writes a NOPASSWD line, and deletes it again.
+# enrolled unit; it alone writes a NOPASSWD line, and deletes it again. It
+# sources attack.sh, E7's rows that try every way around that grant.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -709,10 +710,13 @@ else
 fi
 [ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
 # The passwordless grant end to end, with a lane-only NOPASSWD line that the
-# script removes before it returns (G1f). If it aborts first, this undoes both
-# of its edits to the system on the way out.
+# script removes before it returns (G1f). If it aborts first, this undoes its
+# edits to the system on the way out, and attack.sh's two bind mounts.
 g1f_cleanup() {
     rm -f /etc/sudoers.d/xudo-g1f-lane-only
+    for mnt in /var/lib/xudo-g1f-tree/cache/deep/m2 /var/lib/xudo-g1f-tree/mnt; do
+        if mountpoint -q "$mnt"; then umount "$mnt" || umount -l "$mnt" || true; fi
+    done
     if [ -f /var/tmp/g1f-pam-sudo ]; then
         cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
         rm -f /var/tmp/g1f-pam-sudo

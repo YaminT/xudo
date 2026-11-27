@@ -87,6 +87,10 @@ pub struct PeerIdentity {
     pub sid: i64,
     /// Controlling terminal number; zero means no controlling terminal.
     pub tty: i64,
+    /// Its `comm` from the same `/proc/<pid>/stat` read: the name the process
+    /// gave itself. An unauthenticated hint (invariant 1), recorded in the
+    /// audit trail and never read by a decision.
+    pub comm: Vec<u8>,
     /// Whether namespace facts diverge from the broker's identity namespace.
     pub diverged: bool,
     /// Whether a pidfd held the process while `/proc` was read and the
@@ -343,6 +347,7 @@ fn identify_inner(
         starttime: stat.starttime,
         sid: stat.session,
         tty: stat.tty_nr,
+        comm: stat.comm,
         diverged: namespaces,
         pinned: pin.is_some(),
         cgroup_id: cgroup_result
@@ -865,6 +870,7 @@ mod tests {
                 starttime: START,
                 sid: 1,
                 tty: 0,
+                comm: b"xudo".to_vec(),
                 diverged: false,
                 pinned: true,
                 cgroup_id: Some(77),

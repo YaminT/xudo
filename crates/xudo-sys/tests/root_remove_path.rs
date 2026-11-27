@@ -32,6 +32,8 @@ const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
 // from a subdirectory of it. Same filesystem, same `st_dev`, still a mount.
 const BIND_TREE: &str = "/var/lib/xudo-t1-remove-bind";
 const XDEV_TREE: &str = "/var/lib/xudo-t1-remove-xdev";
+// Docker bind-mounts a host file over `FILE_TREE/box/over`.
+const FILE_TREE: &str = "/var/lib/xudo-t1-remove-filebind";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -281,4 +283,80 @@ fn a_same_device_bind_mount_as_the_tree_is_refused() {
     for dir in [child.as_str(), BIND_TREE] {
         std::os::unix::fs::chown(dir, Some(owner.uid()), Some(owner.gid())).unwrap();
     }
+}
+
+#[test]
+fn denies_a_real_symlink_planted_as_a_parent_of_the_target() {
+    if !begin_root_test("denies_a_real_symlink_planted_as_a_parent_of_the_target") {
+        return;
+    }
+    // Attack: `hop -> MOVED` in the tree, and a removal of `hop/v`. The
+    // kernel answers ENOTDIR or ELOOP; either is an escape, nothing goes.
+    fs::create_dir_all(MOVED).unwrap();
+    let victim = format!("{MOVED}/v");
+    fs::write(&victim, b"keep").unwrap();
+    chown_unprivileged(&victim, false);
+    let link = format!("{TREE}/hop");
+    std::os::unix::fs::symlink(MOVED, &link).unwrap();
+    chown_unprivileged(&link, true);
+    assert_eq!(
+        walk(b"hop/v", false).unwrap_err(),
+        RemoveError::WalkEscape("a directory on the way to the target is a symbolic link")
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn denies_a_real_mount_as_a_parent_or_as_the_target() {
+    if !begin_root_test("denies_a_real_mount_as_a_parent_or_as_the_target") {
+        return;
+    }
+    let mount = format!("{XDEV_TREE}/box/mnt");
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    let inside = format!("{mount}/kept");
+    fs::write(&inside, b"behind the mount").unwrap();
+    chown_unprivileged(&inside, false);
+    chown_unprivileged(&mount, false);
+    for relative in [&b"box/mnt/kept"[..], b"box/mnt"] {
+        let mut request = request(relative, true);
+        request.under = XDEV_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    let _ = fs::remove_file(&inside);
+}
+
+#[test]
+fn denies_a_file_bind_mounted_over_a_name_in_the_tree() {
+    if !begin_root_test("denies_a_file_bind_mounted_over_a_name_in_the_tree") {
+        return;
+    }
+    // Attack: a file bind-mounted over a name the walk would unlink, by name
+    // or inside a directory it empties. A mount whose root is a file is still
+    // a mount: the walk refuses it as an escape and nothing goes.
+    let box_dir = format!("{FILE_TREE}/box");
+    let over = format!("{box_dir}/over");
+    assert!(Path::new(&over).is_file(), "the lane did not mount {over}");
+    for path in [&over, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    for (relative, recursive) in [(&b"box/over"[..], false), (b"box", true)] {
+        let mut request = request(relative, recursive);
+        request.under = FILE_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&over).unwrap(), b"bound over");
+    assert!(Path::new(&box_dir).is_dir());
 }
