@@ -38,9 +38,10 @@
 //!
 //! # What none of this decides
 //!
-//! Classification. In M2b every caller is `Unattested`, so nothing here grants
-//! anything; the identity binds the request and fills the audit record. The
-//! rung is still recorded honestly, because M4 will rest authority on it.
+//! Classification. The broker uses these kernel facts and the root registry
+//! to identify an enrolled harness. Every other caller takes the password
+//! path or is refused. This identity binds the request and fills the audit
+//! record; the rung is recorded honestly for audit and classification.
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 

@@ -10,13 +10,20 @@ The package and plain `xudo install` install only the password-authenticated
 gate rule. The passwordless agent path is off until an operator enrolls a
 service harness, grants it an exact rule, and explicitly runs
 `sudo xudo install --agent-path` on sudo or sudo-rs. OpenDoas does not support
-that opt-in path. Enrollment alone grants no command. Session start and attach
-for a harness running as a logged-in user's account are not implemented.
+that opt-in path. Enrollment alone grants no command. The session way (a
+harness running in the human's own account) is parsed and loaded but has no
+start command. A session harness shares the human's uid: at
+`kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
+password, `xudo watch` accepts a same-uid watcher on another tty, and a
+registry entry can name the human's account. Run harnesses as separate service
+accounts. `--raise-ptrace-scope` takes effect only after `sudo sysctl --system`
+or reboot.
 
 ## Security boundary
 
-The authorization boundary is the combination of root-owned rules, the
-compiled-in deny-list, and the broker and gate's independent checks. A
+The policy boundary is the root-owned rules and their argument matchers. The
+compiled-in deny-list is defense in depth; the broker and gate both check
+policy. A
 passwordless run additionally requires kernel-attested membership in a live
 root-created cgroup scope, a matching root-owned harness registry entry, an
 exact rule for that harness, and the installed opt-in backend rule. Caller
@@ -47,13 +54,20 @@ host configuration responsibility.
   service, or audit state. The hash-chained audit file and journal copies can
   expose some edits; they are not an external trust anchor or protection from
   malicious root.
-- Audit hints are bounded and do not contain raw command arguments or a digest
-  of them. Some process details are unavailable to the unprivileged broker.
-  Hints never change an authorization decision.
+- Audit hints include a bounded, caller-controlled `argv[0]`, argument count,
+  and argument length, but no later arguments and no digest. A process can
+  rewrite its title, and a failed read is recorded as `unavailable`. Hints
+  never change an authorization decision.
 - A reviewer must make human decisions outside the requesting process tree.
   Root-held `ask-human` entries are written by the broker and read through it;
-  the requester cannot answer or edit them. The reviewer rechecks policy and
-  enters the host backend's password before a queued command runs.
+  the requester can see its own entry but cannot edit, claim, release, or
+  answer it. `ido` asks the broker to release or run an entry; it does not
+  rewrite queue files. The reviewer rechecks policy and enters the host
+  backend's password before a queued command runs.
+- Root's thaw lifts every freeze marker. A reviewer's thaw removes only their
+  uid marker, not `frozen-h-<label>`. An attested harness cannot freeze or thaw;
+  a harness account outside its scope can freeze its own uid marker. Only
+  `sudo xudo thaw` lifts a harness marker.
 - A broad rule can grant broad root access. Rule packs are previewed and bound
   to the reviewed bytes and policy generation; installation still requires a
   root reviewer. Read the preview, especially any GTFOBins waiver.

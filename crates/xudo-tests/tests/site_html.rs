@@ -70,6 +70,22 @@ fn index_states_the_opt_in_and_security_page_states_the_landlock_limit() {
 }
 
 #[test]
+fn site_pins_session_uid_and_broker_queue_limits() {
+    let root = workspace_root();
+    let security = fs::read_to_string(root.join("site/security.html")).unwrap();
+    let how = fs::read_to_string(root.join("site/how-it-works.html")).unwrap();
+    let faq = fs::read_to_string(root.join("site/faq.html")).unwrap();
+    assert!(security.contains("a same-uid watcher on another tty"));
+    assert!(security.contains("--raise-ptrace-scope</code> takes effect after"));
+    for page in [&how, &faq] {
+        assert!(page.contains("can see its own"));
+        assert!(page.contains("cannot edit, claim, release, or answer"));
+        assert!(page.contains("asks the broker to release or run"));
+        assert!(page.contains("does not rewrite queue files"));
+    }
+}
+
+#[test]
 fn the_checks_catch_a_backtick_and_the_old_unavailable_claim() {
     assert!(!shows_markdown_backtick(
         "<p>Use <code>xudo exec</code>.</p>"

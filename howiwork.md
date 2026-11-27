@@ -8,8 +8,9 @@ claims consistent with this file and with the implementation.
 
 xudo is a Linux privilege broker for AI harnesses. A harness calls `xudo exec`
 with a program and its exact argument vector. xudo checks the request against
-root-owned rules and a compiled-in deny-list, then either runs it, queues it for
-a human, or refuses it. The host's `sudo`, `sudo-rs`, or `doas` performs the
+root-owned rules and their argument matchers, with a compiled-in deny-list as
+defense in depth, then either runs it, queues it for a human, or refuses it.
+The host's `sudo`, `sudo-rs`, or `doas` performs the
 uid transition. xudo has no setuid binary.
 
 The default install grants no passwordless execution. A verified, registered
@@ -38,8 +39,9 @@ password-authenticated path.
   always follows the password path. The `-nopass` gate works only for an
   attested harness with a matching rule and only if root has explicitly
   installed its backend rule.
-- `ido` reads the broker queue through the broker and lets a reviewer claim and
-  run an entry. The requester cannot answer or edit this root-held queue.
+- `ido` reads the broker queue through the broker and asks the broker to release
+  or run an entry. It does not rewrite the queue files. The requester can see
+  its own entry, but cannot edit, claim, release, or answer it.
 
 Authorization relies on a connected Unix socket peer and the kernel's
 pidfd/cgroup evidence, plus a root-owned harness registry. User-controlled
@@ -62,8 +64,13 @@ with a matching registry record, is a verified harness. A similarly named
 process or an SSH login as the service account is not enough. Root-created
 cgroups and registry state are the authentication basis; display names are not.
 
-Session start and attach for a harness running as a logged-in human are not
-implemented. There is no laptop/session enrollment path in this beta.
+The session way (a harness running in the human's own account) is parsed and
+loaded, but has no start command. A session harness shares the human's uid:
+with `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
+password, `xudo watch` accepts a same-uid watcher on another tty, and a session
+registry entry can name the human's account. Run harnesses as separate service
+accounts. `--raise-ptrace-scope` writes a sysctl drop-in; it takes effect only
+after `sudo sysctl --system` or reboot.
 
 The package and plain `xudo install` install only the password-authenticated
 backend rule. After enrollment and after installing rules that grant the
@@ -80,8 +87,9 @@ place with a warning.
 Rules are TOML files owned by root under `/etc/xudo/rules.d`. Each action names
 one absolute executable and constrains its arguments position by position
 using typed matchers. A harness allow requires both an exact command match and
-the harness label in the rule. The compiled-in deny-list is evaluated after
-allow matching and cannot be overridden by rules. `path-under` is lexical
+the harness label in the rule. The policy boundary is the root-owned rules and
+their argument matchers. The compiled-in deny-list is defense in depth and
+cannot be overridden by rules. `path-under` is lexical
 only; it does not enforce filesystem containment for programs that open paths
 as root.
 
@@ -96,7 +104,8 @@ There are three outcomes:
    `xudo exec --queued ID`. The broker rechecks the saved request against the
    current rules, then the host asks for the reviewer's password. Queue entries
    are bounded, expire, and are invalidated when relevant policy changes.
-   The requester cannot list, edit, claim, approve, or answer its own entry.
+   The requester can see its own entry, but cannot edit, claim, release, or
+   answer it.
 3. **Deny.** A deny rule, the compiled-in deny-list, a missing match, a failed
    check, or a required human decision with no available human stops the
    request. Denied commands never run.
@@ -114,7 +123,9 @@ The rule fixes the allowed tree. The implementation enforces ownership and
 trust of the path's ancestors, refuses mount boundaries, and bounds the walk
 by depth and entry count; it does not follow symlinks. Harness rules can grant this typed operation with
 the same verified-harness and optional passwordless gates. The shipped example
-is `rules/examples/50-remove-path.toml.example`.
+is `rules/examples/50-remove-path.toml.example`. A harness `remove-path` rule
+must set `owners` or it fails to load; the any-non-root default is not accepted.
+`ask-human` is not a supported operation outcome and fails to load.
 
 ## Rule packs
 
@@ -134,15 +145,21 @@ It allows at most 60 invocations in a minute and 600 retained stamps in an
 hour; reaching a ceiling refuses the request and records the refusal with
 bounded coalescing. A missing, corrupt, unreadable, or busy ledger also
 refuses the request. Root can freeze all harnesses; a user can freeze that
-user's own harness. Harnesses cannot freeze or thaw. The broker, gate, queue,
-freeze controls, and decision records use bounded root-owned state.
+user's own harness. An attested harness cannot freeze or thaw; a process of a
+harness account outside its scope can freeze only its own uid marker. The
+broker, gate, queue, freeze controls, and decision records use bounded
+root-owned state. Root's thaw lifts every freeze marker. A reviewer's thaw
+removes only that reviewer's uid marker, not any `frozen-h-<label>` marker.
+Only `sudo xudo thaw` can lift a harness marker.
 
 The audit trail is hash-chained and the system journal receives root-written
 records. `xudo audit --against-journal` can compare the local file to the
 journal records it can read. This is tamper evidence, not an external audit or
 a guarantee against a malicious root user. Audit hints are bounded and
-audit-only: xudo does not store raw arguments or a digest of them. Hints may be
-unavailable for processes the broker cannot inspect.
+audit-only. They include a bounded, caller-controlled `argv[0]`, the argument
+count, and the argument length; they include no later arguments and no digest.
+A process can rewrite its title, so `argv[0]` is not proof of the executable.
+A failed read is recorded as `unavailable`.
 
 ## Install and supported hosts
 

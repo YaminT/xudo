@@ -2,7 +2,7 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Security — xudo</title><meta name="description" content="xudo beta security status, limits, and vulnerability reporting."><link rel="canonical" href="https://yamint.github.io/xudo/security.html"><link rel="stylesheet" href="style.css"></head>
 <body><header><nav aria-label="Main"><a href="./">xudo</a><a href="security.html">Security</a><a href="how-it-works.html">How it works</a><a href="rules.html">Rules</a><a href="faq.html">FAQ</a></nav></header><main>
 <h1>Security</h1><p><strong>Beta. Not externally audited.</strong> Do not deploy where compromise would have unacceptable consequences.</p>
-<p>The package installs only the password-authenticated gate rule. Passwordless harness execution is off until an operator enrolls a service harness, grants it an exact rule, and runs <code>sudo xudo install --agent-path</code> on sudo or sudo-rs. OpenDoas does not support this opt-in path. Session start and attach are not implemented.</p>
+<p>The package installs only the password-authenticated gate rule. Passwordless harness execution is off until an operator enrolls a service harness, grants it an exact rule, and runs <code>sudo xudo install --agent-path</code> on sudo or sudo-rs. OpenDoas does not support this opt-in path. The session way is parsed and loaded but has no start command. It shares the human's uid: at <code>ptrace_scope=0</code>, that uid can read a typed password, <code>xudo watch</code> accepts a same-uid watcher on another tty, and the registry can name the human's account. Run harnesses as separate service accounts. <code>--raise-ptrace-scope</code> takes effect after <code>sudo sysctl --system</code> or reboot.</p>
 <h2>Limits</h2>
 <ul>
 <li>Authorization depends on root-owned rules and registry state, kernel-attested membership in a live root-created service scope, and checks by both broker and gate. Names and environment values are audit hints only.</li>
@@ -10,7 +10,7 @@
 <li>The service account's file and network access is a host responsibility. xudo does not confine code inside the account with Landlock.</li>
 <li><code>path-under</code> is lexical and does not enforce filesystem containment. The separate <code>remove-path</code> operation has ownership checks and bounded tree traversal.</li>
 <li>xudo governs only commands routed through xudo. Other host paths to root remain. <code>xudo doctor</code> reports paths it can inspect but cannot prove that none exist.</li>
-<li>The hash-chained audit log and journal records provide tamper evidence, not protection against a malicious root user or an external trust anchor. Audit hints are bounded; raw arguments and their digests are not recorded.</li>
+<li>The hash-chained audit log and journal records provide tamper evidence, not protection against a malicious root user or an external trust anchor. Hints include bounded, caller-controlled <code>argv[0]</code>, argument count, and length; they include no later arguments or digest. A process can rewrite its title, and a failed read is <code>unavailable</code>.</li>
 </ul>
 <p>Supported package targets are Debian 13, Ubuntu 24.04 and 26.04, amd64 and arm64. See <a href="https://github.com/YaminT/xudo/blob/main/SECURITY.md">SECURITY.md</a> for details.</p>
 <h2>Report a vulnerability</h2><p>Open a <a href="https://github.com/YaminT/xudo/security/advisories">private security advisory</a>. Do not open a public issue for an exploitable vulnerability.</p>

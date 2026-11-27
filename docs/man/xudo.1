@@ -246,7 +246,8 @@ rule is stored by the broker in its root-held queue.
 claims that entry for a fresh decision against the current rules. The stored
 working directory is not used; the command runs in
 .BR / .
-Only a human reviewer who does not own the entry can claim it. The run uses
+The requester can see its own entry but cannot edit, claim, release, or answer
+it. Only a human reviewer who does not own the entry can claim it. The run uses
 the same scoped sudo rule as any other xudo authorization, so sudo asks for
 the password. Its
 .B timestamp_timeout=0
@@ -306,10 +307,15 @@ per hour. A request over either ceiling, or one the ledger cannot safely
 check, is refused. Over-ceiling audit records are coalesced.
 .TP
 .B thaw
-Lift the caller's own freeze and resume that scope. A user's thaw removes only
-the marker for their own uid: root's global freeze stays in force, and so does
-every other user's, until root lifts it. Root's thaw lifts the global freeze
-and every user's marker. A non-root thaw is refused for an attested agent, an unattested caller, a
+Root's thaw lifts every marker. A reviewer's thaw removes only their uid
+marker, not any
+.B frozen-h-\fILABEL
+marker. An attested harness cannot freeze or thaw. A harness account outside
+its attested scope can freeze its own uid marker; only
+.B sudo xudo thaw
+can lift a harness marker. A user's thaw removes only the marker for their own
+uid: root's global freeze stays in force, and so does every other user's,
+until root lifts it. A non-root thaw is refused for an attested agent, an unattested caller, a
 peer in another user namespace, and any caller whose uid is the account or a
 user of a registered harness: being outside an agent scope does not prove a
 human, because an agent can start a process outside its scope as its own uid.
@@ -700,15 +706,21 @@ removes it with everything else, and refuses to remove an edited
 .B xudo doctor
 says whether the agent path is on and whether its text is exact.
 .IP
-The shipped enrollment path uses a dedicated service account. Session start
-and attach for a harness running as a logged-in user's account are not
-implemented.
+The shipped enrollment path uses a dedicated service account. The session way
+(a harness running in the human's own account) is parsed and loaded but has no
+start command. A session harness shares the human's uid: at
+.B kernel.yama.ptrace_scope=0
+a process of that uid can read a typed password,
+.B xudo watch
+accepts a same-uid watcher on another tty, and a registry entry can name the
+human's account. Run harnesses as separate service accounts.
 .B \-\-raise\-ptrace\-scope
 also writes a root-owned sysctl drop-in setting
 .BR kernel.yama.ptrace_scope=1 ,
 but only when its live value is 0. It never lowers a higher value and does not
-apply the setting immediately; it takes effect through the host's sysctl
-reload or at boot. Uninstall removes an unedited drop-in and leaves an edited
+apply the setting immediately; it takes effect after
+.B sudo sysctl \-\-system
+or at boot. Uninstall removes an unedited drop-in and leaves an edited
 one with a warning.
 .TP
 .B audit
@@ -981,12 +993,8 @@ Both files are looked at in their first 64 KiB only, and the broker reads
 no more of them than that; a
 .B +
 after the count or the length marks a longer command line.
-The broker runs without capabilities, so the kernel shows it another
-user's command line but not its
-.B exe
-or environment; its records carry those two as
-.BR unavailable ,
-and the gate, which runs as root, records them.
+The broker runs as root. A failed read is recorded as
+.BR unavailable .
 Authorization does not branch on them.
 An unattested caller is not treated as a verified harness. It takes the
 human path or is refused; hints never change that decision.

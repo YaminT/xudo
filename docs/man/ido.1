@@ -155,7 +155,10 @@ as
 in
 .BR / ,
 never through a shell and never in the directory the agent stored.
-The broker refuses a claim or a release from the harness that owns the entry.
+The requester can see its own entry but cannot edit, claim, release, or answer
+it. Listing and running entries, and releasing a claim, are broker requests;
+.B ido
+does not rewrite the root-held queue files.
 If the broker cannot be asked, the text list says the root-held queue is
 unavailable.
 .B \-\-json

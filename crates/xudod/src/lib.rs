@@ -7,8 +7,9 @@
 //!
 //! 1. takes the connection from systemd, as descriptor 0;
 //! 2. identifies the peer from the kernel, by the attestation ladder;
-//! 3. classifies it `Unattested`: no caller is a verified harness in this
-//!    release, so every caller takes the human path, with a password;
+//! 3. classifies the peer from kernel facts and the root registry. A live
+//!    service harness in a root-registered scope is an enrolled agent; every
+//!    other caller takes the password path;
 //! 4. evaluates the request against root's ruleset, with the same function
 //!    `xudo explain` uses;
 //! 5. runs the optional human-path confirmation (`confirm_human_path`, off by

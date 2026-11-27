@@ -167,13 +167,15 @@ outcome submits the request to the broker's root-held queue and denies the
 current request. For this outcome, the action must list the caller's verified
 harness label; an empty or different list does not queue it. A human-path
 denial is never queued. A command with no matching rule is denied. A human
-reviewer reads the queued entry through
+reviewer uses
 .B ido
-and runs it with
+to read the broker queue and ask the broker to run it with
 .B xudo exec \-\-queued
 through the password-authenticated gate, and
 lists it separately from the user-side queue. The passwordless gate runs only
 when root has installed the opt-in agent path.
+The requester can see its own entry but cannot edit, claim, release, or answer
+it; queue changes are made by the broker, not by rewriting its files.
 .TP
 .B gtfobins\-waiver
 .RI \(dq technique ": " why \(dq.
@@ -216,6 +218,15 @@ unattested or out-of-scope caller is refused or sent through the human path.
 When
 .B confirm_human_path
 is on, the remove-path harness grant is withheld.
+.PP
+A harness
+.B remove-path
+rule must set
+.B owners
+or the rule fails to load; the default of any non-root owner is not accepted
+for a harness grant. The
+.B ask-human
+outcome is not supported for operations and fails to load.
 .TP
 .B id
 Stable identifier, unique across actions, deny rules, and operations.

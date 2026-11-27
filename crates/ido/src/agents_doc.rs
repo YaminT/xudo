@@ -43,8 +43,8 @@ Example:
 
     ido queue --root -m \"install ripgrep for code search\" -- /usr/bin/apt-get -y --no-install-recommends --no-remove install -- ripgrep
 
-The user runs `ido` later and picks what to run. Do not wait for it. Do not ask
-the user to run the command by hand.
+The user runs `ido` later and picks what to run; do not wait or ask them to run commands by hand.
+The broker's root-owned `xudo` `ask-human` entries are visible to requesters, who cannot edit, claim, release, or answer them; `ido` asks the broker to release or run an entry and does not rewrite queue files.
 
 If two commands must run in order, put them in one group:
 
@@ -287,6 +287,8 @@ mod tests {
             BLOCK.lines().count() < 30,
             "a long block gets summarised away"
         );
+        assert!(BLOCK.contains("cannot edit, claim, release, or answer them"));
+        assert!(BLOCK.contains("does not rewrite queue files"));
     }
 
     #[test]

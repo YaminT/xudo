@@ -81,6 +81,46 @@ fn stale_shipped_feature_claim(text: &str) -> bool {
     .any(|claim| flat.contains(claim))
 }
 
+const STALE_PRIVILEGED_RUST_DOC_CLAIMS: [&str; 5] = [
+    "every caller is unattested",
+    "no caller is a verified harness",
+    "no caller can be a registered agent",
+    "every caller takes the human path",
+    "every caller takes the password path",
+];
+
+fn rust_doc_comments(text: &str) -> String {
+    let docs = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("//!")
+                .or_else(|| trimmed.strip_prefix("///"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    flatten_claim(&docs)
+}
+
+fn stale_privileged_rust_doc_claim(text: &str) -> bool {
+    let docs = rust_doc_comments(text);
+    STALE_PRIVILEGED_RUST_DOC_CLAIMS
+        .iter()
+        .any(|claim| docs.contains(claim))
+}
+
+fn rust_files(directory: &Path, found: &mut Vec<String>) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, found);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            found.push(path.display().to_string());
+        }
+    }
+}
+
 fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
@@ -333,6 +373,74 @@ fn public_docs_describe_the_current_approval_model() {
         stale.is_empty(),
         "replaced approval model stated in: {stale:?}"
     );
+}
+
+#[test]
+fn privileged_rust_docs_do_not_make_stale_public_claims() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let crates = root.join("crates");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&crates).unwrap() {
+        let source = entry.unwrap().path().join("src");
+        if source.is_dir() {
+            rust_files(&source, &mut files);
+        }
+    }
+    let stale: Vec<_> = files
+        .iter()
+        .filter(|file| stale_privileged_rust_doc_claim(&fs::read_to_string(file).unwrap()))
+        .cloned()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "stale claims in Rust doc comments: {stale:?}"
+    );
+}
+
+#[test]
+fn rust_doc_comment_check_catches_stale_claims_and_allows_current_wording() {
+    assert!(stale_privileged_rust_doc_claim(
+        "//! every caller is Unattested; no caller is a verified harness in this release"
+    ));
+    assert!(stale_privileged_rust_doc_claim(
+        "/// every caller takes the\n/// password path"
+    ));
+    assert!(!stale_privileged_rust_doc_claim(
+        "//! The broker classifies the peer from kernel facts and the root registry.\n\
+         //! A live service harness in a root-registered scope is an enrolled agent;\n\
+         //! every other caller takes the password path."
+    ));
+    assert!(!stale_privileged_rust_doc_claim(
+        "// every caller is unattested\nfn internal() {}"
+    ));
+}
+
+#[test]
+fn public_docs_pin_correct_queue_freeze_session_and_audit_limits() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let how = fs::read_to_string(root.join("howiwork.md")).unwrap();
+    let security = fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let manual = fs::read_to_string(root.join("docs/man/xudo.1")).unwrap();
+    let queue_manual = fs::read_to_string(root.join("docs/man/ido.1")).unwrap();
+    let rules_manual = fs::read_to_string(root.join("docs/man/xudo-rules.5")).unwrap();
+
+    for text in [&how, &security, &queue_manual] {
+        let flat = flatten_claim(text);
+        assert!(flat.contains("can see its own entry"));
+        assert!(flat.contains("cannot edit, claim, release, or answer"));
+    }
+    for text in [&how, &security, &manual] {
+        let flat = flatten_claim(text);
+        assert!(flat.contains("root's thaw lifts every"));
+        assert!(flat.contains("same-uid watcher on another tty"));
+        assert!(flat.contains("no start command"));
+    }
+    assert!(flatten_claim(&how).contains("bounded, caller-controlled argv[0]"));
+    assert!(flatten_claim(&security).contains("bounded, caller-controlled argv[0]"));
+    assert!(how.contains("must set `owners`"));
+    assert!(how.contains("not a supported operation outcome"));
+    assert!(rules_manual.contains("must set"));
+    assert!(rules_manual.contains("not supported for operations"));
 }
 
 #[test]
