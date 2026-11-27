@@ -18,13 +18,13 @@ use xudo_gate::request::{BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION}
 use xudo_policy::{ActionId, CallerFacts, Classification, Decision, DenialCode, Source, Verdict};
 use xudo_sys::{Attestation, SpoolError};
 use xudo_wire::{BrokerRequest, RefusalCode};
-use xudod::identify::{EuidSource, PeerIdentity};
+use xudod::identify::{EuidSource, Identified, PeerIdentity};
 use xudod::mint::MintError;
 use xudod::record::{decided, refused};
 use xudod::refusal::Refusal;
 
-fn identity() -> PeerIdentity {
-    PeerIdentity {
+fn identity() -> Identified {
+    let identity = PeerIdentity {
         rung: Attestation::PeerPidfdInfo,
         pid: 4242,
         uid: 1000,
@@ -32,13 +32,21 @@ fn identity() -> PeerIdentity {
         starttime: 998_877,
         sid: 1,
         tty: 0,
-        comm: b"xudo".to_vec(),
         diverged: true,
         pinned: true,
         cgroup_id: Some(77),
         cgroup_attestation: xudod::identify::CgroupAttestation::NotChecked,
         cgroup_rung: None,
         euid_source: EuidSource::PidfdInfo,
+    };
+    Identified {
+        identity,
+        hints: xudo_sys::CallerHints::from_reads(
+            Some(b"/usr/bin/xudo"),
+            Some(b"xudo\0exec\0--\0/usr/bin/id\0"),
+            Some(b"HOME=/home/alice\0CLAUDECODE=1\0"),
+        )
+        .with_comm(b"xudo"),
     }
 }
 

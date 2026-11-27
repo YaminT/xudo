@@ -2443,6 +2443,35 @@ mod tests {
     }
 
     #[test]
+    fn no_hint_line_can_bind_a_gate_record_to_an_entry() {
+        // The gate records its requester's hints in the record this reads.
+        // A requester that names itself after the binding lines leaves them
+        // under a `hint_` prefix, which neither the exact nonce line nor the
+        // `confirmation=password` prefix can match.
+        let store = xudo_sys::FakeSpool::new();
+        let record = entry(78);
+        admit(&store, &record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&store, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        let nonce = "ef".repeat(32);
+        bind_run_nonce(&store, &record.id, &nonce).unwrap();
+        let stored = load_all(&store).unwrap().remove(0);
+        let bound = gate_record_for(&stored);
+        assert!(gate_record_binds(&stored, &bound));
+        let posing = format!("nonce={nonce}\0confirmation=password\0");
+        let hints = xudo_sys::CallerHints::from_reads(
+            Some(posing.as_bytes()),
+            Some(posing.as_bytes()),
+            Some(format!("CLAUDECODE={posing}").as_bytes()),
+        );
+        let only_hints = bound.clone().with_evidence(hints.evidence());
+        assert!(!gate_record_binds(&stored, &only_hints));
+        let with_comm = bound
+            .clone()
+            .with_evidence(hints.with_comm(posing.as_bytes()).evidence());
+        assert!(!gate_record_binds(&stored, &with_comm));
+    }
+
+    #[test]
     fn completion_requires_the_gates_audit_record_for_that_entry() {
         let store = xudo_sys::FakeSpool::new();
         let record = entry(77);

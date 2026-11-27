@@ -26,7 +26,7 @@ use xudo_sys::{
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
-use crate::identify::{Fault, PeerIdentity, identify_classified};
+use crate::identify::{Fault, Identified, PeerIdentity, identify_classified};
 use crate::mint::{
     AttestedCaller, ExecPath, Grant, HARNESS_TTL_MILLIS, MintError, Minting, REQUEST_TTL_MILLIS,
     draw_nonce, entry_for_classified, exec_path, publish,
@@ -104,7 +104,7 @@ impl Served {
 struct Evaluated {
     decision: Decision,
     caller: CallerFacts,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
     policy: LoadedPolicy,
 }
@@ -327,7 +327,7 @@ fn serve_request(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
 ) -> Served {
     if matches!(request.question, xudo_wire::Question::RemovePath { .. }) {
@@ -454,7 +454,7 @@ fn harness_not_granted(
 fn queue_ask_human(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     decision: &Decision,
     caller: &CallerFacts,
@@ -699,7 +699,7 @@ struct QueueReady<'a> {
 fn prepare_queue<'a>(
     conn: &dyn Connection,
     platform: &mut Platform<'a>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<QueueReady<'a>, Served> {
     let Some(store) = platform.queue else {
@@ -845,7 +845,7 @@ fn queue_claim_refusal(error: &crate::queue::ClaimError) -> Refusal {
 fn serve_queue_list(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Served {
     let ready = match prepare_queue(conn, platform, identity, request) {
@@ -1109,7 +1109,7 @@ fn serve_queue_claim(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
 ) -> Served {
@@ -1316,7 +1316,7 @@ fn fail_claimed(
     store: &dyn Spool,
     id: &str,
     act: &crate::queue::ClaimAct<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     denial: xudo_policy::Decision,
 ) -> Served {
@@ -1437,7 +1437,7 @@ fn serve_queue_complete(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
     audit_seq: u64,
@@ -1527,7 +1527,7 @@ fn serve_queue_release(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
 ) -> Served {
@@ -1811,7 +1811,7 @@ fn validated_confirm(bytes: &[u8]) -> Result<ConfirmData, SpoolError> {
 fn clear_approved_backoff(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     consumed: &xudo_gate::request::PendingRequest,
     now: u64,
@@ -2599,7 +2599,7 @@ fn serve_confirmation_question(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Served {
     let result = match &request.question {
@@ -2664,7 +2664,7 @@ fn done() -> BrokerResponse {
 fn freeze(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     reason: &str,
 ) -> Result<BrokerResponse, Refusal> {
@@ -2867,7 +2867,7 @@ fn harness_freeze_stands(platform: &Platform<'_>, label: &str) -> bool {
 fn freeze_with(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     caller: &CallerFacts,
     markers: &[String],
     request: &BrokerRequest,
@@ -3003,7 +3003,7 @@ fn encoded_freeze_record(
 fn deny_pending(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<(), Refusal> {
     let store = platform.confirmations.ok_or_else(|| {
@@ -3579,7 +3579,7 @@ fn save_heartbeat(
 fn answer_confirmation(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<BrokerResponse, Refusal> {
     let xudo_wire::Question::Answer { id, token, approve } = &request.question else {
@@ -3650,7 +3650,7 @@ struct AnsweredEntry {
 fn complete_answer(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     answered: AnsweredEntry,
     approve: bool,
@@ -3779,7 +3779,7 @@ fn serve_remove(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
 ) -> Served {
     let mut policy = match platform.policy.load() {
@@ -4090,7 +4090,7 @@ fn refuse(
     conn: &dyn Connection,
     audit: &mut dyn AuditSink,
     refusal: &Refusal,
-    identity: Option<&PeerIdentity>,
+    identity: Option<&Identified>,
     request: Option<&BrokerRequest>,
 ) -> Served {
     let _ = audit.append(&|previous| refused(previous, refusal, identity, request));
@@ -4664,8 +4664,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
         let identity = test_identity(PID, START, 1, 0);
-        let served =
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &identity, &request);
+        let served = serve_confirmation_question(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            &identity.clone().into(),
+            &request,
+        );
         assert_eq!(served, Served::Refused(Fault::Broker));
     }
 
@@ -5698,7 +5703,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -5795,7 +5800,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &caller,
+                &caller.clone().into(),
                 &status_request
             ),
             Served::Decided
@@ -5812,7 +5817,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &watch_request
             ),
             Served::Decided
@@ -5825,7 +5830,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request
             ),
             Served::Decided
@@ -5834,7 +5839,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let run = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
         let conn = connection(Ok(run.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &run),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &run
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5846,7 +5857,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(unknown.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &unknown),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &unknown
+            ),
             Served::Refused(Fault::Client)
         );
 
@@ -5856,7 +5873,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(queue_list.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &queue_list,),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &queue_list,
+            ),
             Served::Decided
         );
     }
@@ -5874,7 +5897,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &request),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         assert!(matches!(
@@ -5995,6 +6024,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queue_list_refuses_missing_storage_policy_and_prune_failures() {
         let identity = test_identity(PID, START, 0, 0);
         let request = BrokerRequest {
@@ -6007,7 +6037,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         platform.queue = None;
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut platform, &identity, &request),
+            serve_queue_list(&conn, &mut platform, &identity.clone().into(), &request),
             Served::Refused(Fault::Broker)
         );
 
@@ -6019,7 +6049,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         ));
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -6028,7 +6063,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_names_on_call(2, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -6037,7 +6077,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             FakeSpool::new().failing_lock(SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -6067,7 +6112,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         assert!(
@@ -6082,7 +6132,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_names_on_call(3, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -6093,7 +6148,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         assert_eq!(
@@ -6113,7 +6173,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             request,
         );
         assert_eq!(response, Served::Decided);
@@ -6143,7 +6203,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             unknown,
         );
         assert_eq!(response, Served::Decided);
@@ -6165,7 +6225,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &invalid_request,
                 &decision,
                 &caller,
@@ -6251,7 +6311,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6291,7 +6351,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6309,7 +6369,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6338,7 +6398,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6394,7 +6454,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6442,7 +6502,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         queue_ask_human(
             &conn,
             &mut platform,
-            &identity,
+            &identity.clone().into(),
             &request,
             &decision,
             &caller,
@@ -6496,7 +6556,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             request,
         );
         let class = host
@@ -6523,7 +6583,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6545,7 +6605,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6574,7 +6634,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &store,
                 &"ab".repeat(32),
                 &act,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
             ),
@@ -6637,7 +6697,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &store,
                 &"ab".repeat(32),
                 &act,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
             ),
@@ -6655,7 +6715,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6678,7 +6738,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6698,7 +6758,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity,
+                identity.into(),
                 request,
             ),
             Served::Decided
@@ -6777,7 +6837,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.queue = FakeSpool::new();
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         // Broker faults stay off the wire. The audit record carries the reason.
@@ -6796,7 +6861,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.queue = FakeSpool::new();
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -6841,7 +6911,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(queue_request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &queue_request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &queue_request
+            ),
             Served::Decided
         );
 
@@ -6864,7 +6939,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             serve_queue_list(
                 &conn,
                 &mut human_host.platform(),
-                &human_identity,
+                &human_identity.clone().into(),
                 &queue_request,
             ),
             Served::Decided
@@ -6956,7 +7031,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             question: xudo_wire::Question::Thaw,
         };
         let conn = connection(Ok(thaw.to_json().into_bytes()));
-        let served = serve_request(&conn, &mut host.platform(), &spool, human_identity(), thaw);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            human_identity().into(),
+            thaw,
+        );
         assert_eq!(served, Served::Decided);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
         assert_eq!(answer, Answer::Done);
@@ -6996,7 +7077,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            human_identity(),
+            human_identity().into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Decided);
@@ -7085,7 +7166,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7145,7 +7226,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze_with(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &an_attested_agent(),
                 &[],
                 &freeze_request(),
@@ -7281,7 +7362,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &root,
+            &root.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7301,7 +7382,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let refused = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7325,7 +7406,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7350,7 +7431,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7390,7 +7471,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7402,7 +7483,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7423,7 +7504,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let result = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &test_identity(PID, START, 0, 0),
+                &test_identity(PID, START, 0, 0).into(),
                 &freeze_request(),
                 "maintenance",
             );
@@ -7448,7 +7529,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             if freeze(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7466,7 +7547,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &spool,
-            &root,
+            &root.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7504,7 +7585,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let result = complete_answer(
                 &mut host.platform(),
                 &spool,
-                &arbitrary_watcher(5000, UID, 2, 34816, None),
+                &arbitrary_watcher(5000, UID, 2, 34816, None).into(),
                 &answer_request(NONCE, "remove", true),
                 AnsweredEntry {
                     id: NONCE.to_owned(),
@@ -7588,7 +7669,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7602,7 +7683,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7634,7 +7715,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze_with(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &classify_for_test(&identity),
             &[],
             &request,
@@ -7663,7 +7744,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7674,8 +7755,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             FakeSpool::new().failing_names(broken.clone()),
         ] {
             let mut host = Host::honest();
-            let error = deny_pending(&mut host.platform(), &request_spool, &identity, &request)
-                .unwrap_err();
+            let error = deny_pending(
+                &mut host.platform(),
+                &request_spool,
+                &identity.clone().into(),
+                &request,
+            )
+            .unwrap_err();
             assert_eq!(error.code, RefusalCode::SpoolUnusable);
         }
     }
@@ -7694,7 +7780,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7723,7 +7809,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .with_file("already-denied", denied.to_json())
             .failing_read(b"unreadable".to_vec());
         let mut host = Host::honest();
-        deny_pending(&mut host.platform(), &spool, &identity, &request).unwrap();
+        deny_pending(
+            &mut host.platform(),
+            &spool,
+            &identity.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert_eq!(spool.files().len(), 4);
     }
 
@@ -7748,19 +7840,51 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
             file: "config".to_owned(),
         }));
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         host.audit = FakeAuditSink::failing("refused");
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         let spool = pending().failing_remove(broken.clone());
-        assert!(deny_pending(&mut host.platform(), &spool, &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &spool,
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new().failing_publish(broken);
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7926,7 +8050,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let again = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
             "again",
         )
@@ -7949,7 +8073,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let error = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7965,7 +8089,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             &reason,
         )
@@ -7982,7 +8106,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             reason,
         )
@@ -8481,7 +8605,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8510,7 +8634,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8546,7 +8670,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8587,7 +8711,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -9423,7 +9547,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         deny_pending(
             &mut host.platform(),
             &freeze_spool,
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
         )
         .unwrap();
@@ -9973,7 +10097,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.audit = FakeAuditSink::failing("audit unavailable");
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "remove", true);
-        let result = answer_confirmation(&mut host.platform(), &spool, &watcher, &request);
+        let result = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        );
         assert!(result.is_err());
         assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&before));
     }
@@ -9988,9 +10117,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             question: xudo_wire::Question::Thaw,
         };
         assert_eq!(
-            answer_confirmation(&mut host.platform(), &spool, &watcher, &not_answer)
-                .unwrap_err()
-                .code,
+            answer_confirmation(
+                &mut host.platform(),
+                &spool,
+                &watcher.clone().into(),
+                &not_answer
+            )
+            .unwrap_err()
+            .code,
             RefusalCode::RequestMalformed
         );
 
@@ -9998,7 +10132,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut platform = host.platform();
         platform.confirmations = None;
         assert_eq!(
-            answer_confirmation(&mut platform, &spool, &watcher, &denial)
+            answer_confirmation(&mut platform, &spool, &watcher.clone().into(), &denial)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -10012,7 +10146,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -10025,7 +10159,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &malformed,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -10041,7 +10175,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -10051,6 +10185,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn denial_completion_refusals_cover_audit_outcome_and_removal() {
         let identity = test_identity(5000, 77, 2, 34816);
         let mut entry = shown_entry();
@@ -10070,7 +10205,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -10089,9 +10224,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             entry: entry.clone(),
         };
         assert_eq!(
-            complete_answer(&mut platform, &spool, &identity, &request, answered, false)
-                .unwrap_err()
-                .code,
+            complete_answer(
+                &mut platform,
+                &spool,
+                &identity.clone().into(),
+                &request,
+                answered,
+                false
+            )
+            .unwrap_err()
+            .code,
             RefusalCode::SpoolUnusable
         );
 
@@ -10115,7 +10257,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -10142,7 +10284,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &remove_error,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -10163,8 +10305,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "remove", true);
-        let response =
-            answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        let response = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert_eq!(response.answer, Answer::Done);
         assert_eq!(host.audit.records().len(), 1);
         let entry =
@@ -10195,7 +10342,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "private-token", false);
-        answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert!(spool.files().is_empty());
         assert_eq!(host.audit.records().len(), 1);
         assert!(
@@ -10231,7 +10384,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "no", false),
         )
         .unwrap();
@@ -10292,7 +10445,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let result = complete_answer(
             &mut host.platform(),
             &spool,
-            &test_identity(5000, 77, 2, 34816),
+            &test_identity(5000, 77, 2, 34816).into(),
             &answer_request(NONCE, "no", false),
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -10354,7 +10507,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let too_fast = answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", true),
         )
         .unwrap_err();
@@ -10366,7 +10519,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let approved = answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", true),
         )
         .unwrap();
@@ -10400,7 +10553,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(&first_id, "remove", true),
         )
         .unwrap();
@@ -10413,7 +10566,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(&second.nonce, "remove", true),
         )
         .unwrap();
@@ -11288,13 +11441,198 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             starttime,
             sid,
             tty,
-            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id: None,
             cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
             cgroup_rung: None,
             euid_source: crate::identify::EuidSource::PidfdInfo,
+        }
+    }
+
+    /// One row of hints: `comm`, `exe`, `cmdline`, `environ`.
+    type HintRow<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+    /// What serving `request` to a peer of `kind` (a harness in its scope, a
+    /// human outside the slice, a recordless process in it) showing `hints`
+    /// came to: how it ended, the answer, and the records with their hint
+    /// lines and hash chain dropped.
+    fn served_beside_hints(
+        kind: usize,
+        hints: Option<HintRow<'_>>,
+        request: &BrokerRequest,
+    ) -> (Served, Answer, Vec<Record>) {
+        let mut host = with_test_boot(Host::honest());
+        let mut identity = test_identity(PID, START, 0, 0);
+        match kind {
+            0 => identity = enrolled_identity(&mut host),
+            1 => identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside,
+            _ => identity.cgroup_attestation = crate::identify::CgroupAttestation::Recordless,
+        }
+        host.policy.answer = Ok(hint_policy());
+        let hints = hints.map_or_else(
+            xudo_sys::CallerHints::unavailable,
+            |(comm, exe, cmd, env)| {
+                xudo_sys::CallerHints::from_reads(Some(exe), Some(cmd), Some(env)).with_comm(comm)
+            },
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            Identified { identity, hints },
+            request.clone(),
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        let records = host
+            .audit
+            .records()
+            .iter()
+            .map(|record| {
+                let mut record = record.clone();
+                record.evidence.retain(|line| !line.starts_with("hint_"));
+                record.prev_hash = String::new();
+                record.hash = String::new();
+                record
+            })
+            .collect();
+        (served, answer, records)
+    }
+
+    /// The serve tests' rules, plus an ask-human rule and a remove-path
+    /// operation for the `codex` harness, so every path that writes a record
+    /// is reachable from [`hint_requests`].
+    fn hint_policy() -> LoadedPolicy {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+        const MORE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n\n[[operation]]\nid = \"web.clean-build\"\nop = \"remove-path\"\nunder = \"/srv/app/build\"\nrecursive = true\nmax-depth = 4\nmax-entries = 10\nowners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n";
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-hints.toml".to_vec(),
+                    bytes: MORE.as_bytes().to_vec(),
+                },
+            ],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: HARNESS.as_bytes().to_vec(),
+            }],
+        )
+        .unwrap();
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
+        loaded
+    }
+
+    /// A rule that runs, one that always confirms, none at all, an ask-human
+    /// rule, a remove-path, and two questions that are not a run.
+    fn hint_requests() -> [BrokerRequest; 7] {
+        let ask = |program: &str, argv: &[&str]| {
+            BrokerRequest::new(
+                program,
+                argv.iter().map(|a| (*a).to_owned()).collect(),
+                "enrolled-agent-yolo",
+            )
+        };
+        [
+            ask("/usr/bin/systemctl", &["restart", "nginx.service"]),
+            ask("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            ask("/usr/bin/id", &[]),
+            ask("/usr/bin/apt-get", &["upgrade"]).with_cwd_bytes(b"/srv".to_vec()),
+            remove_question(b"/srv/app/build/out", false),
+            answer_request(NONCE, "remove", true),
+            freeze_request(),
+        ]
+    }
+
+    #[test]
+    fn hints_never_change_a_decision() {
+        // Every value a harness would show, and a few that pose as fields:
+        // the whole service, answer and records, is the no-hint baseline's
+        // for every kind of peer.
+        let table: [HintRow<'_>; 5] = [
+            (
+                b"claude",
+                b"/usr/bin/claude",
+                b"claude\0",
+                b"CLAUDECODE=1\0",
+            ),
+            (
+                b"codex",
+                b"/usr/lib/xudo/harness/codex",
+                b"codex\0exec\0",
+                b"CLAUDECODE=0\0",
+            ),
+            (
+                b"xudo-agent@codex",
+                b"/home/agent/.local/bin/claude",
+                b"node\0claude\0",
+                b"AI_AGENT=1\0",
+            ),
+            (
+                b"via=harness",
+                b"/usr/bin/xudo (deleted)",
+                b"via=harness\0",
+                b"CLAUDECODE=\0",
+            ),
+            (b"", b"", b"", b""),
+        ];
+        let mut baselines = Vec::new();
+        for kind in 0..3 {
+            for request in hint_requests() {
+                let baseline = served_beside_hints(kind, None, &request);
+                for row in table {
+                    assert_eq!(
+                        served_beside_hints(kind, Some(row), &request),
+                        baseline,
+                        "{kind} {:?}",
+                        row.1
+                    );
+                }
+                baselines.push(baseline);
+            }
+        }
+        // The baseline is not trivially one answer for everyone, every
+        // question wrote a record a hint would sit in, and the harness's
+        // ask-human request reached the queue.
+        assert_ne!(baselines[0].1, baselines[7].1);
+        for (at, baseline) in baselines.iter().enumerate() {
+            assert!(!baseline.2.is_empty(), "{at}: {baseline:?}");
+        }
+        assert_eq!(denial_of(&baselines[3].1), Some(DenialCode::AskHuman));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn hints_never_change_a_decision_for_any_bytes(
+            kind in 0usize..3,
+            which in 0usize..7,
+            comm in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..16),
+            exe in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            cmd in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            claudecode in proptest::prelude::any::<bool>(),
+            env in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            // Half the time the environment sets `CLAUDECODE`, to `1` or to
+            // anything, as a harness's would.
+            let mut environ = Vec::new();
+            if claudecode {
+                environ.extend(b"CLAUDECODE=");
+                if env.first().is_some_and(|byte| byte % 2 == 0) {
+                    environ.extend(b"1\0");
+                }
+            }
+            environ.extend(&env);
+            let request = hint_requests()[which].clone();
+            proptest::prop_assert_eq!(
+                served_beside_hints(kind, Some((&comm, &exe, &cmd, &environ)), &request),
+                served_beside_hints(kind, None, &request)
+            );
         }
     }
 
@@ -11468,7 +11806,13 @@ outcome = "allow"
     ) -> (Served, Answer, Vec<PendingRequest>) {
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
         (served, answer, entries_in(&spool))
     }
@@ -11550,6 +11894,7 @@ outcome = "allow"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn only_the_exec_path_for_a_live_harness_mints_via_harness() {
         let questions = every_question_for_a_grant();
         let kinds: std::collections::BTreeSet<usize> =
@@ -11583,7 +11928,7 @@ outcome = "allow"
                     &conn,
                     &mut host.platform(),
                     &spool,
-                    harness_identity(scope),
+                    harness_identity(scope).into(),
                     request,
                 );
                 let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -11641,7 +11986,13 @@ outcome = "allow"
         let request = claim_request(&entry.id);
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
         assert_eq!(served, Served::Minted);
         let minted = entries_in(&spool);
         assert_eq!(minted.len(), 1);
@@ -11864,7 +12215,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &spool,
-            harness_identity(scope),
+            harness_identity(scope).into(),
             request,
         );
         assert_eq!(served, Served::Decided);
@@ -12431,7 +12782,7 @@ outcome = "allow"
             answer_confirmation(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "no", false)
             )
             .unwrap_err()
@@ -12448,7 +12799,7 @@ outcome = "allow"
             answer_confirmation(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -12478,7 +12829,7 @@ outcome = "allow"
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered(),
                 true
@@ -12496,7 +12847,7 @@ outcome = "allow"
             complete_answer(
                 &mut host.platform(),
                 &failing,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered(),
                 true
@@ -12517,7 +12868,7 @@ outcome = "allow"
         let err = complete_answer(
             &mut host.platform(),
             &changed_spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -12738,7 +13089,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &spool,
-                identity,
+                identity.into(),
                 request.clone(),
             );
             let n = slot(&request.question);
@@ -12815,7 +13166,13 @@ outcome = "allow"
         let request = freeze_request();
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
-        serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
         assert_eq!(host.audit.records()[0].classification, "unattested");
     }
 
@@ -12829,7 +13186,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             request,
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -12854,7 +13211,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -12877,7 +13234,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &spool,
-            identity.clone(),
+            identity.clone().into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -12890,7 +13247,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &spool,
-            identity,
+            identity.into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -12925,7 +13282,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            test_identity(PID, START, 0, 0),
+            test_identity(PID, START, 0, 0).into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -12987,7 +13344,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Decided);
@@ -13050,7 +13407,7 @@ outcome = "allow"
         let _ = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
             "maintenance",
         );
@@ -13126,7 +13483,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -13154,7 +13511,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -13246,7 +13603,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Broker));
@@ -13304,7 +13661,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             thaw_request(),
         );
         (served, refusal_code_written(&conn))
@@ -13336,7 +13693,7 @@ outcome = "allow"
                 let refused = answer_confirmation(
                     &mut host.platform(),
                     &spool,
-                    &agent,
+                    &agent.clone().into(),
                     &answer_request(NONCE, "remove", approve),
                 )
                 .unwrap_err();
@@ -13360,7 +13717,7 @@ outcome = "allow"
         let refused = answer_confirmation(
             &mut host.platform(),
             &FakeSpool::new(),
-            &agent,
+            &agent.clone().into(),
             &answer_request(NONCE, "remove", true),
         );
         assert!(refused.is_err());
@@ -13383,7 +13740,7 @@ outcome = "allow"
         let answered = answer_confirmation(
             &mut host.platform(),
             &spool,
-            &human,
+            &human.clone().into(),
             &answer_request(NONCE, "remove", false),
         );
         assert_ne!(
@@ -13493,7 +13850,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            human_identity(),
+            human_identity().into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Decided);
@@ -13521,7 +13878,7 @@ outcome = "allow"
                     &conn,
                     &mut host.platform(),
                     &FakeSpool::new(),
-                    human_identity(),
+                    human_identity().into(),
                     request,
                 );
                 assert_eq!(served, Served::Refused(Fault::Broker));
@@ -13548,7 +13905,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity.clone(),
+                identity.clone().into(),
                 request,
             );
             assert_eq!(served, Served::Refused(Fault::Broker));
@@ -13573,7 +13930,13 @@ outcome = "allow"
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
         assert_eq!(served, Served::Decided);
         let written = conn.written();
         let response = BrokerResponse::parse(&written).unwrap();
@@ -13602,7 +13965,13 @@ outcome = "allow"
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
 
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
 
         assert_eq!(served, Served::Minted);
         let response = BrokerResponse::parse(&conn.written()).unwrap();
@@ -13629,7 +13998,13 @@ outcome = "allow"
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
 
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
 
         assert_eq!(served, Served::Refused(Fault::Broker));
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -14328,7 +14703,7 @@ outcome = "allow"
         let result = complete_answer(
             &mut host.platform(),
             &spool,
-            watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", approve),
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -14343,7 +14718,12 @@ outcome = "allow"
     fn frozen_by(entry: &PendingRequest, freezer: &PeerIdentity) -> Redecided {
         let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json());
         let mut host = Host::honest();
-        let result = deny_pending(&mut host.platform(), &spool, freezer, &freeze_request());
+        let result = deny_pending(
+            &mut host.platform(),
+            &spool,
+            &freezer.clone().into(),
+            &freeze_request(),
+        );
         redecided(&host, &spool, result.err().map(|e| e.code))
     }
 
@@ -14628,7 +15008,7 @@ outcome = "allow"
             let refused = answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true),
             )
             .unwrap_err();
@@ -14638,7 +15018,13 @@ outcome = "allow"
             // A freeze never acts on it either: nothing is decided or removed.
             let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
             let mut host = Host::honest();
-            deny_pending(&mut host.platform(), &spool, &watcher, &freeze_request()).unwrap();
+            deny_pending(
+                &mut host.platform(),
+                &spool,
+                &watcher.clone().into(),
+                &freeze_request(),
+            )
+            .unwrap();
             assert_eq!(spool.files()[NONCE.as_bytes()], bytes);
             assert!(host.audit.records().is_empty());
         }
@@ -14685,7 +15071,7 @@ outcome = "allow"
             let mut identity = test_identity(PID, START, 0, 0);
             identity.uid = freezer_uid;
             let mut host = Host::honest_as(freezer_uid);
-            deny_pending(&mut host.platform(), &spool, &identity, &freeze_request()).unwrap();
+            deny_pending(&mut host.platform(), &spool, &identity.clone().into(), &freeze_request()).unwrap();
             let after = spool.files();
             for (name, bytes) in &before {
                 let nonce = String::from_utf8(name.clone()).unwrap();
@@ -14954,7 +15340,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -14978,7 +15364,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -15038,7 +15424,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15068,7 +15454,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15091,7 +15477,7 @@ outcome = "allow"
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15118,7 +15504,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15143,7 +15529,7 @@ outcome = "allow"
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15193,7 +15579,7 @@ outcome = "allow"
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -15218,7 +15604,7 @@ outcome = "allow"
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -15240,7 +15626,7 @@ outcome = "allow"
                 &conn,
                 &mut owner_host.platform(),
                 &FakeSpool::new(),
-                &owner,
+                &owner.clone().into(),
                 &request,
                 &agent_entry.id,
             ),
@@ -15257,7 +15643,7 @@ outcome = "allow"
                 &conn,
                 &mut owner_host.platform(),
                 &FakeSpool::new(),
-                &owner,
+                &owner.clone().into(),
                 &request,
                 &agent_entry.id
             ),
@@ -15282,7 +15668,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15311,7 +15697,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15340,7 +15726,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &confirm,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15606,7 +15992,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity,
+                identity.into(),
                 dashed,
             ),
             Served::Decided
@@ -15631,7 +16017,12 @@ outcome = "allow"
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -15684,7 +16075,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15712,7 +16103,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15736,7 +16127,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &confirm,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15758,7 +16149,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &missing.id,
             ),
@@ -15782,7 +16173,7 @@ outcome = "allow"
                         &conn,
                         &mut host.platform(),
                         &FakeSpool::new(),
-                        &identity,
+                        &identity.clone().into(),
                         &request,
                         &previous.id,
                     );
@@ -15808,7 +16199,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -15822,7 +16213,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -15859,7 +16250,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 99,
@@ -15877,7 +16268,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 seq,
@@ -15902,7 +16293,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &agent,
+                &agent.clone().into(),
                 &request,
                 &claimed.id,
                 0,
@@ -15920,7 +16311,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &agent,
+                &agent.clone().into(),
                 &request,
                 &claimed.id
             ),
@@ -15960,7 +16351,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &requests,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id
             ),
@@ -15980,7 +16371,7 @@ outcome = "allow"
                         &conn,
                         &mut host.platform(),
                         &FakeSpool::new(),
-                        &identity,
+                        &identity.clone().into(),
                         &request,
                         &entry.id,
                     );
@@ -16037,7 +16428,12 @@ outcome = "allow"
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -16051,7 +16447,12 @@ outcome = "allow"
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -16108,7 +16509,12 @@ outcome = "allow"
             };
             let conn = connection(Ok(request.to_json().into_bytes()));
             assert_eq!(
-                serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+                serve_queue_list(
+                    &conn,
+                    &mut host.platform(),
+                    &identity.clone().into(),
+                    &request
+                ),
                 Served::Decided
             );
             let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -16140,7 +16546,12 @@ outcome = "allow"
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let listed = host
@@ -16161,7 +16572,12 @@ outcome = "allow"
         host.audit = FakeAuditSink::failing("audit unavailable");
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         assert_eq!(stored_queue(&host).len(), 1);
@@ -16187,7 +16603,7 @@ outcome = "allow"
                     &conn,
                     &mut host.platform(),
                     &FakeSpool::new(),
-                    &identity,
+                    &identity.clone().into(),
                     &request,
                 ),
                 Served::Refused(Fault::Broker)
@@ -16215,7 +16631,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &claim,
                 &id,
             ),
@@ -16228,7 +16644,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &release,
                 &id
             ),
@@ -16241,7 +16657,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &complete,
                 &id,
                 0,
@@ -16256,7 +16672,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &claim,
                 &id,
             ),
@@ -16268,7 +16684,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &release,
                 &id
             ),
@@ -16280,7 +16696,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &complete,
                 &id,
                 0
@@ -16326,7 +16742,7 @@ outcome = "allow"
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -16432,7 +16848,7 @@ outcome = "allow"
                 &conn,
                 &mut platform,
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0
@@ -16530,7 +16946,7 @@ outcome = "allow"
                 &conn,
                 &mut platform,
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,

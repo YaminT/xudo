@@ -779,7 +779,6 @@ mod tests {
             starttime,
             sid: 1,
             tty: 0,
-            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id: None,

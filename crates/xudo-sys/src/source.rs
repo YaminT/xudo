@@ -65,6 +65,18 @@ pub trait ProcSource {
             "this source cannot identify the file a link leads to",
         ))
     }
+
+    /// The target of a link under the root (for example `"412/exe"`), as the
+    /// bytes the kernel reports, never the file it leads to. For the audit
+    /// trail only: a link's text is not a path anything may open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Read`] when the link cannot be read. The default
+    /// refuses: a source that keeps no links has none to report.
+    fn read_link(&self, relative: &str) -> Result<Vec<u8>, SysError> {
+        Err(SysError::read(relative, "this source keeps no links"))
+    }
 }
 
 /// A source backed by a real directory.
@@ -112,6 +124,37 @@ impl DirSource {
     }
 }
 
+/// Reads at most `cap` bytes of `reader`, however much it holds.
+///
+/// For a file a caller controls the size of, like `/proc/<pid>/cmdline`,
+/// which the kernel lets reach about 6 MiB: the bound is on the read, so
+/// nothing past it is ever copied.
+///
+/// # Errors
+///
+/// Returns the reader's error.
+pub fn read_prefix(reader: &mut dyn std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    reader.take(cap).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+impl DirSource {
+    /// The first `cap` bytes of a file under the root, never more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Read`] when the file cannot be opened or read.
+    pub fn read_prefix(&self, relative: &str, cap: u64) -> Result<Vec<u8>, SysError> {
+        let path = self.resolve(relative)?;
+        std::fs::File::open(&path)
+            .and_then(|mut file| read_prefix(&mut file, cap))
+            .map_err(|e| SysError::read(relative, e.to_string()))
+    }
+}
+
 /// Refuses a path that is empty, absolute, or has an empty, current, or parent
 /// component: the lexical rule every source holds its relative paths to.
 pub(crate) fn check_relative(relative: &str) -> Result<(), SysError> {
@@ -150,6 +193,15 @@ impl ProcSource for DirSource {
             .map(|meta| meta.ino())
             .map_err(|e| SysError::read(relative, e.to_string()))
     }
+
+    fn read_link(&self, relative: &str) -> Result<Vec<u8>, SysError> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = self.resolve(relative)?;
+        std::fs::read_link(&path)
+            .map(|target| target.into_os_string().into_vec())
+            .map_err(|e| SysError::read(relative, e.to_string()))
+    }
 }
 
 /// An in-memory source, for tests.
@@ -157,6 +209,7 @@ impl ProcSource for DirSource {
 pub struct MapSource {
     files: BTreeMap<String, Vec<u8>>,
     inodes: BTreeMap<String, u64>,
+    links: BTreeMap<String, Vec<u8>>,
 }
 
 impl MapSource {
@@ -176,6 +229,13 @@ impl MapSource {
     #[must_use]
     pub fn with_inode(mut self, relative: impl Into<String>, inode: u64) -> Self {
         self.inodes.insert(relative.into(), inode);
+        self
+    }
+
+    /// Adds a link and the text it holds.
+    #[must_use]
+    pub fn with_link(mut self, relative: impl Into<String>, target: impl Into<Vec<u8>>) -> Self {
+        self.links.insert(relative.into(), target.into());
         self
     }
 
@@ -202,6 +262,13 @@ impl ProcSource for MapSource {
         self.inodes
             .get(relative)
             .copied()
+            .ok_or_else(|| SysError::read(relative, "not present in the in-memory source"))
+    }
+
+    fn read_link(&self, relative: &str) -> Result<Vec<u8>, SysError> {
+        self.links
+            .get(relative)
+            .cloned()
             .ok_or_else(|| SysError::read(relative, "not present in the in-memory source"))
     }
 }
@@ -318,6 +385,94 @@ mod tests {
         // And the well-formed version of the same path still works, so the
         // check is not simply refusing everything.
         assert!(source.read("100/stat").is_ok());
+    }
+
+    /// A reader of `size` bytes that counts how many it handed out.
+    struct Counting {
+        left: usize,
+        handed: usize,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            buf.iter_mut().take(n).for_each(|byte| *byte = b'x');
+            self.left -= n;
+            self.handed += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_six_mib_file_is_read_only_up_to_the_cap() {
+        // The largest `cmdline` the kernel lets a caller make: the root
+        // broker must not copy it to keep a few hundred bytes.
+        let mut file = Counting {
+            left: 6 << 20,
+            handed: 0,
+        };
+        let bytes = read_prefix(&mut file, 64 * 1024 + 1).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024 + 1);
+        assert_eq!(file.handed, 64 * 1024 + 1, "read past the cap");
+        let mut short = Counting {
+            left: 10,
+            handed: 0,
+        };
+        assert_eq!(read_prefix(&mut short, 64).unwrap(), b"xxxxxxxxxx");
+    }
+
+    #[test]
+    fn a_reader_that_fails_fails_the_prefix() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken"))
+            }
+        }
+        assert!(read_prefix(&mut Broken, 8).is_err());
+    }
+
+    #[test]
+    fn a_directory_source_reads_a_prefix_and_refuses_what_it_cannot_open() {
+        let dir = DirSource::new(fixture_root());
+        let whole = dir.read("100/stat").unwrap();
+        assert_eq!(
+            dir.read_prefix("100/stat", 5).unwrap(),
+            whole.get(..5).unwrap()
+        );
+        assert_eq!(dir.read_prefix("100/stat", 1 << 20).unwrap(), whole);
+        assert!(dir.read_prefix("100/missing", 5).is_err());
+        assert!(dir.read_prefix("../100/stat", 5).is_err());
+    }
+
+    #[test]
+    fn a_link_is_reported_as_its_text_and_never_followed() {
+        // `100/exe` is a dangling link in the fixture tree: its text is all
+        // there is, so a reader that followed it would fail.
+        let dir = DirSource::new(fixture_root());
+        assert_eq!(dir.read_link("100/exe").unwrap(), b"/usr/bin/fixture-exe");
+        assert!(dir.read_link("100/stat").is_err(), "a file is not a link");
+        assert!(dir.read_link("../100/exe").is_err());
+        let map = MapSource::new().with_link("1/exe", "/sbin/init");
+        assert_eq!(map.read_link("1/exe").unwrap(), b"/sbin/init");
+        assert!(map.read_link("2/exe").is_err());
+    }
+
+    #[test]
+    fn a_source_that_keeps_no_links_reports_none() {
+        struct Plain;
+        impl ProcSource for Plain {
+            fn read(&self, relative: &str) -> Result<Vec<u8>, SysError> {
+                Err(SysError::read(relative, "plain"))
+            }
+            fn namespace_inode(&self, relative: &str) -> Result<u64, SysError> {
+                Err(SysError::read(relative, "plain"))
+            }
+        }
+        let error = Plain.read_link("1/exe").unwrap_err();
+        assert!(error.to_string().contains("keeps no links"), "{error}");
+        assert!(Plain.read("x").is_err());
+        assert!(Plain.namespace_inode("x").is_err());
     }
 
     #[test]

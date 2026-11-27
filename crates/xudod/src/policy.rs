@@ -294,7 +294,6 @@ args = [
             starttime: 998_877,
             sid: 1,
             tty: 0,
-            comm: b"xudo".to_vec(),
             diverged: false,
             pinned,
             cgroup_id: None,
@@ -332,7 +331,6 @@ args = [
     fn claudecode_env_and_agent_comm_without_a_scope_is_human() {
         let mut peer = identity(true);
         peer.cgroup_attestation = CgroupAttestation::Outside;
-        peer.comm = b"claude".to_vec();
         let facts = classify_for_test(&peer);
         assert_eq!(facts.classification.label(), "human");
         assert!(facts.classification.requires_password());
@@ -364,32 +362,6 @@ args = [
                 declared_yolo: false,
             }
         );
-    }
-
-    #[test]
-    fn a_harness_peer_named_anything_is_classified_by_its_scope_alone() {
-        let registry = test_registry();
-        let classes: Vec<_> = [&b"xudo"[..], b"claude", b"sudo", b""]
-            .into_iter()
-            .map(|comm| {
-                let mut peer = identity(true);
-                peer.comm = comm.to_vec();
-                peer.cgroup_id = Some(77);
-                peer.cgroup_attestation = CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
-                    kind: xudo_sys::ScopeKind::Agent,
-                    name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
-                    record: test_record(&registry, "codex"),
-                });
-                classify_with_registry(
-                    &peer,
-                    &registry,
-                    "agent:x:1000:1000:agent:/home/agent:/bin/sh\n",
-                )
-                .classification
-            })
-            .collect();
-        assert!(classes.iter().all(|class| *class == classes[0]));
-        assert_eq!(classes[0].enrolled_agent_id(), Some("codex"));
     }
 
     #[test]

@@ -944,6 +944,47 @@ the command line,
 .BR /proc/ pid /exe ,
 and process ancestry are unauthenticated hints.
 They are recorded.
+The broker and the gate write the requester's
+.BR comm ,
+.B exe
+path (at most 1024 bytes), a summary of its command line, and whether it set
+.B CLAUDECODE
+into every audit record as
+.BR hint_comm ,
+.BR hint_exe ,
+.B hint_cmdline
+and
+.BR hint_claudecode ,
+escaped and quoted, or
+.B unavailable
+when they could not be read from the pinned process.
+Of the command line only
+.BR argv[0] ,
+the argument count and the length are recorded, never an argument and no
+digest of one, so a password on a command line is not copied to the audit
+trail or the journal, for example
+.BR "hint_cmdline=argv0:\(dq/usr/bin/sudo\(dq argc:3 len:41" .
+.B argv[0]
+is whatever the caller made it, cut at 256 bytes: a process that rewrote
+its title as one string records that whole string there.
+Of the environment only
+.BR CLAUDECODE 's
+presence is recorded:
+.BR unset ,
+.B set:\(dq1\(dq
+when it is exactly 1, or
+.BI set:other(len= N )
+for any other value.
+Both files are looked at in their first 64 KiB only, and the broker reads
+no more of them than that; a
+.B +
+after the count or the length marks a longer command line.
+The broker runs without capabilities, so the kernel shows it another
+user's command line but not its
+.B exe
+or environment; its records carry those two as
+.BR unavailable ,
+and the gate, which runs as root, records them.
 Authorization does not branch on them.
 An unattested caller takes the human path and is asked for a password.
 .PP

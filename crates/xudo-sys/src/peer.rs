@@ -69,7 +69,20 @@ pub enum ProcFile {
     Status,
     /// `uid_map`: the uid namespace mapping.
     UidMap,
+    /// `exe`: the text of the link, never the file. A hint for the audit
+    /// trail (invariant 1).
+    Exe,
+    /// `cmdline`: the argument vector the process shows. A hint.
+    Cmdline,
+    /// `environ`: the initial environment, read only for the `CLAUDECODE`
+    /// hint. A hint.
+    Environ,
 }
+
+/// How much of a hint file the broker reads: the window, and one byte to
+/// tell a longer file from one that fills it.
+#[cfg(target_os = "linux")]
+const HINT_READ_CAP: u64 = crate::caller_hints::HINT_READ_MAX as u64 + 1;
 
 impl ProcFile {
     /// The file's name under `/proc/<pid>`.
@@ -78,6 +91,9 @@ impl ProcFile {
             Self::Stat => "stat",
             Self::Status => "status",
             Self::UidMap => "uid_map",
+            Self::Exe => "exe",
+            Self::Cmdline => "cmdline",
+            Self::Environ => "environ",
         }
     }
 }
@@ -175,7 +191,15 @@ impl PeerCalls for HostPeer {
     fn read_proc(&self, pid: u32, file: ProcFile) -> Result<Vec<u8>, SysError> {
         use crate::source::ProcSource as _;
 
-        crate::source::DirSource::proc().read(&format!("{pid}/{}", file.name()))
+        let source = crate::source::DirSource::proc();
+        let relative = format!("{pid}/{}", file.name());
+        match file {
+            ProcFile::Exe => source.read_link(&relative),
+            // The caller sizes these, up to about 6 MiB: read one byte past
+            // the window the hints look at, and never more.
+            ProcFile::Cmdline | ProcFile::Environ => source.read_prefix(&relative, HINT_READ_CAP),
+            ProcFile::Stat | ProcFile::Status | ProcFile::UidMap => source.read(&relative),
+        }
     }
 
     fn has_exited(&self, pidfd: BorrowedFd<'_>) -> Result<bool, SysError> {
@@ -552,9 +576,9 @@ impl PeerCalls for FakePeer {
         let queue = match file {
             ProcFile::Stat => &self.stats,
             ProcFile::Status => &self.statuses,
-            ProcFile::UidMap => {
+            ProcFile::UidMap | ProcFile::Exe | ProcFile::Cmdline | ProcFile::Environ => {
                 return Err(SysError::read(
-                    format!("{pid}/uid_map"),
+                    format!("{pid}/{}", file.name()),
                     "fake: nothing scripted",
                 ));
             }
@@ -609,6 +633,9 @@ mod tests {
         assert_eq!(ProcFile::Stat.name(), "stat");
         assert_eq!(ProcFile::Status.name(), "status");
         assert_eq!(ProcFile::UidMap.name(), "uid_map");
+        assert_eq!(ProcFile::Exe.name(), "exe");
+        assert_eq!(ProcFile::Cmdline.name(), "cmdline");
+        assert_eq!(ProcFile::Environ.name(), "environ");
     }
 
     #[test]
@@ -620,6 +647,20 @@ mod tests {
             fake.calls(),
             vec![PeerCall::ReadProc(412, ProcFile::UidMap)]
         );
+    }
+
+    #[test]
+    fn fake_peer_refuses_an_unscripted_hint_read_and_answers_a_tabled_one() {
+        let fake = FakePeer::new().with_proc(412, ProcFile::Exe, b"/usr/bin/claude".to_vec());
+        for file in [ProcFile::Cmdline, ProcFile::Environ] {
+            let error = fake.read_proc(412, file).unwrap_err();
+            assert!(error.to_string().contains(file.name()), "{error}");
+        }
+        assert_eq!(
+            fake.read_proc(412, ProcFile::Exe).unwrap(),
+            b"/usr/bin/claude"
+        );
+        assert!(fake.read_proc(413, ProcFile::Exe).is_err());
     }
 
     #[test]
@@ -971,6 +1012,29 @@ mod tests {
             let raw = HostSyscalls.peer_cred(connected.as_fd()).unwrap();
             assert_eq!(raw.pid, 0, "the kernel records no process for a datagram");
             assert_eq!(from_raw(raw).pid, 0);
+        }
+
+        #[test]
+        fn the_host_reads_an_exe_link_as_text_and_the_other_hint_files_as_bytes() {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let own = std::process::id();
+            let exe = HostPeer.read_proc(own, ProcFile::Exe).unwrap();
+            let want = std::fs::read_link(format!("/proc/{own}/exe")).unwrap();
+            assert_eq!(exe, want.as_os_str().as_bytes());
+            assert!(
+                !HostPeer
+                    .read_proc(own, ProcFile::Cmdline)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(HostPeer.read_proc(own, ProcFile::Environ).is_ok());
+            // The status file is read whole, the hint files at most to the cap.
+            assert!(HostPeer.read_proc(own, ProcFile::Status).is_ok());
+            assert!(
+                HostPeer.read_proc(own, ProcFile::Cmdline).unwrap().len() as u64 <= HINT_READ_CAP
+            );
+            assert!(HostPeer.read_proc(4_194_999, ProcFile::Exe).is_err());
         }
 
         #[test]
