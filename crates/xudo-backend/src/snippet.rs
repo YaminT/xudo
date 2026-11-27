@@ -47,12 +47,71 @@ pub const GATE_AUTH: &str = "/usr/libexec/xudo/xudo-gate-auth";
 
 /// The agent-path helper: passwordless.
 ///
-/// **Not installed by the beta.** Until enrollment, the broker, and out-of-band
-/// confirmation exist, a passwordless rule is a standing root grant with no
-/// compensating control. [`SudoersSnippet::human_only`] is the only constructor
-/// the current release uses, and it does not mention this path at all: the file
-/// ships in the package, inert, and no sudoers rule names it.
+/// The file ships in the package, inert: no sudoers rule the package or a plain
+/// `xudo install` writes names it. Only `xudo install --agent-path`, an opt-in
+/// the operator runs by hand, writes the one `NOPASSWD` line for it
+/// ([`SudoersSnippet::with_agent_path`]).
 pub const GATE_NOPASS: &str = "/usr/libexec/xudo/xudo-gate-nopass";
+
+/// The sysctl drop-in `xudo install --agent-path --raise-ptrace-scope` writes.
+///
+/// `05-`: systemd applies `sysctl.d` files in name order and a later file
+/// wins, so this one never overrides a value any other file sets, higher or
+/// lower. A `.conf` name, or systemd skips it; its candidate is not one.
+pub const PTRACE_DROP_IN_PATH: &str = "/etc/sysctl.d/05-xudo-ptrace-scope.conf";
+
+/// The whole of that drop-in. Uninstall removes it only when it is still
+/// exactly this.
+pub const PTRACE_DROP_IN: &str = "# Managed by xudo. Remove with `sudo xudo install --uninstall`.\n\
+#\n\
+# At kernel.yama.ptrace_scope = 0 any process can attach to any other process\n\
+# of its uid and read what is typed there, a sudo password included. 1 limits\n\
+# that to a process's own children. Named 05- so that any later file setting\n\
+# this value, higher or lower, still wins.\n\
+kernel.yama.ptrace_scope = 1\n";
+
+/// Which of xudo's two sudoers texts a file holds, byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedForm {
+    /// The human path only: what a plain `xudo install` writes.
+    HumanOnly,
+    /// The human path and the one passwordless line: `--agent-path`.
+    AgentPath,
+}
+
+/// Which text xudo wrote, when `bytes` is exactly one of them for the sudo or
+/// sudo-rs version its own header names. `None` for anything else: an edit, an
+/// older xudo's text, or not xudo's at all.
+#[must_use]
+pub fn recognize(bytes: &[u8]) -> Option<ManagedForm> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let named = text
+        .lines()
+        .find_map(|line| line.strip_prefix("# Backend at install time: "))?;
+    let (label, rest) = named.split_once(" (")?;
+    let version = rest.strip_suffix(')')?;
+    let kind = [BackendKind::Sudo, BackendKind::SudoRs]
+        .into_iter()
+        .find(|kind| kind.label() == label)?;
+    [ManagedForm::AgentPath, ManagedForm::HumanOnly]
+        .into_iter()
+        .find(|form| sudoers_text(kind, version, *form == ManagedForm::AgentPath) == text)
+}
+
+/// Whether a sudoers text names the agent path in any spelling: the
+/// passwordless tag, the helper, its alias or its group.
+#[must_use]
+pub fn names_agent_path(bytes: &[u8]) -> bool {
+    [
+        &b"NOPASSWD"[..],
+        b"!authenticate",
+        b"xudo-gate-nopass",
+        b"XUDO_NOPASS",
+        b"xudo-agent",
+    ]
+    .iter()
+    .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
+}
 
 /// The `xudo` front-end, as the package installs it. Named in the drop-in only
 /// so sudo never uses a cached credential for it: `sudo xudo rules add` and
@@ -134,9 +193,9 @@ impl SudoersSnippet {
 
     /// Generates a snippet that also grants the passwordless agent path.
     ///
-    /// Not reachable from the current CLI. It exists so the shape can be
-    /// reviewed and tested now, and so the diff that enables it is small and
-    /// obvious rather than sprawling.
+    /// Reached only from [`crate::InstallPlan::with_agent_path`], which
+    /// `xudo install --agent-path` builds, and from
+    /// [`managed_agent_snippet`], which enrol's scan compares against.
     ///
     /// # Errors
     ///
@@ -159,41 +218,46 @@ impl SudoersSnippet {
             });
         }
 
-        let mut out = String::new();
-        out.push_str(&header(backend));
-
-        // `""` after the path means "with no arguments at all". This is the
-        // single most important token in the file: it removes sudo's fnmatch
-        // layer from the trust path entirely, so the whole sudoers
-        // argument-injection class becomes unreachable rather than guarded
-        // against.
-        let _ = writeln!(out, "Cmnd_Alias XUDO_AUTH = {GATE_AUTH} \"\"");
-        if includes_nopass {
-            let _ = writeln!(out, "Cmnd_Alias XUDO_NOPASS = {GATE_NOPASS} \"\"");
-        }
-        // Any arguments: this alias grants nothing, it only scopes a Default.
-        let _ = writeln!(out, "Cmnd_Alias XUDO_SELF = {XUDO_FRONT_END}");
-        out.push('\n');
-
-        out.push_str(&defaults_line("XUDO_AUTH"));
-        if includes_nopass {
-            out.push_str(&defaults_line("XUDO_NOPASS"));
-        }
-        out.push_str(XUDO_SELF_DEFAULTS);
-        out.push('\n');
-        out.push('\n');
-
-        let _ = writeln!(out, "%{XUDO_GROUP} ALL=(root) PASSWD:   XUDO_AUTH");
-        if includes_nopass {
-            let _ = writeln!(out, "%{XUDO_AGENT_GROUP} ALL=(root) NOPASSWD: XUDO_NOPASS");
-        }
-
         Ok(Self {
-            contents: out,
+            contents: sudoers_text(backend.kind, &backend.version, includes_nopass),
             includes_nopass,
             validate_argv: validate_argv(backend),
         })
     }
+}
+
+/// The sudoers text for a backend `kind` at `version`, with or without the
+/// passwordless line. Nothing in it can fail: every check is made before.
+fn sudoers_text(kind: BackendKind, version: &str, includes_nopass: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&header(kind, version));
+
+    // `""` after the path means "with no arguments at all". This is the
+    // single most important token in the file: it removes sudo's fnmatch
+    // layer from the trust path entirely, so the whole sudoers
+    // argument-injection class becomes unreachable rather than guarded
+    // against.
+    let _ = writeln!(out, "Cmnd_Alias XUDO_AUTH = {GATE_AUTH} \"\"");
+    if includes_nopass {
+        let _ = writeln!(out, "Cmnd_Alias XUDO_NOPASS = {GATE_NOPASS} \"\"");
+    }
+    // Any arguments: this alias grants nothing, it only scopes a Default.
+    let _ = writeln!(out, "Cmnd_Alias XUDO_SELF = {XUDO_FRONT_END}");
+    out.push('\n');
+
+    out.push_str(&defaults_line("XUDO_AUTH"));
+    if includes_nopass {
+        out.push_str(&defaults_line("XUDO_NOPASS"));
+    }
+    out.push_str(XUDO_SELF_DEFAULTS);
+    out.push('\n');
+    out.push('\n');
+
+    let _ = writeln!(out, "%{XUDO_GROUP} ALL=(root) PASSWD:   XUDO_AUTH");
+    if includes_nopass {
+        let _ = writeln!(out, "%{XUDO_AGENT_GROUP} ALL=(root) NOPASSWD: XUDO_NOPASS");
+    }
+    out
 }
 
 /// The exact text of the passwordless snippet xudo itself would install for
@@ -222,7 +286,7 @@ pub fn human_only_form(agent_text: &str) -> String {
 
 /// The explanatory header. An operator who opens this file mid-incident should
 /// not have to guess what it is or why each directive is there.
-fn header(backend: &Backend) -> String {
+fn header(kind: BackendKind, version: &str) -> String {
     format!(
         "# Managed by xudo. Do not edit; run `xudo doctor --fix` instead.\n\
          #\n\
@@ -246,8 +310,7 @@ fn header(backend: &Backend) -> String {
          # The helper takes no arguments and reads nothing from its environment. It is\n\
          # safe to invoke directly, because it is itself the policy engine.\n\
          \n",
-        kind = backend.kind.label(),
-        version = backend.version,
+        kind = kind.label(),
     )
 }
 
@@ -665,10 +728,11 @@ mod tests {
         assert!(!human.contents.contains(XUDO_AGENT_GROUP));
     }
 
-    /// The agent-path snippet stays unreachable from install: nothing outside
-    /// this file builds it. E8 is the step that may change this, on purpose.
+    /// The agent-path snippet is built in one place outside this file: the
+    /// opt-in plan `xudo install --agent-path` runs. Anything else that builds
+    /// it is a second way to write the passwordless line.
     #[test]
-    fn nothing_outside_the_snippet_builds_the_agent_path() {
+    fn only_the_opt_in_plan_builds_the_agent_path() {
         fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -682,17 +746,85 @@ mod tests {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut files = Vec::new();
         rust_files(&crates, &mut files);
+        // Production code only: a test may build it to compare against, and
+        // a crate's tests sit after its first `#[cfg(test)]` or in a tests file.
         let users: Vec<_> = files
             .iter()
             .filter(|path| !path.ends_with("xudo-backend/src/snippet.rs"))
             .filter(|path| {
-                std::fs::read_to_string(path)
-                    .unwrap()
-                    .contains("with_agent_path")
+                !path.ends_with("tests.rs") && !path.components().any(|c| c.as_os_str() == "tests")
+            })
+            .filter(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+                production.contains("SudoersSnippet::with_agent_path")
             })
             .collect();
         assert!(files.len() > 50, "the walk found too few files");
-        assert!(users.is_empty(), "{users:?}");
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users[0].ends_with("xudo-backend/src/plan.rs"), "{users:?}");
+    }
+
+    #[test]
+    fn both_texts_are_recognized_for_the_version_their_header_names() {
+        for backend in [sudo(), sudo_rs()] {
+            let human = SudoersSnippet::human_only(&backend).unwrap().contents;
+            let agent = SudoersSnippet::with_agent_path(&backend).unwrap().contents;
+            assert_eq!(recognize(human.as_bytes()), Some(ManagedForm::HumanOnly));
+            assert_eq!(recognize(agent.as_bytes()), Some(ManagedForm::AgentPath));
+            // Another version in the header is still xudo's text for that one.
+            let upgraded = agent.replace(&backend.version, "9.9");
+            assert_eq!(recognize(upgraded.as_bytes()), Some(ManagedForm::AgentPath));
+        }
+    }
+
+    #[test]
+    fn an_edited_agent_file_is_not_recognized() {
+        let agent = SudoersSnippet::with_agent_path(&sudo()).unwrap().contents;
+        for edited in [
+            format!("{agent}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n"),
+            agent.replace("%xudo-agent ALL", "%xudo ALL"),
+            agent.replace("xudo-gate-nopass \"\"", "xudo-gate-nopass"),
+            agent.replace("p2)\n", "p2\n"),
+            agent.replace(": sudo (", ": doas ("),
+            agent.replace("# Backend at install time: ", "# Backend: "),
+            agent.replace(" (Sudo version", "(Sudo version"),
+        ] {
+            assert_eq!(recognize(edited.as_bytes()), None, "{edited}");
+        }
+        assert_eq!(recognize(&[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn the_agent_path_is_named_in_every_spelling() {
+        for text in [
+            &b"x NOPASSWD: y"[..],
+            b"Defaults:x !authenticate",
+            b"/usr/libexec/xudo/xudo-gate-nopass",
+            b"XUDO_NOPASS",
+            b"%xudo-agent",
+        ] {
+            assert!(names_agent_path(text), "{text:?}");
+        }
+        let human = SudoersSnippet::human_only(&sudo()).unwrap().contents;
+        assert!(!names_agent_path(human.as_bytes()));
+    }
+
+    #[test]
+    fn the_ptrace_drop_in_raises_only_and_says_whose_it_is() {
+        assert!(PTRACE_DROP_IN.starts_with(MANAGED_MARKER));
+        let settings: Vec<&str> = PTRACE_DROP_IN
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        assert_eq!(settings, ["kernel.yama.ptrace_scope = 1"]);
+        assert_eq!(
+            std::path::Path::new(PTRACE_DROP_IN_PATH)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("conf")
+        );
+        assert!(PTRACE_DROP_IN_PATH.starts_with("/etc/sysctl.d/05-"));
     }
 
     #[test]

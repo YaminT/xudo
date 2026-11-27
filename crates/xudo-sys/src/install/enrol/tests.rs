@@ -238,6 +238,11 @@ impl InstallOps for Machine {
         Ok(())
     }
 
+    fn read_managed(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError> {
+        self.step(format!("read_managed {path}"))?;
+        Ok(self.files.borrow().get(path).map(|t| t.as_bytes().to_vec()))
+    }
+
     fn remove_managed(&self, path: &str) -> Result<Removal, InstallError> {
         self.step(format!("remove_managed {path}"))?;
         if self.files.borrow().contains_key(path) && !self.marked(path) {
@@ -1325,4 +1330,12 @@ fn a_group_lookup_that_fails_stops_the_join() {
     let machine = bare_groups().failing("group_exists xudo");
     assert!(enrol(&machine).is_err());
     assert!(!machine.calls().iter().any(|c| c.starts_with("add_member")));
+}
+
+#[test]
+fn the_machine_reads_back_what_it_holds() {
+    // Part of the double's contract even where enrol never asks.
+    let machine = bare_groups();
+    assert_eq!(machine.read_managed("/etc/nothing").unwrap(), None);
+    assert!(machine.read_managed("/etc/group").unwrap().is_some());
 }

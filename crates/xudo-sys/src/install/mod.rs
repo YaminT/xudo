@@ -13,8 +13,9 @@
 //!
 //! * **Root only.** An effective uid other than 0 is refused first, before the
 //!   plan is even read.
-//! * **Only files xudo writes.** Every path a step names must be one of the five
-//!   xudo's snippets install to, or the candidate beside one. `/etc/sudoers`,
+//! * **Only files xudo writes.** Every path a step names must be one of the six
+//!   xudo's snippets install to (the sysctl drop-in of `--raise-ptrace-scope`
+//!   among them), or the candidate beside one. `/etc/sudoers`,
 //!   `/etc/passwd`, and anything else are refused, so the executor cannot touch
 //!   a file it did not write however the plan was assembled.
 //! * **No name sudo ignores.** A drop-in whose name contains a dot or ends in
@@ -27,6 +28,12 @@
 //!   once and start with an absolute path.
 //!
 //! and while it runs:
+//!
+//! * **The passwordless helper refuses first.** A `RefusalProbe` that does not
+//!   show the helper refusing a caller it cannot attest stops the run. The
+//!   agent-path plan puts it first, so nothing has been written.
+//! * **An edited file is left alone.** A `RefuseEdited` step reads the file and
+//!   stops when it holds an edit (`xudo_backend::plan::edited`).
 //!
 //! * **Validate before install, structurally.** An `Install` step is refused
 //!   unless the candidate it names was written by this run and validated by
@@ -57,7 +64,8 @@ mod pack;
 
 use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest};
 use xudo_backend::snippet::{
-    DOAS_BEGIN, DOAS_CONF_PATH, DOAS_DROP_IN_PATH, DOAS_END, SUDOERS_PATH, XUDO_GROUP,
+    DOAS_BEGIN, DOAS_CONF_PATH, DOAS_DROP_IN_PATH, DOAS_END, PTRACE_DROP_IN_PATH, SUDOERS_PATH,
+    XUDO_AGENT_GROUP, XUDO_GROUP,
 };
 use xudo_backend::{BackendKind, InstallPlan, PlanStep};
 
@@ -113,7 +121,10 @@ pub enum InstallError {
         path: String,
     },
     /// A step names a group other than xudo's.
-    #[error("refusing to create group {name}: xudo manages only the group {XUDO_GROUP}")]
+    #[error(
+        "refusing to create group {name}: xudo manages only the groups {XUDO_GROUP} and \
+         {XUDO_AGENT_GROUP}"
+    )]
     GroupNotManaged {
         /// The group.
         name: String,
@@ -270,6 +281,32 @@ pub enum InstallError {
     /// This context has no installer.
     #[error("this context cannot modify the machine; nothing was changed")]
     NoInstaller,
+    /// The passwordless helper was not shown to refuse an unattested caller.
+    #[error(
+        "the passwordless helper was not shown to refuse a caller it cannot attest: {reason}; \
+         nothing was written"
+    )]
+    HelperDidNotRefuse {
+        /// What the probe saw.
+        reason: String,
+    },
+    /// A file xudo would replace or remove holds an edit.
+    #[error("{path} was left as it is: {reason}")]
+    Edited {
+        /// The file.
+        path: String,
+        /// How it was told apart.
+        reason: &'static str,
+    },
+    /// A read-back asked to stand in for a parser where one exists.
+    #[error(
+        "refusing to read back {path} in place of a parser: only the sysctl drop-in has no \
+         parser of its own"
+    )]
+    ReadBackRefused {
+        /// The candidate.
+        path: String,
+    },
 }
 
 /// What a functional probe saw.
@@ -293,6 +330,15 @@ pub enum ProbeResult {
 pub trait InstallProbe {
     /// Runs `argv` and judges the outcome against the plan's expectation.
     fn verify(&self, argv: &[String]) -> ProbeResult;
+
+    /// Runs the passwordless helper through `argv` as a caller it cannot
+    /// attest. [`ProbeResult::Verified`] only when it refused and ran nothing.
+    /// A probe that cannot run it says so, which stops the install.
+    fn refuses(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "this probe cannot run the passwordless helper".to_owned(),
+        }
+    }
 }
 
 /// Whether the integration was shown to work.
@@ -388,6 +434,14 @@ pub trait InstallOps {
     ///
     /// [`InstallError::CandidateReplaced`] when something else is there now.
     fn discard(&self, path: &str, identity: FileIdentity) -> Result<(), InstallError>;
+
+    /// The whole of a file xudo wrote, checked as [`Self::remove_managed`]
+    /// checks it; `None` when nothing is there.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotOurs`] for a file that is anything else.
+    fn read_managed(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError>;
 
     /// Removes a file xudo wrote: a regular, root-owned, singly-linked file
     /// that begins with xudo's marker.
@@ -646,8 +700,10 @@ fn is_managed(path: &str) -> bool {
     path == SUDOERS_PATH
         || path == DOAS_DROP_IN_PATH
         || path == DOAS_CONF_PATH
+        || path == PTRACE_DROP_IN_PATH
         || candidate_of(SUDOERS_PATH)
         || candidate_of(DOAS_DROP_IN_PATH)
+        || candidate_of(PTRACE_DROP_IN_PATH)
 }
 
 fn managed(path: &str) -> Result<(), InstallError> {
@@ -702,15 +758,30 @@ fn check_validator(argv: &[String]) -> Result<(), InstallError> {
 fn preflight(step: &PlanStep) -> Result<(), InstallError> {
     match step {
         PlanStep::CreateGroup { name } => {
-            if name == XUDO_GROUP {
+            if name == XUDO_GROUP || name == XUDO_AGENT_GROUP {
                 Ok(())
             } else {
                 Err(InstallError::GroupNotManaged { name: name.clone() })
             }
         }
-        PlanStep::WriteCandidate { path, mode, .. } => {
+        PlanStep::WriteCandidate {
+            path,
+            mode,
+            contents,
+        } => {
             managed(path)?;
-            check_mode(path, *mode)
+            check_mode(path, *mode)?;
+            // The drop-in has no parser to ask, so its one text is pinned
+            // here: no plan can put another value in it.
+            match xudo_backend::plan::edited(PTRACE_DROP_IN_PATH, contents.as_bytes()) {
+                Some(reason) if path.strip_suffix(".candidate") == Some(PTRACE_DROP_IN_PATH) => {
+                    Err(InstallError::Edited {
+                        path: path.clone(),
+                        reason,
+                    })
+                }
+                _ => Ok(()),
+            }
         }
         PlanStep::Validate { argv } => check_validator(argv),
         PlanStep::ValidateBySubstitution { candidate, .. } => managed(candidate),
@@ -738,8 +809,21 @@ fn preflight(step: &PlanStep) -> Result<(), InstallError> {
                 Err(InstallError::ForeignMarkers)
             }
         }
-        PlanStep::AppendBlock { path, .. } | PlanStep::Remove { path } => managed(path),
-        PlanStep::FunctionalProbe { .. } | PlanStep::Notice { .. } => Ok(()),
+        PlanStep::AppendBlock { path, .. }
+        | PlanStep::Remove { path }
+        | PlanStep::RefuseEdited { path } => managed(path),
+        PlanStep::ReadBack { candidate } => {
+            if candidate.strip_suffix(".candidate") == Some(PTRACE_DROP_IN_PATH) {
+                Ok(())
+            } else {
+                Err(InstallError::ReadBackRefused {
+                    path: candidate.clone(),
+                })
+            }
+        }
+        PlanStep::FunctionalProbe { .. }
+        | PlanStep::Notice { .. }
+        | PlanStep::RefusalProbe { .. } => Ok(()),
     }
 }
 
@@ -747,6 +831,7 @@ fn preflight(step: &PlanStep) -> Result<(), InstallError> {
 struct Candidate {
     path: String,
     identity: FileIdentity,
+    contents: Vec<u8>,
 }
 
 /// One execution's state.
@@ -813,6 +898,7 @@ impl Run {
                 self.candidate = Some(Candidate {
                     path: path.clone(),
                     identity,
+                    contents: contents.as_bytes().to_vec(),
                 });
                 self.validated = false;
                 self.events.push(format!("wrote candidate {path}"));
@@ -874,7 +960,64 @@ impl Run {
                 });
             }
             PlanStep::Notice { text } => self.notices.push(text.clone()),
+            PlanStep::RefusalProbe { argv, .. } => self.refusal_probe(argv, probe)?,
+            PlanStep::RefuseEdited { path } => self.refuse_edited(path, ops)?,
+            PlanStep::ReadBack { candidate } => self.read_back(candidate, ops)?,
         }
+        Ok(())
+    }
+
+    /// A `RefusalProbe` step: the helper must refuse a caller it cannot attest.
+    fn refusal_probe(
+        &mut self,
+        argv: &[String],
+        probe: &dyn InstallProbe,
+    ) -> Result<(), InstallError> {
+        match probe.refuses(argv) {
+            ProbeResult::Verified => {
+                self.events
+                    .push("the passwordless helper refused a caller it cannot attest".to_owned());
+                Ok(())
+            }
+            ProbeResult::Failed { reason } | ProbeResult::Unavailable { reason } => {
+                Err(InstallError::HelperDidNotRefuse { reason })
+            }
+        }
+    }
+
+    /// A `RefuseEdited` step: a file that holds an edit stops the run.
+    fn refuse_edited(&mut self, path: &str, ops: &dyn InstallOps) -> Result<(), InstallError> {
+        if let Some(reason) = ops
+            .read_managed(path)?
+            .and_then(|bytes| xudo_backend::plan::edited(path, &bytes))
+        {
+            return Err(InstallError::Edited {
+                path: path.to_owned(),
+                reason,
+            });
+        }
+        self.events.push(format!("{path} holds no edit"));
+        Ok(())
+    }
+
+    /// A `ReadBack` step: the candidate this run wrote must hold exactly the
+    /// bytes written, and still be the inode written.
+    fn read_back(&mut self, path: &str, ops: &dyn InstallOps) -> Result<(), InstallError> {
+        let candidate =
+            self.candidate
+                .as_ref()
+                .filter(|c| c.path == path)
+                .ok_or(InstallError::OutOfOrder {
+                    reason: "a read-back of a file this run did not write as a candidate",
+                })?;
+        if ops.read_managed(path)?.as_deref() != Some(candidate.contents.as_slice()) {
+            return Err(InstallError::ValidatorRejected {
+                detail: format!("{path} does not hold what was written"),
+            });
+        }
+        let identity = candidate.identity;
+        self.confirm_identity(ops, path, identity)?;
+        self.events.push(format!("read back {path}"));
         Ok(())
     }
 
@@ -886,19 +1029,30 @@ impl Run {
             return Ok(());
         };
         ops.validate(&substitute(argv, &candidate.path))?;
-        // The inode that passed the backend's parser must be the inode this run
-        // wrote. A rename into the path in between would have the parser bless
-        // one file and the install move another.
-        let now = ops.identity(&candidate.path)?;
-        if now != candidate.identity {
-            let path = candidate.path.clone();
-            // Not this run's file any more, so it is not this run's to remove.
-            self.candidate = None;
-            return Err(InstallError::CandidateReplaced { path });
-        }
-        self.validated = true;
+        let (path, identity) = (candidate.path.clone(), candidate.identity);
+        self.confirm_identity(ops, &path, identity)?;
         self.events
             .push("validated by the backend's own parser".to_owned());
+        Ok(())
+    }
+
+    /// The inode that passed a check must be the inode this run wrote. A
+    /// rename into the path in between would have the check bless one file
+    /// and the install move another. Marks the candidate validated.
+    fn confirm_identity(
+        &mut self,
+        ops: &dyn InstallOps,
+        path: &str,
+        identity: FileIdentity,
+    ) -> Result<(), InstallError> {
+        if ops.identity(path)? != identity {
+            // Not this run's file any more, so it is not this run's to remove.
+            self.candidate = None;
+            return Err(InstallError::CandidateReplaced {
+                path: path.to_owned(),
+            });
+        }
+        self.validated = true;
         Ok(())
     }
 

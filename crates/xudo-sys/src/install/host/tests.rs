@@ -625,6 +625,65 @@ fn a_removal_refuses_every_file_that_is_not_provably_xudos() {
     assert!(exists(&dir, "target"));
 }
 
+#[test]
+fn a_managed_file_is_read_whole_only_when_it_is_xudos() {
+    let dir = scratch("read-managed");
+    let ops = ops_in(&dir, &Script::new());
+    assert_eq!(ops.read_managed(SUDOERS).unwrap(), None);
+    assert!(ops.read_managed("relative").is_err());
+    put(&dir, "xudo", &ours("line\n"), 0o440);
+    assert_eq!(
+        ops.read_managed(SUDOERS).unwrap(),
+        Some(ours("line\n").into_bytes())
+    );
+    // An operator's file, a link to xudo's file, a second name, too large.
+    put(&dir, "xudo", "# mine\n", 0o440);
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("marker")
+    );
+    put(&dir, "target", &ours("x\n"), 0o440);
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    symlink(dir.join("target"), dir.join("xudo")).unwrap();
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic")
+    );
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    std::fs::hard_link(dir.join("target"), dir.join("xudo")).unwrap();
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("more than one name")
+    );
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    let huge = ours(&"x".repeat(usize::try_from(MAX_SHARED_BYTES).unwrap()));
+    put(&dir, "xudo", &huge, 0o440);
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("larger")
+    );
+    // A directory cannot be read as a file.
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    std::fs::create_dir(dir.join("xudo")).unwrap();
+    assert!(ops.read_managed(SUDOERS).is_err());
+    // Through the real walk, a directory that is not there holds nothing.
+    let system = HostInstallOps::system();
+    assert_eq!(
+        system
+            .read_managed("/xudo-test-no-such-directory/xudo")
+            .unwrap(),
+        None
+    );
+}
+
 // --- the group -----------------------------------------------------------
 
 #[test]

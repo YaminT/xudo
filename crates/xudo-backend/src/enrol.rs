@@ -523,7 +523,7 @@ fn managed_installed(host: &dyn HostView, managed: Option<&str>) -> bool {
 }
 
 /// The gid of the group named `group` in `/etc/group`, when it appears once.
-fn group_gid(host: &dyn HostView, group: &str) -> Option<u32> {
+pub(crate) fn group_gid(host: &dyn HostView, group: &str) -> Option<u32> {
     let Lookup::Found(file) = host.read(Path::new("/etc/group")) else {
         return None;
     };
@@ -562,13 +562,13 @@ fn held_gids(account: &str, primary: u32, group_file: &[u8]) -> Vec<u32> {
 
 /// Where sudo, sudo-rs and doas read rules, and the directories that add to
 /// them.
-const RULE_FILES: [&str; 4] = [
+pub(crate) const RULE_FILES: [&str; 4] = [
     "/etc/sudoers",
     "/etc/sudoers-rs",
     "/etc/doas.conf",
     "/usr/local/etc/doas.conf",
 ];
-const RULE_DIRS: [&str; 2] = ["/etc/sudoers.d", "/etc/doas.d"];
+pub(crate) const RULE_DIRS: [&str; 2] = ["/etc/sudoers.d", "/etc/doas.d"];
 
 /// Every line of every sudo or doas file that names the account (by name or
 /// `#uid`), with or without a password, or that names everyone, or that
@@ -681,7 +681,7 @@ fn lines_naming(
 
 /// Whether `token` occurs in `line` as a whole word: not followed by another
 /// word byte, so `%xudo` is not `%xudo-agent` and `%#99` is not `%#998`.
-fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
+pub(crate) fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
     line.windows(token.len().max(1))
         .enumerate()
         .any(|(at, window)| {
@@ -693,7 +693,7 @@ fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool
 }
 
 /// Whether `line` has a `%#N` or `%N` group, `N` being digits.
-fn names_numeric_group(line: &[u8]) -> bool {
+pub(crate) fn names_numeric_group(line: &[u8]) -> bool {
     line.split(|byte| *byte == b'%').skip(1).any(|rest| {
         let rest = rest.strip_prefix(b":").unwrap_or(rest);
         let rest = rest.strip_prefix(b"#").unwrap_or(rest);
@@ -702,7 +702,7 @@ fn names_numeric_group(line: &[u8]) -> bool {
 }
 
 /// Whether `needle` occurs in `haystack`.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len().max(1))
         .any(|window| window == needle)

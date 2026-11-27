@@ -124,7 +124,44 @@ impl BrokerProbe<'_> {
     }
 }
 
+/// How the gate's refusal line begins (`xudo_gate::run`'s exit message).
+const GATE_REFUSED: &str = "xudo-gate: refused (";
+
 impl InstallProbe for BrokerProbe<'_> {
+    /// Runs the passwordless helper through the backend, as root and with no
+    /// request minted for it: a caller it cannot attest. Refused means a
+    /// non-zero status, nothing on standard output, and the gate's own refusal
+    /// line, so sudo saying no (a password, no rule) is not taken for it.
+    fn refuses(&self, plan: &[String]) -> ProbeResult {
+        let Some((backend, rest)) = plan.split_first() else {
+            return ProbeResult::Unavailable {
+                reason: "the plan names nothing to run".to_owned(),
+            };
+        };
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        match self.runner.run(backend, &rest, None) {
+            Ok(out)
+                if !out.success
+                    && out.stdout.is_empty()
+                    && out.stderr.lines().any(|l| l.starts_with(GATE_REFUSED)) =>
+            {
+                ProbeResult::Verified
+            }
+            Ok(out) => ProbeResult::Failed {
+                reason: format!(
+                    "the helper, run through {backend}, did not refuse as the gate refuses \
+                     (status {:?}, {} bytes on standard output): {}",
+                    out.code,
+                    out.stdout.len(),
+                    out.stderr.trim()
+                ),
+            },
+            Err(why) => ProbeResult::Unavailable {
+                reason: format!("{backend} could not be run: {why}"),
+            },
+        }
+    }
+
     fn verify(&self, plan: &[String]) -> ProbeResult {
         let unavailable = |reason: String| ProbeResult::Unavailable { reason };
         let Some((backend, rest)) = plan.split_first() else {
@@ -367,6 +404,78 @@ mod tests {
             &id_is_regular(),
         );
         assert!(format!("{result:?}").starts_with("Failed"), "{result:?}");
+    }
+
+    /// What the refusal check judges `stdout`, `stderr` and `success` to be.
+    fn refusal_of(stdout: &str, stderr: &str, success: bool) -> (ProbeResult, Vec<String>) {
+        let gate = Gate(
+            Ok(Output {
+                success,
+                code: Some(if success { 0 } else { 19 }),
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+            }),
+            RefCell::default(),
+        );
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let nopass = ["/usr/bin/sudo", "-n", xudo_backend::snippet::GATE_NOPASS].map(String::from);
+        let result = probe.refuses(&nopass);
+        let ran = gate.1.borrow().clone();
+        (result, ran)
+    }
+
+    #[test]
+    fn the_helper_refusing_an_unattested_caller_is_the_only_pass() {
+        let refused = "xudo-gate: refused (no_pending_request, severity high)\n";
+        let (result, ran) = refusal_of("", refused, false);
+        assert_eq!(result, ProbeResult::Verified);
+        // Through the backend, with no request asked of the broker first.
+        assert_eq!(ran, ["/usr/bin/sudo -n /usr/libexec/xudo/xudo-gate-nopass"]);
+    }
+
+    #[test]
+    fn the_probe_failing_is_never_taken_for_a_refusal() {
+        // It ran something and exited 0; it printed; sudo asked a password or
+        // had no rule; a refusal line on a success: each one is a failure.
+        let refused = "xudo-gate: refused (no_pending_request, severity high)";
+        for (stdout, stderr, success) in [
+            ("0\n", "", true),
+            ("", refused, true),
+            ("0\n", refused, false),
+            ("", "sudo: a password is required", false),
+            ("", "sudo: xudo-gate-nopass: command not found", false),
+            ("", "  xudo-gate: refused (indented)", false),
+        ] {
+            let (result, _) = refusal_of(stdout, stderr, success);
+            assert!(
+                format!("{result:?}").starts_with("Failed"),
+                "{stdout:?} {stderr:?} {success}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_run_or_is_not_named_is_not_a_refusal() {
+        let gate = Gate(Err(()), RefCell::default());
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let result = probe.refuses(&argv());
+        assert!(
+            unavailable(&result).contains("could not be run"),
+            "{result:?}"
+        );
+        assert!(unavailable(&probe.refuses(&[])).contains("names nothing"));
     }
 
     #[test]

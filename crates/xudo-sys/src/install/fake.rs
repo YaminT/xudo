@@ -19,6 +19,7 @@ pub(super) struct FakeInstallOps {
     group: bool,
     present: RefCell<BTreeSet<String>>,
     identity: FileIdentity,
+    contents: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl FakeInstallOps {
@@ -35,7 +36,17 @@ impl FakeInstallOps {
             group: false,
             present: RefCell::new(BTreeSet::new()),
             identity: WRITTEN,
+            contents: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// `path` holds these bytes of xudo's. A candidate path set this way keeps
+    /// them when the run writes it, as if the write were tampered with.
+    pub(super) fn with_contents(self, path: &str, bytes: &[u8]) -> Self {
+        self.contents
+            .borrow_mut()
+            .insert(path.to_owned(), bytes.to_vec());
+        self
     }
 
     /// Makes `method` fail with the error that method would plausibly raise.
@@ -119,10 +130,14 @@ impl InstallOps for FakeInstallOps {
     fn write_candidate(
         &self,
         path: &str,
-        _contents: &[u8],
+        contents: &[u8],
         _mode: u32,
     ) -> Result<FileIdentity, InstallError> {
         self.record("write_candidate", path)?;
+        self.contents
+            .borrow_mut()
+            .entry(path.to_owned())
+            .or_insert_with(|| contents.to_vec());
         Ok(WRITTEN)
     }
 
@@ -141,6 +156,11 @@ impl InstallOps for FakeInstallOps {
 
     fn discard(&self, path: &str, _identity: FileIdentity) -> Result<(), InstallError> {
         self.record("discard", path)
+    }
+
+    fn read_managed(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError> {
+        self.record("read_managed", path)?;
+        Ok(self.contents.borrow().get(path).cloned())
     }
 
     fn remove_managed(&self, path: &str) -> Result<Removal, InstallError> {

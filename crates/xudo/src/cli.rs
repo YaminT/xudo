@@ -53,7 +53,7 @@ pub enum Format {
     about = "Linux privilege broker; this beta uses the human password path",
     long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
                   password-authenticated path through the host backend. The passwordless \
-                  agent path is not available in this beta."
+                  agent path is off unless root runs `xudo install --agent-path`."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -281,6 +281,19 @@ pub enum Command {
         /// Remove what an install wrote, and nothing else.
         #[arg(long)]
         uninstall: bool,
+
+        /// Opt in to the passwordless agent path (sudo and sudo-rs only):
+        /// also write the one `%xudo-agent` `NOPASSWD` line for the `-nopass`
+        /// helper with no arguments, after showing the helper refuses a caller
+        /// it cannot attest. A plain `xudo install` turns it off again.
+        #[arg(long, conflicts_with = "uninstall")]
+        agent_path: bool,
+
+        /// With `--agent-path`, on a host at `kernel.yama.ptrace_scope = 0`:
+        /// also write a sysctl.d drop-in that sets it to 1. Never lowers a
+        /// higher value; removed by `--uninstall`.
+        #[arg(long, requires = "agent_path")]
+        raise_ptrace_scope: bool,
     },
 
     /// Enrol, list or remove a harness that runs as its own account.
@@ -579,14 +592,19 @@ pub fn run_with_installer_at_socket(
             dry_run,
             show_contents,
             uninstall,
+            agent_path,
+            raise_ptrace_scope,
         } => install(
             platform.host,
             probe,
             installer,
-            InstallMode {
+            &InstallMode {
                 dry_run: *dry_run,
                 show_contents: *show_contents,
                 uninstall: *uninstall,
+                agent_path: (*agent_path)
+                    .then(|| crate::agent_path::session_harness(loaded.as_ref()))
+                    .map(|session| (session, *raise_ptrace_scope)),
             },
             out,
             err,
@@ -691,11 +709,14 @@ fn broker_control(
 }
 
 /// What `install` was asked to do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct InstallMode {
     dry_run: bool,
     show_contents: bool,
     uninstall: bool,
+    /// `--agent-path`: whether a session-way harness is registered, and
+    /// `--raise-ptrace-scope`.
+    agent_path: Option<(crate::agent_path::SessionHarness, bool)>,
 }
 
 /// Plans the install, or the removal, and performs it unless `--dry-run`.
@@ -712,7 +733,7 @@ fn install(
     host: &dyn HostView,
     probe: &dyn Probe,
     installer: &dyn Installer,
-    mode: InstallMode,
+    mode: &InstallMode,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -721,6 +742,18 @@ fn install(
             uninstall_plan(BackendKind::Sudo),
             uninstall_plan(BackendKind::Doas),
         ]
+    } else if let Some((session, raise)) = &mode.agent_path {
+        let backend = match detect(probe) {
+            Ok(backend) => backend,
+            Err(reason) => {
+                let _ = writeln!(err, "xudo: no usable backend: {reason}");
+                return ExitCode::Unusable;
+            }
+        };
+        match crate::agent_path::plan(host, &backend, session, *raise, out, err) {
+            Ok(plan) => vec![plan],
+            Err(code) => return code,
+        }
     } else {
         // One refusal path, not two. A backend that cannot be given a snippet
         // is a backend xudo cannot use, so the snippet failure is folded into
@@ -730,7 +763,10 @@ fn install(
             .map_err(|source| source.to_string())
             .and_then(|backend| plan_for(&backend))
         {
-            Ok(plan) => vec![plan],
+            Ok(plan) => {
+                crate::agent_path::warn_if_on(host, err);
+                vec![plan]
+            }
             Err(reason) => {
                 let _ = writeln!(err, "xudo: no usable backend: {reason}");
                 return ExitCode::Unusable;
@@ -751,8 +787,16 @@ fn install(
         }
         let _ = writeln!(
             out,
-            "\nNothing was written. This build grants the human path only: every rule it\n\
-             would install requires a password, and no passwordless rule exists in it."
+            "{}",
+            if mode.agent_path.is_some() {
+                "\nNothing was written. With --agent-path the plan also writes one passwordless\n\
+                 line: %xudo-agent may run /usr/libexec/xudo/xudo-gate-nopass with no\n\
+                 arguments, which runs a command only for an attested, registered harness\n\
+                 that a root-written rule grants it."
+            } else {
+                "\nNothing was written. This plan grants the human path only: every rule it\n\
+                 would install requires a password, and no passwordless rule exists in it."
+            }
         );
         return ExitCode::Delegated;
     }
@@ -868,7 +912,7 @@ fn doas_later_rules(
 }
 
 /// The word for what is being done, for a failure message.
-fn plan_verb(mode: InstallMode) -> &'static str {
+fn plan_verb(mode: &InstallMode) -> &'static str {
     if mode.uninstall {
         "uninstall"
     } else {
@@ -923,6 +967,9 @@ fn step_contents(step: &PlanStep) -> &str {
         PlanStep::AppendBlock { block, .. } => block,
         PlanStep::Notice { text } => text,
         PlanStep::CreateGroup { .. }
+        | PlanStep::RefusalProbe { .. }
+        | PlanStep::RefuseEdited { .. }
+        | PlanStep::ReadBack { .. }
         | PlanStep::Validate { .. }
         | PlanStep::ValidateBySubstitution { .. }
         | PlanStep::Install { .. }
@@ -4435,6 +4482,172 @@ expect = "deny"
         assert!(installer.plans.borrow().is_empty());
     }
 
+    /// A root-run sudo host for `--agent-path`, with `extra` in sudoers.d and
+    /// `ptrace_scope` at `scope`.
+    fn nopass_host(scope: &[u8], extra: &[(&str, &[u8])]) -> MemoryHost {
+        let mut host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
+        .file("/etc/sudoers", 0, 0, 0o440, b"@includedir /etc/sudoers.d\n")
+        .dir("/etc/sudoers.d", 0, 0, 0o750)
+        .dir("/proc", 0, 0, 0o555)
+        .dir("/proc/sys", 0, 0, 0o555)
+        .dir("/proc/sys/kernel", 0, 0, 0o555)
+        .dir("/proc/sys/kernel/yama", 0, 0, 0o555)
+        .file("/proc/sys/kernel/yama/ptrace_scope", 0, 0, 0o644, scope);
+        for (path, contents) in extra {
+            host = host.file(path, 0, 0, 0o440, contents);
+        }
+        host
+    }
+
+    /// `xudo install <args>` on `host` with a working sudo and `installer`.
+    fn install_on(
+        host: &MemoryHost,
+        installer: &dyn Installer,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let fx = fixture("cli-install-agent-path");
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "install"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let platform = Platform {
+            ops: &BlindOps,
+            probe: &WorkingSudoProbe,
+            host,
+            path: None,
+        };
+        let code = run_with_installer(&cli, &platform, installer, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn the_agent_path_dry_run_shows_the_one_passwordless_line_and_writes_nothing() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, out, err) = install_on(
+            &nopass_host(b"1\n", &[]),
+            &installer,
+            &["--agent-path", "--dry-run", "--show-contents"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(
+            out.contains("probe first: the passwordless helper"),
+            "{out}"
+        );
+        assert!(
+            out.contains("%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS"),
+            "{out}"
+        );
+        assert!(
+            out.contains("With --agent-path the plan also writes one passwordless"),
+            "{out}"
+        );
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_agent_path_runs_the_opt_in_plan_and_says_when_it_is_unverified() {
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Unverified {
+                reason: "no broker".to_owned(),
+            },
+        ))]);
+        let (code, _, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("NOT VERIFIED"), "{err}");
+        let plans = installer.plans.borrow();
+        assert!(plans[0].steps[0].describe().starts_with("probe first:"));
+    }
+
+    #[test]
+    fn the_agent_path_stops_on_a_hand_written_line_before_the_installer() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let host = nopass_host(
+            b"1\n",
+            &[(
+                "/etc/sudoers.d/00-ops",
+                b"%xudo-agent ALL=(ALL) NOPASSWD: ALL\n",
+            )],
+        );
+        let (code, _, err) = install_on(&host, &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("00-ops line 1"), "{err}");
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_agent_path_needs_a_backend() {
+        let fx = fixture("cli-install-agent-nobackend");
+        let (code, _, err) = run_probe_full(
+            &fx,
+            &NoBackendProbe,
+            &["install", "--agent-path", "--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("no usable backend"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_path_refuses_doas_through_the_command() {
+        let (code, out, err) = install_on_doas(b"", &["--agent-path", "--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("sudo and sudo-rs only"), "{err}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn the_agent_path_flags_cannot_be_combined_with_an_uninstall_or_stand_alone() {
+        for args in [
+            &["xudo", "install", "--agent-path", "--uninstall"][..],
+            &["xudo", "install", "--raise-ptrace-scope"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["xudo", "install", "--agent-path", "--raise-ptrace-scope"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_plain_install_over_the_agent_path_warns_and_writes_no_nopasswd() {
+        let backend = xudo_backend::detect(&WorkingSudoProbe).unwrap();
+        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, false)
+            .unwrap()
+            .steps
+            .into_iter()
+            .find_map(|s| match s {
+                PlanStep::WriteCandidate { contents, .. } => Some(contents),
+                _ => None,
+            })
+            .unwrap();
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Verified,
+        ))]);
+        let host = nopass_host(b"1\n", &[("/etc/sudoers.d/xudo", agent.as_bytes())]);
+        let (code, _, err) = install_on(&host, &installer, &[]);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.contains("turns it off"), "{err}");
+        let plans = installer.plans.borrow();
+        for step in &plans[0].steps {
+            if let PlanStep::WriteCandidate { contents, .. } = step {
+                assert!(!contents.contains("NOPASSWD"), "{contents}");
+            }
+        }
+    }
+
     #[test]
     fn install_shows_the_file_it_would_write_when_asked() {
         let fx = fixture("cli-install-contents");
@@ -5392,7 +5605,7 @@ expect = "deny"
         let text = err.to_string();
         assert!(text.contains("password-authenticated path"), "{text}");
         assert!(
-            text.contains("passwordless agent path is not available"),
+            text.contains("passwordless agent path is off unless root runs"),
             "{text}"
         );
     }

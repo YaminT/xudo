@@ -319,9 +319,10 @@ differential:
 # probe, which needs a request only the front-end's broker client can mint
 # (plan item C1, `xudo exec`), so a finished install reports NOT VERIFIED. The
 # uid-0 proof that the installed rule reaches the gate is in the root lane
-# (`xudo-gate-bin/tests/root_probe.rs`).
+# (`xudo-gate-bin/tests/root_probe.rs`). The gate is built too: `--agent-path`
+# runs the real `-nopass` helper through sudo and writes nothing unless it refuses.
 install-root:
-    cargo build -p xudo-bin --release --target {{musl_triple}}
+    cargo build -p xudo-bin -p xudo-gate-bin --release --target {{musl_triple}}
     ci/install/run.sh target/{{musl_triple}}/release/xudo
 
 # --- SBOM --------------------------------------------------------------------
