@@ -383,14 +383,14 @@ else
     show "$case_name"
     cat "/proc/$impostor/cmdline" >&2 || true
 fi
-# Where the hint is recorded: `xudo doctor` counts it and trusts none. It
-# counts one more hint with CLAUDECODE than without (comm, cmdline and exe
-# are hints too).
+# `xudo doctor` counts the CLAUDECODE hint and trusts none: one more hint
+# with it than without (comm, cmdline and exe are hints too). This is the
+# client's count; the broker's trail is the next rows.
 as_harness e7-lane hints '/usr/bin/xudo doctor 2>&1 | sed -n "s/^hints  *\([0-9]*\) recorded, 0 trusted$/with=\1/p"
 env -u CLAUDECODE /usr/bin/xudo doctor 2>&1 | sed -n "s/^hints  *\([0-9]*\) recorded, 0 trusted$/without=\1/p"'
 with=$(printf '%s\n' "$hout" | sed -n 's/^with=//p')
 without=$(printf '%s\n' "$hout" | sed -n 's/^without=//p')
-case_name=the_impostors_claudecode_hint_is_recorded_and_not_trusted
+case_name=doctor_counts_the_claudecode_hint_and_trusts_none
 if [ -n "$with" ] && [ -n "$without" ] && [ "$with" = "$((without + 1))" ]; then
     good "$case_name"
 else
@@ -471,16 +471,22 @@ fi
 # harness's entry waits; then the requester itself is moved out through the
 # account's user manager. Neither runs anything. row.sh's EXIT trap restores
 # the PAM file if this aborts.
+# Each edit is a rename, so sudo never reads half a file. hook_on runs once:
+# a second call would save the hooked file as the backup.
 hook_on() {
+    [ -e /var/tmp/g1f-pam-sudo ] && return
     cp -a /etc/pam.d/sudo /var/tmp/g1f-pam-sudo
     {
         echo 'auth optional pam_exec.so seteuid quiet /usr/local/lib/xudo-g1f/between'
         echo 'account optional pam_exec.so seteuid quiet /usr/local/lib/xudo-g1f/between'
         cat /var/tmp/g1f-pam-sudo
-    } >/etc/pam.d/sudo
+    } >/etc/pam.d/.sudo.g1f
+    chmod 0644 /etc/pam.d/.sudo.g1f
+    mv -f /etc/pam.d/.sudo.g1f /etc/pam.d/sudo
 }
 hook_off() {
-    cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
+    cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/.sudo.g1f
+    mv -f /etc/pam.d/.sudo.g1f /etc/pam.d/sudo
     rm -f /var/tmp/g1f-pam-sudo "$g1f/once" /run/xudo/req/*
 }
 hook_on

@@ -88,13 +88,18 @@ take_machine_lock root-test
 # A same-device bind mount: a parent and a child bind-mounted from one host
 # directory, so the child shares st_dev with its parent and only the kernel's
 # mount flags tell it apart.
+# A host file bind-mounted over a name inside a walked tree: a mount whose
+# root is a file, which the walk must refuse as it refuses a directory one.
 bind_host=$(mktemp -d)
 mkdir -p "$bind_host/child"
-trap 'rm -rf "$bind_host"' EXIT
+file_host=$(mktemp -d)
+printf 'bound over' >"$file_host/over"
+trap 'rm -rf "$bind_host" "$file_host"' EXIT
 docker run --rm -i \
     --cap-add SYS_RESOURCE \
     -v "$bind_host:/var/lib/xudo-t1-remove-bind" \
     -v "$bind_host/child:/var/lib/xudo-t1-remove-bind/child" \
+    -v "$file_host/over:/var/lib/xudo-t1-remove-filebind/box/over" \
     --tmpfs /var/lib/xudo-t1-remove-mount:rw,noexec,nosuid,nodev,mode=0755 \
     --tmpfs /var/lib/xudo-t1-remove-xdev/box/mnt:rw,noexec,nosuid,nodev,mode=0755 \
     -v "$root:/src:ro" \

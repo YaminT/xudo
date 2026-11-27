@@ -605,7 +605,7 @@ impl Walk<'_> {
     ) -> Result<(), RemoveError> {
         let stat = match self.fs.lstat(parent, name) {
             Ok(stat) => stat,
-            Err(error) if stop_errno(&error) || matches_errno(&error, ENOENT) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -645,8 +645,11 @@ impl Walk<'_> {
         if !(matches_errno(error, ELOOP) || matches_errno(error, ENOTDIR)) {
             return None;
         }
+        // A directory where the open just said "not a directory" is a link
+        // swapped for one between the two calls: still an escape.
         let kind = self.fs.lstat(parent, name).map(|stat| stat.kind);
-        if kind == Ok(NodeKind::Symlink) {
+        let swapped = kind == Ok(NodeKind::Dir) && matches_errno(error, ENOTDIR);
+        if kind == Ok(NodeKind::Symlink) || swapped {
             return Some(RemoveError::WalkEscape(THROUGH_A_LINK));
         }
         None
@@ -675,7 +678,7 @@ impl Walk<'_> {
                 self.partial = true;
                 return Ok(());
             }
-            Err(error) if matches_errno(&error, ENOENT) || stop_errno(&error) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -683,7 +686,7 @@ impl Walk<'_> {
         }
         let leaf = match self.fs.lstat(parent, name) {
             Ok(stat) => stat,
-            Err(error) if stop_errno(&error) || matches_errno(&error, ENOENT) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -715,8 +718,10 @@ fn off_the_tree(stat: &NodeStat, tree_dev: u64) -> bool {
     stat.dev != tree_dev || stat.mount_root || stat.kind != NodeKind::Dir
 }
 
+/// A walk that met one of these lost its way and stops. `ELOOP` is not one:
+/// a loop that is not a link the walk could name fails loudly as itself.
 fn stop_errno(error: &RemoveError) -> bool {
-    matches_errno(error, EXDEV) || matches_errno(error, ENOENT) || matches_errno(error, ELOOP)
+    matches_errno(error, EXDEV) || matches_errno(error, ENOENT)
 }
 
 fn matches_errno(error: &RemoveError, errno: i32) -> bool {
@@ -2429,11 +2434,11 @@ mod tests {
 
     #[test]
     fn a_walk_that_loses_its_way_to_the_target_stops_or_fails() {
-        // A vanished directory, or a loop that is not a link, is a stop. A
-        // crossed mount is an escape. Anything else is an error.
+        // A vanished directory is a stop. A crossed mount is an escape.
+        // Anything else is an error, a loop that is not a link included.
         for (errno, outcome) in [
             (ENOENT, Ok(true)),
-            (ELOOP, Ok(true)),
+            (ELOOP, Err(os("openat2", ELOOP))),
             (EXDEV, Err(RemoveError::WalkEscape(ACROSS_A_MOUNT))),
             (5, Err(os("openat2", 5))),
         ] {
@@ -2566,11 +2571,40 @@ mod tests {
             os("openat2", ENOTDIR)
         );
         // A link that cannot be told from a file, because its lstat fails,
-        // is not called an escape either: the walk only stops.
+        // is not called an escape either, and does not pass as a quiet stop:
+        // the open's own error fails the walk.
         let mut fs = hop();
         fs.fail_at("lstat", 0, 5);
-        assert!(remove_path(&mut fs, &req("hop/v")).unwrap().partial);
+        assert_eq!(
+            remove_path(&mut fs, &req("hop/v")).unwrap_err(),
+            os("openat2", ELOOP)
+        );
         assert!(fs.exists(&[b"victim", b"v"]));
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_link_swapped_for_a_directory_before_the_lstat() {
+        // Attack: the open meets the planted link (ENOTDIR), then the link is
+        // swapped for a directory before the walk asks what it was. A
+        // directory cannot answer ENOTDIR, so it is still the escape.
+        let (mut fs, _) = boxed(&[b"a"]);
+        // `/`, `srv`, `app`, `build`; the fifth open is `box`.
+        fs.fail_at("openat2", 4, ENOTDIR);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            RemoveError::WalkEscape(THROUGH_A_LINK)
+        );
+        assert!(fs.unlinked().is_empty());
+        // The same swap after `ELOOP` is no escape the walk can name, and
+        // still not a stop: it fails as the open's error.
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.fail_at("openat2", 4, ELOOP);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            os("openat2", ELOOP)
+        );
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
     }
 
     #[test]

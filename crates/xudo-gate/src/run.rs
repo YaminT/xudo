@@ -3815,6 +3815,78 @@ max-entries = 10
     }
 
     #[test]
+    fn denies_a_password_remove_path_through_a_planted_link_or_mount() {
+        // Attack: on the password path too, a link or bind mount planted in
+        // the tree must not let the walk reach outside it. The human typed a
+        // password for a name under the tree, not for what a link points at.
+        use xudo_sys::remove::NodeKind;
+        for (target, reason) in [
+            (
+                &b"/srv/app/build/hop/v"[..],
+                "detail=a directory on the way to the target is a symbolic link",
+            ),
+            (
+                b"/srv/app/build/mnt/v",
+                "detail=the walk would cross a mount",
+            ),
+        ] {
+            let spool = Rc::new(holding(&[(
+                NONCE_A,
+                remove_entry(REMOVE_RULE, target, false),
+            )]));
+            let mut host = FakeHost::new(&spool);
+            host.policy = Ok(remove_policy(REMOVE_RULE));
+            plant_tree(&mut host);
+            let fs = &mut host.remove;
+            fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+            fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"hop",
+                NodeKind::Symlink,
+                1000,
+                0o777,
+                7,
+            );
+            let mnt = fs.add(
+                &[b"srv", b"app", b"build"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"mnt"],
+                b"v",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            fs.set_device(mnt, 9);
+            let exit = run(&mut host, &auth());
+            assert_eq!(exit.status, 19, "{exit:?}");
+            assert!(
+                exit.message.contains("gate_walk_escape, severity high"),
+                "{exit:?}"
+            );
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"victim", b"v"]));
+            assert!(
+                host.remove
+                    .exists(&[b"srv", b"app", b"build", b"mnt", b"v"])
+            );
+            assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+            assert_eq!(exec_calls(&host), 0);
+            let record = &host.audit.records()[0];
+            assert_eq!(record.decision, AuditDecision::Denied);
+            assert!(has_line(&record.evidence, "severity=high"), "{record:?}");
+            assert!(has_line(&record.evidence, reason), "{record:?}");
+        }
+    }
+
+    #[test]
     fn a_password_gate_removes_a_path_and_does_not_exec() {
         let spool = Rc::new(holding(&[(
             NONCE_A,

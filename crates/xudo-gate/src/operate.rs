@@ -316,6 +316,13 @@ pub(crate) fn operation_status(report: &RemoveReport) -> i32 {
 pub(crate) fn operation_message(report: &RemoveReport) -> String {
     if report.dry_run {
         format!("xudo-gate: dry-run listed {} paths", report.removed.len())
+    } else if let Some(RemoveError::WalkEscape(reason)) = &report.error {
+        // The tree changed after the dry run and the real walk met a planted
+        // link or mount: say so, not only how many names went first.
+        format!(
+            "xudo-gate: partial remove of {} paths, stopped by gate_walk_escape: {reason}",
+            report.removed.len()
+        )
     } else if report.partial {
         format!(
             "xudo-gate: partial remove of {} paths",
@@ -931,6 +938,30 @@ outcome = "allow"
         ] {
             assert!(record.evidence.iter().any(|seen| seen == line), "{line}");
         }
+    }
+
+    #[test]
+    fn an_escape_met_only_by_the_real_walk_is_named_in_the_message() {
+        // Attack: the tree is clean for the dry run, then a link or mount is
+        // planted before the walk that unlinks. The caller's line names the
+        // escape, not only the count of names that went before it.
+        let mut walked = report(&[b"/srv/app/build/cache/a"], false, true);
+        walked.error = Some(RemoveError::WalkEscape("the walk would cross a mount"));
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths, stopped by gate_walk_escape: \
+             the walk would cross a mount"
+        );
+        assert_eq!(operation_status(&walked), 1);
+        // Another stop keeps the plain partial line.
+        walked.error = Some(RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths"
+        );
     }
 
     fn report_owned(paths: &[Vec<u8>], dry_run: bool, partial: bool) -> RemoveReport {

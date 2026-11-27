@@ -32,6 +32,8 @@ const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
 // from a subdirectory of it. Same filesystem, same `st_dev`, still a mount.
 const BIND_TREE: &str = "/var/lib/xudo-t1-remove-bind";
 const XDEV_TREE: &str = "/var/lib/xudo-t1-remove-xdev";
+// Docker bind-mounts a host file over `FILE_TREE/box/over`.
+const FILE_TREE: &str = "/var/lib/xudo-t1-remove-filebind";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -329,4 +331,32 @@ fn denies_a_real_mount_as_a_parent_or_as_the_target() {
     }
     assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
     let _ = fs::remove_file(&inside);
+}
+
+#[test]
+fn denies_a_file_bind_mounted_over_a_name_in_the_tree() {
+    if !begin_root_test("denies_a_file_bind_mounted_over_a_name_in_the_tree") {
+        return;
+    }
+    // Attack: a file bind-mounted over a name the walk would unlink, by name
+    // or inside a directory it empties. A mount whose root is a file is still
+    // a mount: the walk refuses it as an escape and nothing goes.
+    let box_dir = format!("{FILE_TREE}/box");
+    let over = format!("{box_dir}/over");
+    assert!(Path::new(&over).is_file(), "the lane did not mount {over}");
+    for path in [&over, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    for (relative, recursive) in [(&b"box/over"[..], false), (b"box", true)] {
+        let mut request = request(relative, recursive);
+        request.under = FILE_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&over).unwrap(), b"bound over");
+    assert!(Path::new(&box_dir).is_dir());
 }
