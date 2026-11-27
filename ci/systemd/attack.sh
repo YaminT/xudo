@@ -834,18 +834,24 @@ EOF
 as_operator() { capture su -s /bin/sh -c "$1" xudotest; }
 # as_admin <command>: xudotest on a pty, typing the password at each prompt,
 # in a system unit of its own, so root's ancestor walk ends at pid 1 and not
-# at this script's `docker exec` (a bare `/`, which root refuses). The status
-# is the command's, printed last as rc=.
+# at this script's `docker exec` (a bare `/`, which root refuses). Its output
+# and status go to files as well, because `su --pty` can drop the last bytes
+# of its pty when the command exits; hout is the transcript (the prompt)
+# and the output, hrc the command's status.
 as_admin() {
-    printf '%s\necho "rc=$?"\n' "$1" >"$e7/admin"
+    printf '{ %s; echo "$?" >%s; } 2>&1 | tee %s\n' "$1" "$e7/admin.rc" "$e7/admin.out" >"$e7/admin"
     chmod 0644 "$e7/admin"
+    for f in admin.rc admin.out; do
+        install -m 0644 -o xudotest -g xudotest /dev/null "$e7/$f"
+    done
     set +e
     timeout 180 systemd-run --quiet --wait --pipe --collect \
         expect /opt/exec.exp "su --pty" pw "sh $e7/admin" </dev/null >/var/tmp/e7-admin.raw 2>&1
     set -e
-    hout=$(tr -d '\r' </var/tmp/e7-admin.raw |
+    hout="$(tr -d '\r' </var/tmp/e7-admin.raw |
         sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b\][^\x1b]*\x1b\\//g')
-    hrc=$(printf '%s\n' "$hout" | sed -n 's/^rc=//p' | tail -n 1)
+$(cat "$e7/admin.out")"
+    hrc=$(cat "$e7/admin.rc")
 }
 # token_of <output>: the token the review printed in its sudo line.
 token_of() { printf '%s\n' "$1" | sed -n 's/^  sudo xudo rules [a-z]*.* --reviewed \([0-9a-f]*\) .*/\1/p'; }
@@ -1066,7 +1072,7 @@ else
     bad "$case_name"
     rules_now >&2
 fi
-rm -f "$admin_sudoers" "$e7/admin" "$e7/out-of-box" /var/tmp/e7-admin.raw
+rm -f "$admin_sudoers" "$e7/admin" "$e7/admin.rc" "$e7/admin.out" "$e7/out-of-box" /var/tmp/e7-admin.raw
 rm -rf "$pack_dir"
 rm -f /run/xudo/req/*
 
