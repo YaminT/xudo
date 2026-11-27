@@ -11289,6 +11289,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             sid,
             tty,
             comm: b"xudo".to_vec(),
+            hints: xudo_sys::CallerHints::unavailable(),
             diverged: false,
             pinned: true,
             cgroup_id: None,

@@ -944,6 +944,21 @@ the command line,
 .BR /proc/ pid /exe ,
 and process ancestry are unauthenticated hints.
 They are recorded.
+The broker and the gate write the requester's
+.BR comm ,
+.BR exe ,
+command line (at most 512 bytes) and whether it set
+.B CLAUDECODE
+(at most 32 bytes of the value, and nothing else of the environment) into
+every audit record as
+.BR hint_comm ,
+.BR hint_exe ,
+.B hint_cmdline
+and
+.BR hint_claudecode ,
+escaped, or
+.B unavailable
+when they could not be read from the pinned process.
 Authorization does not branch on them.
 An unattested caller takes the human path and is asked for a password.
 .PP

@@ -780,6 +780,7 @@ mod tests {
             sid: 1,
             tty: 0,
             comm: b"xudo".to_vec(),
+            hints: xudo_sys::CallerHints::unavailable(),
             diverged: false,
             pinned: true,
             cgroup_id: None,

@@ -295,6 +295,7 @@ args = [
             sid: 1,
             tty: 0,
             comm: b"xudo".to_vec(),
+            hints: xudo_sys::CallerHints::unavailable(),
             diverged: false,
             pinned,
             cgroup_id: None,
@@ -390,6 +391,121 @@ args = [
             .collect();
         assert!(classes.iter().all(|class| *class == classes[0]));
         assert_eq!(classes[0].enrolled_agent_id(), Some("codex"));
+    }
+
+    /// Classification and decisions for one peer, over requests that a
+    /// harness rule, a plain rule and no rule answer.
+    fn decisions_for(peer: &PeerIdentity) -> Vec<(CallerFacts, Decision)> {
+        const PASSWD: &str = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n";
+        let rules = format!(
+            "{RULES}\n[[action]]\nid = \"xudo.pkg.upgrade\"\ntier = \"diag-read\"\n\
+             exe = \"/usr/bin/true\"\nargs = [{{ name = \"verb\", matcher = {{ literal = \
+             \"upgrade\" }} }}]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n"
+        );
+        let policy = policy_of(&rules);
+        let registry = test_registry();
+        let facts = classify_with_registry(peer, &registry, PASSWD);
+        [
+            ask("/usr/bin/systemctl", &["restart", "nginx.service"]),
+            ask("/usr/bin/true", &["upgrade"]),
+            ask("/usr/bin/id", &[]),
+        ]
+        .iter()
+        .map(|request| (facts.clone(), decide(&policy, &facts, request)))
+        .collect()
+    }
+
+    /// The three kinds of peer: a harness in its scope, a human outside the
+    /// slice, and a recordless process in the slice.
+    fn peer_kinds() -> Vec<PeerIdentity> {
+        let registry = test_registry();
+        let mut harness = identity(true);
+        harness.cgroup_id = Some(77);
+        harness.cgroup_attestation = CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
+            kind: xudo_sys::ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: test_record(&registry, "codex"),
+        });
+        let mut human = identity(true);
+        human.cgroup_attestation = CgroupAttestation::Outside;
+        let mut recordless = identity(true);
+        recordless.cgroup_attestation = CgroupAttestation::Recordless;
+        vec![harness, human, recordless]
+    }
+
+    fn with_hints(
+        base: &PeerIdentity,
+        comm: &[u8],
+        exe: &[u8],
+        cmd: &[u8],
+        env: &[u8],
+    ) -> PeerIdentity {
+        let mut peer = base.clone();
+        peer.comm = comm.to_vec();
+        peer.hints = xudo_sys::CallerHints::from_reads(Some(exe), Some(cmd), Some(env));
+        peer
+    }
+
+    /// One row of hints: `comm`, `exe`, `cmdline`, `environ`.
+    type HintRow<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+    #[test]
+    fn hints_never_change_a_decision() {
+        // Every value a harness would show, and a few that pose as fields:
+        // the decision is the no-hint baseline's for every kind of peer.
+        let table: [HintRow<'_>; 5] = [
+            (
+                b"claude",
+                b"/usr/bin/claude",
+                b"claude\0",
+                b"CLAUDECODE=1\0",
+            ),
+            (
+                b"codex",
+                b"/usr/lib/xudo/harness/codex",
+                b"codex\0exec\0",
+                b"CLAUDECODE=0\0",
+            ),
+            (
+                b"xudo-agent@codex",
+                b"/home/agent/.local/bin/claude",
+                b"node\0claude\0",
+                b"AI_AGENT=1\0",
+            ),
+            (
+                b"via=harness",
+                b"/usr/bin/xudo (deleted)",
+                b"via=harness\0",
+                b"CLAUDECODE=\0",
+            ),
+            (b"", b"", b"", b""),
+        ];
+        for base in peer_kinds() {
+            let baseline = decisions_for(&base);
+            assert_eq!(base.hints, xudo_sys::CallerHints::unavailable());
+            for (comm, exe, cmd, env) in table {
+                let peer = with_hints(&base, comm, exe, cmd, env);
+                assert_eq!(decisions_for(&peer), baseline, "{comm:?} {exe:?}");
+            }
+        }
+        // The baseline is not trivially one answer for everyone.
+        let kinds: Vec<_> = peer_kinds().iter().map(decisions_for).collect();
+        assert_ne!(kinds[0], kinds[1]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn hints_never_change_a_decision_for_any_bytes(
+            kind in 0usize..3,
+            comm in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..16),
+            exe in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            cmd in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            env in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            let base = peer_kinds().swap_remove(kind);
+            let peer = with_hints(&base, &comm, &exe, &cmd, &env);
+            proptest::prop_assert_eq!(decisions_for(&peer), decisions_for(&base));
+        }
     }
 
     #[test]

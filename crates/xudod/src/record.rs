@@ -189,6 +189,7 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
         // with reads as itself and cannot pose as another field.
         format!("hint_comm={}", identity.comm.escape_ascii()),
     ];
+    evidence.extend(identity.hints.evidence());
     if let Some(id) = identity.cgroup_id {
         evidence.push(format!("cgroup_id={id}"));
     }
@@ -242,6 +243,7 @@ mod tests {
             sid: 1,
             tty: 0,
             comm: b"xudo".to_vec(),
+            hints: xudo_sys::CallerHints::unavailable(),
             diverged: false,
             pinned: true,
             cgroup_id,
@@ -511,11 +513,76 @@ mod tests {
         let mut peer = identity(None);
         peer.comm = b"via=harness\x1b[2J\n\xff".to_vec();
         let evidence = identity_evidence(&peer);
-        assert_eq!(
-            evidence.last().unwrap(),
-            "hint_comm=via=harness\\x1b[2J\\n\\xff"
+        assert!(
+            evidence.contains(&"hint_comm=via=harness\\x1b[2J\\n\\xff".to_owned()),
+            "{evidence:?}"
         );
         assert!(!evidence.iter().any(|line| line.starts_with("via=")));
+    }
+
+    #[test]
+    fn the_peers_exe_cmdline_and_claudecode_are_recorded_as_hints_on_decisions_and_refusals() {
+        let mut peer = identity(None);
+        peer.hints = xudo_sys::CallerHints::from_reads(
+            Some(b"/usr/bin/claude"),
+            Some(b"claude\0-p\0"),
+            Some(b"PATH=/bin\0CLAUDECODE=1\0"),
+        );
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let decided = decided(
+            None,
+            &decision,
+            &caller(),
+            &peer,
+            &request(),
+            &generation(),
+            None,
+        );
+        let refusal = Refusal::client(RefusalCode::RequestUnknown, "x");
+        let refused = refused(None, &refusal, Some(&peer), None);
+        for record in [decided, refused] {
+            for line in peer.hints.evidence() {
+                assert!(record.evidence.contains(&line), "{line}");
+            }
+            assert!(
+                record
+                    .evidence
+                    .contains(&"hint_claudecode=\"1\"".to_owned()),
+                "{:?}",
+                record.evidence
+            );
+            assert!(!record.evidence.iter().any(|line| line.contains("PATH=")));
+        }
+    }
+
+    #[test]
+    fn a_hostile_peers_hints_cannot_swell_a_record_toward_the_limit() {
+        // Every byte the worst kind (escaped to four, then JSON-escaped), and
+        // far longer than any cap: the hints add under 8 KiB to the record.
+        let junk = vec![0xff_u8; 1 << 20];
+        let mut environ = b"CLAUDECODE=".to_vec();
+        environ.extend(&junk);
+        let mut peer = identity(None);
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let size = |peer: &PeerIdentity| {
+            decided(
+                None,
+                &decision,
+                &caller(),
+                peer,
+                &request(),
+                &generation(),
+                None,
+            )
+            .to_jsonl()
+            .len()
+        };
+        let plain = size(&peer);
+        peer.hints = xudo_sys::CallerHints::from_reads(Some(&junk), Some(&junk), Some(&environ));
+        let hostile = size(&peer);
+        assert!(hostile > plain + 4096, "{plain} -> {hostile}");
+        assert!(hostile - plain < 8 * 1024, "{plain} -> {hostile}");
+        assert!(hostile < xudo_audit::MAX_RECORD_BYTES);
     }
 
     #[test]

@@ -44,6 +44,7 @@
 pub mod audit;
 #[cfg(any(target_os = "linux", test))]
 mod beneath;
+pub mod caller_hints;
 pub mod cgroup;
 pub mod clock;
 pub mod connection;
@@ -79,6 +80,7 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
+pub use caller_hints::{CallerHints, pinned_hints};
 pub use cgroup::{
     CgroupCalls, CgroupIdentity, CgroupRung, HostCgroup, ProcessSecurityStatus, RecordIdentity,
     SERVICE_RECORD_PREFIX, Scope, ScopeFacts, ScopeKind, is_record_name,

@@ -45,10 +45,10 @@
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use xudo_sys::{
-    Attestation, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo, ProcFile,
-    Scope, ScopeKind, SysError, Syscalls, is_identity_uid_map, lacks_peer_pidfd, lacks_pidfd_info,
-    lacks_pidfd_open, parse_nspid_count, parse_stat, parse_status_euid, peer_cgroup_id,
-    peer_was_reaped, process_is_gone, scope_status,
+    Attestation, CallerHints, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo,
+    ProcFile, Scope, ScopeKind, SysError, Syscalls, is_identity_uid_map, lacks_peer_pidfd,
+    lacks_pidfd_info, lacks_pidfd_open, parse_nspid_count, parse_stat, parse_status_euid,
+    peer_cgroup_id, peer_was_reaped, process_is_gone, scope_status,
 };
 
 /// Kernel-derived cgroup result retained for classification and audit.
@@ -91,6 +91,11 @@ pub struct PeerIdentity {
     /// gave itself. An unauthenticated hint (invariant 1), recorded in the
     /// audit trail and never read by a decision.
     pub comm: Vec<u8>,
+    /// Its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd held it:
+    /// unauthenticated hints like `comm`, recorded and never decided on.
+    /// `unavailable` on the rung with no pidfd, where a read by number could
+    /// be another process's.
+    pub hints: CallerHints,
     /// Whether namespace facts diverge from the broker's identity namespace.
     pub diverged: bool,
     /// Whether a pidfd held the process while `/proc` was read and the
@@ -323,6 +328,12 @@ fn identify_inner(
         });
     }
 
+    // Hints are read last by number, so the re-check below covers them too.
+    let hints = match &pin {
+        Some(_) => peer_hints(cred.pid, peers),
+        None => CallerHints::unavailable(),
+    };
+
     // After the last read of /proc by number, and not before.
     if let Some((pidfd, _)) = &pin {
         confirm_unreaped(pidfd.as_fd(), peers)?;
@@ -348,6 +359,7 @@ fn identify_inner(
         sid: stat.session,
         tty: stat.tty_nr,
         comm: stat.comm,
+        hints,
         diverged: namespaces,
         pinned: pin.is_some(),
         cgroup_id: cgroup_result
@@ -478,6 +490,15 @@ fn namespace_facts(pid: u32, peers: &dyn PeerCalls, status: Option<&[u8]>) -> bo
         .read_proc(pid, ProcFile::UidMap)
         .is_ok_and(|bytes| is_identity_uid_map(&bytes));
     nested_pid || !identity_uid
+}
+
+/// The peer's hints. A file that cannot be read is `unavailable` and never
+/// fails identification: nothing decides on a hint.
+fn peer_hints(pid: u32, peers: &dyn PeerCalls) -> CallerHints {
+    let exe = peers.read_proc(pid, ProcFile::Exe).ok();
+    let cmdline = peers.read_proc(pid, ProcFile::Cmdline).ok();
+    let environ = peers.read_proc(pid, ProcFile::Environ).ok();
+    CallerHints::from_reads(exe.as_deref(), cmdline.as_deref(), environ.as_deref())
 }
 
 /// Confirms, through the pidfd, that the pinned process has not exited.
@@ -699,7 +720,19 @@ mod tests {
             .with_stat(Ok(stat(PID, START)))
             .with_status(Ok(status(UID)))
             .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/xudo".to_vec())
+            .with_proc(PID, ProcFile::Cmdline, b"xudo\0exec\0".to_vec())
+            .with_proc(PID, ProcFile::Environ, b"CLAUDECODE=1\0".to_vec())
             .with_exit(Ok(false))
+    }
+
+    /// What [`honest_peer`]'s hint files render as.
+    fn honest_hints() -> CallerHints {
+        CallerHints::from_reads(
+            Some(b"/usr/bin/xudo"),
+            Some(b"xudo\0exec\0"),
+            Some(b"CLAUDECODE=1\0"),
+        )
     }
 
     fn namespace_peer(status: Vec<u8>, uid_map: Option<&[u8]>) -> FakePeer {
@@ -871,6 +904,7 @@ mod tests {
                 sid: 1,
                 tty: 0,
                 comm: b"xudo".to_vec(),
+                hints: honest_hints(),
                 diverged: false,
                 pinned: true,
                 cgroup_id: Some(77),
@@ -887,6 +921,9 @@ mod tests {
                 PeerCall::ReadProc(PID, ProcFile::Stat),
                 PeerCall::ReadProc(PID, ProcFile::Status),
                 PeerCall::ReadProc(PID, ProcFile::UidMap),
+                PeerCall::ReadProc(PID, ProcFile::Exe),
+                PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                PeerCall::ReadProc(PID, ProcFile::Environ),
                 PeerCall::HasExited,
             ]
         );
@@ -919,6 +956,9 @@ mod tests {
                     PeerCall::ReadProc(PID, ProcFile::Stat),
                     PeerCall::ReadProc(PID, ProcFile::Status),
                     PeerCall::ReadProc(PID, ProcFile::UidMap),
+                    PeerCall::ReadProc(PID, ProcFile::Exe),
+                    PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                    PeerCall::ReadProc(PID, ProcFile::Environ),
                     PeerCall::HasExited,
                 ],
                 "the re-check must follow the last /proc read"
@@ -944,6 +984,9 @@ mod tests {
                 PeerCall::ReadProc(PID, ProcFile::Stat),
                 PeerCall::ReadProc(PID, ProcFile::Status),
                 PeerCall::ReadProc(PID, ProcFile::UidMap),
+                PeerCall::ReadProc(PID, ProcFile::Exe),
+                PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                PeerCall::ReadProc(PID, ProcFile::Environ),
                 PeerCall::HasExited,
             ]
         );
@@ -983,6 +1026,66 @@ mod tests {
             !peers.calls().contains(&PeerCall::HasExited),
             "there is no pidfd to re-check through"
         );
+    }
+
+    #[test]
+    fn an_unpinned_peer_records_no_hints_read_by_its_number() {
+        // No pidfd: the number may name another process by the time its exe,
+        // cmdline or environ is read, so none of them is read at all.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/claude".to_vec())
+            .with_proc(PID, ProcFile::Environ, b"CLAUDECODE=1\0".to_vec());
+        let identity = identify(sock.as_fd(), &FakeSyscalls::new(), &peers).unwrap();
+        assert_eq!(identity.hints, CallerHints::unavailable());
+        for file in [ProcFile::Exe, ProcFile::Cmdline, ProcFile::Environ] {
+            assert!(!peers.calls().contains(&PeerCall::ReadProc(PID, file)));
+        }
+    }
+
+    #[test]
+    fn a_peer_whose_hint_files_cannot_be_read_is_identified_all_the_same() {
+        // A hint that cannot be read is `unavailable`; it never refuses.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
+            .with_exit(Ok(false));
+        let identity = identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers).unwrap();
+        assert!(identity.pinned);
+        assert_eq!(identity.hints, CallerHints::unavailable());
+    }
+
+    #[test]
+    fn a_peer_that_exits_while_its_hints_are_read_is_refused() {
+        // The hints are read before the pidfd re-check, so a number reissued
+        // during those reads cannot lend another process's hints to a record.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/claude".to_vec())
+            .with_exit(Ok(true));
+        assert_eq!(
+            identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers),
+            Err(IdentifyError::Exited)
+        );
+        let calls = peers.calls();
+        let exe = calls
+            .iter()
+            .position(|c| *c == PeerCall::ReadProc(PID, ProcFile::Exe))
+            .unwrap();
+        let recheck = calls
+            .iter()
+            .position(|c| *c == PeerCall::HasExited)
+            .unwrap();
+        assert!(exe < recheck, "{calls:?}");
     }
 
     #[test]

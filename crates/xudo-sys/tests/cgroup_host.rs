@@ -71,7 +71,7 @@ impl PeerCalls for FakePeer {
         Ok(match file {
             ProcFile::Stat => self.stat.clone(),
             ProcFile::Status => self.status.clone(),
-            ProcFile::UidMap => Vec::new(),
+            ProcFile::UidMap | ProcFile::Exe | ProcFile::Cmdline | ProcFile::Environ => Vec::new(),
         })
     }
     fn has_exited(&self, _: BorrowedFd<'_>) -> Result<bool, SysError> {

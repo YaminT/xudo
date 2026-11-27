@@ -397,28 +397,32 @@ else
     bad "$case_name"
     printf '%s\n' "$hout" >&2
 fi
-# The broker records the requester's comm as a hint (`hint_comm=`) and
-# decides without it: a copy of xudo named `claude`, asked from the impostor
-# and from the real harness, is recorded under that name and classified as
+# The broker records the requester's comm, exe and CLAUDECODE as hints
+# (`hint_comm=`, `hint_exe=`, `hint_claudecode=`) and decides without them: a
+# copy of xudo named `claude`, asked from the impostor (CLAUDECODE=1) and from
+# the real harness, is recorded under that name and path and classified as
 # before, human and harness.
 install -m 0755 /usr/bin/xudo "$e7/claude"
-# hints_since <mark>: classification, decision and hint of each broker record.
+# hints_since <mark>: classification, decision and the comm, exe and
+# CLAUDECODE hints of each broker record (the ones with `hint_comm=`; the
+# gate's records carry the other hints too).
 hints_since() {
     tail -n +"$(($1 + 1))" "$audit" | python3 -c '
 import json, sys
 for line in sys.stdin:
     r = json.loads(line)
-    hints = [e for e in r["evidence"] if e.startswith("hint_")]
-    if hints:
-        print(r["classification"], r["decision"], " ".join(hints))
+    hints = {e.split("=", 1)[0]: e for e in r["evidence"] if e.startswith("hint_")}
+    if "hint_comm" in hints:
+        print(r["classification"], r["decision"], " ".join(
+            hints.get(k, k + "=missing") for k in ("hint_comm", "hint_exe", "hint_claudecode")))
 '
 }
 mark=$(trail_len)
 as_harness e7-lane hint-human "$e7/claude exec -- $gate_exe -un"
 claude_trail=$(hints_since "$mark")
 human_path an_impostor_named_claude_is_human human
-case_name=an_impostors_comm_is_recorded_as_a_hint_and_not_trusted
-if [ "$claude_trail" = "human allowed hint_comm=claude" ]; then
+case_name=an_impostors_comm_exe_and_claudecode_are_recorded_and_not_trusted
+if [ "$claude_trail" = "human allowed hint_comm=claude hint_exe=\"$e7/claude\" hint_claudecode=\"1\"" ]; then
     good "$case_name"
 else
     bad "$case_name"
@@ -427,14 +431,19 @@ fi
 mark=$(trail_len)
 as_harness lane hint-harness "$e7/claude exec -- $gate_exe -un"
 case_name=a_harness_named_claude_is_still_only_its_scope
-if [ "$hrc" = 0 ] && has_root_line "$hout" &&
-    [ "$(hints_since "$mark")" = "enrolled-agent allowed hint_comm=claude" ] &&
+harness_trail=$(hints_since "$mark")
+case $harness_trail in
+"enrolled-agent allowed hint_comm=claude hint_exe=\"$e7/claude\" hint_claudecode="*) harness_hints=yes ;;
+*) harness_hints= ;;
+esac
+if [ "$hrc" = 0 ] && has_root_line "$hout" && [ -n "$harness_hints" ] &&
+    [ "$(printf '%s\n' "$harness_trail" | wc -l)" = 1 ] &&
     e7_trail "$mark" | grep -q '^enrolled-agent allowed - g1f.whoami gate_mode=Nopass via=harness'; then
     good "$case_name"
 else
     bad "$case_name"
     show "$case_name"
-    hints_since "$mark" >&2
+    printf '%s\n' "$harness_trail" >&2
 fi
 rm -f "$e7/claude"
 systemctl stop e7-impostor.service

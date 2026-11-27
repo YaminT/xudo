@@ -109,10 +109,10 @@ use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
 use xudo_sys::TrustedRulesError;
 use xudo_sys::{
-    Admission, AuditSink, Authorized, CgroupCalls, Clock, GateFiles, GateMode, HostClock,
-    HostGateFiles, HostHygiene, HostPeer, HostPrograms, HostRateLedger, HostSyscalls, Hygiene,
-    LedgerKey, PeerCalls, ProcRef, ProcSource, Program, Programs, RateLedger, Spool, SpoolDir,
-    SpoolError, Syscalls, VerifiedProc, authorize, lineage,
+    Admission, AuditSink, Authorized, CallerHints, CgroupCalls, Clock, GateFiles, GateMode,
+    HostClock, HostGateFiles, HostHygiene, HostPeer, HostPrograms, HostRateLedger, HostSyscalls,
+    Hygiene, LedgerKey, PeerCalls, ProcRef, ProcSource, Program, Programs, RateLedger, Spool,
+    SpoolDir, SpoolError, Syscalls, VerifiedProc, authorize, lineage, pinned_hints,
 };
 
 use crate::decide::{
@@ -854,6 +854,14 @@ fn proceed(
         passwd,
     );
     progress.caller = Some(caller.clone());
+    progress.evidence.extend(
+        requester_hints(
+            &*proc,
+            matched.as_ref().map(|found| found.caller),
+            &ancestors.chain,
+        )
+        .evidence(),
+    );
     progress.ledger_key = Some(match (&pending_entry_missing, ancestors.chain.get(1)) {
         // No entry: count by the real uid of `sudo`, the process that
         // authenticates, so one flood cannot fill every stranger's bucket.
@@ -1091,6 +1099,22 @@ fn args_first_escaped(args: &[OsString]) -> String {
 /// A process's pin.
 fn pin_of(process: &ProcRef) -> CallerPin {
     CallerPin::new(process.pid, process.starttime)
+}
+
+/// The hints of whoever asked: the requester the entry is pinned to, or
+/// `sudo`, the gate's parent, when no entry matched. Read by number and
+/// checked against the pin afterwards; recorded, never decided on
+/// (invariant 1).
+fn requester_hints(
+    proc: &dyn ProcSource,
+    matched: Option<CallerPin>,
+    chain: &[ProcRef],
+) -> CallerHints {
+    matched
+        .or_else(|| chain.get(1).map(pin_of))
+        .map_or_else(CallerHints::unavailable, |pin| {
+            pinned_hints(proc, pin.pid, pin.starttime)
+        })
 }
 
 /// A spool entry, and the process the walk matched it to.
@@ -2133,6 +2157,72 @@ args = [
         assert_eq!(records[1].outcome.kind(), "failed");
         let after = &records[1].evidence;
         assert!(has_line(after, "authorization_seq=1"), "{after:?}");
+    }
+
+    #[test]
+    fn the_gate_records_the_requesters_hints_and_decides_as_without_them() {
+        let outcome = |proc: MapSource| {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc);
+            let exit = run(&mut host, &auth());
+            let records = host.audit.records();
+            let decisions: Vec<_> = records.iter().map(|r| r.decision).collect();
+            (
+                exit.status,
+                exit.message,
+                decisions,
+                records[0].evidence.clone(),
+            )
+        };
+        let (status, message, decisions, plain) = outcome(proc_tree());
+        assert!(has_line(&plain, "hint_exe=unavailable"), "{plain:?}");
+        // The requester (200) looks like a harness in every way it can choose.
+        let posing = proc_tree()
+            .with_link("200/exe", "/usr/bin/claude")
+            .with("200/cmdline", "claude\0--dangerously-skip-permissions\0")
+            .with("200/environ", "CLAUDECODE=1\0AI_AGENT=claude\0");
+        let (status2, message2, decisions2, hinted) = outcome(posing);
+        assert_eq!(
+            (status2, message2, decisions2),
+            (status, message, decisions)
+        );
+        for line in [
+            "hint_exe=\"/usr/bin/claude\"",
+            "hint_cmdline=\"claude\\x00--dangerously-skip-permissions\"",
+            "hint_claudecode=\"1\"",
+        ] {
+            assert!(hinted.contains(&line.to_owned()), "{line} in {hinted:?}");
+        }
+        assert!(!hinted.iter().any(|line| line.contains("AI_AGENT")));
+    }
+
+    #[test]
+    fn the_gate_reads_hints_of_the_entrys_requester_else_of_sudo_else_none() {
+        let tree = proc_tree()
+            .with_link("200/exe", "/usr/bin/xudo")
+            .with_link("400/exe", "/usr/bin/sudo");
+        let chain = lineage(&tree, 500, LINEAGE_PROCESSES).unwrap().chain;
+        let exe_of = |hints: CallerHints| hints.evidence()[0].clone();
+        let requester = Some(CallerPin::new(200, XUDO_START));
+        assert_eq!(
+            exe_of(requester_hints(&tree, requester, &chain)),
+            "hint_exe=\"/usr/bin/xudo\""
+        );
+        assert_eq!(
+            exe_of(requester_hints(&tree, None, &chain)),
+            "hint_exe=\"/usr/bin/sudo\""
+        );
+        assert_eq!(
+            requester_hints(&tree, None, &chain[..1]),
+            CallerHints::unavailable()
+        );
+        // A pin whose start time is no longer the process's: someone else's.
+        let recycled = Some(CallerPin::new(200, XUDO_START + 1));
+        assert_eq!(
+            requester_hints(&tree, recycled, &chain),
+            CallerHints::unavailable()
+        );
     }
 
     #[test]

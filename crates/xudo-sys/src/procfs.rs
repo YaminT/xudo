@@ -72,6 +72,10 @@ impl ProcSource for VerifiedProc {
     fn file_identity(&self, relative: &str) -> Result<crate::FileId, SysError> {
         imp::file_identity(self, relative)
     }
+
+    fn read_link(&self, relative: &str) -> Result<Vec<u8>, SysError> {
+        imp::read_link(self, relative)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -175,6 +179,14 @@ mod imp {
         .map_err(|errno| failed(relative, errno))
     }
 
+    /// The link's text, read from the pinned descriptor and never followed.
+    pub(super) fn read_link(proc: &VerifiedProc, relative: &str) -> Result<Vec<u8>, SysError> {
+        check_relative(relative)?;
+        rustix::fs::readlinkat(&proc.root, relative, Vec::new())
+            .map(std::ffi::CString::into_bytes)
+            .map_err(|errno| failed(relative, errno))
+    }
+
     fn read_bounded(fd: OwnedFd, at: &str) -> Result<Vec<u8>, SysError> {
         let mut bytes = Vec::new();
         std::fs::File::from(fd)
@@ -206,6 +218,12 @@ mod imp {
     }
 
     pub(super) fn namespace_inode(_proc: &VerifiedProc, relative: &str) -> Result<u64, SysError> {
+        Err(SysError::unsupported(format!(
+            "reading {relative} from procfs"
+        )))
+    }
+
+    pub(super) fn read_link(_proc: &VerifiedProc, relative: &str) -> Result<Vec<u8>, SysError> {
         Err(SysError::unsupported(format!(
             "reading {relative} from procfs"
         )))
@@ -245,6 +263,8 @@ mod tests {
         let err = proc.namespace_inode("1/ns/user").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
         let err = proc.file_identity("self/exe").unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+        let err = proc.read_link("1/exe").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
         assert!(format!("{proc:?}").contains("VerifiedProc"));
     }
@@ -342,6 +362,21 @@ mod tests {
                 assert!(proc.file_identity(bad).is_err(), "{bad:?}");
             }
             assert!(proc.file_identity("4194999/exe").is_err());
+        }
+
+        #[test]
+        fn an_exe_link_is_read_as_its_text_through_the_verified_handle() {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let proc = VerifiedProc::open().unwrap();
+            let own = std::process::id();
+            let text = proc.read_link(&format!("{own}/exe")).unwrap();
+            let want = std::fs::read_link(format!("/proc/{own}/exe")).unwrap();
+            assert_eq!(text, want.as_os_str().as_bytes());
+            for bad in ["", "/proc/self/exe", "self/../self/exe"] {
+                assert!(proc.read_link(bad).is_err(), "{bad:?}");
+            }
+            assert!(proc.read_link("4194999/exe").is_err());
         }
 
         #[test]

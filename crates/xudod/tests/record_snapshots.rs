@@ -33,6 +33,11 @@ fn identity() -> PeerIdentity {
         sid: 1,
         tty: 0,
         comm: b"xudo".to_vec(),
+        hints: xudo_sys::CallerHints::from_reads(
+            Some(b"/usr/bin/xudo"),
+            Some(b"xudo\0exec\0--\0/usr/bin/id\0"),
+            Some(b"HOME=/home/alice\0CLAUDECODE=1\0"),
+        ),
         diverged: true,
         pinned: true,
         cgroup_id: Some(77),
