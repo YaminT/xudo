@@ -9,6 +9,19 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
+# Never outside the lane's throwaway container: this installs a package,
+# creates an account with a known password, puts it in group xudo and edits
+# sudo's configuration. systemd-detect-virt --container alone also passes on
+# WSL, LXC and distrobox, so ci/systemd/run.sh writes a sentinel inside the
+# container it started, and this refuses without it.
+lane_sentinel=/xudo-systemd-lane
+[ -f "$lane_sentinel" ] && [ ! -L "$lane_sentinel" ] && [ "$(stat -c %u "$lane_sentinel")" = 0 ] &&
+    [ "$(cat "$lane_sentinel")" = "xudo systemd lane: a throwaway container made by ci/systemd/run.sh" ] &&
+    systemd-detect-virt --container -q || {
+    echo "FAIL: not inside the systemd lane's container ($lane_sentinel is not run.sh's); refusing to touch this machine" >&2
+    exit 1
+}
+
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }
 good() { echo "PASS: $*"; }

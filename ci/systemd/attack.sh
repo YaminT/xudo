@@ -17,8 +17,11 @@
 
 # Never outside the throwaway container: this mounts, starts sshd, and
 # deletes a home.
-systemd-detect-virt --container -q || {
-    bad "e7: not inside a container; refusing to run the attack rows"
+lane_sentinel=/xudo-systemd-lane
+[ -f "$lane_sentinel" ] && [ ! -L "$lane_sentinel" ] && [ "$(stat -c %u "$lane_sentinel")" = 0 ] &&
+    [ "$(cat "$lane_sentinel")" = "xudo systemd lane: a throwaway container made by ci/systemd/run.sh" ] &&
+    systemd-detect-virt --container -q || {
+    bad "e7: not inside the systemd lane's container (no run.sh sentinel); refusing to run the attack rows"
     return 1
 }
 

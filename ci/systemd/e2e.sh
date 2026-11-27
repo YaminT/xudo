@@ -15,8 +15,11 @@
 
 # Never outside the throwaway container: this purges the package, deletes
 # accounts and turns the passwordless agent path on.
-systemd-detect-virt --container -q || {
-    bad "e2e: not inside a container; refusing to run the journey"
+lane_sentinel=/xudo-systemd-lane
+[ -f "$lane_sentinel" ] && [ ! -L "$lane_sentinel" ] && [ "$(stat -c %u "$lane_sentinel")" = 0 ] &&
+    [ "$(cat "$lane_sentinel")" = "xudo systemd lane: a throwaway container made by ci/systemd/run.sh" ] &&
+    systemd-detect-virt --container -q || {
+    bad "e2e: not inside the systemd lane's container (no run.sh sentinel); refusing to run the journey"
     return 1
 }
 
