@@ -4,7 +4,8 @@
 # The unit files are the ones the package shipped. This script does not edit them.
 # grant.sh, sourced near the end, proves the passwordless grant through a live
 # enrolled unit; it alone writes a NOPASSWD line, and deletes it again. It
-# sources attack.sh, E7's rows that try every way around that grant.
+# sources attack.sh, E7's rows that try every way around that grant. e2e.sh,
+# sourced last, walks an operator's whole journey with the real installer.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -766,6 +767,10 @@ if [ ! -e /etc/sudoers.d/xudo ] && [ ! -L /etc/sudoers.d/xudo ]; then
 else
     bad "sudoers rule still present"
 fi
+
+# The operator's whole journey, with the real `xudo install --agent-path` and
+# no lane-only line (E9). It purges what the rows above left first.
+. /harness/e2e.sh
 
 if [ "$fail" -ne 0 ]; then
     echo "row: FAILED"
