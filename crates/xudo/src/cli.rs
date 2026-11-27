@@ -45,15 +45,16 @@ pub enum Format {
     Json,
 }
 
-/// Linux privilege broker. This beta uses the human password path.
+/// Linux privilege broker for rules-controlled commands and verified service harnesses.
 #[derive(Debug, Parser)]
 #[command(
     name = "xudo",
     version = concat!(env!("CARGO_PKG_VERSION"), " (beta, not externally audited)"),
-    about = "Linux privilege broker; this beta uses the human password path",
-    long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
-                  password-authenticated path through the host backend. The passwordless \
-                  agent path is off unless root runs `xudo install --agent-path`."
+    about = "Linux privilege broker; passwordless harness execution is opt-in",
+    long_about = "xudo checks requests against root-owned rules. Human requests use the \
+                  password-authenticated path through the host backend. A verified, \
+                  registered service harness may use an exact rule without a password \
+                  only when root has enabled the agent path with `xudo install --agent-path`."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -159,7 +160,7 @@ pub struct CheckArgs {
 /// A typed operation `xudo` performs itself.
 #[derive(Debug, Subcommand)]
 pub enum OpCommand {
-    /// Remove a path under a `remove-path` rule. Asks for your password.
+    /// Remove a path under a `remove-path` rule. A matching harness rule may allow it without a password.
     RemovePath {
         /// The absolute path to remove.
         target: OsString,
@@ -186,7 +187,7 @@ pub enum Command {
         argv: Vec<String>,
     },
 
-    /// Run a command as root, if the broker permits it. Asks for your password.
+    /// Run a command as root if the broker permits it. Human requests use the password path.
     Exec {
         /// Run one root-held queue entry. The broker re-decides it, then sudo asks.
         #[arg(
@@ -206,7 +207,7 @@ pub enum Command {
         argv: Vec<String>,
     },
 
-    /// Run a typed operation as root, if a rule permits it. Asks for your password.
+    /// Run a typed operation as root if a rule permits it. Human requests use the password path.
     Op {
         /// Which operation.
         #[command(subcommand)]
@@ -2900,9 +2901,8 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
 
     /// A platform that reports an attested agent.
     ///
-    /// No real platform can do this yet. It is here to cover the reporting
-    /// branch for the day one can, and to prove the renderer does not assume
-    /// every caller needs a password.
+    /// The fake platform reports a verified harness to cover the reporting
+    /// branch and prove the renderer distinguishes it from a human caller.
     struct AttestingOps;
 
     impl PrivilegedOps for AttestingOps {
@@ -5653,12 +5653,19 @@ expect = "deny"
     }
 
     #[test]
-    fn the_help_text_describes_the_beta_password_path() {
+    fn the_help_text_describes_the_opt_in_agent_path() {
         let err = Cli::try_parse_from(["xudo", "--help"]).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("password-authenticated path"), "{text}");
         assert!(
-            text.contains("passwordless agent path is off unless root runs"),
+            text.contains("Human requests use the password-authenticated path"),
+            "{text}"
+        );
+        assert!(
+            text.contains("only when root has enabled the agent path"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("this beta uses the human password path"),
             "{text}"
         );
     }
@@ -5778,7 +5785,8 @@ expect = "deny"
             .expect(&out);
         let done = out.find("enrolled codex").expect(&out);
         assert!(diff < done, "{out}");
-        assert!(out.contains("It grants nothing"), "{out}");
+        assert!(out.contains("Enrollment adds no command rule"), "{out}");
+        assert!(out.contains("xudo install --agent-path"), "{out}");
         let asked = installer.agent.asked.borrow();
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert!(

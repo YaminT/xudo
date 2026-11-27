@@ -3,19 +3,23 @@
 //!
 //! The gate refuses with `NoPendingRequest` unless a root-minted entry exists
 //! under `/run/xudo/req`, so without this broker nothing `xudo` decides can be
-//! executed — the human path included. M2b's broker does exactly one job:
+//! executed — the human path included. For each connection it:
 //!
-//! 1. take one connection from systemd, as descriptor 0;
-//! 2. identify the peer from the kernel, by the attestation ladder;
-//! 3. classify it `Unattested` — there is no cgroup classification until M4,
-//!    so every caller takes the human path, with a password;
-//! 4. evaluate the request against root's ruleset, with the same function
+//! 1. takes the connection from systemd, as descriptor 0;
+//! 2. identifies the peer from the kernel, by the attestation ladder;
+//! 3. classifies the peer from kernel facts and the root registry. A live
+//!    service harness in a root-registered scope is an enrolled agent; every
+//!    other caller takes the password path;
+//! 4. evaluates the request against root's ruleset, with the same function
 //!    `xudo explain` uses;
-//! 5. on a permitted decision, mint the spool entry the gate reads;
-//! 6. answer with the decision and, if one was minted, the nonce, the deadline,
-//!    and the gate to run.
+//! 5. runs the optional human-path confirmation (`confirm_human_path`, off by
+//!    default) through `xudo watch`;
+//! 6. on a permitted decision, mints the spool entry the gate reads, and
+//!    answers with the decision and, if one was minted, the nonce, the
+//!    deadline, and the gate to run.
 //!
-//! No confirmation channel, no `freeze`, no cgroups: those are M3 and M4.
+//! In the design a verified harness never waits for a live approval: root's
+//! rules decide, and a command that needs a human goes to the `ido` queue.
 //!
 //! # Trust
 //!

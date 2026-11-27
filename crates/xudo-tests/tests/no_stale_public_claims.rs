@@ -1,4 +1,4 @@
-//! Public docs must describe the shipped M3 confirmation and telemetry check.
+//! Public docs must describe what ships, and no permanent claim of the old approval model.
 
 #![allow(clippy::unwrap_used)]
 
@@ -60,6 +60,67 @@ fn stale_probe_claim(text: &str) -> bool {
     gnu_id_workaround(&flat) || ubuntu_2604_near_not_verified(&flat)
 }
 
+/// Claims made obsolete by the service enrollment, broker queue, agent path,
+/// and reviewed rule packs shipped in beta.2.
+fn stale_shipped_feature_claim(text: &str) -> bool {
+    let flat = flatten_claim(text);
+    [
+        "every caller is unattested",
+        "no caller can be a registered agent",
+        "nothing in this release creates such a scope",
+        "empty until agents can be registered",
+        "enrollment is not built",
+        "enrolment is not built",
+        "rule packs are not built",
+        "rule packs are not in this release",
+        "passwordless agent path is not in this release",
+        "passwordless agent path is not yet shipped",
+        "does not enroll or authenticate agents",
+    ]
+    .iter()
+    .any(|claim| flat.contains(claim))
+}
+
+const STALE_PRIVILEGED_RUST_DOC_CLAIMS: [&str; 5] = [
+    "every caller is unattested",
+    "no caller is a verified harness",
+    "no caller can be a registered agent",
+    "every caller takes the human path",
+    "every caller takes the password path",
+];
+
+fn rust_doc_comments(text: &str) -> String {
+    let docs = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("//!")
+                .or_else(|| trimmed.strip_prefix("///"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    flatten_claim(&docs)
+}
+
+fn stale_privileged_rust_doc_claim(text: &str) -> bool {
+    let docs = rust_doc_comments(text);
+    STALE_PRIVILEGED_RUST_DOC_CLAIMS
+        .iter()
+        .any(|claim| docs.contains(claim))
+}
+
+fn rust_files(directory: &Path, found: &mut Vec<String>) {
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, found);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            found.push(path.display().to_string());
+        }
+    }
+}
+
 fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
     for entry in fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
@@ -75,12 +136,13 @@ fn markdown_and_html_files(directory: &Path, found: &mut Vec<String>) {
 }
 
 #[test]
-fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
+fn public_docs_do_not_claim_built_checks_or_features_are_absent() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = vec![
         "README.md".to_owned(),
         "SECURITY.md".to_owned(),
         "CHANGELOG.md".to_owned(),
+        "llms.txt".to_owned(),
     ];
     markdown_and_html_files(&root.join("site"), &mut files);
 
@@ -91,15 +153,13 @@ fn public_docs_do_not_claim_m3_or_strace_check_is_absent() {
             let text = fs::read_to_string(&path).unwrap();
             (stale_confirmation_claim(&text)
                 || stale_telemetry_claim(&text)
-                || stale_probe_claim(&text))
+                || stale_probe_claim(&text)
+                || (file != "CHANGELOG.md" && stale_shipped_feature_claim(&text)))
             .then(|| file.clone())
         })
         .collect();
 
-    assert!(
-        stale.is_empty(),
-        "stale public release claims in: {stale:?}"
-    );
+    assert!(stale.is_empty(), "stale public status claims in: {stale:?}");
 }
 
 #[test]
@@ -167,9 +227,9 @@ fn the_check_catches_stale_claims_and_allows_current_status() {
     assert!(stale_confirmation_claim(
         "Out-of-band confirmation is not in this beta."
     ));
-    assert!(!stale_confirmation_claim(
-        "Out-of-band confirmation is built and off by default. The passwordless path is not in this beta."
-    ));
+    let current_status = "Out-of-band confirmation is built and off by default. The passwordless path is built and off by default.";
+    assert!(!stale_confirmation_claim(current_status));
+    assert!(!stale_shipped_feature_claim(current_status));
     assert!(stale_confirmation_claim(
         "The passwordless path and out-of-band confirmation are not in this release."
     ));
@@ -234,4 +294,195 @@ fn stale_probe_claims_fail_the_old_readme_and_allow_current_wording() {
     ));
     assert_eq!(flatten_claim(""), "");
     assert_eq!(flatten_claim("GNU"), "gnu");
+}
+
+/// Words that make a password claim a statement about the current release.
+const RELEASE_QUALIFIERS: [&str; 6] = [
+    "beta",
+    "this release",
+    "today",
+    "currently",
+    "this build",
+    "for now",
+];
+
+/// Phrases of the approval model the owner replaced on 2026-11-16: the agent
+/// path is not confirmed live, and invariant 2 is no longer "never broader".
+const REPLACED_MODEL: [&str; 6] = [
+    "never broader than the human path",
+    "passwordless but confirmed",
+    "confirmation always",
+    "always confirmed",
+    "a human approves every",
+    "confirmation lives outside",
+];
+
+/// A sentence that states the old model, or says every request asks for a
+/// password as a permanent property instead of as this release's status.
+fn stale_approval_claim(text: &str) -> bool {
+    flatten_claim(text)
+        .split(['.', '!', '?', ';'])
+        .any(|sentence| {
+            let every_request_password = [
+                "every request",
+                "every privileged request",
+                "every invocation",
+                "always prompt",
+                "always asks",
+            ]
+            .iter()
+            .any(|phrase| sentence.contains(phrase))
+                && sentence.contains("password");
+            REPLACED_MODEL
+                .iter()
+                .any(|phrase| sentence.contains(phrase))
+                || (every_request_password
+                    && !RELEASE_QUALIFIERS
+                        .iter()
+                        .any(|qualifier| sentence.contains(qualifier)))
+        })
+}
+
+#[test]
+fn public_docs_describe_the_current_approval_model() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // CHANGELOG.md is excluded: shipped sections are history and say
+    // "Every request uses the human password path" about their own release.
+    let mut files = vec![
+        "README.md".to_owned(),
+        "SECURITY.md".to_owned(),
+        "howiwork.md".to_owned(),
+        "llms.txt".to_owned(),
+        "packaging/deb/first-install-notice".to_owned(),
+        "docs/man/xudo.1".to_owned(),
+        "docs/man/xudo-rules.5".to_owned(),
+        "docs/man/ido.1".to_owned(),
+        "docs/man/ido-queue.5".to_owned(),
+        "site/llms.txt".to_owned(),
+    ];
+    markdown_and_html_files(&root.join("site"), &mut files);
+    let stale: Vec<_> = files
+        .iter()
+        .filter(|file| {
+            let text = fs::read_to_string(root.join(file)).unwrap();
+            stale_approval_claim(&text) || stale_shipped_feature_claim(&text)
+        })
+        .cloned()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "replaced approval model stated in: {stale:?}"
+    );
+}
+
+#[test]
+fn privileged_rust_docs_do_not_make_stale_public_claims() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let crates = root.join("crates");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&crates).unwrap() {
+        let source = entry.unwrap().path().join("src");
+        if source.is_dir() {
+            rust_files(&source, &mut files);
+        }
+    }
+    let stale: Vec<_> = files
+        .iter()
+        .filter(|file| stale_privileged_rust_doc_claim(&fs::read_to_string(file).unwrap()))
+        .cloned()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "stale claims in Rust doc comments: {stale:?}"
+    );
+}
+
+#[test]
+fn rust_doc_comment_check_catches_stale_claims_and_allows_current_wording() {
+    assert!(stale_privileged_rust_doc_claim(
+        "//! every caller is Unattested; no caller is a verified harness in this release"
+    ));
+    assert!(stale_privileged_rust_doc_claim(
+        "/// every caller takes the\n/// password path"
+    ));
+    assert!(!stale_privileged_rust_doc_claim(
+        "//! The broker classifies the peer from kernel facts and the root registry.\n\
+         //! A live service harness in a root-registered scope is an enrolled agent;\n\
+         //! every other caller takes the password path."
+    ));
+    assert!(!stale_privileged_rust_doc_claim(
+        "// every caller is unattested\nfn internal() {}"
+    ));
+}
+
+#[test]
+fn public_docs_pin_correct_queue_freeze_session_and_audit_limits() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let how = fs::read_to_string(root.join("howiwork.md")).unwrap();
+    let security = fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let manual = fs::read_to_string(root.join("docs/man/xudo.1")).unwrap();
+    let queue_manual = fs::read_to_string(root.join("docs/man/ido.1")).unwrap();
+    let rules_manual = fs::read_to_string(root.join("docs/man/xudo-rules.5")).unwrap();
+
+    for text in [&how, &security, &queue_manual] {
+        let flat = flatten_claim(text);
+        assert!(flat.contains("can see its own entry"));
+        assert!(flat.contains("cannot edit, claim, release, or answer"));
+    }
+    for text in [&how, &security, &manual] {
+        let flat = flatten_claim(text);
+        assert!(flat.contains("root's thaw lifts every"));
+        assert!(flat.contains("same-uid watcher on another tty"));
+        assert!(flat.contains("no start command"));
+    }
+    assert!(flatten_claim(&how).contains("bounded, caller-controlled argv[0]"));
+    assert!(flatten_claim(&security).contains("bounded, caller-controlled argv[0]"));
+    assert!(how.contains("must set `owners`"));
+    assert!(how.contains("not a supported operation outcome"));
+    assert!(rules_manual.contains("must set"));
+    assert!(rules_manual.contains("not supported for operations"));
+}
+
+#[test]
+fn the_approval_check_catches_permanent_claims_and_allows_the_beta_status() {
+    assert!(stale_approval_claim("Every request asks for a password."));
+    assert!(stale_approval_claim(
+        "A human is always prompted for a password."
+    ));
+    assert!(stale_approval_claim(
+        "The agent path is never broader than the human path in authentication."
+    ));
+    assert!(stale_approval_claim(
+        "An enrolled agent is passwordless but confirmed."
+    ));
+    assert!(stale_approval_claim(
+        "Confirmation lives outside the requester's process tree."
+    ));
+    assert!(!stale_approval_claim(
+        "In this release every privileged request asks for a password."
+    ));
+    assert!(!stale_approval_claim(
+        "This beta always prompts for a password."
+    ));
+    assert!(!stale_approval_claim(
+        "Today's beta builds both the passwordless harness path and the human password path."
+    ));
+    assert!(!stale_approval_claim(
+        "A command runs without a password only for a verified harness."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "No caller can be a registered agent in this release."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "The passwordless agent path is not in this release."
+    ));
+    assert!(stale_shipped_feature_claim(
+        "The root-held queue is empty until agents can be registered."
+    ));
+    assert!(!stale_shipped_feature_claim(
+        "Session start and attach are not implemented in this beta."
+    ));
+    assert!(!stale_shipped_feature_claim(
+        "Passwordless execution is off by default and can be enabled by root."
+    ));
 }

@@ -1,4 +1,4 @@
-.TH XUDO 1 "2026-11-22" "xudo 0.1.0-beta.2" "User Commands"
+.TH XUDO 1 "2026-11-27" "xudo 0.1.0-beta.2" "User Commands"
 .SH NAME
 xudo \- decide whether a privileged command runs as root
 .SH SYNOPSIS
@@ -137,9 +137,11 @@ turns it on (see
 .BR install ).
 It never retries with a password, and it refuses that path under
 .BR doas .
-A service harness that no rule grants is refused with
-.B harness_not_granted
-and exit status 17: it has no password to type.
+A service harness can use a passwordless rule only when it is verified,
+registered, named by that rule, and the opt-in agent path is installed.
+An unmatched request is refused; a matching
+.B ask-human
+rule is queued for its separate reviewer.
 .PP
 This release is a beta and has not been externally audited.
 .SH OPTIONS
@@ -226,7 +228,9 @@ keys.
 .TP
 .B exec
 Run the command as root, if the broker permits it.
-Asks for your password through the host backend.
+Human requests use the password-authenticated host backend. A verified
+harness with a matching rule uses the passwordless gate only when the opt-in
+agent path is installed.
 The program is an absolute path, after
 .BR \-\- .
 The command's own status is the process status.
@@ -242,7 +246,8 @@ rule is stored by the broker in its root-held queue.
 claims that entry for a fresh decision against the current rules. The stored
 working directory is not used; the command runs in
 .BR / .
-Only a human reviewer who does not own the entry can claim it. The run uses
+The requester can see its own entry but cannot edit, claim, release, or answer
+it. Only a human reviewer who does not own the entry can claim it. The run uses
 the same scoped sudo rule as any other xudo authorization, so sudo asks for
 the password. Its
 .B timestamp_timeout=0
@@ -288,18 +293,29 @@ Freeze the agent path with an operator supplied reason. The scope is the
 caller's. A user's freeze stops only that user's own agents: it writes a
 marker named by the user's uid, and root's global freeze is untouched.
 Root's freeze is global and stops every user's agents. An attested agent
-cannot freeze, and neither can a peer in another user namespace. Until the
-passwordless agent path ships this sets the flag but changes nothing for new
-requests or for human requests: every caller is unattested, and the human password path
-stays available. Pending or approved requests of an enrolled agent in the
-freezer's scope (every user's, for root) are denied and audited, without a
+cannot freeze, and neither can a peer in another user namespace. The freeze
+stops new passwordless requests from enrolled agents in scope and denies their
+pending requests; human requests remain available. Pending or approved
+requests of an enrolled agent in the freezer's scope (every user's, for root) are denied and audited, without a
 backoff strike; a human's pending request is left alone.
+.PP
+The passwordless gate keeps a root-owned rate ledger under
+.IR /run/xudo/rate ,
+keyed by account and harness. Every invocation counts, including a refusal.
+It allows at most 60 invocations per minute and retains at most 600 stamps
+per hour. A request over either ceiling, or one the ledger cannot safely
+check, is refused. Over-ceiling audit records are coalesced.
 .TP
 .B thaw
-Lift the caller's own freeze and resume that scope. A user's thaw removes only
-the marker for their own uid: root's global freeze stays in force, and so does
-every other user's, until root lifts it. Root's thaw lifts the global freeze
-and every user's marker. A non-root thaw is refused for an attested agent, an unattested caller, a
+Root's thaw lifts every marker. A reviewer's thaw removes only their uid
+marker, not any
+.B frozen-h-\fILABEL
+marker. An attested harness cannot freeze or thaw. A harness account outside
+its attested scope can freeze its own uid marker; only
+.B sudo xudo thaw
+can lift a harness marker. A user's thaw removes only the marker for their own
+uid: root's global freeze stays in force, and so does every other user's,
+until root lifts it. A non-root thaw is refused for an attested agent, an unattested caller, a
 peer in another user namespace, and any caller whose uid is the account or a
 user of a registered harness: being outside an agent scope does not prove a
 human, because an agent can start a process outside its scope as its own uid.
@@ -565,8 +581,9 @@ Anything else, such as
 .BR pam_sss ,
 .B pam_systemd_home
 or a bracket control of the operator's own, makes it refuse.
-It grants nothing: no rule names the harness, so every command it asks for
-still asks for the sudo password.
+Enrollment creates the registry and service scope but does not add a command
+rule. A root-owned rule must name the harness and allow the exact command.
+Passwordless execution also requires the explicit agent-path installation.
 On a machine whose escalator is doas it refuses: the agent path is sudo and
 sudo\-rs only.
 .B \-\-dry\-run
@@ -689,25 +706,22 @@ removes it with everything else, and refuses to remove an edited
 .B xudo doctor
 says whether the agent path is on and whether its text is exact.
 .IP
-On a host at
-.BR kernel.yama.ptrace_scope=0 ,
-any process of a uid can read what is typed in that uid's other processes.
-With a session-way harness registered,
-.B \-\-agent\-path
-says so and names
-.BR \-\-raise\-ptrace\-scope ,
-which prints the diff and writes
-.I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
-setting it to 1.
-That file is written only with the flag and only while the live value is 0,
-so it never lowers a higher value.
-xudo does not apply it: it takes effect with
+The shipped enrollment path uses a dedicated service account. The session way
+(a harness running in the human's own account) is parsed and loaded but has no
+start command. A session harness shares the human's uid: at
+.B kernel.yama.ptrace_scope=0
+a process of that uid can read a typed password,
+.B xudo watch
+accepts a same-uid watcher on another tty, and a registry entry can name the
+human's account. Run harnesses as separate service accounts.
+.B \-\-raise\-ptrace\-scope
+also writes a root-owned sysctl drop-in setting
+.BR kernel.yama.ptrace_scope=1 ,
+but only when its live value is 0. It never lowers a higher value and does not
+apply the setting immediately; it takes effect after
 .B sudo sysctl \-\-system
-or at boot, and only when no file read after it sets the value; the install
-warns about each such line.
-.B \-\-uninstall
-removes it, after the sudoers file, and leaves it with a warning when it was
-edited.
+or at boot. Uninstall removes an unedited drop-in and leaves an edited
+one with a warning.
 .TP
 .B audit
 Verify that a hash-chained log has not been edited in place.
@@ -979,14 +993,11 @@ Both files are looked at in their first 64 KiB only, and the broker reads
 no more of them than that; a
 .B +
 after the count or the length marks a longer command line.
-The broker runs without capabilities, so the kernel shows it another
-user's command line but not its
-.B exe
-or environment; its records carry those two as
-.BR unavailable ,
-and the gate, which runs as root, records them.
+The broker runs as root. A failed read is recorded as
+.BR unavailable .
 Authorization does not branch on them.
-An unattested caller takes the human path and is asked for a password.
+An unattested caller is not treated as a verified harness. It takes the
+human path or is refused; hints never change that decision.
 .PP
 Confirmation is not read from the requester's standard input, standard
 output, or terminal.

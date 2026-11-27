@@ -2,8 +2,9 @@
 //!
 //! # The inverted trust model
 //!
-//! `xudo`'s premise — agents run without a password, humans are prompted —
-//! makes the *absence* of proof-of-humanity the thing that grants a privilege.
+//! `xudo`'s premise — a verified harness runs the commands root's rules allow
+//! without a password, and everyone else is prompted — makes the *absence* of
+//! proof-of-humanity the thing that grants a privilege.
 //! Every cheap signal that a caller is an agent is produced by the caller:
 //! `CLAUDECODE=1` is an environment variable anyone can export, `argv[0]` is
 //! chosen by the exec'ing process, `comm` is 16 bytes of anything, and

@@ -1,361 +1,197 @@
 # howiwork.md — the source of truth
 
-This file is the authoritative statement of what xudo is and how the system
-behaves. **Every other description derives from it**: the README, the FigJam
-overview, generated agent documentation, and marketing text of any kind. When
-any of them disagrees with this file, this file is right and the other document
-is the bug. Changes to product behaviour are made *here first*, then propagated.
+This file describes the product that ships in xudo `0.1.0-beta.2`. The README,
+site, man pages, and generated harness instructions derive from it. Keep their
+claims consistent with this file and with the implementation.
 
-Division of labour:
+## What xudo does
 
-| Document | Owns |
-|---|---|
-| `howiwork.md` (this file) | What the product is, which components exist, how a request flows, what each mode and outcome means |
-| `docs/crates.md` | The workspace crate list, checked against `Cargo.toml` |
+xudo is a Linux privilege broker for AI harnesses. A harness calls `xudo exec`
+with a program and its exact argument vector. xudo checks the request against
+root-owned rules and their argument matchers, with a compiled-in deny-list as
+defense in depth, then either runs it, queues it for a human, or refuses it.
+The host's `sudo`, `sudo-rs`, or `doas` performs the
+uid transition. xudo has no setuid binary.
 
-Contributor rules and the design history are maintainer notes and are not part
-of the published tree. The three invariants below are part of this file.
-Nothing written here or anywhere else may weaken them; a future edit to this
-file that contradicts them is an error in the edit, not a new truth.
-
----
-
-## What xudo is
-
-xudo lives beside `sudo`. Its job is to let AI agents run the privileged
-commands a task genuinely needs — in the safest way achievable — while a human
-invoking the same commands is always prompted, and everything either of them
-does is recorded in a tamper-evident trail.
-
-The long-term shape is a system where xudo is part of the installed path of a
-machine built for agent work (ultimately a Linux distribution that ships it
-preconfigured). The near-term shape is a signed `.deb` an operator installs
-beside the escalator they already have (`sudo`, `sudo-rs`, or `doas`).
+The default install grants no passwordless execution. A verified, registered
+harness can run a rule-allowed command without a password only when an operator
+also enables the opt-in agent path. A normal human request uses the host's
+password-authenticated path. An `ask-human` harness request enters a root-held
+queue; a separate reviewer uses `ido` to review it and run it through the
+password-authenticated path.
 
 ## The three invariants
 
-1. **Agent detection is not a security boundary.** Authorization comes only
-   from kernel-attested facts (`SO_PEERPIDFD` + a root-created cgroup scope
-   under `xudo.slice`). Environment variables, process names, `/proc` paths,
-   and process ancestry are *unauthenticated hints*: recorded in the audit
-   trail, never used to authorize.
-2. **The agent path is never broader than the human path in authentication.**
-   Misclassification may only withhold capability. An unattested caller falls
-   through to the human flow with a password — never a silent downgrade to
-   passwordless.
-3. **Confirmation lives outside the requester's process tree.** A confirmation
-   that the requesting process (or anything it controls) can answer is not a
-   confirmation. No live out-of-band channel means **deny**.
+1. **Agent detection is not a security boundary.** Authorization comes only from kernel-attested facts (`SO_PEERPIDFD` + a root-created cgroup scope under `xudo.slice`). `CLAUDECODE`, `argv[0]`, `comm`, `cmdline`, `/proc/<pid>/exe`, and process ancestry are *unauthenticated hints*: record them in the audit trail, never branch authorization on them. A **verified harness** means exactly two things together: the kernel attests the caller is inside a live root-created scope, and a root-written registry entry names that scope's harness. Never a program name, an environment variable, or anything the caller sends.
+2. **No caller gets passwordless root by mistake or by default.** A command runs without a password only when the kernel attests the caller is inside a root-registered harness scope **and** a root-written rule allows that exact command for that harness. Everything else (a human, an unattested caller, a process that left its scope, a command no rule allows) takes the human path, where the machine's own `sudo` asks the password, or is denied. Misclassification may only withhold. Nothing the agent may run is closed to the human path.
+3. **A human decision is made where the requester cannot answer it.** Anything that needs a human (an `ido` entry, or the optional `xudo watch` check on the human path) is decided by the human on a channel the requesting process tree cannot answer: never from its stdin, stdout, or `/dev/tty`. "Needs a human" never resolves by itself; with no human, it does not run.
 
-## The permission model: action X, situation Y, requester Z
+## Components and trust
 
-A permission answers: *may requester Z perform action X in situation Y?*
+- `xudo` is the unprivileged CLI used by people and harnesses.
+- `xudod` is the root broker. It authenticates the connected process from
+  kernel facts, checks root-owned policy, writes the audit trail, and manages
+  the root-held review queue.
+- `xudo-gate` is the separately invoked root executor. It independently checks
+  the request and current policy, consumes the one-use request, and executes
+  the validated file descriptor.
+- The host privilege backend performs the uid transition. The `-auth` gate
+  always follows the password path. The `-nopass` gate works only for an
+  attested harness with a matching rule and only if root has explicitly
+  installed its backend rule.
+- `ido` reads the broker queue through the broker and asks the broker to release
+  or run an entry. It does not rewrite the queue files. The requester can see
+  its own entry, but cannot edit, claim, release, or answer it.
 
-- **Action X** — a *named action*: one fixed executable plus an argument list
-  constrained position by position with typed matchers. No globs anywhere.
-  Actions cover what the invoking user cannot already do: installing packages,
-  restarting services, writing under `/var/www`, running `certbot` as root.
-- **Situation Y** — the context the decision is made in: the project the
-  request is scoped to, global settings (frozen, agent confirmation; a freeze is global when root sets it and covers only the caller's own agents when a user does), whether
-  a rule demands human confirmation, rate and novelty limits, and conflicts
-  the doctor can see (for the nginx example: Apache already holding port 80 is
-  reported, not silently fought). Context can only *narrow* what an action
-  grants — a project layer that tries to widen policy is structurally
-  rejected.
-- **Requester Z** — who is asking, established by the kernel, not by names.
-  The broker identifies its peer through the socket (`SO_PEERPIDFD`,
-  credentials at connect time via `SO_PEERCRED`) and classifies it:
-  *enrolled agent* (its cgroup is a live root-created scope), *human*, or
-  *unattested*. "Claude Code requested this" is recorded as a hint for the
-  audit record; it never authorizes. Prompt injection and malicious scripts
-  are contained by this design rather than detected: whatever a hijacked agent
-  claims to be, it can reach only the allowlist, minus the deny-list, through
-  the confirmation rules.
+Authorization relies on a connected Unix socket peer and the kernel's
+pidfd/cgroup evidence, plus a root-owned harness registry. User-controlled
+names, environment, process ancestry, and command-line hints do not authorize.
+The broker and gate both make decisions; any mismatch, stale generation,
+missing state, or error fails closed.
 
-### Permission sets
+## Harness enrollment and passwordless execution
 
-A **permission set** groups named actions into something an admin can reason
-about — e.g. *web admin*: install from the web-server list (nginx, apache),
-write under `/var/www`, run `certbot` as root. **Predefined permission sets
-(PRS)** are shipped, reviewed sets the operator selects or imports.
+The shipped enrollment path is the **service way**. An operator runs
+`sudo xudo agent enrol LABEL --account ACCOUNT --reviewer USER -- PROGRAM ARGS`
+for an existing dedicated account. Enrollment checks the account and its
+privilege paths, then creates a root-owned registry record, a systemd service
+drop-in, and a private environment file, adds the account to xudo's groups, and
+enables `xudo-agent@LABEL.service`. Credentials for the harness may be stored
+in the root-only environment file. Enrollment itself authorizes no command.
 
-The engine's native, tested format is TOML under root-owned
-`/etc/xudo/rules.d/` (this is what ships today). YAML and JSON are accepted as
-*import formats* for permission sets: converted to the native rules, shown to
-the operator as a capability-level diff, and installed only after review.
-Every shipped set is tested as code and checked against the GTFOBins gate —
-a set that allowlists something shell-capable needs a written waiver naming
-why the rule makes the technique unreachable.
+Only a process running inside the live scope created by that root-managed unit,
+with a matching registry record, is a verified harness. A similarly named
+process or an SSH login as the service account is not enough. Root-created
+cgroups and registry state are the authentication basis; display names are not.
 
-### Temporary permissions
+The session way (a harness running in the human's own account) is parsed and
+loaded, but has no start command. A session harness shares the human's uid:
+with `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
+password, `xudo watch` accepts a same-uid watcher on another tty, and a session
+registry entry can name the human's account. Run harnesses as separate service
+accounts. `--raise-ptrace-scope` writes a sysctl drop-in; it takes effect only
+after `sudo sysctl --system` or reboot.
 
-A **temporary permission** lets a harness use a defined permission, or a whole
-permission set, without asking the human each time, for a bounded window that
-ends on its own.
+The package and plain `xudo install` install only the password-authenticated
+backend rule. After enrollment and after installing rules that grant the
+harness, an operator may opt in on sudo or sudo-rs hosts with
+`sudo xudo install --agent-path`. This writes the narrowly scoped passwordless
+rule for the agent group and the no-argument helper. The helper still rejects
+unattested callers. OpenDoas does not support this agent-path installation.
+An upgrade or plain `xudo install` turns the agent path off. `--uninstall`
+removes only exact files xudo manages; an edited ptrace-scope file is left in
+place with a warning.
 
-```
-xudo grant nginx-reload              # 30 minutes, the default
-xudo grant web-admin 24h             # a whole permission set
-xudo grant nginx-reload 2h --agent claude-code --project /srv/site --max 20
-xudo grants                          # what is live, who granted it, when it ends
-xudo revoke <grant-id>               # end one early
-```
+## Rules and outcomes
 
-What makes it safe:
+Rules are TOML files owned by root under `/etc/xudo/rules.d`. Each action names
+one absolute executable and constrains its arguments position by position
+using typed matchers. A harness allow requires both an exact command match and
+the harness label in the rule. The policy boundary is the root-owned rules and
+their argument matchers. The compiled-in deny-list is defense in depth and
+cannot be overridden by rules. `path-under` is lexical
+only; it does not enforce filesystem containment for programs that open paths
+as root.
 
-- **Only what root already defined.** A grant names an action or a set that
-  exists in root's rules. It cannot invent a permission or widen a matcher,
-  and the compiled-in deny-list is evaluated after it exactly as without it.
-- **Minted by a human, never by an agent.** Granting runs through the human
-  path: the `PASSWD` hop, where the human types the password, with the prompt
-  saying exactly what is granted, to whom, and until when. That password
-  prompt is the out-of-band confirmation for the whole window, given in
-  advance on a channel the requesting process tree cannot answer: a grant does
-  not skip invariant 3's confirmation, it *is* that confirmation, time-boxed
-  and recorded. An agent may *ask* for a grant (the request is shown to the
-  human, who mints it on the password path or declines); an attested agent
-  trying to mint or extend one itself is refused. The real boundary is that
-  minting always needs the human-path password; refusing a mint from inside a
-  live grant is a second guard, not the boundary.
-- **What it changes during the window**, for the named harness (and project,
-  if given). The harness is an enrolled identity from M4's registry, and at
-  every use the broker matches it to the requester's kernel-attested enrolled
-  scope: the name is how the human picks the grantee, never how a requester is
-  identified. A grant without `--agent` covers the sole enrolled agent, and
-  `--agent` is required when more than one is enrolled. During the window: the per-call out-of-band confirmation of the granted actions is
-  lifted, and actions marked `grant-only` (defined and reviewed, but dormant)
-  become usable. It does **not** lift a human-only action, does not lift the
-  critical tier's confirmation, and does not bypass rate limits: a burst still
-  forces confirmation even under a grant, then denies.
-- **Bounded.** The default is 30 minutes. Each permission or set may declare
-  a ceiling (`max-grant = "24h"`), a global ceiling caps all of them, and a
-  request above a ceiling is refused, not silently shortened. Deadlines are
-  monotonic, so moving the clock cannot extend one. An optional use count is
-  persisted before each execution.
-- **Expiry is enforced twice:** at every use — at both decision points, the
-  broker when it mints a request and the gate when it re-decides before
-  executing, so a request minted under a grant that expires before the gate
-  runs it is refused — and by pasban, which removes expired grants and reports
-  any grant it finds that should not exist.
-- **A grant never outlives the rules it named.** Each grant records the policy
-  generation it was minted under; a policy change bumps the generation
-  and invalidates every outstanding grant (comments, positions and tests
-  do not).
-- **Visible and recorded.** Granting, every use under a grant, expiry, and
-  revocation each write an audit record, and while any grant is live, xudo
-  shows a banner naming it.
+There are three outcomes:
 
-Grants are stored root-owned under `/var/lib/xudo/grants` and read only
-through the trust walk. Standing, reviewed narrowing over days or weeks stays
-in `trust.d`; a grant is its time-boxed sibling, the short window an operator
-opens from the command line. Grants only mean something once the passwordless path exists (M4):
-until then every request asks for a password anyway. They are scheduled for
-M5, with permission sets becoming a construct in the rule files first.
+1. **Allow.** A matching rule may run for a verified harness. It runs without
+   a password only if the opt-in agent path is installed. Everyone else takes
+   the human path or is refused.
+2. **Ask human.** A matching `outcome = "ask-human"` rule for a verified,
+   listed harness places the request in the broker's root-held queue. A
+   configured reviewer sees it in `ido`, reviews it, and runs it with
+   `xudo exec --queued ID`. The broker rechecks the saved request against the
+   current rules, then the host asks for the reviewer's password. Queue entries
+   are bounded, expire, and are invalidated when relevant policy changes.
+   The requester can see its own entry, but cannot edit, claim, release, or
+   answer it.
+3. **Deny.** A deny rule, the compiled-in deny-list, a missing match, a failed
+   check, or a required human decision with no available human stops the
+   request. Denied commands never run.
 
-## The components
+Human requests that match ordinary allow rules use the password-authenticated
+gate. The optional `xudo watch` flow can provide an extra human confirmation
+where policy requires it; it is not required for the passwordless harness
+path. No agent can answer a human confirmation from its own terminal or
+process tree.
 
-| Component | Privilege | Role |
-|---|---|---|
-| `xudo` | user | The front-end agents and humans call. Explains, checks, asks the broker. Decides nothing. |
-| `xudod` | root | The authority. Identifies the peer, classifies, evaluates policy, mints one-use requests, owns confirmation. |
-| `xudo-gate` | root (via sudo/doas) | The executor, and a **second independent policy engine**: re-decides from root-owned state, consumes the one-use nonce, execs the validated descriptor. Safe to invoke directly because it trusts nothing it is handed. |
-| `sudo` / `doas` (the hop) | root | The machine's own escalator, used only as the **uid transition**: xudo ships no setuid bit anywhere. Two rules point at two files of the gate, copies of one binary with one name each: `xudo-gate-nopass` (`NOPASSWD`, the approved agent path) and `xudo-gate-auth` (`PASSWD`, the human path). The password lives on the second and only the second. The gate reads which one it is from the executed file (`/proc/self/exe` against the two files under `/usr/libexec/xudo`), never from `argv[0]`, and refuses a gate file with a second name. Today only `xudo-gate-auth` is named by any sudoers rule. The broker mints a `-nopass` entry for a live harness a rule grants, and `xudo` runs `sudo -n` on that file, which sudo refuses until root runs `sudo xudo install --agent-path`, the opt-in that writes the one `NOPASSWD` line; the package and a plain `xudo install` write none. |
-| `ido` | user | The buffered human-run queue (below). Where the human's password is entered. |
-| `airead` | user | The read-only surface (below). |
-| `pasban` | root (scheduled) | The watchman (below). |
+### Typed `remove-path`
 
-## The three outcomes
+The `remove-path` operation is performed by xudo itself, not by running `rm`.
+The rule fixes the allowed tree. The implementation enforces ownership and
+trust of the path's ancestors, refuses mount boundaries, and bounds the walk
+by depth and entry count; it does not follow symlinks. Harness rules can grant this typed operation with
+the same verified-harness and optional passwordless gates. The shipped example
+is `rules/examples/50-remove-path.toml.example`. A harness `remove-path` rule
+must set `owners` or it fails to load; the any-non-root default is not accepted.
+`ask-human` is not a supported operation outcome and fails to load.
 
-Every request resolves to exactly one of:
+## Rule packs
 
-1. **Rejected** — the deny-list matched, no rule accepts the command, the
-   context forbids it, or a required confirmation has no live channel. Every
-   error path lands here: xudo fails closed.
-2. **Approved** — an enrolled agent, attested by the kernel, asks for
-   something a rule accepts, and every requirement is met, including whatever
-   out-of-band confirmation the strictest matching rule demands. **An approved
-   request needs no human password: the approval is the authorization.** It
-   runs through the `NOPASSWD` hop. A caller the kernel cannot attest is never
-   approved this way (invariant 2): it takes the human path below.
-   *Built, off by default:* the broker mints the passwordless entry and `xudo`
-   runs `sudo -n` on `xudo-gate-nopass`. The package installs no `NOPASSWD`
-   line, so sudo refuses it until root opts in with
-   `sudo xudo install --agent-path`.
-3. **Run with ido** — xudo cannot or should not run it now, so it is handed to
-   a human as reviewable work instead of being silently dropped. **This is
-   where the human password lives**: the human runs the entry, and the
-   privileged step goes through the `PASSWD` hop, which asks for it once.
+A rule pack is a local TOML file with a `[pack]` header. `xudo rules add FILE`
+previews the policy and effects without writing. The preview returns a token
+bound to the reviewed pack bytes, the current rule set and registry generation,
+and the selected waiver setting. A reviewer installs it by passing that token
+back with `sudo xudo rules add FILE --reviewed TOKEN`; the root side recomputes
+the review and refuses if anything changed. Packs are not downloaded or
+updated automatically. Removal uses the same preview and review token flow.
 
-A human who runs `xudo` directly is on the same human path: always prompted,
-because a human is exactly what the kernel cannot attest as an enrolled agent.
+## G1 rate ledger, freeze, and audit limits
 
-When several rules accept the same command, the **strictest requirement wins**
-— file order can never decide whether a human is asked.
+The passwordless gate keeps a root-owned rate ledger keyed by account and
+harness under `/run/xudo/rate`. Every invocation counts, including a refusal.
+It allows at most 60 invocations in a minute and 600 retained stamps in an
+hour; reaching a ceiling refuses the request and records the refusal with
+bounded coalescing. A missing, corrupt, unreadable, or busy ledger also
+refuses the request. Root can freeze all harnesses; a user can freeze that
+user's own harness. An attested harness cannot freeze or thaw; a process of a
+harness account outside its scope can freeze only its own uid marker. The
+broker, gate, queue, freeze controls, and decision records use bounded
+root-owned state. Root's thaw lifts every freeze marker. A reviewer's thaw
+removes only that reviewer's uid marker, not any `frozen-h-<label>` marker.
+Only `sudo xudo thaw` can lift a harness marker.
 
-### ido
+The audit trail is hash-chained and the system journal receives root-written
+records. `xudo audit --against-journal` can compare the local file to the
+journal records it can read. This is tamper evidence, not an external audit or
+a guarantee against a malicious root user. Audit hints are bounded and
+audit-only. They include a bounded, caller-controlled `argv[0]`, the argument
+count, and the argument length; they include no later arguments and no digest.
+A process can rewrite its title, so `argv[0]` is not proof of the executable.
+A failed read is recorded as `unavailable`.
 
-`ido` keeps a queue of commands an agent wanted but could not run. Each entry
-stores the exact argv (never re-parsed through a shell), the agent's stated
-reason, and an identifier; `ido {id}` runs one entry, `ido` opens the picker.
-The admin is told when unfinished tasks exist.
+## Install and supported hosts
 
-Running an entry is a *human* act: it executes with the human's own authority,
-and anything privileged goes through xudo's human path, where the `PASSWD` hop
-(`xudo-gate-auth`) prompts for the password once. ido itself holds no privilege and never will —
-"running ido is equivalent to sudo" is achieved by routing through the same
-gate as everything else, not by making ido a second sudo. Every rendered field
-of an entry is sanitized for the terminal (agent text cannot forge the UI), and
-every run lands in the audit chain.
+The supported package targets are Debian 13, Ubuntu 24.04 LTS, and Ubuntu
+26.04 LTS, on amd64 and arm64. The service broker uses systemd and journald.
+Other distributions and releases are not supported.
 
-### airead
+Download the `.deb`, `SHA256SUMS`, and its `.cosign.bundle` from the matching
+GitHub Release. Check the checksum and verify the package signature against the
+release workflow identity before installation. GitHub renders `~` as `.` in
+the Debian package filename; use this checksum command:
 
-`airead` is xudo's read-only twin: the same engine, the same attestation, the
-same audit trail, but it can only ever grant actions whose capability class is
-*reads* — no file writes, no database writes, no cloud-CLI mutations, no
-network egress that changes state. The separation is structural, not
-cosmetic: read-only-ness is decided by the action's declared capability class
-and the compiled-in deny-list (which classifies by what a binary *can do*,
-never by its name), so a write cannot be disguised as a read by renaming or
-copying a binary. A rule whose action could write is simply not expressible in
-airead's rule set.
-
-### Vision mode and blind mode
-
-**Blind mode is the authorization engine and it is always on.** Strictly
-defined rules, compiled-in deny-list, fail closed; only known actions pass.
-This is not a degraded state — it is the only thing that ever authorizes.
-
-**Vision mode** adds AI assistance on top, using a configured provider
-(Anthropic-, OpenAI-, or Gemini-compatible, by key or subscription). Where no
-strict rule decides, a model may: explain a denial, triage a request into the
-ido queue with a drafted script and rationale, flag a suspicious context, or
-propose a new rule *for the operator to review*. A model's output can reject,
-defer, or annotate — **it can never approve**. That is the merge of the
-original idea with invariant 2: an AI decision may only withhold capability,
-because a component that can be prompt-injected must not be a component that
-can grant root.
-
-When the provider is unreachable or the quota is exhausted, the operator's
-configured fallback applies: continue in blind mode (default), queue
-everything unmatched to ido, or reject everything unmatched. There is no
-configuration in which the absence of AI widens what passes.
-
-### Pasban
-
-Pasban is the watchman: a root-owned scheduled job (daily by default, period
-operator-configurable) that
-
-- **revokes** every temporarily-gained permission past its expiry — time-boxed
-  grants die on schedule even if nothing else runs;
-- **verifies** the audit trail end to end and **escalates** suspicious
-  patterns found in it;
-- treats any third-party write, truncation, or deletion of the security log as
-  an **immediate threat** and reports it loudly.
-
-The security log is the hash-chained audit trail: root-owned, mode 0600,
-append-only in practice and tamper-evident by construction. xudo (broker and
-gate) writes it and can read it; pasban reads and verifies it; nothing else has
-access except root, which the chain detects only through the journal copy.
-"Hard written" is implemented as a hash chain — every record seals the
-one before it — plus the journald copy, so a modification cannot be hidden
-even from an attacker who gains the file: the chain stops verifying, and
-pasban's next run reports exactly where.
-
-## How a request flows
-
-```
-enrolled agent ── xudo ──► xudod (root broker)
-                             ├ who is asking? (kernel-attested)
-                             ├ which rules accept it? strictest wins
-                             ├ deny-list (compiled in, non-overridable)
-                             ├ confirmation needed? channel live? (else deny)
-                             └ outcome: Reject │ Approve │ ido-queue
-
-  Approve ─► mint one-use record ─► sudo/doas, NOPASSWD ─► xudo-gate-nopass
-                                    (uid transition only,       │
-                                     no password)               │
-  Run with ido ─► human reviews, runs entry ─► xudo (human path)│
-                  ─► sudo/doas, PASSWD ─────► xudo-gate-auth    │
-                  (the human types the password here)           │
-                                                                ▼
-                                        xudo-gate (root, the same binary)
-                                          ├ re-decides from root-owned state
-                                          ├ consumes the nonce (one use, ever)
-                                          └ execs the validated file descriptor
-                                              └ audit record before and after
+```sh
+sed 's/~/./' SHA256SUMS | sha256sum -c --ignore-missing
+cosign verify-blob --bundle xudo_<ver>_<arch>.deb.cosign.bundle \
+  --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  xudo_<ver>_<arch>.deb
+sudo apt install ./xudo_<ver>_<arch>.deb
 ```
 
-Why the hop exists at all when approval needs no password: it is the only
-place a uid transition happens, because xudo has no setuid bit. It also gives
-the gate a real pty (`use_pty`, the TIOCSTI defence), faithful exit status, and
-the operator's existing sudo/doas logging. Take it away and the choice is a
-setuid binary, which this project refuses, or having the root daemon execute
-commands itself, which makes the broker, the parser, and the executor one
-process. Two files keep the password rule and the passwordless rule from
-ever naming the same command: `NOPASSWD` attaches only to the agent-path file.
+Replace `<ver>`, `<arch>`, and `<tag>` with the package version, `amd64` or
+`arm64`, and Git tag shown by the release. xudo has no `curl | sh` installer.
 
-## Mismatches resolved (pasted vision → merged truth)
+## Limits
 
-Recorded so the reconciliation is visible, not silent:
+This is beta software and has not had an external security audit. xudo protects
+only commands routed through xudo; it does not remove other ways to obtain
+root. `xudo doctor` reports paths it can inspect, but cannot prove that no
+other root path exists. The deny-list is defense in depth; narrow root-owned
+rules are the policy boundary. `path-under` does not provide filesystem
+containment. Landlock confinement and an external audit are not implemented.
 
-1. *"Check if Claude Code is added as an actor"* → actor identity is
-   kernel-attested (invariant 1). The actor's *name* is an audited hint. The
-   registry of enrolled agents is an availability control, not a boundary.
-2. *"AI takes decisions where no strict rule is defined"* → AI may reject,
-   defer to ido, or annotate — never approve (invariants 2 and 3). Blind mode
-   is the engine, not a fallback.
-3. *"Running ido is equivalent of sudo without sudo"* → ido stays
-   unprivileged; privileged entries run through xudo's human path with its
-   password prompt. Same user experience, no second privilege boundary.
-4. *"Permission sets in YAML and JSON"* → native engine format stays TOML
-   (tested, shipped); YAML/JSON are import formats converted and reviewed
-   before install.
-5. *"If something is approved, no human password is needed"* → true for an
-   approved, attested agent request, which takes the `NOPASSWD` hop. The
-   password moved next to ido: it belongs to the human path (the human running
-   an ido entry, or running `xudo` directly), because an unattested caller,
-   including a human, is never silently downgraded to passwordless
-   (invariant 2). The `sudo`/`doas` hop itself stays: it is the uid transition,
-   not the password mechanism.
-6. *"airead as a separate app"* → same engine, structurally restricted to
-   read-class capabilities, so the read/write separation cannot drift between
-   two codebases.
-7. *"Temp permissions: `xudo set-temp nginx-reload 30m`, `xudo set-temp
-   nginx-perm-set 24h`, default 30 minutes"* → adopted as temporary
-   permissions, spelled `xudo grant <name> [duration]` to match the existing
-   `grants`/`revoke` verbs, default 30 minutes. A grant activates something
-   root already defined, for a named harness, minted by a human on the
-   password path; it lifts only the per-call confirmation, and never the
-   deny-list, a human-only action, the critical tier, or rate limits
-   (invariants 2 and 3).
-
-## Derived views
-
-Everything below is generated from this file and must never be edited as if it
-were the source:
-
-| View | Where | How it stays true |
-|---|---|---|
-| README | `README.md` | Opens by naming this file as the source; its product claims are copied from here, never extended |
-| FigJam overview | FigJam board `zfZBwQ4rf9rks1sUl50XEd` (private to the owner's account; drafts folder) | A banner on the board stamps the `howiwork.md` commit it was built from. A board whose stamp differs from the current commit of this file is stale |
-
-The rule: **edit this file first, then bring the views up to date, in the same
-change where possible.** When a view and this file disagree, this file is right
-and the view is the bug. Agents and humans reading a view should open this
-file before acting on it.
-
----
-
-## Where the build stands
-
-M1 (policy core, explain) done. M2a (backend model) done. M2b done in code
-and tests (2026-10-30): the broker mints entries, the gate consumes one and
-runs it as root, `xudo exec` and `xudo install` ask the broker, both write one
-hash-chained audit trail, and the same ruleset behaves the same through sudo,
-sudo-rs and OpenDoas. M3 is built: out-of-band confirmation via `xudo watch`
-is off by default, and every path still requires the password. The broker runs
-under its real systemd sandbox, and Pasban verifies the audit chain daily. The
-doas install probe remains NOT VERIFIED. Next: M4 enrollment and the passwordless
-path, M5 temporary permissions, narrowing and volume controls
-(pasban's revocation substrate), M6 ergonomics (`airead` surfaces here),
-M7 confinement and external audit.
+For the security reporting route and details of the limits, see
+[`SECURITY.md`](SECURITY.md).

@@ -1,4 +1,8 @@
 //! Pure confirmation state and matching rules.
+//!
+//! This is the optional extra check on the human path (`confirm_human_path`,
+//! off by default). In the design no agent request waits for it: root's rules
+//! alone decide what a verified harness may run.
 
 use sha2::{Digest, Sha256};
 use xudo_gate::request::{ConfirmationState, PendingRequest, WatcherPin};

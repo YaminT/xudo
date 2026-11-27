@@ -1,12 +1,16 @@
 # xudo
 
-> Linux privilege broker for narrowly scoped privileged commands; this beta uses the human password path.
-## Project
-- [README](https://github.com/YaminT/xudo/blob/main/README.md): Install status, examples, security limits, rules, and FAQ.
-- [howiwork.md](https://github.com/YaminT/xudo/blob/main/howiwork.md): Authoritative description of product behavior, request flow, and the product invariants.
-- [SECURITY.md](https://github.com/YaminT/xudo/blob/main/SECURITY.md): Vulnerability reporting route and current security limits.
-## Rules
-- [Rule files](https://github.com/YaminT/xudo/tree/main/rules/): Shipped TOML action rules.
-## Manuals
-- [ido(1)](https://github.com/YaminT/xudo/blob/main/docs/man/ido.1): Human-run queued command interface.
-- [ido-queue(5)](https://github.com/YaminT/xudo/blob/main/docs/man/ido-queue.5): Queue data format.
+> sudo for AI harnesses: root-owned rules decide which exact privileged commands a verified service harness may run.
+> Beta; not externally audited. Passwordless execution is off by default.
+
+## Product behavior
+- [howiwork](https://github.com/YaminT/xudo/blob/main/howiwork.md): Source of truth and security invariants.
+- [README](https://github.com/YaminT/xudo/blob/main/README.md): Install summary and example.
+- [Security](https://github.com/YaminT/xudo/blob/main/SECURITY.md): Security boundary, limits, and private reporting route.
+
+## Rules and commands
+- [Shipped rules](https://github.com/YaminT/xudo/tree/main/rules): Root-owned TOML policy and examples.
+- [xudo(1)](https://github.com/YaminT/xudo/blob/main/docs/man/xudo.1): CLI commands and options.
+- [xudo-rules(5)](https://github.com/YaminT/xudo/blob/main/docs/man/xudo-rules.5): Rule, deny-rule, test, pack, and harness registry formats.
+- [ido(1)](https://github.com/YaminT/xudo/blob/main/docs/man/ido.1): Human-run queue interface.
+- [ido-queue(5)](https://github.com/YaminT/xudo/blob/main/docs/man/ido-queue.5): User-side queue file format.

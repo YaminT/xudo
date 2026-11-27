@@ -5,6 +5,10 @@ All notable changes to xudo are documented here. This project follows
 
 ## Unreleased
 
+### Documentation
+
+- Updated the product, install, security, site, and manual text to describe the shipped beta behavior.
+
 ### Added
 
 - `xudo install --agent-path`, the opt-in that turns the passwordless agent path on (E8). Opt-in only: nothing ships it, the package never runs it, and the default install is unchanged (`install_without_agent_path_writes_no_nopasswd`). sudo and sudo-rs only; doas is refused (`the_agent_path_refuses_doas`). It writes `/etc/sudoers.d/xudo` with one more line, `%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS`, for `/usr/libexec/xudo/xudo-gate-nopass` with no arguments, built by the same generator enrol's scan exempts byte for byte (`nopass_rule_names_only_the_nopass_file`, `the_auth_rule_never_carries_nopasswd`). Before it writes anything it runs the helper through `sudo -n` as a caller it cannot attest and stops unless the helper prints its own refusal and nothing else (`the_probe_failing_writes_nothing`). It stops, naming the line, when any other sudo or doas line names `%xudo-agent` (or its gid), the helper, or an include it cannot follow, in any file and include order (`a_preexisting_agent_group_line_blocks_the_agent_path`, `a_line_granting_the_nopass_helper_to_xudo_blocks_the_agent_path`). It creates the `xudo-agent` group empty if missing and adds nobody. The candidate is validated by the backend's parser before the rename, as for every install.

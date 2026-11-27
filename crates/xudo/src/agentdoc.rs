@@ -48,7 +48,7 @@ pub fn render(rules: &RuleSet, generation: &str, format: DocFormat) -> String {
     }
 
     out.push_str("Do not use sudo. Use xudo. It runs an approved list only.\n\n");
-    out.push_str("In this beta every `xudo exec` asks a human for a password; queue it with `ido queue` instead when no human is at the terminal.\n\n");
+    out.push_str("Only a verified, registered service harness can use passwordless rules, and only when root has enabled the agent path. Run commands with `xudo exec -- <command> <args>`. An `ask-human` rule is queued by xudo for its separate reviewer; do not try to answer or queue it yourself.\n\n");
     out.push_str("You may run these:\n\n");
 
     for action in rules.actions() {
@@ -167,6 +167,21 @@ args = [{ name = "t", matcher = { literal = "/mnt" } }]
             assert!(text.contains("Never run `ido run` or `ido drop`"), "{text}");
             assert!(text.starts_with("<!-- xudo:begin v2 -->"));
         }
+    }
+
+    #[test]
+    fn the_block_describes_the_opt_in_path_and_broker_queue() {
+        let text = render(&rules(), "abcdef0123456789", DocFormat::Agents);
+        assert!(
+            text.contains("Only a verified, registered service harness"),
+            "{text}"
+        );
+        assert!(
+            text.contains("An `ask-human` rule is queued by xudo"),
+            "{text}"
+        );
+        assert!(!text.contains("every `xudo exec` asks a human"), "{text}");
+        assert!(!text.contains("queue it with `ido queue"), "{text}");
     }
 
     #[test]

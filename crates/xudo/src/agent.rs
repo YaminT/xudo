@@ -1,8 +1,9 @@
 //! `xudo agent`: enrol, list and remove a harness that runs as its own account.
 //!
 //! Enrolling writes a registry entry, a drop-in and an environment stub, and
-//! enables the unit. It grants nothing: no rule names the harness, so every
-//! command it asks for still asks for the sudo password. Run as root, like
+//! enables the unit. Enrollment adds no command rule; only an exact rule can
+//! authorize a request, and the passwordless path also needs the explicit
+//! `xudo install --agent-path` opt-in. Run enrollment as root, like
 //! `xudo install`, through the machine's own `sudo`; this process never sees
 //! the password.
 
@@ -27,8 +28,9 @@ pub enum AgentAction {
     /// account to the groups `xudo` and `xudo-agent` (creating them if absent),
     /// and enables `xudo-agent@<label>.service`. Refuses an account that is root, has a
     /// password, is in a group that is root by another name, or has a sudo or
-    /// doas rule of its own. Grants nothing: the harness still asks for the
-    /// password for every command.
+    /// doas rule of its own. Adds no command rule: a root-owned rule must
+    /// name the harness and allow the exact command. Passwordless execution
+    /// also needs the explicit agent-path install.
     Enrol {
         /// The harness's name: letters, digits and `-`.
         label: String,
@@ -137,8 +139,9 @@ fn enrol(
     let _ = writeln!(
         out,
         "\nenrolled {label}: {unit} runs as {account}.\n\
-         It grants nothing: no rule names this harness, so every command it asks for\n\
-         still asks for the sudo password. Put its credentials in {env} (root only).\n\
+         Enrollment adds no command rule. A root-owned rule must name this harness\n\
+         and allow the exact command; passwordless execution also needs the\n\
+         explicit `xudo install --agent-path` opt-in. Put its credentials in {env} (root only).\n\
          {account} is in the groups xudo and xudo-agent, so it can reach the broker.",
         label = plan.label,
         unit = plan.unit,
