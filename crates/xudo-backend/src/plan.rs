@@ -221,7 +221,7 @@ impl PlanStep {
 /// What the agent path checks once its file is in place: the whole
 /// configuration parses, the backend lists the helper for root (the
 /// control), and not for nobody nor with an argument for `member`.
-fn checks_after_rename(exe: &str, member: &str) -> [PlanStep; 4] {
+fn checks_after_rename(exe: &str, member: Option<&str>) -> Vec<PlanStep> {
     let listing = |user: &str, extra: &[&str]| {
         let mut argv = vec![
             exe.to_owned(),
@@ -234,7 +234,7 @@ fn checks_after_rename(exe: &str, member: &str) -> [PlanStep; 4] {
         argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
         argv
     };
-    [
+    let mut steps = vec![
         // `-f` names the file sudo reads, so its includes are parsed
         // with it, and skips the mode check that `-c` alone makes:
         // Ubuntu 26.04's sudo-rs ships it 0644, which sudo accepts.
@@ -259,15 +259,32 @@ fn checks_after_rename(exe: &str, member: &str) -> [PlanStep; 4] {
                           who is not in the agent group"
                 .to_owned(),
         },
-        PlanStep::MustNotList {
+    ];
+    // The empty argument list (`""`) is proved on a member of the agent
+    // group: asking about anyone else (nobody, who is never listed) could not
+    // fail, and would pass for a backend that ignores `""`.
+    steps.push(match member {
+        Some(member) => PlanStep::MustNotList {
             argv: listing(member, &["x"]),
             expectation: format!(
                 "the backend does not list the passwordless helper with an argument for \
                  {member}"
             ),
         },
-    ]
+        None => PlanStep::Notice {
+            text: NO_MEMBER_YET.to_owned(),
+        },
+    });
+    steps
 }
+
+/// What the install says when `xudo-agent` has no member to ask the backend
+/// about: the empty argument list stays unproved until an install runs with
+/// one. The gate refuses any argument on its own.
+pub const NO_MEMBER_YET: &str = "could not verify the empty argument list (no member yet): \
+     xudo-agent has no member, so the backend was not asked whether one may run the \
+     passwordless helper with an argument. The helper refuses any argument itself. Run \
+     `sudo xudo install --agent-path` again once `xudo agent enrol` has added a member.";
 
 /// The first sentence of a notice, for a one-line summary.
 fn first_sentence(text: &str) -> String {
@@ -355,8 +372,9 @@ impl InstallPlan {
     /// helper must refuse a caller it cannot attest and no file xudo would
     /// replace may hold an edit. After the rename, the backend parses its whole
     /// configuration and must not list the helper for `nobody`, nor with an
-    /// argument for `member` (a member of the agent group, or `nobody` when
-    /// there is none); any of those failing restores what the run installed.
+    /// argument for `member` (a member of the agent group; with none, the plan
+    /// says the empty argument list is unverified, [`NO_MEMBER_YET`]); any of
+    /// those failing restores what the run installed.
     /// It never carries the ptrace drop-in: the caller builds it only once the
     /// live `kernel.yama.ptrace_scope` is 1 or more (see [`Self::ptrace_drop_in`]).
     ///
@@ -396,7 +414,7 @@ impl InstallPlan {
             },
         ]);
         steps.extend(sudoers_steps(snippet));
-        steps.extend(checks_after_rename(&exe, member.unwrap_or("nobody")));
+        steps.extend(checks_after_rename(&exe, member));
         steps.push(auth_probe(&exe));
         steps.push(PlanStep::Notice {
             text: "The agent path is on. A member of xudo-agent may run the passwordless helper \
@@ -1139,12 +1157,21 @@ mod tests {
                 assert_eq!(argv[0], "/usr/bin/sudo-rs", "{step:?}");
             }
         }
-        // With no member to ask about, nobody stands in for one.
-        let alone = agent_plan(BackendKind::Sudo);
+        // With no member to ask about, nobody stands in for one: a check
+        // that could not fail is not made, and the plan says so.
+        let alone = agent_plan(BackendKind::Sudo).describe();
         assert!(
-            alone
-                .describe()
-                .contains(&"check: the backend does not list the passwordless helper with an argument for nobody".to_owned())
+            !alone.iter().any(|d| d.contains("with an argument for")),
+            "{alone:?}"
+        );
+        assert!(
+            alone.contains(
+                &"notice: could not verify the empty argument list (no member yet): \
+                 xudo-agent has no member, so the backend was not asked whether one may run the \
+                 passwordless helper with an argument."
+                    .to_owned()
+            ),
+            "{alone:?}"
         );
     }
 

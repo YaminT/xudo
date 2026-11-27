@@ -709,8 +709,9 @@ impl InstallProbe for Refusing {
     }
 }
 
+/// The agent path, installed while `agent` is in xudo-agent.
 fn nopass_plan() -> InstallPlan {
-    InstallPlan::with_agent_path(&backend(BackendKind::Sudo, true), None).unwrap()
+    InstallPlan::with_agent_path(&backend(BackendKind::Sudo, true), Some("agent")).unwrap()
 }
 
 fn run_agent(
@@ -1172,6 +1173,29 @@ fn the_helper_listed_wider_than_its_line_restores_what_was_there() {
     assert!(
         ops.calls()
             .contains(&"remove_managed /etc/sudoers.d/xudo".to_owned())
+    );
+}
+
+#[test]
+fn with_no_member_the_empty_argument_list_is_reported_unverified() {
+    // Asking about nobody, who is never listed, could not fail: the check is
+    // not made, and the report says what was not verified.
+    let ops = FakeInstallOps::root();
+    let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
+    let plan = InstallPlan::with_agent_path(&backend(BackendKind::Sudo, true), None).unwrap();
+    let report = execute(&plan, &ops, &probe).unwrap();
+    let verified = report
+        .events
+        .iter()
+        .filter(|e| e.starts_with("verified: "))
+        .count();
+    assert_eq!(verified, 2, "{:?}", report.events);
+    assert!(
+        report
+            .notices
+            .contains(&xudo_backend::plan::NO_MEMBER_YET.to_owned()),
+        "{:?}",
+        report.notices
     );
 }
 

@@ -8,10 +8,12 @@
 //! the password.
 
 use std::io::Write;
+use std::path::Path;
 
 use clap::Subcommand;
 use xudo_backend::enrol::{EnrolRequest, Listed, managed_snippet, scan_account};
-use xudo_backend::paths_to_root::Input;
+use xudo_backend::paths_to_root::{Input, Lookup};
+use xudo_backend::snippet::{SUDOERS_PATH, names_agent_path};
 use xudo_backend::{Backend, BackendKind, identify};
 use xudo_policy::ExitCode;
 use xudo_sys::Installer;
@@ -148,6 +150,19 @@ fn enrol(
         account = plan.account,
         env = plan.env.path,
     );
+    // An agent-path install made while xudo-agent had no member could not ask
+    // the backend about the empty argument list; now there is one to ask.
+    if let Lookup::Found(bytes) = platform.host.read(Path::new(SUDOERS_PATH)) {
+        if names_agent_path(&bytes) {
+            let _ = writeln!(
+                out,
+                "The agent path is on: run `sudo xudo install --agent-path` again, so the \
+                 backend is asked whether {account} may run the passwordless helper with an \
+                 argument.",
+                account = plan.account
+            );
+        }
+    }
     ExitCode::Delegated
 }
 

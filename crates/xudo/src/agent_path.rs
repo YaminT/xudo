@@ -708,7 +708,7 @@ mod tests {
             accounts: Ok(vec!["-x".to_owned()]),
         };
         let (result, _, _) = planned_with(&odd, BackendKind::Sudo, &registry, false);
-        assert_eq!(listed_users(&result.unwrap()), ["nobody", "nobody"]);
+        assert_eq!(listed_users(&result.unwrap()), ["nobody"]);
         assert!(is_plain_name("svc-agent.1_b"));
         assert!(!is_plain_name("a b"));
     }

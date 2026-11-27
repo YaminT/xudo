@@ -5846,6 +5846,50 @@ expect = "deny"
     ];
 
     #[test]
+    fn enrolling_a_member_while_the_agent_path_is_on_asks_for_its_check() {
+        // The install that turned the path on may have had no member to ask
+        // about the empty argument list: the first enrol says to ask now.
+        let agent = xudo_backend::SudoersSnippet::with_agent_path(
+            &xudo_backend::detect(&WorkingSudoProbe).unwrap(),
+        )
+        .unwrap()
+        .contents;
+        let with_file = |text: &[u8]| {
+            agent_host(b"").dir("/etc/sudoers.d", 0, 0, 0o750).file(
+                "/etc/sudoers.d/xudo",
+                0,
+                0,
+                0o440,
+                text,
+            )
+        };
+        // The human-only file, or none: the path is off, nothing to ask.
+        for (host, asked) in [
+            (with_file(agent.as_bytes()), true),
+            (
+                with_file(b"# Managed by xudo.\n%xudo ALL=(root) PASSWD: XUDO_AUTH\n"),
+                false,
+            ),
+            (agent_host(b""), false),
+        ] {
+            let installer = ScriptedInstaller::answering(vec![]);
+            *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+            *installer.agent.apply.borrow_mut() = Some(Ok(()));
+            let (code, out, err) = run_agent(&host, &WorkingSudoProbe, &installer, &ENROL);
+            assert_eq!(code, ExitCode::Delegated, "{err}");
+            assert_eq!(
+                out.contains(
+                    "The agent path is on: run `sudo xudo install --agent-path` again, so the \
+                     backend is asked whether agent may run the passwordless helper with an \
+                     argument."
+                ),
+                asked,
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_enrol_prints_what_it_will_write_before_it_writes() {
         let installer = ScriptedInstaller::answering(vec![]);
         *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
