@@ -299,7 +299,8 @@ pub enum Command {
     /// Enrol, list or remove a harness that runs as its own account.
     ///
     /// `enrol` and `remove` need root, like `install`, and grant nothing: an
-    /// enrolled harness still asks for the sudo password for every command.
+    /// enrolled harness takes the password path for every command until a
+    /// rule grants it one and root has run `xudo install --agent-path`.
     Agent {
         /// What to do.
         #[command(subcommand)]
