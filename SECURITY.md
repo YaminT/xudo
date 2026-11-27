@@ -25,6 +25,12 @@ user manager) can attach to the harness and act from inside its scope, so
 off; it takes effect only after `sudo sysctl --system` or reboot, and then the
 install turns the path on.
 
+`xudo watch` requires only a different session, a different terminal and a
+pty or virtual console for a watcher of the requester's own uid: a process of
+that uid can open a pty in a new session and answer its own prompt. Treat a
+watch approval as an extra check on the human path; the password at `-auth`
+still applies.
+
 ## Security boundary
 
 The policy boundary is the root-owned rules and their argument matchers. The

@@ -26,6 +26,14 @@ password-authenticated path.
 2. **No caller gets passwordless root by mistake or by default.** A command runs without a password only when the kernel attests the caller is inside a root-registered harness scope **and** a root-written rule allows that exact command for that harness. Everything else (a human, an unattested caller, a process that left its scope, a command no rule allows) takes the human path, where the machine's own `sudo` asks the password, or is denied. Misclassification may only withhold. Nothing the agent may run is closed to the human path.
 3. **A human decision is made where the requester cannot answer it.** Anything that needs a human (an `ido` entry, or the optional `xudo watch` check on the human path) is decided by the human on a channel the requesting process tree cannot answer: never from its stdin, stdout, or `/dev/tty`. "Needs a human" never resolves by itself; with no human, it does not run.
 
+What `xudo watch` checks is narrower than invariant 3 reads. The broker
+accepts a watcher of the requester's own uid in a different session on a
+different terminal (a pty or a virtual console), and nothing more: a process of
+that uid can open a pty in a new session and answer its own prompt. A watch
+approval is an extra check, not proof of a human; on the human path the
+password at `-auth` still applies, and the requester cannot supply it without
+the secret.
+
 ## Components and trust
 
 - `xudo` is the unprivileged CLI used by people and harnesses.
@@ -121,7 +129,9 @@ Human requests that match ordinary allow rules use the password-authenticated
 gate. The optional `xudo watch` flow can provide an extra human confirmation
 where policy requires it; it is not required for the passwordless harness
 path. No agent can answer a human confirmation from its own terminal or
-process tree.
+process tree, though a process of the requester's own uid can open a pty in a
+new session and answer a watch prompt there; the password at `-auth` still
+applies.
 
 ### Typed `remove-path`
 

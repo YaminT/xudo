@@ -444,6 +444,28 @@ fn public_docs_pin_correct_queue_freeze_session_and_audit_limits() {
 }
 
 #[test]
+fn public_docs_say_a_same_uid_process_can_answer_a_watch_prompt() {
+    // The watcher must only be in another session on another terminal: a
+    // process of the requester's uid can openpty and setsid. The docs must
+    // not promise more, and must say the password still applies.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in ["howiwork.md", "SECURITY.md", "docs/man/xudo.1"] {
+        let flat = flatten_claim(&fs::read_to_string(root.join(file)).unwrap());
+        assert!(
+            flat.contains("can open a pty in a new session and answer"),
+            "{file}"
+        );
+    }
+    for file in ["howiwork.md", "SECURITY.md"] {
+        let flat = flatten_claim(&fs::read_to_string(root.join(file)).unwrap());
+        assert!(
+            flat.contains("the password at -auth still applies"),
+            "{file}"
+        );
+    }
+}
+
+#[test]
 fn public_docs_say_the_agent_path_refuses_at_ptrace_scope_zero() {
     // At 0 a process of the service account outside its unit (an SSH key
     // login, a cron job) can attach to the harness: the docs once said such

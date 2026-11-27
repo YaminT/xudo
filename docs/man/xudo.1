@@ -279,8 +279,11 @@ answer. A line shows the canonical command, governing rule, classification,
 evidence, time left, and the action's final word. Type that word to approve,
 or
 .B n
-to deny. Approval still requires the command's password. Input typed before
-the prompt is flushed; a rejected answer leaves the request pending.
+to deny. Approval still requires the command's password. The broker accepts a
+watcher of the requester's own uid in another session on another terminal, so
+a process of that uid can open a pty in a new session and answer; the password
+is what it cannot supply. Input typed before the prompt is flushed; a rejected
+answer leaves the request pending.
 .TP
 .B pending
 List this user's pending confirmation requests without answering them.
