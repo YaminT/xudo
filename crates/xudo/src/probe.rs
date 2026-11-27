@@ -162,6 +162,33 @@ impl InstallProbe for BrokerProbe<'_> {
         }
     }
 
+    /// Asks the backend whether it lists the passwordless helper. Listed is a
+    /// zero status, which `-l` with a command gives only when it would run
+    /// it; a refusal is non-zero whatever it prints, and may name the helper
+    /// as it refuses. A backend that cannot be run could not be asked.
+    fn not_listed(&self, plan: &[String]) -> ProbeResult {
+        let Some((backend, rest)) = plan.split_first() else {
+            return ProbeResult::Unavailable {
+                reason: "the plan names nothing to run".to_owned(),
+            };
+        };
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        match self.runner.run(backend, &rest, None) {
+            Ok(out) if out.success => ProbeResult::Failed {
+                reason: format!(
+                    "`{}` lists the passwordless helper (status {:?}): {}",
+                    plan.join(" "),
+                    out.code,
+                    out.stdout.trim()
+                ),
+            },
+            Ok(_) => ProbeResult::Verified,
+            Err(why) => ProbeResult::Unavailable {
+                reason: format!("{backend} could not be run: {why}"),
+            },
+        }
+    }
+
     fn verify(&self, plan: &[String]) -> ProbeResult {
         let unavailable = |reason: String| ProbeResult::Unavailable { reason };
         let Some((backend, rest)) = plan.split_first() else {
@@ -237,6 +264,7 @@ mod tests {
     use std::cell::RefCell;
     use std::os::unix::net::UnixListener;
 
+    use xudo_backend::snippet::GATE_NOPASS;
     use xudo_policy::{Decision, DenialCode, Verdict};
     use xudo_sys::{Output, SysError};
     use xudo_wire::{BrokerResponse, Minted, RefusalCode};
@@ -424,7 +452,7 @@ mod tests {
             runner: &gate,
             files: &files,
         };
-        let nopass = ["/usr/bin/sudo", "-n", xudo_backend::snippet::GATE_NOPASS].map(String::from);
+        let nopass = ["/usr/bin/sudo", "-n", GATE_NOPASS].map(String::from);
         let result = probe.refuses(&nopass);
         let ran = gate.1.borrow().clone();
         (result, ran)
@@ -476,6 +504,62 @@ mod tests {
             "{result:?}"
         );
         assert!(unavailable(&probe.refuses(&[])).contains("names nothing"));
+    }
+
+    /// What the listing check makes of one answer from the backend.
+    fn listing_of(answer: Result<Output, ()>) -> (ProbeResult, Vec<String>) {
+        let gate = Gate(answer, RefCell::default());
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let argv = ["/usr/bin/sudo-rs", "-n", "-l", "-U", "nobody", GATE_NOPASS].map(String::from);
+        let result = probe.not_listed(&argv);
+        let ran = gate.1.borrow().clone();
+        (result, ran)
+    }
+
+    fn output(success: bool, stdout: &str) -> Output {
+        Output {
+            success,
+            code: Some(i32::from(!success)),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_helper_the_backend_lists_is_a_failed_check() {
+        // A zero status is a listing, whatever is printed.
+        let (result, ran) = listing_of(Ok(output(true, "")));
+        assert!(format!("{result:?}").starts_with("Failed"), "{result:?}");
+        assert_eq!(
+            ran,
+            [format!("/usr/bin/sudo-rs -n -l -U nobody {GATE_NOPASS}")]
+        );
+        // A refusal may name the helper as it refuses; it is still a refusal.
+        for stdout in [
+            "",
+            &format!("Sorry, user nobody may not run {GATE_NOPASS}\n"),
+        ] {
+            let (result, _) = listing_of(Ok(output(false, stdout)));
+            assert_eq!(result, ProbeResult::Verified);
+        }
+    }
+
+    #[test]
+    fn a_listing_the_backend_could_not_be_asked_for_is_not_a_pass() {
+        let (result, _) = listing_of(Err(()));
+        assert!(
+            unavailable(&result).contains("could not be run"),
+            "{result:?}"
+        );
+        let gate = printed("", false);
+        let probe = BrokerProbe::live(&gate);
+        assert!(unavailable(&probe.not_listed(&[])).contains("names nothing"));
     }
 
     #[test]

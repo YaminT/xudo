@@ -638,15 +638,43 @@ as a caller it cannot attest, and stops unless the helper refuses.
 It also stops, naming the line, when any other sudo or doas line names the
 group
 .BR xudo\-agent ,
-the helper, or an include it cannot follow, and it never replaces
+one of the aliases
+.BR XUDO_NOPASS ,
+.B XUDO_AUTH
+or
+.BR XUDO_SELF ,
+a path under
+.I /usr/libexec/xudo
+or a wildcard that reaches the helper, or an include it cannot follow.
+It stops when the helper or a directory above it is not root's, is writable
+by its group or by everyone, or is a symbolic link, or the helper has a second
+name; and when an account is in
+.B xudo\-agent
+(listed, or by its primary group) that no harness in the registry names.
+It never replaces
 .I /etc/sudoers.d/xudo
-when that file names the agent path but is not byte for byte xudo's text.
+when that file names the agent path but is not byte for byte xudo's text, and
+it checks for edits before it creates a group.
+After the rename it runs
+.B visudo \-c \-f /etc/sudoers
+on the whole configuration and asks the backend
+.RB ( "sudo \-l \-U" )
+that the helper is not listed for
+.BR nobody ,
+nor with an argument for a member of the group.
+Any of those failing, or a functional probe that runs and fails, puts back
+what the install replaced and exits
+.BR 19 .
+A probe that cannot run here is reported on a
+.B could not verify:
+line, and the install exits 0.
 A plain
 .B xudo install
 (which a package upgrade runs) writes the human-only file again and turns the
 agent path off;
 .B xudo install \-\-uninstall
-removes it with everything else, and refuses to remove an edited file.
+removes it with everything else, and refuses to remove an edited
+.IR /etc/sudoers.d/xudo .
 .B xudo doctor
 says whether the agent path is on and whether its text is exact.
 .IP
@@ -661,9 +689,14 @@ which prints the diff and writes
 .I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
 setting it to 1.
 That file is written only with the flag and only while the live value is 0,
-so it never lowers a higher value, and
+so it never lowers a higher value.
+xudo does not apply it: it takes effect with
+.B sudo sysctl \-\-system
+or at boot, and only when no file read after it sets the value; the install
+warns about each such line.
 .B \-\-uninstall
-removes it.
+removes it, after the sudoers file, and leaves it with a warning when it was
+edited.
 .TP
 .B audit
 Verify that a hash-chained log has not been edited in place.

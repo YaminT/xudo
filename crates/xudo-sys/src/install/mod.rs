@@ -33,7 +33,15 @@
 //!   show the helper refusing a caller it cannot attest stops the run. The
 //!   agent-path plan puts it first, so nothing has been written.
 //! * **An edited file is left alone.** A `RefuseEdited` step reads the file and
-//!   stops when it holds an edit (`xudo_backend::plan::edited`).
+//!   stops when it holds an edit (`xudo_backend::plan::edited`). A
+//!   `RemoveUnlessEdited` step leaves such a file in place with a warning
+//!   instead, so an uninstall still removes the passwordless line.
+//! * **All or nothing, once a plan checks the whole configuration.** A plan
+//!   with a `ValidateWhole` step records what each file it installs replaced.
+//!   Any failure after an install restores those files: the whole-config check
+//!   failing, a `MustNotList` probe finding the helper listed, or a functional
+//!   probe that ran and failed. A probe that cannot run is reported as such
+//!   and restores nothing.
 //!
 //! * **Validate before install, structurally.** An `Install` step is refused
 //!   unless the candidate it names was written by this run and validated by
@@ -298,6 +306,38 @@ pub enum InstallError {
         /// How it was told apart.
         reason: &'static str,
     },
+    /// The backend rejected its whole configuration once xudo's file was in
+    /// place, though it accepted the file alone.
+    #[error("the backend rejected its whole configuration with xudo's file in place: {detail}")]
+    WholeRejected {
+        /// What the validator said.
+        detail: String,
+    },
+    /// A post-install check ran and showed the install wrong.
+    #[error("a check after the install failed: {reason}")]
+    ProbeFailed {
+        /// What it saw.
+        reason: String,
+    },
+    /// A failure after an install, with every installed file restored.
+    #[error("{cause}; every file this run installed was restored to what it was before")]
+    RolledBack {
+        /// The failure.
+        cause: Box<InstallError>,
+    },
+    /// A failure after an install, and a file that could not be restored.
+    #[error(
+        "{cause}; and then {path} could not be restored: {reason}. Check it by hand before \
+         relying on sudo"
+    )]
+    NotRolledBack {
+        /// The file.
+        path: String,
+        /// Why not.
+        reason: String,
+        /// The failure.
+        cause: Box<InstallError>,
+    },
     /// A read-back asked to stand in for a parser where one exists.
     #[error(
         "refusing to read back {path} in place of a parser: only the sysctl drop-in has no \
@@ -337,6 +377,15 @@ pub trait InstallProbe {
     fn refuses(&self, _argv: &[String]) -> ProbeResult {
         ProbeResult::Unavailable {
             reason: "this probe cannot run the passwordless helper".to_owned(),
+        }
+    }
+
+    /// Asks the backend, through `argv`, whether it lists the passwordless
+    /// helper. [`ProbeResult::Verified`] when it does not; [`ProbeResult::Failed`]
+    /// when it does; unavailable when it could not be asked.
+    fn not_listed(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "this probe cannot ask the backend".to_owned(),
         }
     }
 }
@@ -687,7 +736,13 @@ pub fn execute(
     for step in &plan.steps {
         preflight(step)?;
     }
-    let mut run = Run::default();
+    let mut run = Run {
+        transactional: plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, PlanStep::ValidateWhole { .. })),
+        ..Run::default()
+    };
     match run.steps(plan, ops, probe) {
         Ok(()) => Ok(run.report(plan.backend)),
         Err(error) => Err(run.abandon(ops, error)),
@@ -811,7 +866,23 @@ fn preflight(step: &PlanStep) -> Result<(), InstallError> {
         }
         PlanStep::AppendBlock { path, .. }
         | PlanStep::Remove { path }
+        | PlanStep::RemoveUnlessEdited { path }
         | PlanStep::RefuseEdited { path } => managed(path),
+        PlanStep::ValidateWhole { argv } => {
+            if !argv.first().is_some_and(|exe| exe.starts_with('/')) {
+                return Err(InstallError::BadValidator {
+                    argv: argv.clone(),
+                    reason: "the validator must be an absolute path",
+                });
+            }
+            if argv.iter().any(|arg| arg == CANDIDATE_PLACEHOLDER) {
+                return Err(InstallError::BadValidator {
+                    argv: argv.clone(),
+                    reason: "a whole-configuration check names no candidate",
+                });
+            }
+            Ok(())
+        }
         PlanStep::ReadBack { candidate } => {
             if candidate.strip_suffix(".candidate") == Some(PTRACE_DROP_IN_PATH) {
                 Ok(())
@@ -823,6 +894,7 @@ fn preflight(step: &PlanStep) -> Result<(), InstallError> {
         }
         PlanStep::FunctionalProbe { .. }
         | PlanStep::Notice { .. }
+        | PlanStep::MustNotList { .. }
         | PlanStep::RefusalProbe { .. } => Ok(()),
     }
 }
@@ -841,6 +913,11 @@ struct Run {
     validated: bool,
     armed: Option<Vec<String>>,
     wrote: bool,
+    /// Whether a failure after an install restores what it replaced.
+    transactional: bool,
+    /// Each file installed by a transactional run, last last, with what it
+    /// replaced: `None` when nothing was there.
+    installed: Vec<(String, Option<Vec<u8>>)>,
     events: Vec<String>,
     notices: Vec<String>,
     verification: Option<Verification>,
@@ -909,23 +986,7 @@ impl Run {
                     reason: reason.clone(),
                 });
             }
-            PlanStep::Install { from, to } => {
-                let candidate = self.candidate.as_ref().filter(|c| c.path == *from).ok_or(
-                    InstallError::OutOfOrder {
-                        reason: "an install of a file this run did not write as a candidate",
-                    },
-                )?;
-                if !self.validated {
-                    return Err(InstallError::OutOfOrder {
-                        reason: "an install before the candidate was validated",
-                    });
-                }
-                ops.install(from, to, candidate.identity)?;
-                self.candidate = None;
-                self.validated = false;
-                self.wrote = true;
-                self.events.push(format!("installed {to}"));
-            }
+            PlanStep::Install { from, to } => self.install(from, to, ops)?,
             PlanStep::AppendBlock { path, block } => {
                 let validator = self.armed.take().ok_or(InstallError::OutOfOrder {
                     reason: "a block appended with no validator named before it",
@@ -948,17 +1009,29 @@ impl Run {
                     Removal::Absent => format!("{path} was not present"),
                 });
             }
-            PlanStep::FunctionalProbe { argv, .. } => {
-                self.verification = Some(match probe.verify(argv) {
-                    ProbeResult::Verified => Verification::Verified,
-                    ProbeResult::Unavailable { reason } => Verification::Unverified { reason },
-                    // It ran and the answer was wrong. The snippet passed the
-                    // backend's own parser, so it stays; the operator is told.
-                    ProbeResult::Failed { reason } => Verification::Unverified {
-                        reason: format!("the probe ran and failed: {reason}"),
-                    },
-                });
+            PlanStep::FunctionalProbe { argv, .. } => self.functional_probe(argv, probe)?,
+            PlanStep::ValidateWhole { argv } => {
+                ops.validate(argv).map_err(|error| match error {
+                    InstallError::ValidatorRejected { detail } => {
+                        InstallError::WholeRejected { detail }
+                    }
+                    other => other,
+                })?;
+                self.events.push(format!(
+                    "the backend parsed its whole configuration: {}",
+                    argv.join(" ")
+                ));
             }
+            PlanStep::MustNotList { argv, expectation } => match probe.not_listed(argv) {
+                ProbeResult::Verified => self.events.push(format!("verified: {expectation}")),
+                ProbeResult::Unavailable { reason } => self
+                    .events
+                    .push(format!("could not verify that {expectation}: {reason}")),
+                ProbeResult::Failed { reason } => {
+                    return Err(InstallError::ProbeFailed { reason });
+                }
+            },
+            PlanStep::RemoveUnlessEdited { path } => self.remove_unless_edited(path, ops)?,
             PlanStep::Notice { text } => self.notices.push(text.clone()),
             PlanStep::RefusalProbe { argv, .. } => self.refusal_probe(argv, probe)?,
             PlanStep::RefuseEdited { path } => self.refuse_edited(path, ops)?,
@@ -997,6 +1070,92 @@ impl Run {
             });
         }
         self.events.push(format!("{path} holds no edit"));
+        Ok(())
+    }
+
+    /// An `Install` step: the candidate this run wrote and validated is
+    /// renamed into place. A transactional run first keeps what it replaces.
+    fn install(&mut self, from: &str, to: &str, ops: &dyn InstallOps) -> Result<(), InstallError> {
+        let candidate =
+            self.candidate
+                .as_ref()
+                .filter(|c| c.path == from)
+                .ok_or(InstallError::OutOfOrder {
+                    reason: "an install of a file this run did not write as a candidate",
+                })?;
+        if !self.validated {
+            return Err(InstallError::OutOfOrder {
+                reason: "an install before the candidate was validated",
+            });
+        }
+        let identity = candidate.identity;
+        let replaced = if self.transactional {
+            Some(ops.read_managed(to)?)
+        } else {
+            None
+        };
+        ops.install(from, to, identity)?;
+        if let Some(replaced) = replaced {
+            self.installed.push((to.to_owned(), replaced));
+        }
+        self.candidate = None;
+        self.validated = false;
+        self.wrote = true;
+        self.events.push(format!("installed {to}"));
+        Ok(())
+    }
+
+    /// A `FunctionalProbe` step.
+    fn functional_probe(
+        &mut self,
+        argv: &[String],
+        probe: &dyn InstallProbe,
+    ) -> Result<(), InstallError> {
+        self.verification = Some(match probe.verify(argv) {
+            ProbeResult::Verified => Verification::Verified,
+            ProbeResult::Unavailable { reason } => Verification::Unverified { reason },
+            // It ran and the answer was wrong: an all-or-nothing run
+            // restores what it installed.
+            ProbeResult::Failed { reason } if self.transactional => {
+                return Err(InstallError::ProbeFailed {
+                    reason: format!("the functional probe ran and failed: {reason}"),
+                });
+            }
+            // Otherwise the snippet passed the backend's own parser, so it
+            // stays; the operator is told.
+            ProbeResult::Failed { reason } => Verification::Unverified {
+                reason: format!("the probe ran and failed: {reason}"),
+            },
+        });
+        Ok(())
+    }
+
+    /// A `RemoveUnlessEdited` step: remove the file, or leave an edited one
+    /// (one without xudo's marker included) and warn.
+    fn remove_unless_edited(
+        &mut self,
+        path: &str,
+        ops: &dyn InstallOps,
+    ) -> Result<(), InstallError> {
+        let edited = match ops.read_managed(path) {
+            Ok(bytes) => bytes
+                .and_then(|bytes| xudo_backend::plan::edited(path, &bytes))
+                .map(str::to_owned),
+            Err(InstallError::NotOurs { reason, .. }) => Some(reason),
+            Err(other) => return Err(other),
+        };
+        if let Some(reason) = edited {
+            self.notices.push(format!(
+                "WARNING: {path} was left in place: {reason}. Everything else was removed; \
+                 remove or restore it by hand."
+            ));
+            return Ok(());
+        }
+        let removal = ops.remove_managed(path)?;
+        self.events.push(match removal {
+            Removal::Removed => format!("removed {path}"),
+            Removal::Absent => format!("{path} was not present"),
+        });
         Ok(())
     }
 
@@ -1056,7 +1215,9 @@ impl Run {
         Ok(())
     }
 
-    /// Cleans up after `error`, and returns what to report.
+    /// Cleans up after `error`, and returns what to report: the candidate is
+    /// discarded, and in a transactional run every installed file is put back
+    /// as it was, last first.
     fn abandon(&mut self, ops: &dyn InstallOps, error: InstallError) -> InstallError {
         let mut error = error;
         if let Some(candidate) = self.candidate.take() {
@@ -1068,7 +1229,28 @@ impl Run {
                 };
             }
         }
-        error
+        if self.installed.is_empty() {
+            return error;
+        }
+        let mut failed = None;
+        while let Some((path, replaced)) = self.installed.pop() {
+            let restored = match &replaced {
+                Some(bytes) => restore(ops, &path, bytes),
+                None => ops.remove_managed(&path).map(|_| ()),
+            };
+            if let Err(why) = restored {
+                failed.get_or_insert((path, why.to_string()));
+            }
+        }
+        let cause = Box::new(error);
+        match failed {
+            None => InstallError::RolledBack { cause },
+            Some((path, reason)) => InstallError::NotRolledBack {
+                path,
+                reason,
+                cause,
+            },
+        }
     }
 
     fn report(self, backend: BackendKind) -> InstallReport {
@@ -1087,6 +1269,18 @@ impl Run {
             verification,
         }
     }
+}
+
+/// Puts `bytes`, what an install replaced, back at `path`: written beside it
+/// and renamed over it, as every install is. Not validated again: it is the
+/// configuration the backend was reading before this run.
+fn restore(ops: &dyn InstallOps, path: &str, bytes: &[u8]) -> Result<(), InstallError> {
+    let candidate = format!("{path}.candidate");
+    let identity = ops.write_candidate(&candidate, bytes, 0o440)?;
+    ops.install(&candidate, path, identity).inspect_err(|_| {
+        // The rename failed and the restore with it; the candidate is ours.
+        let _ = ops.discard(&candidate, identity);
+    })
 }
 
 /// `argv` with the candidate's path in place of the placeholder.

@@ -15,7 +15,7 @@ const WRITTEN: FileIdentity = FileIdentity {
 pub(super) struct FakeInstallOps {
     uid: u32,
     calls: RefCell<Vec<String>>,
-    failures: BTreeMap<&'static str, InstallError>,
+    failures: BTreeMap<&'static str, (usize, InstallError)>,
     group: bool,
     present: RefCell<BTreeSet<String>>,
     identity: FileIdentity,
@@ -56,7 +56,7 @@ impl FakeInstallOps {
                 name: "xudo".to_owned(),
                 reason: "scripted".to_owned(),
             },
-            "validate" => InstallError::ValidatorRejected {
+            "validate" | "validate_whole" => InstallError::ValidatorRejected {
                 detail: "scripted".to_owned(),
             },
             _ => InstallError::Io {
@@ -68,8 +68,18 @@ impl FakeInstallOps {
         self.failing_with(method, error)
     }
 
-    pub(super) fn failing_with(mut self, method: &'static str, error: InstallError) -> Self {
-        self.failures.insert(method, error);
+    pub(super) fn failing_with(self, method: &'static str, error: InstallError) -> Self {
+        self.failing_from(method, 0, error)
+    }
+
+    /// Makes `method` fail from its call after the first `succeed` on.
+    pub(super) fn failing_from(
+        mut self,
+        method: &'static str,
+        succeed: usize,
+        error: InstallError,
+    ) -> Self {
+        self.failures.insert(method, (succeed, error));
         self
     }
 
@@ -98,10 +108,19 @@ impl FakeInstallOps {
     }
 
     fn record(&self, method: &'static str, detail: &str) -> Result<(), InstallError> {
+        let before = self
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.split(' ').next() == Some(method))
+            .count();
         self.calls
             .borrow_mut()
             .push(format!("{method} {detail}").trim_end().to_owned());
-        self.failures.get(method).map_or(Ok(()), |e| Err(e.clone()))
+        match self.failures.get(method) {
+            Some((succeed, error)) if before >= *succeed => Err(error.clone()),
+            _ => Ok(()),
+        }
     }
 
     fn removal(&self, path: &str) -> Removal {
@@ -141,8 +160,16 @@ impl InstallOps for FakeInstallOps {
         Ok(WRITTEN)
     }
 
+    /// A validator that names a candidate is `validate`; one that does not
+    /// checks the whole configuration and is `validate_whole`, so a test can
+    /// fail the one and not the other.
     fn validate(&self, argv: &[String]) -> Result<(), InstallError> {
-        self.record("validate", &argv.join(" "))
+        let method = if argv.iter().any(|arg| arg.ends_with(".candidate")) {
+            "validate"
+        } else {
+            "validate_whole"
+        };
+        self.record(method, &argv.join(" "))
     }
 
     fn identity(&self, path: &str) -> Result<FileIdentity, InstallError> {

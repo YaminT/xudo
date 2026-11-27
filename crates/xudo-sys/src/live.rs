@@ -168,6 +168,7 @@ fn meta_of(meta: &std::fs::Metadata) -> Meta {
         gid: meta.gid(),
         mode: meta.mode() & 0o7777,
         kind,
+        nlink: meta.nlink(),
     }
 }
 

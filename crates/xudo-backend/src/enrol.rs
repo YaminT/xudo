@@ -349,14 +349,14 @@ pub fn env_path(label: &str) -> String {
 }
 
 /// One account line of `/etc/passwd`.
-struct Passwd<'a> {
-    name: &'a [u8],
+pub(crate) struct Passwd<'a> {
+    pub(crate) name: &'a [u8],
     password: &'a [u8],
     uid: u32,
-    gid: u32,
+    pub(crate) gid: u32,
 }
 
-fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
+pub(crate) fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
     bytes
         .split(|byte| *byte == b'\n')
         .filter_map(|line| {
@@ -374,7 +374,7 @@ fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
         .collect()
 }
 
-fn number(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn number(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
@@ -504,21 +504,21 @@ fn with_membership(group_file: &[u8], account: &str) -> Vec<u8> {
 pub use crate::snippet::managed_agent_snippet as managed_snippet;
 
 /// Whether the sudoers file xudo manages is root's alone (a regular file, uid
-/// 0, no group or world write) and holds exactly `managed` or the human-only
-/// text that ships. Both name `%xudo`; nothing else is exempt.
+/// 0, no group or world write) and holds exactly one of xudo's two texts, for
+/// the backend version its own header names ([`crate::snippet::recognize`],
+/// the reader `xudo doctor` uses): after a sudo upgrade the file an older
+/// version wrote is still xudo's. Both name `%xudo`; nothing else is exempt.
+/// `managed` is `None` where xudo writes no sudoers file (doas, no backend).
 fn managed_installed(host: &dyn HostView, managed: Option<&str>) -> bool {
-    let Some(text) = managed else {
-        return false;
-    };
     let trusted = matches!(
         host.stat(Path::new(SUDOERS_PATH)),
         Lookup::Found(meta) if meta.kind == Kind::File && meta.uid == 0 && meta.mode & 0o022 == 0
     );
-    trusted
+    managed.is_some()
+        && trusted
         && matches!(
             host.read(Path::new(SUDOERS_PATH)),
-            Lookup::Found(bytes)
-                if bytes == text.as_bytes() || bytes == crate::snippet::human_only_form(text).as_bytes()
+            Lookup::Found(bytes) if crate::snippet::recognize(&bytes).is_some()
         )
 }
 

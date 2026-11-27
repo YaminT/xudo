@@ -89,7 +89,10 @@ fi
 
 # 2b. The opt-in agent path's plan: refused on doas and where nothing usable
 #     exists; elsewhere exactly one passwordless line, and the file as it would
-#     land handed to the backend's own parser like the default one.
+#     land handed to the backend's own parser like the default one. The
+#     helper goes where the package puts it first: a missing one is refused.
+install -d -m 755 /usr/libexec/xudo
+install -m 755 /bins/xudo-gate /usr/libexec/xudo/xudo-gate-nopass
 set +e
 run_xudo install --agent-path --dry-run --show-contents >"$out/agent-path.txt" 2>&1
 rc=$?

@@ -2,11 +2,14 @@
 //! hands the executor the opt-in plan.
 //!
 //! The plan itself is `xudo_backend::InstallPlan::with_agent_path`, and the
-//! executor runs its refusal probe and edit checks. What is decided here reads
-//! the machine: doas is refused, any other sudo or doas line that names the
-//! agent group or the passwordless helper stops the install, and the host's
-//! `kernel.yama.ptrace_scope` decides what `--raise-ptrace-scope` writes
-//! (OD9 f-b). It never lowers a value and never writes without the flag.
+//! executor runs its refusal probe, edit checks and post-write checks. What is
+//! decided here reads the machine: doas is refused; any other sudo or doas
+//! line that names the agent group, xudo's aliases or its helpers stops the
+//! install, as does a helper file or directory above it that is not root's
+//! alone, and an account in the agent group that no harness in the registry
+//! names; and the host's `kernel.yama.ptrace_scope` decides what
+//! `--raise-ptrace-scope` writes (OD9 f-b). It never lowers a value and never
+//! writes without the flag.
 
 use std::io::Write;
 use std::path::Path;
@@ -33,6 +36,36 @@ pub(crate) enum SessionHarness {
     None,
     /// The registry could not be read, so nobody can say.
     Unknown(String),
+}
+
+/// What `--agent-path` needs from the harness registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Registry {
+    /// Whether a session-way harness is registered.
+    pub(crate) session: SessionHarness,
+    /// Every account a harness names (a service account, or a user who may
+    /// start a session), or why the registry could not be read.
+    pub(crate) accounts: Result<Vec<String>, String>,
+}
+
+/// What the loaded rules say about the registry.
+pub(crate) fn registry(loaded: Result<&LoadedRules, &LoadError>) -> Registry {
+    let accounts = match loaded {
+        Err(error) => Err(error.to_string()),
+        Ok(rules) => match rules.registry_fault() {
+            Some(fault) => Err(fault.to_owned()),
+            None => Ok(rules
+                .harnesses()
+                .entries()
+                .flat_map(|entry| entry.account.iter().chain(&entry.users))
+                .cloned()
+                .collect()),
+        },
+    };
+    Registry {
+        session: session_harness(loaded),
+        accounts,
+    }
 }
 
 /// What the loaded rules say about session-way harnesses.
@@ -75,7 +108,7 @@ pub(crate) fn ptrace_scope(host: &dyn HostView) -> Result<u8, String> {
 pub(crate) fn plan(
     host: &dyn HostView,
     backend: &Backend,
-    session: &SessionHarness,
+    registry: &Registry,
     raise: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -84,15 +117,33 @@ pub(crate) fn plan(
         let _ = writeln!(err, "xudo: refusing --agent-path: {AGENT_PATH_SUDO_ONLY}");
         return Err(ExitCode::Unusable);
     }
-    let conflicts = xudo_backend::agent_path::conflicts(host);
-    if !conflicts.is_empty() {
-        for conflict in &conflicts {
-            let _ = writeln!(err, "xudo: refusing --agent-path: {conflict}");
+    let session = &registry.session;
+    let mut refusals = xudo_backend::agent_path::conflicts(host);
+    refusals.extend(
+        xudo_backend::agent_path::gate_faults(host)
+            .into_iter()
+            .map(|fault| format!("the passwordless helper cannot be trusted: {fault}")),
+    );
+    let member = match xudo_backend::agent_path::agent_members(host) {
+        Err(why) => {
+            refusals.push(format!("the members of xudo-agent cannot be known: {why}"));
+            None
+        }
+        Ok(members) => {
+            refusals.extend(unnamed(&members, &registry.accounts));
+            members.into_iter().find(|name| is_plain_name(name))
+        }
+    };
+    if !refusals.is_empty() {
+        for refusal in &refusals {
+            let _ = writeln!(err, "xudo: refusing --agent-path: {refusal}");
         }
         let _ = writeln!(
             err,
-            "xudo: xudo's line must be the only one for the agent group and the passwordless \
-             helper; change or remove those, then run the install again. Nothing was written."
+            "xudo: xudo's line must be the only one for the agent group, its aliases and its \
+             helpers, the helper must be root's alone, and only registered accounts may be in \
+             the agent group; fix each of these, then run the install again. Nothing was \
+             written."
         );
         return Err(ExitCode::Unusable);
     }
@@ -132,10 +183,19 @@ pub(crate) fn plan(
         }
         let _ = writeln!(
             out,
-            "The value takes effect at the next boot, or now with `sudo sysctl --system`."
+            "xudo writes this file and does not apply it: it takes effect with \
+             `sudo sysctl --system` or at boot, and only if no file read after it sets the \
+             value too."
         );
+        for setting in later_ptrace_settings(host) {
+            let _ = writeln!(
+                err,
+                "xudo: warning: {setting}, so the drop-in does not decide the value and the \
+                 scope may stay at 0"
+            );
+        }
     }
-    agent_plan_for(backend, raise).map_err(|reason| {
+    agent_plan_for(backend, raise, member.as_deref()).map_err(|reason| {
         let _ = writeln!(err, "xudo: no usable backend: {reason}");
         ExitCode::Unusable
     })
@@ -143,8 +203,107 @@ pub(crate) fn plan(
 
 /// The opt-in plan, with its failure as text. Detection refuses a backend
 /// that cannot be given a snippet first, so only a test reaches the error.
-fn agent_plan_for(backend: &Backend, raise: bool) -> Result<InstallPlan, String> {
-    InstallPlan::with_agent_path(backend, raise).map_err(|source| source.to_string())
+fn agent_plan_for(
+    backend: &Backend,
+    raise: bool,
+    member: Option<&str>,
+) -> Result<InstallPlan, String> {
+    InstallPlan::with_agent_path(backend, raise, member).map_err(|source| source.to_string())
+}
+
+/// One refusal per member of the agent group that no harness names. Only
+/// `enrol` adds an account to the group; one that is in it otherwise reaches
+/// the passwordless helper with no password, and nothing registered it.
+fn unnamed(members: &[String], accounts: &Result<Vec<String>, String>) -> Vec<String> {
+    members
+        .iter()
+        .filter_map(|member| match accounts {
+            Ok(named) if named.contains(member) => None,
+            Ok(_) => Some(format!(
+                "{member} is in xudo-agent and no harness in the registry names it; only \
+                 `xudo agent enrol` adds an account to that group"
+            )),
+            Err(why) => Some(format!(
+                "{member} is in xudo-agent and the registry could not be read ({why}), so \
+                 nothing shows the account belongs there"
+            )),
+        })
+        .collect()
+}
+
+/// Whether `name` is safe to pass to the backend as a user name: one word
+/// that cannot be read as an option.
+fn is_plain_name(name: &str) -> bool {
+    !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+/// Where sysctl settings are read from, in systemd-sysctl's order of
+/// precedence: a file in an earlier directory hides one of the same name in a
+/// later one, and the files are applied in name order, the last one winning.
+const SYSCTL_DIRS: [&str; 4] = [
+    "/etc/sysctl.d",
+    "/run/sysctl.d",
+    "/usr/local/lib/sysctl.d",
+    "/usr/lib/sysctl.d",
+];
+
+/// Every setting of `kernel.yama.ptrace_scope` read after xudo's drop-in: in
+/// a `.conf` file whose name sorts after it, or in `/etc/sysctl.conf`, which
+/// `sysctl --system` reads last. One entry per line, and one per file or
+/// directory that could not be read. Warned about, never refused: such a line
+/// only keeps the scope where it is.
+fn later_ptrace_settings(host: &dyn HostView) -> Vec<String> {
+    // `rsplit` always yields at least one part.
+    let ours = PTRACE_DROP_IN_PATH.rsplit('/').next().unwrap_or_default();
+    let mut files = Vec::new();
+    let mut out = Vec::new();
+    for dir in SYSCTL_DIRS {
+        match host.list(Path::new(dir)) {
+            Lookup::Found(names) => files.extend(
+                names
+                    .iter()
+                    .filter(|name| {
+                        let name = name.as_encoded_bytes();
+                        name.ends_with(b".conf") && name > ours.as_bytes()
+                    })
+                    .map(|name| Path::new(dir).join(name)),
+            ),
+            Lookup::Missing => {}
+            Lookup::Unreadable(why) => out.push(format!("{dir} could not be examined: {why}")),
+        }
+    }
+    files.push(Path::new("/etc/sysctl.conf").to_path_buf());
+    for file in files {
+        match host.read(&file) {
+            Lookup::Found(bytes) => {
+                for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+                    let line = line.trim_ascii_start();
+                    let comment = line.first().is_some_and(|byte| b"#;".contains(byte));
+                    let names = [
+                        &b"kernel.yama.ptrace_scope"[..],
+                        b"kernel/yama/ptrace_scope",
+                    ]
+                    .iter()
+                    .any(|key| line.windows(key.len()).any(|window| window == *key));
+                    if names && !comment {
+                        out.push(format!(
+                            "{} line {} sets kernel.yama.ptrace_scope after xudo's drop-in",
+                            file.display(),
+                            index.saturating_add(1)
+                        ));
+                    }
+                }
+            }
+            Lookup::Missing => {}
+            Lookup::Unreadable(why) => {
+                out.push(format!("{} could not be examined: {why}", file.display()));
+            }
+        }
+    }
+    out
 }
 
 /// Before a plain install: if the file there now names the agent path, say
@@ -192,6 +351,11 @@ mod tests {
         .dir("/", 0, 0, 0o755)
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo-agent:x:997:\n")
+        .file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n")
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/libexec", 0, 0, 0o755)
+        .dir("/usr/libexec/xudo", 0, 0, 0o755)
+        .file(xudo_backend::snippet::GATE_NOPASS, 0, 0, 0o755, b"gate")
         .file(
             "/etc/sudoers",
             0,
@@ -210,15 +374,28 @@ mod tests {
         }
     }
 
-    /// `plan`, with what it printed.
+    /// `plan`, with what it printed, for a registry naming `agent`.
     fn planned(
         host: &MemoryHost,
         kind: BackendKind,
         session: &SessionHarness,
         raise: bool,
     ) -> (Result<InstallPlan, ExitCode>, String, String) {
+        let registry = Registry {
+            session: session.clone(),
+            accounts: Ok(vec!["agent".to_owned()]),
+        };
+        planned_with(host, kind, &registry, raise)
+    }
+
+    fn planned_with(
+        host: &MemoryHost,
+        kind: BackendKind,
+        registry: &Registry,
+        raise: bool,
+    ) -> (Result<InstallPlan, ExitCode>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let result = plan(host, &backend(kind), session, raise, &mut out, &mut err);
+        let result = plan(host, &backend(kind), registry, raise, &mut out, &mut err);
         (
             result,
             String::from_utf8(out).unwrap(),
@@ -350,7 +527,7 @@ mod tests {
             ..backend(BackendKind::Sudo)
         };
         assert!(
-            agent_plan_for(&crippled, false)
+            agent_plan_for(&crippled, false, None)
                 .unwrap_err()
                 .contains("cannot generate")
         );
@@ -358,7 +535,10 @@ mod tests {
         let result = plan(
             &host(Some(b"1")),
             &crippled,
-            &SessionHarness::None,
+            &Registry {
+                session: SessionHarness::None,
+                accounts: Ok(Vec::new()),
+            },
             false,
             &mut out,
             &mut err,
@@ -395,7 +575,7 @@ mod tests {
     }
 
     /// A rules directory beside a `harnesses.d` holding `entries`.
-    fn registry(name: &str, entries: &[(&str, &str)]) -> PathBuf {
+    fn registry_dir(name: &str, entries: &[(&str, &str)]) -> PathBuf {
         let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-tmp")
             .join(format!("agent-path-{name}"));
@@ -412,16 +592,185 @@ mod tests {
     fn a_session_way_entry_is_what_counts() {
         let service = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
         let session = "label = \"dev\"\nway = \"session\"\nusers = [\"carol\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n";
-        let only_service = LoadedRules::from_dir(&registry("service", &[("codex.toml", service)]));
+        let only_service =
+            LoadedRules::from_dir(&registry_dir("service", &[("codex.toml", service)]));
         assert_eq!(session_harness(only_service.as_ref()), SessionHarness::None);
-        let both = LoadedRules::from_dir(&registry(
+        let both = LoadedRules::from_dir(&registry_dir(
             "session",
             &[("codex.toml", service), ("dev.toml", session)],
         ));
         assert_eq!(session_harness(both.as_ref()), SessionHarness::Registered);
-        let faulty = LoadedRules::from_dir(&registry("fault", &[("x.toml", "wat = 1\n")]));
+        let faulty = LoadedRules::from_dir(&registry_dir("fault", &[("x.toml", "wat = 1\n")]));
         assert!(format!("{:?}", session_harness(faulty.as_ref())).starts_with("Unknown("));
         let missing = LoadedRules::from_dir(Path::new("/xudo-test-no-such-rules"));
         assert!(format!("{:?}", session_harness(missing.as_ref())).starts_with("Unknown("));
+    }
+
+    #[test]
+    fn a_helper_anyone_but_root_could_swap_stops_the_install() {
+        let gate = xudo_backend::snippet::GATE_NOPASS;
+        for host in [
+            host(Some(b"1\n")).file(gate, 0, 1000, 0o775, b"gate"),
+            host(Some(b"1\n")).dir("/usr/libexec/xudo", 1000, 1000, 0o755),
+            host(Some(b"1\n")).hard_linked(gate),
+        ] {
+            let (result, out, err) =
+                planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+            assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+            assert!(
+                err.contains("refusing --agent-path: the passwordless helper cannot be trusted"),
+                "{err}"
+            );
+            assert!(err.contains("Nothing was written"), "{err}");
+            assert_eq!(out, "");
+        }
+    }
+
+    /// `host` with `group` as its agent-group line and an account `lurker`
+    /// whose primary gid is 990.
+    fn with_members(group: &[u8]) -> MemoryHost {
+        host(Some(b"1\n"))
+            .file("/etc/group", 0, 0, 0o644, group)
+            .file(
+                "/etc/passwd",
+                0,
+                0,
+                0o644,
+                b"agent:x:990:990::/:/bin/sh\nlurker:x:991:997::/:/bin/sh\n",
+            )
+    }
+
+    fn listed_users(plan: &InstallPlan) -> Vec<String> {
+        plan.steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::MustNotList { argv, .. } => argv.get(4).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unregistered_member_of_the_agent_group_stops_the_install_and_is_named() {
+        // Listed in /etc/group, or in it by primary gid: either way it would
+        // reach the passwordless helper, and no harness names it.
+        for (group, who) in [
+            (&b"xudo-agent:x:997:agent,mallory\n"[..], "mallory"),
+            (b"xudo-agent:x:997:agent\nlurk:x:997:\n", "lurker"),
+        ] {
+            let host = with_members(group);
+            let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+            assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+            assert!(
+                err.contains(&format!(
+                    "refusing --agent-path: {who} is in xudo-agent and no harness in the \
+                     registry names it"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_of_exactly_registered_accounts_is_accepted_and_asked_about() {
+        let host = with_members(b"xudo-agent:x:996:agent\n");
+        let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+        assert_eq!(listed_users(&result.unwrap()), ["nobody", "agent"], "{err}");
+        // A registered name that could be read as an option is never passed
+        // to the backend: nobody stands in.
+        let odd = with_members(b"xudo-agent:x:996:-x\n");
+        let registry = Registry {
+            session: SessionHarness::None,
+            accounts: Ok(vec!["-x".to_owned()]),
+        };
+        let (result, _, _) = planned_with(&odd, BackendKind::Sudo, &registry, false);
+        assert_eq!(listed_users(&result.unwrap()), ["nobody", "nobody"]);
+        assert!(is_plain_name("svc-agent.1_b"));
+        assert!(!is_plain_name("a b"));
+    }
+
+    #[test]
+    fn members_nobody_can_vouch_for_stop_the_install() {
+        // The registry could not be read: no member can be shown to belong.
+        let members = with_members(b"xudo-agent:x:996:agent\n");
+        let unread = Registry {
+            session: SessionHarness::Unknown("bad".to_owned()),
+            accounts: Err("bad registry".to_owned()),
+        };
+        let (result, _, err) = planned_with(&members, BackendKind::Sudo, &unread, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(
+            err.contains("the registry could not be read (bad registry)"),
+            "{err}"
+        );
+        // An empty group needs no registry.
+        let (result, _, _) = planned_with(&host(Some(b"1\n")), BackendKind::Sudo, &unread, false);
+        assert!(result.is_ok());
+        // The group itself could not be read: the members cannot be known.
+        let unreadable = host(Some(b"1\n")).unreadable_file("/etc/group", 0, 0, 0o600);
+        let (result, _, err) =
+            planned(&unreadable, BackendKind::Sudo, &SessionHarness::None, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(
+            err.contains("the members of xudo-agent cannot be known"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_later_sysctl_setting_is_named_and_the_drop_in_is_not_said_to_win() {
+        let host = host(Some(b"0\n"))
+            .dir("/etc/sysctl.d", 0, 0, 0o755)
+            .file(
+                "/etc/sysctl.d/10-ptrace.conf",
+                0,
+                0,
+                0o644,
+                b"# kernel.yama.ptrace_scope = 1\n; kernel.yama.ptrace_scope = 1\nkernel.yama.ptrace_scope = 0\n",
+            )
+            .file("/etc/sysctl.d/00-early.conf", 0, 0, 0o644, b"kernel.yama.ptrace_scope = 0\n")
+            .file("/etc/sysctl.d/99-notes.txt", 0, 0, 0o644, b"kernel.yama.ptrace_scope = 0\n")
+            .dir("/run", 0, 0, 0o755)
+            .unlistable_dir("/run/sysctl.d", 0, 0, 0o711)
+            .dir("/usr/lib", 0, 0, 0o755)
+            .dir("/usr/lib/sysctl.d", 0, 0, 0o755)
+            .file("/usr/lib/sysctl.d/50-x.conf", 0, 0, 0o644, b"kernel/yama/ptrace_scope=0\n")
+            .unreadable_file("/usr/lib/sysctl.d/60-y.conf", 0, 0, 0o600)
+            .file("/etc/sysctl.conf", 0, 0, 0o644, b"kernel.yama.ptrace_scope=0\n");
+        let (result, out, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, true);
+        assert!(writes_drop_in(&result.unwrap()));
+        assert!(out.contains("does not apply it"), "{out}");
+        assert!(!out.contains("next boot"), "{out}");
+        for named in [
+            "/etc/sysctl.d/10-ptrace.conf line 3 sets",
+            "/usr/lib/sysctl.d/50-x.conf line 1 sets",
+            "/usr/lib/sysctl.d/60-y.conf could not be examined",
+            "/run/sysctl.d could not be examined",
+            "/etc/sysctl.conf line 1 sets",
+        ] {
+            assert!(err.contains(named), "{named}: {err}");
+        }
+        assert!(!err.contains("00-early"), "{err}");
+        assert!(!err.contains("99-notes"), "{err}");
+        assert!(!err.contains("10-ptrace.conf line 1"), "{err}");
+        assert!(!err.contains("10-ptrace.conf line 2"), "{err}");
+    }
+
+    #[test]
+    fn every_account_a_harness_names_is_registered() {
+        let service = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let session = "label = \"dev\"\nway = \"session\"\nusers = [\"carol\", \"dave\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n";
+        let both = LoadedRules::from_dir(&registry_dir(
+            "accounts",
+            &[("codex.toml", service), ("dev.toml", session)],
+        ));
+        let mut accounts = registry(both.as_ref()).accounts.unwrap();
+        accounts.sort();
+        assert_eq!(accounts, ["agent", "carol", "dave"]);
+        let faulty =
+            LoadedRules::from_dir(&registry_dir("accounts-fault", &[("x.toml", "wat = 1\n")]));
+        assert!(registry(faulty.as_ref()).accounts.is_err());
+        let missing = LoadedRules::from_dir(Path::new("/xudo-test-no-such-rules"));
+        assert!(registry(missing.as_ref()).accounts.is_err());
     }
 }

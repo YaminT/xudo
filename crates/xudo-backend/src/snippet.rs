@@ -131,6 +131,9 @@ pub fn sets_self_timeout(drop_in: &[u8]) -> bool {
     has(&alias) && has(XUDO_SELF_DEFAULTS)
 }
 
+/// The backend's own parser, for sudo and sudo-rs alike.
+pub const VISUDO: &str = "/usr/sbin/visudo";
+
 /// The `secure_path` given to the privileged child.
 const SECURE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -332,12 +335,19 @@ fn validate_argv(backend: &Backend) -> Option<Vec<String>> {
         return None;
     }
     Some(vec![
-        "/usr/sbin/visudo".to_owned(),
+        VISUDO.to_owned(),
         "-cf".to_owned(),
         // The temporary file, not the destination: validate before installing,
         // never after.
         "{candidate}".to_owned(),
     ])
+}
+
+/// The one doas rule xudo writes: `%xudo` may run the password helper with
+/// exactly no arguments.
+#[must_use]
+pub fn doas_rule() -> String {
+    format!("permit :{XUDO_GROUP} as root cmd {GATE_AUTH} args")
 }
 
 /// A generated doas configuration, and how to check it.
@@ -382,7 +392,7 @@ impl DoasSnippet {
         // is doas's equivalent of sudo's `""`. Note that omitting `args`
         // entirely would mean "any arguments" — the inverse — which is why it is
         // written explicitly.
-        let rule = format!("permit :{XUDO_GROUP} as root cmd {GATE_AUTH} args\n");
+        let rule = format!("{}\n", doas_rule());
 
         let body = format!(
             "# Managed by xudo. Do not edit between the markers.\n\

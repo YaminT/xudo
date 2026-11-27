@@ -4664,7 +4664,8 @@ fn the_planned_host_serves_everything_else_as_the_real_one_does() {
             uid: 0,
             gid: 0,
             mode: 0o400,
-            kind: Kind::File
+            kind: Kind::File,
+            nlink: 1,
         })
     );
     assert_eq!(

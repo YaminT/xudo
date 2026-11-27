@@ -603,8 +603,8 @@ pub fn run_with_installer_at_socket(
                 show_contents: *show_contents,
                 uninstall: *uninstall,
                 agent_path: (*agent_path)
-                    .then(|| crate::agent_path::session_harness(loaded.as_ref()))
-                    .map(|session| (session, *raise_ptrace_scope)),
+                    .then(|| crate::agent_path::registry(loaded.as_ref()))
+                    .map(|registry| (registry, *raise_ptrace_scope)),
             },
             out,
             err,
@@ -714,9 +714,9 @@ struct InstallMode {
     dry_run: bool,
     show_contents: bool,
     uninstall: bool,
-    /// `--agent-path`: whether a session-way harness is registered, and
+    /// `--agent-path`: what the harness registry says, and
     /// `--raise-ptrace-scope`.
-    agent_path: Option<(crate::agent_path::SessionHarness, bool)>,
+    agent_path: Option<(crate::agent_path::Registry, bool)>,
 }
 
 /// Plans the install, or the removal, and performs it unless `--dry-run`.
@@ -742,7 +742,7 @@ fn install(
             uninstall_plan(BackendKind::Sudo),
             uninstall_plan(BackendKind::Doas),
         ]
-    } else if let Some((session, raise)) = &mode.agent_path {
+    } else if let Some((registry, raise)) = &mode.agent_path {
         let backend = match detect(probe) {
             Ok(backend) => backend,
             Err(reason) => {
@@ -750,7 +750,7 @@ fn install(
                 return ExitCode::Unusable;
             }
         };
-        match crate::agent_path::plan(host, &backend, session, *raise, out, err) {
+        match crate::agent_path::plan(host, &backend, registry, *raise, out, err) {
             Ok(plan) => vec![plan],
             Err(code) => return code,
         }
@@ -817,6 +817,19 @@ fn install(
         }
     }
     match unverified {
+        // The agent path's own checks passed after the write, and anything
+        // they found wrong was rolled back; what is left is a functional probe
+        // that could not run here. Said so, in so many words, and not called
+        // a failure: a failed probe would have restored the old state.
+        Some(reason) if mode.agent_path.is_some() => {
+            let _ = writeln!(
+                out,
+                "could not verify: the gate running as root through the password rule: \
+                 {reason}. Nothing that ran found the install wrong; the checks that \
+                 passed are listed above."
+            );
+            ExitCode::Delegated
+        }
         // Files were written and nothing proved they take effect. Said in so
         // many words, with a failing status, because a quiet success here is
         // exactly the claim xudo must not make.
@@ -975,6 +988,9 @@ fn step_contents(step: &PlanStep) -> &str {
         | PlanStep::Install { .. }
         | PlanStep::RemoveBlock { .. }
         | PlanStep::Remove { .. }
+        | PlanStep::RemoveUnlessEdited { .. }
+        | PlanStep::ValidateWhole { .. }
+        | PlanStep::MustNotList { .. }
         | PlanStep::FunctionalProbe { .. } => "",
     }
 }
@@ -4495,6 +4511,10 @@ expect = "deny"
         .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
         .file("/etc/sudoers", 0, 0, 0o440, b"@includedir /etc/sudoers.d\n")
         .dir("/etc/sudoers.d", 0, 0, 0o750)
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/libexec", 0, 0, 0o755)
+        .dir("/usr/libexec/xudo", 0, 0, 0o755)
+        .file(xudo_backend::snippet::GATE_NOPASS, 0, 0, 0o755, b"gate")
         .dir("/proc", 0, 0, 0o555)
         .dir("/proc/sys", 0, 0, 0o555)
         .dir("/proc/sys/kernel", 0, 0, 0o555)
@@ -4556,18 +4576,41 @@ expect = "deny"
     }
 
     #[test]
-    fn the_agent_path_runs_the_opt_in_plan_and_says_when_it_is_unverified() {
+    fn a_probe_that_cannot_run_is_said_and_does_not_fail_the_agent_path() {
+        // The functional probe could not run (no broker yet). Every check
+        // that did run passed, or the executor would have restored the old
+        // state and failed: so exit 0 and say what was not verified.
         let installer = ScriptedInstaller::answering(vec![Ok(report(
             BackendKind::Sudo,
             Verification::Unverified {
                 reason: "no broker".to_owned(),
             },
         ))]);
-        let (code, _, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
-        assert_eq!(code, ExitCode::Unusable);
-        assert!(err.contains("NOT VERIFIED"), "{err}");
+        let (code, out, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(
+            out.contains(
+                "could not verify: the gate running as root through the password rule: no broker"
+            ),
+            "{out}"
+        );
+        assert!(!err.contains("NOT VERIFIED"), "{err}");
         let plans = installer.plans.borrow();
         assert!(plans[0].steps[0].describe().starts_with("probe first:"));
+    }
+
+    #[test]
+    fn a_failed_check_after_the_write_fails_the_agent_path() {
+        let installer =
+            ScriptedInstaller::answering(vec![Err(xudo_sys::InstallError::RolledBack {
+                cause: Box::new(xudo_sys::InstallError::ProbeFailed {
+                    reason: "sudo lists the helper for nobody".to_owned(),
+                }),
+            })]);
+        let (code, _, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("lists the helper for nobody"), "{err}");
+        assert!(err.contains("was restored"), "{err}");
     }
 
     #[test]
@@ -4623,7 +4666,7 @@ expect = "deny"
     #[test]
     fn a_plain_install_over_the_agent_path_warns_and_writes_no_nopasswd() {
         let backend = xudo_backend::detect(&WorkingSudoProbe).unwrap();
-        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, false)
+        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, false, None)
             .unwrap()
             .steps
             .into_iter()

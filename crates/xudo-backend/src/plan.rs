@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::detect::{Backend, BackendKind};
 use crate::snippet::{
     DOAS_BEGIN, DOAS_END, DoasSnippet, GATE_AUTH, GATE_NOPASS, PTRACE_DROP_IN, PTRACE_DROP_IN_PATH,
-    SUDOERS_PATH, SnippetError, SudoersSnippet, XUDO_AGENT_GROUP, XUDO_GROUP, names_agent_path,
-    recognize,
+    SUDOERS_PATH, SnippetError, SudoersSnippet, VISUDO, XUDO_AGENT_GROUP, XUDO_GROUP,
+    names_agent_path, recognize,
 };
 
 /// Why `--agent-path` refuses a doas host.
@@ -138,6 +138,30 @@ pub enum PlanStep {
         /// The candidate.
         candidate: String,
     },
+    /// After the rename, ask the backend to parse its whole configuration.
+    /// A file that is valid alone can clash with another (an alias defined
+    /// twice). Failing it restores everything this run installed; a plan with
+    /// this step is all or nothing from its first install on.
+    ValidateWhole {
+        /// The command to run; it names no candidate.
+        argv: Vec<String>,
+    },
+    /// Ask the backend whether it lists the passwordless helper for `argv`'s
+    /// user and arguments, and require that it does not. Listed means the line
+    /// grants more than it says, and restores what this run installed.
+    MustNotList {
+        /// What to run.
+        argv: Vec<String>,
+        /// What must be true.
+        expectation: String,
+    },
+    /// Delete a file xudo owns unless it holds an edit, in which case leave it
+    /// and warn: for the sysctl drop-in, whose edit must never keep the
+    /// passwordless line in place.
+    RemoveUnlessEdited {
+        /// The path.
+        path: String,
+    },
 }
 
 impl PlanStep {
@@ -171,6 +195,13 @@ impl PlanStep {
             Self::RefusalProbe { expectation, .. } => format!("probe first: {expectation}"),
             Self::RefuseEdited { path } => format!("stop if {path} was edited"),
             Self::ReadBack { candidate } => format!("read back {candidate}"),
+            Self::ValidateWhole { argv } => {
+                format!("validate the whole configuration: {}", argv.join(" "))
+            }
+            Self::MustNotList { expectation, .. } => format!("check: {expectation}"),
+            Self::RemoveUnlessEdited { path } => {
+                format!("remove {path}, or leave it with a warning if it was edited")
+            }
         }
     }
 }
@@ -237,7 +268,7 @@ impl InstallPlan {
             }
         }
 
-        steps.push(auth_probe(backend.kind));
+        steps.push(auth_probe(&backend.exe));
 
         steps.push(PlanStep::Notice {
             text: "xudo is installed in its password-required form. Every invocation will \
@@ -258,14 +289,23 @@ impl InstallPlan {
     /// Builds the opt-in plan that also turns on the passwordless agent path:
     /// the human-only file plus one `%xudo-agent` `NOPASSWD` line for the
     /// `-nopass` helper with no arguments. Before anything is written, the
-    /// helper must refuse a caller it cannot attest. `raise_ptrace` adds the
-    /// sysctl drop-in; the caller decides it, from the flag and the live value.
+    /// helper must refuse a caller it cannot attest and no file xudo would
+    /// replace may hold an edit. After the rename, the backend parses its whole
+    /// configuration and must not list the helper for `nobody`, nor with an
+    /// argument for `member` (a member of the agent group, or `nobody` when
+    /// there is none); any of those failing restores what the run installed.
+    /// `raise_ptrace` adds the sysctl drop-in; the caller decides it, from the
+    /// flag and the live value.
     ///
     /// # Errors
     ///
     /// [`SnippetError::Unsupported`] for doas ([`AGENT_PATH_SUDO_ONLY`]) or a
     /// backend that cannot be given a snippet.
-    pub fn with_agent_path(backend: &Backend, raise_ptrace: bool) -> Result<Self, SnippetError> {
+    pub fn with_agent_path(
+        backend: &Backend,
+        raise_ptrace: bool,
+        member: Option<&str>,
+    ) -> Result<Self, SnippetError> {
         if backend.kind == BackendKind::Doas {
             return Err(SnippetError::Unsupported {
                 backend: backend.kind.label().to_owned(),
@@ -273,32 +313,74 @@ impl InstallPlan {
             });
         }
         let snippet = SudoersSnippet::with_agent_path(backend)?;
+        // The backend detection found, not the kind's usual path: Ubuntu's
+        // sudo-rs package installs `/usr/bin/sudo-rs` alone.
+        let exe = backend.exe.clone();
+        let listing = |user: &str, extra: &[&str]| {
+            let mut argv = vec![
+                exe.clone(),
+                "-n".to_owned(),
+                "-l".to_owned(),
+                "-U".to_owned(),
+                user.to_owned(),
+                GATE_NOPASS.to_owned(),
+            ];
+            argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            argv
+        };
+        let member = member.unwrap_or("nobody");
         let mut steps = vec![
-            // The backend detection found, not the kind's usual path: Ubuntu's
-            // sudo-rs package installs `/usr/bin/sudo-rs` alone.
             PlanStep::RefusalProbe {
-                argv: vec![backend.exe.clone(), "-n".to_owned(), GATE_NOPASS.to_owned()],
+                argv: vec![exe.clone(), "-n".to_owned(), GATE_NOPASS.to_owned()],
                 expectation: "the passwordless helper, run through the backend by a caller it \
                               cannot attest, refuses and runs nothing"
                     .to_owned(),
             },
+            // Every edit check before the first change, groups included.
+            PlanStep::RefuseEdited {
+                path: SUDOERS_PATH.to_owned(),
+            },
+        ];
+        if raise_ptrace {
+            steps.push(PlanStep::RefuseEdited {
+                path: PTRACE_DROP_IN_PATH.to_owned(),
+            });
+        }
+        steps.extend([
             PlanStep::CreateGroup {
                 name: XUDO_GROUP.to_owned(),
             },
             PlanStep::CreateGroup {
                 name: XUDO_AGENT_GROUP.to_owned(),
             },
-            PlanStep::RefuseEdited {
-                path: SUDOERS_PATH.to_owned(),
-            },
-        ];
+        ]);
         steps.extend(sudoers_steps(snippet));
+        steps.extend([
+            // `-f` names the file sudo reads, so its includes are parsed
+            // with it, and skips the mode check that `-c` alone makes:
+            // Ubuntu 26.04's sudo-rs ships it 0644, which sudo accepts.
+            PlanStep::ValidateWhole {
+                argv: [VISUDO, "-c", "-f", "/etc/sudoers"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            },
+            PlanStep::MustNotList {
+                argv: listing("nobody", &[]),
+                expectation: "the backend does not list the passwordless helper for nobody, \
+                              who is not in the agent group"
+                    .to_owned(),
+            },
+            PlanStep::MustNotList {
+                argv: listing(member, &["x"]),
+                expectation: format!(
+                    "the backend does not list the passwordless helper with an argument for \
+                     {member}"
+                ),
+            },
+        ]);
         if raise_ptrace {
             let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
             steps.extend([
-                PlanStep::RefuseEdited {
-                    path: PTRACE_DROP_IN_PATH.to_owned(),
-                },
                 PlanStep::WriteCandidate {
                     path: candidate.clone(),
                     contents: PTRACE_DROP_IN.to_owned(),
@@ -313,7 +395,7 @@ impl InstallPlan {
                 },
             ]);
         }
-        steps.push(auth_probe(backend.kind));
+        steps.push(auth_probe(&exe));
         steps.push(PlanStep::Notice {
             text: "The agent path is on. A member of xudo-agent may run the passwordless helper \
                    with no arguments and no password; the helper runs a command only when the \
@@ -369,10 +451,11 @@ fn sudoers_steps(snippet: SudoersSnippet) -> [PlanStep; 3] {
     ]
 }
 
-/// The probe that shows the password rule is in effect.
-fn auth_probe(kind: BackendKind) -> PlanStep {
+/// The probe that shows the password rule is in effect, through the backend
+/// detection found.
+fn auth_probe(exe: &str) -> PlanStep {
     PlanStep::FunctionalProbe {
-        argv: vec![kind.exe().to_owned(), "-n".to_owned(), GATE_AUTH.to_owned()],
+        argv: vec![exe.to_owned(), "-n".to_owned(), GATE_AUTH.to_owned()],
         expectation: "the helper refuses without a password rather than reporting that \
                       no rule permits it, which proves the rule is in effect and that \
                       no credential is cached"
@@ -407,14 +490,11 @@ pub fn edited(path: &str, bytes: &[u8]) -> Option<&'static str> {
 /// package removal is a surprise in the other direction.
 pub fn uninstall_plan(backend: BackendKind) -> InstallPlan {
     let steps = match backend {
-        // Every edit check before the first removal, so a refusal leaves
-        // everything in place rather than half of it.
+        // An edited sudoers file stops the uninstall before anything is
+        // removed: it is not xudo's to remove.
         BackendKind::Sudo | BackendKind::SudoRs => vec![
             PlanStep::RefuseEdited {
                 path: SUDOERS_PATH.to_owned(),
-            },
-            PlanStep::RefuseEdited {
-                path: PTRACE_DROP_IN_PATH.to_owned(),
             },
             PlanStep::Remove {
                 path: SUDOERS_PATH.to_owned(),
@@ -422,7 +502,9 @@ pub fn uninstall_plan(backend: BackendKind) -> InstallPlan {
             PlanStep::Remove {
                 path: format!("{SUDOERS_PATH}.candidate"),
             },
-            PlanStep::Remove {
+            // After the sudoers file: an edited drop-in is left with a
+            // warning, and never keeps the passwordless line in place.
+            PlanStep::RemoveUnlessEdited {
                 path: PTRACE_DROP_IN_PATH.to_owned(),
             },
             PlanStep::Remove {
@@ -784,6 +866,16 @@ mod tests {
             PlanStep::ReadBack {
                 candidate: "/p".to_owned(),
             },
+            PlanStep::ValidateWhole {
+                argv: vec!["/usr/sbin/visudo".to_owned()],
+            },
+            PlanStep::MustNotList {
+                argv: vec!["/usr/bin/sudo".to_owned()],
+                expectation: "e".to_owned(),
+            },
+            PlanStep::RemoveUnlessEdited {
+                path: "/p".to_owned(),
+            },
         ];
         for step in &steps {
             assert!(step.describe().len() > 4, "{step:?}");
@@ -814,7 +906,7 @@ mod tests {
     }
 
     fn agent_plan(kind: BackendKind, raise: bool) -> InstallPlan {
-        InstallPlan::with_agent_path(&backend(kind, true, true), raise).unwrap()
+        InstallPlan::with_agent_path(&backend(kind, true, true), raise, None).unwrap()
     }
 
     #[test]
@@ -871,8 +963,9 @@ mod tests {
 
     #[test]
     fn the_agent_path_refuses_doas() {
-        let refused = InstallPlan::with_agent_path(&backend(BackendKind::Doas, true, true), false)
-            .unwrap_err();
+        let refused =
+            InstallPlan::with_agent_path(&backend(BackendKind::Doas, true, true), false, None)
+                .unwrap_err();
         assert!(
             refused.to_string().contains("sudo and sudo-rs only"),
             "{refused}"
@@ -895,10 +988,8 @@ mod tests {
                     .to_owned(),
             })
         );
-        // Both groups, and the edit check before anything is written.
         let described = plan.describe();
         let at = |needle: &str| described.iter().position(|d| d.contains(needle)).unwrap();
-        assert!(at("create group xudo-agent") < at("stop if /etc/sudoers.d/xudo was edited"));
         assert!(at("was edited") < at("write candidate"));
         assert!(!described.join("\n").contains("sysctl"));
 
@@ -919,6 +1010,79 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_file_stops_the_agent_path_before_any_group_is_created() {
+        for raise in [false, true] {
+            let described = agent_plan(BackendKind::Sudo, raise).describe();
+            let last_check = described
+                .iter()
+                .rposition(|d| d.starts_with("stop if"))
+                .unwrap();
+            let first_group = described
+                .iter()
+                .position(|d| d.starts_with("create group"))
+                .unwrap();
+            assert!(last_check < first_group, "{described:?}");
+        }
+    }
+
+    #[test]
+    fn the_whole_configuration_is_parsed_and_the_helper_never_listed_wider_after_the_rename() {
+        let sudo_rs_only = Backend {
+            exe: "/usr/bin/sudo-rs".to_owned(),
+            ..backend(BackendKind::SudoRs, true, true)
+        };
+        let plan = InstallPlan::with_agent_path(&sudo_rs_only, false, Some("agent")).unwrap();
+        let install = plan
+            .steps
+            .iter()
+            .position(|s| matches!(s, PlanStep::Install { to, .. } if to == SUDOERS_PATH))
+            .unwrap();
+        assert_eq!(
+            plan.steps[install + 1],
+            PlanStep::ValidateWhole {
+                argv: ["/usr/sbin/visudo", "-c", "-f", "/etc/sudoers"]
+                    .map(str::to_owned)
+                    .to_vec()
+            }
+        );
+        let listings: Vec<Vec<String>> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                PlanStep::MustNotList { argv, .. } => Some(argv.clone()),
+                _ => None,
+            })
+            .collect();
+        let nopass = GATE_NOPASS.to_owned();
+        assert_eq!(
+            listings,
+            [
+                ["/usr/bin/sudo-rs", "-n", "-l", "-U", "nobody", &nopass]
+                    .map(String::from)
+                    .to_vec(),
+                ["/usr/bin/sudo-rs", "-n", "-l", "-U", "agent", &nopass, "x"]
+                    .map(String::from)
+                    .to_vec()
+            ]
+        );
+        // Every probe goes through the backend detection found.
+        for step in &plan.steps {
+            if let PlanStep::FunctionalProbe { argv, .. } | PlanStep::RefusalProbe { argv, .. } =
+                step
+            {
+                assert_eq!(argv[0], "/usr/bin/sudo-rs", "{step:?}");
+            }
+        }
+        // With no member to ask about, nobody stands in for one.
+        let alone = agent_plan(BackendKind::Sudo, false);
+        assert!(
+            alone
+                .describe()
+                .contains(&"check: the backend does not list the passwordless helper with an argument for nobody".to_owned())
+        );
+    }
+
+    #[test]
     fn a_backend_with_no_honest_snippet_gets_no_agent_path() {
         let crippled = Backend {
             exe: "/usr/bin/sudo".to_owned(),
@@ -926,22 +1090,27 @@ mod tests {
             version: "0.0".to_owned(),
             capabilities: CapabilityMatrix::empty(),
         };
-        assert!(InstallPlan::with_agent_path(&crippled, false).is_err());
+        assert!(InstallPlan::with_agent_path(&crippled, false, None).is_err());
     }
 
     #[test]
-    fn uninstall_checks_every_edit_before_removing_anything() {
-        let described = uninstall_plan(BackendKind::Sudo).describe();
-        let last_check = described
-            .iter()
-            .rposition(|d| d.starts_with("stop if"))
-            .unwrap();
-        let first_removal = described
-            .iter()
-            .position(|d| d.starts_with("remove "))
-            .unwrap();
-        assert!(last_check < first_removal, "{described:?}");
-        assert!(described.contains(&"remove /etc/sysctl.d/05-xudo-ptrace-scope.conf".to_owned()));
+    fn an_edited_drop_in_never_keeps_the_passwordless_line_in_place() {
+        // The sudoers file is checked and removed before the drop-in is
+        // looked at, and an edited drop-in is left with a warning, not a stop.
+        let plan = uninstall_plan(BackendKind::Sudo);
+        let described = plan.describe();
+        let at = |want: &str| described.iter().position(|d| d == want).unwrap();
+        assert_eq!(at("stop if /etc/sudoers.d/xudo was edited"), 0);
+        assert!(
+            at("remove /etc/sudoers.d/xudo")
+                < at(
+                    "remove /etc/sysctl.d/05-xudo-ptrace-scope.conf, or leave it with a \
+                      warning if it was edited"
+                )
+        );
+        assert!(!plan.steps.contains(&PlanStep::RefuseEdited {
+            path: PTRACE_DROP_IN_PATH.to_owned()
+        }));
     }
 
     #[test]

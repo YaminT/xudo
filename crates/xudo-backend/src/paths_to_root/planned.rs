@@ -99,6 +99,7 @@ impl HostView for PlannedHost<'_> {
                 gid: 0,
                 mode: 0o400,
                 kind: Kind::File,
+                nlink: 1,
             }),
             (_, _, other) => other,
         }

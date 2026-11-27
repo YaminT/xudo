@@ -96,6 +96,17 @@ EOF
 
 restore_doas() { mv /usr/bin/doas.orig /usr/bin/doas; }
 
+# An agent-path install that wrote its line and passed every check that could
+# run: exit 0, the whole configuration parsed, the helper not listed for
+# nobody, and the functional probe either passed or said why it could not run.
+expect_agent_ok() {
+    expect_rc 0 "$1"
+    expect_out "$1" "the backend parsed its whole configuration"
+    expect_out "$1" "verified: the backend does not list the passwordless helper for nobody"
+    has "$out/$1.out" "could not verify: " || has "$out/$1.out" "verified     the functional probe passed" ||
+        fail "$1: neither verified nor said what it could not verify"
+}
+
 # The opt-in agent path (E8), on a sudo or sudo-rs row after the install rows.
 agent_path() {
     dest=/etc/sudoers.d/xudo
@@ -105,11 +116,11 @@ agent_path() {
     install -d -m 755 /usr/libexec/xudo
     expect_absent "$dest"
 
-    # 9. No helper on the machine: no refusal shown, so nothing is written,
+    # 9. No helper on the machine: nothing to trust, so nothing is written,
     #    not even the group.
     try nohelper install --agent-path
     expect_rc 19 "agent path with no helper"
-    expect_err nohelper "was not shown to refuse"
+    expect_err nohelper "the passwordless helper cannot be trusted: $helper is missing"
     expect_absent "$dest"
     if getent group xudo-agent >/dev/null; then fail "a refused agent path created xudo-agent"; fi
 
@@ -127,10 +138,28 @@ echo 0
     install -m 755 /harness-bin/xudo-gate /usr/libexec/xudo/xudo-gate-auth
     install -m 755 /harness-bin/xudo-gate "$helper"
 
+    # 10b. A helper someone else could replace: group-writable, or with a
+    #      second name. Refused before anything is run or written.
+    chmod 775 "$helper"
+    try gwritable install --agent-path
+    chmod 755 "$helper"
+    expect_rc 19 "agent path with a group-writable helper"
+    expect_err gwritable "cannot be trusted: $helper is writable by its group"
+    ln "$helper" /usr/libexec/xudo/second-name
+    try linked2 install --agent-path
+    rm /usr/libexec/xudo/second-name
+    expect_rc 19 "agent path with a hard-linked helper"
+    expect_err linked2 "has 2 names"
+    expect_absent "$dest"
+
     # 11. Another line for the agent group, or the helper given to %xudo:
     #     refused and named, in either include order.
+    #     So is an alias named like xudo's, defined first (visudo -cf passes
+    #     xudo's file alone), and a wildcard Defaults line reaching the helper.
     for line in '%xudo-agent ALL=(ALL) NOPASSWD: ALL' \
-        '%xudo ALL=(root) NOPASSWD: /usr/libexec/xudo/xudo-gate-nopass'; do
+        '%xudo ALL=(root) NOPASSWD: /usr/libexec/xudo/xudo-gate-nopass' \
+        'Cmnd_Alias XUDO_NOPASS = ALL' \
+        'Defaults!/usr/libexec/*/* env_keep+=LD_PRELOAD'; do
         # Not `name`: try() sets that.
         for ops_file in 00-ops zz-ops; do
             printf '%s\n' "$line" >/etc/sudoers.d/$ops_file
@@ -152,9 +181,19 @@ echo 0
     expect_rc 19 "agent path through a symlinked sudoers.d"
     expect_absent "$dest"
 
+    # 12b. A broken file xudo's checks do not name: the candidate parses
+    #      alone, the whole configuration does not, and the rename is undone.
+    printf 'this is not sudoers\n' >/etc/sudoers.d/zz-broken
+    chmod 440 /etc/sudoers.d/zz-broken
+    try whole install --agent-path
+    rm -f /etc/sudoers.d/zz-broken
+    expect_rc 19 "agent path beside a broken sudoers file"
+    expect_err whole "was restored to what it was before"
+    expect_absent "$dest"
+
     # 13. The agent path itself.
     try agent install --agent-path
-    expect_unverified agent
+    expect_agent_ok agent
     expect_out agent "the passwordless helper refused a caller it cannot attest"
     expect_meta "$dest" "440 root:root"
     [ "$(grep -c NOPASSWD "$dest")" -eq 1 ] || fail "not exactly one NOPASSWD line"
@@ -183,10 +222,17 @@ echo 0
         if has "$out/agent-sudo.err" "xudo-gate:"; then fail "a member reached the gate with '$refused'"; fi
     done
 
+    # 13b. That member was added by hand, not by enrol, and no harness names
+    #      it: the next install refuses and names it.
+    try unnamed install --agent-path
+    expect_rc 19 "agent path with an unregistered member of xudo-agent"
+    expect_err unnamed "refusing --agent-path: e8agent is in xudo-agent"
+    userdel e8agent
+
     # 14. A second agent-path install changes nothing.
     before=$(sum "$dest")
     try again install --agent-path
-    expect_unverified again
+    expect_agent_ok again
     [ "$(sum "$dest")" = "$before" ] || fail "a second agent-path install changed the file"
     [ "$(ls /etc/sudoers.d | grep -c '^xudo')" -eq 1 ] || fail "more than one xudo file"
 
@@ -197,12 +243,12 @@ echo 0
     try raise install --agent-path --raise-ptrace-scope
     case $scope in
     0)
-        expect_unverified raise
+        expect_agent_ok raise
         expect_out raise "+kernel.yama.ptrace_scope = 1"
         expect_meta "$drop_in" "440 root:root"
         ;;
     1 | 2 | 3)
-        expect_unverified raise
+        expect_agent_ok raise
         expect_out raise "is already $scope"
         expect_absent "$drop_in"
         ;;
@@ -234,14 +280,23 @@ echo 0
 
     # 18. Uninstall removes the agent path and nothing else.
     try on install --agent-path
-    expect_unverified on
+    expect_agent_ok on
     printf '# operator\n' >/etc/sudoers.d/other
     chmod 440 /etc/sudoers.d/other
     before=$(sum /etc/sudoers.d/other)
+    # An edited drop-in is left, with a warning, and never keeps the line.
+    if [ -e "$drop_in" ]; then
+        printf 'kernel.yama.ptrace_scope = 0\n' >>"$drop_in"
+    else
+        printf '# Managed by xudo.\nkernel.yama.ptrace_scope = 0\n' >"$drop_in"
+        chmod 440 "$drop_in"
+    fi
     try agentuninstall install --uninstall
-    expect_rc 0 "uninstall of the agent path"
+    expect_rc 0 "uninstall of the agent path beside an edited drop-in"
+    expect_out agentuninstall "$drop_in was left in place"
     expect_absent "$dest"
-    expect_absent "$drop_in"
+    [ -e "$drop_in" ] || fail "uninstall removed an edited drop-in"
+    rm -f "$drop_in"
     [ "$(sum /etc/sudoers.d/other)" = "$before" ] || fail "uninstall touched another file"
     getent group xudo-agent >/dev/null || fail "uninstall removed the xudo-agent group"
     visudo -c >/dev/null || fail "the configuration is invalid after removing the agent path"
