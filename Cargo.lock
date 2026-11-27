@@ -806,9 +806,11 @@ dependencies = [
 name = "xudo-backend"
 version = "0.1.0-beta.2"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
+ "xudo-policy",
 ]
 
 [[package]]
@@ -882,6 +884,15 @@ dependencies = [
  "sha2",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "xudo-session-bin"
+version = "0.1.0-beta.2"
+dependencies = [
+ "assert_cmd",
+ "predicates",
+ "xudod",
 ]
 
 [[package]]

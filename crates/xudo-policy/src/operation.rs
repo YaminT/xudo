@@ -6,17 +6,19 @@
 //! does not open, resolve, or unlink anything: that walk lives in `xudo-sys`,
 //! and a decision here is not authority to touch the filesystem.
 //!
-//! A `harness` list is parsed and checked against the registry, the same way
-//! an action's list is. It is not a grant. This step is the password path
-//! only. A later step may arm the label; until then every caller, including a
-//! listed harness, authenticates.
+//! A `harness` list with `outcome = "allow"` is a grant, the same as on an
+//! action: a live enrolled agent whose label the rule lists gets a plain allow
+//! that names it, and only the `-nopass` gate acts on that. Every other caller
+//! runs the operation through the password gate. The grant changes who may
+//! skip the password, never what the walk may touch: the tree, the depth, the
+//! entry cap and the owners are the rule's either way.
 
 use crate::caller::CallerFacts;
 use crate::decision::{Confirm, Decision, DenialCode, ENVELOPE_SCHEMA_VERSION, TraceStep, Verdict};
 use crate::deny::{contains_protected_path, touches_protected_path};
 use crate::engine::Settings;
 use crate::harness::{passwd_uid, valid_account_name, valid_harness_label};
-use crate::rule::{ActionId, RuleSet, Source};
+use crate::rule::{ActionId, Outcome, RuleSet, Source};
 
 /// Longest absolute path an operation rule or a target may name.
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -81,16 +83,29 @@ pub struct Operation {
     /// it would remove nothing and look like a rule.
     #[serde(default)]
     pub owners: Option<Vec<String>>,
-    /// Harness labels. Parsed and checked against the registry. Not a grant
-    /// on this step: the password path is the only way the operation runs.
+    /// Harness labels this operation grants, with [`Outcome::Allow`].
+    ///
+    /// A label not in the registry matches no caller and grants nothing.
     #[serde(default)]
     pub harness: Vec<String>,
+    /// What a listed harness gets. Required when `harness` is non-empty, and
+    /// only `allow`: no queue runs a typed operation.
+    #[serde(default, skip_serializing_if = "Outcome::is_unset")]
+    pub outcome: Outcome,
     /// Assigned by the loader. A rule file cannot set it.
     #[serde(skip)]
     pub source: Source,
 }
 
-/// What the walk is allowed to do once the password path has re-decided.
+impl Operation {
+    /// Whether `label` may run this operation without a password: listed, and
+    /// [`Outcome::Allow`]. A rule with no `harness` key never is.
+    pub fn passwordless_for(&self, label: &str) -> bool {
+        self.outcome == Outcome::Allow && self.harness.iter().any(|item| item == label)
+    }
+}
+
+/// What the walk is allowed to do once the gate has re-decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoveGrant {
     /// The operation id, for the audit record.
@@ -109,6 +124,9 @@ pub struct RemoveGrant {
     pub max_entries: u32,
     /// Resolved owners.
     pub owners: OwnerPolicy,
+    /// The harness label the rule grants, when the caller is that live
+    /// enrolled agent. `None` is the password path.
+    pub harness: Option<String>,
 }
 
 const TREES: &[&[u8]] = &[
@@ -212,7 +230,20 @@ pub fn check_operation(op: &Operation) -> Result<(), String> {
             return Err(format!("harness label {label:?} is listed twice"));
         }
     }
-    Ok(())
+    // Only `allow` means anything here.
+    match (op.harness.is_empty(), op.outcome) {
+        (false, Outcome::Unset) => Err("a rule that lists a harness must set outcome".to_owned()),
+        (_, Outcome::AskHuman) => {
+            Err("outcome \"ask-human\" is not supported: no queue runs an operation".to_owned())
+        }
+        (true, Outcome::Allow) => Err("outcome is set but no harness is listed".to_owned()),
+        // A grant is written, never implied: a harness may delete only what
+        // the rule's named owners own, never the "any non-root owner" default.
+        (false, Outcome::Allow) if op.owners.is_none() => {
+            Err("a rule that lists a harness must set owners".to_owned())
+        }
+        (true, Outcome::Unset) | (false, Outcome::Allow) => Ok(()),
+    }
 }
 
 /// The relative path of `target` under `under`, or why it is not one.
@@ -313,7 +344,13 @@ pub fn select<'a>(
 }
 
 /// The grant the walk runs, or a denial. Frozen enrolled agents are refused
-/// before a rule is consulted. A harness label is never consulted.
+/// before a rule is consulted.
+///
+/// The grant names a harness only for an enrolled agent the rule lists with
+/// `outcome = "allow"`, and never while `confirm_human_path` is on: that
+/// setting asks a watcher for every typed operation, which is a confirmation
+/// a harness cannot give, so the run stays on the password path (the same as
+/// `confirm = "always"`, which cancels an action's grant).
 ///
 /// # Errors
 ///
@@ -340,6 +377,11 @@ pub fn judge_remove_path(
         Ok(owners) => owners,
         Err(reason) => return Err(Box::new(refused(target, Some(op), &reason))),
     };
+    let harness = caller
+        .classification
+        .enrolled_agent_id()
+        .filter(|label| !settings.confirm_human_path && op.passwordless_for(label))
+        .map(str::to_owned);
     Ok(RemoveGrant {
         id: op.id.clone(),
         source: op.source.clone(),
@@ -349,13 +391,15 @@ pub fn judge_remove_path(
         max_depth: op.max_depth,
         max_entries: op.max_entries,
         owners,
+        harness,
     })
 }
 
 /// The decision envelope for a remove-path request.
 ///
-/// An allow means the password path may run the operation. It is not a
-/// passwordless grant, and the `harness` list does not change it.
+/// An allow means the password path may run the operation. It is a
+/// passwordless grant only when `harness_grant` is set, which only the
+/// `-nopass` gate acts on: see [`judge_remove_path`].
 pub fn evaluate_remove_path(
     rules: &RuleSet,
     caller: &CallerFacts,
@@ -364,27 +408,37 @@ pub fn evaluate_remove_path(
     passwd: &str,
 ) -> Decision {
     match judge_remove_path(rules, caller, target, settings, passwd) {
-        Ok(grant) => Decision {
-            schema_version: ENVELOPE_SCHEMA_VERSION,
-            verdict: Verdict::Allow,
-            denial: None,
-            remediation: None,
-            action: Some(grant.id.clone()),
-            rule_source: Some(grant.source.clone()),
-            resolved_exe: None,
-            resolved_argv: display_target(target),
-            confirm: Confirm::NotRequired,
-            trace: vec![
+        Ok(grant) => {
+            let mut trace = vec![
                 TraceStep::OperationMatched {
                     action: grant.id.to_string(),
                     source: grant.source.to_string(),
                 },
                 TraceStep::ConfirmationDecided {
                     required: false,
-                    reason: "a remove-path operation runs on the password path; harness labels are not a grant".to_owned(),
+                    reason: "a remove-path operation runs on the password path unless the rule grants this harness".to_owned(),
                 },
-            ],
-        },
+            ];
+            if let Some(harness) = &grant.harness {
+                trace.push(TraceStep::HarnessGranted {
+                    action: grant.id.to_string(),
+                    harness: harness.clone(),
+                });
+            }
+            Decision {
+                schema_version: ENVELOPE_SCHEMA_VERSION,
+                verdict: Verdict::Allow,
+                denial: None,
+                remediation: None,
+                action: Some(grant.id.clone()),
+                rule_source: Some(grant.source.clone()),
+                resolved_exe: None,
+                resolved_argv: display_target(target),
+                confirm: Confirm::NotRequired,
+                harness_grant: grant.harness.as_ref().map(|_| grant.id.clone()),
+                trace,
+            }
+        }
         Err(decision) => *decision,
     }
 }
@@ -457,6 +511,7 @@ max-depth = 8
 max-entries = 10000
 owners = ["agent", "www-data"]
 harness = ["codex"]
+outcome = "allow"
 "#,
         )
     }
@@ -471,6 +526,7 @@ harness = ["codex"]
             max_entries: 100,
             owners: None,
             harness: Vec::new(),
+            outcome: Outcome::Unset,
             source: Source::default(),
         }
     }
@@ -989,5 +1045,351 @@ max-entries = 4
             resolve_owners(&direct, PASSWD).unwrap_err(),
             "owners may not include uid 0 (root)"
         );
+    }
+
+    fn paths_nest(a: &str, b: &str) -> bool {
+        a == b
+            || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+            || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            // Miri is slow and its isolation refuses the regression file's
+            // I/O; the full 256 cases are the non-miri run.
+            cases: if cfg!(miri) { 2 } else { 256 },
+            failure_persistence: if cfg!(miri) {
+                None
+            } else {
+                proptest::prelude::ProptestConfig::default().failure_persistence
+            },
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Siblings that share a string prefix (`/srv/a`, `/srv/ab`) are not
+        /// nested, and a target under one is never matched to the other.
+        #[test]
+        fn selection_follows_path_components_over_non_nested_trees(
+            names in proptest::collection::vec(
+                proptest::sample::select(vec!["a", "ab", "abc", "b", "ba", "a-b", "a.b"]),
+                1..6,
+            ),
+            deep in proptest::collection::vec(proptest::bool::ANY, 6),
+            pick in 0usize..6,
+            rest in proptest::collection::vec(
+                proptest::sample::select(vec!["x", "xy", "a", "ab"]),
+                1..3,
+            ),
+        ) {
+            let mut trees: Vec<String> = Vec::new();
+            for (name, deep) in names.iter().zip(deep.iter()) {
+                let tree = if *deep {
+                    format!("/srv/{name}/t")
+                } else {
+                    format!("/srv/{name}")
+                };
+                if !trees.iter().any(|other| paths_nest(other, &tree)) {
+                    trees.push(tree);
+                }
+            }
+            let operations: Vec<Operation> = trees
+                .iter()
+                .enumerate()
+                .map(|(index, tree)| operation(&format!("t{index}"), tree, 4))
+                .collect();
+            let chosen = trees.iter().cycle().nth(pick).unwrap().clone();
+            let target = format!("{chosen}/{}", rest.join("/"));
+            let (op, relative) = select(&operations, target.as_bytes()).unwrap();
+            proptest::prop_assert_eq!(&op.under, &chosen);
+            proptest::prop_assert_eq!(relative, rest.join("/").into_bytes());
+            // A name that merely starts with a tree's text is not inside it.
+            let lookalike = format!("{chosen}{}/f", rest.first().unwrap());
+            if let Ok((other, _)) = select(&operations, lookalike.as_bytes()) {
+                proptest::prop_assert_ne!(&other.under, &chosen);
+            }
+            // The tree root itself is refused.
+            proptest::prop_assert!(select(&operations, chosen.as_bytes()).is_err());
+        }
+    }
+
+    // ---- G1e: a listed harness is granted, nobody else is ------------------
+
+    fn agent_named(label: &str) -> CallerFacts {
+        CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: label.to_owned(),
+                session_id: "s".to_owned(),
+                declared_yolo: false,
+            },
+            1000,
+        )
+    }
+
+    #[test]
+    fn a_listed_harness_is_granted_a_remove_path_it_names() {
+        let decision = evaluate_remove_path(
+            &sample(),
+            &agent(),
+            b"/srv/app/build/cache",
+            Settings::default(),
+            PASSWD,
+        );
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.harness_grant, decision.action);
+        assert_eq!(
+            decision.harness_grant.as_ref().map(ActionId::as_str),
+            Some("web.clean-build")
+        );
+        assert!(decision.trace.contains(&TraceStep::HarnessGranted {
+            action: "web.clean-build".to_owned(),
+            harness: "codex".to_owned(),
+        }));
+        let grant = judge_remove_path(
+            &sample(),
+            &agent(),
+            b"/srv/app/build/cache",
+            Settings::default(),
+            PASSWD,
+        )
+        .unwrap();
+        assert_eq!(grant.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn an_unlisted_harness_a_human_and_an_unattested_caller_are_never_granted() {
+        let target = b"/srv/app/build/cache";
+        for caller in [
+            agent_named("claude"),
+            agent_named("codex2"),
+            human(),
+            CallerFacts::new(
+                Classification::Unattested {
+                    reason: "no pidfd".to_owned(),
+                },
+                1000,
+            ),
+        ] {
+            let decision =
+                evaluate_remove_path(&sample(), &caller, target, Settings::default(), PASSWD);
+            // Still allowed on the password path, and no grant.
+            assert_eq!(decision.verdict, Verdict::Allow, "{caller:?}");
+            assert_eq!(decision.harness_grant, None, "{caller:?}");
+            assert!(
+                !decision
+                    .trace
+                    .iter()
+                    .any(|step| matches!(step, TraceStep::HarnessGranted { .. })),
+                "{caller:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_listed_without_allow_or_an_unlisted_rule_grants_nothing() {
+        let mut op = operation("o", "/srv/a", 2);
+        assert!(!op.passwordless_for("codex"));
+        op.harness = vec!["codex".to_owned()];
+        assert!(!op.passwordless_for("codex"));
+        op.outcome = Outcome::AskHuman;
+        assert!(!op.passwordless_for("codex"));
+        op.outcome = Outcome::Allow;
+        assert!(op.passwordless_for("codex"));
+        assert!(!op.passwordless_for("claude"));
+        assert!(!op.passwordless_for(""));
+        let plain = rules(&op_toml("o", "/srv/a", ""));
+        let decision =
+            evaluate_remove_path(&plain, &agent(), b"/srv/a/x", Settings::default(), PASSWD);
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.harness_grant, None);
+    }
+
+    #[test]
+    fn confirm_human_path_withholds_the_remove_path_grant() {
+        // The setting asks a watcher for every typed operation, which a
+        // harness cannot be: the run goes to the password path instead.
+        let settings = Settings {
+            confirm_human_path: true,
+            ..Settings::default()
+        };
+        let decision = evaluate_remove_path(
+            &sample(),
+            &agent(),
+            b"/srv/app/build/cache",
+            settings,
+            PASSWD,
+        );
+        assert_eq!(decision.verdict, Verdict::Allow);
+        assert_eq!(decision.harness_grant, None);
+    }
+
+    #[test]
+    fn a_frozen_listed_harness_is_refused_a_remove_path() {
+        let frozen = Settings {
+            frozen: true,
+            ..Settings::default()
+        };
+        let decision =
+            evaluate_remove_path(&sample(), &agent(), b"/srv/app/build/cache", frozen, PASSWD);
+        assert_eq!(decision.denial, Some(DenialCode::Frozen));
+        assert_eq!(decision.harness_grant, None);
+    }
+
+    #[test]
+    fn a_listed_harness_is_refused_a_remove_path_outside_its_tree() {
+        for target in [
+            &b"/srv/app/build"[..],
+            b"/srv/app/build-evil/cache",
+            b"/srv/app/other",
+            b"/srv/app/build/../../../etc/passwd",
+            b"/etc/shadow",
+            b"/srv/app/build/a/b/c/d/e/f/g/h/i",
+        ] {
+            let decision =
+                evaluate_remove_path(&sample(), &agent(), target, Settings::default(), PASSWD);
+            assert_eq!(decision.denial, Some(DenialCode::OperationRefused));
+            assert_eq!(decision.harness_grant, None);
+        }
+    }
+
+    #[test]
+    fn a_harness_operation_without_outcome_fails_to_load() {
+        let message = load_err(&op_toml("a", "/srv/a", "harness = [\"codex\"]\n"));
+        assert!(
+            message.contains("a rule that lists a harness must set outcome"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_operation_outcome_is_allow_and_only_with_a_harness() {
+        let ask = load_err(&op_toml(
+            "a",
+            "/srv/a",
+            "harness = [\"codex\"]\noutcome = \"ask-human\"\n",
+        ));
+        assert!(ask.contains("no queue runs an operation"), "{ask}");
+        let bare_ask = load_err(&op_toml("a", "/srv/a", "outcome = \"ask-human\"\n"));
+        assert!(
+            bare_ask.contains("no queue runs an operation"),
+            "{bare_ask}"
+        );
+        let bare = load_err(&op_toml("a", "/srv/a", "outcome = \"allow\"\n"));
+        assert!(bare.contains("no harness is listed"), "{bare}");
+        assert!(
+            RuleSet::from_toml(
+                "ok.toml",
+                &op_toml(
+                    "a",
+                    "/srv/a",
+                    "owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
+                ),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_harness_operation_without_owners_fails_to_load() {
+        // Attack: a harness grant that falls back to "any non-root owner" would
+        // let the harness delete www-data's or another user's files as root.
+        let message = load_err(&op_toml(
+            "a",
+            "/srv/a",
+            "harness = [\"codex\"]\noutcome = \"allow\"\n",
+        ));
+        assert!(
+            message.contains("a rule that lists a harness must set owners"),
+            "{message}"
+        );
+        // A rule with no harness keeps the human-path default.
+        assert!(RuleSet::from_toml("ok.toml", &op_toml("a", "/srv/a", "")).is_ok());
+    }
+
+    #[test]
+    fn an_operation_cannot_set_agent_allowed_or_any_action_key() {
+        // A typed operation has no human-only switch to forget: the key is
+        // unknown, so a rule that tries is a load error, not a silent grant.
+        for extra in [
+            "agent-allowed = false\nharness = [\"codex\"]\noutcome = \"allow\"\n",
+            "confirm = \"never\"\nharness = [\"codex\"]\noutcome = \"allow\"\n",
+            "gtfobins-waiver = \"x: y\"\nharness = [\"codex\"]\noutcome = \"allow\"\n",
+        ] {
+            assert!(
+                RuleSet::from_toml("bad.toml", &op_toml("a", "/srv/a", extra)).is_err(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_operation_keeps_the_refused_trees() {
+        for under in ["/", "/etc", "/usr/lib", "/var/lib/xudo", "/home", "/root/x"] {
+            let text = op_toml(
+                "a",
+                under,
+                "owners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n",
+            );
+            assert!(RuleSet::from_toml("bad.toml", &text).is_err(), "{under}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: if cfg!(miri) { 2 } else { 256 },
+            failure_persistence: if cfg!(miri) {
+                None
+            } else {
+                proptest::prelude::ProptestConfig::default().failure_persistence
+            },
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// A remove-path grant only ever goes to a label the rule lists, for a
+        /// target a human could remove on the password path under the same
+        /// rule, and an operation that lists no harness never grants.
+        #[test]
+        fn a_remove_path_grant_implies_a_listed_label_and_a_human_allow(
+            label in proptest::sample::select(vec!["codex", "claude", "codex2", "c", "x-y"]),
+            listed in proptest::collection::vec(
+                proptest::sample::select(vec!["codex", "claude", "c"]),
+                0..3,
+            ),
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec!["a", "..", ".", "", "b", "build", "x/y"]),
+                0..5,
+            ),
+            prefix in proptest::sample::select(vec!["/srv/app/build", "/srv/app/build-x", "/srv/app", "/etc"]),
+            confirm_human_path in proptest::bool::ANY,
+        ) {
+            let mut labels: Vec<&str> = Vec::new();
+            for item in &listed {
+                if !labels.contains(item) {
+                    labels.push(item);
+                }
+            }
+            let extra = if labels.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "owners = [\"agent\"]\nharness = [{}]\noutcome = \"allow\"\n",
+                    labels.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ")
+                )
+            };
+            let set = rules(&op_toml("web.clean-build", "/srv/app/build", &extra));
+            let target = format!("{prefix}/{}", parts.join("/"));
+            let settings = Settings { confirm_human_path, ..Settings::default() };
+            let decision = evaluate_remove_path(&set, &agent_named(label), target.as_bytes(), settings, PASSWD);
+            if decision.harness_grant.is_some() {
+                proptest::prop_assert!(labels.contains(&label));
+                proptest::prop_assert!(!confirm_human_path);
+                proptest::prop_assert_eq!(decision.verdict, Verdict::Allow);
+                proptest::prop_assert_eq!(&decision.harness_grant, &decision.action);
+                let human_decision = evaluate_remove_path(&set, &human(), target.as_bytes(), settings, PASSWD);
+                proptest::prop_assert_eq!(human_decision.verdict, Verdict::Allow);
+            }
+            if labels.is_empty() {
+                proptest::prop_assert_eq!(decision.harness_grant, None);
+            }
+        }
     }
 }

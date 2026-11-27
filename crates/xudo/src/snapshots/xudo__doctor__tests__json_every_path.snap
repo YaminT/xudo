@@ -36,6 +36,10 @@ expression: "render::json_of(&hostile_report(true))"
     "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
     "unavailable": "test fixture has no sudoers directory"
   },
+  "agent_path": {
+    "state": "off",
+    "detail": null
+  },
   "caller": {
     "classification": null,
     "password_required": true,
@@ -697,5 +701,9 @@ expression: "render::json_of(&hostile_report(true))"
       "commands": [],
       "by_hand": "Edit the shell startup file that sets PATH (~/.profile, ~/.bashrc, ~/.zshrc, or fish's config.fish) and remove the entry, or move it after the system directories."
     }
-  ]
+  ],
+  "enrolled_accounts": {
+    "accounts": [],
+    "unreadable": null
+  }
 }

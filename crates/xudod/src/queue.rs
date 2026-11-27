@@ -431,13 +431,18 @@ pub fn visibility(
     passwd: &str,
 ) -> Visibility {
     let owner = entry.uid == peer_uid;
+    // The load check compares names; two names can share one uid, so the
+    // peer's uid is also compared against every harness account at request time.
     let reviewer = peer_class == PeerClass::Human
         && registry.get(&entry.harness).is_some_and(|harness| {
             harness
                 .reviewers
                 .iter()
                 .any(|name| xudo_policy::passwd_uid(passwd, name) == Some(peer_uid))
-        });
+        })
+        && !registry
+            .entries()
+            .any(|e| e.uid_matches(peer_uid, &|name| xudo_policy::passwd_uid(passwd, name)));
     Visibility {
         visible: owner || reviewer,
         reviewer: reviewer && !owner,
@@ -2047,6 +2052,23 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_reviewer_with_a_harness_accounts_uid_is_refused() {
+        // alice (reviewer) and agent (codex's account) share uid 1000.
+        let passwd = "alice:x:1000:1000::/:/bin/sh\nagent:x:1000:1000::/:/bin/sh\n";
+        let access = visibility(&entry(1), 1000, PeerClass::Human, &registry(), passwd);
+        assert!(!access.visible);
+        assert!(!access.reviewer);
+    }
+
+    #[test]
+    fn a_reviewer_with_a_distinct_uid_is_still_allowed() {
+        let passwd = "alice:x:1000:1000::/:/bin/sh\nagent:x:1001:1000::/:/bin/sh\n";
+        let access = visibility(&entry(1), 1000, PeerClass::Human, &registry(), passwd);
+        assert!(access.visible);
+        assert!(access.reviewer);
+    }
+
+    #[test]
     fn an_enrolled_agent_cannot_act_as_a_configured_reviewer() {
         let access = visibility(
             &entry(1),
@@ -2418,6 +2440,35 @@ mod tests {
         assert_eq!(effective_ttl(Some(60)), 60);
         assert_eq!(effective_ttl(Some(DEFAULT_TTL_SECS)), DEFAULT_TTL_SECS);
         assert_eq!(effective_ttl(Some(DEFAULT_TTL_SECS + 1)), DEFAULT_TTL_SECS);
+    }
+
+    #[test]
+    fn no_hint_line_can_bind_a_gate_record_to_an_entry() {
+        // The gate records its requester's hints in the record this reads.
+        // A requester that names itself after the binding lines leaves them
+        // under a `hint_` prefix, which neither the exact nonce line nor the
+        // `confirmation=password` prefix can match.
+        let store = xudo_sys::FakeSpool::new();
+        let record = entry(78);
+        admit(&store, &record, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        claim(&store, &record.id, 101, DEFAULT_TTL_SECS * 1000, BOOT).unwrap();
+        let nonce = "ef".repeat(32);
+        bind_run_nonce(&store, &record.id, &nonce).unwrap();
+        let stored = load_all(&store).unwrap().remove(0);
+        let bound = gate_record_for(&stored);
+        assert!(gate_record_binds(&stored, &bound));
+        let posing = format!("nonce={nonce}\0confirmation=password\0");
+        let hints = xudo_sys::CallerHints::from_reads(
+            Some(posing.as_bytes()),
+            Some(posing.as_bytes()),
+            Some(format!("CLAUDECODE={posing}").as_bytes()),
+        );
+        let only_hints = bound.clone().with_evidence(hints.evidence());
+        assert!(!gate_record_binds(&stored, &only_hints));
+        let with_comm = bound
+            .clone()
+            .with_evidence(hints.with_comm(posing.as_bytes()).evidence());
+        assert!(!gate_record_binds(&stored, &with_comm));
     }
 
     #[test]

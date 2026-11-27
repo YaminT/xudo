@@ -8,7 +8,19 @@ use serde::Deserialize;
 use xudo_policy::{HarnessRegistry, HarnessWay, passwd_uid};
 use xudo_sys::{RecordIdentity, ScopeKind};
 
-/// Parsed contents of `/run/xudo/sessions/agent-<n>` (record version 2).
+/// The longest a `session`-way record may live, in milliseconds: twelve hours.
+///
+/// A person starts a session, so it expires. Only a `service` record, written
+/// by the unit's own start and removed by its stop, may name no deadline.
+pub const SESSION_MAX_LIFETIME_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// The deadline of a service record: the unit's stop removes the record, so
+/// the clock never does. Accepted for `way = service` and for nothing else.
+pub const NO_DEADLINE: u64 = u64::MAX;
+
+/// Parsed contents of a committed record: `/run/xudo/sessions/agent-<n>` for
+/// a session scope, `/run/xudo/sessions/svc-<label>` for an enrolled service
+/// (record version 2).
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
@@ -42,10 +54,21 @@ pub fn parse_session_record(
     boot_id: &str,
     now_boottime_ms: u64,
 ) -> Option<SessionRecord> {
-    if uid == 0 || !valid_committed_name(name) {
+    if uid == 0 {
         return None;
     }
+    let form = committed_name(name)?;
     let record: SessionRecord = serde_json::from_slice(bytes).ok()?;
+    // The label in the unit name, the record and the registry entry must be
+    // the same one, and only a service has a unit of its own.
+    if let NameForm::Service(label) = form
+        && (record.label != label || record.way != HarnessWay::Service)
+    {
+        return None;
+    }
+    if !deadline_is_allowed(&record, &form) {
+        return None;
+    }
     if record.uid != uid
         || record.boot_id != boot_id
         || record.created_at_boottime_ms > now_boottime_ms
@@ -60,6 +83,23 @@ pub fn parse_session_record(
         return None;
     }
     Some(record)
+}
+
+/// A scope's record expires within twelve hours of its creation, whatever
+/// its `way` says: a scope has no stop hook to remove its record. The absent
+/// deadline, or a longer one, belongs to a service unit's record alone, whose
+/// `ExecStopPost` voids it. The name decides, never a field inside the record.
+fn deadline_is_allowed(record: &SessionRecord, form: &NameForm<'_>) -> bool {
+    match form {
+        NameForm::Service(_) => true,
+        NameForm::Scope => {
+            record.deadline != NO_DEADLINE
+                && record
+                    .deadline
+                    .saturating_sub(record.created_at_boottime_ms)
+                    <= SESSION_MAX_LIFETIME_MS
+        }
+    }
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -144,11 +184,21 @@ pub fn attested_harness_label(
     Some(record.label)
 }
 
-fn valid_committed_name(name: &str) -> bool {
-    let Some(suffix) = name.strip_prefix("agent-") else {
-        return false;
-    };
-    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+/// The two committed names that carry authority.
+enum NameForm<'a> {
+    /// `agent-<32 hex>`: a session scope.
+    Scope,
+    /// `svc-<label>`: the unit `xudo-agent@<label>.service`.
+    Service(&'a str),
+}
+
+fn committed_name(name: &str) -> Option<NameForm<'_>> {
+    if let Some(label) = name.strip_prefix(xudo_sys::SERVICE_RECORD_PREFIX) {
+        return xudo_policy::valid_harness_label(label).then_some(NameForm::Service(label));
+    }
+    let suffix = name.strip_prefix("agent-")?;
+    (suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(NameForm::Scope)
 }
 
 #[cfg(test)]
@@ -354,6 +404,140 @@ mod tests {
             assert!(
                 parse_session_record(candidate.as_bytes(), NAME, 1000, "boot-a", 199).is_none()
             );
+        }
+    }
+
+    const SERVICE_NAME: &str = "svc-codex";
+
+    fn with_way_and_deadline(way: &str, deadline: u64) -> String {
+        RECORD
+            .replace("\"way\":\"service\"", &format!("\"way\":\"{way}\""))
+            .replace("\"deadline\":200", &format!("\"deadline\":{deadline}"))
+    }
+
+    #[test]
+    fn a_service_record_is_named_for_its_unit_and_may_name_no_deadline() {
+        let forever = with_way_and_deadline("service", NO_DEADLINE);
+        let record =
+            parse_session_record(forever.as_bytes(), SERVICE_NAME, 1000, "boot-a", 199).unwrap();
+        assert_eq!(record.deadline, NO_DEADLINE);
+        assert_eq!(record.label, "codex");
+        let identity =
+            record_identity(forever.as_bytes(), SERVICE_NAME, 1000, "boot-a", 199).unwrap();
+        assert_eq!(identity.kind, ScopeKind::Agent);
+        assert!(identity.live && identity.current_boot);
+    }
+
+    #[test]
+    fn a_session_record_with_no_deadline_is_refused() {
+        let forever = with_way_and_deadline("session", NO_DEADLINE);
+        assert!(parse_session_record(forever.as_bytes(), NAME, 1000, "boot-a", 199).is_none());
+        // Not even by its other way of spelling "very far away".
+        let far = with_way_and_deadline("session", NO_DEADLINE - 1);
+        assert!(parse_session_record(far.as_bytes(), NAME, 1000, "boot-a", 199).is_none());
+    }
+
+    #[test]
+    fn a_scope_name_with_the_service_way_and_no_deadline_is_refused() {
+        // The name decides, not the record's own `way`: a scope has no stop
+        // hook to remove a record that never expires.
+        for deadline in [NO_DEADLINE, 20 + SESSION_MAX_LIFETIME_MS + 1] {
+            let record = with_way_and_deadline("service", deadline);
+            assert!(
+                parse_session_record(record.as_bytes(), NAME, 1000, "boot-a", 199).is_none(),
+                "{deadline}"
+            );
+        }
+        let capped = with_way_and_deadline("service", 20 + SESSION_MAX_LIFETIME_MS);
+        assert!(parse_session_record(capped.as_bytes(), NAME, 1000, "boot-a", 199).is_some());
+    }
+
+    #[test]
+    fn a_session_record_must_expire_within_twelve_hours() {
+        let at_limit = with_way_and_deadline("session", 20 + SESSION_MAX_LIFETIME_MS);
+        let past_limit = with_way_and_deadline("session", 20 + SESSION_MAX_LIFETIME_MS + 1);
+        assert!(parse_session_record(at_limit.as_bytes(), NAME, 1000, "boot-a", 199).is_some());
+        assert!(parse_session_record(past_limit.as_bytes(), NAME, 1000, "boot-a", 199).is_none());
+    }
+
+    #[test]
+    fn a_record_for_one_label_in_another_labels_unit_is_refused() {
+        assert!(
+            parse_session_record(RECORD.as_bytes(), "svc-claude", 1000, "boot-a", 199).is_none()
+        );
+        assert!(
+            parse_session_record(RECORD.as_bytes(), SERVICE_NAME, 1000, "boot-a", 199).is_some()
+        );
+    }
+
+    #[test]
+    fn a_service_unit_name_never_carries_a_session_record() {
+        let session = with_way_and_deadline("session", 200);
+        assert!(
+            parse_session_record(session.as_bytes(), SERVICE_NAME, 1000, "boot-a", 199).is_none()
+        );
+    }
+
+    #[test]
+    fn a_service_record_name_needs_a_registry_label() {
+        for name in [
+            "svc-",
+            "svc-Codex",
+            "svc-1codex",
+            "svc-co dex",
+            "svc-codex/x",
+            "svc-",
+        ] {
+            assert!(
+                parse_session_record(RECORD.as_bytes(), name, 1000, "boot-a", 199).is_none(),
+                "{name}"
+            );
+        }
+        let long = format!("svc-a{}", "b".repeat(32));
+        assert!(parse_session_record(RECORD.as_bytes(), &long, 1000, "boot-a", 199).is_none());
+    }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn record_with(way: &str, created: u64, deadline: u64) -> String {
+            RECORD
+                .replace("\"way\":\"service\"", &format!("\"way\":\"{way}\""))
+                .replace(
+                    "\"created_at_boottime_ms\":20",
+                    &format!("\"created_at_boottime_ms\":{created}"),
+                )
+                .replace("\"deadline\":200", &format!("\"deadline\":{deadline}"))
+        }
+
+        proptest! {
+            #[test]
+            fn only_a_service_record_outlives_twelve_hours_or_names_no_deadline(
+                created in 0u64..1_000_000,
+                deadline in prop_oneof![any::<u64>(), Just(NO_DEADLINE), 0u64..100_000_000],
+                session in any::<bool>(),
+            ) {
+                let way = if session { "session" } else { "service" };
+                let bytes = record_with(way, created, deadline);
+                let name = if session { NAME } else { "svc-codex" };
+                let parsed = parse_session_record(bytes.as_bytes(), name, 1000, "boot-a", created);
+                if let Some(record) = parsed {
+                    prop_assert!(record.deadline > created);
+                    if session {
+                        prop_assert!(record.deadline != NO_DEADLINE);
+                        prop_assert!(record.deadline.saturating_sub(created) <= SESSION_MAX_LIFETIME_MS);
+                    }
+                }
+            }
+
+            #[test]
+            fn a_service_name_never_accepts_a_record_of_another_label(label in "[a-z][a-z0-9-]{0,31}") {
+                let name = format!("svc-{label}");
+                let parsed = parse_session_record(RECORD.as_bytes(), &name, 1000, "boot-a", 199);
+                prop_assert_eq!(parsed.is_some(), label == "codex");
+            }
         }
     }
 }

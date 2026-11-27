@@ -45,16 +45,19 @@
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use xudo_sys::{
-    Attestation, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo, ProcFile,
-    Scope, ScopeKind, SysError, Syscalls, lacks_peer_pidfd, lacks_pidfd_info, lacks_pidfd_open,
-    parse_stat, parse_status_euid, peer_cgroup_id, peer_was_reaped, process_is_gone, scope_status,
+    Attestation, CallerHints, CgroupCalls, CgroupIdentity, CgroupRung, Clock, PeerCalls, PidfdInfo,
+    ProcFile, Scope, ScopeKind, SysError, Syscalls, is_identity_uid_map, lacks_peer_pidfd,
+    lacks_pidfd_info, lacks_pidfd_open, parse_nspid_count, parse_stat, parse_status_euid,
+    peer_cgroup_id, peer_was_reaped, process_is_gone, scope_status,
 };
 
 /// Kernel-derived cgroup result retained for classification and audit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CgroupAttestation {
-    /// The peer is in a committed, live, root-owned agent scope.
-    AgentScope(Scope),
+    /// The peer is in a committed, live, root-owned agent scope. Only the
+    /// registry decides whether that scope is a harness: until
+    /// `classify_with_registry` has run, it names none.
+    UnregisteredScope(Scope),
     /// The peer is outside `xudo.slice` on a supported pidfd rung.
     Outside,
     /// A live root-created scope has a valid record, but it is not an agent scope.
@@ -100,6 +103,43 @@ pub struct PeerIdentity {
     pub cgroup_rung: Option<CgroupRung>,
     /// Where the current effective uid that was compared came from.
     pub euid_source: EuidSource,
+}
+
+/// A peer's identity, and beside it what it claims about itself.
+///
+/// The hints are its `comm`, from the `stat` the identity is read from, and
+/// its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd held it:
+/// unauthenticated (invariant 1). The last three are `unavailable` on the
+/// rung with no pidfd, where a read by number could be another process's;
+/// `comm` comes from the same read as the identity on every rung. They are not
+/// part of [`PeerIdentity`], so no decision, which is handed the identity,
+/// can reach them; only the audit record reads them. `Deref` hands out the
+/// identity alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identified {
+    /// What the kernel attested.
+    pub identity: PeerIdentity,
+    /// What the peer showed, for the audit record only.
+    pub hints: CallerHints,
+}
+
+impl std::ops::Deref for Identified {
+    type Target = PeerIdentity;
+
+    fn deref(&self) -> &PeerIdentity {
+        &self.identity
+    }
+}
+
+#[cfg(test)]
+impl From<PeerIdentity> for Identified {
+    /// An identity with no hints read, for tests that build one by hand.
+    fn from(identity: PeerIdentity) -> Self {
+        Self {
+            identity,
+            hints: CallerHints::unavailable(),
+        }
+    }
 }
 
 /// Where the peer's current effective uid was read.
@@ -256,7 +296,7 @@ pub fn identify(
     socket: BorrowedFd<'_>,
     syscalls: &dyn Syscalls,
     peers: &dyn PeerCalls,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     identify_inner(socket, syscalls, peers, None)
 }
 
@@ -273,7 +313,7 @@ pub fn identify_classified(
     peers: &dyn PeerCalls,
     cgroups: &dyn CgroupCalls,
     clock: &dyn Clock,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     identify_inner(socket, syscalls, peers, Some((cgroups, clock)))
 }
 
@@ -282,7 +322,7 @@ fn identify_inner(
     syscalls: &dyn Syscalls,
     peers: &dyn PeerCalls,
     cgroup_inputs: Option<(&dyn CgroupCalls, &dyn Clock)>,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     let cred = peers.peer_cred(socket).map_err(IdentifyError::PeerCred)?;
     // Pid 0 names no process: refuse it before any call that takes a pid.
     if cred.pid == 0 {
@@ -316,6 +356,13 @@ fn identify_inner(
         });
     }
 
+    // Hints are read last by number, so the re-check below covers them too.
+    let hints = match &pin {
+        Some(_) => xudo_sys::peer_hints(peers, cred.pid),
+        None => CallerHints::unavailable(),
+    }
+    .with_comm(&stat.comm);
+
     // After the last read of /proc by number, and not before.
     if let Some((pidfd, _)) = &pin {
         confirm_unreaped(pidfd.as_fd(), peers)?;
@@ -332,7 +379,7 @@ fn identify_inner(
                 clock.boottime_millis(),
             )
         });
-    Ok(PeerIdentity {
+    let identity = PeerIdentity {
         rung: rung_of(pin.as_ref().map(|(_, source)| *source), info.is_some()),
         pid: cred.pid,
         uid: cred.uid,
@@ -350,7 +397,8 @@ fn identify_inner(
         cgroup_attestation: cgroup_result.0,
         cgroup_rung: cgroup_result.1.as_ref().map(|identity| identity.rung),
         euid_source,
-    })
+    };
+    Ok(Identified { identity, hints })
 }
 
 fn attest_cgroup(
@@ -395,7 +443,7 @@ fn classify_live_scope(
     cgroup: CgroupIdentity,
 ) -> (CgroupAttestation, Option<CgroupIdentity>) {
     if scope.kind == ScopeKind::Agent {
-        (CgroupAttestation::AgentScope(scope), Some(cgroup))
+        (CgroupAttestation::UnregisteredScope(scope), Some(cgroup))
     } else {
         (CgroupAttestation::OtherScope(scope), Some(cgroup))
     }
@@ -472,30 +520,6 @@ fn namespace_facts(pid: u32, peers: &dyn PeerCalls, status: Option<&[u8]>) -> bo
     nested_pid || !identity_uid
 }
 
-fn is_identity_uid_map(uid_map: &[u8]) -> bool {
-    let fields: Vec<_> = uid_map
-        .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-        .collect();
-    fields.as_slice() == [&b"0"[..], &b"0"[..], &b"4294967295"[..]]
-}
-
-fn parse_nspid_count(status: &[u8]) -> Option<usize> {
-    let line = status
-        .split(|byte| *byte == b'\n')
-        .find(|line| line.starts_with(b"NSpid:"))?;
-    let values = line.get(6..).unwrap_or_default();
-    let ids: Vec<_> = values
-        .split(u8::is_ascii_whitespace)
-        .filter(|id| !id.is_empty())
-        .collect();
-    if ids.iter().all(|id| id.iter().all(u8::is_ascii_digit)) {
-        Some(ids.len())
-    } else {
-        None
-    }
-}
-
 /// Confirms, through the pidfd, that the pinned process has not exited.
 fn confirm_unreaped(pidfd: BorrowedFd<'_>, peers: &dyn PeerCalls) -> Result<(), IdentifyError> {
     match peers.has_exited(pidfd) {
@@ -548,7 +572,7 @@ mod tests {
             fallback_errno: None,
         };
         let (attestation, observed) = classify_live_scope(scope.clone(), cgroup.clone());
-        assert_eq!(attestation, CgroupAttestation::AgentScope(scope));
+        assert_eq!(attestation, CgroupAttestation::UnregisteredScope(scope));
         assert_eq!(observed, Some(cgroup));
     }
 
@@ -715,7 +739,20 @@ mod tests {
             .with_stat(Ok(stat(PID, START)))
             .with_status(Ok(status(UID)))
             .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/xudo".to_vec())
+            .with_proc(PID, ProcFile::Cmdline, b"xudo\0exec\0".to_vec())
+            .with_proc(PID, ProcFile::Environ, b"CLAUDECODE=1\0".to_vec())
             .with_exit(Ok(false))
+    }
+
+    /// What [`honest_peer`]'s hint files render as.
+    fn honest_hints() -> CallerHints {
+        CallerHints::from_reads(
+            Some(b"/usr/bin/xudo"),
+            Some(b"xudo\0exec\0"),
+            Some(b"CLAUDECODE=1\0"),
+        )
+        .with_comm(b"xudo")
     }
 
     fn namespace_peer(status: Vec<u8>, uid_map: Option<&[u8]>) -> FakePeer {
@@ -761,7 +798,7 @@ mod tests {
         .unwrap();
         assert_eq!(identity.cgroup_attestation, CgroupAttestation::Unattested);
         assert_eq!(
-            std::mem::discriminant(&crate::policy::classify(&identity).classification),
+            std::mem::discriminant(&crate::policy::classify_for_test(&identity).classification),
             std::mem::discriminant(&xudo_policy::Classification::Unattested {
                 reason: String::new(),
             })
@@ -785,7 +822,9 @@ mod tests {
         .unwrap();
         assert_eq!(identity.cgroup_attestation, CgroupAttestation::Outside);
         assert_eq!(
-            crate::policy::classify(&identity).classification.label(),
+            crate::policy::classify_for_test(&identity)
+                .classification
+                .label(),
             "human"
         );
     }
@@ -876,20 +915,23 @@ mod tests {
         let identity = identify(sock.as_fd(), &syscalls, &peers).unwrap();
         assert_eq!(
             identity,
-            PeerIdentity {
-                rung: Attestation::PeerPidfdInfo,
-                pid: PID,
-                uid: UID,
-                gid: GID,
-                starttime: START,
-                sid: 1,
-                tty: 0,
-                diverged: false,
-                pinned: true,
-                cgroup_id: Some(77),
-                cgroup_attestation: CgroupAttestation::NotChecked,
-                cgroup_rung: None,
-                euid_source: EuidSource::PidfdInfo,
+            Identified {
+                identity: PeerIdentity {
+                    rung: Attestation::PeerPidfdInfo,
+                    pid: PID,
+                    uid: UID,
+                    gid: GID,
+                    starttime: START,
+                    sid: 1,
+                    tty: 0,
+                    diverged: false,
+                    pinned: true,
+                    cgroup_id: Some(77),
+                    cgroup_attestation: CgroupAttestation::NotChecked,
+                    cgroup_rung: None,
+                    euid_source: EuidSource::PidfdInfo,
+                },
+                hints: honest_hints(),
             }
         );
         // Namespace facts are read after stat and before the pidfd re-check.
@@ -900,6 +942,9 @@ mod tests {
                 PeerCall::ReadProc(PID, ProcFile::Stat),
                 PeerCall::ReadProc(PID, ProcFile::Status),
                 PeerCall::ReadProc(PID, ProcFile::UidMap),
+                PeerCall::ReadProc(PID, ProcFile::Exe),
+                PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                PeerCall::ReadProc(PID, ProcFile::Environ),
                 PeerCall::HasExited,
             ]
         );
@@ -932,6 +977,9 @@ mod tests {
                     PeerCall::ReadProc(PID, ProcFile::Stat),
                     PeerCall::ReadProc(PID, ProcFile::Status),
                     PeerCall::ReadProc(PID, ProcFile::UidMap),
+                    PeerCall::ReadProc(PID, ProcFile::Exe),
+                    PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                    PeerCall::ReadProc(PID, ProcFile::Environ),
                     PeerCall::HasExited,
                 ],
                 "the re-check must follow the last /proc read"
@@ -957,6 +1005,9 @@ mod tests {
                 PeerCall::ReadProc(PID, ProcFile::Stat),
                 PeerCall::ReadProc(PID, ProcFile::Status),
                 PeerCall::ReadProc(PID, ProcFile::UidMap),
+                PeerCall::ReadProc(PID, ProcFile::Exe),
+                PeerCall::ReadProc(PID, ProcFile::Cmdline),
+                PeerCall::ReadProc(PID, ProcFile::Environ),
                 PeerCall::HasExited,
             ]
         );
@@ -996,6 +1047,83 @@ mod tests {
             !peers.calls().contains(&PeerCall::HasExited),
             "there is no pidfd to re-check through"
         );
+    }
+
+    #[test]
+    fn an_unpinned_peer_records_no_hints_read_by_its_number() {
+        // No pidfd: the number may name another process by the time its exe,
+        // cmdline or environ is read, so none of them is read at all.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/claude".to_vec())
+            .with_proc(PID, ProcFile::Environ, b"CLAUDECODE=1\0".to_vec());
+        let identity = identify(sock.as_fd(), &FakeSyscalls::new(), &peers).unwrap();
+        // Only the comm, from the stat the identity itself is read from.
+        assert_eq!(
+            identity.hints,
+            CallerHints::unavailable().with_comm(b"xudo")
+        );
+        for file in [ProcFile::Exe, ProcFile::Cmdline, ProcFile::Environ] {
+            assert!(!peers.calls().contains(&PeerCall::ReadProc(PID, file)));
+        }
+    }
+
+    #[test]
+    fn a_peer_whose_hint_files_cannot_be_read_is_identified_all_the_same() {
+        // A hint that cannot be read is `unavailable`; it never refuses.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::UidMap, b"0 0 4294967295\n".to_vec())
+            .with_exit(Ok(false));
+        let identity = identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers).unwrap();
+        assert!(identity.pinned);
+        assert_eq!(
+            identity.hints,
+            CallerHints::unavailable().with_comm(b"xudo")
+        );
+        // And the identity is the one a peer showing every hint gets: the
+        // hints sit beside it and change nothing in it.
+        let hinted = identify(
+            socket().as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &honest_peer(),
+        )
+        .unwrap();
+        assert_eq!(hinted.hints, honest_hints());
+        assert_eq!(hinted.identity, identity.identity);
+    }
+
+    #[test]
+    fn a_peer_that_exits_while_its_hints_are_read_is_refused() {
+        // The hints are read before the pidfd re-check, so a number reissued
+        // during those reads cannot lend another process's hints to a record.
+        let sock = socket();
+        let peers = FakePeer::new()
+            .with_cred(Ok(cred()))
+            .with_stat(Ok(stat(PID, START)))
+            .with_status(Ok(status(UID)))
+            .with_proc(PID, ProcFile::Exe, b"/usr/bin/claude".to_vec())
+            .with_exit(Ok(true));
+        assert_eq!(
+            identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers),
+            Err(IdentifyError::Exited)
+        );
+        let calls = peers.calls();
+        let exe = calls
+            .iter()
+            .position(|c| *c == PeerCall::ReadProc(PID, ProcFile::Exe))
+            .unwrap();
+        let recheck = calls
+            .iter()
+            .position(|c| *c == PeerCall::HasExited)
+            .unwrap();
+        assert!(exe < recheck, "{calls:?}");
     }
 
     #[test]

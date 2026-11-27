@@ -21,6 +21,7 @@ expression: "render::json(&decision)"
       "reason": "rule_requires_confirmation"
     }
   },
+  "harness_grant": null,
   "trace": [
     {
       "canonicalized": {
@@ -42,7 +43,7 @@ expression: "render::json(&decision)"
     },
     {
       "deny_list_evaluated": {
-        "version": 7,
+        "version": 8,
         "matched": []
       }
     },

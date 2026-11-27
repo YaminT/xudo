@@ -59,6 +59,10 @@ expression: "render::json_of(&report)"
     "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
     "unavailable": "one candidate was not trusted"
   },
+  "agent_path": {
+    "state": "off",
+    "detail": null
+  },
   "caller": {
     "classification": null,
     "password_required": true,
@@ -488,5 +492,9 @@ expression: "render::json_of(&report)"
       "member": false
     }
   },
-  "proposals": null
+  "proposals": null,
+  "enrolled_accounts": {
+    "accounts": [],
+    "unreadable": null
+  }
 }

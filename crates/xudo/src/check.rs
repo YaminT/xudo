@@ -22,7 +22,7 @@ use xudo_policy::{
     TestResult,
     engine::Settings,
     fuzz_check::{Finding, FindingKind, FuzzConfig, FuzzReport, fuzz},
-    gtfobin_sets, run_tests,
+    run_tests,
 };
 
 use crate::cli::{CheckArgs, Cli, Format};
@@ -41,7 +41,9 @@ const LIMITS: Limits = Limits {
     max_lines: 1,
 };
 
-/// A systemctl rule that can start or stop a unit it does not name.
+/// A rule that is open where it must be closed: a systemctl rule that can
+/// start or stop a unit it does not name, or a multicall rule with no pinned
+/// applet. Both are lint errors and share the report shape.
 struct OpenUnit {
     action: String,
     file: String,
@@ -105,6 +107,23 @@ impl Report {
         .max_by_key(|code| code.as_i32())
         .unwrap_or(ExitCode::Delegated)
     }
+}
+
+/// Multicall rules whose applet is not pinned, one error each.
+fn unpinned_multicall_lints(rules: &xudo_policy::RuleSet) -> Vec<OpenUnit> {
+    rules
+        .unpinned_multicall_actions()
+        .into_iter()
+        .map(|action| OpenUnit {
+            action: action.id.to_string(),
+            file: action.source.file.clone(),
+            line: action.source.line,
+            message: format!(
+                "{}: a multicall rule must pin its applet with a literal or a one-of of safe applet names",
+                action.id
+            ),
+        })
+        .collect()
 }
 
 /// Lints and tests `loaded`, writes the report, and returns the exit status.
@@ -181,6 +200,7 @@ pub(crate) fn run(
                         line: lint.source.line,
                         message: lint.message(),
                     })
+                    .chain(unpinned_multicall_lints(loaded.rules()))
                     .collect(),
                 harness_rule_lints(loaded),
                 overlaps.iter().map(ToString::to_string).collect(),
@@ -217,15 +237,27 @@ pub(crate) fn run(
 }
 
 fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
+    // A rule naming a label nobody registered loads and grants nothing, which
+    // is exactly why it is an error here: the author believes it grants.
+    let unregistered = loaded.unregistered_labels().iter().map(|rule| HarnessRule {
+        action: rule.id.clone(),
+        file: rule.at.file.clone(),
+        line: rule.at.line,
+        message: format!(
+            "{} names harness {:?}, which is not in the registry, so it grants nothing",
+            rule.kind, rule.label
+        ),
+    });
+    // A registry that failed to load disarms every harness for everyone.
+    let fault = loaded.registry_fault().map(|why| HarnessRule {
+        action: "(registry)".to_owned(),
+        file: "harnesses.d".to_owned(),
+        line: 0,
+        message: format!("the harness registry failed to load, so no harness is armed: {why}"),
+    });
     loaded
         .rules()
-        .harness_lints(
-            loaded.tests(),
-            &gtfobin_sets(
-                include_str!("../../../ci/gtfobins.txt"),
-                include_str!("../../../ci/gtfobins-waivers.txt"),
-            ),
-        )
+        .harness_lints(loaded.tests())
         .into_iter()
         .map(|lint| HarnessRule {
             action: lint.id.to_string(),
@@ -233,6 +265,8 @@ fn harness_rule_lints(loaded: &LoadedRules) -> Vec<HarnessRule> {
             line: lint.source.line,
             message: lint.message,
         })
+        .chain(unregistered)
+        .chain(fault)
         .collect()
 }
 
@@ -580,7 +614,7 @@ fn result_json(result: &TestResult) -> Value {
 /// The sentence is the whole warning: the match is lexical only, nothing in
 /// xudo enforces containment for argument paths, and it must not be used for
 /// a program that opens the path as root.
-fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
+pub(crate) fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
     let mut warnings = Vec::new();
     for action in rules.actions() {
         for (index, spec) in action.args.iter().enumerate() {
@@ -599,7 +633,7 @@ fn path_under_warnings(rules: &RuleSet) -> Vec<String> {
 
 /// Text from a rule file, made safe for a terminal and flagged when anything
 /// was removed.
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     let Clean { text, findings } = term_sanitize::display_str(text, LIMITS);
     if findings.is_empty() {
         return text;

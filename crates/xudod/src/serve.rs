@@ -26,13 +26,13 @@ use xudo_sys::{
 };
 use xudo_wire::{BrokerRequest, BrokerResponse, MAX_REQUEST_BYTES, Minted, RefusalCode};
 
-use crate::identify::{Fault, PeerIdentity, identify_classified};
+use crate::identify::{Fault, Identified, PeerIdentity, identify_classified};
 use crate::mint::{
-    AttestedCaller, Grant, MintError, Minting, REQUEST_TTL_MILLIS, draw_nonce,
-    entry_for_classified, publish,
+    AttestedCaller, ExecPath, Grant, HARNESS_TTL_MILLIS, MintError, Minting, REQUEST_TTL_MILLIS,
+    draw_nonce, entry_for_classified, exec_path, publish,
 };
 use crate::policy::{LoadedPolicy, PolicySource, classify_with_registry, decide, stored_caller};
-use crate::record::{decided, refused};
+use crate::record::{decided_under, refused};
 use crate::refusal::Refusal;
 
 /// The exit status of a broker that could not do its job: `xudo`'s own
@@ -104,7 +104,7 @@ impl Served {
 struct Evaluated {
     decision: Decision,
     caller: CallerFacts,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
     policy: LoadedPolicy,
 }
@@ -232,14 +232,8 @@ fn serve_confirmation_denial(
     } = evaluated;
     let denied = confirmation_denial(decision, code);
     let _receipt = platform.audit.append(&|previous| {
-        decided(
-            previous,
-            &denied,
-            &caller,
-            &identity,
-            &request,
-            &policy.rules.generation,
-            None,
+        decided_under(
+            previous, &denied, &caller, &identity, &request, &policy, None,
         )
     });
     answer(
@@ -333,7 +327,7 @@ fn serve_request(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
 ) -> Served {
     if matches!(request.question, xudo_wire::Question::RemovePath { .. }) {
@@ -356,9 +350,14 @@ fn serve_request(
     };
     policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
 
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let passwd = policy.passwd.as_str();
     let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
+    // The gate re-reads the marker; this is the early, clean refusal.
+    if let xudo_policy::Classification::EnrolledAgent { agent_id, .. } = &caller.classification {
+        policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
+    }
     let decision = decide(&policy, &caller, &request);
+    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
     let evaluated = Evaluated {
         decision,
         caller,
@@ -366,6 +365,15 @@ fn serve_request(
         request,
         policy,
     };
+    // One of the two places a `via = harness` entry is minted, both through
+    // `exec_path`: a run question (here) or a remove-path (`serve_remove`)
+    // from a live harness that a rule grants. Every other question, and every
+    // other caller, mints for the password gate or not at all.
+    match path {
+        ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
+        ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::Password => {}
+    }
     let evaluated = match confirm_run(conn, platform, spool, evaluated) {
         ConfirmRun::Served(served) => return served,
         ConfirmRun::Continue(evaluated) => *evaluated,
@@ -386,14 +394,8 @@ fn serve_request(
         // Nothing is enabled by this record, so a sink that cannot take it
         // does not change the answer.
         let _ = platform.audit.append(&|previous| {
-            decided(
-                previous,
-                &decision,
-                &caller,
-                &identity,
-                &request,
-                &policy.rules.generation,
-                None,
+            decided_under(
+                previous, &decision, &caller, &identity, &request, &policy, None,
             )
         });
         return answer(
@@ -413,6 +415,38 @@ fn serve_request(
             request,
             policy,
         },
+        MintFor::Password(None),
+    )
+}
+
+/// Refuses a service harness that no rule grants: it has no password to type,
+/// so nothing is minted. The record keeps the whole decision; the reply carries
+/// the code and the action id only.
+fn harness_not_granted(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    evaluated: &Evaluated,
+) -> Served {
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
+    // Nothing is enabled by this record, so a sink that cannot take it does
+    // not change the answer.
+    let _ = platform.audit.append(&|previous| {
+        let record = decided_under(previous, decision, caller, identity, request, policy, None);
+        let mut evidence = record.evidence.clone();
+        evidence.push("refused=harness_not_granted".to_owned());
+        record.with_evidence(evidence)
+    });
+    let action = decision.action.as_ref().map(xudo_policy::ActionId::as_str);
+    answer(
+        conn,
+        &BrokerResponse::harness_not_granted(action),
+        Served::Decided,
     )
 }
 
@@ -420,7 +454,7 @@ fn serve_request(
 fn queue_ask_human(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     decision: &Decision,
     caller: &CallerFacts,
@@ -488,15 +522,7 @@ fn queue_ask_human(
     // published. A failed audit leaves the store untouched.
     let record = platform.audit.append(&|previous| {
         crate::record::with_queue_id(
-            decided(
-                previous,
-                decision,
-                caller,
-                identity,
-                request,
-                &policy.rules.generation,
-                None,
-            ),
+            decided_under(previous, decision, caller, identity, request, policy, None),
             &entry.id,
         )
     });
@@ -509,7 +535,7 @@ fn queue_ask_human(
             Some(request),
         );
     }
-    if !audit_queue_pruned(platform.audit, &pruned) {
+    if !audit_queue_pruned(platform.audit, &pruned, caller.classification.label()) {
         return refuse(
             conn,
             platform.audit,
@@ -613,7 +639,7 @@ fn queue_entry_from_request(
     .map_err(|error| error.to_string())
 }
 
-fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
+fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String], class: &str) -> bool {
     ids.iter().all(|id| {
         audit
             .append(&|previous| {
@@ -621,7 +647,7 @@ fn audit_queue_pruned(audit: &mut dyn AuditSink, ids: &[String]) -> bool {
                     previous,
                     xudo_audit::record::Decision::Denied,
                     Vec::new(),
-                    "human",
+                    class,
                 )
                 .with_denial("queue_entry_pruned")
                 .with_evidence(vec![format!("queue_id={id}")])
@@ -637,6 +663,7 @@ fn audit_queue_listed(
     after: &str,
     count: usize,
     next: Option<&str>,
+    class: crate::queue::PeerClass,
 ) -> bool {
     audit
         .append(&|previous| {
@@ -644,7 +671,7 @@ fn audit_queue_listed(
                 previous,
                 xudo_audit::record::Decision::Denied,
                 Vec::new(),
-                "human",
+                peer_class_label(class),
             )
             .with_denial("queue_listed")
             .with_evidence(vec![
@@ -672,7 +699,7 @@ struct QueueReady<'a> {
 fn prepare_queue<'a>(
     conn: &dyn Connection,
     platform: &mut Platform<'a>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<QueueReady<'a>, Served> {
     let Some(store) = platform.queue else {
@@ -699,9 +726,7 @@ fn prepare_queue<'a>(
             ));
         }
     };
-    let passwd = std::str::from_utf8(&policy.passwd)
-        .unwrap_or_default()
-        .to_owned();
+    let passwd = policy.passwd.clone();
     let caller = classify_with_registry(identity, &policy.rules.harnesses, &passwd);
     let class = peer_class(&caller);
     let now = platform.clock.boottime_millis();
@@ -725,6 +750,16 @@ fn prepare_queue<'a>(
         boot_id,
         passwd,
     })
+}
+
+/// The classification label the audit trail records for a queue peer: what the
+/// broker attested, never a fixed "human".
+fn peer_class_label(class: crate::queue::PeerClass) -> &'static str {
+    match class {
+        crate::queue::PeerClass::Human => "human",
+        crate::queue::PeerClass::EnrolledAgent => "enrolled-agent",
+        crate::queue::PeerClass::Unattested => "unattested",
+    }
 }
 
 fn peer_class(caller: &CallerFacts) -> crate::queue::PeerClass {
@@ -810,7 +845,7 @@ fn queue_claim_refusal(error: &crate::queue::ClaimError) -> Refusal {
 fn serve_queue_list(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Served {
     let ready = match prepare_queue(conn, platform, identity, request) {
@@ -832,7 +867,7 @@ fn serve_queue_list(
         };
     // Audit the prune set before any name is removed. A failed audit leaves
     // the store untouched.
-    if !audit_queue_pruned(platform.audit, &planned) {
+    if !audit_queue_pruned(platform.audit, &planned, peer_class_label(ready.class)) {
         return refuse(
             conn,
             platform.audit,
@@ -883,6 +918,7 @@ fn serve_queue_list(
         after,
         page.len(),
         next.as_deref(),
+        ready.class,
     ) {
         return refuse(
             conn,
@@ -1073,7 +1109,7 @@ fn serve_queue_claim(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
 ) -> Served {
@@ -1214,10 +1250,10 @@ fn serve_queue_claim(
         spool,
         evaluated,
         nonce.clone(),
-        Some(QueuedMint {
+        MintFor::Password(Some(QueuedMint {
             id,
             harness: &harness,
-        }),
+        })),
     );
     if served != Served::Minted {
         let _ = release_claimed(
@@ -1280,7 +1316,7 @@ fn fail_claimed(
     store: &dyn Spool,
     id: &str,
     act: &crate::queue::ClaimAct<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     denial: xudo_policy::Decision,
 ) -> Served {
@@ -1401,7 +1437,7 @@ fn serve_queue_complete(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
     audit_seq: u64,
@@ -1491,7 +1527,7 @@ fn serve_queue_release(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     id: &str,
 ) -> Served {
@@ -1775,7 +1811,7 @@ fn validated_confirm(bytes: &[u8]) -> Result<ConfirmData, SpoolError> {
 fn clear_approved_backoff(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     consumed: &xudo_gate::request::PendingRequest,
     now: u64,
@@ -1946,13 +1982,13 @@ fn mint_approved(
     // Audit first: nothing is swapped without a record, and a failed record
     // leaves the entry Approved.
     let build = |previous: Option<&Record>, grant: &Grant| {
-        decided(
+        decided_under(
             previous,
             &decision,
             &caller,
             &identity,
             &request,
-            &policy.rules.generation,
+            &policy,
             Some(&grant.0),
         )
     };
@@ -2563,7 +2599,7 @@ fn serve_confirmation_question(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Served {
     let result = match &request.question {
@@ -2576,8 +2612,12 @@ fn serve_confirmation_question(
         xudo_wire::Question::Freeze { reason } => {
             freeze(platform, spool, identity, request, reason)
         }
-        xudo_wire::Question::Thaw => registry_caller(platform, identity)
-            .and_then(|caller| thaw(platform, identity, &caller, request)),
+        xudo_wire::Question::Thaw => {
+            registry_caller_with_harness_uid(platform, identity).and_then(|(caller, harness)| {
+                refuse_harness_uid_thaw(identity, harness)?;
+                thaw(platform, identity, &caller, request)
+            })
+        }
         xudo_wire::Question::Run { .. } | xudo_wire::Question::RemovePath { .. } => {
             return Served::Refused(Fault::Broker);
         }
@@ -2624,40 +2664,124 @@ fn done() -> BrokerResponse {
 fn freeze(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     reason: &str,
 ) -> Result<BrokerResponse, Refusal> {
-    let caller = registry_caller(platform, identity)?;
+    let policy = platform
+        .policy
+        .load()
+        .map_err(|error| Refusal::from(&error))?;
+    let (caller, harness_uid) = registry_caller_with_harness_uid(platform, identity)?;
+    // Which harnesses this peer reviews comes from the registry loaded for
+    // this very request, never from anything the peer sent. Only a peer the
+    // broker positively classes human, and whose uid is no harness's account
+    // or user, gets any: a harness uid outside its scope (a second passwd name
+    // for the same uid, say) is classed human but keeps the uid marker alone.
+    let labels = if matches!(caller.classification, xudo_policy::Classification::Human)
+        && harness_uid == HarnessUid::No
+    {
+        reviewed_markers(&policy, identity)
+    } else {
+        Vec::new()
+    };
     freeze_with(
         platform,
         spool,
         identity,
         &caller,
+        &labels,
         request,
         reason,
         &serde_json::to_vec,
     )
 }
 
-/// Classifies the peer against the registry the broker loads for this very
-/// request, as a run does. An empty registry would call an enrolled agent
-/// unattested and let it lift its owner's freeze. A ruleset that cannot be
-/// loaded cannot say who is an agent, so the request is refused.
-fn registry_caller(
+/// The marker names (`frozen-h-<label>`) of the harnesses whose `reviewers`
+/// name `identity`'s uid, names resolved through the passwd the classification
+/// used. Root reviews none by name: its own marker is the global one. A
+/// registry that failed to load names no one (the caller refuses first). A label that
+/// cannot name a marker is dropped, so no marker is ever built from text.
+fn reviewed_markers(policy: &crate::policy::LoadedPolicy, identity: &PeerIdentity) -> Vec<String> {
+    if identity.uid == 0 {
+        return Vec::new();
+    }
+    policy
+        .rules
+        .harnesses
+        .entries()
+        .filter(|entry| {
+            entry.reviewers.iter().any(|name| {
+                xudo_policy::harness::passwd_uid(&policy.passwd, name) == Some(identity.uid)
+            })
+        })
+        .filter_map(|entry| xudo_gate::policy::harness_marker_name(&entry.label))
+        .collect()
+}
+
+/// Whether a peer's uid belongs to a harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessUid {
+    /// The uid is no registered harness's account or user.
+    No,
+    /// It is the account or a user of a registered harness.
+    Yes,
+    /// The registry failed to load, so no uid can be ruled out.
+    Unknown,
+}
+
+/// The caller facts, and whether the peer's uid is the account or a user
+/// of any registered harness (names resolved through the same passwd the
+/// classification used, so two names for one uid both count). A registry that
+/// failed to load rules nobody out: [`HarnessUid::Unknown`].
+fn registry_caller_with_harness_uid(
     platform: &Platform<'_>,
     identity: &PeerIdentity,
-) -> Result<CallerFacts, Refusal> {
+) -> Result<(CallerFacts, HarnessUid), Refusal> {
     let policy = platform
         .policy
         .load()
         .map_err(|error| Refusal::from(&error))?;
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
-    Ok(classify_with_registry(
-        identity,
-        &policy.rules.harnesses,
-        passwd,
-    ))
+    let passwd = Some(policy.passwd.as_str())
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| Refusal::from(&crate::policy::PolicyError::PasswdUnusable))?;
+    let resolve = |name: &str| xudo_policy::harness::passwd_uid(passwd, name);
+    let harness_uid = policy
+        .rules
+        .harnesses
+        .entries()
+        .any(|entry| entry.uid_matches(identity.uid, &resolve));
+    let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
+    let harness_uid = match (policy.rules.registry_fault.is_some(), harness_uid) {
+        (true, _) => HarnessUid::Unknown,
+        (false, true) => HarnessUid::Yes,
+        (false, false) => HarnessUid::No,
+    };
+    Ok((caller, harness_uid))
+}
+
+/// "Outside any agent scope" is not "a human": an agent running as its
+/// harness's uid can start a process outside its scope (`systemd-run --user`,
+/// cron, ssh to localhost) and be classed outside. So a non-root peer that
+/// shares a harness uid cannot thaw; `sudo xudo thaw` reaches the broker as
+/// uid 0, which the password already proved.
+fn refuse_harness_uid_thaw(
+    identity: &PeerIdentity,
+    harness_uid: HarnessUid,
+) -> Result<(), Refusal> {
+    let what = match harness_uid {
+        _ if identity.uid == 0 => return Ok(()),
+        HarnessUid::No => return Ok(()),
+        HarnessUid::Yes => {
+            "this account runs an agent harness: use `sudo xudo thaw`, which lifts ALL freezes (the global one and every user's)"
+        }
+        // With the registry gone nobody can say which uid is an agent's, and a
+        // thaw lifts a brake, so only the password path may do it.
+        HarnessUid::Unknown => {
+            "the harness registry cannot be loaded, so only `sudo xudo thaw` can lift a freeze"
+        }
+    };
+    Err(Refusal::client(RefusalCode::ChannelUntrusted, what))
 }
 
 /// The most names the state directory is listed to: the audit log, root's
@@ -2665,11 +2789,24 @@ fn registry_caller(
 /// thaw walks and the markers a group member can make the directory hold.
 const MAX_STATE_NAMES: usize = 128;
 
+/// The most names root's thaw and the `*_freeze_stands` readers list. A
+/// reviewer's marker skips `MAX_STATE_NAMES` (its brake is never refused for
+/// room) but stops at this bound, so the directory can never grow past what
+/// root's thaw can list: reviewer markers cannot lock root's thaw out.
+const MAX_LISTED_NAMES: usize = 2 * MAX_STATE_NAMES;
+
 /// A freeze or a thaw is a lever over every agent in its scope, so an
 /// attested agent never pulls it: the class is the broker's, from kernel
 /// facts, and an agent that could freeze could stop its owner's other agents.
 fn refuse_attested_agent(caller: &CallerFacts, what: &'static str) -> Result<(), Refusal> {
     if caller.classification.is_enrolled_agent() {
+        return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
+    }
+    Ok(())
+}
+
+fn refuse_unless_human(caller: &CallerFacts, what: &'static str) -> Result<(), Refusal> {
+    if !matches!(caller.classification, xudo_policy::Classification::Human) {
         return Err(Refusal::client(RefusalCode::ChannelUntrusted, what));
     }
     Ok(())
@@ -2695,11 +2832,11 @@ fn user_freeze_stands(platform: &Platform<'_>, uid: u32) -> bool {
     let Some(state) = platform.freeze_file else {
         return true;
     };
-    let Ok(names) = state.names_up_to(MAX_STATE_NAMES + 1) else {
+    let Ok(names) = state.names_up_to(MAX_LISTED_NAMES + 1) else {
         return true;
     };
     // A listing cut off one past the bound may have cut the marker off too.
-    if names.len() > MAX_STATE_NAMES {
+    if names.len() > MAX_LISTED_NAMES {
         return true;
     }
     let marker = xudo_gate::policy::freeze_marker_name(uid);
@@ -2708,11 +2845,31 @@ fn user_freeze_stands(platform: &Platform<'_>, uid: u32) -> bool {
         .any(|name| name.as_slice() == marker.as_bytes())
 }
 
+/// Whether the harness `label`'s own freeze marker stands. The same terms as
+/// [`user_freeze_stands`]: storage that cannot be listed counts as frozen.
+fn harness_freeze_stands(platform: &Platform<'_>, label: &str) -> bool {
+    let Some(marker) = xudo_gate::policy::harness_marker_name(label) else {
+        return true;
+    };
+    let Some(state) = platform.freeze_file else {
+        return true;
+    };
+    let Ok(names) = state.names_up_to(MAX_LISTED_NAMES + 1) else {
+        return true;
+    };
+    names.len() > MAX_LISTED_NAMES
+        || names
+            .iter()
+            .any(|name| name.as_slice() == marker.as_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn freeze_with(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     caller: &CallerFacts,
+    markers: &[String],
     request: &BrokerRequest,
     reason: &str,
     encode: &dyn Fn(&FreezeRecord) -> Result<Vec<u8>, serde_json::Error>,
@@ -2743,13 +2900,14 @@ fn freeze_with(
                 previous,
                 xudo_audit::record::Decision::Denied,
                 vec!["xudo freeze".to_owned()],
-                "human",
+                caller.classification.label(),
             )
             .with_denial("freeze")
             .with_evidence(vec![
                 "broker=xudod".to_owned(),
                 format!("uid={}", identity.uid),
                 format!("reason={}", reason.escape_debug()),
+                format!("harness_markers={}", markers.join(",")),
             ])
             .with_outcome(xudo_audit::record::Outcome::NotExecuted)
         })
@@ -2760,10 +2918,18 @@ fn freeze_with(
             )
         })?;
     drop(record);
+    // One marker per reviewed harness, each stopping that harness alone,
+    // first: a reviewer's brake is never refused for room. Root named the
+    // reviewer in the registry and the names are bounded by it, so the
+    // reviewer's own uid marker keeps the same room.
+    for name in markers {
+        publish_freeze(state, name, &bytes, true)?;
+    }
     publish_freeze(
         state,
         &xudo_gate::policy::freeze_marker_name(identity.uid),
         &bytes,
+        !markers.is_empty(),
     )?;
     deny_pending(platform, spool, identity, request)?;
     Ok(done())
@@ -2772,16 +2938,28 @@ fn freeze_with(
 /// A killed broker can leave the temporary name behind, and the publish would
 /// then fail on it for ever. Under the directory lock no other freeze is
 /// mid-publish, so a name found here is stale.
-fn publish_freeze(state: &dyn Spool, name: &str, bytes: &[u8]) -> Result<(), Refusal> {
+fn publish_freeze(
+    state: &dyn Spool,
+    name: &str,
+    bytes: &[u8],
+    reserved: bool,
+) -> Result<(), Refusal> {
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
     let names = state
-        .names_up_to(MAX_STATE_NAMES + 1)
+        .names_up_to(MAX_LISTED_NAMES + 1)
         .map_err(|e| Refusal::from(&e))?;
     // Root's global marker is never refused for room: one slot is held back
     // for it, so a full directory of user markers cannot disable root's freeze.
-    let is_roots = name == xudo_gate::policy::freeze_marker_name(0);
+    // A reviewer's marker skips the user bound but not the listing bound, so
+    // root's thaw can always list what it must remove.
     let present = names.iter().any(|n| n.as_slice() == name.as_bytes());
-    if !is_roots && !present && names.len() >= MAX_STATE_NAMES - 1 {
+    let is_roots = name == xudo_gate::policy::freeze_marker_name(0);
+    let limit = if reserved {
+        MAX_LISTED_NAMES - 1
+    } else {
+        MAX_STATE_NAMES - 1
+    };
+    if !is_roots && !present && names.len() >= limit {
         return Err(Refusal::client(
             RefusalCode::SpoolFull,
             "too many freeze markers; root can free room by removing the extra files in /var/lib/xudo by hand",
@@ -2820,10 +2998,12 @@ fn encoded_freeze_record(
     })
 }
 
+// The harness's own entries are left in the spool on purpose: the gate
+// refuses them while its marker stands, so they cannot run.
 fn deny_pending(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<(), Refusal> {
     let store = platform.confirmations.ok_or_else(|| {
@@ -2866,14 +3046,8 @@ fn deny_pending(
         let _receipt = platform
             .audit
             .append(&|previous| {
-                decided(
-                    previous,
-                    &decision,
-                    &caller,
-                    identity,
-                    request,
-                    &policy.rules.generation,
-                    None,
+                decided_under(
+                    previous, &decision, &caller, identity, request, &policy, None,
                 )
             })
             .map_err(|_| {
@@ -2930,6 +3104,11 @@ fn thaw(
 ) -> Result<BrokerResponse, Refusal> {
     refuse_diverged(identity, "thaw requires an undiverged peer")?;
     refuse_attested_agent(caller, "an attested agent cannot thaw")?;
+    // Thaw lifts a stop, so misclassification must not allow it: a user may
+    // thaw only when positively classed human. Root is unchanged.
+    if identity.uid != 0 {
+        refuse_unless_human(caller, "only a human can thaw")?;
+    }
     let state = platform.freeze_file.ok_or_else(|| {
         Refusal::broker(RefusalCode::SpoolUnusable, "freeze storage is unavailable")
     })?;
@@ -2960,9 +3139,9 @@ fn thaw(
     }
     let _lock = SpoolGuard::lock(state).map_err(|e| Refusal::from(&e))?;
     let names = state
-        .names_up_to(MAX_STATE_NAMES + 1)
+        .names_up_to(MAX_LISTED_NAMES + 1)
         .map_err(|e| Refusal::from(&e))?;
-    if names.len() > MAX_STATE_NAMES {
+    if names.len() > MAX_LISTED_NAMES {
         return Err(Refusal::broker(
             RefusalCode::SpoolFull,
             "the state directory holds too many names to thaw",
@@ -3144,6 +3323,24 @@ fn status_outcome(
     ))
 }
 
+/// A human decision is made where the requester cannot answer it: a peer
+/// whose uid is a registered harness's account or user could be the agent
+/// itself on its own pty, so it may neither watch nor answer. With the
+/// registry unreadable nobody can be ruled out, so nobody watches.
+fn refuse_harness_uid_watcher(
+    platform: &Platform<'_>,
+    identity: &PeerIdentity,
+) -> Result<(), Refusal> {
+    let (_, harness_uid) = registry_caller_with_harness_uid(platform, identity)?;
+    match harness_uid {
+        HarnessUid::No => Ok(()),
+        HarnessUid::Yes | HarnessUid::Unknown => Err(Refusal::client(
+            RefusalCode::ChannelUntrusted,
+            "an agent harness account cannot watch or answer confirmations",
+        )),
+    }
+}
+
 fn watch(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
@@ -3155,6 +3352,7 @@ fn watch(
             "watch requires a checked terminal",
         ));
     }
+    refuse_harness_uid_watcher(platform, identity)?;
     let now = platform.clock.boottime_millis();
     save_heartbeat(platform, spool, identity, now)?;
     let watcher = crate::confirm::WatcherFacts {
@@ -3381,7 +3579,7 @@ fn save_heartbeat(
 fn answer_confirmation(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
 ) -> Result<BrokerResponse, Refusal> {
     let xudo_wire::Question::Answer { id, token, approve } = &request.question else {
@@ -3391,6 +3589,7 @@ fn answer_confirmation(
         ));
     };
     let (id, token, approve) = (id.as_str(), token.as_str(), *approve);
+    refuse_harness_uid_watcher(platform, identity)?;
     let _confirm_guard = if approve {
         None
     } else {
@@ -3451,7 +3650,7 @@ struct AnsweredEntry {
 fn complete_answer(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     answered: AnsweredEntry,
     approve: bool,
@@ -3483,15 +3682,14 @@ fn complete_answer(
     }
     if approve {
         let grant = Grant(entry.clone());
-        let generation = &policy.rules.generation;
         let authorized = authorize(&mut *platform.audit, grant, &|previous, grant| {
-            decided(
+            decided_under(
                 previous,
                 &decision,
                 &caller,
                 identity,
                 request,
-                generation,
+                &policy,
                 Some(&grant.0),
             )
         })
@@ -3511,14 +3709,8 @@ fn complete_answer(
         let record = platform
             .audit
             .append(&|previous| {
-                decided(
-                    previous,
-                    &decision,
-                    &caller,
-                    identity,
-                    request,
-                    &policy.rules.generation,
-                    None,
+                decided_under(
+                    previous, &decision, &caller, identity, request, &policy, None,
                 )
             })
             .map_err(|_| {
@@ -3579,13 +3771,15 @@ fn receive(conn: &dyn Connection) -> Result<BrokerRequest, Refusal> {
     BrokerRequest::parse(&bytes).map_err(|error| Refusal::from(&error))
 }
 
-/// A remove-path is re-decided from the operation table and minted only for
-/// the password gate. It is not queued and it does not ask for a watch.
+/// A remove-path is re-decided from the operation table. It is minted for
+/// `-nopass` only where [`exec_path`] says so (a live harness the operation
+/// grants), refused for a service harness it does not grant, and otherwise
+/// minted for the password gate. It is never queued.
 fn serve_remove(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
-    identity: PeerIdentity,
+    identity: Identified,
     request: BrokerRequest,
 ) -> Served {
     let mut policy = match platform.policy.load() {
@@ -3601,19 +3795,39 @@ fn serve_remove(
         }
     };
     policy.settings.frozen |= user_freeze_stands(platform, identity.uid);
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+    let passwd = policy.passwd.as_str();
     let caller = classify_with_registry(&identity, &policy.rules.harnesses, passwd);
+    // The gate re-reads the marker; this is the early, clean refusal.
+    if let xudo_policy::Classification::EnrolledAgent { agent_id, .. } = &caller.classification {
+        policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
+    }
     let decision = crate::policy::decide_remove(&policy, &caller, &request);
+    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
+    let evaluated = Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    };
+    // The other half of the one mint-site family: the same `exec_path`
+    // decides, for an operation the rule grants this live harness.
+    match path {
+        ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
+        ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::Password => {}
+    }
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
     if !decision.verdict.is_permitted() {
         let _ = platform.audit.append(&|previous| {
-            decided(
-                previous,
-                &decision,
-                &caller,
-                &identity,
-                &request,
-                &policy.rules.generation,
-                None,
+            decided_under(
+                previous, &decision, &caller, &identity, &request, &policy, None,
             )
         });
         return answer(
@@ -3633,6 +3847,7 @@ fn serve_remove(
             request,
             policy,
         },
+        MintFor::Password(None),
     )
 }
 
@@ -3642,6 +3857,7 @@ fn mint(
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     evaluated: Evaluated,
+    mint_for: MintFor<'_>,
 ) -> Served {
     let nonce = match draw_nonce(platform.entropy) {
         Ok(nonce) => nonce,
@@ -3659,7 +3875,7 @@ fn mint(
             );
         }
     };
-    mint_with_nonce(conn, platform, spool, evaluated, nonce, None)
+    mint_with_nonce(conn, platform, spool, evaluated, nonce, mint_for)
 }
 
 /// A queued claim's id and harness, carried onto the minted spool and the answer.
@@ -3669,23 +3885,47 @@ struct QueuedMint<'a> {
     harness: &'a str,
 }
 
+/// Which gate file an entry is minted for.
+#[derive(Clone, Copy)]
+enum MintFor<'a> {
+    /// `-auth`, after `sudo` asks the password; a queued claim carries its id.
+    Password(Option<QueuedMint<'a>>),
+    /// `-nopass`: built only where [`exec_path`] says [`ExecPath::Harness`].
+    Harness,
+}
+
 /// Mints `evaluated` under a nonce the caller already drew.
 ///
 /// A queued claim binds this nonce on the queue record before calling here,
-/// so the gate record and the queue entry name the same run. `queue` is set
-/// only for that path; an ordinary human-path mint passes [`None`].
+/// so the gate record and the queue entry name the same run: it passes
+/// [`MintFor::Password`] with the queue item. An ordinary human-path mint
+/// passes `Password(None)`.
 fn mint_with_nonce(
     conn: &dyn Connection,
     platform: &mut Platform<'_>,
     spool: &dyn Spool,
     evaluated: Evaluated,
     nonce: String,
-    queue: Option<QueuedMint<'_>>,
+    mint_for: MintFor<'_>,
 ) -> Served {
+    let (queue, ttl, via, gate) = match mint_for {
+        MintFor::Password(queue) => (
+            queue,
+            REQUEST_TTL_MILLIS,
+            xudo_gate::request::Via::Auth,
+            xudo_backend::snippet::GATE_AUTH,
+        ),
+        MintFor::Harness => (
+            None,
+            HARNESS_TTL_MILLIS,
+            xudo_gate::request::Via::Harness,
+            xudo_backend::snippet::GATE_NOPASS,
+        ),
+    };
     let queue_id = queue.map(|item| item.id);
     let harness_label = queue.map(|item| item.harness);
     let now = platform.clock.boottime_millis();
-    let deadline = now.saturating_add(REQUEST_TTL_MILLIS);
+    let deadline = now.saturating_add(ttl);
     let mut entry = match mint_entry(platform, &evaluated, deadline, nonce) {
         Ok(entry) => entry,
         Err(refusal) => {
@@ -3701,6 +3941,10 @@ fn mint_with_nonce(
     if let Some(id) = queue_id {
         entry.queue_id = Some(id.to_owned());
     }
+    // `needs_watch` stays as computed: a grant is a plain allow, so it is
+    // false, and if it ever were not, the gate refuses a harness entry that
+    // waits on a watcher.
+    entry.via = via;
     let Evaluated {
         decision,
         caller,
@@ -3712,13 +3956,13 @@ fn mint_with_nonce(
 
     // No record, no entry: `publish` takes the authorization.
     let build = |previous: Option<&Record>, grant: &Grant| {
-        decided(
+        decided_under(
             previous,
             &decision,
             &caller,
             &identity,
             &request,
-            &policy.rules.generation,
+            &policy,
             Some(&grant.0),
         )
     };
@@ -3762,7 +4006,7 @@ fn mint_with_nonce(
     let minted = Minted {
         nonce: nonce.clone(),
         expires_in_ms: remaining_millis(deadline, platform.clock.boottime_millis()),
-        gate: xudo_backend::snippet::GATE_AUTH.to_owned(),
+        gate: gate.to_owned(),
         claim_token: queue_id.map(|_| nonce.clone()),
         harness: harness_label.map(str::to_owned),
     };
@@ -3846,7 +4090,7 @@ fn refuse(
     conn: &dyn Connection,
     audit: &mut dyn AuditSink,
     refusal: &Refusal,
-    identity: Option<&PeerIdentity>,
+    identity: Option<&Identified>,
     request: Option<&BrokerRequest>,
 ) -> Served {
     let _ = audit.append(&|previous| refused(previous, refusal, identity, request));
@@ -3949,7 +4193,7 @@ mod tests {
 
     use super::*;
     use crate::mint::{MAX_SPOOL_ENTRIES, MintError, entry_for};
-    use crate::policy::{PolicyError, classify};
+    use crate::policy::{PolicyError, classify_for_test};
 
     const PID: u32 = 4242;
     const UID: u32 = 1000;
@@ -3991,7 +4235,7 @@ mod tests {
 
     fn ask_human_fixture() -> (Host, PeerIdentity, BrokerRequest) {
         const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
-        const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n";
+        const RULE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n";
         let harness_file = xudo_policy::HarnessFile {
             name: b"codex.toml".to_vec(),
             bytes: HARNESS.as_bytes().to_vec(),
@@ -4008,14 +4252,14 @@ mod tests {
         let mut loaded = policy();
         loaded.rules = rules;
         loaded.queue_ttl_secs = 60;
-        loaded.passwd = b"agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_vec();
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
         let mut host = Host::honest();
         host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
         host.policy.answer = Ok(loaded);
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
         identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
+            crate::identify::CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
                 kind: xudo_sys::ScopeKind::Agent,
                 name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
                 record: serde_json::json!({
@@ -4048,7 +4292,7 @@ mod tests {
         request: &BrokerRequest,
     ) -> (LoadedPolicy, CallerFacts, xudo_policy::Decision) {
         let policy = host.policy.load().unwrap();
-        let passwd = std::str::from_utf8(&policy.passwd).unwrap_or_default();
+        let passwd = policy.passwd.as_str();
         let caller = classify_with_registry(identity, &policy.rules.harnesses, passwd);
         let decision = decide(&policy, &caller, request);
         (policy, caller, decision)
@@ -4110,7 +4354,8 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .unwrap(),
             settings: xudo_policy::engine::Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: Vec::new(),
+            passwd: "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_owned(),
+            passwd_fault: None,
         }
     }
 
@@ -4419,8 +4664,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
         let identity = test_identity(PID, START, 1, 0);
-        let served =
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &identity, &request);
+        let served = serve_confirmation_question(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            &identity.clone().into(),
+            &request,
+        );
         assert_eq!(served, Served::Refused(Fault::Broker));
     }
 
@@ -5053,7 +5303,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         // Both read the entry as Approved before either has published.
         let mut taken = Vec::new();
         for identity in [&first, &second] {
-            let caller = classify(identity);
+            let caller = classify_for_test(identity);
             let approved = take_matching_approval(
                 &spool,
                 &search_for(&request, identity, &caller, &syscalls, &action),
@@ -5214,7 +5464,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "unattested",
         );
         let identity = test_identity(PID, START, 7, 7);
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let syscalls = xudo_sys::FakeSyscalls::new();
         let taken = take_matching_approval(
             &spool,
@@ -5346,7 +5596,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let identity =
                 crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
             let policy = confirming_policy();
-            let caller = classify(&identity);
+            let caller = classify_for_test(&identity);
             let decision = decide(&policy, &caller, &request);
             Evaluated {
                 decision,
@@ -5449,11 +5699,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID, START, 0, 0);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let mut evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -5550,7 +5800,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &caller,
+                &caller.clone().into(),
                 &status_request
             ),
             Served::Decided
@@ -5567,7 +5817,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &watch_request
             ),
             Served::Decided
@@ -5580,7 +5830,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request
             ),
             Served::Decided
@@ -5589,7 +5839,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let run = BrokerRequest::new("/usr/bin/true", Vec::<String>::new(), "unattested");
         let conn = connection(Ok(run.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &run),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &run
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5601,7 +5857,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(unknown.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &unknown),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &unknown
+            ),
             Served::Refused(Fault::Client)
         );
 
@@ -5611,7 +5873,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(queue_list.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &queue_list,),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &queue_list,
+            ),
             Served::Decided
         );
     }
@@ -5629,7 +5897,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_confirmation_question(&conn, &mut host.platform(), &spool, &caller, &request),
+            serve_confirmation_question(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                &caller.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         assert!(matches!(
@@ -5750,6 +6024,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queue_list_refuses_missing_storage_policy_and_prune_failures() {
         let identity = test_identity(PID, START, 0, 0);
         let request = BrokerRequest {
@@ -5762,7 +6037,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         platform.queue = None;
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut platform, &identity, &request),
+            serve_queue_list(&conn, &mut platform, &identity.clone().into(), &request),
             Served::Refused(Fault::Broker)
         );
 
@@ -5774,7 +6049,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         ));
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5783,7 +6063,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_names_on_call(2, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5792,7 +6077,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             FakeSpool::new().failing_lock(SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5822,7 +6112,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         assert!(
@@ -5837,7 +6132,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .failing_names_on_call(3, SpoolError::NotADirectory { at: "queue".into() });
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
 
@@ -5848,7 +6148,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         assert_eq!(
@@ -5868,7 +6173,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             request,
         );
         assert_eq!(response, Served::Decided);
@@ -5898,7 +6203,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             unknown,
         );
         assert_eq!(response, Served::Decided);
@@ -5920,7 +6225,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &invalid_request,
                 &decision,
                 &caller,
@@ -6006,7 +6311,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6046,7 +6351,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6064,7 +6369,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6093,7 +6398,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6129,10 +6434,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             format!("{}.json", stale.id),
             serde_json::to_vec(&stale).unwrap(),
         );
+        let mut pruned_audit = FakeAuditSink::new();
         assert!(audit_queue_pruned(
-            &mut FakeAuditSink::new(),
+            &mut pruned_audit,
             std::slice::from_ref(&stale.id),
+            "unattested",
         ));
+        assert_eq!(pruned_audit.records()[0].classification, "unattested");
         let (mut host, _, _) = ask_human_fixture();
         let mut audit = SecondAuditAppendFails {
             inner: FakeAuditSink::new(),
@@ -6146,7 +6454,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6163,6 +6471,106 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn the_prune_record_names_the_class_that_triggered_it_not_human() {
+        let (mut host, identity, request) = ask_human_fixture();
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        let store = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let mut platform = host.platform();
+        platform.queue = Some(&store);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        queue_ask_human(
+            &conn,
+            &mut platform,
+            &identity.clone().into(),
+            &request,
+            &decision,
+            &caller,
+            &policy,
+        );
+        let pruned = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(pruned, caller.classification.label());
+        assert_ne!(pruned, "human");
+    }
+
+    #[test]
+    fn a_listing_prune_record_names_the_listers_class_not_human() {
+        let mut host = Host::honest();
+        host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+        let identity = enrolled_identity(&mut host);
+        let stale = crate::queue::QueueEntry {
+            id: "ef".repeat(32),
+            argv: vec![b"/usr/bin/true".to_vec()],
+            cwd: b"/srv".to_vec(),
+            boot_id: TEST_BOOT.to_owned(),
+            harness: "codex".to_owned(),
+            uid: UID,
+            rule_id: "xudo.test.run".to_owned(),
+            generation: 7,
+            queued_at: NOW.saturating_sub(100_000),
+            expires_at: NOW.saturating_sub(1),
+            reason: None,
+            state: crate::queue::QueueState::Pending,
+            run_nonce: None,
+            claimant_uid: None,
+            claim_token: None,
+            claimed_at: None,
+        };
+        host.queue = FakeSpool::new().with_file(
+            format!("{}.json", stale.id),
+            serde_json::to_vec(&stale).unwrap(),
+        );
+        let request = BrokerRequest {
+            schema_version: WIRE_SCHEMA_VERSION,
+            question: xudo_wire::Question::QueueList,
+        };
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            request,
+        );
+        let class = host
+            .audit
+            .records()
+            .iter()
+            .find(|record| record.denial.as_deref() == Some("queue_entry_pruned"))
+            .unwrap()
+            .classification
+            .clone();
+        assert_eq!(class, "enrolled-agent");
+    }
+
+    #[test]
     fn an_unreadable_queue_refuses_admission_before_anything_is_written() {
         let (mut host, identity, request) = ask_human_fixture();
         let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
@@ -6175,7 +6583,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6197,7 +6605,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut platform,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6226,7 +6634,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &store,
                 &"ab".repeat(32),
                 &act,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
             ),
@@ -6289,7 +6697,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &store,
                 &"ab".repeat(32),
                 &act,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 Decision::deny(DenialCode::AskHuman, Vec::new(), Vec::new()),
             ),
@@ -6307,7 +6715,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6330,7 +6738,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             queue_ask_human(
                 &conn,
                 &mut host.platform(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &decision,
                 &caller,
@@ -6350,7 +6758,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity,
+                identity.into(),
                 request,
             ),
             Served::Decided
@@ -6429,7 +6837,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.queue = FakeSpool::new();
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         // Broker faults stay off the wire. The audit record carries the reason.
@@ -6448,7 +6861,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.queue = FakeSpool::new();
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -6493,14 +6911,19 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(queue_request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &queue_request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &queue_request
+            ),
             Served::Decided
         );
 
         let (mut human_host, mut human_identity, _) = ask_human_fixture();
         human_identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
         let mut loaded = human_host.policy.load().unwrap();
-        loaded.passwd = b"alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_vec();
+        loaded.passwd = "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_owned();
         human_host.policy.answer = Ok(loaded);
         let reviewer_entry = crate::queue::QueueEntry {
             id: "cd".repeat(32),
@@ -6516,7 +6939,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             serve_queue_list(
                 &conn,
                 &mut human_host.platform(),
-                &human_identity,
+                &human_identity.clone().into(),
                 &queue_request,
             ),
             Served::Decided
@@ -6607,12 +7030,17 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             schema_version: WIRE_SCHEMA_VERSION,
             question: xudo_wire::Question::Thaw,
         };
-        let outcome = serve_with(
-            &mut host,
-            &connection(Ok(thaw.to_json().into_bytes())),
-            Ok(&spool),
+        let conn = connection(Ok(thaw.to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            human_identity().into(),
+            thaw,
         );
-        assert_eq!(outcome.answer, Answer::Done);
+        assert_eq!(served, Served::Decided);
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        assert_eq!(answer, Answer::Done);
     }
 
     fn thaw_request() -> BrokerRequest {
@@ -6644,12 +7072,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         for name in ["frozen", "frozen-1000", "frozen-2000", "audit.jsonl"] {
             host.freeze_file.publish(name, MARKER).unwrap();
         }
-        let outcome = serve_with(
-            &mut host,
-            &connection(Ok(thaw_request().to_json().into_bytes())),
-            Ok(&FakeSpool::new()),
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            human_identity().into(),
+            thaw_request(),
         );
-        assert_eq!(outcome.answer, Answer::Done);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(refusal_code_written(&conn), None);
         let left: Vec<_> = host.freeze_file.files().into_keys().collect();
         assert_eq!(
             left,
@@ -6702,7 +7134,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 thaw(
                     &mut host.platform(),
                     &root,
-                    &classify(&root),
+                    &classify_for_test(&root),
                     &thaw_request()
                 )
                 .is_err()
@@ -6716,7 +7148,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &root,
-                &classify(&root),
+                &classify_for_test(&root),
                 &thaw_request()
             )
             .is_err()
@@ -6734,7 +7166,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -6745,10 +7177,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.freeze_file = FakeSpool::new()
             .with_file("frozen-1000", MARKER)
             .failing_remove(broken);
+        let human = human_identity();
         let error = thaw(
             &mut host.platform(),
-            &identity,
-            &classify(&identity),
+            &human,
+            &classify_for_test(&human),
             &thaw_request(),
         )
         .unwrap_err();
@@ -6793,8 +7226,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze_with(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &an_attested_agent(),
+                &[],
                 &freeze_request(),
                 "maintenance",
                 &serde_json::to_vec,
@@ -6895,7 +7329,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     #[test]
     fn an_overflowing_state_listing_counts_as_frozen_and_blocks_a_thaw_all() {
         let junk = || {
-            (0..=MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            (0..=MAX_LISTED_NAMES).fold(FakeSpool::new(), |state, index| {
                 state.with_file(format!("junk-{index:04}"), MARKER)
             })
         };
@@ -6910,7 +7344,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let refused = thaw(
             &mut host.platform(),
             &root,
-            &classify(&root),
+            &classify_for_test(&root),
             &thaw_request(),
         )
         .unwrap_err();
@@ -6928,7 +7362,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &root,
+            &root.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -6948,7 +7382,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let refused = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -6972,7 +7406,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -6997,7 +7431,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7019,7 +7453,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &thaw_request(),
             )
             .unwrap_err();
@@ -7037,7 +7471,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7049,7 +7483,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7070,7 +7504,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let result = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &test_identity(PID, START, 0, 0),
+                &test_identity(PID, START, 0, 0).into(),
                 &freeze_request(),
                 "maintenance",
             );
@@ -7095,7 +7529,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             if freeze(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7113,7 +7547,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &spool,
-            &root,
+            &root.clone().into(),
             &freeze_request(),
             "maintenance",
         )
@@ -7124,7 +7558,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         thaw(
             &mut host.platform(),
             &root,
-            &classify(&root),
+            &classify_for_test(&root),
             &thaw_request(),
         )
         .unwrap();
@@ -7151,7 +7585,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let result = complete_answer(
                 &mut host.platform(),
                 &spool,
-                &arbitrary_watcher(5000, UID, 2, 34816, None),
+                &arbitrary_watcher(5000, UID, 2, 34816, None).into(),
                 &answer_request(NONCE, "remove", true),
                 AnsweredEntry {
                     id: NONCE.to_owned(),
@@ -7235,7 +7669,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7249,7 +7683,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7281,8 +7715,9 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze_with(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
-            &classify(&identity),
+            &identity.clone().into(),
+            &classify_for_test(&identity),
+            &[],
             &request,
             "x",
             &|_| Err(serde_json::from_str::<()>("invalid").unwrap_err()),
@@ -7309,7 +7744,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7320,8 +7755,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             FakeSpool::new().failing_names(broken.clone()),
         ] {
             let mut host = Host::honest();
-            let error = deny_pending(&mut host.platform(), &request_spool, &identity, &request)
-                .unwrap_err();
+            let error = deny_pending(
+                &mut host.platform(),
+                &request_spool,
+                &identity.clone().into(),
+                &request,
+            )
+            .unwrap_err();
             assert_eq!(error.code, RefusalCode::SpoolUnusable);
         }
     }
@@ -7340,7 +7780,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &request,
             "maintenance",
         )
@@ -7369,7 +7809,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             .with_file("already-denied", denied.to_json())
             .failing_read(b"unreadable".to_vec());
         let mut host = Host::honest();
-        deny_pending(&mut host.platform(), &spool, &identity, &request).unwrap();
+        deny_pending(
+            &mut host.platform(),
+            &spool,
+            &identity.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert_eq!(spool.files().len(), 4);
     }
 
@@ -7394,19 +7840,51 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.policy.answer = Err(PolicyError::Config(xudo_gate::SettingsError::NotUtf8 {
             file: "config".to_owned(),
         }));
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         host.audit = FakeAuditSink::failing("refused");
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         let spool = pending().failing_remove(broken.clone());
-        assert!(deny_pending(&mut host.platform(), &spool, &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &spool,
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
 
         let mut host = Host::honest();
         host.confirmations = FakeSpool::new().failing_publish(broken);
-        assert!(deny_pending(&mut host.platform(), &pending(), &identity, &request).is_err());
+        assert!(
+            deny_pending(
+                &mut host.platform(),
+                &pending(),
+                &identity.clone().into(),
+                &request
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7423,7 +7901,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .unwrap()
@@ -7438,7 +7916,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .is_err()
@@ -7451,7 +7929,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             thaw(
                 &mut host.platform(),
                 &identity,
-                &classify(&identity),
+                &classify_for_test(&identity),
                 &request
             )
             .is_err()
@@ -7572,7 +8050,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let again = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
             "again",
         )
@@ -7595,7 +8073,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let error = freeze(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &freeze_request(),
                 "maintenance",
             )
@@ -7611,7 +8089,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let error = freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             &reason,
         )
@@ -7628,7 +8106,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         freeze(
             &mut host.platform(),
             &FakeSpool::new(),
-            &test_identity(PID, START, 0, 0),
+            &test_identity(PID, START, 0, 0).into(),
             &freeze_request(),
             reason,
         )
@@ -8107,7 +8585,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn unattested_live(identity: &PeerIdentity) -> LiveAttestation {
         live_attestation(
             &xudo_sys::FakeSyscalls::new(),
-            &classify(identity),
+            &classify_for_test(identity),
             identity,
         )
         .unwrap()
@@ -8127,7 +8605,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8152,11 +8630,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8188,11 +8666,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8229,11 +8707,11 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let identity = test_identity(PID + 1, START + 1, 9, 9);
         let policy = confirming_policy();
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let evaluated = Evaluated {
             decision: decide(&policy, &caller, &request),
             caller,
-            identity,
+            identity: identity.into(),
             request,
             policy,
         };
@@ -8716,7 +9194,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                         }
                     },
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8731,7 +9209,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: None,
                     generation,
@@ -8748,7 +9226,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8765,7 +9243,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8782,7 +9260,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -8925,7 +9403,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 .ok()
                 .map(|live| live.class)
         };
-        let unattested = classify(&identity);
+        let unattested = classify_for_test(&identity);
         assert_eq!(
             class_of(&unattested, &identity),
             Some(xudo_gate::request::AttestedClass::Unattested)
@@ -9008,7 +9486,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation: policy().rules.generation.id(),
@@ -9069,7 +9547,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         deny_pending(
             &mut host.platform(),
             &freeze_spool,
-            &identity,
+            &identity.clone().into(),
             &freeze_request(),
         )
         .unwrap();
@@ -9137,7 +9615,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -9157,7 +9635,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &ApprovalSearch {
                     request: &request,
                     identity: &identity,
-                    caller: &classify(&identity),
+                    caller: &classify_for_test(&identity),
                     syscalls: &xudo_sys::HostSyscalls,
                     action: Some("xudo.pkg.remove"),
                     generation,
@@ -9619,7 +10097,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.audit = FakeAuditSink::failing("audit unavailable");
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "remove", true);
-        let result = answer_confirmation(&mut host.platform(), &spool, &watcher, &request);
+        let result = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        );
         assert!(result.is_err());
         assert_eq!(spool.files().get(NONCE.as_bytes()), Some(&before));
     }
@@ -9634,9 +10117,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             question: xudo_wire::Question::Thaw,
         };
         assert_eq!(
-            answer_confirmation(&mut host.platform(), &spool, &watcher, &not_answer)
-                .unwrap_err()
-                .code,
+            answer_confirmation(
+                &mut host.platform(),
+                &spool,
+                &watcher.clone().into(),
+                &not_answer
+            )
+            .unwrap_err()
+            .code,
             RefusalCode::RequestMalformed
         );
 
@@ -9644,7 +10132,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut platform = host.platform();
         platform.confirmations = None;
         assert_eq!(
-            answer_confirmation(&mut platform, &spool, &watcher, &denial)
+            answer_confirmation(&mut platform, &spool, &watcher.clone().into(), &denial)
                 .unwrap_err()
                 .code,
             RefusalCode::SpoolUnusable
@@ -9658,7 +10146,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -9671,7 +10159,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &malformed,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -9687,7 +10175,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -9697,6 +10185,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn denial_completion_refusals_cover_audit_outcome_and_removal() {
         let identity = test_identity(5000, 77, 2, 34816);
         let mut entry = shown_entry();
@@ -9716,7 +10205,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -9735,9 +10224,16 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             entry: entry.clone(),
         };
         assert_eq!(
-            complete_answer(&mut platform, &spool, &identity, &request, answered, false)
-                .unwrap_err()
-                .code,
+            complete_answer(
+                &mut platform,
+                &spool,
+                &identity.clone().into(),
+                &request,
+                answered,
+                false
+            )
+            .unwrap_err()
+            .code,
             RefusalCode::SpoolUnusable
         );
 
@@ -9761,7 +10257,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -9788,7 +10284,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &remove_error,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered,
                 false
@@ -9809,8 +10305,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "remove", true);
-        let response =
-            answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        let response = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert_eq!(response.answer, Answer::Done);
         assert_eq!(host.audit.records().len(), 1);
         let entry =
@@ -9841,7 +10342,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let watcher = test_identity(5000, 77, 2, 34816);
         let request = answer_request(NONCE, "private-token", false);
-        answer_confirmation(&mut host.platform(), &spool, &watcher, &request).unwrap();
+        answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &watcher.clone().into(),
+            &request,
+        )
+        .unwrap();
         assert!(spool.files().is_empty());
         assert_eq!(host.audit.records().len(), 1);
         assert!(
@@ -9877,7 +10384,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "no", false),
         )
         .unwrap();
@@ -9938,7 +10445,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let result = complete_answer(
             &mut host.platform(),
             &spool,
-            &test_identity(5000, 77, 2, 34816),
+            &test_identity(5000, 77, 2, 34816).into(),
             &answer_request(NONCE, "no", false),
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -10000,7 +10507,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let too_fast = answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", true),
         )
         .unwrap_err();
@@ -10012,7 +10519,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let approved = answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", true),
         )
         .unwrap();
@@ -10046,7 +10553,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(&first_id, "remove", true),
         )
         .unwrap();
@@ -10059,7 +10566,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         answer_confirmation(
             &mut host.platform(),
             &spool,
-            &watcher,
+            &watcher.clone().into(),
             &answer_request(&second.nonce, "remove", true),
         )
         .unwrap();
@@ -10943,6 +11450,192 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    /// One row of hints: `comm`, `exe`, `cmdline`, `environ`.
+    type HintRow<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+    /// What serving `request` to a peer of `kind` (a harness in its scope, a
+    /// human outside the slice, a recordless process in it) showing `hints`
+    /// came to: how it ended, the answer, and the records with their hint
+    /// lines and hash chain dropped.
+    fn served_beside_hints(
+        kind: usize,
+        hints: Option<HintRow<'_>>,
+        request: &BrokerRequest,
+    ) -> (Served, Answer, Vec<Record>) {
+        let mut host = with_test_boot(Host::honest());
+        let mut identity = test_identity(PID, START, 0, 0);
+        match kind {
+            0 => identity = enrolled_identity(&mut host),
+            1 => identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside,
+            _ => identity.cgroup_attestation = crate::identify::CgroupAttestation::Recordless,
+        }
+        host.policy.answer = Ok(hint_policy());
+        let hints = hints.map_or_else(
+            xudo_sys::CallerHints::unavailable,
+            |(comm, exe, cmd, env)| {
+                xudo_sys::CallerHints::from_reads(Some(exe), Some(cmd), Some(env)).with_comm(comm)
+            },
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            Identified { identity, hints },
+            request.clone(),
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        let records = host
+            .audit
+            .records()
+            .iter()
+            .map(|record| {
+                let mut record = record.clone();
+                record.evidence.retain(|line| !line.starts_with("hint_"));
+                record.prev_hash = String::new();
+                record.hash = String::new();
+                record
+            })
+            .collect();
+        (served, answer, records)
+    }
+
+    /// The serve tests' rules, plus an ask-human rule and a remove-path
+    /// operation for the `codex` harness, so every path that writes a record
+    /// is reachable from [`hint_requests`].
+    fn hint_policy() -> LoadedPolicy {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+        const MORE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n\n[[operation]]\nid = \"web.clean-build\"\nop = \"remove-path\"\nunder = \"/srv/app/build\"\nrecursive = true\nmax-depth = 4\nmax-entries = 10\nowners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n";
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-hints.toml".to_vec(),
+                    bytes: MORE.as_bytes().to_vec(),
+                },
+            ],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: HARNESS.as_bytes().to_vec(),
+            }],
+        )
+        .unwrap();
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
+        loaded
+    }
+
+    /// A rule that runs, one that always confirms, none at all, an ask-human
+    /// rule, a remove-path, and two questions that are not a run.
+    fn hint_requests() -> [BrokerRequest; 7] {
+        let ask = |program: &str, argv: &[&str]| {
+            BrokerRequest::new(
+                program,
+                argv.iter().map(|a| (*a).to_owned()).collect(),
+                "enrolled-agent-yolo",
+            )
+        };
+        [
+            ask("/usr/bin/systemctl", &["restart", "nginx.service"]),
+            ask("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
+            ask("/usr/bin/id", &[]),
+            ask("/usr/bin/apt-get", &["upgrade"]).with_cwd_bytes(b"/srv".to_vec()),
+            remove_question(b"/srv/app/build/out", false),
+            answer_request(NONCE, "remove", true),
+            freeze_request(),
+        ]
+    }
+
+    #[test]
+    fn hints_never_change_a_decision() {
+        // Every value a harness would show, and a few that pose as fields:
+        // the whole service, answer and records, is the no-hint baseline's
+        // for every kind of peer.
+        let table: [HintRow<'_>; 5] = [
+            (
+                b"claude",
+                b"/usr/bin/claude",
+                b"claude\0",
+                b"CLAUDECODE=1\0",
+            ),
+            (
+                b"codex",
+                b"/usr/lib/xudo/harness/codex",
+                b"codex\0exec\0",
+                b"CLAUDECODE=0\0",
+            ),
+            (
+                b"xudo-agent@codex",
+                b"/home/agent/.local/bin/claude",
+                b"node\0claude\0",
+                b"AI_AGENT=1\0",
+            ),
+            (
+                b"via=harness",
+                b"/usr/bin/xudo (deleted)",
+                b"via=harness\0",
+                b"CLAUDECODE=\0",
+            ),
+            (b"", b"", b"", b""),
+        ];
+        let mut baselines = Vec::new();
+        for kind in 0..3 {
+            for request in hint_requests() {
+                let baseline = served_beside_hints(kind, None, &request);
+                for row in table {
+                    assert_eq!(
+                        served_beside_hints(kind, Some(row), &request),
+                        baseline,
+                        "{kind} {:?}",
+                        row.1
+                    );
+                }
+                baselines.push(baseline);
+            }
+        }
+        // The baseline is not trivially one answer for everyone, every
+        // question wrote a record a hint would sit in, and the harness's
+        // ask-human request reached the queue.
+        assert_ne!(baselines[0].1, baselines[7].1);
+        for (at, baseline) in baselines.iter().enumerate() {
+            assert!(!baseline.2.is_empty(), "{at}: {baseline:?}");
+        }
+        assert_eq!(denial_of(&baselines[3].1), Some(DenialCode::AskHuman));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn hints_never_change_a_decision_for_any_bytes(
+            kind in 0usize..3,
+            which in 0usize..7,
+            comm in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..16),
+            exe in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            cmd in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            claudecode in proptest::prelude::any::<bool>(),
+            env in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            // Half the time the environment sets `CLAUDECODE`, to `1` or to
+            // anything, as a harness's would.
+            let mut environ = Vec::new();
+            if claudecode {
+                environ.extend(b"CLAUDECODE=");
+                if env.first().is_some_and(|byte| byte % 2 == 0) {
+                    environ.extend(b"1\0");
+                }
+            }
+            environ.extend(&env);
+            let request = hint_requests()[which].clone();
+            proptest::prop_assert_eq!(
+                served_beside_hints(kind, Some((&comm, &exe, &cmd, &environ)), &request),
+                served_beside_hints(kind, None, &request)
+            );
+        }
+    }
+
     fn registered_harness_scope(host: &mut Host) -> Scope {
         const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
         let registry = xudo_policy::HarnessRegistry::from_files([("codex.toml", HARNESS)]).unwrap();
@@ -10961,7 +11654,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         .unwrap();
         let mut loaded = policy();
         loaded.rules = rules;
-        loaded.passwd = b"agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_vec();
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
         host.policy.answer = Ok(loaded);
         Scope {
             kind: ScopeKind::Agent,
@@ -10983,6 +11676,782 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         }
     }
 
+    // ---- G1b: the one place `via = harness` is minted ----------------------
+
+    const SERVICE_CODEX: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+    const SESSION_CODEX: &str = "label = \"codex\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    /// A rule that grants the `codex` harness `systemctl status <unit>`, and a
+    /// remove-path operation, beside [`RULES`].
+    const GRANT_RULES: &str = r#"
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs"
+args = [
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+owners = ["agent"]
+harness = ["codex"]
+outcome = "allow"
+"#;
+
+    /// Root's policy with [`RULES`], [`GRANT_RULES`] and `harness` registered
+    /// (none when `None`), and a scope record for `codex` written against it.
+    fn granting_host(harness: Option<&str>) -> (Host, Scope) {
+        let mut host = Host::honest();
+        host.syscalls = FakeSyscalls::new().with_boot_id(Ok(TEST_BOOT.to_owned()));
+        let files: Vec<HarnessFile> = harness
+            .map(|text| HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: text.as_bytes().to_vec(),
+            })
+            .into_iter()
+            .collect();
+        let rules = load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-grant.toml".to_vec(),
+                    bytes: GRANT_RULES.as_bytes().to_vec(),
+                },
+            ],
+            &files,
+        )
+        .unwrap();
+        let (way, entry_hash) = match harness {
+            Some(text) => {
+                let registry =
+                    xudo_policy::HarnessRegistry::from_files([("codex.toml", text)]).unwrap();
+                let entry = registry.get("codex").unwrap();
+                let way = if entry.way == xudo_policy::HarnessWay::Service {
+                    "service"
+                } else {
+                    "session"
+                };
+                (way, entry.hash_hex())
+            }
+            None => ("service", "0".repeat(64)),
+        };
+        let mut loaded = policy();
+        loaded.rules = rules;
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
+        host.policy.answer = Ok(loaded);
+        let scope = Scope {
+            kind: ScopeKind::Agent,
+            name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
+            record: serde_json::json!({
+                "uid": UID,
+                "label": "codex",
+                "way": way,
+                "registry_entry_hash": entry_hash,
+                "boot_id": TEST_BOOT,
+                "created_at_boottime_ms": 1,
+                "deadline": 20_000,
+                "pid": PID,
+                "starttime": START,
+                "cgroup_id": 44,
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        (host, scope)
+    }
+
+    /// A caller in `scope` on the top rung, every fact as strong as it gets.
+    fn harness_identity(scope: Scope) -> PeerIdentity {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
+        identity
+    }
+
+    fn status_question(claimed: &str) -> BrokerRequest {
+        BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["status".to_owned(), "nginx.service".to_owned()],
+            claimed,
+        )
+    }
+
+    /// Every entry the spool holds, parsed.
+    fn entries_in(spool: &FakeSpool) -> Vec<PendingRequest> {
+        spool
+            .files()
+            .values()
+            .map(|bytes| PendingRequest::parse(std::str::from_utf8(bytes).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Serves `request` from `identity` and returns the answer and the spool.
+    fn served_by(
+        host: &mut Host,
+        identity: PeerIdentity,
+        request: BrokerRequest,
+    ) -> (Served, Answer, Vec<PendingRequest>) {
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
+        let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+        (served, answer, entries_in(&spool))
+    }
+
+    /// One question of each kind, and the index of its kind: no wildcard arm,
+    /// so a new question kind fails to compile here until it has a row.
+    fn question_kind(question: &xudo_wire::Question) -> usize {
+        match question {
+            xudo_wire::Question::Run { .. } => 0,
+            xudo_wire::Question::Status { .. } => 1,
+            xudo_wire::Question::Watch => 2,
+            xudo_wire::Question::Pending => 3,
+            xudo_wire::Question::Answer { .. } => 4,
+            xudo_wire::Question::Freeze { .. } => 5,
+            xudo_wire::Question::Thaw => 6,
+            xudo_wire::Question::QueueList => 7,
+            xudo_wire::Question::QueueClaim { .. } => 8,
+            xudo_wire::Question::QueueComplete { .. } => 9,
+            xudo_wire::Question::QueueRelease { .. } => 10,
+            xudo_wire::Question::QueueListPage { .. } => 11,
+            xudo_wire::Question::RemovePath { .. } => 12,
+        }
+    }
+
+    fn every_question_for_a_grant() -> Vec<xudo_wire::Question> {
+        use xudo_wire::Question;
+        let id = NONCE.to_owned();
+        vec![
+            status_question("enrolled-agent-yolo").question,
+            Question::Status { id: id.clone() },
+            Question::Watch,
+            Question::Pending,
+            Question::Answer {
+                id: id.clone(),
+                token: id.clone(),
+                approve: true,
+            },
+            Question::Freeze {
+                reason: "stop".to_owned(),
+            },
+            Question::Thaw,
+            Question::QueueList,
+            Question::QueueClaim { id: id.clone() },
+            Question::QueueComplete {
+                id: id.clone(),
+                audit_seq: 0,
+                claim_token: id.clone(),
+            },
+            Question::QueueRelease {
+                id: id.clone(),
+                claim_token: id,
+            },
+            Question::QueueListPage {
+                after: String::new(),
+            },
+            Question::RemovePath {
+                target: b"/srv/app/build/cache".to_vec(),
+                dry_run: false,
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+        ]
+    }
+
+    /// The work a harness entry carries: the action the rule grants, or the
+    /// operation, for the one target asked and nothing to exec.
+    fn assert_granted_work(kind: usize, entry: &PendingRequest) {
+        if kind == 0 {
+            assert_eq!(entry.action, "xudo.svc.status");
+            assert_eq!(entry.argv, ["status", "nginx.service"]);
+            assert_eq!(entry.operation, None);
+        } else {
+            assert_eq!(entry.action, "web.clean-build");
+            assert_eq!(entry.program, xudo_wire::OPERATION_PROGRAM);
+            assert_eq!(entry.argv, ["/srv/app/build/cache"]);
+            let operation = entry.operation.as_ref().unwrap();
+            assert_eq!(operation.target, b"/srv/app/build/cache");
+            assert!(!operation.dry_run);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn only_the_exec_path_for_a_live_harness_mints_via_harness() {
+        let questions = every_question_for_a_grant();
+        let kinds: std::collections::BTreeSet<usize> =
+            questions.iter().map(question_kind).collect();
+        assert_eq!(kinds, (0..=12).collect(), "a question kind has no row");
+        for harness in [SERVICE_CODEX, SESSION_CODEX] {
+            for question in &questions {
+                let (mut host, scope) = granting_host(Some(harness));
+                let request = BrokerRequest {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    question: question.clone(),
+                };
+                // The state each question needs to get as far as it can: a
+                // queued item to claim, a pending entry to answer, a freeze
+                // marker to lift.
+                let spool = if question_kind(question) == 4 {
+                    FakeSpool::new().with_file(
+                        NONCE.as_bytes().to_vec(),
+                        shown_entry().to_json().into_bytes(),
+                    )
+                } else {
+                    FakeSpool::new()
+                };
+                let queued = review_entry(&host, UID + 1, NONCE);
+                plant_queue(&mut host, &queued);
+                host.freeze_file
+                    .publish(&xudo_gate::policy::freeze_marker_name(0), MARKER)
+                    .unwrap();
+                let conn = connection(Ok(request.to_json().into_bytes()));
+                let served = serve_request(
+                    &conn,
+                    &mut host.platform(),
+                    &spool,
+                    harness_identity(scope).into(),
+                    request,
+                );
+                let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
+                let entries = entries_in(&spool);
+                let harness_entries: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.via == xudo_gate::request::Via::Harness)
+                    .collect();
+                if matches!(question_kind(question), 0 | 12) {
+                    assert_eq!(harness_entries.len(), 1, "{question:?}");
+                    let entry = harness_entries[0];
+                    assert_eq!(entry.deadline.0, NOW + HARNESS_TTL_MILLIS);
+                    assert!(!entry.needs_watch);
+                    assert_eq!(entry.attested_harness.as_deref(), Some("codex"));
+                    assert_eq!(entry.attested_scope_id, Some(44));
+                    assert_granted_work(question_kind(question), entry);
+                    assert_eq!(
+                        entry.generation,
+                        host.policy.answer.as_ref().unwrap().rules.generation.id()
+                    );
+                    assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+                } else {
+                    assert!(
+                        harness_entries.is_empty(),
+                        "{question:?} minted {entries:?}"
+                    );
+                    assert_ne!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+                    // A harness is no reviewer, watcher or owner: with the
+                    // state in place it is still refused, and nothing it
+                    // asked for was done.
+                    if matches!(question_kind(question), 4 | 6 | 8) {
+                        assert_ne!(served, Served::Minted, "{question:?}");
+                    }
+                    if question_kind(question) == 8 {
+                        assert_eq!(
+                            stored_queue(&host)[0].state,
+                            crate::queue::QueueState::Pending
+                        );
+                    }
+                    if question_kind(question) == 6 {
+                        assert_eq!(
+                            host.freeze_file.files().len(),
+                            1,
+                            "a harness lifted a freeze"
+                        );
+                    }
+                }
+            }
+        }
+        // A reviewer's claim reaches the mint with the state in place, and
+        // mints for the password gate, never for the harness.
+        let (mut host, identity) = human_reviewer();
+        let entry = review_entry(&host, identity.uid + 1, &"ab".repeat(32));
+        plant_queue(&mut host, &entry);
+        let request = claim_request(&entry.id);
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
+        assert_eq!(served, Served::Minted);
+        let minted = entries_in(&spool);
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].via, xudo_gate::request::Via::Auth);
+        // The same run question from a human, and from an unattested caller,
+        // is minted for the password gate.
+        for identity in [human_identity(), test_identity(PID, START, 0, 0)] {
+            let (mut host, _) = granting_host(Some(SERVICE_CODEX));
+            let (served, answer, entries) =
+                served_by(&mut host, identity, status_question("enrolled-agent-yolo"));
+            assert_eq!(served, Served::Minted);
+            assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+            assert_eq!(entries[0].deadline.0, NOW + REQUEST_TTL_MILLIS);
+        }
+    }
+
+    #[test]
+    fn a_grant_mints_its_record_with_the_via() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (served, _, _) = served_by(&mut host, harness_identity(scope), status_question("x"));
+        assert_eq!(served, Served::Minted);
+        let record = host.audit.records().last().unwrap().clone();
+        assert!(
+            record.evidence.contains(&"via=harness".to_owned()),
+            "{record:?}"
+        );
+        assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+    }
+
+    /// [`granting_host`] with the operation's harness list rewritten.
+    fn remove_host(harness: &str, operation_labels: &str) -> (Host, Scope) {
+        let (mut host, scope) = granting_host(Some(harness));
+        let registry: Vec<HarnessFile> = vec![HarnessFile {
+            name: b"codex.toml".to_vec(),
+            bytes: harness.as_bytes().to_vec(),
+        }];
+        let rules = load_policy(
+            vec![RuleFile {
+                name: b"20-grant.toml".to_vec(),
+                bytes: GRANT_RULES
+                    .replace(
+                        "max-entries = 10\nowners = [\"agent\"]\nharness = [\"codex\"]",
+                        &format!(
+                            "max-entries = 10\nowners = [\"agent\"]\nharness = [{operation_labels}]"
+                        ),
+                    )
+                    .into_bytes(),
+            }],
+            &registry,
+        )
+        .unwrap();
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules = rules;
+        host.policy.answer = Ok(loaded);
+        (host, scope)
+    }
+
+    #[test]
+    fn a_live_listed_harness_gets_a_nopass_remove_path_entry() {
+        for harness in [SERVICE_CODEX, SESSION_CODEX] {
+            let (mut host, scope) = granting_host(Some(harness));
+            let (served, answer, entries) = served_by(
+                &mut host,
+                harness_identity(scope),
+                remove_question(b"/srv/app/build/cache", false),
+            );
+            assert_eq!(served, Served::Minted);
+            assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+            let (decision, _) = decision_of(&answer).unwrap();
+            assert_eq!(
+                decision
+                    .harness_grant
+                    .as_ref()
+                    .map(xudo_policy::ActionId::as_str),
+                Some("web.clean-build")
+            );
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].via, xudo_gate::request::Via::Harness);
+            let record = host.audit.records().last().unwrap().clone();
+            assert!(record.evidence.contains(&"via=harness".to_owned()));
+        }
+    }
+
+    #[test]
+    fn an_unlisted_harness_gets_no_nopass_remove_path_entry() {
+        // The operation lists another label: a session harness is minted for
+        // the password gate, a service harness (no password) is refused.
+        for (harness, expect_minted) in [(SESSION_CODEX, true), (SERVICE_CODEX, false)] {
+            let (mut host, scope) = remove_host(harness, "\"claude\"");
+            let (served, answer, entries) = served_by(
+                &mut host,
+                harness_identity(scope),
+                remove_question(b"/srv/app/build/cache", false),
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.via == xudo_gate::request::Via::Auth),
+                "{entries:?}"
+            );
+            assert_ne!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+            if expect_minted {
+                assert_eq!(served, Served::Minted);
+                assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+            } else {
+                assert_eq!(served, Served::Decided);
+                assert!(entries.is_empty());
+                assert_eq!(
+                    answer,
+                    BrokerResponse::harness_not_granted(Some("web.clean-build")).answer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_remove_path_grant_is_withheld_from_nopass_under_confirm_human_path() {
+        // A watch is a confirmation a harness cannot give: a session harness
+        // goes to the password gate with a watch, nothing goes to `-nopass`.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.settings.confirm_human_path = true;
+        host.policy.answer = Ok(loaded);
+        let (served, answer, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/srv/app/build/cache", false),
+        );
+        assert_eq!(served, Served::Minted);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            std::mem::discriminant(&answer),
+            std::mem::discriminant(&xudo_wire::Answer::Pending {
+                id: entries[0].nonce.clone(),
+                expires_in_ms: 0,
+            })
+        );
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+        assert!(entries[0].needs_watch);
+    }
+
+    #[test]
+    fn a_frozen_harness_gets_no_remove_path_entry() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        host.freeze_file
+            .publish(
+                &xudo_gate::policy::harness_marker_name("codex").unwrap(),
+                MARKER,
+            )
+            .unwrap();
+        let (served, answer, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/srv/app/build/cache", false),
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(entries.is_empty());
+        let (decision, minted) = decision_of(&answer).unwrap();
+        assert_eq!(decision.denial, Some(xudo_policy::DenialCode::Frozen));
+        assert!(minted.is_none());
+    }
+
+    #[test]
+    fn a_harness_remove_path_outside_the_tree_mints_nothing() {
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (served, _, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/etc/passwd", false),
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn a_grant_is_unchanged_by_confirm_human_path() {
+        let mut seen = Vec::new();
+        for confirm_human_path in [false, true] {
+            let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+            let mut loaded = host.policy.answer.clone().unwrap();
+            loaded.settings.confirm_human_path = confirm_human_path;
+            host.policy.answer = Ok(loaded);
+            let (served, answer, entries) =
+                served_by(&mut host, harness_identity(scope), status_question("x"));
+            assert_eq!(served, Served::Minted);
+            let (decision, minted) = decision_of(&answer).unwrap();
+            assert_eq!(decision.verdict, Verdict::Allow);
+            assert_eq!(
+                decision
+                    .harness_grant
+                    .as_ref()
+                    .map(xudo_policy::ActionId::as_str),
+                Some("xudo.svc.status")
+            );
+            assert_eq!(minted.unwrap().gate, xudo_backend::snippet::GATE_NOPASS);
+            assert_eq!(entries.len(), 1);
+            let mut entry = entries[0].clone();
+            assert!(!entry.needs_watch);
+            entry.nonce = String::new();
+            seen.push(entry);
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[test]
+    fn a_service_harness_no_rule_grants_gets_harness_not_granted() {
+        // `restart` is allowed with confirmation: a password the service
+        // account does not have. Refused, nothing minted, no trace sent.
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            harness_identity(scope).into(),
+            request,
+        );
+        assert_eq!(served, Served::Decided);
+        assert!(spool.files().is_empty());
+        let written = String::from_utf8(conn.written()).unwrap();
+        assert!(!written.contains("trace"), "{written}");
+        assert_eq!(
+            BrokerResponse::parse(written.as_bytes()).unwrap(),
+            BrokerResponse::harness_not_granted(Some("xudo.svc.restart"))
+        );
+        // The record keeps the whole decision for the operator.
+        let record = host.audit.records().last().unwrap().clone();
+        assert_eq!(record.action.as_deref(), Some("xudo.svc.restart"));
+        assert!(record.evidence.contains(&"agent_id=codex".to_owned()));
+        assert!(
+            record
+                .evidence
+                .contains(&"refused=harness_not_granted".to_owned()),
+            "{record:?}"
+        );
+
+        // A session harness runs as a person, who can type the password.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let (served, answer, entries) = served_by(&mut host, harness_identity(scope), request);
+        assert_eq!(served, Served::Minted);
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+    }
+
+    #[test]
+    fn claimed_classification_never_reaches_via() {
+        let claims = [
+            "human",
+            "unattested",
+            "enrolled-agent",
+            "enrolled-agent-yolo",
+            "harness",
+            "codex",
+            "harness:codex",
+            "via=harness",
+        ];
+        for harness_caller in [true, false] {
+            let mut vias = std::collections::BTreeSet::new();
+            for claimed in claims {
+                let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+                let identity = if harness_caller {
+                    harness_identity(scope)
+                } else {
+                    human_identity()
+                };
+                let (_, answer, entries) = served_by(&mut host, identity, status_question(claimed));
+                assert_eq!(entries.len(), 1, "{claimed}");
+                vias.insert((entries[0].via.label(), gate_of(&answer).map(str::to_owned)));
+            }
+            let expected = if harness_caller {
+                ("harness", xudo_backend::snippet::GATE_NOPASS)
+            } else {
+                ("auth", xudo_backend::snippet::GATE_AUTH)
+            };
+            assert_eq!(
+                vias.into_iter().collect::<Vec<_>>(),
+                [(expected.0, Some(expected.1.to_owned()))]
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_harness_is_human_at_once() {
+        // Granted while registered...
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        let (_, _, entries) = served_by(
+            &mut host,
+            harness_identity(scope.clone()),
+            status_question("x"),
+        );
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Harness);
+        // ...and on the very next question after root removes the file, the
+        // same live scope takes the password path: no grant, no -nopass.
+        let (mut removed, _) = granting_host(None);
+        let (_, answer, entries) =
+            served_by(&mut removed, harness_identity(scope), status_question("x"));
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+        assert_ne!(
+            entries[0].attested_class,
+            xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 44 }
+        );
+        assert!(entries[0].attested_harness.is_none());
+    }
+
+    #[test]
+    fn exec_path_needs_a_plain_allow_that_cites_its_grant() {
+        let (host, scope) = granting_host(Some(SERVICE_CODEX));
+        let identity = harness_identity(scope);
+        let request = status_question("x");
+        let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
+        let registry = &policy.rules.harnesses;
+        assert_eq!(
+            exec_path(&identity, &caller, &decision, registry),
+            ExecPath::Harness
+        );
+        let mut other_action = decision.clone();
+        other_action.harness_grant = Some(xudo_policy::ActionId::new("xudo.svc.restart"));
+        let mut no_grant = decision.clone();
+        no_grant.harness_grant = None;
+        let mut confirming = decision.clone();
+        confirming.verdict = Verdict::AllowWithConfirmation;
+        for weaker in [&other_action, &no_grant, &confirming] {
+            assert_eq!(
+                exec_path(&identity, &caller, weaker, registry),
+                ExecPath::NotGranted
+            );
+        }
+        // Facts that say agent beside a peer that is not in a live scope:
+        // `classify_with_registry` never builds this, and `exec_path` does not
+        // trust that it cannot.
+        let mut outside = identity.clone();
+        outside.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        assert_eq!(
+            exec_path(&outside, &caller, &decision, registry),
+            ExecPath::NotGranted
+        );
+        let mut denied = decision;
+        denied.verdict = Verdict::Deny;
+        assert_eq!(
+            exec_path(&identity, &caller, &denied, registry),
+            ExecPath::Password
+        );
+    }
+
+    /// The facts a harness grant rests on, each strong or weakened: the rung
+    /// (0 to 3, `PeerCredOnly` to `PeerPidfdInfo`), the cgroup attestation
+    /// (0 is the live scope), and one bit per other fact.
+    #[derive(Clone, Copy, Debug)]
+    struct Weakening {
+        rung: u8,
+        attestation: u8,
+        bits: u8,
+    }
+
+    const UNPINNED: u8 = 1;
+    const DIVERGED: u8 = 2;
+    const NO_CGROUP_ID: u8 = 4;
+    const STALE_HASH: u8 = 8;
+    const WRONG_UID: u8 = 16;
+
+    impl Weakening {
+        /// Both `SO_PEERPIDFD` rungs are strong; the two below them are not.
+        fn none(self) -> bool {
+            self.rung >= 2 && self.attestation == 0 && self.bits == 0
+        }
+
+        fn has(self, bit: u8) -> bool {
+            self.bits & bit != 0
+        }
+
+        fn apply(self, scope: Scope) -> PeerIdentity {
+            use crate::identify::CgroupAttestation;
+            let mut scope = scope;
+            if self.has(STALE_HASH) {
+                let mut record: serde_json::Value = serde_json::from_slice(&scope.record).unwrap();
+                record["registry_entry_hash"] = serde_json::json!("1".repeat(64));
+                scope.record = record.to_string().into_bytes();
+            }
+            let mut identity = harness_identity(scope.clone());
+            identity.rung = [
+                xudo_sys::Attestation::PeerCredOnly,
+                xudo_sys::Attestation::PidfdOpen,
+                xudo_sys::Attestation::PeerPidfd,
+                xudo_sys::Attestation::PeerPidfdInfo,
+            ][usize::from(self.rung)];
+            identity.pinned = !self.has(UNPINNED);
+            identity.diverged = self.has(DIVERGED);
+            if self.has(NO_CGROUP_ID) {
+                identity.cgroup_id = None;
+            }
+            identity.cgroup_attestation = match self.attestation {
+                0 => CgroupAttestation::UnregisteredScope(scope),
+                1 => CgroupAttestation::Outside,
+                2 => CgroupAttestation::OtherScope(scope),
+                3 => CgroupAttestation::Recordless,
+                4 => CgroupAttestation::Unattested,
+                _ => CgroupAttestation::NotChecked,
+            };
+            if self.has(WRONG_UID) {
+                identity.uid = UID + 1;
+            }
+            identity
+        }
+    }
+
+    /// Misclassification may only withhold: from a fully attested harness,
+    /// weakening any live fact, alone or together, never mints for
+    /// `-nopass`. Every combination, for both ways of harness (1536 cases).
+    #[test]
+    fn weakening_any_live_fact_never_adds_a_grant() {
+        let mut granted = 0_u32;
+        for session in [false, true] {
+            for rung in 0_u8..4 {
+                for attestation in 0_u8..6 {
+                    for bits in 0_u8..32 {
+                        let weakening = Weakening {
+                            rung,
+                            attestation,
+                            bits,
+                        };
+                        let (mut host, scope) = granting_host(Some(if session {
+                            SESSION_CODEX
+                        } else {
+                            SERVICE_CODEX
+                        }));
+                        let (_, answer, entries) =
+                            served_by(&mut host, weakening.apply(scope), status_question("x"));
+                        let harness = entries
+                            .iter()
+                            .any(|entry| entry.via == xudo_gate::request::Via::Harness);
+                        assert_eq!(harness, weakening.none(), "{weakening:?}");
+                        assert_eq!(
+                            gate_of(&answer) == Some(xudo_backend::snippet::GATE_NOPASS),
+                            weakening.none()
+                        );
+                        granted += u32::from(harness);
+                    }
+                }
+            }
+        }
+        // The two `SO_PEERPIDFD` rungs, for each way: nothing else.
+        assert_eq!(granted, 4);
+    }
+
     fn shown_entry() -> PendingRequest {
         let policy = policy();
         let request = BrokerRequest::new(
@@ -10991,7 +12460,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             "unattested",
         );
         let identity = test_identity(PID, START, 0, 0);
-        let caller = classify(&identity);
+        let caller = classify_for_test(&identity);
         let decision = decide(&policy, &caller, &request);
         let mut entry = entry_for(
             &decision,
@@ -11313,7 +12782,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "no", false)
             )
             .unwrap_err()
@@ -11330,7 +12799,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             answer_confirmation(
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true)
             )
             .unwrap_err()
@@ -11360,7 +12829,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &spool,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered(),
                 true
@@ -11378,7 +12847,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             complete_answer(
                 &mut host.platform(),
                 &failing,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 answered(),
                 true
@@ -11399,7 +12868,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let err = complete_answer(
             &mut host.platform(),
             &changed_spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -11517,11 +12986,218 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
     }
 
+    /// A live agent scope whose record names a label the registry lacks.
+    fn unregistered_identity(host: &mut Host) -> PeerIdentity {
+        let mut scope = registered_harness_scope(host);
+        let mut record: serde_json::Value = serde_json::from_slice(&scope.record).unwrap();
+        record["label"] = "ghost".into();
+        scope.record = record.to_string().into_bytes();
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_id = Some(44);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
+        identity
+    }
+
+    /// One request per `Question` variant. `slot` is an exhaustive match, so a
+    /// new variant fails to compile until it has a row here.
+    fn every_question() -> Vec<xudo_wire::Question> {
+        use xudo_wire::Question as Q;
+        let id = || "a".repeat(64);
+        vec![
+            Q::Run {
+                program: "/usr/bin/apt-get".to_owned(),
+                argv: vec!["upgrade".to_owned()],
+                cwd: b"/srv".to_vec(),
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+            Q::Status { id: id() },
+            Q::Watch,
+            Q::Pending,
+            Q::Answer {
+                id: id(),
+                token: "b".repeat(64),
+                approve: true,
+            },
+            Q::Freeze {
+                reason: "maintenance".to_owned(),
+            },
+            Q::Thaw,
+            Q::QueueList,
+            Q::QueueClaim { id: id() },
+            Q::QueueComplete {
+                id: id(),
+                audit_seq: 0,
+                claim_token: String::new(),
+            },
+            Q::QueueRelease {
+                id: id(),
+                claim_token: String::new(),
+            },
+            Q::QueueListPage {
+                after: String::new(),
+            },
+            Q::RemovePath {
+                target: b"/var/tmp/x".to_vec(),
+                dry_run: true,
+                claimed_classification: "enrolled-agent-yolo".to_owned(),
+            },
+        ]
+    }
+
+    fn slot(question: &xudo_wire::Question) -> usize {
+        use xudo_wire::Question as Q;
+        match question {
+            Q::Run { .. } => 0,
+            Q::Status { .. } => 1,
+            Q::Watch => 2,
+            Q::Pending => 3,
+            Q::Answer { .. } => 4,
+            Q::Freeze { .. } => 5,
+            Q::Thaw => 6,
+            Q::QueueList => 7,
+            Q::QueueClaim { .. } => 8,
+            Q::QueueComplete { .. } => 9,
+            Q::QueueRelease { .. } => 10,
+            Q::QueueListPage { .. } => 11,
+            Q::RemovePath { .. } => 12,
+        }
+    }
+
+    fn run_every_question(
+        make_identity: fn(&mut Host) -> PeerIdentity,
+        expected_class: &str,
+        names_a_harness: bool,
+        expected_own: &[usize],
+    ) {
+        let questions = every_question();
+        let mut slots: Vec<usize> = questions.iter().map(slot).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..13).collect::<Vec<_>>());
+        let mut with_own_record = Vec::new();
+        for question in questions {
+            let mut host = Host::honest();
+            host.syscalls = host.syscalls.with_boot_id(Ok(TEST_BOOT.to_owned()));
+            let identity = make_identity(&mut host);
+            host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+            let request = BrokerRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                question,
+            };
+            let conn = connection(Ok(request.to_json().into_bytes()));
+            let spool = FakeSpool::new();
+            let _ = serve_request(
+                &conn,
+                &mut host.platform(),
+                &spool,
+                identity.into(),
+                request.clone(),
+            );
+            let n = slot(&request.question);
+            let shape = format!("question slot {n}");
+            // A record `refuse()` did not write: its class came from the
+            // handler's own classification.
+            let own: Vec<_> = host
+                .audit
+                .records()
+                .iter()
+                .filter(|record| {
+                    !record
+                        .evidence
+                        .iter()
+                        .any(|item| item.starts_with("fault="))
+                })
+                .collect();
+            if !own.is_empty() {
+                with_own_record.push(n);
+            }
+            for record in &own {
+                assert_eq!(record.classification, expected_class, "{shape}");
+            }
+            for record in host.audit.records() {
+                let has_agent = record
+                    .evidence
+                    .iter()
+                    .any(|item| item.starts_with("agent_id="));
+                if !names_a_harness {
+                    assert!(
+                        !has_agent,
+                        "{shape}: an unregistered scope was named a harness"
+                    );
+                }
+                if !names_a_harness {
+                    assert_eq!(record.classification, "unattested", "{shape}");
+                }
+            }
+            assert_eq!(
+                host.freeze_file.files().keys().collect::<Vec<_>>(),
+                vec![&b"frozen-1000".to_vec()],
+                "{shape}: the freeze state changed"
+            );
+        }
+        assert_eq!(
+            with_own_record, expected_own,
+            "handlers that wrote a record"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_scope_is_never_a_harness_in_any_handler() {
+        run_every_question(
+            unregistered_identity,
+            "unattested",
+            false,
+            &[0, 5, 7, 11, 12],
+        );
+    }
+
+    #[test]
+    fn a_registered_scope_is_an_enrolled_agent_in_every_handler() {
+        run_every_question(enrolled_identity, "enrolled-agent", true, &[0, 7, 11, 12]);
+    }
+
+    #[test]
+    fn the_audit_names_the_class_the_broker_attested_not_human() {
+        use crate::queue::PeerClass::{EnrolledAgent, Human, Unattested};
+        assert_eq!(peer_class_label(Human), "human");
+        assert_eq!(peer_class_label(EnrolledAgent), "enrolled-agent");
+        assert_eq!(peer_class_label(Unattested), "unattested");
+        let mut host = Host::honest();
+        let identity = unregistered_identity(&mut host);
+        let request = freeze_request();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let spool = FakeSpool::new();
+        serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
+        assert_eq!(host.audit.records()[0].classification, "unattested");
+    }
+
+    #[test]
+    fn a_real_harness_cannot_freeze() {
+        let mut host = Host::honest();
+        let identity = enrolled_identity(&mut host);
+        let request = freeze_request();
+        let conn = connection(Ok(request.to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            request,
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert!(host.freeze_file.files().is_empty());
+    }
+
     fn enrolled_identity(host: &mut Host) -> PeerIdentity {
         let scope = registered_harness_scope(host);
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         identity
     }
 
@@ -11535,7 +13211,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            identity,
+            identity.into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
@@ -11551,27 +13227,668 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let mut host = Host::honest();
         let identity = enrolled_identity(&mut host);
         host.freeze_file.publish("frozen", MARKER).unwrap();
+        host.freeze_file.publish("frozen-2000", MARKER).unwrap();
         let spool = FakeSpool::new();
         let conn = connection(Ok(freeze_request().to_json().into_bytes()));
         let served = serve_request(
             &conn,
             &mut host.platform(),
             &spool,
-            identity.clone(),
+            identity.clone().into(),
             freeze_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
         let served = serve_request(
             &conn,
             &mut host.platform(),
             &spool,
-            identity,
+            identity.into(),
             thaw_request(),
         );
         assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
         let files = host.freeze_file.files();
         assert!(files.contains_key(b"frozen".as_slice()));
         assert!(!files.contains_key(b"frozen-1000".as_slice()));
+        assert!(files.contains_key(b"frozen-2000".as_slice()));
+    }
+
+    fn human_identity() -> PeerIdentity {
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
+        identity
+    }
+
+    fn refusal_code_written(conn: &FakeConnection) -> Option<RefusalCode> {
+        refusal_of(&BrokerResponse::parse(&conn.written()).unwrap().answer)
+    }
+
+    #[test]
+    fn an_unattested_caller_cannot_thaw() {
+        // A caller whose cgroup facts are missing or stale is not classed
+        // outside an agent scope, so it takes no thaw at all.
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            test_identity(PID, START, 0, 0).into(),
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(
+            refusal_code_written(&conn),
+            Some(RefusalCode::ChannelUntrusted)
+        );
+        assert!(
+            host.freeze_file
+                .files()
+                .contains_key(b"frozen-1000".as_slice())
+        );
+    }
+
+    const CAROL_REVIEWED: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 2\n";
+    const REVIEW_PASSWD: &str = "alice:x:1000:1000::/home/alice:/bin/sh\nagent:x:1500:1500::/home/agent:/bin/sh\nbob:x:2000:2000::/home/bob:/bin/sh\ncarol:x:3000:3000::/home/carol:/bin/sh\nroot:x:0:0::/root:/bin/sh\n";
+
+    /// `codex` (reviewer bob, 2000) and `claude` (reviewer carol, 3000), seen
+    /// by a peer `uid` outside any agent scope.
+    fn review_host(uid: u32) -> Host {
+        let mut host = Host::honest_as(uid);
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[
+                HarnessFile {
+                    name: b"claude.toml".to_vec(),
+                    bytes: CAROL_REVIEWED.as_bytes().to_vec(),
+                },
+                HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: SERVICE_HARNESS.as_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        loaded.passwd = REVIEW_PASSWD.to_owned();
+        host.policy.answer = Ok(loaded);
+        host
+    }
+
+    fn markers_of(host: &Host) -> Vec<String> {
+        host.freeze_file
+            .files()
+            .into_keys()
+            .map(|name| String::from_utf8(name).unwrap())
+            .collect()
+    }
+
+    /// A freeze from `uid`, positively classed human.
+    fn freeze_served(host: &mut Host, uid: u32) -> Answer {
+        let mut identity = human_identity();
+        identity.uid = uid;
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Decided);
+        BrokerResponse::parse(&conn.written()).unwrap().answer
+    }
+
+    #[test]
+    fn a_reviewer_freeze_stops_that_harness_only() {
+        let mut host = review_host(2000);
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        // bob reviews codex: codex's marker and bob's own, never claude's.
+        assert_eq!(markers_of(&host), ["frozen-2000", "frozen-h-codex"]);
+        let platform = host.platform();
+        assert!(harness_freeze_stands(&platform, "codex"));
+        assert!(!harness_freeze_stands(&platform, "claude"));
+        // The audit record names the harness the freeze covered.
+        let evidence = host.audit.records().last().unwrap().evidence.clone();
+        assert!(evidence.contains(&"harness_markers=frozen-h-codex".to_owned()));
+    }
+
+    #[test]
+    fn a_marker_for_label_a_does_not_freeze_label_b() {
+        let mut host = review_host(3000);
+        assert_eq!(freeze_served(&mut host, 3000), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen-3000", "frozen-h-claude"]);
+        assert!(!harness_freeze_stands(&host.platform(), "codex"));
+    }
+
+    #[test]
+    fn a_freeze_by_someone_who_reviews_nothing_writes_no_harness_marker() {
+        for uid in [1000, 1500, 4000] {
+            let mut host = review_host(uid);
+            assert_eq!(freeze_served(&mut host, uid), Answer::Done);
+            assert_eq!(markers_of(&host), [format!("frozen-{uid}")]);
+        }
+    }
+
+    #[test]
+    fn a_harness_account_cannot_write_a_harness_marker() {
+        // The agent's own account (1500) is outside any scope here, the way a
+        // process it started elsewhere is. It is no reviewer, and the registry
+        // keeps reviewers disjoint from harness accounts.
+        let mut host = review_host(1500);
+        let _ = freeze_served(&mut host, 1500);
+        assert!(
+            markers_of(&host)
+                .iter()
+                .all(|name| !name.starts_with("frozen-h-"))
+        );
+    }
+
+    #[test]
+    fn an_unattested_reviewer_gets_no_harness_marker() {
+        // A caller whose cgroup facts cannot be read is not positively human,
+        // so even a registered reviewer's freeze names no harness.
+        let mut host = review_host(2000);
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = test_identity(PID, START, 0, 0);
+        identity.uid = 2000;
+        let _ = freeze(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &identity.clone().into(),
+            &freeze_request(),
+            "maintenance",
+        );
+        drop(conn);
+        assert!(
+            markers_of(&host)
+                .iter()
+                .all(|name| !name.starts_with("frozen-h-"))
+        );
+    }
+
+    #[test]
+    fn a_harness_uid_under_a_reviewers_name_gets_no_harness_marker() {
+        // `twin` is a second passwd name for the codex account's uid. Named a
+        // reviewer of claude, the names differ, so the registry loads; the
+        // uids do not, and the broker gives that uid its own marker alone.
+        let mut host = review_host(1500);
+        let claude = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"twin\"]\nmax-sessions = 2\n";
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[
+                HarnessFile {
+                    name: b"claude.toml".to_vec(),
+                    bytes: claude.as_bytes().to_vec(),
+                },
+                HarnessFile {
+                    name: b"codex.toml".to_vec(),
+                    bytes: SERVICE_HARNESS.as_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        loaded.passwd = format!("{REVIEW_PASSWD}twin:x:1500:1500::/home/agent:/bin/sh\n");
+        host.policy.answer = Ok(loaded);
+        assert_eq!(freeze_served(&mut host, 1500), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen-1500"]);
+    }
+
+    #[test]
+    fn reviewer_markers_cannot_lock_roots_thaw_out() {
+        // 126 uid markers and the audit log, then a reviewer's freeze (its
+        // harness marker and its own): 129 names, past the user bound.
+        let mut host = review_host(2000);
+        host.freeze_file = (0..126).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        host.freeze_file.publish("audit.jsonl", MARKER).unwrap();
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        assert_eq!(markers_of(&host).len(), 126 + 1 + 2);
+        // The agent's side still reads the marker: the directory is listed
+        // past the user bound.
+        assert!(harness_freeze_stands(&host.platform(), "codex"));
+        assert!(user_freeze_stands(&host.platform(), 2000));
+        let (served, code) = thaw_outside(&mut host, 0);
+        assert_eq!(served, Served::Decided, "{code:?}");
+        assert_eq!(markers_of(&host), ["audit.jsonl"]);
+    }
+
+    #[test]
+    fn a_reviewers_markers_stop_at_the_listing_bound() {
+        let mut host = review_host(2000);
+        host.freeze_file = (0..MAX_LISTED_NAMES - 1).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("junk-{index}"), MARKER)
+        });
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = human_identity();
+        identity.uid = 2000;
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(refusal_code_written(&conn), Some(RefusalCode::SpoolFull));
+        assert!(!markers_of(&host).contains(&"frozen-h-codex".to_owned()));
+    }
+
+    #[test]
+    fn a_reviewers_freeze_is_not_refused_for_room() {
+        let mut host = review_host(2000);
+        host.freeze_file = (0..MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        assert_eq!(freeze_served(&mut host, 2000), Answer::Done);
+        assert!(markers_of(&host).contains(&"frozen-h-codex".to_owned()));
+        // A stranger's freeze in the same full directory is still refused.
+        let mut host = review_host(4000);
+        host.freeze_file = (0..MAX_STATE_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("frozen-{}", 5000 + index), MARKER)
+        });
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let mut identity = human_identity();
+        identity.uid = 4000;
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(refusal_code_written(&conn), Some(RefusalCode::SpoolFull));
+    }
+
+    #[test]
+    fn a_reviewer_cannot_thaw_with_the_marker_of_the_harness_they_froze() {
+        // Thaw by a non-root peer removes only that peer's own uid marker:
+        // the harness marker stands, and so do another label's.
+        let mut host = review_host(2000);
+        let _ = freeze_served(&mut host, 2000);
+        host.freeze_file.publish("frozen-h-claude", MARKER).unwrap();
+        let (served, _) = thaw_outside(&mut host, 2000);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(markers_of(&host), ["frozen-h-claude", "frozen-h-codex"]);
+    }
+
+    #[test]
+    fn a_harness_uid_cannot_thaw_a_harness_marker() {
+        let mut host = review_host(1500);
+        host.freeze_file.publish("frozen-h-codex", MARKER).unwrap();
+        let (served, code) = thaw_outside(&mut host, 1500);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(markers_of(&host), ["frozen-h-codex"]);
+    }
+
+    #[test]
+    fn root_thaw_lifts_every_harness_marker_and_no_other_name() {
+        let mut host = review_host(0);
+        for name in [
+            "frozen",
+            "frozen-h-codex",
+            "frozen-h-claude",
+            "frozen-h-../x",
+            "frozen-h-",
+            "audit.jsonl",
+        ] {
+            host.freeze_file.publish(name, MARKER).unwrap();
+        }
+        let _ = serve_with(
+            &mut host,
+            &connection(Ok(thaw_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(
+            markers_of(&host),
+            ["audit.jsonl", "frozen-h-", "frozen-h-../x"]
+        );
+    }
+
+    #[test]
+    fn the_broker_early_refusal_reads_only_the_harness_marker_it_names() {
+        let mut host = review_host(0);
+        host.freeze_file.publish("frozen-h-codex", MARKER).unwrap();
+        let platform = host.platform();
+        assert!(harness_freeze_stands(&platform, "codex"));
+        assert!(!harness_freeze_stands(&platform, "claude"));
+        // A label that cannot name a marker is frozen, never a path.
+        assert!(harness_freeze_stands(&platform, "../frozen"));
+        // Storage that cannot be listed, or is over the bound, freezes.
+        let mut missing = review_host(0);
+        let full = (0..=MAX_LISTED_NAMES).fold(FakeSpool::new(), |state, index| {
+            state.with_file(format!("junk-{index}"), MARKER)
+        });
+        missing.freeze_file = full;
+        assert!(harness_freeze_stands(&missing.platform(), "claude"));
+        let mut gone = review_host(0);
+        gone.freeze_available = false;
+        assert!(harness_freeze_stands(&gone.platform(), "claude"));
+        let mut broken = review_host(0);
+        broken.freeze_file = FakeSpool::new().failing_names(SpoolError::InvalidName {
+            name: "state".to_owned(),
+        });
+        assert!(harness_freeze_stands(&broken.platform(), "claude"));
+    }
+
+    #[test]
+    fn a_reviewer_freeze_that_cannot_publish_a_marker_is_refused() {
+        let mut host = review_host(2000);
+        host.freeze_file = FakeSpool::new().failing_publish(SpoolError::InvalidName {
+            name: "state".to_owned(),
+        });
+        let mut identity = human_identity();
+        identity.uid = 2000;
+        let conn = connection(Ok(freeze_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            freeze_request(),
+        );
+        assert_eq!(served, Served::Refused(Fault::Broker));
+        assert!(markers_of(&host).is_empty());
+    }
+
+    #[test]
+    fn root_freeze_names_no_harness_and_writes_the_global_marker_only() {
+        let mut host = review_host(0);
+        assert_eq!(freeze_served(&mut host, 0), Answer::Done);
+        assert_eq!(markers_of(&host), ["frozen"]);
+    }
+
+    const SESSION_HARNESS: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\", \"alias\"]\nreviewers = [\"bob\"]\nmax-sessions = 2\n";
+    const SERVICE_HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"bob\"]\nmax-sessions = 2\n";
+    const THAW_PASSWD: &str = "alice:x:1000:1000::/home/alice:/bin/sh\nalias:x:1000:1000::/home/alice:/bin/sh\nagent:x:1500:1500::/home/agent:/bin/sh\nbob:x:2000:2000::/home/bob:/bin/sh\nroot:x:0:0::/root:/bin/sh\n";
+
+    /// A host whose ruleset registers `harness`, with `frozen-<uid>` markers
+    /// for each uid in `markers`.
+    fn thaw_host(uid: u32, harness: &str, markers: &[u32]) -> Host {
+        let mut host = Host::honest_as(uid);
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![RuleFile {
+                name: b"10-test.toml".to_vec(),
+                bytes: RULES.as_bytes().to_vec(),
+            }],
+            &[HarnessFile {
+                name: if harness.contains("claude") {
+                    b"claude.toml".to_vec()
+                } else {
+                    b"codex.toml".to_vec()
+                },
+                bytes: harness.as_bytes().to_vec(),
+            }],
+        )
+        .unwrap();
+        loaded.passwd = THAW_PASSWD.to_owned();
+        host.policy.answer = Ok(loaded);
+        for marker in markers {
+            host.freeze_file
+                .publish(&format!("frozen-{marker}"), MARKER)
+                .unwrap();
+        }
+        host
+    }
+
+    /// A thaw from `uid`, classed outside any agent scope: what a process an
+    /// agent started with `systemd-run --user` looks like to the broker.
+    fn thaw_outside(host: &mut Host, uid: u32) -> (Served, Option<RefusalCode>) {
+        let mut identity = human_identity();
+        identity.uid = uid;
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            identity.into(),
+            thaw_request(),
+        );
+        (served, refusal_code_written(&conn))
+    }
+
+    #[test]
+    fn an_agent_account_cannot_answer_its_own_confirmation() {
+        // The agent opens its own pty and runs a watcher as its own uid: the
+        // broker refuses it both the prompt and the answer, and the entry
+        // stays as it was.
+        for harness in [SERVICE_HARNESS, SESSION_HARNESS] {
+            let uid = if harness == SERVICE_HARNESS {
+                1500
+            } else {
+                1000
+            };
+            let mut host = thaw_host(uid, harness, &[]);
+            let mut agent = test_identity(5000, 77, 2, 34816);
+            agent.uid = uid;
+            let mut entry = shown_entry();
+            entry.caller_uid = uid;
+            let spool =
+                FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+            let before = spool.files();
+            let watched = watch(&mut host.platform(), &spool, &agent).unwrap_err();
+            assert_eq!(watched.code, RefusalCode::ChannelUntrusted);
+            for approve in [true, false] {
+                host.clock.0 = NOW + 2_000;
+                let refused = answer_confirmation(
+                    &mut host.platform(),
+                    &spool,
+                    &agent.clone().into(),
+                    &answer_request(NONCE, "remove", approve),
+                )
+                .unwrap_err();
+                assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+            }
+            assert_eq!(spool.files(), before);
+        }
+        // A registry that cannot be loaded rules nobody out.
+        let mut host = thaw_host(1500, SERVICE_HARNESS, &[]);
+        let mut broken = host.policy.answer.clone().unwrap();
+        broken.rules.registry_fault = Some("unreadable".into());
+        host.policy.answer = Ok(broken);
+        let mut agent = test_identity(5000, 77, 2, 34816);
+        agent.uid = 2000;
+        let refused = watch(&mut host.platform(), &FakeSpool::new(), &agent).unwrap_err();
+        assert_eq!(refused.code, RefusalCode::ChannelUntrusted);
+        // So does a policy that cannot be loaded at all.
+        host.policy.answer = Err(PolicyError::PasswdUnusable);
+        let refused = watch(&mut host.platform(), &FakeSpool::new(), &agent).unwrap_err();
+        assert_ne!(refused.code, RefusalCode::ChannelUntrusted);
+        let refused = answer_confirmation(
+            &mut host.platform(),
+            &FakeSpool::new(),
+            &agent.clone().into(),
+            &answer_request(NONCE, "remove", true),
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_human_uid_that_is_no_harness_account_can_still_watch_and_answer() {
+        let mut host = thaw_host(1500, SERVICE_HARNESS, &[]);
+        let mut human = test_identity(5000, 77, 2, 34816);
+        human.uid = 2000;
+        let mut entry = shown_entry();
+        entry.caller_uid = 2000;
+        entry.shown_at_ms = None;
+        entry.shown_to = None;
+        let spool =
+            FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json().into_bytes());
+        let response = watch(&mut host.platform(), &spool, &human).unwrap();
+        assert_eq!(watching_prompts(&response.answer).unwrap().len(), 1);
+        host.clock.0 = NOW + 2_000;
+        let answered = answer_confirmation(
+            &mut host.platform(),
+            &spool,
+            &human.clone().into(),
+            &answer_request(NONCE, "remove", false),
+        );
+        assert_ne!(
+            answered.map_err(|refusal| refusal.code),
+            Err(RefusalCode::ChannelUntrusted)
+        );
+    }
+
+    #[test]
+    fn an_outside_caller_with_a_session_harness_uid_cannot_thaw() {
+        let mut host = thaw_host(1000, SESSION_HARNESS, &[1000]);
+        let (served, code) = thaw_outside(&mut host, 1000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn a_service_harness_account_cannot_thaw_even_outside_its_scope() {
+        let mut host = thaw_host(1500, SERVICE_HARNESS, &[1500]);
+        let (served, code) = thaw_outside(&mut host, 1500);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn a_harness_uid_alias_cannot_thaw() {
+        // `alias` and `alice` are one uid; naming either registers it.
+        let harness = SESSION_HARNESS.replace("\"alice\", ", "");
+        let mut host = thaw_host(1000, &harness, &[1000]);
+        let (served, code) = thaw_outside(&mut host, 1000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn a_harness_user_with_a_non_utf8_gecos_is_still_refused_a_thaw() {
+        // The poisoned-GECOS attack: alice puts a stray byte in her own line
+        // hoping the line is skipped and her uid stops being a harness uid.
+        // The loader reads passwd lossily, so the line still resolves.
+        let mut host = thaw_host(1000, SESSION_HARNESS, &[1000]);
+        let bytes = b"alice:x:1000:1000:\xff\xfe:/home/alice:/bin/sh\nalias:x:1000:1000:\xff:/home/alice:/bin/sh\nbob:x:2000:2000::/home/bob:/bin/sh\nroot:x:0:0::/root:/bin/sh\n";
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.passwd = String::from_utf8_lossy(bytes).into_owned();
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 1000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn a_thaw_is_refused_to_every_non_root_uid_while_the_registry_is_faulted() {
+        // The registry failed to load, so no uid can be ruled out as an
+        // agent's: bob, who is no harness user, may not thaw either.
+        let mut host = thaw_host(2000, SESSION_HARNESS, &[2000]);
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d failed the trust walk".to_owned());
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 2000);
+        assert_eq!(served, Served::Refused(Fault::Client));
+        assert_eq!(code, Some(RefusalCode::ChannelUntrusted));
+        assert_eq!(host.freeze_file.files().len(), 1);
+    }
+
+    #[test]
+    fn root_still_thaws_while_the_registry_is_faulted() {
+        let mut host = thaw_host(0, SESSION_HARNESS, &[2000]);
+        let mut loaded = host.policy.answer.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d failed the trust walk".to_owned());
+        host.policy.answer = Ok(loaded);
+        let (served, code) = thaw_outside(&mut host, 0);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn a_user_who_is_not_a_harness_uid_still_thaws_their_own_marker() {
+        let mut host = thaw_host(2000, SESSION_HARNESS, &[1000, 2000]);
+        let (served, code) = thaw_outside(&mut host, 2000);
+        assert_eq!(served, Served::Decided);
+        assert_eq!(code, None);
+        let left: Vec<_> = host.freeze_file.files().into_keys().collect();
+        assert_eq!(left, [b"frozen-1000".to_vec()]);
+    }
+
+    #[test]
+    fn root_can_thaw_any_marker() {
+        let mut host = thaw_host(0, SESSION_HARNESS, &[1000, 1500, 2000]);
+        let outcome = serve_with(
+            &mut host,
+            &connection(Ok(thaw_request().to_json().into_bytes())),
+            Ok(&FakeSpool::new()),
+        );
+        assert_eq!(outcome.answer, Answer::Done);
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn a_human_caller_can_thaw_its_own_freeze() {
+        let mut host = Host::honest();
+        host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+        let conn = connection(Ok(thaw_request().to_json().into_bytes()));
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &FakeSpool::new(),
+            human_identity().into(),
+            thaw_request(),
+        );
+        assert_eq!(served, Served::Decided);
+        assert_eq!(refusal_code_written(&conn), None);
+        assert!(host.freeze_file.files().is_empty());
+    }
+
+    #[test]
+    fn an_empty_passwd_refuses_freeze_and_thaw() {
+        // An empty or missing passwd never loads (the load itself fails); an
+        // empty one that got past a faulty source is refused here too.
+        for unloadable in [true, false] {
+            let mut host = Host::honest();
+            host.policy.answer = if unloadable {
+                Err(PolicyError::PasswdUnusable)
+            } else {
+                let mut loaded = policy();
+                loaded.passwd = String::new();
+                Ok(loaded)
+            };
+            host.freeze_file.publish("frozen-1000", MARKER).unwrap();
+            for request in [thaw_request(), freeze_request()] {
+                let conn = connection(Ok(request.to_json().into_bytes()));
+                let served = serve_request(
+                    &conn,
+                    &mut host.platform(),
+                    &FakeSpool::new(),
+                    human_identity().into(),
+                    request,
+                );
+                assert_eq!(served, Served::Refused(Fault::Broker));
+                assert_eq!(
+                    refusal_code_written(&conn),
+                    Some(RefusalCode::PolicyUnloadable)
+                );
+            }
+            assert_eq!(host.freeze_file.files().len(), 1);
+        }
     }
 
     #[test]
@@ -11588,7 +13905,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity.clone(),
+                identity.clone().into(),
                 request,
             );
             assert_eq!(served, Served::Refused(Fault::Broker));
@@ -11605,7 +13922,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.freeze_file.publish("frozen-1000", MARKER).unwrap();
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11613,7 +13930,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
         assert_eq!(served, Served::Decided);
         let written = conn.written();
         let response = BrokerResponse::parse(&written).unwrap();
@@ -11626,23 +13949,14 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
 
     #[test]
     fn an_unfrozen_enrolled_entry_is_allowed_to_mint() {
-        let mut host = Host::honest();
-        host.policy
-            .answer
-            .as_mut()
-            .unwrap()
-            .settings
-            .confirm_agent_actions = false;
+        // A session harness: a person can type the password a service
+        // account does not have, so an ungranted command takes the -auth path.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
         host.syscalls =
             FakeSyscalls::new().with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation =
-            crate::identify::CgroupAttestation::AgentScope(xudo_sys::Scope {
-                kind: xudo_sys::ScopeKind::Agent,
-                name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
-                record: Vec::new(),
-            });
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11651,24 +13965,31 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
 
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
 
         assert_eq!(served, Served::Minted);
         let response = BrokerResponse::parse(&conn.written()).unwrap();
         let (decision, minted) = decision_of(&response.answer).unwrap();
-        assert_eq!(decision.verdict, Verdict::Allow);
-        assert!(minted.is_some());
-        assert_eq!(spool.files().len(), 1);
+        assert_eq!(decision.verdict, Verdict::AllowWithConfirmation);
+        assert_eq!(minted.unwrap().gate, xudo_backend::snippet::GATE_AUTH);
+        assert_eq!(entries_in(&spool)[0].via, xudo_gate::request::Via::Auth);
     }
 
     #[test]
     fn an_enrolled_entry_with_an_unavailable_live_boot_id_is_not_minted() {
-        let mut host = Host::honest();
-        let scope = registered_harness_scope(&mut host);
+        // A session harness: a person can type the password a service
+        // account does not have, so an ungranted command takes the -auth path.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
         host.syscalls = FakeSyscalls::new().with_boot_id(Ok("invalid-boot-id".to_owned()));
         let mut identity = test_identity(PID, START, 0, 0);
         identity.cgroup_id = Some(44);
-        identity.cgroup_attestation = crate::identify::CgroupAttestation::AgentScope(scope);
+        identity.cgroup_attestation = crate::identify::CgroupAttestation::UnregisteredScope(scope);
         let request = BrokerRequest::new(
             "/usr/bin/systemctl",
             vec!["restart".to_owned(), "nginx.service".to_owned()],
@@ -11677,7 +13998,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let conn = connection(Ok(request.to_json().into_bytes()));
         let spool = FakeSpool::new();
 
-        let served = serve_request(&conn, &mut host.platform(), &spool, identity, request);
+        let served = serve_request(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            identity.into(),
+            request,
+        );
 
         assert_eq!(served, Served::Refused(Fault::Broker));
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -12007,6 +14334,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -12234,13 +14562,19 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let identity =
             crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
         let evaluated = Evaluated {
-            caller: crate::policy::classify(&identity),
+            caller: crate::policy::classify_for_test(&identity),
             decision,
             identity,
             request,
             policy: policy(),
         };
-        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
+        let served = mint(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            MintFor::Password(None),
+        );
         assert_eq!(served, Served::Refused(Fault::Broker));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -12261,7 +14595,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let spool = FakeSpool::new();
         let identity =
             crate::identify::identify(conn.socket(), &host.syscalls, &host.peers).unwrap();
-        let caller = crate::policy::classify(&identity);
+        let caller = crate::policy::classify_for_test(&identity);
         let loaded = policy();
         let mut request = BrokerRequest::new(
             "/usr/bin/systemctl",
@@ -12282,7 +14616,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             request,
             policy: loaded,
         };
-        let served = mint(&conn, &mut host.platform(), &spool, evaluated);
+        let served = mint(
+            &conn,
+            &mut host.platform(),
+            &spool,
+            evaluated,
+            MintFor::Password(None),
+        );
         assert_eq!(served, Served::Refused(Fault::Client));
         assert_eq!(spool.calls(), []);
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -12363,7 +14703,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let result = complete_answer(
             &mut host.platform(),
             &spool,
-            watcher,
+            &watcher.clone().into(),
             &answer_request(NONCE, "remove", approve),
             AnsweredEntry {
                 id: NONCE.to_owned(),
@@ -12378,7 +14718,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     fn frozen_by(entry: &PendingRequest, freezer: &PeerIdentity) -> Redecided {
         let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), entry.to_json());
         let mut host = Host::honest();
-        let result = deny_pending(&mut host.platform(), &spool, freezer, &freeze_request());
+        let result = deny_pending(
+            &mut host.platform(),
+            &spool,
+            &freezer.clone().into(),
+            &freeze_request(),
+        );
         redecided(&host, &spool, result.err().map(|e| e.code))
     }
 
@@ -12513,6 +14858,25 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
     }
 
     #[test]
+    fn stored_caller_is_never_a_live_attestation() {
+        use xudo_policy::Classification;
+        // A spool entry names a harness by label only: no scope, no yolo. A
+        // harness grant needs the live kernel-attested session, which this
+        // can never be.
+        let entry = enrolled_entry(NONCE, UID);
+        assert_eq!(
+            stored_caller(&entry).classification,
+            Classification::EnrolledAgent {
+                agent_id: "codex".to_owned(),
+                session_id: "stored".to_owned(),
+                declared_yolo: false,
+            }
+        );
+        // The mint, where a grant would be made, never reads the stored class.
+        assert!(!include_str!("mint.rs").contains("stored_caller"));
+    }
+
+    #[test]
     fn stored_caller_uses_the_registry_label_and_refuses_a_missing_one() {
         use xudo_policy::Classification;
         let mut entry = enrolled_entry(NONCE, UID);
@@ -12644,7 +15008,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let refused = answer_confirmation(
                 &mut host.platform(),
                 &spool,
-                &watcher,
+                &watcher.clone().into(),
                 &answer_request(NONCE, "remove", true),
             )
             .unwrap_err();
@@ -12654,7 +15018,13 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             // A freeze never acts on it either: nothing is decided or removed.
             let spool = FakeSpool::new().with_file(NONCE.as_bytes().to_vec(), bytes.clone());
             let mut host = Host::honest();
-            deny_pending(&mut host.platform(), &spool, &watcher, &freeze_request()).unwrap();
+            deny_pending(
+                &mut host.platform(),
+                &spool,
+                &watcher.clone().into(),
+                &freeze_request(),
+            )
+            .unwrap();
             assert_eq!(spool.files()[NONCE.as_bytes()], bytes);
             assert!(host.audit.records().is_empty());
         }
@@ -12701,7 +15071,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             let mut identity = test_identity(PID, START, 0, 0);
             identity.uid = freezer_uid;
             let mut host = Host::honest_as(freezer_uid);
-            deny_pending(&mut host.platform(), &spool, &identity, &freeze_request()).unwrap();
+            deny_pending(&mut host.platform(), &spool, &identity.clone().into(), &freeze_request()).unwrap();
             let after = spool.files();
             for (name, bytes) in &before {
                 let nonce = String::from_utf8(name.clone()).unwrap();
@@ -12718,7 +15088,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let (mut host, mut identity, _) = ask_human_fixture();
         identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
         let mut loaded = host.policy.load().unwrap();
-        loaded.passwd = b"alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_vec();
+        loaded.passwd = "alice:x:1000:1000:Alice:/home/alice:/bin/sh\n".to_owned();
         host.policy.answer = Ok(loaded);
         (host, identity)
     }
@@ -12970,7 +15340,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -12994,7 +15364,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &spool,
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -13054,7 +15424,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13084,7 +15454,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13107,7 +15477,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13134,7 +15504,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13159,7 +15529,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13209,7 +15579,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut with_audit(&host, &mut sink),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -13234,7 +15604,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             &conn,
             &mut host.platform(),
             &FakeSpool::new(),
-            &identity,
+            &identity.clone().into(),
             &request,
             &entry.id,
         );
@@ -13256,7 +15626,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut owner_host.platform(),
                 &FakeSpool::new(),
-                &owner,
+                &owner.clone().into(),
                 &request,
                 &agent_entry.id,
             ),
@@ -13273,7 +15643,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut owner_host.platform(),
                 &FakeSpool::new(),
-                &owner,
+                &owner.clone().into(),
                 &request,
                 &agent_entry.id
             ),
@@ -13298,7 +15668,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13327,7 +15697,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13356,7 +15726,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &confirm,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13622,7 +15992,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                identity,
+                identity.into(),
                 dashed,
             ),
             Served::Decided
@@ -13647,7 +16017,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -13700,7 +16075,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13728,7 +16103,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13752,7 +16127,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &confirm,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13774,7 +16149,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &missing.id,
             ),
@@ -13798,7 +16173,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                         &conn,
                         &mut host.platform(),
                         &FakeSpool::new(),
-                        &identity,
+                        &identity.clone().into(),
                         &request,
                         &previous.id,
                     );
@@ -13824,7 +16199,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
             ),
@@ -13838,7 +16213,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -13875,7 +16250,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 99,
@@ -13893,7 +16268,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 seq,
@@ -13918,7 +16293,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &agent,
+                &agent.clone().into(),
                 &request,
                 &claimed.id,
                 0,
@@ -13936,7 +16311,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &agent,
+                &agent.clone().into(),
                 &request,
                 &claimed.id
             ),
@@ -13976,7 +16351,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &requests,
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id
             ),
@@ -13996,7 +16371,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                         &conn,
                         &mut host.platform(),
                         &FakeSpool::new(),
-                        &identity,
+                        &identity.clone().into(),
                         &request,
                         &entry.id,
                     );
@@ -14020,7 +16395,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         let rules = load_policy(
             vec![RuleFile {
                 name: b"10-review.toml".to_vec(),
-                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n".to_vec(),
             }],
             &[
                 HarnessFile {
@@ -14053,7 +16428,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -14067,7 +16447,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -14085,7 +16470,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         loaded.rules = load_policy(
             vec![RuleFile {
                 name: b"10-review.toml".to_vec(),
-                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\n".to_vec(),
+                bytes: b"[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n".to_vec(),
             }],
             &[HarnessFile {
                 name: b"codex.toml".to_vec(),
@@ -14124,7 +16509,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             };
             let conn = connection(Ok(request.to_json().into_bytes()));
             assert_eq!(
-                serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+                serve_queue_list(
+                    &conn,
+                    &mut host.platform(),
+                    &identity.clone().into(),
+                    &request
+                ),
                 Served::Decided
             );
             let answer = BrokerResponse::parse(&conn.written()).unwrap().answer;
@@ -14156,7 +16546,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         };
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Decided
         );
         let listed = host
@@ -14177,7 +16572,12 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         host.audit = FakeAuditSink::failing("audit unavailable");
         let conn = connection(Ok(request.to_json().into_bytes()));
         assert_eq!(
-            serve_queue_list(&conn, &mut host.platform(), &identity, &request),
+            serve_queue_list(
+                &conn,
+                &mut host.platform(),
+                &identity.clone().into(),
+                &request
+            ),
             Served::Refused(Fault::Broker)
         );
         assert_eq!(stored_queue(&host).len(), 1);
@@ -14203,7 +16603,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                     &conn,
                     &mut host.platform(),
                     &FakeSpool::new(),
-                    &identity,
+                    &identity.clone().into(),
                     &request,
                 ),
                 Served::Refused(Fault::Broker)
@@ -14231,7 +16631,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &claim,
                 &id,
             ),
@@ -14244,7 +16644,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &release,
                 &id
             ),
@@ -14257,7 +16657,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &complete,
                 &id,
                 0,
@@ -14272,7 +16672,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &claim,
                 &id,
             ),
@@ -14284,7 +16684,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &release,
                 &id
             ),
@@ -14296,7 +16696,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &complete,
                 &id,
                 0
@@ -14342,7 +16742,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut host.platform(),
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,
@@ -14448,7 +16848,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut platform,
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0
@@ -14546,7 +16946,7 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 &conn,
                 &mut platform,
                 &FakeSpool::new(),
-                &identity,
+                &identity.clone().into(),
                 &request,
                 &entry.id,
                 0,

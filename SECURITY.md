@@ -6,35 +6,89 @@
 precondition for 1.0. Until then, do not deploy this where a compromise would
 matter.
 
-The broker and the password-authenticated gate are built. Both can recognise a
-caller inside a scope that root made for a registered agent, but nothing in
-this release creates one, so every request takes the password path. The
-package installs no `NOPASSWD` rule. Passwordless runs, agent enrolment,
-Landlock confinement and a separate agent account are not in this release. An
-optional confirmation through `xudo watch` is built and off by default; it is
-an extra on the human path and the agent path never depends on it. Every path
-still requires the password. Session and terminal checks do not prove a human:
-a same-uid agent can run `script -qc 'xudo watch'`. This limits only that
-extra.
+The broker and password-authenticated gate are built. Every caller is currently
+classified as `Unattested`, so every request uses the password path. The
+package does not install a `NOPASSWD` rule: the passwordless agent path is off
+unless root runs `sudo xudo install --agent-path`. Landlock confinement and
+same-uid watcher separation are not in this release.
+Out-of-band confirmation through `xudo watch` is built but off by default; every
+path still requires the password. Session and terminal checks do not prove a
+human: a same-uid agent can run `script -qc 'xudo watch'`. A cgroup scope for agents, not in this
+release, is needed to separate the agent from the human.
 
 The doas rule `xudo install` writes has no `persist`, so every run prompts even on an OpenDoas built
 with timestamp support. doas does not give its command a new pty, so a command that uses the
 terminal can reach the parent's tty. The package depends on sudo.
 
-`v0.1.0-beta.1` had three issues that `v0.1.0-beta.2` fixed. The shipped
-service rule accepted `systemctl` start, stop, and restart of power, reboot,
-rescue, and similar units. A package name ending in `-` could remove a
-package, including a security package. On remove, a name containing `.` or
-`+` was read as a regular expression and could select many packages. The
-fixes, and what an operator who kept an old rule file should do, are in
-[CHANGELOG.md](CHANGELOG.md).
+The published `v0.1.0-beta.1` package ships `xudo.svc.lifecycle` accepting
+`systemctl` start, stop, and restart of power, reboot, rescue, kernel-module,
+filesystem-template, and broker-socket units for any caller who passes the
+password gate. The filesystem templates on the deny-list are
+`systemd-fsck@`, `systemd-growfs@`, `systemd-makefs@`, and `mdadm*@`.
+A `.mount` unit is not on that list, and `unit-name` accepts it. The
+tripwire is best effort and covers the `systemctl` program only. A rule
+whose exe is not exactly named `systemctl` (a renamed copy of the binary)
+gets no checks and no lint. `service`, `invoke-rc.d`, `busctl`, and a unit
+alias such as firewalld's `dbus-org.fedoraproject.FirewallD1.service` get
+around it. The enumeration is the boundary. The shipped rule set no longer
+contains a service lifecycle rule. Copy
+`/usr/share/xudo/examples/20-services-lifecycle.toml` to
+`/etc/xudo/rules.d/` and list the units that host should expose. `reset-failed`
+still ships, and accepts only a plain `.service` name. The compiled-in
+deny-list refuses those names, the systemd power and sleep services,
+`umount.target`, `final.target`, `rescue.service`, `emergency.service`,
+`debug-shell`, the runlevel aliases, firewall and time-sync units (including
+the `dbus-org.freedesktop.timesync1` alias), the journal and `syslog`
+units, `systemd-repart`, and `systemd-sysctl`, on a `systemctl` verb that
+starts, stops, signals, or
+otherwise acts, including a unit an operator listed by mistake. A command is
+exempt from the unit-name check only in the plain read-only shape: optional
+`--no-pager`, `--full`, `--no-ask-password`, `-l`, `--no-legend`, `--plain`,
+`--value` or `--all`, then a read-only verb (`status`, `show`, and the other
+queries), then only unit names or joined `--property=` flags. Any other
+option, including `-p` with a separate value, and any verb that is not
+read-only (`reenable`, `reset-failed`, and every other verb of the systemctl
+table), removes the exemption, so `-p status reenable debug-shell.service`
+is refused. What is checked: every non-flag token against the verb sets and
+the unit list; options by their form (`-H`, `--host`, `-M`, `--machine` and
+their prefixes are refused); and a `*`, `?` or `[` in a token outside the
+plain shape is refused, because `systemctl` expands globs itself against the
+loaded units. What is not checked: the items in the first paragraph above,
+and any other spelling `systemctl` resolves that this list does not name.
+`xudo check` also reports an enumerated unit list that names a refused unit
+or a glob. `poweroff`, `reboot`, `sleep`, and the other power subcommands are
+refused in any position. `start --job-mode=isolate` and a prefix such as
+`--j=isolate` are refused for every target. `status rescue` is refused,
+because `rescue` is itself a power subcommand. The acting verbs also
+include `kill`, `clean`, `freeze`, `thaw`, and the compatibility names
+`condrestart`, `force-reload`, `reload-or-try-restart`, `condreload`, and
+`condstop`. If dpkg asked about `/etc/xudo/rules.d/20-services.toml`
+during the upgrade and you kept your version, run `xudo check`, and
+replace its `unit-name` with a `one-of` list of your units. The package
+notice says to run that check. It does not decide whether the host is
+exposed.
 
-No shipped rule starts or stops a service. To allow it, copy
-`/usr/share/xudo/examples/20-services-lifecycle.toml` into
-`/etc/xudo/rules.d/` and list your units with `one-of`. The built-in list
-refuses power, rescue, firewall, time-sync, journal and xudo's own units on any
-verb that acts, but it is a list of names: an alias it does not name gets past.
-If you kept a beta.1 `20-services.toml` during an upgrade, run `xudo check`.
+The published `v0.1.0-beta.1` install rule accepted a package name ending in
+`-`. `apt-get install apparmor-` removes `apparmor`, so that command skipped
+the confirmation `xudo.pkg.remove` demands when `confirm_human_path` is on
+and could remove a security
+package or xudo itself. `deb-name` and `apk-name` now reject a trailing `-`.
+The install rule also requires `--no-remove`: an install that would remove a
+conflicting package is refused, and the operator removes that package with
+the remove rule. A trailing `+` stays accepted by `deb-name`. `g++` and
+`libstdc++6` are real package names, and `pkg+` on `apt-get install` asks
+apt to install the package. On remove, a name containing `.` or `+` is no
+longer accepted. In apt-get a name containing either that is not an exact
+cache hit is read as an unanchored regular expression. On install that can
+select many packages and cannot remove one, because of `--no-remove`, so
+`deb-name` is unchanged there. On remove one confirmed token such as `lib.`
+could remove hundreds of packages, and `pkg+` installs. The remove rule uses
+`deb-name-literal`: the `deb-name` rules, and no `.` and no `+` anywhere. A
+package whose name contains either (`python3.12`, `g++`, `libstdc++6`) can
+no longer be removed through xudo. Remove it with the host's own tools, or
+add an operator rule that lists that name with `one-of`. The remove matcher's
+change is part of the ruleset generation, so an approval already minted
+against the previous ruleset no longer matches.
 
 With `confirm_human_path` off, the default, `xudo.pkg.remove`'s
 `confirm = "always"` is satisfied by the password alone. The shipped active
@@ -106,16 +160,6 @@ to non-root daemons, and keeping sudo's combined rule would let a tight
 caller umask under sudo-rs or doas do the same to other users' services. A
 fixed `022` is deterministic and matches what classic sudo gives.
 
-## Verifying a release
-
-Each release carries a CycloneDX SBOM, `xudo-<version>.cdx.json` (`<version>` is Cargo's spelling, for example `0.1.0-beta.1`), listing every crate the shipped binaries link, as resolved for the two musl targets, with its `Cargo.lock` version and checksum. It is signed like the package; verify it with the same identity the package uses:
-
-```sh
-cosign verify-blob --bundle xudo-<version>.cdx.json.cosign.bundle --certificate-identity https://github.com/YaminT/xudo/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com xudo-<version>.cdx.json
-```
-
-The four binaries also embed that dependency list (`cargo-auditable`). Read it from an installed binary with `cargo audit bin /usr/bin/xudo`. That embedded list may name a crate the binary does not link (`errno`); the SBOM does not. Building the package (`just deb`) needs `cargo-auditable` 0.7.7.
-
 ## Reporting
 
 Open a private security advisory on the GitHub repository. Please do not open a
@@ -123,10 +167,9 @@ public issue for anything that could be exploited.
 
 If you are reporting a design flaw rather than a bug, that is welcome and useful.
 The limits of the design are the rest of this file. The product invariants are
-in `howiwork.md`: agent detection is not a security boundary; no caller gets
-passwordless root by mistake or by default; and a decision that needs a person
-is made where the requester cannot answer it. Passwordless runs are not built
-yet, so today nothing runs without a password.
+in `howiwork.md`: agent detection is not a security boundary, the agent path is
+never broader than the human path, and confirmation lives outside the
+requester's process tree.
 
 ## What this does not protect against
 
@@ -134,11 +177,9 @@ Stated plainly, because a control you believe in and do not have is worse than
 one you know you lack.
 
 - **Agent detection is not a security boundary.** A same-uid process can forge
-  every cheap signal, and a person can ask a verified harness to run a command.
-  In the design, a process inside a verified harness's scope runs, without a
-  password, exactly what root's rules allow that harness: no live approval
-  stands in between, so the rules must be sized for that. In this release no
-  caller is a verified harness and impersonation buys nothing.
+  every cheap signal, and a human can ask a genuinely-enrolled agent to run a
+  command. Once the passwordless path exists, impersonation would skip the password on
+  an already-allowlisted action; today it buys nothing.
 - **The deny-list is defence in depth.** The set of programs that can be turned
   into a root shell is not enumerable. It catches a mistake in a rule; it is not
   the boundary.
@@ -162,21 +203,12 @@ one you know you lack.
   report can and cannot see.
 - **`xudo explain` does not verify the rules it reads.** It reads them by path,
   so that it works on a checkout; a tampered ruleset makes it print a wrong
-  answer to the human who asked. `exec` does not use the front-end's rule path. The broker and gate load through a trusted loader, which refuses a ruleset with
+  answer to the human who asked. `exec` does not use the front-end's rule path. The broker and gate load through the privileged loader `xudo_sys::load_trusted_rules`, which refuses a ruleset with
   any component that is not root's, is writable by group or world, is a
   symbolic link, or is on a mount a non-root user could have made — checked on
   the descriptors the rules are read through — and `xudo doctor` reports
   through it. The broker and gate use this trusted loader for privileged
   requests; `explain` itself remains an unprivileged inspection command.
-- **The review queue shows text the agent wrote.** A queued entry's reason is
-  agent-written and shown sanitised. Judge the exact argv, which is re-checked
-  against the current rules when you run it, in `/`. Only a person classified
-  as human and listed in the harness's `reviewers` may claim an entry, never
-  the account that queued it. The queue holds at most 32 entries per account
-  and 1024 in total, and an entry expires after `queue_ttl_secs` (at most one
-  day). A harness label names a scope root made, not a program: whatever runs
-  in that scope gets that label's rules. Nothing in this release creates such
-  a scope, so the queue stays empty.
 - **Not every user-writable filesystem is refused yet.** A mount that root made
   from a block device or loop file a user can write passes, and so does an
   overlay whose upper layer a user can write: what is checked is who made the
@@ -277,3 +309,16 @@ The install probe runs `/usr/bin/gnuid -u` when `/usr/bin/id` is not a regular f
 ## No telemetry
 
 The shipped release-musl binaries are checked under `strace` across selected commands, failing on socket families outside `AF_UNIX`/`AF_LOCAL`. CI also checks their normal Cargo dependency tree for known networking crates.
+
+## Enrolling an agent account: what the checks read
+
+`xudo agent enrol` resolves the account from `/etc/passwd` alone and consults
+no directory service (`nsswitch.conf` is not read). On a host whose `passwd`
+order is, say, `sss files`, the uid systemd runs the unit as can differ from the
+uid in `/etc/passwd`. That cannot grant anything: the gate compares the uid the
+kernel attests against `/etc/passwd` and refuses on any difference. Enrol also
+refuses on any rule in the sudo or doas files that names the account, whether or
+not it asks for a password, and on a group sharing the gid of a root-equivalent
+one. Before it enables the unit it asks systemd for the unit's `DropInPaths`
+and `FragmentPath` and stops unless they are exactly its own drop-in and the
+packaged template.

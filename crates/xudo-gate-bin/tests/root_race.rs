@@ -205,7 +205,8 @@ fn write_entry(round: u64) -> String {
         confirmed: false,
         confirmed_by: None,
         state: xudo_gate::request::ConfirmationState::Pending,
-        caller_uid: 1000,
+        // The pinned process is this test; the gate reads its live uid.
+        caller_uid: rustix::process::getuid().as_raw(),
         caller_sid: 10,
         caller_tty: 20,
         needs_watch: false,
@@ -217,6 +218,7 @@ fn write_entry(round: u64) -> String {
         attested_scope_id: None,
         boot_id: None,
         attested_harness: None,
+        via: xudo_gate::request::Via::Auth,
         queue_id: None,
         operation: None,
     };

@@ -62,7 +62,7 @@ sums() { # <out dir> : sha256 of the deb and the files it ships
     local out=$1 deb
     deb=$(ls "$out"/xudo_*.deb)
     sha256sum "$deb" | sed "s|$out/||"
-    (cd "$out/stage" && sha256sum usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth)
+    (cd "$out/stage" && sha256sum usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-gate-nopass)
 }
 sums "$root/target/repro-a/out" >"$root/target/repro-a/sums"
 sums "$root/target/repro-b/out" >"$root/target/repro-b/sums"
@@ -79,7 +79,7 @@ b=$root/target/repro-b/out
 if command -v diffoscope >/dev/null; then
     diffoscope "$a"/xudo_*.deb "$b"/xudo_*.deb || true
 else
-    for f in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth; do
+    for f in usr/bin/xudo usr/bin/ido usr/libexec/xudo/xudod usr/libexec/xudo/xudo-gate-auth usr/libexec/xudo/xudo-gate-nopass; do
         n=$(cmp -l "$a/stage/$f" "$b/stage/$f" | wc -l || true)
         echo "$f: $n differing bytes" >&2
     done

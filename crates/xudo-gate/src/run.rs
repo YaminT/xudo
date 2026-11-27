@@ -27,9 +27,14 @@
 //!    nothing the gate runs gains privilege from a set-user-ID or
 //!    file-capability binary. Set before anything is consumed, so a host that
 //!    refuses costs the caller nothing.
-//! 6. **The invocation.** No arguments, and `argv[0]` is the `-auth` name.
-//!    `xudo-gate-nopass` is not shipped until M4, so any other name is refused.
-//! 7. **`/proc` verified as procfs**, on the descriptor it is read through.
+//! 6. **The invocation.** No arguments, and `argv[0]` is one of the two gate
+//!    names, `-auth` or `-nopass`. Any other name is refused.
+//! 7. **`/proc` verified as procfs**, on the descriptor it is read through,
+//!    and then **the mode from the executed file**: `/proc/self/exe` is
+//!    compared with both gate files under `/usr/libexec/xudo`, each opened
+//!    through the trust walk and each with one name only
+//!    ([`xudo_sys::GateFiles`]). The match is the mode, and `argv[0]` must
+//!    say the same: a caller can choose a name and cannot choose an inode.
 //! 8. **The lineage walk**: the gate, `sudo` or `sudo-rs` (with its `use_pty`
 //!    monitor) or `doas`, and then the `xudo` process that asked, each pinned
 //!    by `(pid, starttime)`, bounded at [`LINEAGE_PROCESSES`] processes. The
@@ -49,6 +54,14 @@
 //!     more than one is refused. The clock is the broker's, [`xudo_sys::HostClock`]:
 //!     one `CLOCK_BOOTTIME` that a deadline is stamped and judged on, and a
 //!     reading of zero is refused as no reading.
+//!     **The `-nopass` ledger.** For the `-nopass` file only, every invocation
+//!     is counted in the rate ledger ([`xudo_sys::rate`]) under the live uid
+//!     and label, **once** and before any audit append: after [`decide`] and
+//!     before consume for a request that got that far, and first thing in the
+//!     refusal path for one that did not. Over the ceiling the refusal is
+//!     `gate_rate_ceiling`, and one audit record a minute says how many it
+//!     stands for; a ledger that cannot be used refuses without a record. An
+//!     agent that loops on the door cannot fill the trail.
 //! 11. **`validate`, then [`decide`]**, then **consume**: the entry is unlinked
 //!     through the verified directory descriptor before anything executes, and
 //!     a failed unlink — `ENOENT` included, which means a second gate took it
@@ -91,15 +104,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use xudo_audit::record::Record;
-use xudo_policy::{CallerFacts, Classification};
 #[cfg(test)]
 use xudo_policy::{LoadedRuleSet, engine};
 #[cfg(test)]
 use xudo_sys::TrustedRulesError;
 use xudo_sys::{
-    AuditSink, Authorized, CgroupCalls, Clock, HostClock, HostHygiene, HostPeer, HostPrograms,
-    HostSyscalls, Hygiene, PeerCalls, ProcRef, ProcSource, Program, Programs, Spool, SpoolDir,
-    SpoolError, Syscalls, VerifiedProc, authorize, lineage,
+    Admission, AuditSink, Authorized, CallerHints, CgroupCalls, Clock, GateFiles, GateMode,
+    HostClock, HostGateFiles, HostHygiene, HostPeer, HostPrograms, HostRateLedger, HostSyscalls,
+    Hygiene, LedgerKey, PeerCalls, ProcRef, ProcSource, Program, Programs, RateLedger, Spool,
+    SpoolDir, SpoolError, Syscalls, VerifiedProc, authorize, lineage, pinned_hints,
 };
 
 use crate::decide::{
@@ -127,6 +140,11 @@ pub const LINEAGE_PROCESSES: usize = 9;
 /// The one name the gate runs under: the hardlink `sudo` asks for a password
 /// to reach.
 pub const AUTH_NAME: &[u8] = b"xudo-gate-auth";
+
+/// The other name: the gate a harness grant reaches without a password. No
+/// sudoers text names it until the grant ships, and nothing mints the `harness`
+/// entry it requires, so it refuses every invocation today.
+pub const NOPASS_NAME: &[u8] = b"xudo-gate-nopass";
 
 /// Where the root-owned ruleset is read from.
 pub const RULES_DIR: &str = "/etc/xudo/rules.d";
@@ -189,6 +207,9 @@ pub trait GateHost {
     /// Whether the freeze marker for `uid`'s own agents stands. A marker that
     /// cannot be read cleanly counts as standing: the gate fails closed.
     fn user_frozen(&self, uid: u32) -> bool;
+    /// Whether the freeze marker for the harness `label` stands, on the same
+    /// terms as [`Host::user_frozen`].
+    fn harness_frozen(&self, label: &str) -> bool;
     /// Opens the spool through the trust walk.
     ///
     /// # Errors
@@ -206,8 +227,12 @@ pub trait GateHost {
     /// [`SpoolError`] when the directory fails the walk or is not a private
     /// root-owned directory.
     fn open_queue(&self) -> Result<Box<dyn QueueClaim>, SpoolError>;
+    /// Which gate file this process is.
+    fn gate_files(&self) -> &dyn GateFiles;
     /// Where programs are opened.
     fn programs(&self) -> &dyn Programs;
+    /// The `-nopass` rate ledger.
+    fn rate(&self) -> &dyn RateLedger;
     /// The audit trail.
     fn audit(&mut self) -> &mut dyn AuditSink;
     /// Runs a typed remove-path. The host opens nothing until this is called.
@@ -278,6 +303,10 @@ impl GateHost for SystemHost {
         crate::policy::user_frozen(uid, &xudo_sys::read_trusted_file)
     }
 
+    fn harness_frozen(&self, label: &str) -> bool {
+        crate::policy::harness_frozen(label, &xudo_sys::read_trusted_file)
+    }
+
     fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
         SpoolDir::open(Path::new(SPOOL_DIR)).map(into_spool)
     }
@@ -286,8 +315,16 @@ impl GateHost for SystemHost {
         SpoolDir::open_beneath(Path::new(QUEUE_DIR)).map(into_queue)
     }
 
+    fn gate_files(&self) -> &dyn GateFiles {
+        &HostGateFiles
+    }
+
     fn programs(&self) -> &dyn Programs {
         &HostPrograms
+    }
+
+    fn rate(&self) -> &dyn RateLedger {
+        &HostRateLedger
     }
 
     fn audit(&mut self) -> &mut dyn AuditSink {
@@ -397,36 +434,22 @@ pub struct GateExit {
     pub message: String,
 }
 
-/// Which hardlink the gate was started as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Entry {
-    /// `xudo-gate-auth`: `sudo` asked a human for a password to start it.
-    Auth,
-}
-
-impl Entry {
-    /// Whether this name proves a password was typed.
-    fn password_confirms(self) -> bool {
-        match self {
-            Self::Auth => true,
-        }
-    }
-
-    /// What the record says confirmed the request under this name.
-    fn confirmation(self) -> &'static str {
-        match self {
-            Self::Auth => "confirmation=password (sudo's own prompt, on the -auth name)",
-        }
+/// What the record says confirmed the request under this gate file.
+fn confirmation_text(mode: GateMode) -> &'static str {
+    match mode {
+        GateMode::Auth => "confirmation=password (sudo's own prompt, on the -auth name)",
+        GateMode::Nopass => "confirmation=none (the -nopass name asks no password)",
     }
 }
 
-/// Accepts the one invocation `sudo` makes: no arguments, under the `-auth`
-/// name.
+/// Accepts the one invocation `sudo` makes: no arguments, under one of the two
+/// gate names.
 ///
 /// The name is the last `/`-separated segment of `argv[0]`, compared as bytes
 /// and exactly: no normalisation, so `xudo-gate-auth/` and `xudo-gate-auth/.`
-/// are not it. `xudo-gate-nopass` is refused with the rest until M4 ships it.
-fn accept_invocation(args: &[OsString]) -> Result<Entry, Refusal> {
+/// are not it. This is what the caller *claims*. [`proceed`] refuses unless
+/// the executed file says the same.
+fn accept_invocation(args: &[OsString]) -> Result<GateMode, Refusal> {
     let refuse = |reason: String| Refusal::Failed {
         stage: Stage::Invocation,
         reason,
@@ -446,14 +469,144 @@ fn accept_invocation(args: &[OsString]) -> Result<Entry, Refusal> {
         .next()
         .unwrap_or_default();
     if last == AUTH_NAME {
-        Ok(Entry::Auth)
+        Ok(GateMode::Auth)
+    } else if last == NOPASS_NAME {
+        Ok(GateMode::Nopass)
     } else {
         Err(refuse(format!(
-            "started as {}, and only {} runs",
+            "started as {}, and only {} and {} run",
             bytes.escape_ascii(),
-            AUTH_NAME.escape_ascii()
+            AUTH_NAME.escape_ascii(),
+            NOPASS_NAME.escape_ascii()
         )))
     }
+}
+
+/// The mode the executed file says, and refused unless it is the one `argv[0]`
+/// claimed.
+///
+/// An executed `-nopass` file is noted in `progress` before the comparison, so
+/// the invocation counts against the ledger even when `argv[0]` lied about it.
+fn mode_of_executed_file(
+    host: &dyn GateHost,
+    proc: &dyn ProcSource,
+    claimed: GateMode,
+    progress: &mut Progress,
+) -> Result<GateMode, Refusal> {
+    let refuse = |reason: String| Refusal::Failed {
+        stage: Stage::Invocation,
+        reason,
+    };
+    let executed = host
+        .gate_files()
+        .executing(proc)
+        .map_err(|error| refuse(error.to_string()))?;
+    progress.nopass |= executed == GateMode::Nopass;
+    if executed == claimed {
+        Ok(executed)
+    } else {
+        Err(refuse(
+            "argv[0] names one gate file and the executed file is the other".to_owned(),
+        ))
+    }
+}
+
+/// The step of the `-nopass` ledger, and the only place it is counted.
+///
+/// Every `-nopass` invocation counts, a refusal as much as a run, and counts
+/// **before** any audit append, so an agent that calls the door in a loop is
+/// stopped by the ledger and not by a full trail. [`proceed`] counts a
+/// request that has been decided, after `decide` and before the entry is
+/// consumed; [`finish_refusal`] counts a refusal that ended earlier. Whichever
+/// comes first counts, and the other finds it done: once per invocation.
+///
+/// `Ok` is "counted, carry on" or "not the `-nopass` gate". `Err` is the
+/// refusal that stands for the invocation now: over the ceiling, or a ledger
+/// that could not be used. Neither is ever retried.
+fn count_nopass(host: &dyn GateHost, progress: &mut Progress) -> Result<(), Refusal> {
+    if !progress.nopass || progress.ledger != LedgerStep::Uncounted {
+        return Ok(());
+    }
+    progress.ledger = LedgerStep::Ended;
+    let now = read_clock(host.clock())?;
+    let key = progress.ledger_key.clone().unwrap_or(LedgerKey {
+        uid: crate::decide::UNKNOWN_UID,
+        label: None,
+    });
+    match host.rate().admit(&key, now) {
+        Ok(Admission::Admitted {
+            minute,
+            hour,
+            carried,
+        }) => {
+            progress.ledger = LedgerStep::Counted;
+            progress
+                .evidence
+                .push(format!("ledger_minute={minute} ledger_hour={hour}"));
+            if carried > 0 {
+                // Refusals over the ceiling that no record has counted yet.
+                progress
+                    .evidence
+                    .push(format!("ledger_suppressed_before={carried}"));
+            }
+            Ok(())
+        }
+        Ok(Admission::OverCeiling {
+            minute,
+            hour,
+            report,
+        }) => Err(Refusal::RateCeiling {
+            minute,
+            hour,
+            suppressed: report,
+        }),
+        Err(error) => Err(Refusal::Failed {
+            stage: Stage::Ledger,
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The key of an invocation no broker entry matches: the real uid read from
+/// `sudo`'s own `status`, and the shared unknown uid only when that cannot
+/// be read.
+fn unmatched_ledger_key(uid: Option<u32>) -> LedgerKey {
+    LedgerKey {
+        uid: uid.unwrap_or(crate::decide::UNKNOWN_UID),
+        label: None,
+    }
+}
+
+/// The ledger key of a caller the gate has read live: its uid, and its harness
+/// label when the kernel attests one. A caller that is not attested is counted
+/// by uid alone.
+fn ledger_key_of(caller: &GateCaller) -> LedgerKey {
+    let label = match &caller.facts.classification {
+        xudo_policy::Classification::EnrolledAgent { agent_id, .. } => Some(agent_id.clone()),
+        _ => None,
+    };
+    LedgerKey {
+        uid: caller.facts.uid,
+        label,
+    }
+}
+
+/// Whether a refusal is left out of the audit trail on purpose: a refusal over
+/// the ceiling that is not the minute's one, and a ledger that could not be
+/// used. Both are what a caller can repeat without limit; the trail is the
+/// one shared resource every gate, a human's included, must still be able to
+/// write. The refusal is still the gate's exit and its line on standard error.
+fn left_off_the_trail(refusal: &Refusal) -> bool {
+    matches!(
+        refusal,
+        Refusal::RateCeiling {
+            suppressed: None,
+            ..
+        } | Refusal::Failed {
+            stage: Stage::Ledger,
+            ..
+        }
+    )
 }
 
 /// Turns a failure of one step into the refusal that names it.
@@ -486,6 +639,26 @@ struct Progress {
     /// Entries a remove-path walk already removed when its final audit
     /// record failed: the work is done, so the exit must not say "refused".
     removed_unrecorded: Option<usize>,
+    /// Whether this is the `-nopass` gate, by `argv[0]` or by the executed
+    /// file: either one counts, so neither can be used to dodge the ledger.
+    nopass: bool,
+    /// Who the ledger counts: set once the live caller is read. Until then the
+    /// invocation is counted under the unknown uid.
+    ledger_key: Option<LedgerKey>,
+    /// Where the invocation is in the ledger.
+    ledger: LedgerStep,
+}
+
+/// Whether this invocation has been counted in the ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LedgerStep {
+    /// Not yet.
+    #[default]
+    Uncounted,
+    /// Counted: the invocation is under the ceiling.
+    Counted,
+    /// The ledger refused it, or could not be used: never asked again.
+    Ended,
 }
 
 /// Runs the gate.
@@ -507,16 +680,31 @@ pub fn run(host: &mut dyn GateHost, args: &[OsString]) -> GateExit {
             status: crate::operate::operation_status(&report),
             message: crate::operate::operation_message(&report),
         },
-        Err(refusal) => finish_refusal(host, &refusal, &progress),
+        Err(refusal) => finish_refusal(host, &refusal, &mut progress),
     }
 }
 
 /// Writes the refusal and builds the exit line.
-fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &Progress) -> GateExit {
+fn finish_refusal(host: &mut dyn GateHost, refusal: &Refusal, progress: &mut Progress) -> GateExit {
+    // A refusal that ended the run before the count still counts, and counts
+    // first. Over the ceiling it is replaced by the ledger's own refusal. A
+    // ledger that cannot be used leaves the refusal as it was and leaves it
+    // out of the trail: with no count, a loop of calls would be a loop of
+    // appends.
+    let counted = count_nopass(&*host, progress).err();
+    let (refusal, recorded) = match &counted {
+        Some(over @ Refusal::RateCeiling { .. }) => (over, !left_off_the_trail(over)),
+        Some(_unusable) => (refusal, false),
+        None => (refusal, !left_off_the_trail(refusal)),
+    };
     // The authorization append and the refusal append are different calls.
     // Either one reporting damage is enough, and the sentence is the same,
     // so the operator sees it once.
-    let notice = record(host, refusal, progress).or(progress.audit_notice);
+    let notice = if recorded {
+        record(host, refusal, progress).or(progress.audit_notice)
+    } else {
+        progress.audit_notice
+    };
     let mut message = match progress.removed_unrecorded {
         Some(count) => format!(
             "xudo-gate: removed {count} entries; the audit record failed ({}, severity {})",
@@ -578,10 +766,19 @@ fn annotate(record: Record, extra: &[String]) -> Record {
 /// up. Opening the queue directory is a spool failure. A missing, unreadable,
 /// or non-matching record is [`RequestError::QueueNotClaimed`]: the request
 /// must not fall through and run as a normal human-path command.
-fn require_queued_claim(host: &dyn GateHost, entry: &PendingRequest) -> Result<(), Refusal> {
+fn require_queued_claim(
+    host: &dyn GateHost,
+    entry: &PendingRequest,
+    caller: &GateCaller,
+) -> Result<(), Refusal> {
     let Some(id) = entry.queue_id.as_deref() else {
         return Ok(());
     };
+    // The queue is the human's. A caller the gate could only read as
+    // unattested, or in other namespaces than the host's, never claims it.
+    if caller.attested_class != crate::request::AttestedClass::Human {
+        return Err(Refusal::Request(RequestError::QueueNeedsAttestedHuman));
+    }
     let queue = stage(Stage::Spool, host.open_queue())?;
     let name = queue_claim::queue_file_name(id);
     let held = match queue.read(&name) {
@@ -617,12 +814,15 @@ fn proceed(
     stage(Stage::CallerState, host.hygiene().reset_umask())?;
     stage(Stage::CallerState, host.hygiene().reset_cwd())?;
     stage(Stage::Privileges, host.hygiene().forbid_new_privileges())?;
-    let entry = accept_invocation(args)?;
+    let claimed = accept_invocation(args)?;
+    progress.nopass = claimed == GateMode::Nopass;
     progress
         .evidence
         .push(format!("gate_argv0={}", args_first_escaped(args)));
 
     let proc = stage(Stage::Procfs, host.open_proc())?;
+    // The mode is the executed file's, and `argv[0]` only has to agree.
+    let mode = mode_of_executed_file(&*host, &*proc, claimed, progress)?;
     let ancestors = stage(
         Stage::Lineage,
         lineage(&*proc, progress.gate_pid, LINEAGE_PROCESSES),
@@ -632,6 +832,7 @@ fn proceed(
         .push(format!("lineage={}", ancestors.describe()));
 
     let loaded = load_policy_or_refuse(host)?;
+    progress.evidence.extend(loaded.fault_evidence());
     let spool = stage(Stage::Spool, host.open_spool())?;
     let now = read_clock(host.clock())?;
 
@@ -640,9 +841,11 @@ fn proceed(
         .chain
         .first()
         .map_or(CallerPin::new(progress.gate_pid, 0), pin_of);
-    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or_default();
-    let caller = caller_for(
+    let pending_entry_missing = matched.is_none();
+    let passwd = loaded.passwd.as_str();
+    let (caller, live_uid) = caller_for(
         host,
+        &*proc,
         matched.as_ref(),
         own,
         &ancestors.chain,
@@ -651,22 +854,53 @@ fn proceed(
         passwd,
     );
     progress.caller = Some(caller.clone());
+    progress.evidence.extend(
+        requester_hints(
+            &*proc,
+            matched.as_ref().map(|found| found.caller),
+            &ancestors.chain,
+        )
+        .evidence(),
+    );
+    progress.ledger_key = Some(match (&pending_entry_missing, ancestors.chain.get(1)) {
+        // No entry: count by the real uid of `sudo`, the process that
+        // authenticates, so one flood cannot fill every stranger's bucket.
+        (true, Some(sudo)) => unmatched_ledger_key(crate::live::read(&*proc, sudo).uid),
+        _ => ledger_key_of(&caller),
+    });
     let pending = matched.map(|found| found.entry);
     progress.pending.clone_from(&pending);
 
-    // The matched entry's uid, which the broker stored at mint from the
-    // kernel's facts, picks whose freeze marker also applies. Root's global
-    // marker is already in the loaded settings. With no entry there is no uid,
-    // and `decide` refuses on the missing entry.
+    // The uid read from the live ancestor's own `status` picks whose freeze
+    // marker also applies, and must be the uid the broker minted the entry for.
+    // The entry's uid is a claim and is never used for a decision. Root's
+    // global marker is already in the loaded settings. With no entry there is
+    // no uid, and `decide` refuses on the missing entry.
     let mut settings = loaded.settings;
     if let Some(found) = &pending {
-        settings.frozen |= host.user_frozen(found.caller_uid);
+        let Some(live) = live_uid.filter(|live| *live == found.caller_uid) else {
+            return Err(Refusal::Request(RequestError::WrongCallerUid {
+                expected: found.caller_uid,
+                actual: live_uid,
+            }));
+        };
+        settings.frozen |= host.user_frozen(live);
+        // The live label, from the registry and the kernel's scope, picks the
+        // harness's own marker; the entry's label is a claim. Both modes read
+        // it: the engine freezes only an enrolled agent, so a human is unaffected.
+        if let xudo_policy::Classification::EnrolledAgent { agent_id, .. } =
+            &caller.facts.classification
+        {
+            settings.frozen |= host.harness_frozen(agent_id);
+        }
     }
     let context = GateContext {
         generation: loaded.rules.generation.id(),
         now: BoottimeMillis(now),
         settings,
-        password_confirms: entry.password_confirms(),
+        password_confirms: mode == GateMode::Auth,
+        mode,
+        caller_is_agent_account: is_agent_account(&loaded.rules.harnesses, passwd, live_uid),
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -678,7 +912,7 @@ fn proceed(
     };
     crate::decide::validate_pending_identity(&pending_entry, &caller, &context)?;
     // A typed operation never opens the marker program and never execs.
-    // The password name was already required by `accept_invocation`.
+    // On `-nopass` it runs only what the rule grants this live harness.
     if let Some(requested) = pending_entry.operation.as_ref() {
         return run_typed_operation(
             host,
@@ -691,9 +925,15 @@ fn proceed(
             progress,
         );
     }
-    let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)?;
-    progress.evidence.push(entry.confirmation().to_owned());
-    require_queued_claim(host, &pending_entry)?;
+    // Counted once: after the decision, before the entry is consumed.
+    let approved = decide(&loaded.rules.rules, &caller, Some(&pending_entry), context)
+        .and_then(|approved| count_nopass(&*host, progress).map(|()| approved))?;
+    progress.evidence.push(confirmation_text(mode).to_owned());
+    progress.evidence.push(format!(
+        "gate_mode={mode:?} via={}",
+        pending_entry.via.label()
+    ));
+    require_queued_claim(host, &pending_entry, &caller)?;
 
     // Consumed before anything runs: the entry is used at most once, and a
     // second gate that read it too fails here, on the unlink, and runs nothing.
@@ -755,7 +995,7 @@ fn run_typed_operation(
     spool: &dyn RequestSpool,
     progress: &mut Progress,
 ) -> Result<xudo_sys::RemoveReport, Refusal> {
-    let passwd = std::str::from_utf8(&loaded.passwd).unwrap_or("");
+    let passwd = loaded.passwd.as_str();
     let mut work = crate::operate::prepare_remove(
         &loaded.rules.rules,
         &caller.facts,
@@ -765,8 +1005,10 @@ fn run_typed_operation(
         requested.dry_run,
         context.settings,
         passwd,
-        context.password_confirms,
-    )?;
+        context.mode,
+    )
+    .and_then(|work| count_nopass(&*host, progress).map(|()| work))?;
+    // (Counted once, above: after the decision, before the entry is consumed.)
     progress.evidence.push(format!(
         "op=remove-path target={}",
         requested.target.escape_ascii()
@@ -781,6 +1023,7 @@ fn run_typed_operation(
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
     };
+    crate::operate::refuse_a_planned_escape(&planned)?;
     let intent = host
         .audit()
         .append(&|previous| crate::operate::intent_record(previous, caller, &work, &planned))
@@ -792,6 +1035,7 @@ fn run_typed_operation(
             }
         })?;
     work.intent_sequence = Some(intent.seq().get());
+    work.planned_digest = Some(planned.digest);
     let report = match host.remove_path(&work.request) {
         Ok(report) => report,
         Err(error) => return Err(crate::operate::walk_refusal(&error)),
@@ -857,6 +1101,22 @@ fn pin_of(process: &ProcRef) -> CallerPin {
     CallerPin::new(process.pid, process.starttime)
 }
 
+/// The hints of whoever asked: the requester the entry is pinned to, or
+/// `sudo`, the gate's parent, when no entry matched. Read by number and
+/// checked against the pin afterwards; recorded, never decided on
+/// (invariant 1).
+fn requester_hints(
+    proc: &dyn ProcSource,
+    matched: Option<CallerPin>,
+    chain: &[ProcRef],
+) -> CallerHints {
+    matched
+        .or_else(|| chain.get(1).map(pin_of))
+        .map_or_else(CallerHints::unavailable, |pin| {
+            pinned_hints(proc, pin.pid, pin.starttime)
+        })
+}
+
 /// A spool entry, and the process the walk matched it to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Matched {
@@ -871,20 +1131,24 @@ struct Matched {
     caller: CallerPin,
 }
 
-/// The caller `decide` judges the entry for. Any class comes from a fresh
-/// kernel cgroup read and ancestor recheck; the entry supplies only the uid
-/// against which the root record is checked.
+/// The caller `decide` judges the entry for, and the uid read from its live
+/// process. Any class comes from a fresh kernel cgroup read and ancestor
+/// recheck, and the uid from the ancestor's own `status`; the entry supplies
+/// neither. A caller or a gate in namespaces other than PID 1's is unattested,
+/// and the class is never stronger than the broker's.
+#[allow(clippy::too_many_arguments)]
 fn caller_for(
     host: &dyn GateHost,
+    proc: &dyn ProcSource,
     matched: Option<&Matched>,
     own: CallerPin,
     ancestors: &[ProcRef],
     now: u64,
     registry: &xudo_policy::HarnessRegistry,
     passwd: &str,
-) -> GateCaller {
+) -> (GateCaller, Option<u32>) {
     let Some(found) = matched else {
-        return GateCaller::unidentified(own.pid);
+        return (GateCaller::unidentified(own.pid), None);
     };
     let index = ancestors.iter().position(|ancestor| {
         ancestor.pid == found.caller.pid && ancestor.starttime == found.caller.starttime
@@ -893,39 +1157,53 @@ fn caller_for(
         .and_then(|at| at.checked_sub(1))
         .and_then(|at| ancestors.get(at))
         .map(|child| (child.pid, child.starttime));
-    let live = match (host.cgroups(), child) {
-        (Ok(cgroups), Some(child)) => crate::classify::classify_with_registry(
-            cgroups.as_ref(),
-            host.peers(),
-            host.syscalls(),
-            registry,
-            passwd,
-            crate::classify::AncestorPin {
-                caller: (found.caller.pid, found.caller.starttime),
-                uid: found.entry.caller_uid,
-                child,
-                now_boottime_ms: now,
-            },
-        ),
-        _ => crate::classify::LiveClass {
-            facts: CallerFacts::new(
-                Classification::Unattested {
-                    reason: "the gate could not recheck its caller's lineage".to_owned(),
+    let gate_clean = ancestors
+        .first()
+        .is_some_and(|gate| crate::live::read(proc, gate).namespaces_match_init);
+    let caller_facts = index
+        .and_then(|at| ancestors.get(at))
+        .map(|caller| crate::live::read(proc, caller));
+    let live_uid = caller_facts.and_then(|facts| facts.uid);
+    let live = match (host.cgroups(), child, live_uid, caller_facts) {
+        (Ok(cgroups), Some(child), Some(uid), Some(facts))
+            if gate_clean && facts.namespaces_match_init =>
+        {
+            let live = crate::classify::classify_with_registry(
+                cgroups.as_ref(),
+                host.peers(),
+                host.syscalls(),
+                registry,
+                passwd,
+                crate::classify::AncestorPin {
+                    caller: (found.caller.pid, found.caller.starttime),
+                    uid,
+                    child,
+                    now_boottime_ms: now,
                 },
-                found.entry.caller_uid,
-            ),
-            attested_class: crate::request::AttestedClass::Unattested,
-            scope_id: None,
-            boot_id: None,
-        },
+            );
+            if found.entry.effective_class(&live.attested_class) == live.attested_class {
+                // Agreement with the broker's record, or nothing.
+                live
+            } else {
+                crate::classify::LiveClass::unattested(
+                    uid,
+                    "the broker could not attest this caller, and the gate never upgrades it",
+                )
+            }
+        }
+        _ => crate::classify::LiveClass::unattested(
+            live_uid.unwrap_or(crate::decide::UNKNOWN_UID),
+            "the gate could not recheck its caller's lineage, uid, and namespaces",
+        ),
     };
-    GateCaller {
+    let caller = GateCaller {
         pin: found.caller,
         facts: live.facts,
         attested_class: live.attested_class,
         attested_scope_id: live.scope_id,
         boot_id: live.boot_id,
-    }
+    };
+    (caller, live_uid)
 }
 
 /// The spool entry pinned to one of the `ancestors`, if exactly one is, and
@@ -1157,13 +1435,43 @@ args = [
     /// The gate under sudo with `use_pty`, under xudo, under a shell:
     /// 500 gate, 400 sudo monitor, 300 sudo, 200 xudo, 100 bash, 1 init.
     fn proc_tree() -> MapSource {
-        MapSource::new()
+        let source = MapSource::new()
             .with("500/stat", stat(500, "xudo-gate-auth", 400, 9_000))
             .with("400/stat", stat(400, "sudo", 300, 8_500))
             .with("300/stat", stat(300, "sudo", 200, 8_000))
             .with("200/stat", stat(200, "xudo", 100, XUDO_START))
             .with("100/stat", stat(100, "bash", 1, 5_000))
-            .with("1/stat", stat(1, "systemd", 0, 1))
+            .with("1/stat", stat(1, "systemd", 0, 1));
+        // Every process in PID 1's namespaces, as an ordinary host has it; the
+        // gate (500) as root, the rest as the user the entries are for.
+        [500_u32, 400, 300, 200, 100, 1]
+            .into_iter()
+            .fold(source, |source, pid| {
+                let uid = if (300..=500).contains(&pid) || pid == 1 {
+                    0
+                } else {
+                    1000
+                };
+                in_init_namespaces(source, pid, uid)
+            })
+    }
+
+    /// `pid`'s status, `uid_map` and namespace links, all as PID 1's.
+    fn in_init_namespaces(source: MapSource, pid: u32, uid: u32) -> MapSource {
+        ["user", "pid", "cgroup", "mnt"].iter().enumerate().fold(
+            source
+                .with(
+                    format!("{pid}/status"),
+                    format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nNSpid:\t{pid}\n"),
+                )
+                .with(format!("{pid}/uid_map"), "0 0 4294967295\n"),
+            |source, (at, kind)| {
+                let inode = 4_026_531_800 + u64::try_from(at).unwrap();
+                source
+                    .with_inode(format!("{pid}/ns/{kind}"), inode)
+                    .with_inode(format!("1/ns/{kind}"), inode)
+            },
+        )
     }
 
     fn entry(nonce: &str, pid: u32, starttime: u64, argv: &[&str]) -> PendingRequest {
@@ -1192,6 +1500,7 @@ args = [
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -1268,6 +1577,8 @@ args = [
         Host,
         Agent,
         MissingAgentFacts,
+        /// A caller outside `xudo.slice`, in an ordinary login session.
+        Human,
         Unavailable,
     }
 
@@ -1283,6 +1594,7 @@ args = [
         /// The root-owned queue, separate from the request spool.
         queue: Result<Rc<FakeSpool>, SpoolError>,
         rival: bool,
+        gate_files: xudo_sys::FakeGateFiles,
         programs: FakePrograms,
         audit: FakeAuditSink,
         proc_opened: Cell<bool>,
@@ -1291,10 +1603,46 @@ args = [
         user_freezes: Vec<u32>,
         /// The uids the gate asked about.
         freeze_asked: std::cell::RefCell<Vec<u32>>,
+        /// The harness labels whose own freeze marker stands.
+        harness_freezes: Vec<String>,
+        /// The labels the gate asked about.
+        harness_freeze_asked: std::cell::RefCell<Vec<String>>,
         /// The in-memory tree a remove-path walks.
         remove: xudo_sys::FakeRemoveFs,
         /// Make the fake unlink seam assert that a durable intent exists.
         assert_intent_before_unlink: bool,
+        /// Add an entry under `cache` just before the real walk, after the dry run.
+        grow_before_walk: bool,
+        /// The `-nopass` ledger.
+        rate: FakeRate,
+    }
+
+    /// The real ledger logic on an in-memory directory, remembering whom it
+    /// was asked to count.
+    struct FakeRate {
+        dir: FakeSpool,
+        failing: Option<xudo_sys::RateError>,
+        keys: std::cell::RefCell<Vec<LedgerKey>>,
+    }
+
+    impl FakeRate {
+        fn new() -> Self {
+            Self {
+                dir: FakeSpool::new(),
+                failing: None,
+                keys: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RateLedger for FakeRate {
+        fn admit(&self, key: &LedgerKey, now_ms: u64) -> Result<Admission, xudo_sys::RateError> {
+            self.keys.borrow_mut().push(key.clone());
+            match &self.failing {
+                Some(error) => Err(error.clone()),
+                None => xudo_sys::rate::admit(&self.dir, key, now_ms, &std::mem::drop),
+            }
+        }
     }
 
     #[test]
@@ -1339,6 +1687,53 @@ args = [
 
     struct AgentCgroup {
         missing_facts: bool,
+    }
+
+    /// A cgroup tree in which every process is in a login session.
+    struct HumanCgroup;
+
+    impl CgroupCalls for HumanCgroup {
+        fn require_cgroup2(&self) -> Result<(), SysError> {
+            Ok(())
+        }
+        fn pidfd_cgroup_id(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn proc_cgroup(&self, _pid: u32) -> Result<Vec<u8>, SysError> {
+            Ok(b"0::/user.slice/session-1.scope\n".to_vec())
+        }
+        fn cgroup_inode(&self, _path: &str) -> Result<u64, SysError> {
+            Ok(90)
+        }
+        fn peer_alive(&self, _pidfd: std::os::fd::BorrowedFd<'_>) -> Result<bool, SysError> {
+            Ok(true)
+        }
+        fn scope_facts(
+            &self,
+            _name: &str,
+            _id: u64,
+            _with_processes: bool,
+        ) -> Result<Option<ScopeFacts>, SysError> {
+            Ok(None)
+        }
+        fn scope_names(&self) -> Result<Vec<String>, SysError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_human_cgroup_double_answers_every_read() {
+        use std::os::fd::AsFd as _;
+
+        let fd = std::os::unix::net::UnixStream::pair().unwrap().0;
+        let seam = HumanCgroup;
+        assert!(seam.require_cgroup2().is_ok());
+        assert_eq!(seam.pidfd_cgroup_id(fd.as_fd()).unwrap(), 90);
+        assert!(seam.proc_cgroup(1).is_ok());
+        assert_eq!(seam.cgroup_inode("x").unwrap(), 90);
+        assert!(seam.peer_alive(fd.as_fd()).unwrap());
+        assert!(seam.scope_facts("x", 90, false).unwrap().is_none());
+        assert!(seam.scope_names().unwrap().is_empty());
     }
 
     impl CgroupCalls for AgentCgroup {
@@ -1417,6 +1812,12 @@ args = [
     }
 
     impl FakeHost {
+        /// The registered account is the caller's own uid, as for a live agent.
+        fn agent_has_the_callers_uid(&mut self) {
+            let policy = self.policy.as_mut().unwrap();
+            policy.passwd = "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned();
+        }
+
         fn new(spool: &Rc<FakeSpool>) -> Self {
             let (path, owner) = program_file("tool", b"the program that would run as root");
             Self {
@@ -1430,19 +1831,25 @@ args = [
                     rules: rules(),
                     settings: engine::Settings::default(),
                     queue_ttl_secs: 24 * 60 * 60,
-                    passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
+                    passwd: "agent:x:2000:2000:agent:/home/agent:/bin/sh\n".to_owned(),
+                    passwd_fault: None,
                 }),
                 spool: Ok(Rc::clone(spool)),
                 queue: Ok(Rc::new(FakeSpool::new())),
                 rival: false,
+                gate_files: xudo_sys::FakeGateFiles::running_as(GateMode::Auth),
                 programs: FakePrograms::serving(path, owner),
                 audit: FakeAuditSink::new(),
                 proc_opened: Cell::new(false),
                 spool_opened: Cell::new(false),
                 user_freezes: Vec::new(),
                 freeze_asked: std::cell::RefCell::new(Vec::new()),
+                harness_freezes: Vec::new(),
+                harness_freeze_asked: std::cell::RefCell::new(Vec::new()),
                 remove: xudo_sys::FakeRemoveFs::new(),
                 assert_intent_before_unlink: false,
+                grow_before_walk: false,
+                rate: FakeRate::new(),
             }
         }
     }
@@ -1469,6 +1876,7 @@ args = [
                         missing_facts: true,
                     }));
                 }
+                FakeCgroupMode::Human => return Ok(Box::new(HumanCgroup)),
                 FakeCgroupMode::Host => {}
             }
             boxed_cgroups(xudo_sys::HostCgroup::open())
@@ -1492,6 +1900,12 @@ args = [
             self.freeze_asked.borrow_mut().push(uid);
             self.user_freezes.contains(&uid)
         }
+        fn harness_frozen(&self, label: &str) -> bool {
+            self.harness_freeze_asked
+                .borrow_mut()
+                .push(label.to_owned());
+            self.harness_freezes.iter().any(|frozen| frozen == label)
+        }
         fn open_spool(&self) -> Result<Box<dyn RequestSpool>, SpoolError> {
             self.spool_opened.set(true);
             self.spool.clone().map(|spool| {
@@ -1506,8 +1920,14 @@ args = [
                 .clone()
                 .map(|spool| Box::new(SharedQueue { spool }) as Box<dyn QueueClaim>)
         }
+        fn gate_files(&self) -> &dyn GateFiles {
+            &self.gate_files
+        }
         fn programs(&self) -> &dyn Programs {
             &self.programs
+        }
+        fn rate(&self) -> &dyn RateLedger {
+            &self.rate
         }
         fn audit(&mut self) -> &mut dyn AuditSink {
             &mut self.audit
@@ -1524,8 +1944,34 @@ args = [
                         .any(|record| { has_line(&record.evidence, "op=remove-path-intent") })
                 );
             }
+            if self.grow_before_walk && !request.dry_run {
+                self.remove.add(
+                    &[b"srv", b"app", b"build", b"cache"],
+                    b"late",
+                    xudo_sys::remove::NodeKind::File,
+                    1000,
+                    0o644,
+                    1,
+                );
+            }
             xudo_sys::remove_path(&mut self.remove, request)
         }
+    }
+
+    /// Makes the gate read this entry's caller as a human: the entry says
+    /// `Human`, the pinned ancestors are scripted, and no cgroup is the slice.
+    fn human_caller(host: &mut FakeHost, entry: &mut PendingRequest) {
+        entry.attested_class = crate::request::AttestedClass::Human;
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(host);
+    }
+
+    /// The scripted reads one gate run consumes; script again before each run.
+    fn script_human(host: &mut FakeHost) {
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
     }
 
     fn auth() -> Vec<OsString> {
@@ -1564,8 +2010,11 @@ args = [
         let id = "c".repeat(64);
         let mut entry = ours();
         entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
         let spool = Rc::new(holding(&[(NONCE_A, entry)]));
-        let mut host = FakeHost::new(&spool);
+        host.spool = Ok(Rc::clone(&spool));
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1574,6 +2023,7 @@ args = [
             format!(r#"{{"state":"pending","run_nonce":"{NONCE_A}"}}"#),
         )));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1582,6 +2032,7 @@ args = [
             format!(r#"{{"state":"claimed","run_nonce":"{NONCE_B}"}}"#),
         )));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1589,6 +2040,7 @@ args = [
             FakeSpool::new().with_file(format!("{id}.json"), b"no".to_vec()),
         ));
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_queue_not_claimed");
 
@@ -1596,6 +2048,7 @@ args = [
             at: "queue".to_owned(),
         });
         host.audit = FakeAuditSink::new();
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "gate_failed_spool");
     }
@@ -1605,12 +2058,15 @@ args = [
         let id = "c".repeat(64);
         let mut entry = ours();
         entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
         let spool = Rc::new(holding(&[(NONCE_A, entry)]));
-        let mut host = FakeHost::new(&spool);
+        host.spool = Ok(Rc::clone(&spool));
         host.queue = Ok(Rc::new(FakeSpool::new().with_file(
             format!("{id}.json"),
             format!(r#"{{"state":"claimed","run_nonce":"{NONCE_A}","argv":[]}}"#),
         )));
+        script_human(&mut host);
         let exit = run(&mut host, &auth());
         assert_eq!(exit.status, 19);
         assert!(
@@ -1691,12 +2147,112 @@ args = [
         );
         assert!(has_line(evidence, "confirmation=password"), "{evidence:?}");
         assert!(
+            has_line(evidence, "gate_mode=Auth via=auth"),
+            "{evidence:?}"
+        );
+        assert!(
             has_line(evidence, "gate_argv0=/usr/libexec"),
             "{evidence:?}"
         );
         assert_eq!(records[1].outcome.kind(), "failed");
         let after = &records[1].evidence;
         assert!(has_line(after, "authorization_seq=1"), "{after:?}");
+    }
+
+    #[test]
+    fn the_gate_records_the_requesters_hints_and_decides_as_without_them() {
+        let outcome = |proc: MapSource| {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc);
+            let exit = run(&mut host, &auth());
+            let records = host.audit.records();
+            let decisions: Vec<_> = records.iter().map(|r| r.decision).collect();
+            (
+                exit.status,
+                exit.message,
+                decisions,
+                records[0].evidence.clone(),
+            )
+        };
+        let (status, message, decisions, plain) = outcome(proc_tree());
+        assert!(has_line(&plain, "hint_exe=unavailable"), "{plain:?}");
+        // The requester (200) looks like a harness in every way it can choose.
+        let posing = proc_tree()
+            .with_link("200/exe", "/usr/bin/claude")
+            .with("200/cmdline", "claude\0--dangerously-skip-permissions\0")
+            .with("200/environ", "CLAUDECODE=1\0AI_AGENT=claude\0");
+        let (status2, message2, decisions2, hinted) = outcome(posing);
+        assert_eq!(
+            (status2, message2, decisions2),
+            (status, message, decisions)
+        );
+        for line in [
+            "hint_exe=\"/usr/bin/claude\"",
+            "hint_cmdline=argv0:\"claude\" argc:2 len:38",
+            "hint_claudecode=set:\"1\"",
+        ] {
+            assert!(hinted.contains(&line.to_owned()), "{line} in {hinted:?}");
+        }
+        let all = hinted.join(" ");
+        assert!(!all.contains("AI_AGENT"), "{all}");
+        assert!(!all.contains("dangerously"), "{all}");
+    }
+
+    #[test]
+    fn a_requesters_largest_hints_cannot_swell_the_gate_record_toward_the_limit() {
+        // Every byte the worst kind, far past every cap, on the requester the
+        // entry is pinned to: the hints add under 8 KiB to the record.
+        let size = |proc: MapSource| {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc);
+            let _ = run(&mut host, &auth());
+            let records = host.audit.records();
+            assert!(has_line(&records[0].evidence, "nonce="), "{records:?}");
+            records[0].to_jsonl().len()
+        };
+        let junk = vec![0xff_u8; 1 << 20];
+        let mut environ = b"CLAUDECODE=".to_vec();
+        environ.extend(&junk);
+        let plain = size(proc_tree());
+        let hostile = size(
+            proc_tree()
+                .with_link("200/exe", junk.clone())
+                .with("200/cmdline", junk.clone())
+                .with("200/environ", environ),
+        );
+        assert!(hostile > plain + 4096, "{plain} -> {hostile}");
+        assert!(hostile - plain < 8 * 1024, "{plain} -> {hostile}");
+        assert!(hostile < xudo_audit::MAX_RECORD_BYTES);
+    }
+
+    #[test]
+    fn the_gate_reads_hints_of_the_entrys_requester_else_of_sudo_else_none() {
+        let tree = proc_tree()
+            .with_link("200/exe", "/usr/bin/xudo")
+            .with_link("400/exe", "/usr/bin/sudo");
+        let chain = lineage(&tree, 500, LINEAGE_PROCESSES).unwrap().chain;
+        let exe_of = |hints: CallerHints| hints.evidence()[0].clone();
+        let requester = Some(CallerPin::new(200, XUDO_START));
+        assert_eq!(
+            exe_of(requester_hints(&tree, requester, &chain)),
+            "hint_exe=\"/usr/bin/xudo\""
+        );
+        assert_eq!(
+            exe_of(requester_hints(&tree, None, &chain)),
+            "hint_exe=\"/usr/bin/sudo\""
+        );
+        assert_eq!(
+            requester_hints(&tree, None, &chain[..1]),
+            CallerHints::unavailable()
+        );
+        // A pin whose start time is no longer the process's: someone else's.
+        let recycled = Some(CallerPin::new(200, XUDO_START + 1));
+        assert_eq!(
+            requester_hints(&tree, recycled, &chain),
+            CallerHints::unavailable()
+        );
     }
 
     #[test]
@@ -1773,10 +2329,30 @@ args = [
     fn system_host_constructs_its_peer_and_cgroup_adapters() {
         let host = SystemHost::new();
         let _peers = host.peers();
+        // The real ledger answers or refuses; it never needs a lane here.
+        let _ledger = host.rate().admit(
+            &LedgerKey {
+                uid: 1,
+                label: None,
+            },
+            1,
+        );
         #[cfg(target_os = "linux")]
         assert!(host.cgroups().is_ok());
         #[cfg(not(target_os = "linux"))]
         assert!(host.cgroups().is_err());
+        // No test host has the gate installed as the executed file.
+        assert!(
+            host.gate_files()
+                .executing(&xudo_sys::MapSource::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_record_says_how_each_gate_file_confirmed() {
+        assert!(confirmation_text(GateMode::Auth).starts_with("confirmation=password"));
+        assert!(confirmation_text(GateMode::Nopass).starts_with("confirmation=none"));
     }
 
     #[test]
@@ -1789,6 +2365,7 @@ args = [
         let spool = Rc::new(holding(&[(NONCE_A, agent)]));
         let mut host = FakeHost::new(&spool);
         host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
         host.peers = agent_parent_peers();
         host.syscalls = FakeSyscalls::new()
             .with_cloexec(Ok(()))
@@ -1818,6 +2395,177 @@ args = [
         let mut host = FakeHost::new(&empty);
         let _ = run(&mut host, &auth());
         assert!(host.freeze_asked.borrow().is_empty());
+    }
+
+    /// A queued, claimed run by a caller the broker called `stored`, in a
+    /// proc tree that `tree` has altered, and what the gate did with it.
+    fn queued_run(
+        stored: crate::request::AttestedClass,
+        tree: impl FnOnce(MapSource) -> MapSource,
+    ) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        queued_run_in(stored, FakeCgroupMode::Human, tree)
+    }
+
+    /// [`queued_run`] with the gate's own cgroup read set to `mode`.
+    fn queued_run_in(
+        stored: crate::request::AttestedClass,
+        mode: FakeCgroupMode,
+        tree: impl FnOnce(MapSource) -> MapSource,
+    ) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        let id = "c".repeat(64);
+        let mut entry = ours();
+        entry.queue_id = Some(id.clone());
+        let mut host = FakeHost::new(&Rc::new(FakeSpool::new()));
+        human_caller(&mut host, &mut entry);
+        entry.attested_class = stored;
+        host.cgroup_mode = mode;
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        host.spool = Ok(Rc::clone(&spool));
+        host.proc = Ok(tree(proc_tree()));
+        host.queue = Ok(Rc::new(FakeSpool::new().with_file(
+            format!("{id}.json"),
+            format!(r#"{{"state":"claimed","run_nonce":"{NONCE_A}","argv":[]}}"#),
+        )));
+        let exit = run(&mut host, &auth());
+        (host, spool, exit)
+    }
+
+    /// The same run, with the caller's `ns/<kind>` (or the gate's) altered.
+    fn queued_run_with_namespace(pid: u32, kind: &str) -> (FakeHost, Rc<FakeSpool>, GateExit) {
+        queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with_inode(format!("{pid}/ns/{kind}"), 4_026_539_999)
+        })
+    }
+
+    #[test]
+    fn a_clean_queued_human_run_is_the_baseline_the_namespace_tests_differ_from() {
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| tree);
+        assert!(
+            exit.message.contains("gate_failed_exec"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert_eq!(exec_calls(&host), 1);
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_user_namespace() {
+        let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "user");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_mount_namespace() {
+        let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, "mnt");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+    }
+
+    #[test]
+    fn the_gate_refuses_an_ancestor_in_another_pid_or_cgroup_namespace() {
+        for kind in ["pid", "cgroup"] {
+            let (host, spool, exit) = queued_run_with_namespace(XUDO_PID, kind);
+            assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_when_it_is_itself_in_another_mount_namespace() {
+        // sudo runs the gate in its caller's mount namespace, so a caller that
+        // unshared one reaches the gate in it.
+        let (host, spool, exit) = queued_run_with_namespace(GATE_PID, "mnt");
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+    }
+
+    #[test]
+    fn an_ancestor_with_a_nested_pid_or_mapped_uid_namespace_is_unattested() {
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with(
+                "200/status",
+                "Uid:\t1000\t1000\t1000\t1000\nNSpid:\t200\t1\n",
+            )
+        });
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+        let (host, spool, exit) = queued_run(crate::request::AttestedClass::Human, |tree| {
+            tree.with("200/uid_map", "0 100000 65536\n")
+        });
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+    }
+
+    #[test]
+    fn the_gate_reads_the_uid_from_the_live_ancestor() {
+        // The marker consulted is the live process's uid, which here is also
+        // the entry's. Nothing the entry says is asked about on its own.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.proc =
+            Ok(proc_tree().with("200/status", "Uid:\t1001\t1001\t1001\t1001\nNSpid:\t200\n"));
+        let exit = run(&mut host, &auth());
+        // The live uid is 1001, the entry says 1000: nothing it says is used.
+        assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+        assert!(host.freeze_asked.borrow().is_empty());
+        assert!(exit.message.contains("request_wrong_caller_uid"));
+
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        let _ = run(&mut host, &auth());
+        assert_eq!(*host.freeze_asked.borrow(), [1000]);
+    }
+
+    #[test]
+    fn a_spool_uid_that_differs_from_the_live_one_is_refused() {
+        // An entry that claims another uid, including the one whose marker is
+        // absent or whose registry entry would grant something.
+        for claimed in [0, 1001, 4_294_967_294] {
+            let mut forged = ours();
+            forged.caller_uid = claimed;
+            let spool = Rc::new(holding(&[(NONCE_A, forged)]));
+            let mut host = FakeHost::new(&spool);
+            let exit = run(&mut host, &auth());
+            assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+            assert!(host.freeze_asked.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_ancestor_whose_uid_cannot_be_read_is_refused_not_trusted_from_the_entry() {
+        for status in ["Uid:\tx\t1000\t1000\t1000\nNSpid:\t200\n", "NSpid:\t200\n"] {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc_tree().with("200/status", status));
+            let exit = run(&mut host, &auth());
+            assert_refused_with(&host, &spool, &exit, "request_wrong_caller_uid");
+        }
+    }
+
+    #[test]
+    fn a_stored_unattested_entry_is_never_human_at_the_gate() {
+        // The gate reads this caller as a human; the broker could not attest
+        // it. The gate does not upgrade it: no queue claim, and the audit
+        // record says unattested.
+        let (host, spool, exit) =
+            queued_run(crate::request::AttestedClass::Unattested, |tree| tree);
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
+
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let _ = run(&mut host, &auth());
+        assert_eq!(host.audit.records()[0].classification, "unattested");
+    }
+
+    #[test]
+    fn a_live_unattested_read_downgrades_a_human_entry() {
+        // Stored human, queue record claimed; the gate's own cgroup read
+        // fails. The effective class is the weaker one, so the queue stays
+        // closed to this run although its record would hold.
+        let (host, spool, exit) = queued_run_in(
+            crate::request::AttestedClass::Human,
+            FakeCgroupMode::Unavailable,
+            |tree| tree,
+        );
+        assert_refused_with(&host, &spool, &exit, "request_queue_needs_attested_human");
     }
 
     #[test]
@@ -1910,8 +2658,9 @@ args = [
         };
         let spool = Rc::new(holding(&[]));
         let host = FakeHost::new(&spool);
-        let caller = caller_for(
+        let (caller, _) = caller_for(
             &host,
+            &MapSource::new(),
             Some(&found),
             CallerPin::new(500, 9_000),
             &[],
@@ -1924,6 +2673,8 @@ args = [
             now: BoottimeMillis(100),
             settings: engine::Settings::default(),
             password_confirms: true,
+            mode: GateMode::Auth,
+            caller_is_agent_account: false,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -2018,7 +2769,8 @@ all = [{ any-arg = ["restart"] }]
             rules: changed,
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
-            passwd: Vec::new(),
+            passwd: String::new(),
+            passwd_fault: None,
         });
         let exit = run(&mut host, &auth());
         assert_refused_with(&host, &spool, &exit, "request_stale_generation");
@@ -2189,6 +2941,29 @@ all = [{ any-arg = ["restart"] }]
         );
         // Not authorized: nothing was recorded as allowed.
         assert_eq!(host.audit.records()[0].decision, AuditDecision::Denied);
+    }
+
+    #[test]
+    fn a_registry_fault_is_in_the_evidence_of_every_gate_record() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.rival = true;
+        let mut loaded = host.policy.clone().unwrap();
+        loaded.rules.registry_fault = Some("harnesses.d is writable".to_owned());
+        loaded.passwd_fault = Some("1 unusable and 0 non-UTF-8 line(s)".to_owned());
+        host.policy = Ok(loaded);
+        let _ = run(&mut host, &auth());
+        let evidence = &host.audit.records()[0].evidence;
+        assert!(
+            evidence.contains(&"registry_fault=harnesses.d is writable".to_owned()),
+            "{evidence:?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.starts_with("passwd_fault=1 unusable")),
+            "{evidence:?}"
+        );
     }
 
     #[test]
@@ -2392,6 +3167,24 @@ all = [{ any-arg = ["restart"] }]
         request.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
         request.attested_harness = Some("codex".to_owned());
         refused_for_class(request);
+    }
+
+    #[test]
+    fn an_agent_account_process_outside_its_scope_is_refused_on_the_auth_gate() {
+        // A crontab or ssh login of the agent account reads as a human, and
+        // may have passed PAM; its uid is the registry's account.
+        let mut request = ours();
+        request.attested_class = crate::request::AttestedClass::Human;
+        let spool = Rc::new(holding(&[(NONCE_A, request)]));
+        let mut host = FakeHost::new(&spool);
+        host.agent_has_the_callers_uid();
+        let exit = run(&mut host, &auth());
+        assert!(
+            exit.message.contains("gate_mode_agent_without_approval"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(exec_calls(&host), 0);
     }
 
     #[test]
@@ -2843,7 +3636,6 @@ all = [{ any-arg = ["restart"] }]
     fn an_unexpected_argv0_is_refused() {
         for name in [
             &b"xudo-gate"[..],
-            b"xudo-gate-nopass",
             b"/usr/libexec/xudo/xudo-gate",
             b"sh",
             b"",
@@ -2871,11 +3663,17 @@ all = [{ any-arg = ["restart"] }]
         ] {
             assert_eq!(
                 accept_invocation(&[OsString::from(name)]).unwrap(),
-                Entry::Auth,
+                GateMode::Auth,
                 "{name}"
             );
         }
-        assert!(Entry::Auth.password_confirms());
+        for name in ["xudo-gate-nopass", "/usr/libexec/xudo/xudo-gate-nopass"] {
+            assert_eq!(
+                accept_invocation(&[OsString::from(name)]).unwrap(),
+                GateMode::Nopass,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2951,6 +3749,7 @@ all = [{ any-arg = ["restart"] }]
         // Whatever this host holds at the marker, the answer is a bool and
         // never a panic: unreadable counts as frozen.
         let _ = host.user_frozen(u32::MAX);
+        let _ = host.harness_frozen("no-such-harness");
         assert!(host.open_spool().is_err());
         assert!(host.open_queue().is_err());
         assert!(
@@ -3058,7 +3857,8 @@ max-entries = 10
             .unwrap(),
             settings: engine::Settings::default(),
             queue_ttl_secs: 24 * 60 * 60,
-            passwd: b"agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_vec(),
+            passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+            passwd_fault: None,
         }
     }
 
@@ -3135,6 +3935,78 @@ max-entries = 10
     }
 
     #[test]
+    fn denies_a_password_remove_path_through_a_planted_link_or_mount() {
+        // Attack: on the password path too, a link or bind mount planted in
+        // the tree must not let the walk reach outside it. The human typed a
+        // password for a name under the tree, not for what a link points at.
+        use xudo_sys::remove::NodeKind;
+        for (target, reason) in [
+            (
+                &b"/srv/app/build/hop/v"[..],
+                "detail=a directory on the way to the target is a symbolic link",
+            ),
+            (
+                b"/srv/app/build/mnt/v",
+                "detail=the walk would cross a mount",
+            ),
+        ] {
+            let spool = Rc::new(holding(&[(
+                NONCE_A,
+                remove_entry(REMOVE_RULE, target, false),
+            )]));
+            let mut host = FakeHost::new(&spool);
+            host.policy = Ok(remove_policy(REMOVE_RULE));
+            plant_tree(&mut host);
+            let fs = &mut host.remove;
+            fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+            fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"hop",
+                NodeKind::Symlink,
+                1000,
+                0o777,
+                7,
+            );
+            let mnt = fs.add(
+                &[b"srv", b"app", b"build"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"mnt"],
+                b"v",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            fs.set_device(mnt, 9);
+            let exit = run(&mut host, &auth());
+            assert_eq!(exit.status, 19, "{exit:?}");
+            assert!(
+                exit.message.contains("gate_walk_escape, severity high"),
+                "{exit:?}"
+            );
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"victim", b"v"]));
+            assert!(
+                host.remove
+                    .exists(&[b"srv", b"app", b"build", b"mnt", b"v"])
+            );
+            assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+            assert_eq!(exec_calls(&host), 0);
+            let record = &host.audit.records()[0];
+            assert_eq!(record.decision, AuditDecision::Denied);
+            assert!(has_line(&record.evidence, "severity=high"), "{record:?}");
+            assert!(has_line(&record.evidence, reason), "{record:?}");
+        }
+    }
+
+    #[test]
     fn a_password_gate_removes_a_path_and_does_not_exec() {
         let spool = Rc::new(holding(&[(
             NONCE_A,
@@ -3153,11 +4025,68 @@ max-entries = 10
         assert_eq!(records.len(), 2);
         assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
         assert!(has_line(&records[0].evidence, "planned_count=1"));
+        // The plan and the walk saw the same names: the two digests agree.
+        let planned_digest = records[0]
+            .evidence
+            .iter()
+            .find_map(|line| line.strip_prefix("planned_sha256="))
+            .unwrap();
+        assert_eq!(planned_digest.len(), 64);
+        assert!(has_line(
+            &records[1].evidence,
+            &format!("paths_sha256={planned_digest}")
+        ));
         assert_eq!(records[1].decision, AuditDecision::Allowed);
         assert!(has_line(&records[1].evidence, "op=remove-path"));
+        assert!(has_line(
+            &records[1].evidence,
+            &format!("planned_digest={planned_digest}")
+        ));
+        assert!(has_line(&records[1].evidence, "matches_plan=true"));
         assert!(has_line(&records[1].evidence, "intent_seq=1"));
         assert!(has_line(&records[1].evidence, "severity=normal"));
         assert_eq!(records[1].outcome.kind(), "exited");
+    }
+
+    #[test]
+    fn a_tree_that_gains_an_entry_after_the_dry_run_is_recorded_as_off_plan() {
+        // Attack: the harness owns the target and adds entries between the
+        // gate's dry run and its walk, so the intent understates the removal.
+        use xudo_sys::remove::NodeKind;
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        host.remove.add(&[], b"srv", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv"], b"app", NodeKind::Dir, 0, 0o755, 0);
+        host.remove
+            .add(&[b"srv", b"app"], b"build", NodeKind::Dir, 0, 0o755, 0);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"cache",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        host.remove.add(
+            &[b"srv", b"app", b"build", b"cache"],
+            b"early",
+            NodeKind::File,
+            1000,
+            0o644,
+            1,
+        );
+        host.grow_before_walk = true;
+        let exit = run(&mut host, &auth());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        let records = host.audit.records();
+        assert!(has_line(&records[0].evidence, "planned_count=2"));
+        assert!(has_line(&records[1].evidence, "count=3"));
+        assert!(has_line(&records[1].evidence, "matches_plan=false"));
     }
 
     #[test]
@@ -3340,5 +4269,1177 @@ max-entries = 10
         let records = host.audit.records();
         assert_eq!(records.len(), 1);
         assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+    }
+
+    // ---- the gate's mode comes from the executed file ---------------------
+
+    fn nopass() -> Vec<OsString> {
+        vec![OsString::from("/usr/libexec/xudo/xudo-gate-nopass")]
+    }
+
+    /// A host whose spool holds one entry and whose executed file is `file`.
+    fn host_running(
+        file: xudo_sys::FakeGateFiles,
+        entry: PendingRequest,
+    ) -> (FakeHost, Rc<FakeSpool>) {
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = file;
+        (host, spool)
+    }
+
+    #[test]
+    fn the_mode_comes_from_the_executed_file_not_argv0() {
+        // The file is the `-nopass` gate and the caller named it `-auth`: a
+        // name the caller chose does not select the mode.
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+        assert!(exit.message.contains("severity high"));
+        // Refused before the ruleset, the spool or the lineage were read.
+        assert!(!host.spool_opened.get());
+    }
+
+    #[test]
+    fn argv0_and_the_executed_file_disagreeing_is_refused() {
+        // The other direction: a password-less name over the `-auth` file.
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Auth), ours());
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+        let detail = &host.audit.records()[0].evidence;
+        assert!(
+            has_line(detail, "detail=argv[0] names one gate file"),
+            "{detail:?}"
+        );
+    }
+
+    #[test]
+    fn a_hardlinked_or_replaced_gate_file_is_refused() {
+        for error in [
+            xudo_sys::GateFilesError::HardLinked {
+                at: "/usr/libexec/xudo/xudo-gate-auth".to_owned(),
+                nlink: 2,
+            },
+            xudo_sys::GateFilesError::NotAGateFile,
+        ] {
+            for name in [auth(), nopass()] {
+                let (mut host, spool) =
+                    host_running(xudo_sys::FakeGateFiles::refusing(error.clone()), ours());
+                let exit = run(&mut host, &name);
+                assert_refused_with(&host, &spool, &exit, "gate_failed_invocation");
+                assert!(!host.spool_opened.get());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_nopass_invocation_with_no_entry_does_nothing() {
+        // A hostile user starts the file with nothing minted for them.
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Nopass);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_no_pending_request");
+        assert!(exit.message.contains("severity high"));
+    }
+
+    #[test]
+    fn nopass_refuses_an_auth_entry_the_broker_minted_today() {
+        // The broker writes only `auth`, so under `-nopass` every real entry
+        // is refused, and none is consumed.
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+    }
+
+    #[test]
+    fn nopass_refuses_when_the_caller_left_its_scope() {
+        // A harness entry for a stored scope whose caller now reads as a human.
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_an_enrolled_agent");
+    }
+
+    #[test]
+    fn nopass_refuses_a_live_enrolled_agent_no_rule_grants() {
+        // Every fact about the caller holds, and no rule grants it.
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+    }
+
+    // ---- the generation binds the registry ---------------------------------
+
+    /// `codex` as `rules()` registers it, so the scope record still matches.
+    const CODEX_ENTRY: &[u8] = b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    const GRANT_RULE: &str = r#"
+[[action]]
+id = "xudo.svc.status"
+tier = "diag-read"
+exe = "/usr/bin/systemctl"
+harness = ["codex"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs"
+args = [
+  { name = "verb", matcher = { literal = "status" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+    /// [`RULES`] and a rule granting `codex`, over these registry files.
+    fn granting_rules(harnesses: &[(&[u8], &[u8])]) -> LoadedRuleSet {
+        let files: Vec<HarnessFile> = harnesses
+            .iter()
+            .map(|(name, bytes)| HarnessFile {
+                name: name.to_vec(),
+                bytes: bytes.to_vec(),
+            })
+            .collect();
+        load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-grant.toml".to_vec(),
+                    bytes: GRANT_RULE.as_bytes().to_vec(),
+                },
+            ],
+            &files,
+        )
+        .unwrap()
+    }
+
+    /// What the broker mints for `codex` running `systemctl status`.
+    fn granted_entry(generation: u64) -> PendingRequest {
+        let mut granted = entry(NONCE_A, XUDO_PID, XUDO_START, &["status", "nginx.service"]);
+        granted.action = "xudo.svc.status".to_owned();
+        granted.generation = generation;
+        granted.via = crate::request::Via::Harness;
+        granted.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        granted.attested_scope_id = Some(90);
+        granted.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        granted.attested_harness = Some("codex".to_owned());
+        granted
+    }
+
+    /// The `-nopass` file run by a live `codex` caller, under `rules`.
+    fn granting_host(granted: PendingRequest, rules: LoadedRuleSet) -> (FakeHost, Rc<FakeSpool>) {
+        let (mut host, spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            granted,
+        );
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.policy = Ok(LoadedPolicy {
+            rules,
+            settings: engine::Settings::default(),
+            queue_ttl_secs: 24 * 60 * 60,
+            passwd: "agent:x:1000:1000:agent:/home/agent:/bin/sh\n".to_owned(),
+            passwd_fault: None,
+        });
+        (host, spool)
+    }
+
+    #[test]
+    fn a_granted_harness_entry_runs_under_nopass() {
+        // The positive control for the test below: under the registry it was
+        // minted against, the entry runs. `sudo` reaches this file only once
+        // root adds a sudoers line naming it, which nothing installs.
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exec_calls(&host), 1, "{}", exit.message);
+        assert_eq!(consumed(&spool), [NONCE_A]);
+    }
+
+    #[test]
+    fn a_harness_freeze_marker_stops_that_harness_at_the_nopass_gate() {
+        // The positive control above runs; the same entry with the label's own
+        // marker standing is refused at once, and the entry stays unconsumed.
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_eq!(exec_calls(&host), 0);
+        assert!(consumed(&spool).is_empty());
+        assert_eq!(*host.harness_freeze_asked.borrow(), ["codex"]);
+    }
+
+    #[test]
+    fn a_marker_for_another_label_does_not_freeze_this_harness() {
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        host.harness_freezes = vec!["claude".to_owned(), "codex2".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exec_calls(&host), 1, "{}", exit.message);
+        assert_eq!(consumed(&spool), [NONCE_A]);
+    }
+
+    #[test]
+    fn a_harness_freeze_marker_also_denies_an_enrolled_entry_on_the_password_gate() {
+        let mut agent = ours();
+        agent.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        agent.attested_scope_id = Some(90);
+        agent.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        agent.attested_harness = Some("codex".to_owned());
+        let spool = Rc::new(holding(&[(NONCE_A, agent)]));
+        let mut host = FakeHost::new(&spool);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+    }
+
+    #[test]
+    fn a_frozen_refusal_at_the_nopass_gate_is_counted_once_by_the_ledger() {
+        let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+        let generation = rules.generation.id();
+        let (mut host, spool) = granting_host(granted_entry(generation), rules);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_harness_marker_stops_a_typed_remove_path_for_that_harness() {
+        // The typed operation is gated like an exec: the marker refuses it
+        // before the walk, and nothing is unlinked.
+        let mut policy = remove_policy(REMOVE_RULE);
+        policy.rules = load_policy(
+            vec![RuleFile {
+                name: b"50-remove.toml".to_vec(),
+                bytes: REMOVE_RULE.as_bytes().to_vec(),
+            }],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: CODEX_ENTRY.to_vec(),
+            }],
+        )
+        .unwrap();
+        let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build", false);
+        entry.generation = policy.rules.generation.id();
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(policy);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        host.harness_freezes = vec!["codex".to_owned()];
+        plant_tree(&mut host);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+    }
+
+    #[test]
+    fn a_harness_marker_is_never_asked_about_for_a_human() {
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let _ = run(&mut host, &auth());
+        assert!(host.harness_freeze_asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn nopass_refuses_a_registry_change_after_mint() {
+        let minted_under = granting_rules(&[(b"codex.toml", CODEX_ENTRY)])
+            .generation
+            .id();
+        let claude: &[u8] = b"label = \"claude\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let edited: &[u8] = b"label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"bob\"]\nmax-sessions = 4\n";
+        for changed in [
+            // Another harness beside codex: codex's own entry is untouched,
+            // and only the generation can tell the registry moved.
+            granting_rules(&[(b"codex.toml", CODEX_ENTRY), (b"claude.toml", claude)]),
+            // Codex's own entry edited.
+            granting_rules(&[(b"codex.toml", edited)]),
+        ] {
+            assert_ne!(changed.generation.id(), minted_under);
+            let (mut host, spool) = granting_host(granted_entry(minted_under), changed);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "request_stale_generation");
+        }
+    }
+
+    // ---- the -nopass ledger: every invocation counts, before any append ----
+
+    /// Runs the `-nopass` gate on `host` with the clock at `at`.
+    fn nopass_run_at(host: &mut FakeHost, at: u64) -> GateExit {
+        host.clock = FixedClock(at);
+        run(host, &nopass())
+    }
+
+    /// A host with no entry in its spool, running as the `-nopass` file.
+    fn flooded_host() -> FakeHost {
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Nopass);
+        host
+    }
+
+    fn suppressed_lines(host: &FakeHost) -> Vec<String> {
+        host.audit
+            .records()
+            .iter()
+            .flat_map(|record| record.evidence.iter())
+            .filter(|line| line.starts_with("suppressed="))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_nopass_refusal_flood_writes_one_record_per_minute() {
+        let mut host = flooded_host();
+        // Sixty refusals spread over half a minute are under the ceiling: each
+        // is counted and each is recorded.
+        for step in 0..60u64 {
+            let exit = nopass_run_at(&mut host, NOW + step * 500);
+            assert!(exit.message.contains("gate_no_pending_request"));
+        }
+        assert_eq!(host.audit.records().len(), 60);
+        // An agent that goes on: the hundreds of refusals that follow in the
+        // same minute write ONE record, the first, and it says how many it is.
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            exits.push(nopass_run_at(&mut host, NOW + 30_000));
+        }
+        for _ in 0..100 {
+            exits.push(nopass_run_at(&mut host, NOW + 45_000));
+        }
+        assert_eq!(host.audit.records().len(), 61);
+        assert_eq!(suppressed_lines(&host), vec!["suppressed=1".to_owned()]);
+        let last = host.audit.records().last().unwrap().clone();
+        assert_eq!(last.denial.as_deref(), Some("gate_rate_ceiling"));
+        assert!(has_line(&last.evidence, "ledger_minute="));
+        assert!(has_line(&last.evidence, "severity=high"));
+        // Every one of them was still refused, and said so on standard error.
+        for exit in &exits {
+            assert_eq!(exit.status, 19);
+            assert!(
+                exit.message.contains("gate_rate_ceiling"),
+                "{}",
+                exit.message
+            );
+        }
+        assert_eq!(exec_calls(&host), 0);
+    }
+
+    #[test]
+    fn a_flood_that_goes_on_for_minutes_writes_a_bounded_trail() {
+        // Ten calls a second for three minutes.
+        let mut host = flooded_host();
+        let mut calls = 0u64;
+        for tick in 0..1800u64 {
+            let exit = nopass_run_at(&mut host, NOW + tick * 100);
+            assert_eq!(exit.status, 19);
+            calls += 1;
+        }
+        let records = host.audit.records();
+        let written = records
+            .iter()
+            .filter(|record| record.denial.as_deref() == Some("gate_no_pending_request"))
+            .count() as u64;
+        let reports: Vec<u64> = suppressed_lines(&host)
+            .iter()
+            .map(|line| line.trim_start_matches("suppressed=").parse().unwrap())
+            .collect();
+        // The sixty a minute the ceiling admits, three minutes of it at most
+        // plus the burst at the start, and one report per minute at most.
+        assert!(written <= 60 * 4, "{written} admitted refusals written");
+        assert!((2..=4).contains(&reports.len()), "{reports:?}");
+        // Every refusal is either its own record or counted in a report (or
+        // is still waiting for the next one): none is lost.
+        assert!(written + reports.iter().sum::<u64>() <= calls);
+        assert!(records.len() < 250);
+    }
+
+    #[test]
+    fn a_refusal_before_the_lineage_is_counted_under_the_unknown_uid() {
+        let mut host = flooded_host();
+        host.proc = Err(SysError::unsupported("no procfs"));
+        let exit = nopass_run_at(&mut host, NOW);
+        assert!(exit.message.contains("gate_failed_procfs"));
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: crate::decide::UNKNOWN_UID,
+                label: None
+            }]
+        );
+    }
+
+    #[test]
+    fn the_ledger_counts_a_live_harness_by_uid_and_label_and_an_unattested_caller_by_uid() {
+        let mut entry = ours();
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        let (mut host, _spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.agent_has_the_callers_uid();
+        script_human(&mut host);
+        let _ = run(&mut host, &nopass());
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: Some("codex".to_owned())
+            }]
+        );
+        // The same caller read as nobody in particular: the uid alone.
+        let (mut host, _spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        host.cgroup_mode = FakeCgroupMode::Unavailable;
+        script_human(&mut host);
+        let _ = run(&mut host, &nopass());
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_caller_with_no_entry_is_counted_under_the_real_uid_of_sudo_not_the_shared_one() {
+        let mut host = flooded_host();
+        let exit = nopass_run_at(&mut host, NOW);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let keys = host.rate.keys.borrow();
+        assert_eq!(keys.len(), 1);
+        assert_ne!(keys[0].uid, crate::decide::UNKNOWN_UID);
+        assert_eq!(keys[0].label, None);
+        // When sudo's uid cannot be read, only then the shared bucket.
+        assert_eq!(
+            unmatched_ledger_key(None),
+            LedgerKey {
+                uid: crate::decide::UNKNOWN_UID,
+                label: None
+            }
+        );
+        assert_eq!(unmatched_ledger_key(Some(1234)).uid, 1234);
+    }
+
+    #[test]
+    fn refusals_a_flood_left_unreported_are_evidence_on_the_next_admitted_record() {
+        let mut host = flooded_host();
+        for step in 0..60u64 {
+            nopass_run_at(&mut host, NOW + step);
+        }
+        // Reported at once (the first), then three more that are not.
+        for step in 0..4u64 {
+            nopass_run_at(&mut host, NOW + 100 + step);
+        }
+        // The minute passes: the stamps age out and the door reopens. The
+        // run let through says how many refusals no record has counted.
+        let exit = nopass_run_at(&mut host, NOW + 70_000);
+        assert!(exit.message.contains("gate_no_pending_request"));
+        let last = host.audit.records().last().unwrap().clone();
+        assert!(
+            has_line(&last.evidence, "ledger_suppressed_before=3"),
+            "{:?}",
+            last.evidence
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_counted_once_however_far_the_run_got() {
+        // Refused after the decision (not granted) and refused in the middle
+        // (wrong via): one ledger call each.
+        let (mut host, _spool) = host_running(
+            xudo_sys::FakeGateFiles::running_as(GateMode::Nopass),
+            ours(),
+        );
+        let _ = run(&mut host, &nopass());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        let mut host = flooded_host();
+        let _ = run(&mut host, &nopass());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_auth_run_never_touches_the_ledger() {
+        // The human path asks sudo's password and is not rate limited here.
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut host = FakeHost::new(&spool);
+        let _ = run(&mut host, &auth());
+        let _ = run(&mut FakeHost::new(&Rc::new(holding(&[]))), &auth());
+        assert!(host.rate.keys.borrow().is_empty());
+        assert!(host.rate.dir.calls().is_empty());
+    }
+
+    #[test]
+    fn an_executed_nopass_file_counts_even_when_argv0_says_auth() {
+        let mut host = flooded_host();
+        let exit = run(&mut host, &auth());
+        assert!(exit.message.contains("gate_failed_invocation"));
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_ledger_refuses() {
+        // The refusal stands as the step that ended the run, and it is left out
+        // of the trail: with no count, a loop of calls would be a loop of
+        // appends.
+        let mut host = flooded_host();
+        host.rate.failing = Some(xudo_sys::RateError::Corrupt("test"));
+        for _ in 0..5 {
+            let exit = nopass_run_at(&mut host, NOW);
+            assert_eq!(exit.status, 19);
+            assert!(
+                exit.message.contains("gate_no_pending_request"),
+                "{}",
+                exit.message
+            );
+        }
+        assert_eq!(exec_calls(&host), 0);
+        assert!(host.audit.records().is_empty());
+        assert_eq!(host.rate.keys.borrow().len(), 5);
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_used_stops_a_decided_request_before_it_is_consumed() {
+        // What `proceed` does between `decide` and the consume, on a progress
+        // that is the `-nopass` gate's: the refusal is the ledger's own, high
+        // severity, and left off the trail.
+        let spool = Rc::new(holding(&[]));
+        let mut host = FakeHost::new(&spool);
+        host.rate.failing = Some(xudo_sys::RateError::Busy);
+        let mut progress = Progress {
+            nopass: true,
+            ..Progress::default()
+        };
+        let refusal = count_nopass(&host, &mut progress).unwrap_err();
+        assert_eq!(refusal.code(), "gate_failed_ledger");
+        assert_eq!(refusal.severity(), crate::decide::Severity::High);
+        assert!(left_off_the_trail(&refusal));
+        // Asked once: the same invocation is never counted again.
+        assert!(count_nopass(&host, &mut progress).is_ok());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        assert!(consumed(&spool).is_empty());
+    }
+
+    #[test]
+    fn the_ledger_is_counted_once_and_only_for_the_nopass_gate() {
+        let spool = Rc::new(holding(&[]));
+        let host = FakeHost::new(&spool);
+        let mut auth_gate = Progress::default();
+        assert!(count_nopass(&host, &mut auth_gate).is_ok());
+        assert!(host.rate.keys.borrow().is_empty());
+        let mut nopass_gate = Progress {
+            nopass: true,
+            ledger_key: Some(LedgerKey {
+                uid: 7,
+                label: Some("codex".to_owned()),
+            }),
+            ..Progress::default()
+        };
+        assert!(count_nopass(&host, &mut nopass_gate).is_ok());
+        assert!(count_nopass(&host, &mut nopass_gate).is_ok());
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+        assert_eq!(nopass_gate.ledger, LedgerStep::Counted);
+        assert!(has_line(
+            &nopass_gate.evidence,
+            "ledger_minute=1 ledger_hour=1"
+        ));
+    }
+
+    #[test]
+    fn only_a_repeatable_refusal_is_left_off_the_trail() {
+        let over = |suppressed| Refusal::RateCeiling {
+            minute: 60,
+            hour: 60,
+            suppressed,
+        };
+        assert!(left_off_the_trail(&over(None)));
+        assert!(!left_off_the_trail(&over(Some(3))));
+        let failed = |stage| Refusal::Failed {
+            stage,
+            reason: String::new(),
+        };
+        assert!(left_off_the_trail(&failed(Stage::Ledger)));
+        assert!(!left_off_the_trail(&failed(Stage::Clock)));
+        assert!(!left_off_the_trail(&Refusal::NoPendingRequest { pid: 1 }));
+    }
+
+    #[test]
+    fn a_clock_that_cannot_be_read_refuses_the_nopass_count() {
+        let mut host = flooded_host();
+        host.clock = FixedClock(0);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 19);
+        assert!(
+            exit.message.contains("gate_failed_clock"),
+            "{}",
+            exit.message
+        );
+        assert!(host.rate.keys.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_ledger_over_the_ceiling_still_lets_the_human_path_run() {
+        // One account at its ceiling and the trail still writable: a human's
+        // password run goes through to the exec.
+        let mut agent = flooded_host();
+        for step in 0..70u64 {
+            nopass_run_at(&mut agent, NOW + step);
+        }
+        let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+        let mut human = FakeHost::new(&spool);
+        human.audit = std::mem::replace(&mut agent.audit, FakeAuditSink::new());
+        let exit = run(&mut human, &auth());
+        assert!(
+            exit.message.contains("gate_failed_exec"),
+            "{}",
+            exit.message
+        );
+        assert_eq!(exec_calls(&human), 1);
+    }
+
+    // ---- G1e: a granted remove-path on the -nopass gate ---------------------
+
+    const GRANTED_REMOVE_RULE: &str = r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+owners = ["agent"]
+harness = ["codex"]
+outcome = "allow"
+"#;
+
+    /// `text` as the only rule file, over `harnesses`.
+    fn remove_rules(text: &str, harnesses: &[(&[u8], &[u8])]) -> LoadedRuleSet {
+        load_policy(
+            vec![RuleFile {
+                name: b"50-remove.toml".to_vec(),
+                bytes: text.as_bytes().to_vec(),
+            }],
+            &harnesses
+                .iter()
+                .map(|(name, bytes)| HarnessFile {
+                    name: name.to_vec(),
+                    bytes: bytes.to_vec(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    /// What the broker mints for a live `codex` asking to remove `target`.
+    fn harness_remove_entry(generation: u64, target: &[u8]) -> PendingRequest {
+        let mut entry = remove_entry(GRANTED_REMOVE_RULE, target, false);
+        entry.generation = generation;
+        entry.via = crate::request::Via::Harness;
+        entry.attested_class = crate::request::AttestedClass::EnrolledAgent { scope_id: 90 };
+        entry.attested_scope_id = Some(90);
+        entry.boot_id = Some("abcdef01-2345-6789-abcd-ef0123456789".to_owned());
+        entry.attested_harness = Some("codex".to_owned());
+        entry
+    }
+
+    /// The `-nopass` file run by a live `codex`, under `rules`, over the
+    /// planted tree and a sibling of the target the entry must not reach.
+    fn harness_remove_host(
+        entry: PendingRequest,
+        rules: LoadedRuleSet,
+    ) -> (FakeHost, Rc<FakeSpool>) {
+        let (mut host, spool) =
+            host_running(xudo_sys::FakeGateFiles::running_as(GateMode::Nopass), entry);
+        host.cgroup_mode = FakeCgroupMode::Agent;
+        host.peers = agent_parent_peers();
+        host.syscalls = FakeSyscalls::new()
+            .with_cloexec(Ok(()))
+            .with_boot_id(Ok("abcdef01-2345-6789-abcd-ef0123456789".to_owned()));
+        let mut policy = remove_policy(GRANTED_REMOVE_RULE);
+        policy.rules = rules;
+        host.policy = Ok(policy);
+        plant_tree(&mut host);
+        host.remove.add(
+            &[b"srv", b"app", b"build"],
+            b"keep",
+            xudo_sys::remove::NodeKind::File,
+            1000,
+            0o644,
+            2,
+        );
+        (host, spool)
+    }
+
+    fn codex_registry() -> [(&'static [u8], &'static [u8]); 1] {
+        [(b"codex.toml", CODEX_ENTRY)]
+    }
+
+    /// Nothing under the tree was touched and the entry is still there.
+    fn assert_nothing_removed(host: &FakeHost, spool: &FakeSpool) {
+        assert!(host.remove.unlinked().is_empty());
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+        assert!(consumed(spool).is_empty());
+        assert_eq!(exec_calls(host), 0);
+    }
+
+    #[test]
+    fn a_listed_harness_runs_a_granted_remove_path_on_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 0, "{exit:?}");
+        assert_eq!(exec_calls(&host), 0);
+        assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+        assert!(!host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+        // The entry names one path: its sibling stays.
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+        assert_eq!(host.remove.unlinked().len(), 1);
+        // Counted once by the ledger, for codex under its live uid.
+        assert_eq!(
+            *host.rate.keys.borrow(),
+            vec![LedgerKey {
+                uid: 1000,
+                label: Some("codex".to_owned())
+            }]
+        );
+        let records = host.audit.records();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert!(has_line(&record.evidence, "via=harness"), "{record:?}");
+        }
+        assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
+        assert!(has_line(&records[1].evidence, "count=1"));
+        assert_eq!(*host.harness_freeze_asked.borrow(), ["codex"]);
+    }
+
+    #[test]
+    fn a_password_remove_path_records_via_auth() {
+        let spool = Rc::new(holding(&[(
+            NONCE_A,
+            remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false),
+        )]));
+        let mut host = FakeHost::new(&spool);
+        host.policy = Ok(remove_policy(REMOVE_RULE));
+        plant_tree(&mut host);
+        assert_eq!(run(&mut host, &auth()).status, 0);
+        assert!(has_line(&host.audit.records()[1].evidence, "via=auth"));
+    }
+
+    #[test]
+    fn an_unlisted_harness_is_refused_a_remove_path_on_nopass() {
+        for text in [
+            // Another label, the same tree.
+            GRANTED_REMOVE_RULE.replace("[\"codex\"]", "[\"claude\"]"),
+            // No harness at all: the password path only.
+            REMOVE_RULE.to_owned(),
+        ] {
+            let rules = remove_rules(&text, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+            assert_nothing_removed(&host, &spool);
+            assert_eq!(host.rate.keys.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_stale_registry_or_rule_generation_refuses_a_nopass_remove_path() {
+        let minted_under = remove_rules(GRANTED_REMOVE_RULE, &codex_registry())
+            .generation
+            .id();
+        let claude: &[u8] = b"label = \"claude\"\nway = \"session\"\nusers = [\"agent\"]\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        for changed in [
+            remove_rules(
+                GRANTED_REMOVE_RULE,
+                &[(b"codex.toml", CODEX_ENTRY), (b"claude.toml", claude)],
+            ),
+            remove_rules(
+                &GRANTED_REMOVE_RULE.replace("max-entries = 10", "max-entries = 9"),
+                &codex_registry(),
+            ),
+        ] {
+            assert_ne!(changed.generation.id(), minted_under);
+            let entry = harness_remove_entry(minted_under, b"/srv/app/build/cache");
+            let (mut host, spool) = harness_remove_host(entry, changed);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "request_stale_generation");
+            assert_nothing_removed(&host, &spool);
+        }
+    }
+
+    #[test]
+    fn denies_a_granted_remove_path_through_a_planted_link_or_mount_as_a_walk_escape() {
+        // Attack: the harness owns the tree, plants `hop -> /victim` or bind
+        // mounts /victim on `mnt`, and asks for a name behind it. The gate's
+        // dry run meets the crossing: nothing is removed, not even the names
+        // the walk reached first, and the refusal is its own, at high.
+        use xudo_sys::remove::NodeKind;
+        for (target, mount) in [
+            (&b"/srv/app/build/hop/v"[..], false),
+            (b"/srv/app/build/mnt/v", true),
+            (b"/srv/app/build/mnt", true),
+            (b"/srv/app/build/box", true),
+        ] {
+            let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), target);
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let fs = &mut host.remove;
+            fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+            fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"hop",
+                NodeKind::Symlink,
+                1000,
+                0o777,
+                7,
+            );
+            let mnt = fs.add(
+                &[b"srv", b"app", b"build"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"mnt"],
+                b"v",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            fs.set_device(mnt, 9);
+            // `box/a` sorts before `box/mnt`: reached first, kept all the same.
+            fs.add(
+                &[b"srv", b"app", b"build"],
+                b"box",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.add(
+                &[b"srv", b"app", b"build", b"box"],
+                b"a",
+                NodeKind::File,
+                1000,
+                0o644,
+                1,
+            );
+            let inner = fs.add(
+                &[b"srv", b"app", b"build", b"box"],
+                b"mnt",
+                NodeKind::Dir,
+                1000,
+                0o755,
+                0,
+            );
+            fs.set_device(inner, 9);
+            let exit = run(&mut host, &nopass());
+            assert_eq!(exit.status, 19, "{exit:?}");
+            assert!(
+                exit.message.contains("gate_walk_escape, severity high"),
+                "{exit:?}"
+            );
+            let reason = if mount {
+                "detail=the walk would cross a mount"
+            } else {
+                "detail=a directory on the way to the target is a symbolic link"
+            };
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"victim", b"v"]));
+            assert!(
+                host.remove
+                    .exists(&[b"srv", b"app", b"build", b"box", b"a"])
+            );
+            assert_eq!(consumed(&spool), [NONCE_A.to_owned()]);
+            assert_eq!(exec_calls(&host), 0);
+            assert_eq!(
+                denial_codes(&host),
+                vec![Some("gate_walk_escape".to_owned())]
+            );
+            let record = &host.audit.records()[0];
+            assert_eq!(record.decision, AuditDecision::Denied);
+            assert!(has_line(&record.evidence, "severity=high"), "{record:?}");
+            assert!(has_line(&record.evidence, reason), "{record:?}");
+        }
+    }
+
+    #[test]
+    fn a_nopass_remove_path_outside_its_tree_is_refused() {
+        for target in [
+            &b"/etc/passwd"[..],
+            b"/srv/app/build-evil/x",
+            b"/srv/app/build",
+        ] {
+            let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+            let entry = harness_remove_entry(rules.generation.id(), target);
+            let (mut host, spool) = harness_remove_host(entry, rules);
+            let exit = run(&mut host, &nopass());
+            assert!(exit.message.contains("operation_refused"), "{exit:?}");
+            assert_nothing_removed(&host, &spool);
+        }
+    }
+
+    #[test]
+    fn a_nopass_entry_for_one_path_cannot_remove_another() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let mut entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        // The rendered argv the broker digested names `keep`; the operation
+        // names `cache`. Neither is removed.
+        entry.argv = vec!["/srv/app/build/keep".to_owned()];
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        let exit = run(&mut host, &nopass());
+        assert_ne!(exit.status, 0);
+        assert!(exit.message.contains("gate_failed_rules"), "{exit:?}");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn a_symlink_or_mount_inside_the_tree_is_not_crossed_under_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        // `box/link` is a symlink, `box/mnt` another device: a target through
+        // either is never reached, and a recursive remove of `box` leaves the
+        // mount and what is inside it.
+        let generation = rules.generation.id();
+        let through_link = harness_remove_entry(generation, b"/srv/app/build/box/link/x");
+        let (mut host, spool) = harness_remove_host(through_link, rules.clone());
+        plant_box(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_ne!(exit.status, 0, "{exit:?}");
+        assert!(exit.message.contains("gate_walk_escape"), "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(
+            host.remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"link"])
+        );
+        assert_eq!(consumed(&spool).len(), 1);
+
+        // The mount inside `box` refuses the whole removal: the link the
+        // walk would have reached first stays too.
+        let whole = harness_remove_entry(generation, b"/srv/app/build/box");
+        let (mut host, _spool) = harness_remove_host(whole, rules);
+        plant_box(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_eq!(exit.status, 19, "{exit:?}");
+        assert!(exit.message.contains("gate_walk_escape"), "{exit:?}");
+        assert!(host.remove.unlinked().is_empty());
+        assert!(
+            host.remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"mnt", b"inside"])
+        );
+        assert!(
+            host.remove
+                .exists(&[b"srv", b"app", b"build", b"box", b"link"])
+        );
+        assert!(host.remove.exists(&[b"srv", b"app", b"build", b"keep"]));
+    }
+
+    fn plant_box(host: &mut FakeHost) {
+        use xudo_sys::remove::NodeKind;
+        let fs = &mut host.remove;
+        fs.add(
+            &[b"srv", b"app", b"build"],
+            b"box",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"link",
+            NodeKind::Symlink,
+            1000,
+            0o777,
+            4,
+        );
+        let mnt = fs.add(
+            &[b"srv", b"app", b"build", b"box"],
+            b"mnt",
+            NodeKind::Dir,
+            1000,
+            0o755,
+            0,
+        );
+        fs.set_device(mnt, 9);
+        fs.add(
+            &[b"srv", b"app", b"build", b"box", b"mnt"],
+            b"inside",
+            NodeKind::File,
+            1000,
+            0o644,
+            5,
+        );
+    }
+
+    #[test]
+    fn a_frozen_harness_cannot_remove_a_path_on_nopass() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.harness_freezes = vec!["codex".to_owned()];
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "frozen");
+        assert_nothing_removed(&host, &spool);
+        assert_eq!(host.rate.keys.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_nopass_remove_path_is_withheld_under_confirm_human_path() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.policy.as_mut().unwrap().settings.confirm_human_path = true;
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_granted");
+        assert_nothing_removed(&host, &spool);
+        // An entry that waits on a watcher is not one a harness can hold.
+        let mut waiting = harness_remove_entry(1, b"/srv/app/build/cache");
+        waiting.needs_watch = true;
+        let (mut host, spool) = harness_remove_host(
+            waiting,
+            remove_rules(GRANTED_REMOVE_RULE, &codex_registry()),
+        );
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "request_invalid_confirmation_state");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn the_wrong_gate_file_never_runs_a_remove_path_entry() {
+        // A password entry under `-nopass`, and a harness entry under `-auth`.
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let mut auth_entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        auth_entry.via = crate::request::Via::Auth;
+        let (mut host, spool) = harness_remove_host(auth_entry, rules.clone());
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+        assert_nothing_removed(&host, &spool);
+
+        let harness_entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(harness_entry, rules);
+        host.gate_files = xudo_sys::FakeGateFiles::running_as(GateMode::Auth);
+        let exit = run(&mut host, &auth());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_wrong_via");
+        assert_nothing_removed(&host, &spool);
+    }
+
+    #[test]
+    fn a_nopass_remove_path_for_a_caller_that_left_its_scope_is_refused() {
+        let rules = remove_rules(GRANTED_REMOVE_RULE, &codex_registry());
+        let entry = harness_remove_entry(rules.generation.id(), b"/srv/app/build/cache");
+        let (mut host, spool) = harness_remove_host(entry, rules);
+        host.cgroup_mode = FakeCgroupMode::Human;
+        script_human(&mut host);
+        let exit = run(&mut host, &nopass());
+        assert_refused_with(&host, &spool, &exit, "gate_mode_not_an_enrolled_agent");
+        assert_nothing_removed(&host, &spool);
+    }
+}
+
+/// Whether `uid` is the account of a registered service harness.
+fn is_agent_account(
+    registry: &xudo_policy::HarnessRegistry,
+    passwd: &str,
+    uid: Option<u32>,
+) -> bool {
+    let Some(uid) = uid else {
+        return false;
+    };
+    registry.entries().any(|entry| {
+        entry
+            .account
+            .as_deref()
+            .is_some_and(|name| xudo_policy::passwd_uid(passwd, name) == Some(uid))
+    })
+}
+
+#[cfg(test)]
+mod agent_account_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::is_agent_account;
+
+    const REGISTRY: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
+    const SESSION: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
+    const PASSWD: &str =
+        "agent:x:1000:1000::/home/agent:/bin/sh\nalice:x:1001:1001::/home/alice:/bin/sh\n";
+
+    #[test]
+    fn the_account_of_a_service_harness_is_an_agent_account() {
+        let registry = xudo_policy::HarnessRegistry::from_files([
+            ("codex.toml", REGISTRY),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
+        assert!(is_agent_account(&registry, PASSWD, Some(1000)));
+        assert!(!is_agent_account(&registry, PASSWD, Some(1001)));
+        assert!(!is_agent_account(&registry, PASSWD, None));
+        let empty = xudo_policy::HarnessRegistry::empty();
+        assert!(!is_agent_account(&empty, PASSWD, Some(1000)));
     }
 }

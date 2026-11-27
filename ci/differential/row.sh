@@ -46,7 +46,7 @@ sed -nE \
     -e 's/^(backend      UNUSABLE: [a-z-]+) .* (is missing a required control .*)$/\1 <version> \2/p' \
     -e '/^backend      NONE/p' \
     -e '/^backend caps /p' \
-    -e '/^ +absent: /p' \
+    -e '/^ +(absent|exempt|unknown): /p' \
     "$out/doctor.txt" >>"$report"
 
 # 2. The install plan: refused with exit 19 where nothing usable exists,
@@ -85,6 +85,36 @@ else
         -e 's/^xudo: no usable backend: no privilege backend found.*$/refused      no privilege backend found/p' \
         -e 's/^xudo: no usable backend: ([a-z-]+) .* is missing a required control.*$/refused      \1 <version> is missing a required control/p' \
         "$out/install.txt" >>"$report"
+fi
+
+# 2b. The opt-in agent path's plan: refused on doas and where nothing usable
+#     exists; elsewhere exactly one passwordless line, and the file as it would
+#     land handed to the backend's own parser like the default one. The
+#     helper goes where the package puts it first: a missing one is refused.
+install -d -m 755 /usr/libexec/xudo
+install -m 755 /bins/xudo-gate /usr/libexec/xudo/xudo-gate-nopass
+set +e
+run_xudo install --agent-path --dry-run --show-contents >"$out/agent-path.txt" 2>&1
+rc=$?
+set -e
+echo "agent path   exit $rc" >>"$report"
+if [ "$rc" -eq 0 ]; then
+    awk '/^   [0-9]+\. write candidate/ { grab = 1; next }
+         /^   [0-9]+\. / { grab = 0 }
+         grab && sub(/^      \| ?/, "")' "$out/agent-path.txt" >"$out/agent-snippet.txt"
+    echo "agent lines  $(grep -c NOPASSWD "$out/agent-snippet.txt"): $(grep NOPASSWD "$out/agent-snippet.txt")" >>"$report"
+    if $validator <"$out/agent-snippet.txt" >"$out/agent-validate.log" 2>&1; then
+        echo "agent snip   accepted by $validator" >>"$report"
+    else
+        echo "agent snip   REJECTED by $validator" >>"$report"
+        cat "$out/agent-validate.log" >>"$report"
+    fi
+else
+    sed -nE \
+        -e 's/^xudo: refusing --agent-path: (the agent path is for sudo and sudo-rs only):.*$/refused      \1/p' \
+        -e 's/^xudo: no usable backend: no privilege backend found.*$/refused      no privilege backend found/p' \
+        -e 's/^xudo: no usable backend: ([a-z-]+) .* is missing a required control.*$/refused      \1 <version> is missing a required control/p' \
+        "$out/agent-path.txt" >>"$report"
 fi
 
 # 3. The ruleset itself is accepted. Its generation hash is not pinned here;

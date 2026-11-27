@@ -22,7 +22,10 @@ use std::fs::{self, File, Permissions};
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 
-use xudo_backend::{BackendKind, InstallPlan, PlanStep, detect, snippet::GATE_AUTH};
+use xudo_backend::{
+    BackendKind, InstallPlan, PlanStep, detect,
+    snippet::{GATE_AUTH, GATE_NOPASS, XUDO_AGENT_GROUP},
+};
 use xudo_sys::{
     Effect, HostInstallOps, HostProbe, HostRunner, InstallError, InstallProbe, ProbeResult,
     check_effect, execute, run_capture,
@@ -193,4 +196,52 @@ fn the_effect_check_sees_that_a_dotted_name_does_nothing() {
         }
     );
     clean();
+}
+
+/// With the rule install
+/// writes, and the account in both `xudo` and `xudo-agent`, real `sudo -n`
+/// will not run the passwordless gate file. No sudoers line names it, so no
+/// caller is passwordless, whatever the broker mints.
+#[test]
+fn sudo_n_on_the_nopass_gate_asks_a_password_until_e8() {
+    if !begin_root_test("sudo_n_on_the_nopass_gate_asks_a_password_until_e8") {
+        return;
+    }
+    execute(&plan(), &HostInstallOps::system(), &NoProbe).unwrap();
+    // Only a group this test made is removed again.
+    let made_group = run_capture("/usr/sbin/groupadd", &["--system", XUDO_AGENT_GROUP], None)
+        .is_ok_and(|output| output.success);
+    let joined = run_capture("/usr/sbin/usermod", &["-aG", XUDO_AGENT_GROUP, USER], None).unwrap();
+    assert!(joined.success, "{}", joined.stderr);
+    // A stand-in at the real path, so `sudo` finds a command and refuses on
+    // policy rather than on a missing file. Only if nothing is there.
+    let planted = fs::symlink_metadata(GATE_NOPASS).is_err();
+    if planted {
+        fs::create_dir_all("/usr/libexec/xudo").unwrap();
+        fs::copy("/usr/bin/true", GATE_NOPASS).unwrap();
+        fs::set_permissions(GATE_NOPASS, Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = run_capture(
+        "/usr/sbin/runuser",
+        &["-u", USER, "--", "/usr/bin/sudo", "-n", GATE_NOPASS, ""],
+        None,
+    )
+    .unwrap();
+    if planted {
+        fs::remove_file(GATE_NOPASS).unwrap();
+    }
+    let _ = run_capture("/usr/bin/gpasswd", &["-d", USER, XUDO_AGENT_GROUP], None);
+    if made_group {
+        let _ = run_capture("/usr/sbin/groupdel", &[XUDO_AGENT_GROUP], None);
+    }
+    clean();
+    assert!(
+        !output.success,
+        "sudo -n ran the passwordless gate: {output:?}"
+    );
+    assert!(
+        output.stderr.contains("password is required"),
+        "sudo refused for another reason: {}",
+        output.stderr
+    );
 }

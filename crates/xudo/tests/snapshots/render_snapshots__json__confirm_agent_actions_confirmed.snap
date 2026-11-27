@@ -22,6 +22,7 @@ expression: "render::json(&decision)"
       "reason": "agent_actions_confirmed"
     }
   },
+  "harness_grant": null,
   "trace": [
     {
       "canonicalized": {
@@ -37,7 +38,7 @@ expression: "render::json(&decision)"
     },
     {
       "deny_list_evaluated": {
-        "version": 7,
+        "version": 8,
         "matched": []
       }
     },
@@ -49,7 +50,7 @@ expression: "render::json(&decision)"
     {
       "confirmation_decided": {
         "required": true,
-        "reason": "an enrolled agent requested a privileged action and confirm_agent_actions is on"
+        "reason": "an enrolled agent requested a privileged action and no rule grants it to this harness"
       }
     }
   ]

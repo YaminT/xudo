@@ -42,17 +42,23 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+#[cfg(any(target_os = "linux", test))]
+mod beneath;
+pub mod caller_hints;
 pub mod cgroup;
 pub mod clock;
 pub mod connection;
 pub mod entropy;
+pub mod envfile;
 pub mod error;
 pub mod exec;
+pub mod gate_files;
 pub mod hygiene;
 pub mod install;
 pub mod kernel;
 pub mod live;
 mod mounts;
+pub mod own;
 pub mod peer;
 pub mod platform;
 pub mod probe;
@@ -60,6 +66,7 @@ pub mod proc;
 pub mod procfs;
 pub mod program;
 pub mod provenance;
+pub mod rate;
 pub mod remove;
 pub mod source;
 pub mod spool;
@@ -73,10 +80,12 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
+pub use caller_hints::{CallerHints, peer_hints, pinned_hints};
 pub use cgroup::{
     CgroupCalls, CgroupIdentity, CgroupRung, HostCgroup, ProcessSecurityStatus, RecordIdentity,
-    Scope, ScopeFacts, ScopeKind, parse_process_security_status, peer_cgroup_id,
-    process_security_status, scope_status, verify_parent_pid,
+    SERVICE_RECORD_PREFIX, Scope, ScopeFacts, ScopeKind, is_record_name,
+    parse_process_security_status, peer_cgroup_id, process_cgroup, process_security_status,
+    scope_status, service_record_name, unit_dir_name, verify_parent_pid,
 };
 #[cfg(target_os = "linux")]
 pub use clock::DEADLINE_CLOCK;
@@ -85,16 +94,30 @@ pub use connection::{
     AdoptError, Connection, FakeConnection, ReadFailure, UnixConnection, connected_unix_stream,
 };
 pub use entropy::{Entropy, FakeEntropy, HostEntropy};
+#[cfg(any(test, feature = "fake"))]
+pub use envfile::FakeEnvFiles;
+pub use envfile::{AGENT_ENV_DIR, EnvFileProbe, EnvFiles, HostEnvFiles};
 pub use error::SysError;
 pub use exec::{HostRunner, Output, Runner, run_capture};
+#[cfg(any(test, feature = "fake"))]
+pub use gate_files::FakeGateFiles;
+pub use gate_files::{
+    AUTH_FILE, FileId, GATE_DIR, GateFiles, GateFilesError, GateMode, HostGateFiles, NOPASS_FILE,
+};
 pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
-    Effect, HostInstallOps, HostInstaller, InstallError, InstallOps, InstallProbe, InstallReport,
-    Installer, ProbeResult, RefusingInstaller, Verification, check_effect, execute,
+    AgentError, AgentRow, DirLock, Effect, EnrolOps, HostInstallOps, HostInstaller,
+    HostWhereabouts, InstallError, InstallOps, InstallProbe, InstallReport, Installer,
+    MAX_PACK_BYTES, PackError, PackReport, PackRequest, ProbeResult, RULES_DIR, RefusingInstaller,
+    Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol, check_effect, execute,
+    list_agents, plan_enrol, remove_agent, remove_pack,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;
 pub use mounts::MountRefusal;
+#[cfg(any(test, feature = "fake"))]
+pub use own::FakeOwn;
+pub use own::{HostOwn, OwnFacts};
 pub use peer::{
     FakePeer, HostPeer, PeerCall, PeerCalls, PeerCred, ProcFile, StatusUids, lacks_peer_pidfd,
     lacks_pidfd_info, lacks_pidfd_open, parse_status_euid, parse_status_uids, peer_was_reaped,
@@ -102,10 +125,14 @@ pub use peer::{
 };
 pub use platform::{LinuxOps, MacOsStub, PrivilegedOps, host_ops};
 pub use probe::HostProbe;
-pub use proc::{CgroupPath, MountEntry, ProcStat, parse_cgroup, parse_mountinfo, parse_stat};
+pub use proc::{
+    CgroupPath, MountEntry, ProcStat, is_identity_uid_map, parse_cgroup, parse_mountinfo,
+    parse_nspid_count, parse_stat,
+};
 pub use procfs::VerifiedProc;
 pub use program::{FakePrograms, HostPrograms, Program, ProgramError, Programs};
 pub use provenance::{Ancestry, ProcRef, ancestry, hints, lineage};
+pub use rate::{Admission, HostRateLedger, LedgerKey, RATE_DIR, RateDir, RateError, RateLedger};
 #[cfg(any(test, feature = "fake"))]
 pub use remove::FakeRemoveFs;
 pub use remove::{

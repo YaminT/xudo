@@ -12,6 +12,7 @@ expression: "render::json(&decision)"
   "resolved_exe": null,
   "resolved_argv": [],
   "confirm": "not_required",
+  "harness_grant": null,
   "trace": [
     {
       "canonicalized": {

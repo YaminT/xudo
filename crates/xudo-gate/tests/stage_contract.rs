@@ -19,7 +19,8 @@ fn lists_every_stage(stage: Stage) {
         | Stage::Program
         | Stage::Audit
         | Stage::Exec
-        | Stage::Config => {}
+        | Stage::Config
+        | Stage::Ledger => {}
     }
 }
 
@@ -39,10 +40,11 @@ fn position(stage: Stage) -> usize {
         Stage::Audit => 11,
         Stage::Exec => 12,
         Stage::Config => 13,
+        Stage::Ledger => 14,
     }
 }
 
-const ALL_STAGES: [Stage; 14] = [
+const ALL_STAGES: [Stage; 15] = [
     Stage::Descriptors,
     Stage::Streams,
     Stage::CallerState,
@@ -57,6 +59,7 @@ const ALL_STAGES: [Stage; 14] = [
     Stage::Audit,
     Stage::Exec,
     Stage::Config,
+    Stage::Ledger,
 ];
 
 #[test]
@@ -66,8 +69,8 @@ fn every_gate_stage_audit_code_is_pinned() {
         lists_every_stage(stage);
         let _ = writeln!(snapshot, "{stage:?} {}", stage.code());
     }
-    assert_eq!(ALL_STAGES.len(), 14);
-    let mut positions = [false; 14];
+    assert_eq!(ALL_STAGES.len(), 15);
+    let mut positions = [false; 15];
     for stage in ALL_STAGES {
         let index = position(stage);
         assert_eq!(ALL_STAGES.get(index).copied(), Some(stage));
@@ -81,4 +84,34 @@ fn every_gate_stage_audit_code_is_pinned() {
     }
     assert!(positions.into_iter().all(|present| present));
     insta::assert_snapshot!("gate_stage_audit_codes", snapshot);
+}
+
+#[test]
+fn the_rate_ceiling_refusal_is_pinned() {
+    let over = xudo_gate::Refusal::RateCeiling {
+        minute: 60,
+        hour: 61,
+        suppressed: Some(3),
+    };
+    let snapshot = format!(
+        "{} {:?} {:?}\n{over}\n",
+        over.code(),
+        over.severity(),
+        over.exit_code()
+    );
+    insta::assert_snapshot!("gate_rate_ceiling", snapshot);
+}
+
+#[test]
+fn the_walk_escape_refusal_is_pinned() {
+    let escape = xudo_gate::Refusal::WalkEscape {
+        reason: "the walk would cross a mount",
+    };
+    let snapshot = format!(
+        "{} {:?} {:?}\n{escape}\n",
+        escape.code(),
+        escape.severity(),
+        escape.exit_code()
+    );
+    insta::assert_snapshot!("gate_walk_escape", snapshot);
 }

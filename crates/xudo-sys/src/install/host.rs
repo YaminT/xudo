@@ -35,8 +35,7 @@ use rustix::fs::{
 use rustix::io::Errno;
 use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END, MANAGED_MARKER};
 
-use super::blocks;
-use super::{FileIdentity, InstallError, InstallOps, Removal, split, substitute};
+use super::{DirLock, FileIdentity, InstallError, InstallOps, Removal, split, substitute};
 use crate::exec::{HostRunner, Runner};
 use crate::trust::{Kind, TRUSTED_UID, TrustError, facts_of, open_trusted};
 
@@ -60,9 +59,9 @@ const CANDIDATE_SUFFIX: &str = ".candidate";
 const COPY_SUFFIX: &str = ".xudo-new";
 
 /// The system group tools, tried in order.
-const GROUP_TOOLS: [(&str, &[&str]); 2] = [
-    ("/usr/sbin/groupadd", &["--system", "xudo"]),
-    ("/usr/sbin/addgroup", &["-S", "xudo"]),
+const GROUP_TOOLS: [(&str, &str); 2] = [
+    ("/usr/sbin/groupadd", "--system"),
+    ("/usr/sbin/addgroup", "-S"),
 ];
 
 /// How a directory is opened: production walks it from `/` as root's, and
@@ -71,7 +70,7 @@ type OpenDir = Box<dyn Fn(&Path) -> Result<Option<OwnedFd>, TrustError>>;
 
 /// What a shared file's editor does with its current contents: the new
 /// contents, or `None` when there is nothing to change.
-type Edit<'a> = &'a dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, blocks::BlockError>;
+type Edit<'a> = &'a dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, xudo_backend::blocks::BlockError>;
 
 /// Reads the real machine, and writes to it.
 pub struct HostInstallOps {
@@ -158,16 +157,9 @@ impl HostInstallOps {
         path: &str,
         partial_ok: bool,
     ) -> Result<bool, InstallError> {
-        let not_ours = |reason: &str| InstallError::NotOurs {
-            path: path.to_owned(),
-            reason: reason.to_owned(),
-        };
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        let fd = match openat(dir, name, flags, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(false),
-            Err(Errno::LOOP) => return Err(not_ours("it is a symbolic link")),
-            Err(errno) => return Err(io("open", path)(errno)),
+        let not_ours = |reason: &str| not_ours(path, reason);
+        let Some(fd) = open_no_follow(dir, name, path)? else {
+            return Ok(false);
         };
         // The checks on a descriptor that is already open: its owner, its kind,
         // its names, then its first bytes. Combinators rather than `?`, so a
@@ -186,6 +178,34 @@ impl HostInstallOps {
                     Ok(true)
                 } else {
                     Err(not_ours("it does not begin with xudo's marker"))
+                }
+            })
+    }
+
+    /// The whole of `name` when it is a file xudo wrote, as
+    /// [`Self::inspect_managed`] decides it; `None` when it is absent.
+    fn read_whole(
+        &self,
+        dir: BorrowedFd<'_>,
+        name: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, InstallError> {
+        let Some(fd) = open_no_follow(dir, name, path)? else {
+            return Ok(None);
+        };
+        fstat(&fd)
+            .map_err(io("stat", path))
+            .and_then(|stat| match self.why_not_ours(&stat) {
+                Some(reason) => Err(not_ours(path, reason)),
+                None => read_all(fd.as_fd(), path),
+            })
+            .and_then(|bytes| {
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SHARED_BYTES {
+                    Err(not_ours(path, "it is larger than any file xudo writes"))
+                } else if bytes.starts_with(MANAGED_MARKER.as_bytes()) {
+                    Ok(Some(bytes))
+                } else {
+                    Err(not_ours(path, "it does not begin with xudo's marker"))
                 }
             })
     }
@@ -515,6 +535,30 @@ struct Shared {
     current: Vec<u8>,
 }
 
+/// A file that is not xudo's, and how that was told.
+fn not_ours(path: &str, reason: &str) -> InstallError {
+    InstallError::NotOurs {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// Opens `name` in `dir` for reading without following a final link; `None`
+/// when it is absent, and a link is not xudo's.
+fn open_no_follow(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    path: &str,
+) -> Result<Option<OwnedFd>, InstallError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    match openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP) => Err(not_ours(path, "it is a symbolic link")),
+        Err(errno) => Err(io("open", path)(errno)),
+    }
+}
+
 /// All of a descriptor's contents, up to one byte past the most xudo will read,
 /// through a duplicate so the original keeps its lock.
 fn read_all(fd: BorrowedFd<'_>, path: &str) -> Result<Vec<u8>, InstallError> {
@@ -614,8 +658,8 @@ impl InstallOps for HostInstallOps {
 
     fn create_group(&self, name: &str) -> Result<(), InstallError> {
         let mut failures = Vec::new();
-        for (exe, args) in GROUP_TOOLS {
-            match self.runner.run(exe, args, None) {
+        for (exe, flag) in GROUP_TOOLS {
+            match self.runner.run(exe, &[flag, name], None) {
                 Ok(output) if output.success => return Ok(()),
                 Ok(output) => failures.push(format!("{exe}: {}", output.stderr.trim())),
                 // A tool this distribution does not have: try the next.
@@ -674,6 +718,14 @@ impl InstallOps for HostInstallOps {
         }
     }
 
+    fn read_managed(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError> {
+        // A directory that is not there holds nothing of xudo's.
+        let Some((dir, name)) = self.locate_dir(path)? else {
+            return Ok(None);
+        };
+        self.read_whole(dir.as_fd(), name, path)
+    }
+
     fn remove_managed(&self, path: &str) -> Result<Removal, InstallError> {
         // A directory that is not there holds nothing of xudo's.
         let Some((dir, name)) = self.locate_dir(path)? else {
@@ -699,7 +751,7 @@ impl InstallOps for HostInstallOps {
         self.rewrite_shared(
             path,
             &|current| {
-                blocks::insert(
+                xudo_backend::blocks::insert(
                     current,
                     block.as_bytes(),
                     DOAS_BEGIN.as_bytes(),
@@ -715,7 +767,9 @@ impl InstallOps for HostInstallOps {
     fn remove_block(&self, path: &str) -> Result<Removal, InstallError> {
         let changed = match self.rewrite_shared(
             path,
-            &|current| blocks::remove(current, DOAS_BEGIN.as_bytes(), DOAS_END.as_bytes()),
+            &|current| {
+                xudo_backend::blocks::remove(current, DOAS_BEGIN.as_bytes(), DOAS_END.as_bytes())
+            },
             None,
         ) {
             // Nothing to remove from a file that is not there.
@@ -728,7 +782,18 @@ impl InstallOps for HostInstallOps {
             Removal::Absent
         })
     }
+
+    fn lock_dir(&self, path: &str) -> Result<DirLock, InstallError> {
+        let fd = (self.open_dir)(Path::new(path))
+            .map_err(InstallError::Untrusted)?
+            .ok_or_else(|| InstallError::Missing {
+                path: path.to_owned(),
+            })?;
+        self.lock(fd.as_fd(), path)?;
+        Ok(DirLock { _fd: Some(fd) })
+    }
 }
 
+mod agent;
 #[cfg(test)]
 mod tests;

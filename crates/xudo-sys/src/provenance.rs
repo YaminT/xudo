@@ -233,7 +233,8 @@ pub fn hints(source: &dyn ProcSource, pid: u32) -> Vec<Hint> {
         }
     }
 
-    if let Ok(bytes) = source.read(&format!("{pid}/exe")) {
+    // The link's text, never the file: a read would copy the whole binary.
+    if let Ok(bytes) = source.read_link(&format!("{pid}/exe")) {
         out.push(Hint::new(
             HintSource::AncestorExe,
             "exe",
@@ -430,7 +431,7 @@ mod tests {
             .with("412/comm", "bash\n")
             .with("412/cmdline", b"bash\0-lc\0id\0".to_vec())
             .with("412/environ", environ)
-            .with("412/exe", "/usr/bin/bash");
+            .with_link("412/exe", "/usr/bin/bash");
 
         let collected = hints(&source, 412);
         let keys: Vec<&str> = collected.iter().map(|h| h.key.as_str()).collect();
@@ -472,7 +473,7 @@ mod tests {
     fn hint_values_of_arbitrary_bytes_survive_rendering() {
         let source = MapSource::new()
             .with("412/comm", vec![0xff, 0xfe])
-            .with("412/exe", vec![b'/', 0xff]);
+            .with_link("412/exe", vec![b'/', 0xff]);
         let collected = hints(&source, 412);
         assert!(collected.iter().any(|h| h.key == "comm"));
         assert!(collected.iter().any(|h| h.key == "exe"));

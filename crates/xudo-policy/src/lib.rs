@@ -63,6 +63,7 @@ pub mod harness;
 pub mod matcher;
 pub mod operation;
 pub mod overlap;
+pub mod pack;
 pub mod rule;
 pub mod rule_test;
 
@@ -73,11 +74,11 @@ pub use deny::{CapabilityClass, DenyFinding, deny_list_version, evaluate_deny_li
 pub use deny_rule::{DenyClause, DenyRule, DenyRuleMatch, MAX_DENY_RULES, evaluate_deny_rules};
 pub use engine::{Request, evaluate, evaluate_command};
 pub use files::{
-    Generation, HarnessFile, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError,
-    is_rule_file_name, load_policy, load_rule_files,
+    Generation, HarnessFile, LoadedPack, LoadedRuleSet, RULE_FILE_SUFFIX, RuleFile, RuleFilesError,
+    UnregisteredLabel, is_rule_file_name, load_policy, load_policy_with_registry, load_rule_files,
 };
 pub use harness::{
-    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, parse_harness_file, passwd_uid,
+    HarnessEntry, HarnessError, HarnessRegistry, HarnessWay, passwd_fault, passwd_uid,
     uid_from_passwd_read, valid_account_name, valid_harness_label,
 };
 pub use matcher::{ArgSpec, MatchError, Matcher, NameKind, Repeat};
@@ -86,8 +87,9 @@ pub use operation::{
     OwnerPolicy, RemoveGrant, evaluate_remove_path, judge_remove_path, target_under,
 };
 pub use overlap::Overlap;
+pub use pack::{Capability, PackHeader, PackRefusal, Review};
 pub use rule::{
-    Action, ActionId, GtfobinSets, HarnessLint, OpenUnitLint, Outcome, RuleSet, RuleSetError,
-    Source, Tier, gtfobin_sets, harness_near_miss,
+    Action, ActionId, HarnessLint, OpenUnitLint, Outcome, ParsedFile, RuleSet, RuleSetError,
+    Source, Tier, harness_near_miss,
 };
 pub use rule_test::{Expectation, RuleTest, TestError, TestOutcome, TestResult, run_tests};

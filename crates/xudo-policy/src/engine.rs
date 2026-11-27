@@ -120,30 +120,12 @@ impl Request {
 /// `trust.d` record plus a per-invocation flag, both enforced by the broker,
 /// because the realistic failure mode for this whole project is someone
 /// disabling a noisy prompt to unstick a workflow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// Whether an enrolled agent's actions are confirmed by a human.
-    ///
-    /// Defaults to `true` via [`Settings::default`]. Read only for an attested
-    /// agent, and no caller is one in this release. The design lets root's
-    /// rules alone decide what a verified harness runs, with no live approval,
-    /// so this setting goes when the agent path is built; until then `true`
-    /// is the fail-closed value.
-    pub confirm_agent_actions: bool,
     /// Whether human-path confirmation rules also require a watch approval.
     pub confirm_human_path: bool,
     /// Whether the agent path is frozen.
     pub frozen: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            confirm_agent_actions: true,
-            confirm_human_path: false,
-            frozen: false,
-        }
-    }
 }
 
 /// Evaluates a request that names an action. The whole crate exists to
@@ -394,12 +376,28 @@ impl<'c> Run<'c> {
             Err(run) => run,
         };
 
-        let (cited, reason) = strictest(seed, accepting, self.caller, self.settings);
+        let (cited, reason) = strictest(seed, accepting, self.caller);
         self.trace.push(TraceStep::ConfirmationDecided {
             required: reason.is_some(),
             reason: confirmation_text(reason, accepting.len()),
         });
 
+        // A grant is an agent the rule itself names, and nothing stricter
+        // overlapped: `reason` is the strictest of every accepting action.
+        let harness_grant = match (reason, self.caller.classification.enrolled_agent_id()) {
+            (None, Some(label)) => {
+                self.trace.push(TraceStep::HarnessGranted {
+                    action: cited.id.to_string(),
+                    harness: label.to_owned(),
+                });
+                Some(cited.id.clone())
+            }
+            _ => None,
+        };
+
+        // A grant is a plain `Allow`: the harness has no password to type. The
+        // broker mints it for `-nopass`, which still does nothing until root
+        // adds a sudoers line naming that file.
         let (verdict, confirm) = match reason {
             Some(reason) => (Verdict::AllowWithConfirmation, Confirm::Required { reason }),
             None => (Verdict::Allow, Confirm::NotRequired),
@@ -420,6 +418,7 @@ impl<'c> Run<'c> {
             resolved_exe: Some(cited.exe.clone()),
             resolved_argv: self.resolved_argv(),
             confirm,
+            harness_grant,
             trace: self.trace,
         }
     }
@@ -473,11 +472,7 @@ impl<'c> Run<'c> {
 
 /// What one action demands before it runs a command for this caller,
 /// considered on its own.
-fn confirmation_for(
-    action: &Action,
-    caller: &CallerFacts,
-    settings: Settings,
-) -> Option<ConfirmReason> {
+fn confirmation_for(action: &Action, caller: &CallerFacts) -> Option<ConfirmReason> {
     if action.tier.always_confirms() {
         // Checked first, so a critical action reports the critical reason
         // whatever its own `confirm` says: with `always`, ranking it as an
@@ -489,10 +484,15 @@ fn confirmation_for(
         Some(ConfirmReason::CriticalTier)
     } else if action.confirm == ConfirmPolicy::Always {
         Some(ConfirmReason::RuleRequiresConfirmation)
-    } else if action.confirm == ConfirmPolicy::Never {
-        None
-    } else if caller.classification.is_enrolled_agent() && settings.confirm_agent_actions {
-        Some(ConfirmReason::AgentActionsConfirmed)
+    } else if let Some(label) = caller.classification.enrolled_agent_id() {
+        // Checked before `confirm = "never"`: that setting is about the human
+        // path. An agent skips confirmation only when the rule names its
+        // harness with `outcome = "allow"`, and nothing else turns it off.
+        if action.passwordless_for(label) {
+            None
+        } else {
+            Some(ConfirmReason::AgentActionsConfirmed)
+        }
     } else {
         None
     }
@@ -507,13 +507,12 @@ fn strictest<'a>(
     seed: &'a Action,
     accepting: &[&'a Action],
     caller: &CallerFacts,
-    settings: Settings,
 ) -> (&'a Action, Option<ConfirmReason>) {
     let rank = |reason: Option<ConfirmReason>| reason.map_or(0, ConfirmReason::strictness);
     accepting.iter().fold(
-        (seed, confirmation_for(seed, caller, settings)),
+        (seed, confirmation_for(seed, caller)),
         |(cited, reason), &action| {
-            let candidate = confirmation_for(action, caller, settings);
+            let candidate = confirmation_for(action, caller);
             if rank(candidate) > rank(reason) {
                 (action, candidate)
             } else {
@@ -562,6 +561,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("20-services.toml", 3),
         }
     }
@@ -585,6 +585,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("30-packages.toml", 4),
         }
     }
@@ -620,13 +621,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_confirming_agent_actions() {
-        // The requirement: confirm even in yolo mode, unless explicitly
-        // narrowed. The default must not be silent.
+    fn settings_default_to_an_open_human_path_and_no_freeze() {
         let s = Settings::default();
-        assert!(s.confirm_agent_actions);
         assert!(!s.frozen);
-        assert!(format!("{s:?}").contains("confirm_agent_actions"));
+        assert!(!s.confirm_human_path);
+        assert!(format!("{s:?}").contains("frozen"));
     }
 
     #[test]
@@ -669,35 +668,124 @@ mod tests {
         assert_eq!(d.verdict, Verdict::AllowWithConfirmation);
     }
 
-    #[test]
-    fn narrowing_the_confirmation_requires_the_setting_and_the_rule_to_agree() {
-        // Turning the global setting off is not enough on its own for a rule
-        // that always confirms, and turning it off for an ordinary rule is the
-        // only combination that yields a bare allow on the agent path.
-        let mut always = svc_restart();
-        always.confirm = ConfirmPolicy::Always;
-        let strict = RuleSet::load(vec![always]).unwrap();
-        let off = Settings {
-            confirm_agent_actions: false,
-            ..Settings::default()
-        };
-        assert_eq!(
-            evaluate(&strict, &agent(), &restart_request(), off).verdict,
-            Verdict::AllowWithConfirmation
-        );
-        assert_eq!(
-            evaluate(&rules(), &agent(), &restart_request(), off).verdict,
-            Verdict::Allow
-        );
+    /// `systemctl` is a `GTFOBins` program, so a harness rule on it is a load
+    /// error without a reviewed waiver. The deny-list is what these tests
+    /// exercise, so they keep the real program name and carry the waiver.
+    const WAIVER: &str = "service manager pager escape: the unit is a name matcher and no option can be passed here, so no pager ever runs";
+
+    fn granted(labels: &[&str], outcome: crate::rule::Outcome) -> Action {
+        let mut action = svc_restart();
+        action.harness = labels.iter().map(|label| (*label).to_owned()).collect();
+        action.outcome = outcome;
+        action.gtfobins_waiver = Some(WAIVER.into());
+        action
+    }
+
+    fn confirmed(d: &Decision) -> bool {
+        d.verdict == Verdict::AllowWithConfirmation
+            && d.confirm
+                == Confirm::Required {
+                    reason: ConfirmReason::AgentActionsConfirmed,
+                }
+            && d.harness_grant.is_none()
+    }
+
+    /// A grant is a plain allow that names it.
+    fn granted_allow(d: &Decision) -> bool {
+        d.verdict == Verdict::Allow
+            && d.confirm == Confirm::NotRequired
+            && d.harness_grant.is_some()
     }
 
     #[test]
-    fn a_rule_may_opt_out_of_confirmation_entirely() {
+    fn a_rule_may_opt_a_human_out_of_confirmation_entirely() {
+        let mut never = svc_restart();
+        never.confirm = ConfirmPolicy::Never;
+        let set = RuleSet::load(vec![never]).unwrap();
+        let d = evaluate(&set, &human(), &restart_request(), Settings::default());
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert!(d.harness_grant.is_none());
+    }
+
+    #[test]
+    fn an_enrolled_agent_is_confirmed_on_a_never_rule() {
         let mut never = svc_restart();
         never.confirm = ConfirmPolicy::Never;
         let set = RuleSet::load(vec![never]).unwrap();
         let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
-        assert_eq!(d.verdict, Verdict::Allow);
+        assert!(confirmed(&d), "{d:?}");
+        let d = evaluate_command(
+            &set,
+            &agent(),
+            &Arg::from("/usr/bin/systemctl"),
+            &Argv::new(["restart", "nginx.service"]),
+            Settings::default(),
+        );
+        assert!(confirmed(&d), "{d:?}");
+    }
+
+    #[test]
+    fn a_listed_harness_on_an_allow_rule_is_granted() {
+        let set =
+            RuleSet::load(vec![granted(&["claude-code"], crate::rule::Outcome::Allow)]).unwrap();
+        let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert!(granted_allow(&d), "{d:?}");
+        assert_eq!(d.harness_grant, Some(ActionId::new("xudo.svc.restart")));
+        assert!(d.trace.iter().any(|step| matches!(
+            step,
+            TraceStep::HarnessGranted { action, harness }
+                if action == "xudo.svc.restart" && harness == "claude-code"
+        )));
+        // A human on the same rule is not an agent: no grant is recorded.
+        let human_decision = evaluate(&set, &human(), &restart_request(), Settings::default());
+        assert!(human_decision.harness_grant.is_none());
+        assert!(
+            !human_decision
+                .trace
+                .iter()
+                .any(|step| matches!(step, TraceStep::HarnessGranted { .. }))
+        );
+    }
+
+    #[test]
+    fn an_unlisted_harness_is_confirmed() {
+        let set = RuleSet::load(vec![granted(&["codex"], crate::rule::Outcome::Allow)]).unwrap();
+        let d = evaluate(&set, &agent(), &restart_request(), Settings::default());
+        assert!(confirmed(&d), "{d:?}");
+    }
+
+    #[test]
+    fn a_stricter_overlapping_action_cancels_the_grant() {
+        let grant = granted(&["claude-code"], crate::rule::Outcome::Allow);
+        let mut stricter = svc_restart();
+        stricter.id = ActionId::new("xudo.svc.restart-strict");
+        let mut always = stricter.clone();
+        always.id = ActionId::new("xudo.svc.restart-always");
+        always.confirm = ConfirmPolicy::Always;
+        let mut critical = stricter.clone();
+        critical.id = ActionId::new("xudo.svc.restart-critical");
+        critical.tier = Tier::Critical;
+        let mut unlisted = stricter.clone();
+        unlisted.harness = vec!["codex".into()];
+        unlisted.gtfobins_waiver = Some(WAIVER.into());
+        unlisted.outcome = crate::rule::Outcome::Allow;
+        for other in [stricter, always, critical, unlisted] {
+            for order in [
+                vec![grant.clone(), other.clone()],
+                vec![other.clone(), grant.clone()],
+            ] {
+                let set = RuleSet::load(order).unwrap();
+                let d = evaluate_command(
+                    &set,
+                    &agent(),
+                    &Arg::from("/usr/bin/systemctl"),
+                    &Argv::new(["restart", "nginx.service"]),
+                    Settings::default(),
+                );
+                assert_eq!(d.verdict, Verdict::AllowWithConfirmation, "{other:?}");
+                assert!(d.harness_grant.is_none());
+            }
+        }
     }
 
     #[test]
@@ -753,7 +841,6 @@ mod tests {
     #[test]
     fn a_frozen_agent_path_denies_while_the_human_path_still_works() {
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };
@@ -783,6 +870,7 @@ mod tests {
     fn an_ask_human_rule_queues_only_for_an_enrolled_harness() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["claude-code".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
 
@@ -807,6 +895,7 @@ mod tests {
     fn an_unattested_caller_hitting_an_ask_human_rule_keeps_the_password_path() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["claude-code".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
         let unattested = CallerFacts::new(
@@ -829,6 +918,7 @@ mod tests {
     fn an_ask_human_rule_only_applies_to_the_harness_labels_it_names() {
         let mut ask_human = svc_restart();
         ask_human.harness = vec!["other-harness".into()];
+        ask_human.gtfobins_waiver = Some(WAIVER.into());
         ask_human.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![ask_human]).unwrap();
         let decision = evaluate(&set, &agent(), &restart_request(), Settings::default());
@@ -865,6 +955,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("20-services.toml", 1),
         }
     }
@@ -986,6 +1077,7 @@ mod tests {
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell]).unwrap();
@@ -1060,8 +1152,6 @@ all = []
                 Matcher::Pattern(crate::matcher::AnchoredPattern::new(".+").unwrap()),
             ),
         ];
-        loose.harness = vec!["claude-code".into()];
-        loose.outcome = crate::rule::Outcome::AskHuman;
         let set = RuleSet::load(vec![loose]).unwrap();
         let d = evaluate(
             &set,
@@ -1153,7 +1243,6 @@ all = []
         // And a freeze does not touch them, because they are not on the agent
         // path at all.
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };
@@ -1181,6 +1270,7 @@ all = []
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("30-packages.toml", line),
         }
     }
@@ -1433,6 +1523,7 @@ all = []
             env_allow: Vec::new(),
             harness: Vec::new(),
             outcome: crate::rule::Outcome::Allow,
+            gtfobins_waiver: None,
             source: Source::new("99-oops.toml", 1),
         };
         let set = RuleSet::load(vec![shell("xudo.oops.one"), shell("xudo.oops.two")]).unwrap();
@@ -1496,7 +1587,6 @@ all = []
     #[test]
     fn a_frozen_agent_is_refused_before_any_action_is_consulted() {
         let frozen = Settings {
-            confirm_agent_actions: true,
             frozen: true,
             ..Settings::default()
         };

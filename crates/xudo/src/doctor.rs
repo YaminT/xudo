@@ -51,9 +51,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use term_sanitize::Limits;
+use xudo_backend::enrol::{managed_snippet, recheck_accounts};
 use xudo_backend::paths_to_root::{
-    self, Applies, Check, CheckId, Finding, Grant, Input, Proposal, Status, Unverified, Via,
-    Writer, assess, propose,
+    self, Applies, Check, CheckId, Finding, Grant, HostView, Input, Lookup, Proposal, Status,
+    Unverified, Via, Writer, assess, propose,
 };
 use xudo_backend::{Backend, BackendKind, Capability, DetectError, identify, judge};
 use xudo_policy::{CallerFacts, ExitCode};
@@ -90,6 +91,8 @@ pub struct Report {
     pub ruleset: RulesetReport,
     /// Whether xudo's sudoers rule is installed under a name sudo reads.
     pub sudoers_snippet: SnippetReport,
+    /// Whether the opt-in agent path is on, and byte for byte xudo's text.
+    pub agent_path: AgentPathReport,
     /// How this caller is classified.
     pub caller: CallerReport,
     /// The privilege backend.
@@ -98,6 +101,99 @@ pub struct Report {
     pub paths_to_root: paths_to_root::Report,
     /// What `--fix` proposes; `None` when it was not asked.
     pub proposals: Option<Vec<Proposal>>,
+    /// The enrol checks, run again for every enrolled agent account.
+    pub enrolled_accounts: EnrolledAccountsReport,
+}
+
+/// Whether `xudo install --agent-path` is in place, read from
+/// `/etc/sudoers.d/xudo` (root's alone, so `unknown` to anyone else).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentPathReport {
+    /// `on`: exactly xudo's agent-path text. `off`: no line of it names the
+    /// agent path. `edited`: it names the agent path and is not exactly
+    /// xudo's text. `unknown`: it could not be read.
+    pub state: &'static str,
+    /// Why, for `edited` and `unknown`.
+    pub detail: Option<String>,
+}
+
+impl AgentPathReport {
+    fn of(read: Lookup<Vec<u8>>) -> Self {
+        let (state, detail) = match read {
+            Lookup::Missing => ("off", None),
+            Lookup::Unreadable(why) => ("unknown", Some(why)),
+            Lookup::Found(bytes) => match xudo_backend::snippet::recognize(&bytes) {
+                Some(xudo_backend::snippet::ManagedForm::AgentPath) => ("on", None),
+                _ if xudo_backend::snippet::names_agent_path(&bytes) => (
+                    "edited",
+                    Some(
+                        "it names the agent path and is not byte for byte xudo's text; \
+                         `sudo xudo install --agent-path` cannot replace it either"
+                            .to_owned(),
+                    ),
+                ),
+                _ => ("off", None),
+            },
+        };
+        Self { state, detail }
+    }
+
+    /// The prose row.
+    fn line(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}: {}", self.state, safe(detail)),
+            None => self.state.to_owned(),
+        }
+    }
+}
+
+/// The account checks `enrol` ran, run again for each registry entry. An
+/// account that was clean when it was enrolled can gain a way to root later:
+/// a sudoers line, a group, a password, a drop-in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EnrolledAccountsReport {
+    /// One row per enrolled agent.
+    pub accounts: Vec<EnrolledAccountRow>,
+    /// Why the registry could not be read, when it could not.
+    pub unreadable: Option<String>,
+}
+
+/// One enrolled account's standing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EnrolledAccountRow {
+    /// The harness label.
+    pub label: String,
+    /// The account it runs as.
+    pub account: String,
+    /// Each way to root it has gained. Empty is clean.
+    pub problems: Vec<String>,
+    /// What could not be checked from here, such as a password as a non-root user.
+    pub unverified: Vec<String>,
+}
+
+fn enrolled_accounts(
+    host: &dyn HostView,
+    input: &Input<'_>,
+    managed: Option<&str>,
+) -> EnrolledAccountsReport {
+    match recheck_accounts(host, input, managed) {
+        Ok(rows) => EnrolledAccountsReport {
+            accounts: rows
+                .into_iter()
+                .map(|row| EnrolledAccountRow {
+                    label: row.label,
+                    account: row.account,
+                    problems: row.problems,
+                    unverified: row.unverified,
+                })
+                .collect(),
+            unreadable: None,
+        },
+        Err(why) => EnrolledAccountsReport {
+            accounts: Vec::new(),
+            unreadable: Some(why),
+        },
+    }
 }
 
 /// What the kernel offers the broker.
@@ -174,6 +270,18 @@ pub struct RulesetReport {
     /// Absent when the rules did not load or every unit matcher is a finite list.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub open_unit_lints: Vec<OpenUnitLintRow>,
+    /// Why the harness registry is empty although root wrote one.
+    ///
+    /// While set, no harness is armed for anyone; the rules still decide the
+    /// human path. Absent when the registry loaded or the rules did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_fault: Option<String>,
+    /// What is wrong with `/etc/passwd` (only that file: no NSS is asked).
+    ///
+    /// Unusable or non-UTF-8 lines, or a file that cannot be read. Absent
+    /// when the database is clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passwd_fault: Option<String>,
 }
 
 /// One systemctl rule whose unit matcher is not a finite list.
@@ -316,6 +424,19 @@ pub struct CapabilityRow {
     pub supported: bool,
     /// Whether xudo refuses to operate without it.
     pub required: bool,
+    /// Why it is neither supported nor plainly absent, when that is so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<CapabilityNote>,
+}
+
+/// A capability that is not supported and not simply absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityNote {
+    /// The backend never provides it and xudo accepts that.
+    Exempt,
+    /// No probe can tell whether the backend has it.
+    Unknown,
 }
 
 impl BackendReport {
@@ -345,6 +466,13 @@ impl BackendReport {
                     capability,
                     supported: backend.capabilities.has(capability),
                     required: capability.is_required(),
+                    note: if backend.capabilities.is_exempt(capability) {
+                        Some(CapabilityNote::Exempt)
+                    } else if backend.capabilities.is_unknown(capability) {
+                        Some(CapabilityNote::Unknown)
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
             missing_required: backend.capabilities.missing_required(),
@@ -364,20 +492,29 @@ pub(crate) fn gather(
 ) -> Report {
     let backend = identify(platform.probe);
     let backend_exe = backend.as_ref().map(|found| Path::new(found.exe.as_str()));
-    let paths = assess(
+    let input = Input {
+        user_path: platform.path,
+        backend_exe,
+        sudo_exe: backend
+            .as_ref()
+            .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
+            .map(|found| found.exe.as_str()),
+        doas_exe: backend
+            .as_ref()
+            .filter(|found| matches!(found.kind, BackendKind::Doas))
+            .map(|found| found.exe.as_str()),
+        doas_ignores_drop_ins: backend.as_ref().is_some_and(Backend::doas_ignores_drop_ins),
+    };
+    let paths = assess(platform.host, &input);
+    // Each enrolled account is held to what enrol held it to; the user `PATH`
+    // is about this caller, not the account.
+    let enrolled = enrolled_accounts(
         platform.host,
         &Input {
-            user_path: platform.path,
-            backend_exe,
-            sudo_exe: backend
-                .as_ref()
-                .filter(|found| matches!(found.kind, BackendKind::Sudo | BackendKind::SudoRs))
-                .map(|found| found.exe.as_str()),
-            doas_exe: backend
-                .as_ref()
-                .filter(|found| matches!(found.kind, BackendKind::Doas))
-                .map(|found| found.exe.as_str()),
+            user_path: None,
+            ..input
         },
+        managed_snippet(backend.as_ref()).as_deref(),
     );
     // Root commands go through the backend, where the human types their
     // password; a root caller needs no prefix.
@@ -395,12 +532,18 @@ pub(crate) fn gather(
             |found| format!("xudo exec runs {} on the gate", found.exe),
         ),
         kernel: KernelReport::of(platform.ops.kernel()),
-        ruleset: ruleset(rules, loaded),
+        ruleset: ruleset(rules, loaded, passwd_fault_of(platform.host)),
         sudoers_snippet: sudoers_snippets(),
+        agent_path: AgentPathReport::of(
+            platform
+                .host
+                .read(Path::new(xudo_backend::snippet::SUDOERS_PATH)),
+        ),
         caller: caller(platform.ops.classify(std::process::id())),
         backend: BackendReport::of(backend),
         paths_to_root: paths,
         proposals,
+        enrolled_accounts: enrolled,
     }
 }
 
@@ -430,7 +573,11 @@ pub(crate) fn run(
 /// Reported here rather than enforced here. `doctor` is diagnostic, and the
 /// enforcement point is the executor: a check the front-end could "pass"
 /// would be a check an attacker races against.
-fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetReport {
+fn ruleset(
+    rules: &Path,
+    loaded: Result<&LoadedRules, &LoadError>,
+    passwd_fault: Option<String>,
+) -> RulesetReport {
     let trusted = xudo_sys::read_trusted_dir(rules);
     let trust = trust_report(&trusted);
     let package_drift = rule_drift(rules, loaded, &trusted);
@@ -484,6 +631,20 @@ fn ruleset(rules: &Path, loaded: Result<&LoadedRules, &LoadError>) -> RulesetRep
                     .collect()
             })
             .unwrap_or_default(),
+        registry_fault: loaded
+            .ok()
+            .and_then(|loaded| loaded.registry_fault().map(str::to_owned)),
+        passwd_fault,
+    }
+}
+
+/// What is wrong with the account database, read the way the gate reads it
+/// (bytes, `/etc/passwd` only), or `None` when it is clean.
+fn passwd_fault_of(host: &dyn HostView) -> Option<String> {
+    match host.read(Path::new("/etc/passwd")) {
+        Lookup::Found(bytes) => xudo_policy::passwd_fault(&bytes),
+        Lookup::Missing => Some("/etc/passwd does not exist".to_owned()),
+        Lookup::Unreadable(why) => Some(format!("/etc/passwd cannot be read: {why}")),
     }
 }
 
@@ -864,6 +1025,7 @@ pub(crate) fn human(report: &Report) -> String {
     for id in &report.ruleset.inert_shipped_deny_rules {
         line("protect rule", id);
     }
+    fault_lines(&report.ruleset, &mut line);
     if report.backend.implementation == Some(BackendKind::Doas) {
         line("sudoers xudo", "does not apply to the doas backend");
     } else {
@@ -891,6 +1053,8 @@ pub(crate) fn human(report: &Report) -> String {
             line("sudoers xudo", &format!("unknown: {}", safe(reason)));
         }
     }
+    line("agent path", &report.agent_path.line());
+    enrolled_lines(&report.enrolled_accounts, &mut line);
     if let Some(label) = report.caller.classification {
         line("classified", label);
         line(
@@ -934,6 +1098,45 @@ pub(crate) fn human(report: &Report) -> String {
          security boundary; the allowlist and the compiled-in deny-list are."
     );
     out
+}
+
+/// The registry and account-database faults, when there are any.
+/// The standing of each enrolled account, or why it could not be read. Nothing
+/// at all when no agent is enrolled.
+fn enrolled_lines(report: &EnrolledAccountsReport, line: &mut dyn FnMut(&str, &str)) {
+    if let Some(why) = &report.unreadable {
+        line("enrolled", &format!("unknown: {}", safe(why)));
+    }
+    for row in &report.accounts {
+        let who = format!("{} ({})", safe(&row.label), safe(&row.account));
+        if row.problems.is_empty() {
+            line("enrolled", &format!("{who}: no other way to root found"));
+        }
+        for problem in &row.problems {
+            line(
+                "enrolled",
+                &format!("{who} HAS A WAY TO ROOT: {}", safe(problem)),
+            );
+        }
+        for gap in &row.unverified {
+            line("enrolled", &format!("{who} unverified: {}", safe(gap)));
+        }
+    }
+}
+
+fn fault_lines(ruleset: &RulesetReport, line: &mut dyn FnMut(&str, &str)) {
+    if let Some(why) = &ruleset.registry_fault {
+        line(
+            "registry",
+            &format!(
+                "FAULT (parse only, no trust walk), no harness is armed: {}",
+                safe(why)
+            ),
+        );
+    }
+    if let Some(why) = &ruleset.passwd_fault {
+        line("account db", &format!("FAULT: {}", safe(why)));
+    }
 }
 
 fn loaded_ruleset_label(loaded: Option<&LoadedSummary>) -> String {
@@ -1054,7 +1257,16 @@ fn backend_lines(backend: &BackendReport, line: &mut dyn FnMut(&str, &str)) {
                 ),
             );
             for row in backend.capabilities.iter().filter(|row| !row.supported) {
-                line("", &format!("absent: {}", capability_label(row.capability)));
+                let label = capability_label(row.capability);
+                match (row.note, row.capability.exemption()) {
+                    (Some(CapabilityNote::Exempt), Some(reason)) => {
+                        line("", &format!("exempt: {label}: {reason}"));
+                    }
+                    (Some(CapabilityNote::Unknown), _) => {
+                        line("", &format!("unknown: {label}"));
+                    }
+                    _ => line("", &format!("absent: {label}")),
+                }
             }
         }
     }
@@ -1202,6 +1414,18 @@ fn finding_line(finding: &Finding) -> String {
             "doas itself permits {} for you without a password, by {}",
             safe(command),
             safe_path(file)
+        ),
+        Finding::DoasLaterRule {
+            file,
+            line,
+            text,
+            why,
+            ..
+        } => format!(
+            "warning: {}:{line} {}: {}",
+            safe_path(file),
+            safe(why),
+            safe(text)
         ),
         Finding::GroupMembership {
             group,
@@ -1899,6 +2123,10 @@ mod tests {
         fn validates_named_file(&self, _absolute_path: &str) -> bool {
             true
         }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            true
+        }
+
         fn accepts_argument_wildcard(&self, _absolute_path: &str) -> bool {
             true
         }
@@ -2280,7 +2508,7 @@ mod tests {
         )
         .unwrap();
         let loaded = LoadedRules::from_dir(&dir).unwrap();
-        let section = ruleset(&dir, Ok(&loaded));
+        let section = ruleset(&dir, Ok(&loaded), None);
         assert!(section.lifecycle_note.is_none());
         let found = section.open_unit_lints.first().unwrap();
         assert_eq!(found.action, "xudo.svc.lifecycle");
@@ -2313,6 +2541,87 @@ mod tests {
         let json = render::json_of(&report);
         assert!(json.contains("\"open_unit_lints\""), "{json}");
         assert!(json.contains("xudo.svc.lifecycle"), "{json}");
+    }
+
+    fn dirty_passwd_host(contents: &[u8]) -> MemoryHost {
+        MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![1000]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, contents)
+    }
+
+    #[test]
+    fn doctor_reports_each_way_the_account_database_can_be_wrong() {
+        assert_eq!(passwd_fault_of(&clean_host()), None);
+        let mut gecos = b"agent:x:1000:1000:A".to_vec();
+        gecos.extend_from_slice(&[0xff]);
+        gecos.extend_from_slice(b":/h:/bin/sh\nbad:x:nope:1\n");
+        assert_eq!(
+            passwd_fault_of(&dirty_passwd_host(&gecos)).as_deref(),
+            Some("1 unusable and 1 non-UTF-8 line(s) in the account database")
+        );
+        let missing = MemoryHost::new(Caller {
+            uid: 1000,
+            gid: 1000,
+            groups: Lookup::Found(vec![]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755);
+        assert_eq!(
+            passwd_fault_of(&missing).as_deref(),
+            Some("/etc/passwd does not exist")
+        );
+        let unreadable = dirty_passwd_host(b"").fault("/etc/passwd", "EACCES");
+        assert!(
+            passwd_fault_of(&unreadable)
+                .unwrap()
+                .contains("cannot be read")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_registry_fault_and_a_passwd_fault() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join("doctor-registry-fault");
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = dir.join("rules.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(dir.join("harnesses.d")).unwrap();
+        std::fs::write(
+            dir.join("harnesses.d/codex.toml"),
+            "label = \"codex\"\nwat = 1\n",
+        )
+        .unwrap();
+        let loaded = LoadedRules::from_dir(&rules).unwrap();
+        let report = gathered(
+            &dirty_passwd_host(b"bad:x:nope:1\n"),
+            "/usr/bin",
+            &TestOps {
+                release: "6.8.0-90-generic",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&loaded),
+            false,
+        );
+        let text = human(&report);
+        assert!(text.contains("no harness is armed"), "{text}");
+        assert!(text.contains("account db"), "{text}");
+        let json = render::json_of(&report);
+        assert!(json.contains("\"registry_fault\""), "{json}");
+        assert!(json.contains("\"passwd_fault\""), "{json}");
+        // A clean machine prints neither, so its pinned envelope is unchanged.
+        let clean = ruleset(&rules, Ok(&loaded), None);
+        assert!(clean.passwd_fault.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2357,6 +2666,94 @@ mod tests {
         );
         insta::assert_snapshot!("json_every_path", render::json_of(&hostile_report(true)));
         insta::assert_snapshot!("human_every_path", human(&hostile_report(true)));
+    }
+
+    #[test]
+    fn a_later_doas_rule_is_a_warning_with_its_file_and_line() {
+        let finding = Finding::DoasLaterRule {
+            file: std::path::PathBuf::from("/etc/doas.d/doas.conf"),
+            line: 3,
+            text: "permit persist :xudo".to_owned(),
+            why: "doas uses the last matching rule".to_owned(),
+            nopass: false,
+            persist: true,
+        };
+        assert_eq!(
+            finding_line(&finding),
+            "warning: /etc/doas.d/doas.conf:3 doas uses the last matching rule: permit persist :xudo"
+        );
+    }
+
+    #[test]
+    fn doas_reports_its_pty_as_an_exemption_and_its_cache_as_unknown() {
+        let doas = xudo_backend::Backend {
+            exe: "/usr/bin/doas".to_owned(),
+            kind: BackendKind::Doas,
+            version: "doas (OpenDoas) 6.8.2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::empty()
+                .with(Capability::PerCommandDefaults)
+                .with(Capability::DisableCredentialCache)
+                .with_exemption(Capability::AllocatePty)
+                .with_unknown(Capability::PersistentCredentialCache),
+        };
+        let mut report = hostile_report(false);
+        report.backend = BackendReport::of(Some(doas));
+        assert_eq!(report.backend.status, BackendStatus::Usable);
+        let text = human(&report);
+        assert!(text.contains("backend caps 2 of 7 supported"), "{text}");
+        assert!(
+            text.contains(
+                "exempt: allocate pty (REQUIRED): doas never allocates a pty; accepted because the target is root"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("unknown: persistent credential cache"),
+            "{text}"
+        );
+        assert!(text.contains("absent: drop-in directory"), "{text}");
+        let json = render::json_of(&report);
+        assert!(json.contains("\"note\": \"exempt\""), "{json}");
+        assert!(json.contains("\"note\": \"unknown\""), "{json}");
+    }
+
+    #[test]
+    fn doctor_reports_the_agent_path_and_whether_its_text_is_byte_exact() {
+        let backend = xudo_backend::Backend {
+            exe: "/usr/bin/sudo".to_owned(),
+            kind: BackendKind::Sudo,
+            version: "Sudo version 1.9.17p2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::from_supported(Capability::ALL),
+        };
+        let agent = xudo_backend::SudoersSnippet::with_agent_path(&backend)
+            .unwrap()
+            .contents;
+        let human = xudo_backend::SudoersSnippet::human_only(&backend)
+            .unwrap()
+            .contents;
+        let state = |read| AgentPathReport::of(read).state;
+        assert_eq!(state(Lookup::Found(agent.clone().into_bytes())), "on");
+        assert_eq!(state(Lookup::Found(human.into_bytes())), "off");
+        assert_eq!(
+            state(Lookup::Found(b"# Managed by xudo.\n".to_vec())),
+            "off"
+        );
+        assert_eq!(state(Lookup::Missing), "off");
+        // Both prose forms, whatever this host's own file says.
+        assert_eq!(AgentPathReport::of(Lookup::Missing).line(), "off");
+        assert_eq!(
+            AgentPathReport::of(Lookup::Unreadable("denied".to_owned())).line(),
+            "unknown: denied"
+        );
+        let edited = format!("{agent}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n");
+        let report = AgentPathReport::of(Lookup::Found(edited.into_bytes()));
+        assert_eq!(report.state, "edited");
+        assert!(report.detail.unwrap().contains("byte for byte"));
+        let report = AgentPathReport::of(Lookup::Unreadable("permission denied".to_owned()));
+        assert_eq!(
+            (report.state, report.detail.as_deref()),
+            ("unknown", Some("permission denied"))
+        );
     }
 
     #[test]
@@ -2697,5 +3094,177 @@ mod tests {
         assert!(report.kernel.withheld_because.is_some());
         assert_eq!(report.caller.classification, None);
         assert!(report.caller.password_required);
+    }
+    // ---- H2d: the enrol checks, run again for every enrolled agent ----
+
+    const ENROLLED_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
+        yamin:x:1000:1000::/home/yamin:/bin/sh\n\
+        alice:x:1001:1001::/home/alice:/bin/sh\n\
+        agent:x:990:990::/var/lib/agent:/usr/sbin/nologin\n";
+    const ENROLLED_GROUPS: &[u8] =
+        b"xudo:x:998:yamin,agent\nxudo-agent:x:997:agent\nyamin:x:1000:\nagent:x:990:\n";
+
+    /// What xudo itself would write for the passwordless line on this machine.
+    fn managed_text() -> String {
+        let backend = identify(&SUDO).unwrap();
+        xudo_backend::enrol::managed_snippet(Some(&backend)).unwrap()
+    }
+
+    /// `clean_host` with one agent enrolled the way `xudo agent enrol` leaves it.
+    fn enrolled_host(snippet: &str) -> MemoryHost {
+        let dir = "/etc/systemd/system/xudo-agent@codex.service.d";
+        clean_host()
+            .file("/etc/passwd", 0, 0, 0o644, ENROLLED_PASSWD)
+            .file("/etc/group", 0, 0, 0o644, ENROLLED_GROUPS)
+            .file("/etc/sudoers.d/xudo", 0, 0, 0o440, snippet.as_bytes())
+            // Debian's stock PAM stack for sudo.
+            .dir("/etc/pam.d", 0, 0, 0o755)
+            .file(
+                "/etc/pam.d/sudo",
+                0,
+                0,
+                0o644,
+                b"@include common-auth\n@include common-account\n",
+            )
+            .file(
+                "/etc/pam.d/common-auth",
+                0,
+                0,
+                0o644,
+                b"auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n",
+            )
+            .file("/etc/pam.d/common-account", 0, 0, 0o644, b"account required pam_unix.so\n")
+            .dir("/etc/xudo", 0, 0, 0o755)
+            .dir("/etc/xudo/harnesses.d", 0, 0, 0o755)
+            .file(
+                "/etc/xudo/harnesses.d/codex.toml",
+                0,
+                0,
+                0o644,
+                b"# Managed by xudo.\nlabel = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n",
+            )
+            .dir("/etc/systemd", 0, 0, 0o755)
+            .dir("/etc/systemd/system", 0, 0, 0o755)
+            .dir(dir, 0, 0, 0o755)
+            .file(
+                &format!("{dir}/10-xudo.conf"),
+                0,
+                0,
+                0o644,
+                b"# Managed by xudo.\n[Service]\nUser=agent\nExecStart=\"/usr/bin/codex\"\n",
+            )
+    }
+
+    fn enrolled_report(host: &MemoryHost) -> Report {
+        gathered(
+            host,
+            "/usr/bin",
+            &TestOps {
+                release: "6.13.0",
+                observable: true,
+            },
+            &SUDO,
+            Ok(&fixture_rules("4")),
+            false,
+        )
+    }
+
+    #[test]
+    fn doctor_reports_an_enrolled_account_that_gained_a_root_path() {
+        // Enrolled clean, with the managed passwordless line in place.
+        let clean = enrolled_report(&enrolled_host(&managed_text()));
+        let row = &clean.enrolled_accounts.accounts[0];
+        assert_eq!(
+            (row.label.as_str(), row.account.as_str()),
+            ("codex", "agent")
+        );
+        assert!(row.problems.is_empty(), "{:?}", row.problems);
+        // The shadow file is root's, and this caller is not: said, not guessed.
+        assert!(row.unverified.iter().any(|gap| gap.contains("/etc/shadow")));
+        let text = human(&clean);
+        assert!(
+            text.contains("codex (agent): no other way to root found"),
+            "{text}"
+        );
+        assert!(text.contains("unverified"), "{text}");
+        assert!(!text.contains("HAS A WAY TO ROOT"));
+
+        // Later, root hand-writes a rule for the account.
+        let gained = enrolled_host(&managed_text()).file(
+            "/etc/sudoers.d/90-agent",
+            0,
+            0,
+            0o440,
+            b"agent ALL=(ALL) NOPASSWD: ALL\n",
+        );
+        let report = enrolled_report(&gained);
+        let row = &report.enrolled_accounts.accounts[0];
+        assert!(
+            row.problems
+                .iter()
+                .any(|p| p.contains("/etc/sudoers.d/90-agent")),
+            "{:?}",
+            row.problems
+        );
+        assert!(human(&report).contains("codex (agent) HAS A WAY TO ROOT"));
+        // The envelope carries the same rows.
+        let json: serde_json::Value = serde_json::from_str(&render::json_of(&report)).unwrap();
+        assert_eq!(json["enrolled_accounts"]["accounts"][0]["label"], "codex");
+        assert!(json["enrolled_accounts"]["accounts"][0]["problems"][0].is_string());
+
+        // The managed line altered by one byte is not exempt any more.
+        let altered = enrolled_host(&format!("{}\n", managed_text()));
+        assert!(
+            !enrolled_report(&altered).enrolled_accounts.accounts[0]
+                .problems
+                .is_empty()
+        );
+        // A group that is root by another name, gained after enrolment.
+        let grouped = enrolled_host(&managed_text()).file(
+            "/etc/group",
+            0,
+            0,
+            0o644,
+            b"xudo:x:998:yamin,agent\nxudo-agent:x:997:agent\ndocker:x:999:agent\nyamin:x:1000:\nagent:x:990:\n",
+        );
+        let report = enrolled_report(&grouped);
+        assert!(
+            report.enrolled_accounts.accounts[0]
+                .problems
+                .iter()
+                .any(|p| p.contains("docker"))
+        );
+        // A second drop-in beside ours.
+        let dropped = enrolled_host(&managed_text()).file(
+            "/etc/systemd/system/xudo-agent@codex.service.d/50-more.conf",
+            0,
+            0,
+            0o644,
+            b"[Service]\nUser=root\n",
+        );
+        let report = enrolled_report(&dropped);
+        assert!(
+            report.enrolled_accounts.accounts[0]
+                .problems
+                .iter()
+                .any(|p| p.contains("50-more") || p.contains("holds more"))
+        );
+    }
+
+    #[test]
+    fn doctor_says_nothing_about_agents_when_none_is_enrolled_and_why_when_it_cannot_look() {
+        let none = enrolled_report(&clean_host());
+        assert!(none.enrolled_accounts.accounts.is_empty());
+        assert!(none.enrolled_accounts.unreadable.is_none());
+        assert!(!human(&none).contains("enrolled "));
+        let unreadable = enrolled_host(&managed_text()).unreadable_file(
+            "/etc/xudo/harnesses.d/codex.toml",
+            0,
+            0,
+            0o644,
+        );
+        let report = enrolled_report(&unreadable);
+        assert!(report.enrolled_accounts.unreadable.is_some());
+        assert!(human(&report).contains("enrolled     unknown:"));
     }
 }

@@ -1,16 +1,19 @@
-//! A typed operation the gate runs itself.
+//! A typed operation the gate runs itself. It never execs.
 //!
-//! The password gate is the only invocation [`crate::run`] accepts, so this
-//! path never execs and never consults a harness label. The broker's verdict
-//! is not an input: the grant comes from root's rules and the passwd file the
-//! trust walk already read.
+//! The `-auth` gate runs it after `sudo` asked the password. The `-nopass`
+//! gate runs it only for a live harness the operation rule lists with
+//! `outcome = "allow"`, re-decided here from root's rules: the broker's
+//! verdict is not an input. Either way the walk is the same one, with the
+//! rule's tree, depth, entry cap and owners.
 
 use xudo_audit::record::{Decision as AuditDecision, Outcome, Record};
 use xudo_policy::{CallerFacts, OwnerPolicy, RuleSet, engine::Settings};
 use xudo_sys::{RemoveError, RemoveOwnerPolicy, RemoveReport, RemoveRequest};
 use xudo_wire::OPERATION_PROGRAM;
 
-use crate::decide::{GateCaller, Refusal, Severity, Stage};
+use xudo_sys::GateMode;
+
+use crate::decide::{GateCaller, ModeRefusal, Refusal, Severity, Stage, mode_refusal};
 use crate::request::PendingRequest;
 
 /// What the walk is allowed to do, plus the fields the audit record cites.
@@ -28,14 +31,19 @@ pub(crate) struct OperationWork {
     pub(crate) target: Vec<u8>,
     /// Sequence number of the pre-walk intent record.
     pub(crate) intent_sequence: Option<u64>,
+    /// Digest of the gate's own dry run, taken before the walk.
+    pub(crate) planned_digest: Option<[u8; 32]>,
+    /// The entry's `via`: `auth` after a password, `harness` for a grant.
+    pub(crate) via: &'static str,
 }
 
 /// Re-decide `pending` and build the walk request.
 ///
 /// # Errors
 ///
-/// A missing password proof, a program that is not the operation marker, an
-/// unknown op, or a policy denial. Nothing has been removed.
+/// A missing human-path confirmation, a program that is not the operation
+/// marker, an unknown op, a policy denial, or, on `-nopass`, no grant for
+/// this harness. Nothing has been removed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_remove(
     rules: &RuleSet,
@@ -46,15 +54,11 @@ pub(crate) fn prepare_remove(
     dry_run: bool,
     settings: Settings,
     passwd: &str,
-    password_confirms: bool,
+    mode: GateMode,
 ) -> Result<OperationWork, Refusal> {
-    if !password_confirms {
-        return Err(Refusal::Failed {
-            stage: Stage::Invocation,
-            reason: "remove-path runs only through the password gate".to_owned(),
-        });
-    }
-    if settings.confirm_human_path && !pending.confirmed {
+    // On `-nopass` the setting withholds the grant instead (see
+    // `judge_remove_path`), so a harness entry never waits on a watcher.
+    if mode == GateMode::Auth && settings.confirm_human_path && !pending.confirmed {
         return Err(Refusal::Failed {
             stage: Stage::Invocation,
             reason: "remove-path requires the configured human-path confirmation".to_owned(),
@@ -70,6 +74,15 @@ pub(crate) fn prepare_remove(
         Ok(grant) => grant,
         Err(decision) => return Err(Refusal::Policy(decision)),
     };
+    // No password was asked: only the rule's grant to this live harness, the
+    // label the broker minted the entry for, lets the walk run. This check is
+    // the gate's own, second engine: it must stay here and never move into
+    // the broker, whose mint is advisory and is not what the gate trusts.
+    if mode == GateMode::Nopass
+        && (grant.harness.is_none() || grant.harness != pending.attested_harness)
+    {
+        return Err(mode_refusal(mode, ModeRefusal::NotGranted));
+    }
     let requested_target = target.escape_ascii().to_string();
     if pending.action != grant.id.as_str()
         || pending.operation.as_ref().is_none_or(|operation| {
@@ -102,6 +115,8 @@ pub(crate) fn prepare_remove(
         under: grant.under,
         target: target.to_vec(),
         intent_sequence: None,
+        planned_digest: None,
+        via: pending.via.label(),
     })
 }
 
@@ -114,13 +129,18 @@ fn walk_owners(owners: OwnerPolicy) -> RemoveOwnerPolicy {
 
 /// Evidence for the one record of a finished walk.
 pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Vec<String> {
-    let severity = if report.dry_run {
+    // An escape met after some names went (the tree changed after the dry
+    // run) is still somebody's planted link or mount.
+    let severity = if escaped(report) {
+        Severity::High
+    } else if report.dry_run {
         Severity::Low
     } else {
         Severity::Normal
     };
     let mut evidence = vec![
         "op=remove-path".to_owned(),
+        format!("via={}", work.via),
         format!("tree={}", work.under.escape_ascii()),
         format!("target={}", work.target.escape_ascii()),
         format!("count={}", report.removed.len()),
@@ -135,6 +155,11 @@ pub(crate) fn remove_evidence(work: &OperationWork, report: &RemoveReport) -> Ve
     }
     if let Some(sequence) = work.intent_sequence {
         evidence.push(format!("intent_seq={sequence}"));
+    }
+    if let Some(planned) = work.planned_digest {
+        // The tree may change between the dry run and the walk: say so.
+        evidence.push(format!("planned_digest={}", hex_digest(&planned)));
+        evidence.push(format!("matches_plan={}", planned == report.digest));
     }
     for path in xudo_sys::remove::audit_path_head(&report.removed) {
         evidence.push(format!("path={}", path.escape_ascii()));
@@ -160,12 +185,17 @@ pub(crate) fn intent_record(
         caller.facts.classification.label(),
     )
     .with_rule(&work.id, &work.source)
+    // `planned_sha256` is an audit trace of the gate's own dry-run, computed
+    // after the request was consumed. It is not an approval binding: the
+    // broker never approves a digest and nothing requires it to match one.
     .with_evidence(vec![
         "op=remove-path-intent".to_owned(),
+        format!("via={}", work.via),
         format!("tree={}", work.under.escape_ascii()),
         format!("target={}", work.target.escape_ascii()),
         format!("planned_count={}", planned.removed.len()),
         format!("planned_partial={}", planned.partial),
+        format!("planned_sha256={}", hex_digest(&planned.digest)),
     ])
     .with_outcome(Outcome::NotExecuted)
 }
@@ -232,12 +262,31 @@ fn hex_digit(nibble: u8) -> char {
 }
 
 /// A walk error before any name was removed. The caller has already consumed
-/// the spool entry.
+/// the spool entry. A link or mount the walk would cross is its own, loud
+/// refusal: it is planted, never a host that could not take a step.
 pub(crate) fn walk_refusal(error: &RemoveError) -> Refusal {
+    if let RemoveError::WalkEscape(reason) = error {
+        return Refusal::WalkEscape { reason };
+    }
     Refusal::Failed {
         stage: Stage::Exec,
         reason: error.to_string(),
     }
+}
+
+/// The gate's dry run met a link or mount it would cross: refuse the whole
+/// operation before the walk that unlinks, even where names before the
+/// escape could have gone.
+pub(crate) fn refuse_a_planned_escape(planned: &RemoveReport) -> Result<(), Refusal> {
+    match &planned.error {
+        Some(error @ RemoveError::WalkEscape(_)) => Err(walk_refusal(error)),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the walk stopped at a link or mount it would cross.
+fn escaped(report: &RemoveReport) -> bool {
+    matches!(report.error, Some(RemoveError::WalkEscape(_)))
 }
 
 /// Whether a policy denial from this path is `DenialCode::OperationRefused`.
@@ -250,6 +299,9 @@ pub(crate) fn is_operation_refusal(refusal: &Refusal) -> bool {
         Refusal::NoPendingRequest { .. }
         | Refusal::Request(_)
         | Refusal::ConfirmationMissing(_)
+        | Refusal::Mode { .. }
+        | Refusal::RateCeiling { .. }
+        | Refusal::WalkEscape { .. }
         | Refusal::Failed { .. } => false,
     }
 }
@@ -264,6 +316,13 @@ pub(crate) fn operation_status(report: &RemoveReport) -> i32 {
 pub(crate) fn operation_message(report: &RemoveReport) -> String {
     if report.dry_run {
         format!("xudo-gate: dry-run listed {} paths", report.removed.len())
+    } else if let Some(RemoveError::WalkEscape(reason)) = &report.error {
+        // The tree changed after the dry run and the real walk met a planted
+        // link or mount: say so, not only how many names went first.
+        format!(
+            "xudo-gate: partial remove of {} paths, stopped by gate_walk_escape: {reason}",
+            report.removed.len()
+        )
     } else if report.partial {
         format!(
             "xudo-gate: partial remove of {} paths",
@@ -354,6 +413,7 @@ owners = ["agent"]
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: crate::request::Via::Auth,
             queue_id: None,
             operation: Some(RequestedOp {
                 op: op.into(),
@@ -368,18 +428,74 @@ owners = ["agent"]
         pending: &'a PendingRequest,
         password: bool,
     ) -> Result<OperationWork, Refusal> {
+        prepare_as(rules, &human(), pending, password, Settings::default())
+    }
+
+    fn prepare_as(
+        rules: &RuleSet,
+        caller: &CallerFacts,
+        pending: &PendingRequest,
+        password: bool,
+        settings: Settings,
+    ) -> Result<OperationWork, Refusal> {
         let op = pending.operation.as_ref().unwrap();
         prepare_remove(
             rules,
-            &human(),
+            caller,
             pending,
             &op.op,
             &op.target,
             op.dry_run,
-            Settings::default(),
+            settings,
             PASSWD,
-            password,
+            if password {
+                GateMode::Auth
+            } else {
+                GateMode::Nopass
+            },
         )
+    }
+
+    fn codex() -> CallerFacts {
+        CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "codex".into(),
+                session_id: "s".into(),
+                declared_yolo: false,
+            },
+            1000,
+        )
+    }
+
+    fn granting() -> RuleSet {
+        rules(
+            r#"
+[[operation]]
+id = "web.clean-build"
+op = "remove-path"
+under = "/srv/app/build"
+recursive = true
+max-depth = 4
+max-entries = 10
+owners = ["agent"]
+harness = ["codex"]
+outcome = "allow"
+"#,
+        )
+    }
+
+    fn harness_pending() -> PendingRequest {
+        let mut entry = pending(OPERATION_PROGRAM, "remove-path");
+        entry.via = crate::request::Via::Harness;
+        entry.attested_harness = Some("codex".into());
+        entry
+    }
+
+    fn not_granted() -> Refusal {
+        Refusal::Mode {
+            mode: "-nopass",
+            reason: ModeRefusal::NotGranted,
+        }
     }
 
     #[test]
@@ -403,17 +519,121 @@ owners = ["agent"]
     }
 
     #[test]
-    fn prepare_remove_refuses_without_the_password_proof() {
-        let error =
-            prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), false).unwrap_err();
+    fn nopass_runs_a_remove_path_the_rule_grants_this_harness() {
+        let work = prepare_as(
+            &granting(),
+            &codex(),
+            &harness_pending(),
+            false,
+            Settings::default(),
+        )
+        .unwrap();
+        // The same walk the password path would run: the rule's bounds.
+        assert_eq!(work.request.under, b"/srv/app/build");
+        assert_eq!(work.request.relative, b"cache");
+        assert_eq!(work.request.max_depth, 4);
+        assert_eq!(work.request.max_entries, 10);
+        assert_eq!(work.request.owners, RemoveOwnerPolicy::Only(vec![1000]));
+    }
+
+    #[test]
+    fn nopass_refuses_a_remove_path_without_a_grant() {
+        // A human, an unlisted harness, and a rule that lists nobody: no
+        // password was asked, so nothing runs.
+        let claude = CallerFacts::new(
+            Classification::EnrolledAgent {
+                agent_id: "claude".into(),
+                session_id: "s".into(),
+                declared_yolo: false,
+            },
+            1000,
+        );
+        for (set, caller) in [
+            (sample(), codex()),
+            (granting(), human()),
+            (granting(), claude),
+        ] {
+            let error = prepare_as(
+                &set,
+                &caller,
+                &harness_pending(),
+                false,
+                Settings::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error, not_granted(), "{caller:?}");
+            assert!(!is_operation_refusal(&error));
+        }
+    }
+
+    #[test]
+    fn nopass_refuses_a_grant_for_a_label_the_entry_was_not_minted_for() {
+        let mut entry = harness_pending();
+        entry.attested_harness = Some("claude".into());
         assert_eq!(
-            error,
+            prepare_as(&granting(), &codex(), &entry, false, Settings::default()).unwrap_err(),
+            not_granted()
+        );
+        entry.attested_harness = None;
+        assert_eq!(
+            prepare_as(&granting(), &codex(), &entry, false, Settings::default()).unwrap_err(),
+            not_granted()
+        );
+    }
+
+    #[test]
+    fn nopass_withholds_a_remove_path_grant_under_confirm_human_path() {
+        // The human-path watch is a confirmation a harness cannot give: the
+        // grant is withheld rather than waited on, and nothing runs.
+        let settings = Settings {
+            confirm_human_path: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            prepare_as(&granting(), &codex(), &harness_pending(), false, settings).unwrap_err(),
+            not_granted()
+        );
+    }
+
+    #[test]
+    fn nopass_refuses_a_target_outside_the_granted_tree() {
+        let mut entry = harness_pending();
+        entry.argv = vec!["/etc/passwd".into()];
+        entry.operation = Some(RequestedOp {
+            op: "remove-path".into(),
+            target: b"/etc/passwd".to_vec(),
+            dry_run: false,
+        });
+        let error =
+            prepare_as(&granting(), &codex(), &entry, false, Settings::default()).unwrap_err();
+        assert!(is_operation_refusal(&error));
+    }
+
+    #[test]
+    fn nopass_entry_for_one_path_cannot_remove_another() {
+        // The entry's argv names one path and its operation another: the gate
+        // refuses rather than pick either.
+        let mut entry = harness_pending();
+        entry.argv = vec!["/srv/app/build/other".into()];
+        assert_eq!(
+            prepare_as(&granting(), &codex(), &entry, false, Settings::default()).unwrap_err(),
             Refusal::Failed {
-                stage: Stage::Invocation,
-                reason: "remove-path runs only through the password gate".into(),
+                stage: Stage::Rules,
+                reason: "the spool entry does not match the gate-selected operation and target"
+                    .into(),
             }
         );
-        assert!(!is_operation_refusal(&error));
+    }
+
+    #[test]
+    fn nopass_refuses_a_frozen_harness_before_the_walk() {
+        let frozen = Settings {
+            frozen: true,
+            ..Settings::default()
+        };
+        let error =
+            prepare_as(&granting(), &codex(), &harness_pending(), false, frozen).unwrap_err();
+        assert_eq!(denial_of(&error), Some(DenialCode::Frozen));
     }
 
     #[test]
@@ -433,7 +653,7 @@ owners = ["agent"]
                 false,
                 settings,
                 PASSWD,
-                true,
+                GateMode::Auth,
             )
             .unwrap_err(),
             Refusal::Failed {
@@ -460,7 +680,7 @@ owners = ["agent"]
                 false,
                 settings,
                 PASSWD,
-                true,
+                GateMode::Auth,
             )
             .is_ok()
         );
@@ -517,6 +737,9 @@ owners = ["agent"]
             Refusal::NoPendingRequest { .. }
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
+            | Refusal::Mode { .. }
+            | Refusal::RateCeiling { .. }
+            | Refusal::WalkEscape { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -527,6 +750,9 @@ owners = ["agent"]
             Refusal::NoPendingRequest { .. }
             | Refusal::Request(_)
             | Refusal::ConfirmationMissing(_)
+            | Refusal::Mode { .. }
+            | Refusal::RateCeiling { .. }
+            | Refusal::WalkEscape { .. }
             | Refusal::Failed { .. } => None,
         }
     }
@@ -551,6 +777,25 @@ owners = ["agent"]
             attested_scope_id: None,
             boot_id: None,
         }
+    }
+
+    #[test]
+    fn final_evidence_says_whether_the_walk_matched_the_plan() {
+        let mut work =
+            prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        let walked = report(&[b"/srv/app/build/cache"], false, false);
+        // No plan recorded: no claim either way.
+        assert!(
+            !remove_evidence(&work, &walked)
+                .iter()
+                .any(|line| line.starts_with("matches_plan="))
+        );
+        work.planned_digest = Some(walked.digest);
+        let same = remove_evidence(&work, &walked);
+        assert!(same.contains(&"matches_plan=true".to_owned()));
+        assert!(same.contains(&format!("planned_digest={}", hex_digest(&walked.digest))));
+        work.planned_digest = Some([7; 32]);
+        assert!(remove_evidence(&work, &walked).contains(&"matches_plan=false".to_owned()));
     }
 
     #[test]
@@ -643,11 +888,80 @@ owners = ["agent"]
             stage: Stage::Audit,
             reason: "audit".to_owned(),
         };
-        for case in [&request, &missing, &confirm, &failed, &refusal] {
+        let escape = walk_refusal(&RemoveError::WalkEscape("a link"));
+        for case in [&request, &missing, &confirm, &failed, &refusal, &escape] {
             assert!(!is_operation_refusal(case));
             assert_eq!(denial_of(case), None);
             assert_eq!(verdict_of(case), None);
         }
+    }
+
+    #[test]
+    fn a_planted_link_or_mount_is_a_loud_walk_escape_and_never_a_plain_exec_failure() {
+        // Attack: a link or bind mount planted in the tree, to make the
+        // walk reach outside it. Its trace must not read as a broken host.
+        let escape = RemoveError::WalkEscape("the walk would cross a mount");
+        let refusal = walk_refusal(&escape);
+        assert_eq!(
+            refusal,
+            Refusal::WalkEscape {
+                reason: "the walk would cross a mount"
+            }
+        );
+        assert_eq!(refusal.code(), "gate_walk_escape");
+        assert_eq!(refusal.severity(), Severity::High);
+        assert_eq!(
+            refusal.to_string(),
+            "the remove-path walk refused an escape: the walk would cross a mount"
+        );
+        // A plan that met one refuses the whole operation, even with names
+        // listed before it; a plan that stopped for another reason does not.
+        let mut planned = report(&[b"/srv/app/build/cache/a"], true, true);
+        assert_eq!(refuse_a_planned_escape(&planned), Ok(()));
+        planned.error = Some(RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        assert_eq!(refuse_a_planned_escape(&planned), Ok(()));
+        planned.error = Some(escape.clone());
+        assert_eq!(refuse_a_planned_escape(&planned), Err(refusal));
+        // One met by the unlinking walk, after the tree changed under the
+        // plan, still reads as an escape: high, with its reason.
+        let work = prepare(&sample(), &pending(OPERATION_PROGRAM, "remove-path"), true).unwrap();
+        let mut walked = report(&[b"/srv/app/build/cache/a"], false, true);
+        walked.error = Some(escape);
+        let record = remove_record(None, &caller(), &work, &walked);
+        for line in [
+            "severity=high",
+            "partial=true",
+            "error=the walk would cross a mount",
+        ] {
+            assert!(record.evidence.iter().any(|seen| seen == line), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_escape_met_only_by_the_real_walk_is_named_in_the_message() {
+        // Attack: the tree is clean for the dry run, then a link or mount is
+        // planted before the walk that unlinks. The caller's line names the
+        // escape, not only the count of names that went before it.
+        let mut walked = report(&[b"/srv/app/build/cache/a"], false, true);
+        walked.error = Some(RemoveError::WalkEscape("the walk would cross a mount"));
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths, stopped by gate_walk_escape: \
+             the walk would cross a mount"
+        );
+        assert_eq!(operation_status(&walked), 1);
+        // Another stop keeps the plain partial line.
+        walked.error = Some(RemoveError::Os {
+            op: "unlinkat",
+            errno: 5,
+        });
+        assert_eq!(
+            operation_message(&walked),
+            "xudo-gate: partial remove of 1 paths"
+        );
     }
 
     fn report_owned(paths: &[Vec<u8>], dry_run: bool, partial: bool) -> RemoveReport {

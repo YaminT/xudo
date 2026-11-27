@@ -26,8 +26,10 @@ if command -v apk >/dev/null; then apk add -q socat expect coreutils; else apt-g
 
 # The product's files, where the product looks for them.
 install -d -m755 /usr/libexec/xudo /etc/xudo /etc/xudo/rules.d /etc/xudo/harnesses.d
-install -m755 "$bins/xudod" "$bins/xudo-gate" /usr/libexec/xudo/
-ln -f /usr/libexec/xudo/xudo-gate /usr/libexec/xudo/xudo-gate-auth
+install -m755 "$bins/xudod" /usr/libexec/xudo/
+# A copy, never a hardlink: the gate reads its mode from the executed file and
+# refuses a gate file that has a second name.
+install -m755 "$bins/xudo-gate" /usr/libexec/xudo/xudo-gate-auth
 install -m644 /rules/*.toml /harness/harness-rules.toml /etc/xudo/rules.d/
 install -d -m700 /var/lib/xudo
 install -d -m755 /run/xudo
@@ -116,6 +118,35 @@ expect /harness/exec.exp "$SU" wrong "/usr/local/bin/xudo exec -- /usr/bin/id -u
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && ! tr -d '\r' <"$out/wrong.raw" | grep -qx 0; then echo "failed, ran nothing" >>"$res"; else echo "UNEXPECTED rc=$rc" >>"$res"; fi
+
+# The opt-in agent path for real, on the sudo rows: the real `-nopass` helper
+# must refuse through the backend before the line is written, and a member of
+# xudo-agent then reaches it with no password and is refused by the gate.
+if [ "$row" != doas ]; then
+    install -m755 "$bins/xudo-gate" /usr/libexec/xudo/xudo-gate-nopass
+    set +e
+    /usr/local/bin/xudo install --agent-path >"$out/agent-real.log" 2>&1
+    set -e
+    if grep -q 'the passwordless helper refused a caller it cannot attest' "$out/agent-real.log" &&
+        grep -qx '%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS' /etc/sudoers.d/xudo; then
+        echo "agent real   installed after the helper refused" >>"$out/report.txt"
+    else
+        echo "agent real   NOT INSTALLED" >>"$out/report.txt"
+        cat "$out/agent-real.log" >>"$out/report.txt"
+    fi
+    useradd -M -s /bin/sh -G xudo-agent e8agent
+    sudo_exe=$(command -v sudo || command -v sudo-rs)
+    set +e
+    su -s /bin/sh e8agent -c "$sudo_exe -n /usr/libexec/xudo/xudo-gate-nopass" >"$out/agent-member.out" 2>"$out/agent-member.err"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && [ ! -s "$out/agent-member.out" ] && grep -q '^xudo-gate: refused (' "$out/agent-member.err"; then
+        echo "agent member reached the helper with no password; the gate refused" >>"$out/report.txt"
+    else
+        echo "agent member UNEXPECTED rc=$rc" >>"$out/report.txt"
+        cat "$out/agent-member.err" >>"$out/report.txt"
+    fi
+fi
 
 # doas asked about telling commands (doctor, as the user: doas -C answers for
 # the caller). `-C` does not follow /etc/doas.d, so the rule goes there, and a

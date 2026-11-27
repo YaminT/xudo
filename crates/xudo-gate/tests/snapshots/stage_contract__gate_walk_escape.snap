@@ -1,0 +1,6 @@
+---
+source: crates/xudo-gate/tests/stage_contract.rs
+expression: snapshot
+---
+gate_walk_escape High Unusable
+the remove-path walk refused an escape: the walk would cross a mount

@@ -39,9 +39,12 @@ mkdir -p "$stage/usr/share/xudo"
 install -m 0755 "$bin/xudo" "$bin/ido" "$stage/usr/bin/"
 ln "$stage/usr/bin/ido" "$stage/usr/bin/willyoumarryme"
 printf '.so man1/ido.1\n' | gzip -9n >"$stage/usr/share/man/man1/willyoumarryme.1.gz"
-install -m 0755 "$bin/xudod" "$stage/usr/libexec/xudo/"
-# Only the -auth name: the passwordless gate is not in this package at all.
+install -m 0755 "$bin/xudod" "$bin/xudo-session" "$stage/usr/libexec/xudo/"
+# Two files, never a hardlink pair: the gate reads its mode from the executed
+# inode and refuses a gate file with a second name. The -nopass file is inert:
+# no sudoers text names it, and nothing mints the entry it requires.
 install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-auth"
+install -m 0755 "$bin/xudo-gate" "$stage/usr/libexec/xudo/xudo-gate-nopass"
 install -m 0644 "$root"/packaging/systemd/* "$stage/usr/lib/systemd/system/"
 install -m 0644 "$root/packaging/tmpfiles.d/xudo.conf" "$stage/usr/lib/tmpfiles.d/"
 install -m 0644 "$root"/rules/*.toml "$stage/etc/xudo/rules.d/"

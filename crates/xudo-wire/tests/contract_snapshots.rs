@@ -38,6 +38,7 @@ fn lists_every_refusal_code(code: RefusalCode) -> &'static str {
         RefusalCode::ChannelUntrusted => "channel_untrusted",
         RefusalCode::RequestUnknown => "request_unknown",
         RefusalCode::AnswerRejected => "answer_rejected",
+        RefusalCode::HarnessNotGranted => "harness_not_granted",
     }
 }
 
@@ -62,6 +63,7 @@ fn renaming_a_refusal_code_breaks_the_wire_contract_and_this_test() {
         "channel_untrusted",
         "request_unknown",
         "answer_rejected",
+        "harness_not_granted",
     ];
     assert_eq!(RefusalCode::ALL.len(), pinned.len());
     for (code, name) in RefusalCode::ALL.iter().zip(pinned) {
@@ -93,4 +95,21 @@ fn every_refusal_is_sent_as_this_exact_response() {
         let _ = writeln!(table, "{}", BrokerResponse::refused(code).to_json());
     }
     insta::assert_snapshot!("refusal_responses", table);
+}
+
+/// A service harness's refusal carries the code and the action id, and no
+/// decision or trace: the agent learns which action matched and nothing about
+/// how the ruleset is written.
+#[test]
+fn harness_not_granted_reply_carries_no_trace() {
+    let mut table = String::new();
+    for action in [Some("xudo.svc.restart"), None] {
+        let response = BrokerResponse::harness_not_granted(action);
+        let json = response.to_json();
+        assert!(!json.contains("trace"), "{json}");
+        assert!(!json.contains("decision"), "{json}");
+        assert_eq!(BrokerResponse::parse(json.as_bytes()).unwrap(), response);
+        let _ = writeln!(table, "{json}");
+    }
+    insta::assert_snapshot!("harness_not_granted_reply", table);
 }

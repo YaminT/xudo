@@ -9,11 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The registry grammar: an enrolled entry is rendered, then read back through
+# the parser the broker and the gate use.
+xudo-policy = { path = "../xudo-policy", version = "0.1.0-beta.1" }
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

@@ -15,6 +15,7 @@ use std::rc::Rc;
 use super::*;
 use crate::error::SysError;
 use crate::exec::Output;
+use crate::install::enrol::EnrolOps;
 
 const DOAS: &str = "/etc/doas.conf";
 const SUDOERS: &str = "/etc/sudoers.d/xudo";
@@ -624,6 +625,65 @@ fn a_removal_refuses_every_file_that_is_not_provably_xudos() {
     assert!(exists(&dir, "target"));
 }
 
+#[test]
+fn a_managed_file_is_read_whole_only_when_it_is_xudos() {
+    let dir = scratch("read-managed");
+    let ops = ops_in(&dir, &Script::new());
+    assert_eq!(ops.read_managed(SUDOERS).unwrap(), None);
+    assert!(ops.read_managed("relative").is_err());
+    put(&dir, "xudo", &ours("line\n"), 0o440);
+    assert_eq!(
+        ops.read_managed(SUDOERS).unwrap(),
+        Some(ours("line\n").into_bytes())
+    );
+    // An operator's file, a link to xudo's file, a second name, too large.
+    put(&dir, "xudo", "# mine\n", 0o440);
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("marker")
+    );
+    put(&dir, "target", &ours("x\n"), 0o440);
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    symlink(dir.join("target"), dir.join("xudo")).unwrap();
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic")
+    );
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    std::fs::hard_link(dir.join("target"), dir.join("xudo")).unwrap();
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("more than one name")
+    );
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    let huge = ours(&"x".repeat(usize::try_from(MAX_SHARED_BYTES).unwrap()));
+    put(&dir, "xudo", &huge, 0o440);
+    assert!(
+        ops.read_managed(SUDOERS)
+            .unwrap_err()
+            .to_string()
+            .contains("larger")
+    );
+    // A directory cannot be read as a file.
+    std::fs::remove_file(dir.join("xudo")).unwrap();
+    std::fs::create_dir(dir.join("xudo")).unwrap();
+    assert!(ops.read_managed(SUDOERS).is_err());
+    // Through the real walk, a directory that is not there holds nothing.
+    let system = HostInstallOps::system();
+    assert_eq!(
+        system
+            .read_managed("/xudo-test-no-such-directory/xudo")
+            .unwrap(),
+        None
+    );
+}
+
 // --- the group -----------------------------------------------------------
 
 #[test]
@@ -709,6 +769,61 @@ fn the_group_is_created_with_whichever_tool_the_distribution_has() {
         text.contains("group exists") && text.contains("addgroup"),
         "{text}"
     );
+}
+
+#[test]
+fn a_group_is_created_under_the_name_it_was_asked_for() {
+    let dir = scratch("group-create-name");
+    let debian = Script::new();
+    debian.reply("/usr/sbin/groupadd", 0, "");
+    ops_in(&dir, &debian).create_group("xudo-agent").unwrap();
+    assert_eq!(
+        debian.seen(),
+        [vec!["/usr/sbin/groupadd", "--system", "xudo-agent"]]
+    );
+}
+
+#[test]
+fn a_member_is_added_and_removed_with_the_absolute_group_tools() {
+    let dir = scratch("agent-members");
+    let script = Script::new();
+    script.reply("/usr/sbin/usermod", 0, "");
+    script.reply("/usr/bin/gpasswd", 0, "");
+    let ops = ops_in(&dir, &script);
+    ops.add_member("xudo-agent", "agent").unwrap();
+    ops.remove_member("xudo-agent", "agent").unwrap();
+    // `--append` is the whole point: a plain `--groups` would drop the rest.
+    assert_eq!(
+        script.seen(),
+        [
+            vec![
+                "/usr/sbin/usermod",
+                "--append",
+                "--groups",
+                "xudo-agent",
+                "agent"
+            ],
+            vec!["/usr/bin/gpasswd", "--delete", "agent", "xudo-agent"],
+        ]
+    );
+    // A tool that ran and refused, and one that is not there, are both errors
+    // that name the group and say why.
+    let refused = Script::new();
+    refused.reply("/usr/sbin/usermod", 6, "user 'agent' does not exist");
+    let text = ops_in(&dir, &refused)
+        .add_member("xudo", "agent")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("does not exist") && text.contains("xudo"),
+        "{text}"
+    );
+    let missing = Script::new();
+    let text = ops_in(&dir, &missing)
+        .remove_member("xudo", "agent")
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("/usr/bin/gpasswd"), "{text}");
 }
 
 // --- a shared file -------------------------------------------------------
@@ -1347,4 +1462,313 @@ fn removing_a_block_from_a_file_that_is_not_there_is_not_an_error() {
     let ops = ops_in(&dir, &Script::new());
     assert_eq!(ops.remove_block(DOAS).unwrap(), Removal::Absent);
     assert!(!exists(&dir, "doas.conf"));
+}
+
+// --- the agent operations -----------------------------------------------
+
+/// An opener that finds no directory, for the paths that must say "absent".
+fn without_dirs(mut ops: HostInstallOps) -> HostInstallOps {
+    ops.open_dir = Box::new(|_| Ok(None));
+    ops
+}
+
+/// An opener the trust walk refuses.
+fn refusing_dirs(mut ops: HostInstallOps) -> HostInstallOps {
+    ops.open_dir = Box::new(|_| {
+        Err(TrustError::Unreadable {
+            at: "the test directory".to_owned(),
+            reason: "scripted".to_owned(),
+        })
+    });
+    ops
+}
+
+#[test]
+fn a_file_is_read_through_a_checked_descriptor() {
+    let dir = scratch("agent-read");
+    put(&dir, "passwd", "root:x:0:0\n", 0o644);
+    let ops = ops_in(&dir, &Script::new());
+    assert_eq!(
+        ops.read_file("/etc/passwd").unwrap(),
+        Some(b"root:x:0:0\n".to_vec())
+    );
+    assert_eq!(ops.read_file("/etc/missing").unwrap(), None);
+    assert_eq!(
+        without_dirs(ops_in(&dir, &Script::new()))
+            .read_file("/gone/passwd")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        refusing_dirs(ops_in(&dir, &Script::new()))
+            .read_file("/etc/passwd")
+            .unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+}
+
+#[test]
+fn a_file_that_is_not_roots_alone_is_not_believed() {
+    let dir = scratch("agent-read-refused");
+    let ops = ops_in(&dir, &Script::new());
+    put(&dir, "writable", "x", 0o664);
+    let err = ops.read_file("/etc/writable").unwrap_err();
+    assert!(err.to_string().contains("writable by group"), "{err}");
+    put(&dir, "big", &"x".repeat(2 << 20), 0o644);
+    let err = ops.read_file("/etc/big").unwrap_err();
+    assert!(err.to_string().contains("too large"), "{err}");
+    put(&dir, "real", "x", 0o644);
+    symlink(dir.join("real"), dir.join("link")).unwrap();
+    assert!(matches!(
+        ops.read_file("/etc/link").unwrap_err(),
+        InstallError::Io {
+            operation: "open",
+            ..
+        }
+    ));
+    std::fs::hard_link(dir.join("real"), dir.join("twin")).unwrap();
+    let err = ops.read_file("/etc/real").unwrap_err();
+    assert!(err.to_string().contains("more than one name"), "{err}");
+    // Not the owner the walk trusts: whoever owns the test directory is not
+    // the owner this ops object demands.
+    let meta = std::fs::metadata(&dir).unwrap();
+    let stranger = ops_owned_by(&dir, &Script::new(), meta.uid() + 1, meta.gid());
+    put(&dir, "mine", "x", 0o644);
+    let err = stranger.read_file("/etc/mine").unwrap_err();
+    assert!(err.to_string().contains("not owned by root"), "{err}");
+}
+
+#[test]
+fn denies_an_env_file_open_to_group_or_others_a_link_or_a_stranger() {
+    let dir = scratch("agent-private");
+    let ops = ops_in(&dir, &Script::new());
+    put(&dir, "ok", "x", 0o600);
+    ops.private_file("/etc/ok").unwrap();
+    ops.private_file("/etc/absent").unwrap();
+    without_dirs(ops_in(&dir, &Script::new()))
+        .private_file("/gone/x")
+        .unwrap();
+    assert!(matches!(
+        refusing_dirs(ops_in(&dir, &Script::new()))
+            .private_file("/etc/ok")
+            .unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+    for mode in [0o640, 0o604, 0o660] {
+        put(&dir, "open", "x", mode);
+        let err = ops.private_file("/etc/open").unwrap_err();
+        assert!(err.to_string().contains("open to group"), "{mode:o} {err}");
+    }
+    put(&dir, "real", "x", 0o600);
+    symlink(dir.join("real"), dir.join("link")).unwrap();
+    assert!(matches!(
+        ops.private_file("/etc/link").unwrap_err(),
+        InstallError::Io {
+            operation: "open",
+            ..
+        }
+    ));
+    let meta = std::fs::metadata(&dir).unwrap();
+    let stranger = ops_owned_by(&dir, &Script::new(), meta.uid() + 1, meta.gid());
+    let err = stranger.private_file("/etc/ok").unwrap_err();
+    assert!(err.to_string().contains("not owned by root"), "{err}");
+}
+
+#[test]
+fn a_directory_is_listed_sorted_and_only_if_the_walk_trusts_it() {
+    let dir = scratch("agent-list");
+    put(&dir, "b.toml", "", 0o644);
+    put(&dir, "a.toml", "", 0o644);
+    let ops = ops_in(&dir, &Script::new());
+    assert_eq!(
+        ops.list_dir("/etc/xudo").unwrap(),
+        Some(vec!["a.toml".to_owned(), "b.toml".to_owned()])
+    );
+    assert_eq!(
+        without_dirs(ops_in(&dir, &Script::new()))
+            .list_dir("/gone")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        refusing_dirs(ops_in(&dir, &Script::new()))
+            .list_dir("/etc/xudo")
+            .unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+}
+
+#[test]
+fn a_directory_with_a_name_that_is_not_text_is_refused() {
+    // Bytes, not a file: APFS will not create such a name, Linux will.
+    let err = super::agent::utf8_name(b"\xff.toml", "/etc/xudo").unwrap_err();
+    assert!(err.to_string().contains("not UTF-8"), "{err}");
+    assert_eq!(
+        super::agent::utf8_name(b"a.toml", "/etc/xudo").unwrap(),
+        "a.toml"
+    );
+}
+
+#[test]
+fn a_directory_is_made_with_its_mode_and_an_existing_one_must_be_roots_alone() {
+    let dir = scratch("agent-mkdir");
+    let ops = ops_in(&dir, &Script::new());
+    assert!(ops.make_dir("/etc/xudo/agents", 0o700).unwrap());
+    assert_eq!(mode_of(&dir, "agents"), 0o700);
+    assert!(!ops.make_dir("/etc/xudo/agents", 0o700).unwrap());
+    // Another account's, or open to a group, is not accepted as root's.
+    std::fs::create_dir(dir.join("open")).unwrap();
+    std::fs::set_permissions(dir.join("open"), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = ops.make_dir("/etc/xudo/open", 0o755).unwrap_err();
+    assert!(err.to_string().contains("writable by group"), "{err}");
+    let meta = std::fs::metadata(&dir).unwrap();
+    let stranger = ops_owned_by(&dir, &Script::new(), meta.uid() + 1, meta.gid());
+    let err = stranger.make_dir("/etc/xudo/agents", 0o700).unwrap_err();
+    assert!(err.to_string().contains("not owned by root"), "{err}");
+    // A file, or a link to a directory, where the directory should be.
+    put(&dir, "file", "x", 0o644);
+    assert!(matches!(
+        ops.make_dir("/etc/xudo/file", 0o755).unwrap_err(),
+        InstallError::Io {
+            operation: "open",
+            ..
+        }
+    ));
+    symlink(dir.join("agents"), dir.join("link")).unwrap();
+    assert!(ops.make_dir("/etc/xudo/link", 0o755).is_err());
+    // A refused call, and a path that names no file.
+    let long = format!("/etc/xudo/{}", "n".repeat(300));
+    assert!(matches!(
+        ops.make_dir(&long, 0o755).unwrap_err(),
+        InstallError::Io {
+            operation: "mkdir",
+            ..
+        }
+    ));
+    assert!(ops.make_dir("/", 0o755).is_err());
+}
+
+#[test]
+fn a_directory_is_removed_only_when_empty_and_roots_alone() {
+    let dir = scratch("agent-rmdir");
+    let ops = ops_in(&dir, &Script::new());
+    assert_eq!(ops.remove_dir("/etc/xudo/none").unwrap(), Removal::Absent);
+    assert_eq!(
+        without_dirs(ops_in(&dir, &Script::new()))
+            .remove_dir("/gone/none")
+            .unwrap(),
+        Removal::Absent
+    );
+    assert!(ops.make_dir("/etc/xudo/d", 0o755).unwrap());
+    put(&dir.join("d"), "f", "x", 0o644);
+    let err = ops.remove_dir("/etc/xudo/d").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallError::Io {
+                operation: "rmdir",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    std::fs::remove_file(dir.join("d/f")).unwrap();
+    assert_eq!(ops.remove_dir("/etc/xudo/d").unwrap(), Removal::Removed);
+    assert!(!exists(&dir, "d"));
+    // Not a directory, or not a name that can be looked at.
+    put(&dir, "file", "x", 0o644);
+    let err = ops.remove_dir("/etc/xudo/file").unwrap_err();
+    assert!(err.to_string().contains("not a directory"), "{err}");
+    let long = format!("/etc/xudo/{}", "n".repeat(300));
+    assert!(matches!(
+        ops.remove_dir(&long).unwrap_err(),
+        InstallError::Io {
+            operation: "stat",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn systemctl_is_run_by_absolute_path_and_its_answer_kept() {
+    let script = Script::new();
+    script.replies.borrow_mut().insert(
+        "/usr/bin/systemctl".to_owned(),
+        Ok(Output {
+            success: true,
+            code: Some(0),
+            stdout: " agent\n".to_owned(),
+            stderr: String::new(),
+        }),
+    );
+    let ops = ops_in(&scratch("agent-systemctl"), &script);
+    let answer = ops.systemctl(&["show", "--value", "u"]).unwrap();
+    assert_eq!((answer.success, answer.stdout.as_str()), (true, "agent"));
+    assert_eq!(
+        script.seen(),
+        vec![vec!["/usr/bin/systemctl", "show", "--value", "u"]]
+    );
+    script.replies.borrow_mut().insert(
+        "/usr/bin/systemctl".to_owned(),
+        Ok(Output {
+            success: false,
+            code: Some(3),
+            stdout: "inactive\n".to_owned(),
+            stderr: "why\n".to_owned(),
+        }),
+    );
+    let answer = ops.systemctl(&["is-active", "u"]).unwrap();
+    assert_eq!(
+        (answer.success, answer.stdout.as_str()),
+        (false, "inactive why")
+    );
+    script.replies.borrow_mut().clear();
+    assert!(matches!(
+        ops.systemctl(&["x"]).unwrap_err(),
+        InstallError::Io {
+            operation: "run",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_directory_the_walk_refuses_is_neither_made_nor_removed_through() {
+    let dir = scratch("agent-refused-walk");
+    let ops = refusing_dirs(ops_in(&dir, &Script::new()));
+    assert!(matches!(
+        ops.remove_dir("/etc/xudo/d").unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+    assert!(matches!(
+        ops.make_dir("/etc/xudo/d", 0o755).unwrap_err(),
+        InstallError::Untrusted(_)
+    ));
+}
+
+#[test]
+fn two_pack_installs_cannot_judge_the_rules_directory_at_once() {
+    let dir = scratch("lock-dir");
+    let ops = ops_in(&dir, &Script::new());
+    let held = ops.lock_dir("/etc/xudo/rules.d").unwrap();
+    // A second writer waits its bounded time, then is refused.
+    let second = ops_in(&dir, &Script::new());
+    let error = second.lock_dir("/etc/xudo/rules.d").unwrap_err();
+    assert!(matches!(error, InstallError::Locked { .. }), "{error}");
+    drop(held);
+    assert!(second.lock_dir("/etc/xudo/rules.d").is_ok());
+    // No directory, or one the walk refuses: nothing to lock.
+    let missing = without_dirs(ops_in(&dir, &Script::new()))
+        .lock_dir("/etc/xudo/rules.d")
+        .unwrap_err();
+    assert_eq!(
+        missing,
+        InstallError::Missing {
+            path: "/etc/xudo/rules.d".to_owned()
+        }
+    );
+    let refused = refusing_dirs(ops_in(&dir, &Script::new()))
+        .lock_dir("/etc/xudo/rules.d")
+        .unwrap_err();
+    assert!(matches!(refused, InstallError::Untrusted(_)), "{refused}");
 }

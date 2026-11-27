@@ -6,11 +6,11 @@ ALLOW, after a human confirms
   command   /usr/bin/systemctl restart nginx.service
   action    xudo.svc.restart
   rule      snapshot-fixture.toml:3
-  confirm   an enrolled agent requested a privileged action and confirm_agent_actions is on
+  confirm   an enrolled agent requested a privileged action and no rule grants it to this harness
 
   trace
     canonicalized: unchanged (restart nginx.service)
     matched xudo.svc.restart at snapshot-fixture.toml:3
-    deny-list v7: no capability class matched
+    deny-list v8: no capability class matched
     deny-rules: no configured rule matched
-    confirmation required: an enrolled agent requested a privileged action and confirm_agent_actions is on
+    confirmation required: an enrolled agent requested a privileged action and no rule grants it to this harness

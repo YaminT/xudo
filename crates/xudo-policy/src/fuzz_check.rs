@@ -310,7 +310,7 @@ fn samples(matcher: &Matcher) -> Vec<Arg> {
 
 /// Every token worth putting in a command: each matcher's samples across the
 /// whole ruleset, and the awkward ones no matcher mentions.
-fn dictionary(rules: &RuleSet) -> Vec<Arg> {
+pub(crate) fn dictionary(rules: &RuleSet) -> Vec<Arg> {
     let mut tokens: BTreeSet<Arg> = rules
         .actions()
         .iter()
@@ -490,8 +490,18 @@ impl Iterator for Candidates<'_> {
 /// Up to `count` argument lists `action` accepts, each verified. For a test and
 /// for self-checking: every one is accepted by `action`.
 pub fn witnesses(rules: &RuleSet, action: &Action, seed: u64, count: usize) -> Vec<Argv> {
-    let dictionary = dictionary(rules);
-    let values = values(action, &dictionary);
+    witnesses_from(&dictionary(rules), action, seed, count)
+}
+
+/// [`witnesses`], drawn from a dictionary built once by the caller: building
+/// it per action makes a review cost the square of the actions.
+pub(crate) fn witnesses_from(
+    dictionary: &[Arg],
+    action: &Action,
+    seed: u64,
+    count: usize,
+) -> Vec<Argv> {
+    let values = values(action, dictionary);
     let mut rng = Rng(seed);
     (0..count)
         .filter_map(|_| witness(action, &values, &mut rng))

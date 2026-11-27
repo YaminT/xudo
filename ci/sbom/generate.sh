@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# CycloneDX SBOM of the four shipped binaries, from Cargo.lock.
+# CycloneDX SBOM of the five shipped binaries, from Cargo.lock.
 #
 #   ci/sbom/generate.sh <output file>      (or: just sbom)
 #
 # One SBOM for both shipped architectures: the component set is the union of
-# `cargo tree -e normal,build` for the four binary packages on the two musl
+# `cargo tree -e normal,build` for the five binary packages on the two musl
 # targets, so it is the same on any host and carries nothing that only
 # cfg(windows) pulls in. Crates only build scripts and proc macros need are
 # marked "scope": "excluded". Versions and sha256 checksums come from Cargo.lock.
@@ -16,7 +16,7 @@ out=$(realpath -m "${1:?usage: generate.sh <output file>}")
 cd "$root"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-pkgs=(-p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin)
+pkgs=(-p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin)
 for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     # Every crate that is built; then the ones that end up linked (normal edges
     # only, not through a proc macro, whose subtree runs at build time).

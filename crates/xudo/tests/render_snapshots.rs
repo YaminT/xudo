@@ -166,7 +166,6 @@ fn denial(code: DenialCode) -> Decision {
             ),
             Settings {
                 frozen: true,
-                confirm_agent_actions: true,
                 confirm_human_path: false,
             },
         ),
@@ -417,4 +416,37 @@ fn a_denial_with_a_queue_entry_is_pinned_in_both_renderers() {
     );
     insta::assert_snapshot!("human__queued", render::queued_human(7, false));
     insta::assert_snapshot!("human__already_queued", render::queued_human(7, true));
+}
+
+const GRANT_FIXTURE: &str = r#"
+[[action]]
+id = "xudo.svc.restart"
+tier = "svc-control"
+exe = "/usr/bin/systemctl"
+harness = ["claude-code"]
+outcome = "allow"
+gtfobins-waiver = "service manager pager escape: the verb is the literal restart and the unit a name, so no option can reach the pager"
+args = [
+  { name = "verb", matcher = { literal = "restart" } },
+  { name = "unit", matcher = { name = "unit-name" } },
+]
+"#;
+
+#[test]
+fn a_decision_carrying_a_harness_grant_is_pinned() {
+    // A grant is a plain allow that names it.
+    let decision = evaluate(
+        &RuleSet::from_toml("snapshot-grant.toml", GRANT_FIXTURE).unwrap(),
+        &agent_caller(),
+        &Request::for_program(
+            "xudo.svc.restart",
+            "/usr/bin/systemctl",
+            Argv::new(["restart", "nginx.service"]),
+        ),
+        Settings::default(),
+    );
+    assert_eq!(decision.verdict, Verdict::Allow);
+    assert!(decision.harness_grant.is_some());
+    insta::assert_snapshot!("human__harness_grant", render::human(&decision));
+    insta::assert_snapshot!("json__harness_grant", render::json(&decision));
 }

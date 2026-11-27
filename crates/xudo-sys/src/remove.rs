@@ -26,6 +26,11 @@ const ELOOP: i32 = 40;
 /// `EBADF`.
 const EBADF: i32 = 9;
 
+/// A directory on the way to the target is a link.
+const THROUGH_A_LINK: &str = "a directory on the way to the target is a symbolic link";
+/// A directory or file the walk reached is another mount.
+const ACROSS_A_MOUNT: &str = "the walk would cross a mount";
+
 /// Group and other write bits. An ancestor with either is not a safe tree.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
@@ -102,6 +107,11 @@ pub enum RemoveError {
     /// device with its opened parent at execution time.
     #[error("the operation tree is a mount point")]
     MountPoint,
+    /// The walk would have to follow a symbolic link or cross a mount to
+    /// reach the target or to walk inside it. Nobody plants either in a tree
+    /// by accident: the gate refuses it loudly and removes nothing.
+    #[error("{0}")]
+    WalkEscape(&'static str),
     /// `recursive` is false and the target is a directory.
     #[error("a directory target needs recursive = true")]
     DirectoryRequiresRecursive,
@@ -145,6 +155,20 @@ pub struct NodeStat {
     pub nlink: u64,
     /// File type. A symlink is reported as a symlink, not its target.
     pub kind: NodeKind,
+    /// The kernel says this is the root of a mount (`STATX_ATTR_MOUNT_ROOT`).
+    /// A bind mount from the same filesystem shares `st_dev` with its parent
+    /// and shows only here. Kernels before 5.8 never set it.
+    pub mount_root: bool,
+}
+
+/// `STATX_ATTR_MOUNT_ROOT`.
+#[cfg(any(target_os = "linux", test))]
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+
+/// True only when the kernel supports the attribute (`mask`) and sets it.
+#[cfg(any(target_os = "linux", test))]
+fn mount_root_bits(attributes: u64, mask: u64) -> bool {
+    mask & attributes & STATX_ATTR_MOUNT_ROOT != 0
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -248,8 +272,10 @@ pub fn audit_path_head(paths: &[Vec<u8>]) -> &[Vec<u8>] {
 /// # Errors
 ///
 /// A grammar failure, a refused ancestor, or an `under` that will not open
-/// returns [`Err`] and removes nothing. A mismatch, mount, or limit during
-/// the walk returns [`Ok`] with [`RemoveReport::partial`].
+/// returns [`Err`] and removes nothing. So does a symbolic link or a mount the
+/// walk would cross ([`RemoveError::WalkEscape`]) before it removed a name.
+/// A mismatch or limit during the walk, or an escape met after some names
+/// went, returns [`Ok`] with [`RemoveReport::partial`].
 pub fn remove_path(
     fs: &mut dyn RemoveFs,
     req: &RemoveRequest,
@@ -301,9 +327,16 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
     for (index, name) in components.iter().enumerate() {
         let parent_dev = stat.dev;
         let parent = dir;
-        dir = fs.open_dir(parent, name, false).map_err(|error| {
+        // The last component is opened with NO_XDEV (`beneath`): the kernel
+        // itself refuses any mount crossing, bind mounts included, on every
+        // kernel with openat2. The st_dev and mount_root checks below are a
+        // second layer.
+        let last = index.saturating_add(1) == components.len();
+        dir = fs.open_dir(parent, name, last).map_err(|error| {
             if matches_errno(&error, ENOENT) || matches_errno(&error, ELOOP) {
                 RemoveError::AncestorRefused
+            } else if last && matches_errno(&error, EXDEV) {
+                RemoveError::MountPoint
             } else {
                 error
             }
@@ -313,7 +346,7 @@ fn open_under(fs: &mut dyn RemoveFs, under: &[u8]) -> Result<(u64, NodeStat), Re
         if !ancestor_ok(&stat) {
             return Err(RemoveError::AncestorRefused);
         }
-        if index.saturating_add(1) == components.len() && stat.dev != parent_dev {
+        if last && (stat.dev != parent_dev || stat.mount_root) {
             return Err(RemoveError::MountPoint);
         }
     }
@@ -422,16 +455,17 @@ impl Walk<'_> {
             let parent = dir;
             dir = match self.fs.open_dir(parent, name, true) {
                 Ok(fd) => fd,
-                Err(error) if stop_errno(&error) => {
+                Err(error) => {
+                    let crossed = self.crossing(parent, name, &error);
                     if parent != under_fd {
                         let _ = self.fs.close(parent);
                     }
-                    self.partial = true;
-                    return Ok(());
-                }
-                Err(error) => {
-                    if parent != under_fd {
-                        let _ = self.fs.close(parent);
+                    if let Some(escape) = crossed {
+                        return Err(escape);
+                    }
+                    if stop_errno(&error) {
+                        self.partial = true;
+                        return Ok(());
                     }
                     return Err(error);
                 }
@@ -440,9 +474,8 @@ impl Walk<'_> {
             if parent != under_fd {
                 self.fs.close(parent)?;
             }
-            if dir_stat.dev != self.tree_dev || dir_stat.kind != NodeKind::Dir {
-                self.partial = true;
-                return Ok(());
+            if off_the_tree(&dir_stat, self.tree_dev) {
+                return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
             }
             push_component(&mut path, name);
         }
@@ -471,10 +504,13 @@ impl Walk<'_> {
             Ok(child) => {
                 self.remove_directory(parent, parent_stat, child, name, &path, (depth, is_target))
             }
+            Err(error) if matches_errno(&error, EXDEV) => {
+                Err(RemoveError::WalkEscape(ACROSS_A_MOUNT))
+            }
             Err(error) if matches_errno(&error, ENOTDIR) || matches_errno(&error, ELOOP) => {
                 self.remove_leaf(parent, parent_stat, name, &path)
             }
-            Err(error) if stop_errno(&error) => {
+            Err(error) if matches_errno(&error, ENOENT) => {
                 self.partial = true;
                 Ok(())
             }
@@ -513,9 +549,8 @@ impl Walk<'_> {
         (depth, is_target): (u32, bool),
     ) -> Result<(), RemoveError> {
         let stat = self.fs.fstat(child)?;
-        if stat.dev != self.tree_dev || stat.kind != NodeKind::Dir {
-            self.partial = true;
-            return Ok(());
+        if off_the_tree(&stat, self.tree_dev) {
+            return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
         }
         if !self.owner_ok(stat.uid) {
             return Ok(());
@@ -570,7 +605,7 @@ impl Walk<'_> {
     ) -> Result<(), RemoveError> {
         let stat = match self.fs.lstat(parent, name) {
             Ok(stat) => stat,
-            Err(error) if stop_errno(&error) || matches_errno(&error, ENOENT) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -581,8 +616,7 @@ impl Walk<'_> {
             return Ok(());
         }
         if stat.dev != self.tree_dev && stat.kind != NodeKind::Symlink {
-            self.partial = true;
-            return Ok(());
+            return Err(RemoveError::WalkEscape(ACROSS_A_MOUNT));
         }
         if !self.owner_ok(stat.uid) {
             return Ok(());
@@ -597,6 +631,28 @@ impl Walk<'_> {
             directory,
             (stat.dev, stat.ino, size),
         )
+    }
+
+    /// Whether a directory on the way to the target failed to open because
+    /// it is another mount or a symbolic link. A missing name or a plain file
+    /// is not an escape: the caller handles those as before.
+    fn crossing(&mut self, parent: u64, name: &[u8], error: &RemoveError) -> Option<RemoveError> {
+        if matches_errno(error, EXDEV) {
+            return Some(RemoveError::WalkEscape(ACROSS_A_MOUNT));
+        }
+        // The kernel answers ENOTDIR for a link opened with O_NOFOLLOW and
+        // O_DIRECTORY, and ELOOP under RESOLVE_NO_SYMLINKS: ask what it is.
+        if !(matches_errno(error, ELOOP) || matches_errno(error, ENOTDIR)) {
+            return None;
+        }
+        // A directory where the open just said "not a directory" is a link
+        // swapped for one between the two calls: still an escape.
+        let kind = self.fs.lstat(parent, name).map(|stat| stat.kind);
+        let swapped = kind == Ok(NodeKind::Dir) && matches_errno(error, ENOTDIR);
+        if kind == Ok(NodeKind::Symlink) || swapped {
+            return Some(RemoveError::WalkEscape(THROUGH_A_LINK));
+        }
+        None
     }
 
     fn commit(
@@ -622,7 +678,7 @@ impl Walk<'_> {
                 self.partial = true;
                 return Ok(());
             }
-            Err(error) if matches_errno(&error, ENOENT) || stop_errno(&error) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -630,7 +686,7 @@ impl Walk<'_> {
         }
         let leaf = match self.fs.lstat(parent, name) {
             Ok(stat) => stat,
-            Err(error) if stop_errno(&error) || matches_errno(&error, ENOENT) => {
+            Err(error) if stop_errno(&error) => {
                 self.partial = true;
                 return Ok(());
             }
@@ -656,8 +712,16 @@ impl Walk<'_> {
     }
 }
 
+/// A directory that is not on the tree's own mount: another device, a bind
+/// mount's root, or not a directory at all after an open that asked for one.
+fn off_the_tree(stat: &NodeStat, tree_dev: u64) -> bool {
+    stat.dev != tree_dev || stat.mount_root || stat.kind != NodeKind::Dir
+}
+
+/// A walk that met one of these lost its way and stops. `ELOOP` is not one:
+/// a loop that is not a link the walk could name fails loudly as itself.
 fn stop_errno(error: &RemoveError) -> bool {
-    matches_errno(error, EXDEV) || matches_errno(error, ENOENT) || matches_errno(error, ELOOP)
+    matches_errno(error, EXDEV) || matches_errno(error, ENOENT)
 }
 
 fn matches_errno(error: &RemoveError, errno: i32) -> bool {
@@ -791,6 +855,7 @@ fn host_stat(stat: &rustix::fs::Stat) -> NodeStat {
         size: i64::from(stat.st_size).unsigned_abs(),
         nlink: u64::from(stat.st_nlink),
         kind: kind_of(mode),
+        mount_root: false,
     }
 }
 
@@ -830,7 +895,7 @@ fn open_at(
     name: &[u8],
     beneath: bool,
 ) -> Result<std::os::fd::OwnedFd, RemoveError> {
-    rustix::fs::openat2(
+    crate::beneath::open_beneath(
         parent,
         name,
         rustix::fs::OFlags::RDONLY
@@ -846,15 +911,12 @@ fn open_at(
 #[cfg(target_os = "linux")]
 impl RemoveFs for LinuxRemoveFs {
     fn open_root(&mut self) -> Result<u64, RemoveError> {
-        rustix::fs::openat2(
-            rustix::fs::CWD,
-            "/",
+        crate::beneath::open_root(
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::DIRECTORY
                 | rustix::fs::OFlags::CLOEXEC
                 | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
-            rustix::fs::ResolveFlags::NO_SYMLINKS,
         )
         .map(|fd| self.insert(fd))
         .map_err(host_err("openat2"))
@@ -868,8 +930,23 @@ impl RemoveFs for LinuxRemoveFs {
     fn fstat(&mut self, fd: u64) -> Result<NodeStat, RemoveError> {
         let fd = self.fd(fd, "fstat")?;
         rustix::fs::fstat(fd)
-            .map(|stat| host_stat(&stat))
             .map_err(host_err("fstat"))
+            .and_then(|raw| {
+                rustix::fs::statx(
+                    fd,
+                    c"",
+                    rustix::fs::AtFlags::EMPTY_PATH,
+                    rustix::fs::StatxFlags::empty(),
+                )
+                .map_err(host_err("statx"))
+                .map(|extra| NodeStat {
+                    mount_root: mount_root_bits(
+                        extra.stx_attributes.bits(),
+                        extra.stx_attributes_mask.bits(),
+                    ),
+                    ..host_stat(&raw)
+                })
+            })
     }
 
     fn verify_dir(
@@ -954,6 +1031,7 @@ struct Node {
     kind: NodeKind,
     size: u64,
     nlink: u64,
+    mount_root: bool,
     link: Vec<u8>,
     children: BTreeMap<Vec<u8>, u64>,
 }
@@ -980,6 +1058,8 @@ pub struct FakeRemoveFs {
     /// The owner the diverging inode reports from its second `stat` on.
     diverge_uid: Option<u32>,
     rename_out: Option<(Vec<u8>, Vec<u8>, bool)>,
+    /// Whether a `beneath` open refuses a mount (`RESOLVE_NO_XDEV`). Off models\n    /// an open that missed it, so the stat checks behind it are exercised.
+    open_checks_mounts: bool,
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -997,6 +1077,7 @@ impl FakeRemoveFs {
                 kind: NodeKind::Dir,
                 size: 0,
                 nlink: 2,
+                mount_root: false,
                 link: Vec::new(),
                 children: BTreeMap::new(),
             },
@@ -1009,6 +1090,7 @@ impl FakeRemoveFs {
             diverge: None,
             diverge_hits: 0,
             swap: None,
+            open_checks_mounts: true,
             unlinked: Vec::new(),
             fail_open: None,
             faults: Vec::new(),
@@ -1092,6 +1174,7 @@ impl FakeRemoveFs {
                 kind,
                 size,
                 nlink: 1,
+                mount_root: false,
                 link: Vec::new(),
                 children: BTreeMap::new(),
             },
@@ -1112,6 +1195,19 @@ impl FakeRemoveFs {
     pub fn set_device(&mut self, ino: u64, dev: u64) {
         if let Some(node) = self.nodes.get_mut(&ino) {
             node.dev = dev;
+        }
+    }
+
+    /// Turn the `RESOLVE_NO_XDEV` model of `beneath` opens on or off.
+    pub fn set_open_checks_mounts(&mut self, on: bool) {
+        self.open_checks_mounts = on;
+    }
+
+    /// Mark `ino` as a mount root on the same device, as a same-filesystem bind
+    /// mount is.
+    pub fn set_mount_root(&mut self, ino: u64) {
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.mount_root = true;
         }
     }
 
@@ -1206,6 +1302,7 @@ impl FakeRemoveFs {
                 kind: NodeKind::Symlink,
                 size: link.len() as u64,
                 nlink: 1,
+                mount_root: false,
                 link,
                 children: BTreeMap::new(),
             },
@@ -1251,6 +1348,7 @@ impl FakeRemoveFs {
             size: node.size,
             nlink: node.nlink,
             kind: node.kind,
+            mount_root: node.mount_root,
         };
         if self.diverge == Some(ino) {
             self.diverge_hits = self.diverge_hits.saturating_add(1);
@@ -1307,7 +1405,7 @@ impl RemoveFs for FakeRemoveFs {
                 errno: ENOTDIR,
             });
         }
-        if beneath && node.dev != parent_dev {
+        if beneath && self.open_checks_mounts && (node.dev != parent_dev || node.mount_root) {
             return Err(RemoveError::Os {
                 op: "openat2",
                 errno: EXDEV,
@@ -1380,6 +1478,7 @@ impl RemoveFs for FakeRemoveFs {
                             kind: NodeKind::Dir,
                             size: 0,
                             nlink: 2,
+                            mount_root: false,
                             link: Vec::new(),
                             children: BTreeMap::new(),
                         },
@@ -1573,8 +1672,10 @@ mod tests {
         fs.nodes
             .entry(link)
             .and_modify(|node| node.link = b"/secret".to_vec());
-        let planted = remove_path(&mut fs, &req("link/secret"));
-        assert!(planted.is_err() || planted.unwrap().removed.is_empty());
+        assert_eq!(
+            remove_path(&mut fs, &req("link/secret")).unwrap_err(),
+            RemoveError::WalkEscape(THROUGH_A_LINK)
+        );
         assert!(fs.exists(&[b"secret"]));
         assert_eq!(fs.node(&[b"secret"]).unwrap().ino, secret);
         assert!(fs.exists(&[b"srv", b"app", b"build", b"link"]));
@@ -1652,6 +1753,7 @@ mod tests {
         );
         let report = remove_path(&mut fs, &req("box")).unwrap();
         assert!(report.partial);
+        assert_eq!(report.error, Some(RemoveError::WalkEscape(ACROSS_A_MOUNT)));
         assert!(!fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt"]));
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt", b"inside"]));
@@ -1668,6 +1770,46 @@ mod tests {
             RemoveError::MountPoint
         );
         assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn a_same_device_bind_mount_as_the_tree_is_refused() {
+        let (mut fs, tree_root) = tree();
+        fs.set_mount_root(tree_root);
+        assert_eq!(
+            remove_path(&mut fs, &req("item")).unwrap_err(),
+            RemoveError::MountPoint
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn a_bind_mount_as_the_tree_is_refused_by_the_open_and_again_by_the_stat() {
+        for open_checks_mounts in [true, false] {
+            let (mut fs, tree_root) = tree();
+            fs.set_mount_root(tree_root);
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("item")).unwrap_err(),
+                RemoveError::MountPoint
+            );
+            assert!(fs.unlinked().is_empty());
+            let (mut fs, tree_root) = tree();
+            fs.set_device(tree_root, 9);
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("item")).unwrap_err(),
+                RemoveError::MountPoint
+            );
+        }
+    }
+
+    #[test]
+    fn mount_root_needs_kernel_support_and_the_attribute() {
+        assert!(mount_root_bits(0x2000, 0x2000));
+        assert!(!mount_root_bits(0x2000, 0));
+        assert!(!mount_root_bits(0, 0x2000));
+        assert!(!mount_root_bits(0xdfff, 0xffff));
     }
 
     #[test]
@@ -2292,17 +2434,19 @@ mod tests {
 
     #[test]
     fn a_walk_that_loses_its_way_to_the_target_stops_or_fails() {
-        // A vanished or crossed directory is a stop. Anything else is an error.
-        for (errno, stops) in [(ENOENT, true), (EXDEV, true), (5, false)] {
+        // A vanished directory is a stop. A crossed mount is an escape.
+        // Anything else is an error, a loop that is not a link included.
+        for (errno, outcome) in [
+            (ENOENT, Ok(true)),
+            (ELOOP, Err(os("openat2", ELOOP))),
+            (EXDEV, Err(RemoveError::WalkEscape(ACROSS_A_MOUNT))),
+            (5, Err(os("openat2", 5))),
+        ] {
             let (mut fs, _) = boxed(&[b"a"]);
             // `/`, `srv`, `app`, `build`; the fifth open is `box`.
             fs.fail_at("openat2", 4, errno);
             let result = remove_path(&mut fs, &req("box/a"));
-            if stops {
-                assert!(result.unwrap().partial);
-            } else {
-                assert_eq!(result.unwrap_err(), os("openat2", errno));
-            }
+            assert_eq!(result.map(|report| report.partial), outcome);
             assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
         }
         // Four fstats open the tree (`/`, `srv`, `app`, `build`); the fifth
@@ -2316,24 +2460,151 @@ mod tests {
     }
 
     #[test]
-    fn an_intermediate_directory_on_another_device_stops_the_walk() {
+    fn an_intermediate_directory_on_another_device_is_a_walk_escape() {
         let (mut fs, dir) = boxed(&[b"a"]);
         fs.remount_on_open(dir, 2);
         // The remount lands after `openat2` resolved `box`: only the fstat
         // sees it.
-        let report = remove_path(&mut fs, &req("box/a")).unwrap();
-        assert!(report.partial);
-        assert!(report.removed.is_empty());
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+        assert!(fs.unlinked().is_empty());
     }
 
     #[test]
-    fn a_target_directory_that_moves_device_after_the_open_is_not_walked() {
+    fn a_target_directory_that_moves_device_after_the_open_is_a_walk_escape() {
         let (mut fs, dir) = boxed(&[b"a"]);
         fs.remount_on_open(dir, 2);
-        let report = remove_path(&mut fs, &req("box")).unwrap();
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_bind_mount_as_a_parent_of_the_target() {
+        // The kernel's NO_XDEV refuses the open; without it, the stat does.
+        for (open_checks_mounts, same_device) in [(true, false), (false, false), (false, true)] {
+            let (mut fs, dir) = boxed(&[b"a"]);
+            if same_device {
+                fs.set_mount_root(dir);
+            } else {
+                fs.set_device(dir, 9);
+            }
+            fs.set_open_checks_mounts(open_checks_mounts);
+            assert_eq!(
+                remove_path(&mut fs, &req("box/a")).unwrap_err(),
+                RemoveError::WalkEscape(ACROSS_A_MOUNT)
+            );
+            assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
+            assert!(fs.unlinked().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_target_that_vanishes_before_its_open_stops_the_walk() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        // `/`, `srv`, `app`, `build`, `box`; the sixth open is `a`.
+        fs.fail_at("openat2", 5, ENOENT);
+        let report = remove_path(&mut fs, &req("box/a")).unwrap();
         assert!(report.partial);
         assert!(report.removed.is_empty());
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_bind_mount_as_the_target() {
+        let (mut fs, dir) = boxed(&[b"a"]);
+        fs.set_device(dir, 9);
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
+        assert!(fs.unlinked().is_empty());
+    }
+
+    /// `build/hop -> /victim`, the agent asks for `build/hop/v`.
+    fn hop() -> FakeRemoveFs {
+        let (mut fs, _) = tree();
+        fs.add(&[], b"victim", NodeKind::Dir, 1000, 0o755, 0);
+        fs.add(&[b"victim"], b"v", NodeKind::File, 1000, 0o644, 1);
+        let link = fs.add(
+            &[b"srv", b"app", b"build"],
+            b"hop",
+            NodeKind::Symlink,
+            1000,
+            0o777,
+            7,
+        );
+        fs.nodes
+            .entry(link)
+            .and_modify(|node| node.link = b"/victim".to_vec());
+        fs
+    }
+
+    #[test]
+    fn denies_a_symlink_planted_as_a_parent_of_the_target() {
+        // ELOOP is RESOLVE_NO_SYMLINKS' answer, ENOTDIR plain O_NOFOLLOW's.
+        for errno in [None, Some(ENOTDIR)] {
+            let mut fs = hop();
+            if let Some(errno) = errno {
+                fs.fail_at("openat2", 4, errno);
+            }
+            assert_eq!(
+                remove_path(&mut fs, &req("hop/v")).unwrap_err(),
+                RemoveError::WalkEscape(THROUGH_A_LINK)
+            );
+            assert!(fs.exists(&[b"victim", b"v"]));
+            assert!(fs.exists(&[b"srv", b"app", b"build", b"hop"]));
+            assert!(fs.unlinked().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_plain_file_as_a_parent_is_an_error_not_an_escape() {
+        let (mut fs, _) = boxed(&[b"a"]);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a/x")).unwrap_err(),
+            os("openat2", ENOTDIR)
+        );
+        // A link that cannot be told from a file, because its lstat fails,
+        // is not called an escape either, and does not pass as a quiet stop:
+        // the open's own error fails the walk.
+        let mut fs = hop();
+        fs.fail_at("lstat", 0, 5);
+        assert_eq!(
+            remove_path(&mut fs, &req("hop/v")).unwrap_err(),
+            os("openat2", ELOOP)
+        );
+        assert!(fs.exists(&[b"victim", b"v"]));
+        assert!(fs.unlinked().is_empty());
+    }
+
+    #[test]
+    fn denies_a_link_swapped_for_a_directory_before_the_lstat() {
+        // Attack: the open meets the planted link (ENOTDIR), then the link is
+        // swapped for a directory before the walk asks what it was. A
+        // directory cannot answer ENOTDIR, so it is still the escape.
+        let (mut fs, _) = boxed(&[b"a"]);
+        // `/`, `srv`, `app`, `build`; the fifth open is `box`.
+        fs.fail_at("openat2", 4, ENOTDIR);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            RemoveError::WalkEscape(THROUGH_A_LINK)
+        );
+        assert!(fs.unlinked().is_empty());
+        // The same swap after `ELOOP` is no escape the walk can name, and
+        // still not a stop: it fails as the open's error.
+        let (mut fs, _) = boxed(&[b"a"]);
+        fs.fail_at("openat2", 4, ELOOP);
+        assert_eq!(
+            remove_path(&mut fs, &req("box/a")).unwrap_err(),
+            os("openat2", ELOOP)
+        );
+        assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"a"]));
     }
 
     #[test]
@@ -2385,8 +2656,10 @@ mod tests {
         let (mut fs, _) = boxed(&[]);
         let mounted = fs.add(&BOX, b"mnt", NodeKind::File, 1000, 0o644, 0);
         fs.set_device(mounted, 2);
-        let report = remove_path(&mut fs, &req("box")).unwrap();
-        assert!(report.partial);
+        assert_eq!(
+            remove_path(&mut fs, &req("box")).unwrap_err(),
+            RemoveError::WalkEscape(ACROSS_A_MOUNT)
+        );
         assert!(fs.exists(&[b"srv", b"app", b"build", b"box", b"mnt"]));
     }
 
@@ -2494,6 +2767,62 @@ mod tests {
         );
     }
 
+    /// A gate started under a unit with `RestrictSUIDSGID=yes` inherits its
+    /// filter, which answers openat2 with ENOSYS. The walk opens the same
+    /// directories one component at a time and still refuses a link, a
+    /// parent, and a mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_walk_holds_its_refusals_where_openat2_is_enosys() {
+        let dir = host_dir("xudo-t1-enosys");
+        std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
+        std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
+        crate::beneath::without_openat2(|| {
+            let mut host = LinuxRemoveFs::default();
+            let root = host.open_root().unwrap();
+            assert!(host.fstat(root).unwrap().mount_root);
+            let tree = open_components(&mut host, &dir);
+            let sub = host.open_dir(tree, b"sub", true).unwrap();
+            let sub_stat = host.fstat(sub).unwrap();
+            assert!(host.verify_dir(tree, b"sub", sub_stat).unwrap());
+            let deep = host.open_dir(sub, b"deep", true).unwrap();
+            let deep_stat = host.fstat(deep).unwrap();
+            assert!(host.verify_dir(tree, b"sub/deep", deep_stat).unwrap());
+            assert!(!host.verify_dir(tree, b"sub", deep_stat).unwrap());
+            for beneath in [true, false] {
+                assert_eq!(
+                    host.open_dir(tree, b"link", beneath).unwrap_err(),
+                    os("openat2", ELOOP)
+                );
+                assert_eq!(
+                    host.open_dir(tree, b"..", beneath).unwrap_err(),
+                    os("openat2", EXDEV)
+                );
+            }
+            assert_eq!(
+                host.verify_dir(tree, b"link/deep", deep_stat).unwrap_err(),
+                os("openat2", ELOOP)
+            );
+            assert_eq!(
+                open_under(&mut host, b"/proc").unwrap_err(),
+                RemoveError::MountPoint
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_real_root_is_a_mount_root_and_a_real_mount_is_not_opened_as_the_tree() {
+        let mut host = LinuxRemoveFs::default();
+        let root = host.open_root().unwrap();
+        assert!(host.fstat(root).unwrap().mount_root);
+        assert_eq!(
+            open_under(&mut host, b"/proc").unwrap_err(),
+            RemoveError::MountPoint
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stale_linux_remove_descriptor_reports_the_actual_operation() {
@@ -2518,6 +2847,7 @@ mod tests {
             size: 0,
             nlink: 1,
             kind: NodeKind::Dir,
+            mount_root: false,
         };
         assert_eq!(
             fs.verify_dir(99, b"", expected_stat).unwrap_err(),
@@ -2798,6 +3128,7 @@ mod tests {
     #[test]
     fn the_fake_tolerates_unknown_inodes_and_stale_descriptors() {
         let mut fs = FakeRemoveFs::new();
+        fs.set_mount_root(99);
         fs.set_device(99, 2);
         fs.set_mode(99, 0o777);
         fs.hardlink(&[], b"ghost", 99);
@@ -2865,6 +3196,7 @@ mod tests {
             size: 0,
             nlink: 2,
             kind: NodeKind::Dir,
+            mount_root: false,
         };
         assert_eq!(
             verify_dir_stat_result(Err(EBADF), expected).unwrap_err(),

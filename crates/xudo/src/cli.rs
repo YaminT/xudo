@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use xudo_backend::paths_to_root::HostView;
+use xudo_backend::paths_to_root::{Finding, HostView, Input, PlannedHost, assess};
 use xudo_backend::{BackendKind, InstallPlan, PlanStep, Probe, detect, uninstall_plan};
 use xudo_config::report::{self, ListOptions};
 use xudo_config::{Layer, Setting, Settings as ConfigSettings, Value as ConfigValue, apply_file};
@@ -22,10 +22,12 @@ use xudo_sys::{
     RefusingInstaller, Runner, Verification, host_ops,
 };
 
+use crate::agent::{self, AgentAction};
 use crate::agentdoc::{self, DocFormat};
 use crate::check;
 use crate::doctor;
 use crate::exec;
+use crate::packs::{self, RulesAction};
 use crate::probe::BrokerProbe;
 use crate::render;
 use crate::rules::{DEFAULT_RULES_DIR, LoadedRules};
@@ -51,7 +53,7 @@ pub enum Format {
     about = "Linux privilege broker; this beta uses the human password path",
     long_about = "xudo checks requests against root-owned rules. `xudo exec` uses the \
                   password-authenticated path through the host backend. The passwordless \
-                  agent path is not available in this beta."
+                  agent path is off unless root runs `xudo install --agent-path`."
 )]
 pub struct Cli {
     /// Directory of rule files to load.
@@ -279,6 +281,43 @@ pub enum Command {
         /// Remove what an install wrote, and nothing else.
         #[arg(long)]
         uninstall: bool,
+
+        /// Opt in to the passwordless agent path (sudo and sudo-rs only):
+        /// also write the one `%xudo-agent` `NOPASSWD` line for the `-nopass`
+        /// helper with no arguments, after showing the helper refuses a caller
+        /// it cannot attest. A plain `xudo install` turns it off again.
+        #[arg(long, conflicts_with = "uninstall")]
+        agent_path: bool,
+
+        /// With `--agent-path`, on a host at `kernel.yama.ptrace_scope = 0`:
+        /// also write a sysctl.d drop-in that sets it to 1. Never lowers a
+        /// higher value; removed by `--uninstall`.
+        #[arg(long, requires = "agent_path")]
+        raise_ptrace_scope: bool,
+    },
+
+    /// Enrol, list or remove a harness that runs as its own account.
+    ///
+    /// `enrol` and `remove` need root, like `install`, and grant nothing: an
+    /// enrolled harness runs nothing as root until a rule grants it the
+    /// command and root has run `xudo install --agent-path`. Anything else is
+    /// refused or queued for a human, never retried with a password.
+    Agent {
+        /// What to do.
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Check, install, list or remove a rule pack: one rule file with a
+    /// `[pack]` header.
+    ///
+    /// `add` shows what the pack changes and installs nothing; installing
+    /// takes `--reviewed` and root, through sudo's own prompt. Nothing is
+    /// fetched and nothing updates itself.
+    Rules {
+        /// What to do.
+        #[command(subcommand)]
+        action: RulesAction,
     },
 
     /// Verify that the audit log has not been edited.
@@ -549,17 +588,25 @@ pub fn run_with_installer_at_socket(
             out,
         ),
         Command::Config { schema, action } => config(cli, *schema, action.as_ref(), out, err),
+        Command::Agent { action } => agent::run(platform, installer, action, out, err),
+        Command::Rules { action } => packs::run(&cli.rules, installer, action, out, err),
         Command::Install {
             dry_run,
             show_contents,
             uninstall,
+            agent_path,
+            raise_ptrace_scope,
         } => install(
+            platform.host,
             probe,
             installer,
-            InstallMode {
+            &InstallMode {
                 dry_run: *dry_run,
                 show_contents: *show_contents,
                 uninstall: *uninstall,
+                agent_path: (*agent_path)
+                    .then(|| crate::agent_path::registry(loaded.as_ref()))
+                    .map(|registry| (registry, *raise_ptrace_scope)),
             },
             out,
             err,
@@ -664,11 +711,14 @@ fn broker_control(
 }
 
 /// What `install` was asked to do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct InstallMode {
     dry_run: bool,
     show_contents: bool,
     uninstall: bool,
+    /// `--agent-path`: what the harness registry says, and
+    /// `--raise-ptrace-scope`.
+    agent_path: Option<(crate::agent_path::Registry, bool)>,
 }
 
 /// Plans the install, or the removal, and performs it unless `--dry-run`.
@@ -682,9 +732,10 @@ struct InstallMode {
 /// can still be cleaned up. Both backends' removals run, each of them removing
 /// nothing it did not write.
 fn install(
+    host: &dyn HostView,
     probe: &dyn Probe,
     installer: &dyn Installer,
-    mode: InstallMode,
+    mode: &InstallMode,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -693,6 +744,18 @@ fn install(
             uninstall_plan(BackendKind::Sudo),
             uninstall_plan(BackendKind::Doas),
         ]
+    } else if let Some((registry, raise)) = &mode.agent_path {
+        let backend = match detect(probe) {
+            Ok(backend) => backend,
+            Err(reason) => {
+                let _ = writeln!(err, "xudo: no usable backend: {reason}");
+                return ExitCode::Unusable;
+            }
+        };
+        match crate::agent_path::plan(host, &backend, registry, *raise, out, err) {
+            Ok(plan) => vec![plan],
+            Err(code) => return code,
+        }
     } else {
         // One refusal path, not two. A backend that cannot be given a snippet
         // is a backend xudo cannot use, so the snippet failure is folded into
@@ -702,13 +765,23 @@ fn install(
             .map_err(|source| source.to_string())
             .and_then(|backend| plan_for(&backend))
         {
-            Ok(plan) => vec![plan],
+            Ok(plan) => {
+                crate::agent_path::warn_if_on(host, err);
+                vec![plan]
+            }
             Err(reason) => {
                 let _ = writeln!(err, "xudo: no usable backend: {reason}");
                 return ExitCode::Unusable;
             }
         }
     };
+    if !mode.uninstall {
+        if let Some(plan) = plans.iter().find(|plan| plan.backend == BackendKind::Doas) {
+            if let Some(refusal) = doas_later_rules(host, plan, err) {
+                return refusal;
+            }
+        }
+    }
 
     if mode.dry_run {
         for plan in &plans {
@@ -716,8 +789,16 @@ fn install(
         }
         let _ = writeln!(
             out,
-            "\nNothing was written. This build grants the human path only: every rule it\n\
-             would install requires a password, and no passwordless rule exists in it."
+            "{}",
+            if mode.agent_path.is_some() {
+                "\nNothing was written. With --agent-path the plan also writes one passwordless\n\
+                 line: %xudo-agent may run /usr/libexec/xudo/xudo-gate-nopass with no\n\
+                 arguments, which runs a command only for an attested, registered harness\n\
+                 that a root-written rule grants it."
+            } else {
+                "\nNothing was written. This plan grants the human path only: every rule it\n\
+                 would install requires a password, and no passwordless rule exists in it."
+            }
         );
         return ExitCode::Delegated;
     }
@@ -738,6 +819,19 @@ fn install(
         }
     }
     match unverified {
+        // The agent path's own checks passed after the write, and anything
+        // they found wrong was rolled back; what is left is a functional probe
+        // that could not run here. Said so, in so many words, and not called
+        // a failure: a failed probe would have restored the old state.
+        Some(reason) if mode.agent_path.is_some() => {
+            let _ = writeln!(
+                out,
+                "could not verify: the gate running as root through the password rule: \
+                 {reason}. Nothing that ran found the install wrong; the checks that \
+                 passed are listed above."
+            );
+            ExitCode::Delegated
+        }
         // Files were written and nothing proved they take effect. Said in so
         // many words, with a failing status, because a quiet success here is
         // exactly the claim xudo must not make.
@@ -753,8 +847,87 @@ fn install(
     }
 }
 
+/// Looks at the doas rules that would come after xudo's own once the plan has
+/// run: doas uses the last rule that matches, so a later `nopass` takes the
+/// human's password from the gate, which is the only proof of a human. A line
+/// xudo cannot read that may carry `nopass` counts as one that does. That
+/// refuses; a later `persist` only warns. `None` means go on.
+///
+/// A rule that merely says `permit "nopass"` (a user named nopass, quoted) is
+/// refused too: the reader drops the quotes, so it cannot tell it from the
+/// keyword. A false positive, and the safe direction.
+///
+/// The host is asked as it would be after the plan, with xudo's rule in the
+/// file and at the place the plan puts it, so the first install is checked
+/// the way every later one is, by the one reader `xudo doctor` uses.
+fn doas_later_rules(
+    host: &dyn HostView,
+    plan: &InstallPlan,
+    err: &mut dyn Write,
+) -> Option<ExitCode> {
+    let planned = PlannedHost::new(host, plan);
+    let view: &dyn HostView = planned.as_ref().map_or(host, |planned| planned);
+    let report = assess(
+        view,
+        &Input {
+            user_path: None,
+            backend_exe: None,
+            sudo_exe: None,
+            doas_exe: None,
+            doas_ignores_drop_ins: planned
+                .as_ref()
+                .is_some_and(|planned| !planned.is_drop_in()),
+        },
+    );
+    let mut refused = false;
+    // xudo's rule is in the planned file by construction. If it cannot be found
+    // there, the file could not be read or the install would not make what was
+    // modelled, so nothing said about the rules after it can be trusted.
+    if planned
+        .as_ref()
+        .is_some_and(|planned| !planned.holds_own_rule())
+    {
+        refused = true;
+        let _ = writeln!(
+            err,
+            "xudo: refusing to install: xudo's own rule could not be found in the doas \
+             configuration as the install would leave it, so the rules after it could not \
+             be checked."
+        );
+    }
+    for finding in report.checks.iter().flat_map(|check| &check.findings) {
+        let Finding::DoasLaterRule {
+            file,
+            line,
+            why,
+            nopass,
+            persist,
+            ..
+        } = finding
+        else {
+            continue;
+        };
+        let at = file.display();
+        if *nopass {
+            refused = true;
+            let _ = writeln!(
+                err,
+                "xudo: refusing to install: {at}:{line}: {why}. Remove nopass from it, or \
+                 move it above xudo's rule."
+            );
+        } else if *persist {
+            let _ = writeln!(
+                err,
+                "xudo: warning: {at}:{line} is a doas rule after xudo's own that carries \
+                 persist, so one password could be reused."
+            );
+        }
+    }
+    refused.then_some(ExitCode::Unusable)
+}
+
 /// The word for what is being done, for a failure message.
-fn plan_verb(mode: InstallMode) -> &'static str {
+fn plan_verb(mode: &InstallMode) -> &'static str {
     if mode.uninstall {
         "uninstall"
     } else {
@@ -809,11 +982,18 @@ fn step_contents(step: &PlanStep) -> &str {
         PlanStep::AppendBlock { block, .. } => block,
         PlanStep::Notice { text } => text,
         PlanStep::CreateGroup { .. }
+        | PlanStep::RefusalProbe { .. }
+        | PlanStep::RefuseEdited { .. }
+        | PlanStep::ReadBack { .. }
         | PlanStep::Validate { .. }
         | PlanStep::ValidateBySubstitution { .. }
         | PlanStep::Install { .. }
         | PlanStep::RemoveBlock { .. }
         | PlanStep::Remove { .. }
+        | PlanStep::RemoveUnlessEdited { .. }
+        | PlanStep::ValidateWhole { .. }
+        | PlanStep::MustNotList { .. }
+        | PlanStep::MustList { .. }
         | PlanStep::FunctionalProbe { .. } => "",
     }
 }
@@ -1400,7 +1580,6 @@ fn engine_settings(cli: &Cli, err: &mut dyn Write) -> Option<Settings> {
     }
 
     Some(Settings {
-        confirm_agent_actions: true,
         confirm_human_path: config.get(Setting::ConfirmHumanPath).value == ConfigValue::Bool(true),
         frozen: config.get(Setting::Frozen).value == ConfigValue::Bool(true),
     })
@@ -1551,8 +1730,11 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixListener;
     use xudo_backend::Capability;
+    use xudo_backend::enrol::{AccountScan, EnrolPlan, EnrolRequest, PlannedFile};
     use xudo_backend::paths_to_root::{Caller, Lookup, MemoryHost};
+    use xudo_backend::snippet::{DOAS_BEGIN, DOAS_END};
     use xudo_config::Setting;
+    use xudo_sys::{AgentError, AgentRow};
 
     /// Runs `cli` against `ops` and `probe`, with this machine's filesystem and
     /// no `PATH` to report on.
@@ -1585,14 +1767,30 @@ mod tests {
             .join("test-tmp")
     }
 
+    /// A directory name no other call, test or process shares.
+    ///
+    /// Tests run in parallel and a shared name lets one test's `remove_dir_all`
+    /// pull the directory from under another's write.
+    fn unique_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        test_tmp_root().join(format!("{name}-{}-{n}", std::process::id()))
+    }
+
     struct Fixture {
         dir: PathBuf,
     }
 
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(self.dir.with_extension("config"));
+        }
+    }
+
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = test_tmp_root().join(name);
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = unique_dir(name);
             std::fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }
@@ -2850,7 +3048,7 @@ args = [{ name = "verb", matcher = { literal = "update" } }]
             "nginx.service",
         ]);
         // ALLOW, and note what that does *not* mean: the human path's password
-        // is sudo's job, not the verdict's. `confirm_agent_actions` applies to
+        // is sudo's job, not the verdict's. The agent confirmation applies to
         // an attested agent, and nobody is attested in this build, so the
         // policy answer here is a plain allow.
         assert_eq!(code, ExitCode::Delegated);
@@ -3225,8 +3423,85 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
     }
 
     #[test]
-    fn check_reports_harness_guardrails_as_lint_errors() {
-        let root = test_tmp_root().join("cli-check-harness-guardrails");
+    fn check_rejects_an_unpinned_multicall_applet() {
+        let rules = "[[action]]\nid = \"x.any\"\ntier = \"diag-read\"\nexe = \"/usr/bin/coreutils\"\nargs = [{ name = \"a\", matcher = { pattern = \"[a-z]+\" } }]\n";
+        let (code, out, err) = Fixture::new("cli-check-unpinned-multicall")
+            .write("10-rules.toml", rules)
+            .run(&["check"]);
+        assert_eq!(code.as_i32(), 21, "{out}{err}");
+        assert!(!out.contains("ok:"), "{out}");
+        assert!(err.contains("must pin its applet"), "{err}");
+        let (code, json, _) = Fixture::new("cli-check-unpinned-multicall-json")
+            .write("10-rules.toml", rules)
+            .run(&["--output", "json", "check"]);
+        assert_eq!(code.as_i32(), 21);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["lint"]["open_unit_lints"][0]["action"], "x.any");
+    }
+
+    const CODEX_FILE: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+
+    fn harness_fixture(name: &str, rule: &str) -> (Fixture, std::path::PathBuf) {
+        let root = unique_dir(name);
+        let _ = std::fs::remove_dir_all(&root);
+        let rules = root.join("rules.d");
+        let harnesses = root.join("harnesses.d");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&harnesses).unwrap();
+        std::fs::write(rules.join("10-harness.toml"), rule).unwrap();
+        std::fs::write(harnesses.join("codex.toml"), CODEX_FILE).unwrap();
+        (Fixture { dir: rules }, root)
+    }
+
+    #[test]
+    fn check_refuses_a_dangerous_harness_shape_at_load() {
+        let (fixture, root) = harness_fixture(
+            "cli-check-harness-dangerous-shape",
+            r#"
+[[action]]
+id = "xudo.harness.broad"
+tier = "diag-read"
+exe = "/usr/bin/xudo-demo"
+harness = ["codex"]
+outcome = "allow"
+args = [{ name = "path", matcher = { path-under = { prefix = "/tmp" } } }]
+"#,
+        );
+        let (code, out, err) = fixture.run(&["check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        assert!(err.contains("path-under"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_reports_a_missing_near_miss_as_a_lint_error() {
+        let (fixture, root) = harness_fixture(
+            "cli-check-harness-near-miss",
+            r#"
+[[action]]
+id = "xudo.harness.ok"
+tier = "diag-read"
+exe = "/usr/bin/xudo-demo"
+harness = ["codex"]
+outcome = "allow"
+args = [{ name = "verb", matcher = { literal = "status" } }]
+"#,
+        );
+        let (code, out, err) = fixture.run(&["--output", "json", "check"]);
+        assert_eq!(code, ExitCode::LintError, "{out}{err}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let lints = parsed["lint"]["harness_lints"].as_array().unwrap();
+        assert_eq!(lints.len(), 1, "{out}");
+        assert!(
+            lints[0]["message"].as_str().unwrap().contains("near-miss"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn check_refuses_a_rule_naming_an_unregistered_harness_and_a_faulted_registry() {
+        let root = unique_dir("cli-check-unregistered");
         let _ = std::fs::remove_dir_all(&root);
         let rules = root.join("rules.d");
         let harnesses = root.join("harnesses.d");
@@ -3234,42 +3509,31 @@ args = [{ name = "target", matcher = { pattern = "[a-z.]+" } }]
         std::fs::create_dir_all(&harnesses).unwrap();
         std::fs::write(
             rules.join("10-harness.toml"),
-            r#"
-[[action]]
-id = "xudo.harness.broad"
-tier = "diag-read"
-exe = "/usr/bin/awk"
-agent-allowed = false
-harness = ["codex"]
-args = [
-  { name = "path", matcher = { path-under = { prefix = "/tmp" } } },
-  { name = "name", matcher = { pattern = "[a-z]+" } },
-]
-"#,
+            "[[action]]\nid = \"xudo.harness.ghost\"\ntier = \"diag-read\"\nexe = \"/usr/bin/id\"\nharness = [\"ghost\"]\noutcome = \"allow\"\nargs = []\n",
         )
         .unwrap();
         std::fs::write(
             harnesses.join("codex.toml"),
-            "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n",
+            "label = \"codex\"\nbogus = 1\n",
         )
         .unwrap();
         let fixture = Fixture { dir: rules };
         let (code, out, err) = fixture.run(&["--output", "json", "check"]);
+        // The rules still load: a registry fault is a lint, not a load failure.
         assert_eq!(code, ExitCode::LintError, "{out}{err}");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["exit_code"], 21);
-        let lints = parsed["lint"]["harness_lints"].as_array().unwrap();
-        assert!(lints.len() >= 5, "{out}");
-        let messages = lints
+        let messages = parsed["lint"]["harness_lints"]
+            .as_array()
+            .unwrap()
             .iter()
             .filter_map(|item| item["message"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(messages.contains("path-under"), "{messages}");
-        assert!(messages.contains("pattern"), "{messages}");
-        assert!(messages.contains("agent-allowed"), "{messages}");
-        assert!(messages.contains("GTFOBins"), "{messages}");
-        assert!(messages.contains("near-miss"), "{messages}");
+        assert!(
+            messages.contains("\"ghost\", which is not in the registry"),
+            "{messages}"
+        );
+        assert!(messages.contains("no harness is armed"), "{messages}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3831,6 +4095,10 @@ expect = "deny"
             true
         }
 
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
+        }
+
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
             true
         }
@@ -3859,6 +4127,10 @@ expect = "deny"
 
         fn validates_named_file(&self, _path: &str) -> bool {
             true
+        }
+
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            false
         }
 
         fn accepts_argument_wildcard(&self, _path: &str) -> bool {
@@ -3903,9 +4175,11 @@ expect = "deny"
         assert!(WorkingSudoProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(WorkingSudoProbe.validates_named_file("/usr/bin/sudo"));
         assert!(WorkingSudoProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!WorkingSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         assert!(!NoBackendProbe.honours_scoped_directive("/usr/bin/sudo", "use_pty"));
         assert!(NoBackendProbe.validates_named_file("/usr/bin/sudo"));
         assert!(NoBackendProbe.accepts_argument_wildcard("/usr/bin/sudo"));
+        assert!(!NoBackendProbe.doas_reads_drop_ins("/usr/bin/doas"));
     }
 
     #[test]
@@ -3956,6 +4230,21 @@ expect = "deny"
     struct ScriptedInstaller {
         plans: std::cell::RefCell<Vec<InstallPlan>>,
         answers: std::cell::RefCell<Vec<Result<InstallReport, xudo_sys::InstallError>>>,
+        agent: AgentScript,
+    }
+
+    /// What the agent calls were asked, and what each answers once.
+    #[derive(Default)]
+    struct AgentScript {
+        asked: std::cell::RefCell<Vec<String>>,
+        plan: std::cell::RefCell<Option<Result<EnrolPlan, AgentError>>>,
+        apply: std::cell::RefCell<Option<Result<(), AgentError>>>,
+        list: std::cell::RefCell<Option<Result<Vec<AgentRow>, AgentError>>>,
+        remove: std::cell::RefCell<Option<Result<Vec<String>, AgentError>>>,
+    }
+
+    fn nobody<T>() -> Result<T, AgentError> {
+        Err(xudo_sys::InstallError::NoInstaller.into())
     }
 
     impl ScriptedInstaller {
@@ -3963,6 +4252,7 @@ expect = "deny"
             Self {
                 plans: std::cell::RefCell::new(Vec::new()),
                 answers: std::cell::RefCell::new(answers.into_iter().rev().collect()),
+                agent: AgentScript::default(),
             }
         }
     }
@@ -3974,6 +4264,54 @@ expect = "deny"
                 .borrow_mut()
                 .pop()
                 .unwrap_or(Err(xudo_sys::InstallError::NoInstaller))
+        }
+
+        fn agent_plan(
+            &self,
+            request: &EnrolRequest,
+            scan: AccountScan,
+        ) -> Result<EnrolPlan, AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("plan {request:?} {scan:?}"));
+            self.agent.plan.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_apply(&self, plan: &EnrolPlan) -> Result<(), AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("apply {}", plan.label));
+            self.agent.apply.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_list(&self) -> Result<Vec<AgentRow>, AgentError> {
+            self.agent.asked.borrow_mut().push("list".to_owned());
+            self.agent.list.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn agent_remove(&self, label: &str) -> Result<Vec<String>, AgentError> {
+            self.agent
+                .asked
+                .borrow_mut()
+                .push(format!("remove {label}"));
+            self.agent.remove.borrow_mut().take().unwrap_or_else(nobody)
+        }
+
+        fn pack_add(
+            &self,
+            _request: &xudo_sys::PackRequest,
+        ) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
+            Err(xudo_sys::InstallError::NoInstaller.into())
+        }
+
+        fn pack_remove(
+            &self,
+            _name: &str,
+            _reviewed: &str,
+        ) -> Result<xudo_sys::PackReport, xudo_sys::PackError> {
+            Err(xudo_sys::InstallError::NoInstaller.into())
         }
     }
 
@@ -4163,6 +4501,206 @@ expect = "deny"
         assert!(installer.plans.borrow().is_empty());
     }
 
+    /// A root-run sudo host for `--agent-path`, with `extra` in sudoers.d and
+    /// `ptrace_scope` at `scope`.
+    fn nopass_host(scope: &[u8], extra: &[(&str, &[u8])]) -> MemoryHost {
+        let mut host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
+        .file(
+            "/etc/passwd",
+            0,
+            0,
+            0o644,
+            b"root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n",
+        )
+        .file("/etc/sudoers", 0, 0, 0o440, b"@includedir /etc/sudoers.d\n")
+        .dir("/etc/sudoers.d", 0, 0, 0o750)
+        .dir("/usr", 0, 0, 0o755)
+        .dir("/usr/libexec", 0, 0, 0o755)
+        .dir("/usr/libexec/xudo", 0, 0, 0o755)
+        .file(xudo_backend::snippet::GATE_NOPASS, 0, 0, 0o755, b"gate")
+        .dir("/proc", 0, 0, 0o555)
+        .dir("/proc/sys", 0, 0, 0o555)
+        .dir("/proc/sys/kernel", 0, 0, 0o555)
+        .dir("/proc/sys/kernel/yama", 0, 0, 0o555)
+        .file("/proc/sys/kernel/yama/ptrace_scope", 0, 0, 0o644, scope);
+        for (path, contents) in extra {
+            host = host.file(path, 0, 0, 0o440, contents);
+        }
+        host
+    }
+
+    /// `xudo install <args>` on `host` with a working sudo and `installer`.
+    fn install_on(
+        host: &MemoryHost,
+        installer: &dyn Installer,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let fx = fixture("cli-install-agent-path");
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "install"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let platform = Platform {
+            ops: &BlindOps,
+            probe: &WorkingSudoProbe,
+            host,
+            path: None,
+        };
+        let code = run_with_installer(&cli, &platform, installer, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn the_agent_path_dry_run_shows_the_one_passwordless_line_and_writes_nothing() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, out, err) = install_on(
+            &nopass_host(b"1\n", &[]),
+            &installer,
+            &["--agent-path", "--dry-run", "--show-contents"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(
+            out.contains("probe first: the passwordless helper"),
+            "{out}"
+        );
+        assert!(
+            out.contains("%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS"),
+            "{out}"
+        );
+        assert!(
+            out.contains("With --agent-path the plan also writes one passwordless"),
+            "{out}"
+        );
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_is_said_and_does_not_fail_the_agent_path() {
+        // The functional probe could not run (no broker yet). Every check
+        // that did run passed, or the executor would have restored the old
+        // state and failed: so exit 0 and say what was not verified.
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Unverified {
+                reason: "no broker".to_owned(),
+            },
+        ))]);
+        let (code, out, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(
+            out.contains(
+                "could not verify: the gate running as root through the password rule: no broker"
+            ),
+            "{out}"
+        );
+        assert!(!err.contains("NOT VERIFIED"), "{err}");
+        let plans = installer.plans.borrow();
+        assert!(plans[0].steps[0].describe().starts_with("probe first:"));
+    }
+
+    #[test]
+    fn a_failed_check_after_the_write_fails_the_agent_path() {
+        let installer =
+            ScriptedInstaller::answering(vec![Err(xudo_sys::InstallError::RolledBack {
+                cause: Box::new(xudo_sys::InstallError::ProbeFailed {
+                    reason: "sudo lists the helper for nobody".to_owned(),
+                }),
+            })]);
+        let (code, _, err) = install_on(&nopass_host(b"1\n", &[]), &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("lists the helper for nobody"), "{err}");
+        assert!(err.contains("was restored"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_path_stops_on_a_hand_written_line_before_the_installer() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let host = nopass_host(
+            b"1\n",
+            &[(
+                "/etc/sudoers.d/00-ops",
+                b"%xudo-agent ALL=(ALL) NOPASSWD: ALL\n",
+            )],
+        );
+        let (code, _, err) = install_on(&host, &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("00-ops line 1"), "{err}");
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_agent_path_needs_a_backend() {
+        let fx = fixture("cli-install-agent-nobackend");
+        let (code, _, err) = run_probe_full(
+            &fx,
+            &NoBackendProbe,
+            &["install", "--agent-path", "--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("no usable backend"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_path_refuses_doas_through_the_command() {
+        let (code, out, err) = install_on_doas(b"", &["--agent-path", "--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("sudo and sudo-rs only"), "{err}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn the_agent_path_flags_cannot_be_combined_with_an_uninstall_or_stand_alone() {
+        for args in [
+            &["xudo", "install", "--agent-path", "--uninstall"][..],
+            &["xudo", "install", "--raise-ptrace-scope"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["xudo", "install", "--agent-path", "--raise-ptrace-scope"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_plain_install_over_the_agent_path_warns_and_writes_no_nopasswd() {
+        let backend = xudo_backend::detect(&WorkingSudoProbe).unwrap();
+        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, false, None)
+            .unwrap()
+            .steps
+            .into_iter()
+            .find_map(|s| match s {
+                PlanStep::WriteCandidate { contents, .. } => Some(contents),
+                _ => None,
+            })
+            .unwrap();
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Verified,
+        ))]);
+        let host = nopass_host(b"1\n", &[("/etc/sudoers.d/xudo", agent.as_bytes())]);
+        let (code, _, err) = install_on(&host, &installer, &[]);
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.contains("turns it off"), "{err}");
+        let plans = installer.plans.borrow();
+        for step in &plans[0].steps {
+            if let PlanStep::WriteCandidate { contents, .. } = step {
+                assert!(!contents.contains("NOPASSWD"), "{contents}");
+            }
+        }
+    }
+
     #[test]
     fn install_shows_the_file_it_would_write_when_asked() {
         let fx = fixture("cli-install-contents");
@@ -4211,10 +4749,15 @@ expect = "deny"
             fn validates_named_file(&self, _path: &str) -> bool {
                 false
             }
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 false
             }
         }
+        assert!(!MuteProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let fx = fixture("cli-install-mute");
         let (code, _, err) = run_probe_full(&fx, &MuteProbe, &["install", "--dry-run"]);
         assert_eq!(code, ExitCode::Unusable);
@@ -4538,6 +5081,320 @@ expect = "deny"
         );
     }
 
+    /// A doas with a drop-in directory, for the install gate.
+    struct DoasInstallProbe {
+        /// Whether the build has `/etc/doas.d`.
+        drop_in: bool,
+        /// Whether the build is shown to read it.
+        reads: bool,
+    }
+    impl Probe for DoasInstallProbe {
+        fn exists(&self, absolute_path: &str) -> bool {
+            absolute_path == "/usr/bin/doas"
+        }
+        fn version_banner(&self, _absolute_path: &str) -> Option<String> {
+            Some("doas (OpenDoas) 6.8.2".to_owned())
+        }
+        fn directory_exists(&self, _absolute_path: &str) -> bool {
+            self.drop_in
+        }
+        fn honours_directive(&self, _absolute_path: &str, _directive: &str) -> bool {
+            true
+        }
+        fn honours_scoped_directive(&self, _path: &str, _directive: &str) -> bool {
+            true
+        }
+        fn validates_named_file(&self, _path: &str) -> bool {
+            true
+        }
+        fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+            self.reads
+        }
+
+        fn accepts_argument_wildcard(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
+    /// `xudo install` on a doas host with a drop-in directory whose only file
+    /// is `zz-local.conf`, holding `later`: xudo's own rule is not installed yet,
+    /// and lands at `60-xudo.conf`, before it.
+    fn install_on_doas(later: &[u8], args: &[&str]) -> (ExitCode, String, String) {
+        install_on_doas_with(true, &[("/etc/doas.d/zz-local.conf", later)], args)
+    }
+
+    /// The same with the files `files` on the machine, and a doas build that
+    /// reads `/etc/doas.d` or not.
+    fn install_on_doas_with(
+        drop_in: bool,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        install_on_doas_probe(
+            &DoasInstallProbe {
+                drop_in,
+                reads: drop_in,
+            },
+            files,
+            args,
+        )
+    }
+
+    /// The same with the probe described in full.
+    fn install_on_doas_probe(
+        probe: &DoasInstallProbe,
+        files: &[(&str, &[u8])],
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        let mut host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n")
+        .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
+        .dir("/etc/doas.d", 0, 0, 0o755);
+        for (path, contents) in files {
+            host = host.file(path, 0, 0, 0o400, contents);
+        }
+        let fx = fixture("cli-install-doas-later");
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "install"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let platform = Platform {
+            ops: &BlindOps,
+            probe,
+            host: &host,
+            path: None,
+        };
+        let code = run_with(&cli, &platform, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn install_refuses_a_later_doas_rule_that_takes_the_password_from_the_gate() {
+        let (code, out, err) = install_on_doas(b"permit nopass :xudo\n", &[]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(
+            err.contains("refusing to install: /etc/doas.d/zz-local.conf:1"),
+            "{err}"
+        );
+        assert!(err.contains("nopass"), "{err}");
+        // Refused before any plan ran, and a dry run is refused the same way.
+        assert!(
+            !err.contains("failed") && !out.contains("done"),
+            "{out}{err}"
+        );
+        let (code, out, _) = install_on_doas(b"permit nopass :xudo\n", &["--dry-run"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(!out.contains("plan for"), "{out}");
+    }
+
+    #[test]
+    fn the_doas_install_probe_answers_every_question() {
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        assert!(probe.honours_directive("/usr/bin/doas", "x"));
+        assert!(probe.honours_scoped_directive("/usr/bin/doas", "x"));
+        assert!(probe.validates_named_file("/usr/bin/doas"));
+        assert!(probe.accepts_argument_wildcard("/usr/bin/doas"));
+        assert!(!probe.directory_exists("/etc/doas.d"));
+        assert!(!probe.doas_reads_drop_ins("/usr/bin/doas"));
+        assert!(
+            DoasInstallProbe {
+                drop_in: true,
+                reads: true
+            }
+            .directory_exists("/etc/doas.d")
+        );
+    }
+
+    #[test]
+    fn the_first_install_is_refused_for_a_zz_local_nopass_wheel_rule_the_agent_is_in() {
+        // No rule of xudo's is installed: 60-xudo.conf is planned, and sorts
+        // before zz-local.conf, whose `permit nopass :wheel` covers the agent.
+        let (code, out, err) = install_on_doas_with(
+            true,
+            &[
+                ("/etc/doas.d/zz-local.conf", b"permit nopass :wheel\n"),
+                (
+                    "/etc/passwd",
+                    b"root:x:0:0::/root:/bin/sh\nagent:x:1001:1001::/h:/bin/sh\n",
+                ),
+                (
+                    "/etc/group",
+                    b"root:x:0:\nxudo:x:998:agent\nwheel:x:10:agent\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(
+            err.contains("refusing to install: /etc/doas.d/zz-local.conf:1"),
+            "{err}"
+        );
+        assert!(!out.contains("done"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_a_nopass_line_it_cannot_read_and_names_its_place() {
+        for line in [
+            &b"permit nopass :xudo \\\n"[..],
+            b"permit nopass :xu\\do\n",
+            b"permit nopass \":xudo\"#x\n",
+            b"permit nopass setenv { A=\"#\" } :xudo\n",
+        ] {
+            let (code, _, err) = install_on_doas(line, &["--dry-run"]);
+            assert_eq!(code, ExitCode::Unusable, "{line:?}");
+            assert!(
+                err.contains("zz-local.conf:1: doas may apply this line"),
+                "{err}"
+            );
+            assert!(err.contains("Remove nopass"), "{err}");
+        }
+    }
+
+    #[test]
+    fn install_goes_on_past_doas_lines_that_do_not_match_the_gate() {
+        let (code, _, err) = install_on_doas(
+            b"permit nopass :xudo\r\npermit nopass :xudo cmd /usr/libexec/xudo/xudo-gate-auth args a\npermit :xudo as root cmd /usr/libexec/xudo/xudo-gate-auth args\n",
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn install_does_not_read_a_drop_in_directory_a_doas_build_ignores() {
+        // The block goes to the end of doas.conf; nothing in doas.d is read by
+        // this build, so what it holds cannot follow xudo's rule.
+        let (code, _, err) = install_on_doas_with(
+            false,
+            &[("/etc/doas.d/zz-local.conf", b"permit nopass :xudo\n")],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn install_appends_when_a_directory_exists_that_the_doas_build_does_not_read() {
+        // Debian's opendoas ignores a /etc/doas.d someone made. A drop-in there
+        // would never take effect, and doas.conf's own `permit nopass :xudo`
+        // would look overridden by it. The block goes to doas.conf instead, so
+        // the nopass line above it is seen as coming BEFORE xudo's rule.
+        let probe = DoasInstallProbe {
+            drop_in: true,
+            reads: false,
+        };
+        let (code, out, err) = install_on_doas_probe(
+            &probe,
+            &[
+                ("/etc/doas.conf", b"permit nopass :xudo\n"),
+                ("/etc/doas.d/zz-local.conf", b"permit nopass :xudo\n"),
+            ],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated, "{err}");
+        assert!(out.contains("append"), "{out}");
+        assert!(!out.contains("60-xudo.conf"), "{out}");
+    }
+
+    #[test]
+    fn install_refuses_when_a_stale_xudo_block_hides_a_nopass_line_behind_it() {
+        // An operator edited xudo's block so it no longer matches, then added
+        // `permit nopass :xudo` after it. The install puts the new rule back
+        // INSIDE the old block, which is before that line: the nopass line
+        // wins. Appending at the end of the file would have hidden it.
+        let conf = format!("{DOAS_BEGIN}\n# xudo disabled\n{DOAS_END}\npermit nopass :xudo\n");
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) =
+            install_on_doas_probe(&probe, &[("/etc/doas.conf", conf.as_bytes())], &[]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("doas.conf:15"), "{err}");
+        assert!(err.contains("Remove nopass"), "{err}");
+    }
+
+    #[test]
+    fn install_refuses_when_the_planned_doas_file_cannot_be_read() {
+        // A doas.conf whose block the install would refuse to edit (an unpaired
+        // sentinel) cannot be shown to hold xudo's rule: refuse, never go on.
+        let probe = DoasInstallProbe {
+            drop_in: false,
+            reads: false,
+        };
+        let (code, _, err) = install_on_doas_probe(
+            &probe,
+            &[(
+                "/etc/doas.conf",
+                format!("{DOAS_BEGIN}\npermit nopass :xudo\n").as_bytes(),
+            )],
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("xudo's own rule could not be found"), "{err}");
+    }
+
+    #[test]
+    fn a_plan_that_writes_no_file_is_checked_against_the_host_as_it_is() {
+        let host = MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755);
+        let plan = InstallPlan {
+            backend: BackendKind::Doas,
+            steps: Vec::new(),
+        };
+        let mut err = Vec::new();
+        assert_eq!(doas_later_rules(&host, &plan, &mut err), None);
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn install_warns_about_a_later_doas_persist_and_goes_on() {
+        let (code, out, err) = install_on_doas(b"permit persist :xudo\n", &["--dry-run"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(
+            err.contains("warning: /etc/doas.d/zz-local.conf:1"),
+            "{err}"
+        );
+        assert!(err.contains("persist"), "{err}");
+        assert!(out.contains("plan for"), "{out}");
+    }
+
+    #[test]
+    fn install_ignores_a_later_doas_rule_that_names_someone_else() {
+        let (code, _, err) = install_on_doas(
+            b"permit nopass :staff\npermit nopass :xudo as nobody\npermit :xudo as root cmd /bin/ls\npermit :xudo\n",
+            &["--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn uninstall_is_never_held_back_by_a_later_doas_rule() {
+        let (code, out, err) =
+            install_on_doas(b"permit nopass :xudo\n", &["--uninstall", "--dry-run"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("plan for"), "{out}");
+        assert!(err.is_empty(), "{err}");
+    }
+
     #[test]
     fn doctor_names_the_capabilities_a_backend_lacks() {
         // A doas port: no drop-in directory, so it appends a delimited block to
@@ -4566,6 +5423,10 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
@@ -4575,6 +5436,7 @@ expect = "deny"
         assert!(DoasProbe.honours_scoped_directive("/usr/bin/doas", "pty"));
         assert!(DoasProbe.validates_named_file("/usr/bin/doas"));
         assert!(DoasProbe.accepts_argument_wildcard("/usr/bin/doas"));
+        assert!(!DoasProbe.doas_reads_drop_ins("/usr/bin/doas"));
 
         let out = run_probe(&fixture("cli-doctor-doas"), &DoasProbe, &["doctor"]);
         assert!(out.contains("backend      doas"), "{out}");
@@ -4606,10 +5468,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!MuteSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-mute"), &MuteSudoProbe, &["doctor"]);
         assert!(out.contains("no version banner"), "{out}");
         // An unreadable banner is assumed to be the stricter implementation.
@@ -4651,10 +5518,15 @@ expect = "deny"
                 true
             }
 
+            fn doas_reads_drop_ins(&self, _path: &str) -> bool {
+                false
+            }
+
             fn accepts_argument_wildcard(&self, _path: &str) -> bool {
                 true
             }
         }
+        assert!(!DeafSudoProbe.doas_reads_drop_ins("/usr/bin/doas"));
         let out = run_probe(&fixture("cli-doctor-deaf"), &DeafSudoProbe, &["doctor"]);
         assert!(out.contains("backend      UNUSABLE"), "{out}");
         assert!(out.contains("fresh pty"), "{out}");
@@ -4786,7 +5658,7 @@ expect = "deny"
         let text = err.to_string();
         assert!(text.contains("password-authenticated path"), "{text}");
         assert!(
-            text.contains("passwordless agent path is not available"),
+            text.contains("passwordless agent path is off unless root runs"),
             "{text}"
         );
     }
@@ -4812,5 +5684,335 @@ expect = "deny"
     fn the_parsed_command_is_debuggable() {
         let cli = Cli::try_parse_from(["xudo", "explain", "--", "x"]).unwrap();
         assert!(format!("{cli:?}").contains("Explain"));
+    }
+
+    // --- xudo agent --------------------------------------------------------
+
+    const AGENT_PASSWD: &[u8] =
+        b"root:x:0:0::/root:/bin/sh\nagent:x:990:990::/h:/usr/sbin/nologin\nalice:x:1000:1000::/h:/bin/sh\n";
+
+    fn agent_host(sudoers: &[u8]) -> MemoryHost {
+        MemoryHost::new(Caller {
+            uid: 0,
+            gid: 0,
+            groups: Lookup::Found(vec![0]),
+        })
+        .dir("/", 0, 0, 0o755)
+        .dir("/etc", 0, 0, 0o755)
+        .file("/etc/passwd", 0, 0, 0o644, AGENT_PASSWD)
+        .file("/etc/sudoers", 0, 0, 0o440, sudoers)
+    }
+
+    fn enrol_plan() -> EnrolPlan {
+        let file = |path: &str, contents: &str| PlannedFile {
+            path: path.to_owned(),
+            contents: contents.to_owned(),
+            mode: 0o644,
+            keep: false,
+        };
+        EnrolPlan {
+            label: "codex".to_owned(),
+            account: "agent".to_owned(),
+            unit: "xudo-agent@codex.service".to_owned(),
+            registry: file("/etc/xudo/harnesses.d/codex.toml", "label = \"codex\"\n"),
+            drop_in_dir: "/etc/systemd/system/xudo-agent@codex.service.d".to_owned(),
+            drop_in: file(
+                "/etc/systemd/system/xudo-agent@codex.service.d/10-xudo.conf",
+                "User=agent\n",
+            ),
+            env: file("/etc/xudo/agents/codex.env", "# stub\n"),
+            memberships: Vec::new(),
+        }
+    }
+
+    fn run_agent(
+        host: &dyn HostView,
+        probe: &dyn Probe,
+        installer: &dyn Installer,
+        args: &[&str],
+    ) -> (ExitCode, String, String) {
+        // One directory per call: tests run in parallel and a fixture clears its own.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fx = fixture(&format!("cli-agent-{n}"));
+        let mut full = vec!["xudo", "--rules", fx.dir.to_str().unwrap(), "agent"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ops = host_ops();
+        let platform = Platform {
+            ops: ops.as_ref(),
+            probe,
+            host,
+            path: None,
+        };
+        let code = run_with_installer(&cli, &platform, installer, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    const ENROL: [&str; 9] = [
+        "enrol",
+        "codex",
+        "--account",
+        "agent",
+        "--reviewer",
+        "alice",
+        "--",
+        "/usr/bin/codex",
+        "--full-auto",
+    ];
+
+    #[test]
+    fn agent_enrol_prints_what_it_will_write_before_it_writes() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        *installer.agent.apply.borrow_mut() = Some(Ok(()));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!((code, err.as_str()), (ExitCode::Delegated, ""), "{out}");
+        let diff = out
+            .find("--- /etc/xudo/harnesses.d/codex.toml")
+            .expect(&out);
+        let done = out.find("enrolled codex").expect(&out);
+        assert!(diff < done, "{out}");
+        assert!(out.contains("It grants nothing"), "{out}");
+        let asked = installer.agent.asked.borrow();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked[0].contains("argv: [\"/usr/bin/codex\", \"--full-auto\"]"),
+            "{asked:?}"
+        );
+        assert!(asked[0].contains("reviewers: [\"alice\"]"), "{asked:?}");
+        assert!(asked[0].contains("uid: 990"), "{asked:?}");
+        assert_eq!(asked[1], "apply codex");
+    }
+
+    #[test]
+    fn agent_enrol_dry_run_writes_nothing() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        let mut args = ENROL.to_vec();
+        args.insert(1, "--dry-run");
+        let (code, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &args);
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("Nothing was written (--dry-run)"), "{out}");
+        assert_eq!(installer.agent.asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn agent_enrol_scans_the_account_with_whichever_backend_there_is() {
+        // sudo: its own listing for the account is asked, and a rule found
+        // there stops the enrol before anything is planned.
+        let host = agent_host(b"alice ALL=(ALL) ALL\n").sudo_says(
+            "agent",
+            xudo_backend::paths_to_root::Answer::Passwordless("(root) NOPASSWD: ALL".to_owned()),
+        );
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        run_agent(&host, &WorkingSudoProbe, &installer, &ENROL);
+        assert!(installer.agent.asked.borrow()[0].contains("blockers: [\"BackendListing"));
+        // doas, and no backend at all: the same scan without a program to ask.
+        for probe in [
+            &DoasInstallProbe {
+                drop_in: false,
+                reads: false,
+            } as &dyn Probe,
+            &NoBackendProbe,
+        ] {
+            let installer = ScriptedInstaller::answering(vec![]);
+            *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+            run_agent(
+                &agent_host(b""),
+                probe,
+                &installer,
+                &[
+                    "enrol",
+                    "codex",
+                    "--account",
+                    "agent",
+                    "--reviewer",
+                    "alice",
+                    "--dry-run",
+                    "--",
+                    "/usr/bin/codex",
+                ],
+            );
+            assert_eq!(installer.agent.asked.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn agent_enrol_refuses_an_account_passwd_does_not_name() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let mut args = ENROL.to_vec();
+        args[3] = "ghost";
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &args);
+        assert_eq!(code, ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("ghost is not in /etc/passwd"), "{err}");
+        assert!(installer.agent.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn agent_enrol_reports_a_refusal_and_a_failed_write_and_exits_non_zero() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.plan.borrow_mut() = Some(Err(AgentError::NotRoot { uid: 1000 }));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("this needs root"), "{err}");
+        *installer.agent.plan.borrow_mut() = Some(Ok(enrol_plan()));
+        *installer.agent.apply.borrow_mut() = Some(Err(AgentError::NotEnrolled("x".to_owned())));
+        let (code, out, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &ENROL);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(out.contains("--- /etc/xudo"), "the diff came first: {out}");
+        assert!(!out.contains("enrolled codex"), "{out}");
+        assert!(err.contains("x is not an enrolled agent"), "{err}");
+    }
+
+    #[test]
+    fn agent_enrol_needs_a_reviewer_a_program_and_a_label() {
+        for bad in [
+            vec![
+                "enrol",
+                "codex",
+                "--account",
+                "agent",
+                "--",
+                "/usr/bin/codex",
+            ],
+            vec![
+                "enrol",
+                "codex",
+                "--account",
+                "agent",
+                "--reviewer",
+                "alice",
+            ],
+            vec![
+                "enrol",
+                "--account",
+                "agent",
+                "--reviewer",
+                "alice",
+                "--",
+                "/x",
+            ],
+            vec!["enrol", "codex", "--reviewer", "alice", "--", "/x"],
+        ] {
+            let mut full = vec!["xudo", "agent"];
+            full.extend(bad.iter());
+            assert!(Cli::try_parse_from(full).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn agent_list_shows_each_agent_with_its_state() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.list.borrow_mut() = Some(Ok(vec![AgentRow {
+            agent: xudo_backend::enrol::Listed {
+                label: "codex".to_owned(),
+                account: "agent".to_owned(),
+                reviewers: vec!["alice".to_owned(), "bob".to_owned()],
+            },
+            state: "active".to_owned(),
+        }]));
+        let (code, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(code, ExitCode::Delegated);
+        assert_eq!(out, "codex  account=agent  active  reviewers=alice,bob\n");
+        *installer.agent.list.borrow_mut() = Some(Ok(vec![]));
+        let (_, out, _) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(out, "No agents enrolled.\n");
+        let (code, _, err) = run_agent(&agent_host(b""), &WorkingSudoProbe, &installer, &["list"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("cannot modify the machine"), "{err}");
+    }
+
+    #[test]
+    fn agent_remove_reports_each_step_and_each_refusal() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        *installer.agent.remove.borrow_mut() =
+            Some(Ok(vec!["stopped u".to_owned(), "removed r".to_owned()]));
+        let (code, out, _) = run_agent(
+            &agent_host(b""),
+            &WorkingSudoProbe,
+            &installer,
+            &["remove", "codex"],
+        );
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::Delegated, "stopped u\nremoved r\n")
+        );
+        assert_eq!(installer.agent.asked.borrow().as_slice(), ["remove codex"]);
+        let (code, _, err) = run_agent(
+            &agent_host(b""),
+            &WorkingSudoProbe,
+            &installer,
+            &["remove", "codex"],
+        );
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.starts_with("xudo: "), "{err}");
+    }
+
+    #[test]
+    fn the_scripted_installer_enrols_nothing_unless_told() {
+        let installer = ScriptedInstaller::answering(vec![]);
+        let request = EnrolRequest {
+            label: "a".to_owned(),
+            account: "b".to_owned(),
+            reviewers: vec![],
+            argv: vec![],
+        };
+        let scan = AccountScan {
+            uid: 1,
+            blockers: vec![],
+            doas: false,
+        };
+        assert!(installer.agent_plan(&request, scan).is_err());
+        assert!(installer.agent_apply(&enrol_plan()).is_err());
+        assert!(installer.agent_list().is_err());
+        assert!(installer.agent_remove("a").is_err());
+        assert_eq!(installer.agent.asked.borrow().len(), 4);
+        let pack = xudo_sys::PackRequest {
+            bytes: Vec::new(),
+            reviewed: String::new(),
+            allow_waivers: false,
+        };
+        assert!(installer.pack_add(&pack).is_err());
+        assert!(installer.pack_remove("a", "t").is_err());
+    }
+
+    #[test]
+    fn an_agent_cannot_install_a_pack_without_root() {
+        // `run_with` refuses every write; the real installer refuses a caller
+        // that is not root or that runs inside xudo.slice (see xudo_sys).
+        let fx = fixture("cli-rules-refusing");
+        let (code, out, err) = fx.run(&["rules", "add", "--reviewed", "00", "/nonexistent"]);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("cannot read /nonexistent"), "{err}");
+        let (code, _, err) = fx.run(&["rules", "remove", "--reviewed", "t", "x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("cannot modify the machine"), "{err}");
+        // Without a token, remove only shows what it would change.
+        let (code, _, err) = fx.run(&["rules", "remove", "x"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("x is not a pack xudo installed"), "{err}");
+        let (code, out, _) = fx.run(&["rules", "list"]);
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::Delegated, "No rule packs.\n")
+        );
+    }
+
+    #[test]
+    fn agent_without_an_installer_cannot_modify_the_machine() {
+        // `run_with` is what every test drives: enrol and remove from an
+        // injected platform must never reach /etc.
+        let fx = fixture("cli-agent-refusing");
+        let (code, out, err) = fx.run(&["agent", "remove", "codex"]);
+        assert_eq!((code, out.as_str()), (ExitCode::Unusable, ""));
+        assert!(err.contains("cannot modify the machine"), "{err}");
     }
 }

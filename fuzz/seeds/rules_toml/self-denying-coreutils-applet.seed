@@ -1,0 +1,5 @@
+[[action]]
+id = "x.c"
+tier = "diag-read"
+exe = "/usr/bin/coreutils"
+args = [{ name = "applet", matcher = { literal = "true" } }]

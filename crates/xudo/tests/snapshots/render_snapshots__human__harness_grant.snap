@@ -1,0 +1,16 @@
+---
+source: crates/xudo/tests/render_snapshots.rs
+expression: "render::human(&decision)"
+---
+ALLOW
+  command   /usr/bin/systemctl restart nginx.service
+  action    xudo.svc.restart
+  rule      snapshot-grant.toml:3
+
+  trace
+    canonicalized: unchanged (restart nginx.service)
+    matched xudo.svc.restart at snapshot-grant.toml:3
+    deny-list v8: no capability class matched
+    deny-rules: no configured rule matched
+    confirmation not required: no confirmation requirement applies
+    harness claude-code granted by xudo.svc.restart

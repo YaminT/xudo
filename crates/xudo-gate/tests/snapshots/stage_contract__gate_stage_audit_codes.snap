@@ -16,3 +16,4 @@ Program gate_failed_program
 Audit gate_failed_audit
 Exec gate_failed_exec
 Config gate_failed_config
+Ledger gate_failed_ledger

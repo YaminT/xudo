@@ -241,10 +241,9 @@ mod imp {
 
     use rustix::fs::{
         Dir, FileType, Mode, OFlags, ResolveFlags, fstat, fstatfs, open as open_path, openat,
-        openat2,
     };
 
-    use super::{HostCgroup, ScopeFacts, is_record_name};
+    use super::{HostCgroup, ScopeFacts, is_record_name, record_of_unit_dir};
     use crate::SysError;
     use crate::syscall::Syscalls as _;
 
@@ -387,7 +386,7 @@ mod imp {
     ) -> Result<OwnedFd, SysError> {
         inject(operation)?;
         rustix_result(
-            openat2(dir, path, DIR_FLAGS, Mode::empty(), RESOLVE),
+            crate::beneath::open_beneath(dir, path.as_bytes(), DIR_FLAGS, Mode::empty(), RESOLVE),
             operation,
         )
     }
@@ -486,9 +485,9 @@ mod imp {
         id: u64,
         with_processes: bool,
     ) -> Result<Option<ScopeFacts>, SysError> {
-        if !valid_scope_name(name) {
+        let Some(record_name) = record_of_unit_dir(name) else {
             return Ok(None);
-        }
+        };
         require_cgroup2(host)?;
         let slice = open_dir_at(&host.root, "xudo.slice", "openat2 xudo.slice")?;
         let slice_stat = stat_of(&slice, "fstat xudo.slice")?;
@@ -535,8 +534,7 @@ mod imp {
                 Err(error) => return Err(error),
             }
         }
-        let record_name = name.strip_suffix(".scope").unwrap_or_default();
-        let record = read_record(host, record_name)?;
+        let record = read_record(host, &record_name)?;
         let (record, record_owner, record_mode, record_nlink) = match record {
             Some(file) => (Some(file.bytes), file.owner, file.mode, file.nlink),
             None => (None, 0, 0, 0),
@@ -555,10 +553,6 @@ mod imp {
             record_nlink,
             processes,
         }))
-    }
-
-    fn valid_scope_name(name: &str) -> bool {
-        name.strip_suffix(".scope").is_some_and(is_record_name)
     }
 
     pub(super) fn trusted_cgroup_directory(
@@ -805,6 +799,25 @@ pub fn peer_cgroup_id<C: CgroupCalls + ?Sized>(
     })
 }
 
+/// A process's unified cgroup path and the inode of the directory it names,
+/// resolved from the pinned cgroup2 root with no symlink followed.
+///
+/// For a process that is the caller itself, or one a pidfd already pins: the
+/// pid is read once and not re-checked here.
+///
+/// # Errors
+///
+/// Returns an error if the cgroup file cannot be read or has no unified path,
+/// or the path does not resolve beneath the cgroup2 root.
+pub fn process_cgroup<C: CgroupCalls + ?Sized>(
+    calls: &C,
+    pid: u32,
+) -> Result<(String, u64), SysError> {
+    let path = read_cgroup_path(calls, pid)?;
+    let id = calls.cgroup_inode(&path)?;
+    Ok((path, id))
+}
+
 /// Reads status by a pinned pid and confirms liveness after the read.
 ///
 /// # Errors
@@ -917,15 +930,60 @@ fn trusted_record(owner: u32, mode: u32, nlink: u64) -> bool {
     owner == 0 && mode & 0o170_000 == 0o100_000 && mode.trailing_zeros() >= 6 && nlink == 1
 }
 
-/// Whether `name` is a committed `agent-<32 hex>` or `watch-<32 hex>` record
-/// name. `pending-*` names and anything else carry no authority.
-fn is_record_name(name: &str) -> bool {
+/// The record name prefix of an enrolled service harness: `svc-<label>`.
+pub const SERVICE_RECORD_PREFIX: &str = "svc-";
+
+/// The record name of the unit `xudo-agent@<label>.service`: `svc-<label>`,
+/// or nothing for a string that is not a registry label.
+#[must_use]
+pub fn service_record_name(label: &str) -> Option<String> {
+    xudo_policy::valid_harness_label(label).then(|| format!("{SERVICE_RECORD_PREFIX}{label}"))
+}
+
+/// Whether `name` is a committed record name: `agent-<32 hex>` and
+/// `watch-<32 hex>` for a session scope, or `svc-<label>` for an enrolled
+/// service. `pending-*` names and anything else carry no authority.
+#[must_use]
+pub fn is_record_name(name: &str) -> bool {
+    if let Some(label) = name.strip_prefix(SERVICE_RECORD_PREFIX) {
+        return xudo_policy::valid_harness_label(label);
+    }
     let Some((kind, suffix)) = name.split_once('-') else {
         return false;
     };
     (kind == "agent" || kind == "watch")
         && suffix.len() == 32
         && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The cgroup directory under `xudo.slice` that a committed record name
+/// describes: `<name>.scope`, or `xudo-agent@<label>.service` for `svc-<label>`.
+#[must_use]
+pub fn unit_dir_name(record_name: &str) -> Option<String> {
+    if !is_record_name(record_name) {
+        return None;
+    }
+    Some(match record_name.strip_prefix(SERVICE_RECORD_PREFIX) {
+        Some(label) => format!("xudo-agent@{label}.service"),
+        None => format!("{record_name}.scope"),
+    })
+}
+
+/// The record name a cgroup directory name under `xudo.slice` is entitled to,
+/// the inverse of [`unit_dir_name`]. Nothing for any other directory.
+#[cfg(target_os = "linux")]
+fn record_of_unit_dir(dir: &str) -> Option<String> {
+    let record = if let Some(stem) = dir.strip_suffix(".scope") {
+        stem.to_owned()
+    } else {
+        let label = dir
+            .strip_prefix("xudo-agent@")
+            .and_then(|rest| rest.strip_suffix(".service"))?;
+        service_record_name(label)?
+    };
+    // A `.scope` can never carry a service name, or two names would meet at
+    // one record.
+    (unit_dir_name(&record).as_deref() == Some(dir)).then_some(record)
 }
 
 /// Finds a live agent/watch scope by cgroup id, never by a name alone.
@@ -944,14 +1002,16 @@ pub fn scope_status(
     }
     for kind in [ScopeKind::Agent, ScopeKind::Watch] {
         let prefix = match kind {
-            ScopeKind::Agent => "agent-",
-            ScopeKind::Watch => "watch-",
+            ScopeKind::Agent => &["agent-", SERVICE_RECORD_PREFIX][..],
+            ScopeKind::Watch => &["watch-"][..],
         };
         for record_name in calls.scope_names()? {
-            if !record_name.starts_with(prefix) || !is_record_name(&record_name) {
+            if !prefix.iter().any(|prefix| record_name.starts_with(prefix)) {
                 continue;
             }
-            let name = format!("{record_name}.scope");
+            let Some(name) = unit_dir_name(&record_name) else {
+                continue;
+            };
             let Some(facts) = calls.scope_facts(&name, id, kind == ScopeKind::Watch)? else {
                 continue;
             };
@@ -1238,6 +1298,26 @@ mod tests {
             Err(SysError::Os { operation, .. }) if operation == "test"
         ));
         assert!(imp::finish_cgroup_root(Err(rustix::io::Errno::NOENT)).is_err());
+    }
+
+    /// The broker unit's `RestrictSUIDSGID=yes` answers openat2 with ENOSYS.
+    /// A peer's cgroup and the session records must still open, the same
+    /// directories as through openat2, and a missing one must still refuse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peers_cgroup_is_attested_where_openat2_is_enosys() {
+        use crate::beneath::without_openat2;
+        let host = fixture_host();
+        let path = "/xudo.slice/xudo-agent@codex.service";
+        let kernel = imp::cgroup_inode(&host, path).unwrap();
+        assert_eq!(
+            without_openat2(|| imp::cgroup_inode(&host, path)).unwrap(),
+            kernel
+        );
+        assert!(without_openat2(|| imp::cgroup_inode(&host, "/missing.scope")).is_err());
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let run = open_dir(&fixture.join("run"));
+        assert!(without_openat2(|| imp::sessions_dir_from(Some(&host), Ok(run))).is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -2196,6 +2276,176 @@ mod tests {
         assert!(!is_record_name("nodash"));
         assert!(!is_record_name("agent-short"));
         assert!(!is_record_name(&format!("agent-{}g", &hex[..31])));
+    }
+
+    #[test]
+    fn a_process_cgroup_is_its_unified_path_and_the_inode_it_resolves_to() {
+        let unit = FakeCgroup::path_result(
+            Err(error(rustix::io::Errno::NOTTY)),
+            "12:cpu:/x\n0::/xudo.slice/xudo-agent@codex.service\n",
+            Ok(7),
+            true,
+        );
+        assert_eq!(
+            process_cgroup(&unit, 5).unwrap(),
+            ("/xudo.slice/xudo-agent@codex.service".to_owned(), 7)
+        );
+        *unit.proc.borrow_mut() = Err(SysError::read("x", "gone"));
+        assert!(process_cgroup(&unit, 5).is_err());
+        *unit.proc.borrow_mut() = Ok(b"1:cpu:/only-v1\n".to_vec());
+        assert!(process_cgroup(&unit, 5).is_err());
+        *unit.proc.borrow_mut() = Ok(b"0::/x\n".to_vec());
+        *unit.inode.borrow_mut() = Err(SysError::read("x", "no such directory"));
+        assert!(process_cgroup(&unit, 5).is_err());
+    }
+
+    #[test]
+    fn a_service_record_is_named_for_a_registry_label_and_nothing_else() {
+        assert!(is_record_name("svc-codex"));
+        assert!(is_record_name("svc-a-1"));
+        for name in [
+            "svc-",
+            "svc-Codex",
+            "svc-1x",
+            "svc-a b",
+            "svc-a/b",
+            "svc-a.b",
+        ] {
+            assert!(!is_record_name(name), "{name}");
+        }
+        assert!(!is_record_name(&format!("svc-a{}", "b".repeat(32))));
+        assert_eq!(service_record_name("codex").as_deref(), Some("svc-codex"));
+        assert_eq!(service_record_name("Codex"), None);
+        assert_eq!(service_record_name(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_name_maps_to_one_unit_directory_and_back() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        for (record, dir) in [
+            (format!("agent-{hex}"), format!("agent-{hex}.scope")),
+            (format!("watch-{hex}"), format!("watch-{hex}.scope")),
+            (
+                "svc-codex".to_owned(),
+                "xudo-agent@codex.service".to_owned(),
+            ),
+        ] {
+            assert_eq!(unit_dir_name(&record).as_deref(), Some(dir.as_str()));
+            assert_eq!(record_of_unit_dir(&dir).as_deref(), Some(record.as_str()));
+        }
+        assert_eq!(unit_dir_name("pending-x"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_user_manager_unit_named_like_the_harness_is_not_one() {
+        // A lookalike directory name, or a service name spelled as a scope,
+        // is no unit of ours: the mapping is exact in both directions.
+        for dir in [
+            "xudo-agent@codex.scope",
+            "svc-codex.scope",
+            "xudo-agent@Codex.service",
+            "xudo-agent@.service",
+            "xudo-agent@codex.service.scope",
+            "user@1000.service",
+            "xudo-agent@codex",
+            "agent-0123456789abcdef0123456789abcdef.service",
+            "watch-short.scope",
+            "",
+        ] {
+            assert_eq!(record_of_unit_dir(dir), None, "{dir}");
+        }
+    }
+
+    #[test]
+    fn a_live_service_unit_with_a_record_is_an_agent_scope() {
+        let mut fake = scope_fake("agent", 1, 1, 0, 0o100_644, true, vec![], true);
+        fake.names = vec!["svc-codex".to_owned()];
+        let facts = fake
+            .scopes
+            .remove(&format!("{AGENT_RECORD_NAME}.scope"))
+            .unwrap();
+        fake.scopes
+            .insert("xudo-agent@codex.service".to_owned(), facts);
+        let parse = |bytes: &[u8], name: &str| {
+            (name == "svc-codex")
+                .then(|| parse_record(bytes, AGENT_RECORD_NAME))
+                .flatten()
+        };
+        let scope = scope_status(&fake, 1, 1000, &parse).unwrap().unwrap();
+        assert_eq!(scope.kind, ScopeKind::Agent);
+        assert_eq!(scope.name, "xudo-agent@codex.service");
+    }
+
+    #[test]
+    fn a_unit_under_the_slice_without_a_record_is_unattested() {
+        let mut fake = scope_fake("agent", 1, 1, 0, 0o100_644, true, vec![], false);
+        fake.names = vec!["svc-codex".to_owned()];
+        let facts = fake
+            .scopes
+            .remove(&format!("{AGENT_RECORD_NAME}.scope"))
+            .unwrap();
+        fake.scopes
+            .insert("xudo-agent@codex.service".to_owned(), facts);
+        let parse = |_: &[u8], _: &str| None;
+        assert!(scope_status(&fake, 1, 1000, &parse).unwrap().is_none());
+        // A service record is never read as a watcher's.
+        fake.names = vec!["watch-svc-codex".to_owned()];
+        assert!(scope_status(&fake, 1, 1000, &parse).unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_reads_a_service_units_directory_and_its_record() {
+        let host = fixture_host();
+        assert!(
+            CgroupCalls::scope_names(&host)
+                .unwrap()
+                .contains(&"svc-codex".to_owned())
+        );
+        let facts = CgroupCalls::scope_facts(
+            &host,
+            "xudo-agent@codex.service",
+            service_fixture_inode(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(facts.populated);
+        assert!(facts.record.is_some());
+        // A service name carrying another inode, or spelled as a scope, is nothing.
+        assert!(
+            CgroupCalls::scope_facts(
+                &host,
+                "xudo-agent@codex.service",
+                service_fixture_inode().wrapping_add(1),
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            CgroupCalls::scope_facts(
+                &host,
+                "xudo-agent@codex.scope",
+                service_fixture_inode(),
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn service_fixture_inode() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/cgroup/xudo.slice/xudo-agent@codex.service"),
+        )
+        .unwrap()
+        .ino()
     }
 
     #[cfg(not(target_os = "linux"))]

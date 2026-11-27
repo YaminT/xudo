@@ -124,7 +124,99 @@ impl BrokerProbe<'_> {
     }
 }
 
+impl BrokerProbe<'_> {
+    /// Runs a `-l -U <user> <helper>` listing: `Ok(true)` and what it printed
+    /// when listed, `Ok(false)` when not. `-l` with a command exits 0 only
+    /// when it would run it, and refuses silently with 1. Anything on
+    /// standard error (an unknown user, a configuration the backend will not
+    /// read, an option it does not know) also exits 1, so it is no answer.
+    fn listing(&self, plan: &[String]) -> Result<(bool, String), String> {
+        let Some((backend, rest)) = plan.split_first() else {
+            return Err("the plan names nothing to run".to_owned());
+        };
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        let out = self
+            .runner
+            .run(backend, &rest, None)
+            .map_err(|why| format!("{backend} could not be run: {why}"))?;
+        if !out.stderr.trim().is_empty() {
+            return Err(format!(
+                "`{}` gave no answer (status {:?}): {}",
+                plan.join(" "),
+                out.code,
+                out.stderr.trim()
+            ));
+        }
+        Ok((out.success, out.stdout.trim().to_owned()))
+    }
+}
+
+/// How the gate's refusal line begins (`xudo_gate::run`'s exit message).
+const GATE_REFUSED: &str = "xudo-gate: refused (";
+
 impl InstallProbe for BrokerProbe<'_> {
+    /// Runs the passwordless helper through the backend, as root and with no
+    /// request minted for it: a caller it cannot attest. Refused means a
+    /// non-zero status, nothing on standard output, and the gate's own refusal
+    /// line, so sudo saying no (a password, no rule) is not taken for it.
+    fn refuses(&self, plan: &[String]) -> ProbeResult {
+        let Some((backend, rest)) = plan.split_first() else {
+            return ProbeResult::Unavailable {
+                reason: "the plan names nothing to run".to_owned(),
+            };
+        };
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        match self.runner.run(backend, &rest, None) {
+            Ok(out)
+                if !out.success
+                    && out.stdout.is_empty()
+                    && out.stderr.lines().any(|l| l.starts_with(GATE_REFUSED)) =>
+            {
+                ProbeResult::Verified
+            }
+            Ok(out) => ProbeResult::Failed {
+                reason: format!(
+                    "the helper, run through {backend}, did not refuse as the gate refuses \
+                     (status {:?}, {} bytes on standard output): {}",
+                    out.code,
+                    out.stdout.len(),
+                    out.stderr.trim()
+                ),
+            },
+            Err(why) => ProbeResult::Unavailable {
+                reason: format!("{backend} could not be run: {why}"),
+            },
+        }
+    }
+
+    /// Asks the backend whether it lists the passwordless helper, and
+    /// requires that it does not. See [`Self::listed`] for what counts as
+    /// an answer.
+    fn not_listed(&self, plan: &[String]) -> ProbeResult {
+        match self.listing(plan) {
+            Ok((true, stdout)) => ProbeResult::Failed {
+                reason: format!(
+                    "`{}` lists the passwordless helper: {stdout}",
+                    plan.join(" ")
+                ),
+            },
+            Ok((false, _)) => ProbeResult::Verified,
+            Err(reason) => ProbeResult::Unavailable { reason },
+        }
+    }
+
+    /// Asks the backend whether it lists the passwordless helper, and
+    /// requires that it does: the control that shows the listing works.
+    fn listed(&self, plan: &[String]) -> ProbeResult {
+        match self.listing(plan) {
+            Ok((true, _)) => ProbeResult::Verified,
+            Ok((false, _)) => ProbeResult::Failed {
+                reason: format!("`{}` does not list the passwordless helper", plan.join(" ")),
+            },
+            Err(reason) => ProbeResult::Unavailable { reason },
+        }
+    }
+
     fn verify(&self, plan: &[String]) -> ProbeResult {
         let unavailable = |reason: String| ProbeResult::Unavailable { reason };
         let Some((backend, rest)) = plan.split_first() else {
@@ -200,6 +292,7 @@ mod tests {
     use std::cell::RefCell;
     use std::os::unix::net::UnixListener;
 
+    use xudo_backend::snippet::GATE_NOPASS;
     use xudo_policy::{Decision, DenialCode, Verdict};
     use xudo_sys::{Output, SysError};
     use xudo_wire::{BrokerResponse, Minted, RefusalCode};
@@ -367,6 +460,188 @@ mod tests {
             &id_is_regular(),
         );
         assert!(format!("{result:?}").starts_with("Failed"), "{result:?}");
+    }
+
+    /// What the refusal check judges `stdout`, `stderr` and `success` to be.
+    fn refusal_of(stdout: &str, stderr: &str, success: bool) -> (ProbeResult, Vec<String>) {
+        let gate = Gate(
+            Ok(Output {
+                success,
+                code: Some(if success { 0 } else { 19 }),
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+            }),
+            RefCell::default(),
+        );
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let nopass = ["/usr/bin/sudo", "-n", GATE_NOPASS].map(String::from);
+        let result = probe.refuses(&nopass);
+        let ran = gate.1.borrow().clone();
+        (result, ran)
+    }
+
+    #[test]
+    fn the_helper_refusing_an_unattested_caller_is_the_only_pass() {
+        let refused = "xudo-gate: refused (no_pending_request, severity high)\n";
+        let (result, ran) = refusal_of("", refused, false);
+        assert_eq!(result, ProbeResult::Verified);
+        // Through the backend, with no request asked of the broker first.
+        assert_eq!(ran, ["/usr/bin/sudo -n /usr/libexec/xudo/xudo-gate-nopass"]);
+    }
+
+    #[test]
+    fn the_probe_failing_is_never_taken_for_a_refusal() {
+        // It ran something and exited 0; it printed; sudo asked a password or
+        // had no rule; a refusal line on a success: each one is a failure.
+        let refused = "xudo-gate: refused (no_pending_request, severity high)";
+        for (stdout, stderr, success) in [
+            ("0\n", "", true),
+            ("", refused, true),
+            ("0\n", refused, false),
+            ("", "sudo: a password is required", false),
+            ("", "sudo: xudo-gate-nopass: command not found", false),
+            ("", "  xudo-gate: refused (indented)", false),
+        ] {
+            let (result, _) = refusal_of(stdout, stderr, success);
+            assert!(
+                format!("{result:?}").starts_with("Failed"),
+                "{stdout:?} {stderr:?} {success}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_that_cannot_be_run_or_is_not_named_is_not_a_refusal() {
+        let gate = Gate(Err(()), RefCell::default());
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let result = probe.refuses(&argv());
+        assert!(
+            unavailable(&result).contains("could not be run"),
+            "{result:?}"
+        );
+        assert!(unavailable(&probe.refuses(&[])).contains("names nothing"));
+    }
+
+    /// What the listing check makes of one answer from the backend.
+    fn listing_of(answer: Result<Output, ()>) -> (ProbeResult, Vec<String>) {
+        listing_with(answer, false)
+    }
+
+    /// The same answer, to the control (`listed`) or to the check.
+    fn listing_with(answer: Result<Output, ()>, control: bool) -> (ProbeResult, Vec<String>) {
+        let gate = Gate(answer, RefCell::default());
+        let files = id_is_regular();
+        let probe = BrokerProbe {
+            socket: Path::new("/nonexistent/broker.sock"),
+            timeout: PATIENT,
+            runner: &gate,
+            files: &files,
+        };
+        let argv = ["/usr/bin/sudo-rs", "-n", "-l", "-U", "nobody", GATE_NOPASS].map(String::from);
+        let result = if control {
+            probe.listed(&argv)
+        } else {
+            probe.not_listed(&argv)
+        };
+        let ran = gate.1.borrow().clone();
+        (result, ran)
+    }
+
+    fn output(success: bool, stdout: &str) -> Output {
+        Output {
+            success,
+            code: Some(i32::from(!success)),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_helper_the_backend_lists_is_a_failed_check() {
+        // A zero status is a listing, whatever is printed.
+        let (result, ran) = listing_of(Ok(output(true, "")));
+        assert!(format!("{result:?}").starts_with("Failed"), "{result:?}");
+        assert_eq!(
+            ran,
+            [format!("/usr/bin/sudo-rs -n -l -U nobody {GATE_NOPASS}")]
+        );
+        // A refusal may name the helper as it refuses; it is still a refusal.
+        for stdout in [
+            "",
+            &format!("Sorry, user nobody may not run {GATE_NOPASS}\n"),
+        ] {
+            let (result, _) = listing_of(Ok(output(false, stdout)));
+            assert_eq!(result, ProbeResult::Verified);
+        }
+    }
+
+    #[test]
+    fn a_refusal_with_anything_on_standard_error_is_no_answer() {
+        // sudo exits 1 for `unknown user`, a usage error, or a configuration
+        // it will not read, as it does for a refusal. Only a silent 1 is no.
+        for stderr in [
+            "sudo: unknown user nobody",
+            "sudo-rs: invalid configuration: No such file or directory (os error 2)",
+            "sudo: invalid option -- 'U'",
+        ] {
+            let answer = Output {
+                stderr: format!("{stderr}\n"),
+                ..output(false, "")
+            };
+            let (result, _) = listing_of(Ok(answer.clone()));
+            assert!(unavailable(&result).contains(stderr), "{result:?}");
+            let (result, _) = listing_with(Ok(answer), true);
+            assert!(
+                unavailable(&result).contains("gave no answer"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_control_passes_only_when_root_is_listed() {
+        let (result, ran) = listing_with(Ok(output(true, GATE_NOPASS)), true);
+        assert_eq!(result, ProbeResult::Verified);
+        assert_eq!(ran.len(), 1);
+        // A silent refusal for root: the listing cannot be trusted to say yes.
+        let (result, _) = listing_with(Ok(output(false, "")), true);
+        assert_eq!(
+            result,
+            ProbeResult::Failed {
+                reason: format!(
+                    "`/usr/bin/sudo-rs -n -l -U nobody {GATE_NOPASS}` does not list the \
+                     passwordless helper"
+                )
+            }
+        );
+        let (result, _) = listing_with(Err(()), true);
+        assert!(unavailable(&result).contains("could not be run"));
+        let gate = printed("", false);
+        assert!(unavailable(&BrokerProbe::live(&gate).listed(&[])).contains("names nothing"));
+    }
+
+    #[test]
+    fn a_listing_the_backend_could_not_be_asked_for_is_not_a_pass() {
+        let (result, _) = listing_of(Err(()));
+        assert!(
+            unavailable(&result).contains("could not be run"),
+            "{result:?}"
+        );
+        let gate = printed("", false);
+        let probe = BrokerProbe::live(&gate);
+        assert!(unavailable(&probe.not_listed(&[])).contains("names nothing"));
     }
 
     #[test]

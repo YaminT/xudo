@@ -3,7 +3,7 @@ source: crates/xudo-policy/tests/contract_snapshots.rs
 expression: prompts
 ---
 AgentActionsConfirmed
-    an enrolled agent requested a privileged action and confirm_agent_actions is on
+    an enrolled agent requested a privileged action and no rule grants it to this harness
 RuleRequiresConfirmation
     the matched rule always requires confirmation
 CriticalTier

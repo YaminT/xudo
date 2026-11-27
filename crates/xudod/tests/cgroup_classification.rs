@@ -12,7 +12,7 @@ use xudo_sys::{
     CgroupCalls, FakePeer, FakeSyscalls, PeerCred, PidfdInfo, ProcessIds, ScopeFacts, SysError,
 };
 use xudod::identify::{CgroupAttestation, identify_classified};
-use xudod::policy::{classify, classify_with_registry};
+use xudod::policy::classify_with_registry;
 
 const PID: u32 = 4242;
 const UID: u32 = 1000;
@@ -126,6 +126,12 @@ impl CgroupCalls for FakeCgroup {
     }
 }
 
+/// The empty-registry classification: no agent is enrolled, so a scope is
+/// never attested. Test-only; the broker always classifies against its registry.
+fn classify(identity: &xudod::identify::PeerIdentity) -> xudo_policy::CallerFacts {
+    classify_with_registry(identity, &xudo_policy::HarnessRegistry::empty(), "")
+}
+
 fn stat(pid: u32, _uid: u32, _nested: bool) -> Vec<u8> {
     let mut fields = vec![
         "S".to_owned(),
@@ -231,7 +237,9 @@ fn identify_with_boot(
         )
         .with_exit(Ok(false));
     let clock = xudo_sys::FixedClock(100);
-    identify_classified(fd.as_fd(), &syscalls, &peer, cgroup, &clock).unwrap()
+    identify_classified(fd.as_fd(), &syscalls, &peer, cgroup, &clock)
+        .unwrap()
+        .identity
 }
 
 #[test]

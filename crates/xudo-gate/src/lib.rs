@@ -69,6 +69,7 @@ pub(crate) fn keep_lane_short_ttl_marker_linked() {
 pub mod classify;
 pub mod decide;
 pub mod env;
+pub mod live;
 mod operate;
 pub mod policy;
 
@@ -87,14 +88,14 @@ pub use run::CONFIG_FILE;
 pub mod status;
 
 pub use decide::{
-    Approved, GateCaller, GateContext, Refusal, Severity, Stage, UNKNOWN_UID, authorization_record,
-    decide, demanded_confirmation, exec_failure_record, refusal_record,
+    Approved, GateCaller, GateContext, ModeRefusal, Refusal, Severity, Stage, UNKNOWN_UID,
+    authorization_record, decide, demanded_confirmation, exec_failure_record, refusal_record,
 };
 pub use env::child_environment;
-pub use request::{PendingRequest, RequestError, SPOOL_DIR};
+pub use request::{PendingRequest, RequestError, SPOOL_DIR, Via};
 pub use run::{GateExit, GateHost, SystemHost, run};
 pub use session::{
-    SessionRecord, attested_harness_label, parse_session_record, record_identity,
-    record_identity_registered,
+    NO_DEADLINE, SESSION_MAX_LIFETIME_MS, SessionRecord, attested_harness_label,
+    parse_session_record, record_identity, record_identity_registered,
 };
 pub use status::Termination;

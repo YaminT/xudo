@@ -115,11 +115,19 @@ no-ignored-passes:
 #               that returns. Its `tests/broker.rs` runs the real binary with a
 #               real socket, a file, and nothing at all on descriptor 0. Every
 #               decision is in the `xudod` library, at 100%.
+#   xudo-session-bin is the same shape for the unit-record helper an enrolled
+#               service's unit runs as root: `main` collects argv, hands
+#               `xudod::unit_record::run` the real host, writes the one line it
+#               returns, and exits with its status. Its `tests/binary.rs` runs
+#               the real binary as a process (a caller that is not root and not
+#               pid 1's child, a hostile argv, a hostile environment). Every
+#               check the helper makes, and every fake it runs against, is in
+#               the `xudod` and `xudo-sys` libraries, at 100%.
 #
 # Everything else is 100% with no waivers. Do not add another exclusion without
 # writing down why here.
 coverage:
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features \
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features \
         --show-missing-lines \
         --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' \
         --fail-under-lines {{cov_lines}} \
@@ -133,11 +141,11 @@ coverage-clean:
     rm -rf target/llvm-cov target/llvm-cov-target
 
 coverage-report: coverage-clean
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' --html
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features --ignore-filename-regex 'crates/xudo-sys/src/exec/host\.rs$' --html
     @echo "open target/llvm-cov/html/index.html"
 
 coverage-lcov: coverage-clean
-    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --all-features --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --exclude xudo-bin --exclude xudo-gate-bin --exclude ido-bin --exclude xudod-bin --exclude xudo-session-bin --all-features --lcov --output-path lcov.info
 
 # --- undefined behaviour ----------------------------------------------------
 
@@ -311,9 +319,10 @@ differential:
 # probe, which needs a request only the front-end's broker client can mint
 # (plan item C1, `xudo exec`), so a finished install reports NOT VERIFIED. The
 # uid-0 proof that the installed rule reaches the gate is in the root lane
-# (`xudo-gate-bin/tests/root_probe.rs`).
+# (`xudo-gate-bin/tests/root_probe.rs`). The gate is built too: `--agent-path`
+# runs the real `-nopass` helper through sudo and writes nothing unless it refuses.
 install-root:
-    cargo build -p xudo-bin --release --target {{musl_triple}}
+    cargo build -p xudo-bin -p xudo-gate-bin --release --target {{musl_triple}}
     ci/install/run.sh target/{{musl_triple}}/release/xudo
 
 # --- SBOM --------------------------------------------------------------------
@@ -360,7 +369,7 @@ deb:
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
     export LC_ALL=C TZ=UTC CARGO_INCREMENTAL=0
     export RUSTFLAGS="--remap-path-prefix={{justfile_directory()}}=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/rustc"
-    cargo auditable build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --target {{musl_triple}}
+    cargo auditable build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --release --locked --target {{musl_triple}}
     packaging/deb/build.sh {{musl_triple}}
 
 # Install, upgrade, remove, and purge the .deb in Ubuntu 24.04, Ubuntu 26.04
@@ -373,7 +382,7 @@ deb-test: deb
 # trail is checked, and remove stops the socket. Needs Docker.
 # ci/systemd/run.sh says how the container is booted and what is asserted.
 systemd-test: deb
-    CARGO_TARGET_DIR=target/systemd-short-ttl cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p ido-bin --release --locked --features xudod/lane-short-ttl --target {{musl_triple}}
+    CARGO_TARGET_DIR=target/systemd-short-ttl cargo build -p xudo-bin -p xudod-bin -p xudo-gate-bin -p xudo-session-bin -p ido-bin --release --locked --features xudod/lane-short-ttl --target {{musl_triple}}
     XUDO_BUILD_BIN_DIR=target/systemd-short-ttl/{{musl_triple}}/release packaging/deb/build.sh {{musl_triple}} target/systemd-short-ttl/deb
     ci/systemd/run.sh {{musl_triple}}
 

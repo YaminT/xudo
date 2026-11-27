@@ -58,10 +58,11 @@ impl PolicySource for HostPolicy {
     }
 }
 
-/// Classifies the peer from the cgroup result derived while its kernel pidfd
-/// was held. Process names and caller-controlled environment are audit hints
-/// only and are never inputs here.
-pub fn classify(identity: &PeerIdentity) -> CallerFacts {
+/// Test fixtures only: a caller classified against no registry, so a live
+/// agent scope reads `Unattested`. Production has one entry point,
+/// [`classify_with_registry`], and no handler may classify any other way.
+#[cfg(test)]
+pub fn classify_for_test(identity: &PeerIdentity) -> CallerFacts {
     classify_with_registry(identity, &HarnessRegistry::empty(), "")
 }
 
@@ -79,7 +80,7 @@ pub fn classify_with_registry(
         }
     } else {
         match &identity.cgroup_attestation {
-            CgroupAttestation::AgentScope(scope) => {
+            CgroupAttestation::UnregisteredScope(scope) => {
                 let registered_label =
                     serde_json::from_slice::<xudo_gate::SessionRecord>(&scope.record)
                         .ok()
@@ -129,6 +130,11 @@ pub fn classify_with_registry(
 /// An enrolled class carries the registry label in `attested_harness`. That
 /// label is what an ask-human rule matches. A missing or invalid label is
 /// unattested: it is never rewritten to a synthetic `scope-N` id.
+///
+/// This is not an attestation. It reads a spool entry, not the kernel and not
+/// the registry, so it selects which rules apply and nothing else: it must
+/// never feed a harness grant. A passwordless mint must come from the live
+/// `classify_with_registry` caller and the policy it was decided under.
 pub fn stored_caller(entry: &xudo_gate::request::PendingRequest) -> CallerFacts {
     use xudo_gate::request::AttestedClass;
     let classification = match &entry.attested_class {
@@ -186,7 +192,7 @@ pub fn decide_remove(
             Vec::new(),
         );
     };
-    let passwd = std::str::from_utf8(&policy.passwd).unwrap_or("");
+    let passwd = policy.passwd.as_str();
     xudo_policy::evaluate_remove_path(&policy.rules.rules, caller, target, policy.settings, passwd)
 }
 
@@ -218,7 +224,6 @@ mod tests {
                 (!rows.is_empty()).then_some(bytes.as_bytes()),
                 Path::new("/etc/xudo/config.toml"),
             ).unwrap();
-            prop_assert!(loaded.confirm_agent_actions);
             prop_assert_eq!(loaded.confirm_human_path, human.unwrap_or(Settings::default().confirm_human_path));
             prop_assert_eq!(loaded.frozen, frozen.unwrap_or(Settings::default().frozen));
         }
@@ -264,7 +269,8 @@ max-entries = 10
             .unwrap(),
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: Vec::new(),
+            passwd: String::new(),
+            passwd_fault: None,
         }
     }
 
@@ -325,7 +331,7 @@ args = [
     fn claudecode_env_and_agent_comm_without_a_scope_is_human() {
         let mut peer = identity(true);
         peer.cgroup_attestation = CgroupAttestation::Outside;
-        let facts = classify(&peer);
+        let facts = classify_for_test(&peer);
         assert_eq!(facts.classification.label(), "human");
         assert!(facts.classification.requires_password());
         assert_eq!(facts.uid, 1000);
@@ -336,7 +342,7 @@ args = [
         let registry = test_registry();
         let mut peer = identity(true);
         peer.cgroup_id = Some(77);
-        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+        peer.cgroup_attestation = CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
             kind: xudo_sys::ScopeKind::Agent,
             name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
             record: test_record(&registry, "codex"),
@@ -374,7 +380,7 @@ outcome = "ask-human"
         let record = test_record(&registry, "codex");
         let mut peer = identity(true);
         peer.cgroup_id = Some(77);
-        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+        peer.cgroup_attestation = CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
             kind: xudo_sys::ScopeKind::Agent,
             name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
             record: record.clone(),
@@ -404,7 +410,8 @@ outcome = "ask-human"
             .unwrap(),
             settings: Settings::default(),
             queue_ttl_secs: crate::queue::DEFAULT_TTL_SECS,
-            passwd: PASSWD.as_bytes().to_vec(),
+            passwd: PASSWD.to_owned(),
+            passwd_fault: None,
         };
         let request = ask("/usr/bin/true", &["upgrade"]);
         let broker_decision = decide(&policy, &broker, &request);
@@ -432,7 +439,7 @@ outcome = "ask-human"
         let registry = test_registry();
         let mut peer = identity(true);
         peer.cgroup_id = Some(77);
-        peer.cgroup_attestation = CgroupAttestation::AgentScope(xudo_sys::Scope {
+        peer.cgroup_attestation = CgroupAttestation::UnregisteredScope(xudo_sys::Scope {
             kind: xudo_sys::ScopeKind::Agent,
             name: "agent-0123456789abcdef0123456789abcdef.scope".to_owned(),
             record: test_record(&registry, "removed"),
@@ -444,6 +451,12 @@ outcome = "ask-human"
         );
         assert!(!facts.classification.is_enrolled_agent());
         assert!(facts.classification.requires_password());
+        // A removed registry file leaves its scope unattested, never human.
+        assert!(
+            format!("{:?}", facts.classification).starts_with("Unattested"),
+            "{:?}",
+            facts.classification
+        );
     }
 
     #[test]
@@ -451,7 +464,7 @@ outcome = "ask-human"
         // Same function, same inputs: the decision is identical to what the
         // front-end prints, field for field.
         let policy = policy_of(RULES);
-        let caller = classify(&identity(true));
+        let caller = classify_for_test(&identity(true));
         let request = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
         let ours = decide(&policy, &caller, &request);
         let explain = evaluate_command(
@@ -469,7 +482,7 @@ outcome = "ask-human"
     fn the_claimed_classification_moves_nothing() {
         // Invariant 1 at the broker: the request may claim anything.
         let policy = policy_of(RULES);
-        let caller = classify(&identity(true));
+        let caller = classify_for_test(&identity(true));
         let mut honest = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
         honest.question = xudo_wire::Question::Run {
             program: "/usr/bin/systemctl".to_owned(),
@@ -493,7 +506,7 @@ outcome = "ask-human"
     #[test]
     fn decide_refuses_a_non_run_question_closed() {
         let loaded = policy_of(RULES);
-        let caller = classify(&identity(true));
+        let caller = classify_for_test(&identity(true));
         let mut request = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
         request.question = xudo_wire::Question::Watch;
         assert_eq!(
@@ -508,13 +521,12 @@ outcome = "ask-human"
         // settings file exists: both settings apply to the agent path only,
         // and nobody reaches it until M4. If this ever fails, a setting has
         // started to affect the human path and must be loaded with care.
-        let caller = classify(&identity(true));
+        let caller = classify_for_test(&identity(true));
         let request = ask("/usr/bin/systemctl", &["restart", "nginx.service"]);
         let mut policy = policy_of(RULES);
         let baseline = decide(&policy, &caller, &request);
-        for (confirm_agent_actions, frozen) in [(true, true), (false, false), (false, true)] {
+        for frozen in [true, false] {
             policy.settings = Settings {
-                confirm_agent_actions,
                 frozen,
                 ..Settings::default()
             };
@@ -525,7 +537,7 @@ outcome = "ask-human"
     #[test]
     fn a_command_no_rule_names_is_an_unknown_action_about_that_program() {
         let policy = policy_of(RULES);
-        let caller = classify(&identity(true));
+        let caller = classify_for_test(&identity(true));
         let decision = decide(&policy, &caller, &ask("/bin/sh", &["-c", "id", "--"]));
         assert_eq!(decision.denial, Some(DenialCode::UnknownAction));
         assert_eq!(decision.resolved_exe.as_deref(), Some("/bin/sh"));
@@ -548,7 +560,6 @@ outcome = "ask-human"
         assert_eq!(
             settings,
             Settings {
-                confirm_agent_actions: true,
                 confirm_human_path: false,
                 frozen: true,
             }

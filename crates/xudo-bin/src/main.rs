@@ -21,7 +21,8 @@ fn caller_path() -> Option<std::ffi::OsString> {
     std::env::var_os("PATH")
 }
 
-/// `xudo op remove-path`: if the broker said yes, become the password gate.
+/// `xudo op remove-path`: if the broker said yes, run the gate it named: the
+/// password gate, or `sudo -n` on `-nopass` for a harness the rule grants.
 ///
 /// The gate performs the walk. This process does not unlink anything.
 fn exec_operation(
@@ -39,10 +40,11 @@ fn exec_operation(
     };
     #[allow(clippy::disallowed_methods)]
     let mut command = std::process::Command::new(plan.backend);
-    command.arg(plan.gate);
+    command.args(plan.backend_args());
     if plan.spawn {
         return match command.status() {
             Ok(status) => {
+                xudo::exec::after_backend(&plan, status.code(), err);
                 let code = status
                     .code()
                     .or(status.signal().and_then(|n| n.checked_add(128)));
@@ -77,13 +79,15 @@ fn exec(
     // The path is absolute and never searched for.
     #[allow(clippy::disallowed_methods)]
     let mut command = std::process::Command::new(plan.backend);
-    command.arg(plan.gate);
+    command.args(plan.backend_args());
     // doas does not fork: stay its parent, so the gate finds us as an ancestor.
+    // `sudo -n` for -nopass is spawned too, so its refusal can be explained.
     // No signal handler; Ctrl-C reaches the whole foreground group anyway.
     if plan.spawn {
         return match command.status() {
             Ok(status) => {
                 use std::os::unix::process::ExitStatusExt;
+                xudo::exec::after_backend(&plan, status.code(), err);
                 let code = status
                     .code()
                     .or(status.signal().and_then(|n| n.checked_add(128)));
@@ -116,7 +120,7 @@ fn exec_queued(
     };
     #[allow(clippy::disallowed_methods)]
     let mut command = std::process::Command::new(run.plan.backend);
-    command.arg(run.plan.gate);
+    command.args(run.plan.backend_args());
     command.current_dir(run.cwd);
     match command.status() {
         Ok(status) => {

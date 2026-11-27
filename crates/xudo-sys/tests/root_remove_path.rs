@@ -27,6 +27,13 @@ const TREE: &str = "/var/lib/xudo-t1-remove-path";
 const SECRET: &str = "/var/lib/xudo-t1-remove-secret";
 const MOVED: &str = "/var/lib/xudo-t1-moved-out";
 const MOUNT_TREE: &str = "/var/lib/xudo-t1-remove-mount";
+// Docker mounts a tmpfs at `XDEV_TREE/box/mnt`: a mount inside a walked tree.
+// Docker bind-mounts one host directory twice: `BIND_TREE`, and `BIND_TREE/child`
+// from a subdirectory of it. Same filesystem, same `st_dev`, still a mount.
+const BIND_TREE: &str = "/var/lib/xudo-t1-remove-bind";
+const XDEV_TREE: &str = "/var/lib/xudo-t1-remove-xdev";
+// Docker bind-mounts a host file over `FILE_TREE/box/over`.
+const FILE_TREE: &str = "/var/lib/xudo-t1-remove-filebind";
 
 fn begin_root_test(test: &str) -> bool {
     if !root_guard(test) {
@@ -192,4 +199,164 @@ fn a_directory_renamed_out_of_the_tree_mid_walk_stops_the_walk() {
     );
     assert!(!Path::new(&format!("{TREE}/box")).exists());
     let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn a_mount_inside_the_walked_tree_is_not_crossed() {
+    if !begin_root_test("a_mount_inside_the_walked_tree_is_not_crossed") {
+        return;
+    }
+    let box_dir = format!("{XDEV_TREE}/box");
+    let mount = format!("{box_dir}/mnt");
+    let inside = format!("{mount}/inside");
+    let sibling = format!("{box_dir}/a");
+    // The lane's tmpfs must be there; a lane without it proves nothing.
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    assert_ne!(
+        fs::metadata(&mount).unwrap().dev(),
+        fs::metadata(&box_dir).unwrap().dev()
+    );
+    fs::write(&inside, b"behind the mount").unwrap();
+    fs::write(&sibling, b"outside the mount").unwrap();
+    for path in [&inside, &sibling, &mount, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    let mut request = request(b"box", true);
+    request.under = XDEV_TREE.as_bytes().to_vec();
+    let outcome = remove_path_on_host(&request);
+    // Whatever the walk reports, nothing behind the mount may be deleted.
+    assert!(
+        outcome.as_ref().map_or(true, |report| report.partial),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    assert!(Path::new(&mount).is_dir());
+    assert!(Path::new(&box_dir).is_dir());
+    let _ = fs::remove_file(&sibling);
+}
+
+#[test]
+fn the_kernel_reports_mount_root_for_a_real_mount() {
+    if !begin_root_test("the_kernel_reports_mount_root_for_a_real_mount") {
+        return;
+    }
+    let dir = fs::File::open(MOUNT_TREE).unwrap();
+    let x = rustix::fs::statx(
+        &dir,
+        c"",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::empty(),
+    )
+    .unwrap();
+    // 0x2000 is STATX_ATTR_MOUNT_ROOT: supported here, and set on the tmpfs.
+    assert_ne!(x.stx_attributes_mask.bits() & 0x2000, 0);
+    assert_ne!(x.stx_attributes.bits() & 0x2000, 0);
+}
+
+#[test]
+fn a_same_device_bind_mount_as_the_tree_is_refused() {
+    if !begin_root_test("a_same_device_bind_mount_as_the_tree_is_refused") {
+        return;
+    }
+    let child = format!("{BIND_TREE}/child");
+    assert_eq!(
+        fs::metadata(BIND_TREE).unwrap().dev(),
+        fs::metadata(&child).unwrap().dev(),
+        "the lane's bind mounts are not on one device"
+    );
+    // The host's temporary directory belongs to whoever ran the lane; the walk
+    // wants root-owned ancestors. Make them root's, and give them back after.
+    let owner = fs::metadata(BIND_TREE).unwrap();
+    for dir in [BIND_TREE, child.as_str()] {
+        std::os::unix::fs::chown(dir, Some(0), Some(0)).unwrap();
+        fs::set_permissions(dir, Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(format!("{child}/stay"), b"secret").unwrap();
+    let mut bound = request(b"stay", false);
+    bound.under = child.as_bytes().to_vec();
+    assert_eq!(
+        remove_path_on_host(&bound).unwrap_err(),
+        RemoveError::MountPoint
+    );
+    assert_eq!(fs::read(format!("{child}/stay")).unwrap(), b"secret");
+    fs::remove_file(format!("{child}/stay")).unwrap();
+    for dir in [child.as_str(), BIND_TREE] {
+        std::os::unix::fs::chown(dir, Some(owner.uid()), Some(owner.gid())).unwrap();
+    }
+}
+
+#[test]
+fn denies_a_real_symlink_planted_as_a_parent_of_the_target() {
+    if !begin_root_test("denies_a_real_symlink_planted_as_a_parent_of_the_target") {
+        return;
+    }
+    // Attack: `hop -> MOVED` in the tree, and a removal of `hop/v`. The
+    // kernel answers ENOTDIR or ELOOP; either is an escape, nothing goes.
+    fs::create_dir_all(MOVED).unwrap();
+    let victim = format!("{MOVED}/v");
+    fs::write(&victim, b"keep").unwrap();
+    chown_unprivileged(&victim, false);
+    let link = format!("{TREE}/hop");
+    std::os::unix::fs::symlink(MOVED, &link).unwrap();
+    chown_unprivileged(&link, true);
+    assert_eq!(
+        walk(b"hop/v", false).unwrap_err(),
+        RemoveError::WalkEscape("a directory on the way to the target is a symbolic link")
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    let _ = fs::remove_dir_all(MOVED);
+}
+
+#[test]
+fn denies_a_real_mount_as_a_parent_or_as_the_target() {
+    if !begin_root_test("denies_a_real_mount_as_a_parent_or_as_the_target") {
+        return;
+    }
+    let mount = format!("{XDEV_TREE}/box/mnt");
+    assert!(Path::new(&mount).is_dir(), "the lane did not mount {mount}");
+    let inside = format!("{mount}/kept");
+    fs::write(&inside, b"behind the mount").unwrap();
+    chown_unprivileged(&inside, false);
+    chown_unprivileged(&mount, false);
+    for relative in [&b"box/mnt/kept"[..], b"box/mnt"] {
+        let mut request = request(relative, true);
+        request.under = XDEV_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&inside).unwrap(), b"behind the mount");
+    let _ = fs::remove_file(&inside);
+}
+
+#[test]
+fn denies_a_file_bind_mounted_over_a_name_in_the_tree() {
+    if !begin_root_test("denies_a_file_bind_mounted_over_a_name_in_the_tree") {
+        return;
+    }
+    // Attack: a file bind-mounted over a name the walk would unlink, by name
+    // or inside a directory it empties. A mount whose root is a file is still
+    // a mount: the walk refuses it as an escape and nothing goes.
+    let box_dir = format!("{FILE_TREE}/box");
+    let over = format!("{box_dir}/over");
+    assert!(Path::new(&over).is_file(), "the lane did not mount {over}");
+    for path in [&over, &box_dir] {
+        chown_unprivileged(path, false);
+    }
+    for (relative, recursive) in [(&b"box/over"[..], false), (b"box", true)] {
+        let mut request = request(relative, recursive);
+        request.under = FILE_TREE.as_bytes().to_vec();
+        assert_eq!(
+            remove_path_on_host(&request).unwrap_err(),
+            RemoveError::WalkEscape("the walk would cross a mount"),
+            "{}",
+            relative.escape_ascii()
+        );
+    }
+    assert_eq!(fs::read(&over).unwrap(), b"bound over");
+    assert!(Path::new(&box_dir).is_dir());
 }

@@ -234,7 +234,34 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
     prop_oneof![
         3 => Just(Outcome::Allow),
         1 => Just(Outcome::AskHuman),
+        2 => Just(Outcome::Unset),
     ]
+}
+
+/// A reviewed waiver. Every generated exe is a `GTFOBins` program, and a
+/// harness rule on one loads only with this.
+const WAIVER: &str = "a generated technique for the property tests: the matchers pin every operand to a literal or a name, so the program cannot be steered at all";
+
+/// Lists `labels` on `action` the way a loadable harness rule is written: no
+/// `path-under` or `pattern` matcher, not human-only, and a waiver where the
+/// program needs one. An empty list takes all of that back off.
+fn set_harness(action: &mut Action, labels: Vec<String>) {
+    action.gtfobins_waiver = (!labels.is_empty()).then(|| WAIVER.to_owned());
+    if !labels.is_empty() {
+        action.agent_allowed = true;
+        drop_human_only_matchers(action);
+    }
+    action.harness = labels;
+}
+
+/// Takes the matchers a harness rule may not use off `action`.
+fn drop_human_only_matchers(action: &mut Action) {
+    action.args.retain(|spec| {
+        !matches!(
+            spec.matcher,
+            Matcher::PathUnder { .. } | Matcher::Pattern(_)
+        )
+    });
 }
 
 /// Builds an action `RuleSet::load` accepts.
@@ -250,7 +277,7 @@ fn finish_generated(
     args: Vec<ArgSpec>,
     mut confirm: ConfirmPolicy,
     agent_allowed: bool,
-    outcome: Outcome,
+    (outcome, listed): (Outcome, bool),
 ) -> Action {
     if tier == Tier::Critical && confirm == ConfirmPolicy::Never {
         confirm = ConfirmPolicy::Always;
@@ -260,10 +287,16 @@ fn finish_generated(
             confirm = ConfirmPolicy::Default;
         }
         vec!["claude-code".to_owned()]
+    } else if outcome == Outcome::Allow && listed {
+        // A listed harness with outcome allow: the shape a grant takes.
+        if confirm == ConfirmPolicy::Always {
+            confirm = ConfirmPolicy::Default;
+        }
+        vec!["claude-code".to_owned()]
     } else {
         Vec::new()
     };
-    Action {
+    let mut action = Action {
         id: ActionId::new(id),
         tier,
         exe,
@@ -271,10 +304,13 @@ fn finish_generated(
         confirm,
         agent_allowed,
         env_allow: Vec::new(),
-        harness,
+        harness: Vec::new(),
         outcome,
+        gtfobins_waiver: None,
         source: Source::new("generated.toml", 1),
-    }
+    };
+    set_harness(&mut action, harness);
+    action
 }
 
 prop_compose! {
@@ -285,8 +321,9 @@ prop_compose! {
         confirm in arb_confirm(),
         agent_allowed in any::<bool>(),
         outcome in arb_outcome(),
+        listed in any::<bool>(),
     ) -> Action {
-        finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
+        finish_generated(id, tier, exe, args, confirm, agent_allowed, (outcome, listed))
     }
 }
 
@@ -591,10 +628,9 @@ proptest! {
         argv in arb_argv(),
         agent in any::<bool>(),
         frozen in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
     ) {
         let rules = RuleSet::load(vec![action.clone()]).unwrap();
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
         let d = xudo_policy::evaluate(
             &rules,
             &caller(agent, Vec::new()),
@@ -609,15 +645,17 @@ proptest! {
 
     #[test]
     fn adding_a_harness_to_a_rule_never_changes_a_human_verdict(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
         ask_human in any::<bool>(),
     ) {
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // A harness rule cannot carry these, so both sides drop them.
+        drop_human_only_matchers(&mut action);
         let before = decide(&action, &argv, false, Vec::new());
         let mut with_harness = action;
-        with_harness.harness = vec![label];
+        set_harness(&mut with_harness, vec![label]);
         with_harness.outcome = if ask_human { Outcome::AskHuman } else { Outcome::Allow };
         let after = decide(&with_harness, &argv, false, Vec::new());
         prop_assert_eq!(after.verdict, before.verdict);
@@ -625,26 +663,174 @@ proptest! {
         prop_assert_eq!(after.denial, before.denial);
     }
 
+    /// h2-req 1: no harness listed, no grant, whatever `confirm` says.
+    #[test]
+    fn a_rule_without_harness_is_never_granted(
+        mut action in arb_action("g.test"),
+        argv in arb_argv(),
+        written_allow in any::<bool>(),
+    ) {
+        set_harness(&mut action, Vec::new());
+        action.outcome = if written_allow { Outcome::Allow } else { Outcome::Unset };
+        let d = decide(&action, &argv, true, Vec::new());
+        prop_assert!(d.harness_grant.is_none());
+        prop_assert_ne!(d.verdict, Verdict::Allow);
+    }
+
+    /// Whatever else is loaded beside a rule that grants only `codex`, the
+    /// `claude-code` agent is granted nothing.
+    #[test]
+    fn adding_a_rule_never_creates_a_grant_for_an_unlisted_label(
+        mut granted in arb_action("g.listed"),
+        mut extra in arb_action("g.extra"),
+        argv in arb_argv(),
+        same_exe in any::<bool>(),
+    ) {
+        set_harness(&mut granted, vec!["codex".to_owned()]);
+        granted.outcome = Outcome::Allow;
+        if granted.confirm == ConfirmPolicy::Always {
+            granted.confirm = ConfirmPolicy::Default;
+        }
+        if same_exe {
+            extra.exe = granted.exe.clone();
+            extra.args = granted.args.clone();
+        }
+        if extra.harness.iter().any(|label| label == "claude-code") {
+            set_harness(&mut extra, Vec::new());
+            extra.outcome = Outcome::Unset;
+        }
+        let rules = RuleSet::load(vec![granted.clone(), extra]).unwrap();
+        let d = xudo_policy::evaluate_command(
+            &rules,
+            &caller(true, Vec::new()),
+            &Arg::from(granted.exe.as_str()),
+            &argv,
+            Settings::default(),
+        );
+        prop_assert!(d.harness_grant.is_none());
+        prop_assert_ne!(d.verdict, Verdict::Allow);
+    }
+
+    /// OD15: a grant is never wider than the human's own allow.
+    #[test]
+    fn a_grant_implies_a_human_allow(
+        mut action in arb_action("g.od15"),
+        argv in arb_argv(),
+    ) {
+        set_harness(&mut action, vec!["claude-code".to_owned()]);
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let agent = decide(&action, &argv, true, Vec::new());
+        if agent.harness_grant.is_some() {
+            let human = decide(&action, &argv, false, Vec::new());
+            // A grant is a plain allow, and the human is allowed the same.
+            prop_assert_eq!(agent.verdict, Verdict::Allow);
+            prop_assert_eq!(human.verdict, Verdict::Allow);
+            prop_assert_eq!(human.action, agent.action);
+        }
+    }
+
+    /// D3: whatever is spliced into a command, a granted argv is one the
+    /// harness rule's own matchers accept whole, and the deny-list passes.
+    #[test]
+    fn no_generated_argv_escapes_a_harness_rule(
+        mut action in arb_action("g.d3"),
+        argv in arb_argv(),
+        injected in arb_argv(),
+        at in any::<prop::sample::Index>(),
+    ) {
+        set_harness(&mut action, vec!["claude-code".to_owned()]);
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let mut spliced = argv.as_slice().to_vec();
+        let position = at.index(spliced.len() + 1);
+        for (offset, arg) in injected.as_slice().iter().enumerate() {
+            spliced.insert(position + offset, arg.clone());
+        }
+        for candidate in [argv, Argv::new(spliced)] {
+            let d = decide(&action, &candidate, true, Vec::new());
+            if d.harness_grant.is_some() {
+                let canonical = candidate.canonicalize();
+                prop_assert_eq!(d.verdict, Verdict::Allow);
+                prop_assert!(match_argv(&action.args, &canonical).is_ok(), "{:?}", canonical);
+                prop_assert!(
+                    xudo_policy::evaluate_deny_list(action.exe.as_bytes(), &canonical).is_empty()
+                );
+                prop_assert_eq!(d.resolved_argv.len(), canonical.len());
+            }
+        }
+    }
+
+    /// Invariant 1 for the grant: a forged hint neither makes nor unmakes one,
+    /// and a human whose hints name the harness is never granted.
+    #[test]
+    fn hints_never_change_a_grant(
+        mut action in arb_action("g.hints"),
+        argv in arb_argv(),
+        listed in any::<bool>(),
+    ) {
+        let label = if listed { "claude-code" } else { "codex" };
+        set_harness(&mut action, vec![label.to_owned()]);
+        action.outcome = Outcome::Allow;
+        if action.confirm == ConfirmPolicy::Always {
+            action.confirm = ConfirmPolicy::Default;
+        }
+        let forged = || vec![
+            Hint::new(HintSource::Environment, "CLAUDECODE", "1"),
+            Hint::new(HintSource::Environment, "XUDO_HARNESS", label),
+            Hint::new(HintSource::Comm, "comm", label),
+            Hint::new(HintSource::AncestorExe, "exe", "/usr/bin/claude"),
+            Hint::new(HintSource::Cmdline, "cmdline", "claude --dangerously-skip-permissions"),
+        ];
+        for agent in [true, false] {
+            let bare = decide(&action, &argv, agent, Vec::new());
+            let hinted = decide(&action, &argv, agent, forged());
+            prop_assert_eq!(&bare.harness_grant, &hinted.harness_grant);
+            prop_assert_eq!(bare.verdict, hinted.verdict);
+            prop_assert_eq!(&bare.confirm, &hinted.confirm);
+            if !agent {
+                prop_assert!(hinted.harness_grant.is_none());
+            }
+        }
+    }
+
     #[test]
     fn every_harness_action_auth_can_run_too(
-        action in arb_action("h1.test"),
+        mut action in arb_action("h1.test"),
         argv in arb_argv(),
         label in "[a-z][a-z0-9-]{0,31}",
     ) {
+        // A human-only rule cannot list a harness: that is a load error now.
+        prop_assume!(action.agent_allowed);
         prop_assume!(action.confirm != ConfirmPolicy::Always);
         // Ask-human changes the agent's verdict on purpose. This property is
         // about a passwordless-shaped allow rule, which must not.
         prop_assume!(action.outcome == Outcome::Allow);
+        drop_human_only_matchers(&mut action);
+        // The baseline lists no harness at all, so a grant can only come from
+        // the label added below.
+        set_harness(&mut action, Vec::new());
         let human_before = decide(&action, &argv, false, Vec::new());
         let agent_before = decide(&action, &argv, true, Vec::new());
         let mut with_harness = action;
-        with_harness.harness = vec![label];
+        set_harness(&mut with_harness, vec![label]);
         with_harness.outcome = Outcome::Allow;
         let human_after = decide(&with_harness, &argv, false, Vec::new());
         let agent_after = decide(&with_harness, &argv, true, Vec::new());
         prop_assert_eq!(human_after.verdict, human_before.verdict);
-        prop_assert_eq!(agent_after.verdict, agent_before.verdict);
-        prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+        if agent_after.harness_grant.is_some() {
+            // The one change a listed label may make: a plain allow the human
+            // is allowed too.
+            prop_assert_eq!(agent_after.verdict, Verdict::Allow);
+            prop_assert!(human_after.verdict.is_permitted());
+        } else {
+            prop_assert_eq!(agent_after.verdict, agent_before.verdict);
+            prop_assert_eq!(agent_after.confirm, agent_before.confirm);
+        }
     }
 
     #[test]
@@ -654,7 +840,8 @@ proptest! {
     ) {
         action.agent_allowed = true;
         action.confirm = ConfirmPolicy::Default;
-        action.harness = vec!["claude-code".into()];
+        set_harness(&mut action, vec!["claude-code".into()]);
+        action.outcome = Outcome::Allow;
         let before = decide(&action, &argv, true, Vec::new());
         action.outcome = Outcome::AskHuman;
         let after = decide(&action, &argv, true, Vec::new());
@@ -676,16 +863,20 @@ proptest! {
         argv in arb_argv(),
         listed in any::<bool>(),
     ) {
+        // A human-only rule cannot list a harness: that is a load error now.
+        prop_assume!(action.agent_allowed);
         prop_assume!(action.confirm != ConfirmPolicy::Always);
+        // Both sides carry the same matchers, so only the outcome differs.
+        drop_human_only_matchers(&mut action);
         action.outcome = Outcome::Allow;
-        action.harness.clear();
+        set_harness(&mut action, Vec::new());
         let before = decide(&action, &argv, true, Vec::new());
         action.outcome = Outcome::AskHuman;
-        action.harness = vec![if listed {
+        set_harness(&mut action, vec![if listed {
             "claude-code".to_owned()
         } else {
             "other-harness".to_owned()
-        }];
+        }]);
         let after = decide(&action, &argv, true, Vec::new());
         prop_assert_ne!(after.verdict, Verdict::Allow);
         prop_assert_ne!(after.verdict, Verdict::AllowWithConfirmation);
@@ -835,7 +1026,15 @@ fn arb_tokens() -> impl Strategy<Value = Argv> {
 }
 
 /// An action's program, arguments, and requirements, before it has an id.
-type Parts = (String, Vec<ArgSpec>, Tier, ConfirmPolicy, bool, Outcome);
+type Parts = (
+    String,
+    Vec<ArgSpec>,
+    Tier,
+    ConfirmPolicy,
+    bool,
+    Outcome,
+    bool,
+);
 
 fn arb_parts() -> impl Strategy<Value = Parts> {
     (
@@ -845,11 +1044,20 @@ fn arb_parts() -> impl Strategy<Value = Parts> {
         arb_confirm(),
         any::<bool>(),
         arb_outcome(),
+        any::<bool>(),
     )
 }
 
-fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed, outcome): Parts) -> Action {
-    finish_generated(id, tier, exe, args, confirm, agent_allowed, outcome)
+fn assemble(id: &str, (exe, args, tier, confirm, agent_allowed, outcome, listed): Parts) -> Action {
+    finish_generated(
+        id,
+        tier,
+        exe,
+        args,
+        confirm,
+        agent_allowed,
+        (outcome, listed),
+    )
 }
 
 /// One to `max` actions with distinct ids, in declaration order.
@@ -958,7 +1166,6 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
         frozen in prop::bool::weighted(0.1),
     ) {
         let mut grown = rules.clone();
@@ -967,7 +1174,7 @@ proptest! {
         let before = RuleSet::load(rules.clone()).unwrap();
         let after = RuleSet::load(grown).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
 
         let then = evaluate_command(&before, &facts, &program, &argv, settings);
         let now = evaluate_command(&after, &facts, &program, &argv, settings);
@@ -1002,13 +1209,12 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
     ) {
         let (program, argv) = command_for(&rules, pick, &choices, &random, sampled);
         let forward = RuleSet::load(rules.clone()).unwrap();
         let shuffled = RuleSet::load(reordered).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen: false, ..Settings::default() };
+        let settings = Settings { frozen: false, ..Settings::default() };
 
         let a = evaluate_command(&forward, &facts, &program, &argv, settings);
         let b = evaluate_command(&shuffled, &facts, &program, &argv, settings);
@@ -1038,13 +1244,12 @@ proptest! {
         random in arb_tokens(),
         sampled in prop::bool::weighted(0.8),
         agent in any::<bool>(),
-        confirm_agent_actions in any::<bool>(),
         frozen in prop::bool::weighted(0.1),
     ) {
         let (program, argv) = command_for(&rules, pick, &choices, &random, sampled);
         let set = RuleSet::load(rules.clone()).unwrap();
         let facts = caller(agent, Vec::new());
-        let settings = Settings { confirm_agent_actions, frozen, ..Settings::default() };
+        let settings = Settings { frozen, ..Settings::default() };
         let whole = evaluate_command(&set, &facts, &program, &argv, settings);
 
         for action in &rules {
@@ -1107,8 +1312,8 @@ proptest! {
         .canonicalize();
         let accepted_by_both = match_argv(&first, &argv).is_ok() && match_argv(&second, &argv).is_ok();
         let set = RuleSet::load(vec![
-            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
-            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("o.first", ("/usr/bin/x".to_owned(), first, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
+            assemble("o.second", ("/usr/bin/x".to_owned(), second, Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
         ])
         .unwrap();
         let overlaps = set.overlaps();
@@ -1147,8 +1352,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);
@@ -1176,8 +1381,8 @@ proptest! {
             return Ok(());
         }
         let set = RuleSet::load(vec![
-            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
-            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow)),
+            assemble("m.first", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("a", first)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
+            assemble("m.second", ("/usr/bin/x".to_owned(), vec![ArgSpec::one("b", second)], Tier::DiagRead, ConfirmPolicy::Default, true, Outcome::Allow, false)),
         ])
         .unwrap();
         prop_assert_eq!(set.overlaps().len(), 1, "both accept {:?}", token);

@@ -80,6 +80,14 @@ impl Backend {
     pub fn is_usable(&self) -> bool {
         self.capabilities.is_usable()
     }
+
+    /// Whether this is a doas build that xudo will not use `/etc/doas.d` with:
+    /// it is not known to read the directory, or the directory is not there.
+    /// Then xudo appends its block to `/etc/doas.conf` and does not analyse
+    /// the directory.
+    pub fn doas_ignores_drop_ins(&self) -> bool {
+        self.kind == BackendKind::Doas && !self.capabilities.has(Capability::DropInDirectory)
+    }
 }
 
 /// Facts about the machine, gathered elsewhere.
@@ -95,6 +103,15 @@ pub trait Probe {
 
     /// Whether a directory exists at an absolute path.
     fn directory_exists(&self, absolute_path: &str) -> bool;
+
+    /// Whether this doas build is known to read `/etc/doas.d`, because its own
+    /// executable names the directory.
+    ///
+    /// A directory on disk proves nothing: Debian's `opendoas` does not read
+    /// one, so a rule written there would be silently ignored. Only the build
+    /// itself says whether it looks. Anything that cannot be shown answers
+    /// `false`, and xudo then appends to `/etc/doas.conf`.
+    fn doas_reads_drop_ins(&self, absolute_path: &str) -> bool;
 
     /// Whether the backend honours a directive, given **exactly the text xudo
     /// intends to write**.
@@ -230,7 +247,7 @@ pub fn identify(probe: &dyn Probe) -> Option<Backend> {
         let banner = probe.version_banner(doas).unwrap_or_default();
         return Some(Backend {
             kind: BackendKind::Doas,
-            capabilities: doas_capabilities(&banner, probe),
+            capabilities: doas_capabilities(probe),
             version: first_line(&banner),
             exe: doas.to_owned(),
         });
@@ -298,7 +315,7 @@ fn sudo_capabilities(exe: &str, probe: &dyn Probe) -> CapabilityMatrix {
 }
 
 /// What a doas port supports.
-fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
+fn doas_capabilities(probe: &dyn Probe) -> CapabilityMatrix {
     let exe = BackendKind::Doas.exe();
     // doas carries its options **on the rule itself**, so a setting cannot leak
     // onto anything else by construction. That is the property
@@ -313,20 +330,19 @@ fn doas_capabilities(banner: &str, probe: &dyn Probe) -> CapabilityMatrix {
     if probe.honours_directive(exe, "nopersist") {
         matrix = matrix.with(Capability::DisableCredentialCache);
     }
-    // Parse check only: doas does not allocate a pty for its child.
-    if probe.honours_directive(exe, "pty") {
-        matrix = matrix.with(Capability::AllocatePty);
-    }
+    // doas never allocates a pty for its child, so the control is not claimed
+    // from a parse check. The exemption is explicit and `xudo doctor` shows it.
+    matrix = matrix.with_exemption(Capability::AllocatePty);
 
-    if probe.directory_exists("/etc/doas.d") {
+    // The directory is used only on a build shown to read it: a directory a
+    // build ignores would hold a rule that never takes effect.
+    if probe.directory_exists("/etc/doas.d") && probe.doas_reads_drop_ins(exe) {
         matrix = matrix.with(Capability::DropInDirectory);
     }
 
-    // A `--with-timestamp` build can cache credentials only for a rule that says
-    // `persist`; xudo's never does. Recorded for `xudo doctor`.
-    if banner.to_ascii_lowercase().contains("with-timestamp") {
-        matrix = matrix.with(Capability::PersistentCredentialCache);
-    }
+    // Whether this build can cache a credential (`--with-timestamp`) cannot be
+    // read from a banner, so the answer is unknown, not absent.
+    matrix = matrix.with_unknown(Capability::PersistentCredentialCache);
 
     matrix
 }
@@ -362,6 +378,8 @@ mod tests {
         validates_named_file: bool,
         /// Whether a rule may carry an argument wildcard.
         accepts_wildcard: bool,
+        /// The doas executables that name `/etc/doas.d` in themselves.
+        doas_d_readers: Vec<String>,
     }
 
     impl Default for FakeMachine {
@@ -375,6 +393,7 @@ mod tests {
                 scopes_defaults: true,
                 validates_named_file: true,
                 accepts_wildcard: true,
+                doas_d_readers: Vec::new(),
             }
         }
     }
@@ -394,6 +413,12 @@ mod tests {
         /// the ones it has not implemented.
         fn ignoring(mut self, directive: &str) -> Self {
             self.ignored_directives.push(directive.to_owned());
+            self
+        }
+
+        /// A doas build whose executable names `/etc/doas.d`, like Alpine's.
+        fn reading_doas_d(mut self) -> Self {
+            self.doas_d_readers.push("/usr/bin/doas".to_owned());
             self
         }
 
@@ -433,6 +458,10 @@ mod tests {
 
         fn directory_exists(&self, absolute_path: &str) -> bool {
             self.directories.iter().any(|d| d == absolute_path)
+        }
+
+        fn doas_reads_drop_ins(&self, absolute_path: &str) -> bool {
+            self.doas_d_readers.iter().any(|d| d == absolute_path)
         }
 
         fn honours_directive(&self, _absolute_path: &str, directive: &str) -> bool {
@@ -542,8 +571,38 @@ mod tests {
     }
 
     #[test]
-    fn a_doas_port_with_a_drop_in_directory_gets_the_better_path() {
+    fn only_a_doas_without_a_drop_in_directory_ignores_doas_d() {
+        assert!(detect(&alpine_doas()).unwrap().doas_ignores_drop_ins());
+        let with_dir = alpine_doas().with_dir("/etc/doas.d").reading_doas_d();
+        assert!(!detect(&with_dir).unwrap().doas_ignores_drop_ins());
+        // sudo has a drop-in directory of its own and is not doas.
+        assert!(!detect(&debian()).unwrap().doas_ignores_drop_ins());
+        let mut sudo = detect(&debian()).unwrap();
+        sudo.capabilities = CapabilityMatrix::empty();
+        assert!(!sudo.doas_ignores_drop_ins());
+    }
+
+    #[test]
+    fn a_doas_that_does_not_read_a_directory_someone_made_gets_the_append_path() {
+        // Debian's opendoas ignores /etc/doas.d; a user-made directory must not
+        // make xudo write a rule there that doas never reads.
         let machine = alpine_doas().with_dir("/etc/doas.d");
+        let backend = detect(&machine).unwrap();
+        assert!(!backend.capabilities.has(Capability::DropInDirectory));
+        assert!(backend.doas_ignores_drop_ins());
+        // A build that reads it, with the directory missing, has nothing to use.
+        let missing = alpine_doas().reading_doas_d();
+        assert!(
+            !detect(&missing)
+                .unwrap()
+                .capabilities
+                .has(Capability::DropInDirectory)
+        );
+    }
+
+    #[test]
+    fn a_doas_port_with_a_drop_in_directory_gets_the_better_path() {
+        let machine = alpine_doas().with_dir("/etc/doas.d").reading_doas_d();
         assert!(
             detect(&machine)
                 .unwrap()
@@ -553,24 +612,23 @@ mod tests {
     }
 
     #[test]
-    fn doas_persistence_is_recorded_but_never_depended_on() {
-        let without = detect(&alpine_doas()).unwrap();
-        assert!(
-            !without
-                .capabilities
-                .has(Capability::PersistentCredentialCache)
-        );
-        // Either way the backend is usable, because xudo does not rely on it.
-        assert!(without.is_usable());
-
-        let with = FakeMachine::default()
-            .with_exe("/usr/bin/doas", "doas (OpenDoas) 6.8.2 --with-timestamp\n");
-        assert!(
-            detect(&with)
-                .unwrap()
-                .capabilities
-                .has(Capability::PersistentCredentialCache)
-        );
+    fn doas_never_claims_a_pty_and_reports_its_credential_cache_as_unknown() {
+        for banner in [
+            "doas (OpenDoas) 6.8.2\n",
+            "doas (OpenDoas) 6.8.2 --with-timestamp\n",
+        ] {
+            let found = detect(&FakeMachine::default().with_exe("/usr/bin/doas", banner)).unwrap();
+            let caps = &found.capabilities;
+            // A banner never shows whether the cache exists: unknown, not absent.
+            assert!(!caps.has(Capability::PersistentCredentialCache));
+            assert!(caps.is_unknown(Capability::PersistentCredentialCache));
+            // No pty is allocated, and that is an accepted, visible exemption.
+            assert!(!caps.has(Capability::AllocatePty));
+            assert!(caps.is_exempt(Capability::AllocatePty));
+            assert!(found.is_usable());
+        }
+        let sudo = detect(&debian()).unwrap();
+        assert!(!sudo.capabilities.is_exempt(Capability::AllocatePty));
     }
 
     #[test]
@@ -618,12 +676,14 @@ mod tests {
 
     #[test]
     fn a_doas_port_that_ignores_a_required_directive_is_refused_too() {
-        // Both required controls, so neither is special-cased on this backend
-        // either.
-        for directive in ["pty", "nopersist"] {
-            let deaf = alpine_doas().ignoring(directive);
-            assert!(detect(&deaf).is_err(), "{directive} was tolerated");
-        }
+        // The cache control is probed and required. doas never allocates a pty,
+        // so the `pty` probe is not consulted: that control is an explicit
+        // exemption, not a claim.
+        let deaf = alpine_doas().ignoring("nopersist");
+        assert!(detect(&deaf).is_err(), "nopersist was tolerated");
+        let no_pty_probe = detect(&alpine_doas().ignoring("pty")).unwrap();
+        assert!(no_pty_probe.is_usable());
+        assert!(!no_pty_probe.capabilities.has(Capability::AllocatePty));
     }
 
     #[test]

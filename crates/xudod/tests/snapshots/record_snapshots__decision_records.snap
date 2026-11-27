@@ -1,6 +1,5 @@
 ---
 source: crates/xudod/tests/record_snapshots.rs
-assertion_line: 145
 expression: text
 ---
 ## minted
@@ -14,7 +13,7 @@ expression: text
   "classification": "unattested",
   "decision": "allowed",
   "denial": null,
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -27,13 +26,18 @@ expression: text
     "peer_gid=100",
     "pinned=true",
     "euid_from=PIDFD_GET_INFO",
+    "hint_comm=\"xudo\"",
+    "hint_exe=\"/usr/bin/xudo\"",
+    "hint_cmdline=argv0:\"xudo\" argc:4 len:25",
+    "hint_claudecode=set:\"1\"",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1",
     "nonce=abababababababababababababababababababababababababababababababab",
-    "deadline_ms=1900"
+    "deadline_ms=1900",
+    "via=auth"
   ],
-  "hash": "840dcd940c0b699c73c0a5d2ce4d31382f50c1f441606b980dd58e228937dbf5",
+  "hash": "d755b9f9b8d7d62a00aa7a715ca6d42a704ccc1913891ba131a4a0aa66ef7ed3",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -52,7 +56,7 @@ expression: text
   "classification": "unattested",
   "decision": "awaiting_confirmation",
   "denial": null,
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -65,11 +69,15 @@ expression: text
     "peer_gid=100",
     "pinned=true",
     "euid_from=PIDFD_GET_INFO",
+    "hint_comm=\"xudo\"",
+    "hint_exe=\"/usr/bin/xudo\"",
+    "hint_cmdline=argv0:\"xudo\" argc:4 len:25",
+    "hint_claudecode=set:\"1\"",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "5ba2de4d8485c824b06d6b9f0672d2cca4329f2d2e0c99541d3b5ca67b6471ce",
+  "hash": "a5f71bb620462d39d37ecb179fa94c92123694ef9624d9f24d38c80931fd75c5",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": "20-services.toml:3",
@@ -86,7 +94,7 @@ expression: text
   "classification": "unattested",
   "decision": "denied",
   "denial": "argv_rejected",
-  "deny_list_version": 7,
+  "deny_list_version": 8,
   "evidence": [
     "broker=xudod",
     "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
@@ -99,11 +107,15 @@ expression: text
     "peer_gid=100",
     "pinned=true",
     "euid_from=PIDFD_GET_INFO",
+    "hint_comm=\"xudo\"",
+    "hint_exe=\"/usr/bin/xudo\"",
+    "hint_cmdline=argv0:\"xudo\" argc:4 len:25",
+    "hint_claudecode=set:\"1\"",
     "cgroup_id=77",
     "claimed_classification=enrolled-agent-yolo",
     "generation=d47cc9ca3477869250ac3e1dce298f8402a764028c123c228443e5485bb1ccc1"
   ],
-  "hash": "53b845bdff75616fb4a61bfae73031c684c2fdf353b514434b36af246cf4e595",
+  "hash": "55659baa5a18d8f353595039ac48bdce42180778607e380be2a541a487ed1c7b",
   "outcome": "not_executed",
   "prev_hash": "",
   "rule_source": null,

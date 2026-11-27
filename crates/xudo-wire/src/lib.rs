@@ -184,7 +184,8 @@ pub enum Question {
         /// The last id of the previous page, or empty for the first page.
         after: String,
     },
-    /// Remove one path under a `remove-path` rule. Password path only.
+    /// Remove one path under a `remove-path` rule: the password gate, or
+    /// `-nopass` for a live harness the rule grants.
     ///
     /// The broker mints a spool entry. The gate walks the tree itself and does
     /// not exec [`OPERATION_PROGRAM`].
@@ -728,11 +729,14 @@ pub enum RefusalCode {
     RequestUnknown,
     /// The requested answer was rejected.
     AnswerRejected,
+    /// A service harness asked for a command no rule grants it. It has no
+    /// password to type, so nothing was minted. Carries the action id only.
+    HarnessNotGranted,
 }
 
 impl RefusalCode {
     /// Every code, in numeric order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::RequestTooLarge,
         Self::RequestTimedOut,
         Self::RequestUnreadable,
@@ -750,6 +754,7 @@ impl RefusalCode {
         Self::ChannelUntrusted,
         Self::RequestUnknown,
         Self::AnswerRejected,
+        Self::HarnessNotGranted,
     ];
 
     /// The stable numeric code. Append-only.
@@ -772,6 +777,7 @@ impl RefusalCode {
             Self::ChannelUntrusted => 15,
             Self::RequestUnknown => 16,
             Self::AnswerRejected => 17,
+            Self::HarnessNotGranted => 18,
         }
     }
 
@@ -795,6 +801,7 @@ impl RefusalCode {
             Self::ChannelUntrusted => "channel_untrusted",
             Self::RequestUnknown => "request_unknown",
             Self::AnswerRejected => "answer_rejected",
+            Self::HarnessNotGranted => "harness_not_granted",
         }
     }
 
@@ -862,6 +869,10 @@ impl RefusalCode {
                 "the request is unknown or this question is not implemented yet"
             }
             Self::AnswerRejected => "the broker rejected this confirmation answer",
+            Self::HarnessNotGranted => {
+                "no rule grants this harness the command, and a service harness has no password \
+                 to type; ask root to add a rule that names the harness, or use the queue"
+            }
         }
     }
 }
@@ -942,6 +953,21 @@ impl BrokerResponse {
                 code,
                 remediation: code.remediation().to_owned(),
                 detail: None,
+            },
+        }
+    }
+
+    /// A service harness's refusal: the code and the action id, nothing else.
+    ///
+    /// No decision and no trace, so the agent learns which action matched and
+    /// not how the ruleset is written.
+    pub fn harness_not_granted(action: Option<&str>) -> Self {
+        Self {
+            schema_version: WIRE_SCHEMA_VERSION,
+            answer: Answer::Refused {
+                code: RefusalCode::HarnessNotGranted,
+                remediation: RefusalCode::HarnessNotGranted.remediation().to_owned(),
+                detail: action.map(str::to_owned),
             },
         }
     }

@@ -1,0 +1,6 @@
+---
+source: crates/xudo-gate/tests/stage_contract.rs
+expression: snapshot
+---
+gate_rate_ceiling High Unusable
+the -nopass ceiling is reached: 60 runs in the last minute, 61 in the hour

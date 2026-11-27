@@ -34,7 +34,10 @@
 //!   [`MAX_SPOOL_BYTES`] byte, and [`MAX_ENTRIES_PER_UID`] per-uid limits.
 //!   Watch entries have separate [`MAX_WATCH_ENTRIES`] and
 //!   [`MAX_WATCH_ENTRIES_PER_UID`] limits, so watcher requests cannot consume
-//!   the password path's capacity.
+//!   the password path's capacity. So do `via = harness` entries: they have
+//!   their own [`MAX_HARNESS_ENTRIES`], [`MAX_HARNESS_ENTRIES_PER_UID`] and
+//!   [`MAX_HARNESS_BYTES`], so no number of busy agent accounts can use up
+//!   what a human's `sudo` password path needs.
 //!   The entry does not record a uid, so the count reads each live caller's
 //!   real and effective uids from `/proc/<pid>/status` and counts the entry
 //!   against both: a caller that exec'd a set-user-ID program after minting
@@ -50,14 +53,14 @@ use xudo_audit::Approval;
 use xudo_gate::request::{
     AttestedClass, BoottimeMillis, PendingRequest, REQUEST_SCHEMA_VERSION, is_boot_id, is_nonce,
 };
-use xudo_policy::{CallerFacts, Classification, Decision};
+use xudo_policy::{CallerFacts, Classification, Decision, HarnessRegistry, HarnessWay, Verdict};
 use xudo_sys::{
     Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
     parse_stat, parse_status_uids,
 };
 use xudo_wire::BrokerRequest;
 
-use crate::identify::PeerIdentity;
+use crate::identify::{CgroupAttestation, PeerIdentity};
 
 /// How long a minted entry lives in the test-only short-TTL build: twenty seconds.
 #[cfg(feature = "lane-short-ttl")]
@@ -110,14 +113,87 @@ pub const MAX_WATCH_ENTRIES: usize = 16;
 /// The most waiting watch entries belonging to one uid.
 pub const MAX_WATCH_ENTRIES_PER_UID: usize = 2;
 
+/// The most live `via = harness` entries across all uids: their own bucket,
+/// apart from [`MAX_SPOOL_ENTRIES`], so busy agent accounts cannot fill the
+/// spool a human's password path needs.
+pub const MAX_HARNESS_ENTRIES: usize = 16;
+
+/// The most live `via = harness` entries whose callers run as one uid.
+pub const MAX_HARNESS_ENTRIES_PER_UID: usize = 4;
+
+/// The most bytes of live harness entries: apart from [`MAX_SPOOL_BYTES`].
+pub const MAX_HARNESS_BYTES: usize = 256 * 1024;
+
+/// How long a `via = harness` entry lives: thirty seconds.
+///
+/// The client runs `sudo -n` at once and nobody types anything, so a short
+/// life costs nothing and leaves little to race.
+pub const HARNESS_TTL_MILLIS: u64 = 30_000;
+
+/// Where the exec path sends a decision for one caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecPath {
+    /// The password gate, `-auth`.
+    Password,
+    /// The passwordless gate, `-nopass`: a live harness a rule grants.
+    Harness,
+    /// A service harness no rule grants. It has no password to type, so it is
+    /// refused and nothing is minted.
+    NotGranted,
+}
+
+/// Which gate a run question's decision is minted for.
+///
+/// `Harness` only when every fact holds: the caller is an enrolled agent, the
+/// kernel handed over its pidfd from the socket, the pidfd held it while it
+/// was read, its namespaces are the broker's, its scope is a live one, and
+/// the decision is a plain allow whose grant is the action it cites. Anything
+/// weaker keeps the password path, or refuses a service harness.
+pub fn exec_path(
+    identity: &PeerIdentity,
+    caller: &CallerFacts,
+    decision: &Decision,
+    registry: &HarnessRegistry,
+) -> ExecPath {
+    let Classification::EnrolledAgent { agent_id, .. } = &caller.classification else {
+        return ExecPath::Password;
+    };
+    let live = identity.rung.can_attest_an_agent()
+        && identity.pinned
+        && !identity.diverged
+        && identity.cgroup_id.is_some()
+        && matches!(
+            identity.cgroup_attestation,
+            CgroupAttestation::UnregisteredScope(_)
+        );
+    let granted = decision.verdict == Verdict::Allow
+        && decision.harness_grant.is_some()
+        && decision.harness_grant == decision.action;
+    if live && granted {
+        return ExecPath::Harness;
+    }
+    let service = registry
+        .get(agent_id)
+        .is_some_and(|entry| entry.way == HarnessWay::Service);
+    if service && decision.verdict.is_permitted() {
+        ExecPath::NotGranted
+    } else {
+        ExecPath::Password
+    }
+}
+
 /// Number of spool names broker scans must request to cover every live entry
 /// and distinguish a spool that exceeds the broker's own limits.
-pub const MAX_SPOOL_NAMES_TO_WALK: usize = MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1;
+pub const MAX_SPOOL_NAMES_TO_WALK: usize =
+    MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + MAX_HARNESS_ENTRIES + 1;
 
 // One uid must never be able to take the whole spool.
 const _: () = assert!(MAX_ENTRIES_PER_UID < MAX_SPOOL_ENTRIES);
 const _: () = assert!(MAX_WATCH_ENTRIES_PER_UID < MAX_WATCH_ENTRIES);
-const _: () = assert!(MAX_SPOOL_NAMES_TO_WALK == MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + 1);
+const _: () = assert!(MAX_HARNESS_ENTRIES_PER_UID < MAX_HARNESS_ENTRIES);
+const _: () = assert!(
+    MAX_SPOOL_NAMES_TO_WALK == MAX_SPOOL_ENTRIES + MAX_WATCH_ENTRIES + MAX_HARNESS_ENTRIES + 1
+);
 const _: () = assert!(MAX_WATCH_ENTRIES * MAX_ENTRY_BYTES <= MAX_SPOOL_BYTES);
 
 /// The largest entry the broker reads back, in bytes.
@@ -174,6 +250,28 @@ pub enum MintError {
         /// The uid that asked.
         uid: u32,
         /// The live entries counted against it.
+        entries: usize,
+    },
+    /// The harness bucket is at its limits. The password path is untouched.
+    #[error(
+        "the harness bucket holds {entries} live entries and {bytes} bytes; the limits are \
+         {MAX_HARNESS_ENTRIES} entries and {MAX_HARNESS_BYTES} bytes"
+    )]
+    HarnessFull {
+        /// Live harness entries.
+        entries: usize,
+        /// Their bytes.
+        bytes: usize,
+    },
+    /// The asking uid's live harness entries are at its limit.
+    #[error(
+        "uid {uid} already holds {entries} live harness entries; the limit for one uid is \
+         {MAX_HARNESS_ENTRIES_PER_UID}"
+    )]
+    HarnessUidFull {
+        /// The uid that asked.
+        uid: u32,
+        /// The live harness entries counted against it.
         entries: usize,
     },
     /// The nonce already names an entry.
@@ -276,7 +374,7 @@ pub(crate) fn entry_for(
     deadline: u64,
     nonce: String,
 ) -> Result<PendingRequest, MintError> {
-    let caller = crate::policy::classify(identity);
+    let caller = crate::policy::classify_for_test(identity);
     entry_for_classified(
         decision,
         &AttestedCaller {
@@ -371,6 +469,7 @@ pub(crate) fn entry_for_classified(
             attested_scope_id,
             boot_id: stored_boot,
             attested_harness,
+            via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: Some(xudo_gate::request::RequestedOp {
                 op: "remove-path".to_owned(),
@@ -415,6 +514,7 @@ pub(crate) fn entry_for_classified(
         attested_scope_id,
         boot_id,
         attested_harness,
+        via: xudo_gate::request::Via::Auth,
         queue_id: None,
         operation: None,
     })
@@ -456,14 +556,22 @@ fn prune_and_publish<S: Spool + ?Sized>(
     let mut this_uid = 0usize;
     let mut watch_entries = 0usize;
     let mut watch_uid = 0usize;
+    let mut harness_entries = 0usize;
+    let mut harness_bytes = 0usize;
+    let mut harness_uid = 0usize;
     for name in spool.names().map_err(MintError::Spool)? {
         match classify(spool, callers, &name, minting) {
             Existing::Live {
                 size,
                 same_uid,
                 watch,
+                harness,
             } => {
-                if watch {
+                if harness {
+                    harness_entries = harness_entries.saturating_add(1);
+                    harness_bytes = harness_bytes.saturating_add(size);
+                    harness_uid = harness_uid.saturating_add(usize::from(same_uid));
+                } else if watch {
                     watch_entries = watch_entries.saturating_add(1);
                     watch_uid = watch_uid.saturating_add(usize::from(same_uid));
                 } else {
@@ -480,7 +588,22 @@ fn prune_and_publish<S: Spool + ?Sized>(
             Existing::Foreign => {}
         }
     }
-    if minting.entry().needs_watch {
+    if minting.entry().via == xudo_gate::request::Via::Harness {
+        if harness_entries >= MAX_HARNESS_ENTRIES
+            || harness_bytes.saturating_add(minting.json.len()) > MAX_HARNESS_BYTES
+        {
+            return Err(MintError::HarnessFull {
+                entries: harness_entries,
+                bytes: harness_bytes,
+            });
+        }
+        if harness_uid >= MAX_HARNESS_ENTRIES_PER_UID {
+            return Err(MintError::HarnessUidFull {
+                uid: minting.uid,
+                entries: harness_uid,
+            });
+        }
+    } else if minting.entry().needs_watch {
         if watch_entries >= MAX_WATCH_ENTRIES || watch_uid >= MAX_WATCH_ENTRIES_PER_UID {
             return Err(MintError::ConfirmationThrottled);
         }
@@ -517,6 +640,8 @@ enum Existing {
         same_uid: bool,
         /// Whether the entry uses the separate watch quota.
         watch: bool,
+        /// Whether the entry is `via = harness`, which has a bucket of its own.
+        harness: bool,
     },
     /// Something to remove: expired, superseded, misnamed, unreadable, a
     /// temporary file, or a non-watch entry whose caller cannot be shown alive.
@@ -591,6 +716,7 @@ fn classify<S: Spool + ?Sized>(
             size: bytes.len(),
             same_uid: existing.caller_uid == minting.uid,
             watch: true,
+            harness: false,
         };
     }
     match live_caller(callers, &existing) {
@@ -598,6 +724,7 @@ fn classify<S: Spool + ?Sized>(
             size: bytes.len(),
             same_uid: uids.real == minting.uid || uids.effective == minting.uid,
             watch: existing.needs_watch,
+            harness: existing.via == xudo_gate::request::Via::Harness,
         },
         None => Existing::Stale,
     }
@@ -691,6 +818,7 @@ mod tests {
             attested_scope_id: None,
             boot_id: None,
             attested_harness: None,
+            via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: None,
         }
@@ -844,6 +972,7 @@ mod tests {
                 attested_scope_id: None,
                 boot_id: None,
                 attested_harness: None,
+                via: xudo_gate::request::Via::Auth,
                 queue_id: None,
                 operation: None,
             }
@@ -1701,6 +1830,248 @@ mod tests {
         publish_as_1000(&spool, &host, &next).unwrap();
         assert_eq!(spool.files().len(), MAX_WATCH_ENTRIES + MAX_SPOOL_ENTRIES);
         assert!(spool.files().contains_key(next.nonce.as_bytes()));
+    }
+
+    fn harness_entry(letter: char, pid: u32) -> PendingRequest {
+        let mut entry = entry(letter, pid, 7, NOW + 100);
+        entry.via = xudo_gate::request::Via::Harness;
+        entry
+    }
+
+    /// A spool holding `count` live harness entries, `per_uid` to a uid.
+    fn harness_spool(count: usize, per_uid: usize) -> (FakeSpool, FakePeer) {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        for index in 0..count {
+            let mut live = harness_entry('b', 40_000 + u32::try_from(index).unwrap());
+            live.nonce = format!("{:064x}", index + 1);
+            let uid = 5_000 + u32::try_from(index.div_euclid(per_uid)).unwrap();
+            host = running(host, &live, uid, uid);
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        (spool, host)
+    }
+
+    #[test]
+    fn harness_entries_cannot_consume_the_password_paths_capacity() {
+        // The harness bucket completely full, and every password-path limit is
+        // still free for the human who asks next.
+        let (spool, host) = harness_spool(MAX_HARNESS_ENTRIES, MAX_HARNESS_ENTRIES_PER_UID);
+        let human = entry('a', 4242, 5_000, NOW + 900);
+        publish_as_1000(&spool, &host, &human).unwrap();
+        assert_eq!(spool.files().len(), MAX_HARNESS_ENTRIES + 1);
+        assert!(spool.files().contains_key(human.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn a_full_password_path_does_not_stop_the_harness_bucket() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        for index in 0..MAX_SPOOL_ENTRIES {
+            let mut live = entry('c', 30_000 + u32::try_from(index).unwrap(), 7, NOW + 100);
+            live.nonce = format!("{:064x}", index + 1);
+            let uid = 2_000 + u32::try_from(index.div_euclid(MAX_ENTRIES_PER_UID)).unwrap();
+            host = running(host, &live, uid, uid);
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        let agent = harness_entry('a', 4242);
+        publish_as_1000(&spool, &host, &agent).unwrap();
+        assert!(spool.files().contains_key(agent.nonce.as_bytes()));
+    }
+
+    #[test]
+    fn the_harness_bucket_refuses_at_its_own_global_and_uid_limits() {
+        let (spool, host) = harness_spool(MAX_HARNESS_ENTRIES, MAX_HARNESS_ENTRIES_PER_UID);
+        let agent = harness_entry('a', 4242);
+        assert!(matches!(
+            publish_as_1000(&spool, &host, &agent),
+            Err(MintError::HarnessFull { entries, .. }) if entries == MAX_HARNESS_ENTRIES
+        ));
+        // One uid holding its share: the uid limit bites, the bucket has room.
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        for index in 0..MAX_HARNESS_ENTRIES_PER_UID {
+            let mut live = harness_entry('b', 40_000 + u32::try_from(index).unwrap());
+            live.nonce = format!("{:064x}", index + 1);
+            host = running(host, &live, 1000, 1000);
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        assert!(matches!(
+            publish_as_1000(&spool, &host, &agent),
+            Err(MintError::HarnessUidFull { uid: 1000, entries }) if entries == MAX_HARNESS_ENTRIES_PER_UID
+        ));
+    }
+
+    #[test]
+    fn the_harness_bucket_refuses_past_its_own_byte_limit() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        let mut s_bytes = 0usize;
+        for index in 0..3u32 {
+            let mut live = harness_entry('b', 40_000 + index);
+            live.nonce = format!("{:064x}", index + 1);
+            live.argv = vec!["x".repeat(30_000)];
+            host = running(host, &live, 5_000 + index, 5_000 + index);
+            s_bytes += live.to_json().len();
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        let mut agent = harness_entry('a', 4242);
+        agent.argv = vec!["x".repeat(MAX_HARNESS_BYTES)];
+        let err = publish_as_1000(&spool, &host, &agent).unwrap_err();
+        assert_eq!(
+            err,
+            MintError::HarnessFull {
+                entries: 3,
+                bytes: s_bytes
+            }
+        );
+        assert!(!spool.files().contains_key(nonce('a').as_bytes()));
+    }
+
+    /// Adds `count` live entries to the spool, `per_uid` to each uid from
+    /// `first_uid`, nonces counting up from `first_nonce`.
+    fn add_live(
+        (mut spool, mut host): (FakeSpool, FakePeer),
+        harness: bool,
+        count: usize,
+        per_uid: usize,
+        first_uid: u32,
+        first_nonce: usize,
+    ) -> (FakeSpool, FakePeer) {
+        for index in 0..count {
+            let pid = 50_000 + u32::try_from(first_nonce + index).unwrap();
+            let mut live = if harness {
+                harness_entry('b', pid)
+            } else {
+                entry('c', pid, 7, NOW + 100)
+            };
+            live.nonce = format!("{:064x}", first_nonce + index);
+            let uid = first_uid + u32::try_from(index.div_euclid(per_uid)).unwrap();
+            host = running(host, &live, uid, uid);
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        (spool, host)
+    }
+
+    #[test]
+    fn four_harness_entries_of_one_uid_leave_its_eighth_password_entry_free() {
+        // Uid 1000 holds 4 harness entries and 7 password entries. Counted in
+        // one bucket that is 11 against a limit of 8 and the mint would fail;
+        // each in its own bucket, the eighth password entry is the uid's last
+        // one and goes through.
+        let both = add_live(
+            (FakeSpool::new(), FakePeer::new()),
+            true,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            1000,
+            1,
+        );
+        let (spool, host) = add_live(
+            both,
+            false,
+            MAX_ENTRIES_PER_UID - 1,
+            MAX_ENTRIES_PER_UID,
+            1000,
+            100,
+        );
+        let eighth = entry('a', 4242, 5_000, NOW + 900);
+        publish_as_1000(&spool, &host, &eighth).unwrap();
+        assert!(spool.files().contains_key(eighth.nonce.as_bytes()));
+        // And the ninth is refused: the password limit still bites.
+        let host = running(host, &eighth, 1000, 1000);
+        let ninth = entry('d', 4243, 5_001, NOW + 900);
+        let refused = publish_as_1000(&spool, &host, &ninth).unwrap_err();
+        assert_eq!(
+            refused,
+            MintError::UidFull {
+                uid: 1000,
+                entries: MAX_ENTRIES_PER_UID
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_harness_bucket_leaves_the_sixty_fourth_password_entry_free() {
+        // 63 password entries and 16 harness entries. In one bucket that is 79
+        // against a limit of 64.
+        let passwords = add_live(
+            (FakeSpool::new(), FakePeer::new()),
+            false,
+            MAX_SPOOL_ENTRIES - 1,
+            MAX_ENTRIES_PER_UID,
+            2_000,
+            1,
+        );
+        let (spool, host) = add_live(
+            passwords,
+            true,
+            MAX_HARNESS_ENTRIES,
+            MAX_HARNESS_ENTRIES_PER_UID,
+            6_000,
+            100,
+        );
+        let last = entry('a', 4242, 5_000, NOW + 900);
+        publish_as_1000(&spool, &host, &last).unwrap();
+        assert!(spool.files().contains_key(last.nonce.as_bytes()));
+        // The sixty-fifth is refused.
+        let host = running(host, &last, 1000, 1000);
+        let over = entry('d', 4243, 5_001, NOW + 900);
+        assert!(matches!(
+            publish_as_1000(&spool, &host, &over),
+            Err(MintError::Full { entries, .. }) if entries == MAX_SPOOL_ENTRIES
+        ));
+    }
+
+    #[test]
+    fn the_harness_byte_limit_admits_exactly_the_limit_and_refuses_one_byte_over() {
+        let mut spool = FakeSpool::new();
+        let mut host = FakePeer::new();
+        let mut held = 0usize;
+        for index in 0..8u32 {
+            let mut live = harness_entry('b', 40_000 + index);
+            live.nonce = format!("{:064x}", index + 1);
+            live.argv = vec!["x".repeat(30_000)];
+            host = running(host, &live, 5_000 + index, 5_000 + index);
+            held += live.to_json().len();
+            spool = spool.with_file(live.nonce.clone(), live.to_json());
+        }
+        let sized = |extra: usize| {
+            let mut agent = harness_entry('a', 4242);
+            agent.argv = vec![String::new()];
+            let base = agent.to_json().len();
+            agent.argv = vec!["x".repeat(MAX_HARNESS_BYTES - held - base + extra)];
+            agent
+        };
+        let exact = sized(0);
+        assert_eq!(held + exact.to_json().len(), MAX_HARNESS_BYTES);
+        let over = sized(1);
+        assert_eq!(held + over.to_json().len(), MAX_HARNESS_BYTES + 1);
+        let refused = publish_as_1000(&spool, &host, &over).unwrap_err();
+        assert_eq!(
+            refused,
+            MintError::HarnessFull {
+                entries: 8,
+                bytes: held
+            }
+        );
+        publish_as_1000(&spool, &host, &exact).unwrap();
+    }
+
+    #[test]
+    fn every_harness_refusal_renders_a_sentence() {
+        for err in [
+            MintError::HarnessFull {
+                entries: 1,
+                bytes: 2,
+            },
+            MintError::HarnessUidFull {
+                uid: 1000,
+                entries: 4,
+            },
+        ] {
+            assert!(err.to_string().len() > 20, "{err:?}");
+        }
     }
 
     proptest! {

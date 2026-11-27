@@ -1,10 +1,13 @@
 backend      doas (<version>)
-backend caps 5 of 7 supported
+backend caps 4 of 7 supported
+             exempt: allocate pty (REQUIRED): doas never allocates a pty; accepted because the target is root
              absent: rejects argument wildcards
-             absent: persistent credential cache
+             unknown: persistent credential cache
 install      exit 0
 plan for     doas
 snippet      accepted by /usr/bin/doas -C /dev/stdin
+agent path   exit 19
+refused      the agent path is for sudo and sudo-rs only
 check        exit 0
 install real  installed, but NOT VERIFIED
 doctor      doas itself permits /usr/bin/env for you without a password, by /etc/doas.d/50-t.conf

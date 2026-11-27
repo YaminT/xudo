@@ -220,8 +220,9 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(output.stdout.trim(), "0");
     assert!(!entry_exists(&nonce));
 
-    // An ordinary user's thaw lifts only their own marker: root's global
-    // freeze stands, and the broker says done all the same.
+    // An unattested caller cannot thaw at all. In
+    // this container the peer's cgroup cannot be read, so the user is
+    // unattested and the thaw is refused (fail closed); root's marker stands.
     let as_user = |args: &[&str]| {
         Command::new("/usr/sbin/runuser")
             .args(["-u", USER, "--"])
@@ -232,7 +233,11 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
             .unwrap()
     };
     let thawed = as_user(&["thaw"]);
-    assert!(thawed.status.success(), "{thawed:?}");
+    assert!(!thawed.status.success(), "{thawed:?}");
+    assert!(
+        String::from_utf8_lossy(&thawed.stderr).contains("only a human can thaw"),
+        "{thawed:?}"
+    );
     assert!(marker.exists(), "a user's thaw lifted root's freeze");
 
     // A user's own freeze writes their own marker, which the gate reads for
@@ -261,8 +266,8 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), record);
     assert!(frozen_for(uid));
     assert!(!frozen_for(uid + 1));
-    assert!(as_user(&["thaw"]).status.success());
-    assert!(!theirs.exists());
+    assert!(!as_user(&["thaw"]).status.success());
+    assert!(theirs.exists(), "an unattested user's thaw lifted a marker");
     assert!(marker.exists());
     // Root's thaw clears every marker, a user's included.
     assert!(
@@ -277,6 +282,72 @@ fn the_root_lane_writes_reads_the_real_freeze_file_and_runs_the_gate() {
     assert!(!theirs.exists());
     assert!(!load().settings.frozen);
     remove_snippet();
+}
+
+/// The real files of the per-harness freeze: the gate's reader sees a root
+/// marker as frozen for that label alone, treats a marker that is not root's
+/// (owned by someone else, or a symlink) as frozen too, and root's thaw
+/// through the real broker lifts every harness marker.
+#[test]
+fn the_root_lane_reads_and_thaws_real_harness_freeze_markers() {
+    if !begin_root_test("the_root_lane_reads_and_thaws_real_harness_freeze_markers") {
+        return;
+    }
+    let _journal = install_everything();
+    start_broker();
+    let dir = Path::new("/var/lib/xudo");
+    let codex = dir.join("frozen-h-codex");
+    let claude = dir.join("frozen-h-claude");
+    for path in [&codex, &claude] {
+        let _ = fs::remove_file(path);
+    }
+    let _guards = [DeleteOnDrop(codex.clone()), DeleteOnDrop(claude.clone())];
+    let frozen =
+        |label: &str| xudo_gate::policy::harness_frozen(label, &xudo_sys::read_trusted_file);
+    assert!(!frozen("codex"));
+
+    let record = br#"{"reason":"reviewer","uid":2000,"time":1}"#;
+    root_file(codex.to_str().unwrap(), record, 0o600);
+    assert!(frozen("codex"));
+    assert!(!frozen("claude"), "codex's marker froze another label");
+
+    // A marker an unprivileged account owns is not root's word: frozen.
+    let user: u32 = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .args(["-u", USER])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    root_file(claude.to_str().unwrap(), record, 0o600);
+    chown(&claude, Some(user), None).unwrap();
+    assert!(frozen("claude"), "a marker not owned by root must freeze");
+    fs::remove_file(&claude).unwrap();
+    // A symlink in its place is refused by the walk, so it freezes as well.
+    std::os::unix::fs::symlink("/dev/null", &claude).unwrap();
+    assert!(frozen("claude"));
+    fs::remove_file(&claude).unwrap();
+    assert!(!frozen("claude"));
+    // A label that could name another path never reads one.
+    assert!(frozen("../frozen"));
+
+    // The agent's account cannot lift it: the broker takes no thaw from it,
+    // and root's thaw clears the marker.
+    let as_user = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--"])
+        .arg(xudo_binary())
+        .args(["--output", "json", "thaw"])
+        .output()
+        .unwrap();
+    assert!(!as_user.status.success(), "{as_user:?}");
+    assert!(codex.exists());
+    assert_eq!(ask_broker(xudo_wire::Question::Thaw).answer, Answer::Done);
+    assert!(!codex.exists());
+    assert!(!frozen("codex"));
 }
 
 fn root_dir(path: &str, mode: u32) {
@@ -406,6 +477,36 @@ fn write_entry_for(
     program: &str,
     argv: Vec<String>,
 ) -> String {
+    write_entry_as(
+        pin,
+        id_of(&["-u"]),
+        generation_offset,
+        action,
+        program,
+        argv,
+    )
+}
+
+/// [`write_entry_for`] for a pinned process running as `uid`.
+fn write_entry_as(
+    pin: (u32, u64),
+    uid: u32,
+    generation_offset: u64,
+    action: &str,
+    program: &str,
+    argv: Vec<String>,
+) -> String {
+    write_entry_edited(pin, uid, generation_offset, (action, program, argv), |_| {})
+}
+
+/// [`write_entry_as`], with `edit` applied to the entry before it is written.
+fn write_entry_edited(
+    pin: (u32, u64),
+    uid: u32,
+    generation_offset: u64,
+    (action, program, argv): (&str, &str, Vec<String>),
+    edit: impl FnOnce(&mut PendingRequest),
+) -> String {
     let nonce = format!(
         "{:064x}",
         (u128::from(std::process::id()) << 64)
@@ -428,7 +529,9 @@ fn write_entry_for(
         confirmed: false,
         confirmed_by: None,
         state: xudo_gate::request::ConfirmationState::Pending,
-        caller_uid: 1000,
+        // The pinned process is this test, and the gate now reads its uid from
+        // the live `/proc`, so the entry must name the uid the test runs as.
+        caller_uid: uid,
         caller_sid: 10,
         caller_tty: 20,
         needs_watch: false,
@@ -440,9 +543,12 @@ fn write_entry_for(
         attested_scope_id: None,
         boot_id: None,
         attested_harness: None,
+        via: xudo_gate::request::Via::Auth,
         queue_id: None,
         operation: None,
     };
+    let mut entry = entry;
+    edit(&mut entry);
     let path = format!("{SPOOL_DIR}/{nonce}");
     root_file(&path, entry.to_json().as_bytes(), 0o600);
     nonce
@@ -491,6 +597,292 @@ fn the_installed_snippet_reaches_the_gate_and_runs_as_uid_0() {
         journal.text().contains(ACTION),
         "the journal was sent nothing"
     );
+    remove_snippet();
+}
+
+const GATE_NOPASS: &str = "/usr/libexec/xudo/xudo-gate-nopass";
+const RATE_DIR: &str = "/run/xudo/rate";
+
+/// An agent that calls the passwordless door in a loop cannot fill the audit
+/// trail, and a human's password run still goes through afterwards.
+///
+/// The real `-nopass` file, as root, with nothing minted for it, two hundred
+/// times: each is a refusal, and each used to be an audit append. The ledger
+/// counts them first, so the trail holds the sixty the ceiling admits and the
+/// one record that says how many were left out. Then a human runs a command
+/// through the real `sudo` and the password prompt, and it runs as uid 0, and
+/// the trail takes its record.
+#[test]
+fn an_agent_flood_leaves_the_human_path_running() {
+    if !begin_root_test("an_agent_flood_leaves_the_human_path_running") {
+        return;
+    }
+    let _journal = install_everything();
+    let _ = fs::remove_file(GATE_NOPASS);
+    fs::copy(GATE, GATE_NOPASS).unwrap();
+    fs::set_permissions(GATE_NOPASS, Permissions::from_mode(0o755)).unwrap();
+    chown(GATE_NOPASS, Some(0), Some(0)).unwrap();
+    root_dir(RATE_DIR, 0o700);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let mut last = String::new();
+    for _ in 0..200 {
+        let output = Command::new(GATE_NOPASS).output().unwrap();
+        assert_eq!(output.status.code(), Some(19), "{output:?}");
+        assert!(output.stdout.is_empty());
+        last = String::from_utf8(output.stderr).unwrap();
+    }
+    assert!(last.contains("gate_rate_ceiling"), "{last}");
+
+    // The trail holds sixty refusals and one report, not two hundred.
+    let log = fs::read_to_string(AUDIT_LOG).unwrap();
+    let lines = log.lines().count();
+    assert!(lines <= 61, "{lines} records for 200 refusals");
+    assert_eq!(log.matches("suppressed=").count(), 1, "{log}");
+    // And the ledger is a whole file, root's, private.
+    let ledgers: Vec<_> = fs::read_dir(RATE_DIR)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    // One ledger and its own key lock, both root's and private.
+    assert_eq!(ledgers.len(), 2, "{ledgers:?}");
+    for path in &ledgers {
+        let meta = fs::metadata(path).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o777), (0, 0o600), "{path:?}");
+    }
+    let ledgers: Vec<_> = ledgers
+        .into_iter()
+        .filter(|path| path.extension().is_none_or(|ext| ext != "lock"))
+        .collect();
+    assert_eq!(ledgers.len(), 1, "{ledgers:?}");
+    let meta = fs::metadata(&ledgers[0]).unwrap();
+    assert_eq!((meta.uid(), meta.mode() & 0o777), (0, 0o600));
+    assert!(
+        fs::read_to_string(&ledgers[0])
+            .unwrap()
+            .starts_with("xudo-rate 1\n")
+    );
+
+    // The human path, untouched: a password run still reaches the exec.
+    let nonce = write_entry(own_pin(), 0);
+    let output = through_sudo();
+    assert!(output.success, "{output:?}");
+    assert_eq!(output.stdout.trim(), "0", "{output:?}");
+    assert!(!entry_exists(&nonce), "the entry was not consumed");
+    let after = fs::read_to_string(AUDIT_LOG).unwrap();
+    assert!(after.lines().count() > lines, "the trail took no record");
+    assert!(after.contains("/usr/bin/id"), "{after}");
+
+    let _ = fs::remove_file(GATE_NOPASS);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    remove_snippet();
+}
+
+const G1E_TREE: &str = "/var/lib/xudo-g1e-nopass";
+const G1E_RULES: &str = "/etc/xudo/rules.d/50-g1e-remove.toml";
+/// A `NOPASSWD` line for the `-nopass` file. It exists only here, in this
+/// throwaway container, and is removed when the test ends: the package and
+/// every install path ship none (`the_package_ships_no_nopasswd_line`).
+const LANE_ONLY_NOPASS_SUDOERS: &str = "/etc/sudoers.d/xudo-g1e-lane-only";
+
+/// `sudo -n` on the `-nopass` file, as the unprivileged account.
+fn through_sudo_n_nopass() -> xudo_sys::Output {
+    run_capture(
+        "/usr/sbin/runuser",
+        &["-u", USER, "--", "/usr/bin/sudo", "-n", GATE_NOPASS],
+        None,
+    )
+    .unwrap()
+}
+
+/// A remove-path entry for `target`, pinned to this test, minted for `via`.
+/// A `harness` entry carries the attestation the broker would have stored for
+/// a `codex` scope.
+fn write_remove_entry(target: &str, via: xudo_gate::request::Via) -> String {
+    write_entry_edited(
+        own_pin(),
+        id_of(&["-u"]),
+        0,
+        (
+            "lane.g1e-clean",
+            xudo_wire::OPERATION_PROGRAM,
+            vec![target.to_owned()],
+        ),
+        |entry| {
+            entry.via = via;
+            entry.operation = Some(xudo_gate::request::RequestedOp {
+                op: "remove-path".to_owned(),
+                target: target.as_bytes().to_vec(),
+                dry_run: false,
+            });
+            if via == xudo_gate::request::Via::Harness {
+                entry.attested_class =
+                    xudo_gate::request::AttestedClass::EnrolledAgent { scope_id: 4242 };
+                entry.attested_scope_id = Some(4242);
+                entry.boot_id = Some(
+                    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                        .unwrap()
+                        .trim()
+                        .to_owned(),
+                );
+                entry.attested_harness = Some("codex".to_owned());
+            }
+        },
+    )
+}
+
+/// A remove-path the rule grants to `codex`, through the real `-nopass` file
+/// and a real `sudo -n` that a lane-only `NOPASSWD` line lets through without
+/// a password: the gate still removes nothing, because the kernel does not
+/// attest this caller as a live harness (no scope can be made in this
+/// container; the granted run is the systemd lane's, G1f). A password entry
+/// through `-nopass` is refused too. Then the same password entry through the
+/// password gate removes the file as uid 0, so the refusals are the gate's,
+/// not a broken setup.
+#[test]
+fn a_nopass_remove_path_needs_a_live_granted_harness_even_past_a_nopasswd_line() {
+    if !begin_root_test(
+        "a_nopass_remove_path_needs_a_live_granted_harness_even_past_a_nopasswd_line",
+    ) {
+        return;
+    }
+    let _journal = install_everything();
+    // No watcher on the human path, so the control needs only the password.
+    root_file(CONFIG_FILE, b"", 0o644);
+    let _ = fs::remove_file(GATE_NOPASS);
+    fs::copy(GATE, GATE_NOPASS).unwrap();
+    fs::set_permissions(GATE_NOPASS, Permissions::from_mode(0o755)).unwrap();
+    chown(GATE_NOPASS, Some(0), Some(0)).unwrap();
+    let _gate_guard = DeleteOnDrop(GATE_NOPASS.into());
+    root_dir(RATE_DIR, 0o700);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let _ = fs::remove_dir_all(G1E_TREE);
+    root_dir(G1E_TREE, 0o755);
+    let target = format!("{G1E_TREE}/cache");
+    root_file(&target, b"build output", 0o644);
+    let user = id_of(&["-u", USER]);
+    chown(&target, Some(user), Some(user)).unwrap();
+    root_file(
+        G1E_RULES,
+        format!(
+            "[[operation]]\nid = \"lane.g1e-clean\"\nop = \"remove-path\"\nunder = \"{G1E_TREE}\"\nrecursive = true\nmax-depth = 2\nmax-entries = 4\nowners = [\"{USER}\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n"
+        )
+        .as_bytes(),
+        0o644,
+    );
+    let _rules_guard = DeleteOnDrop(G1E_RULES.into());
+    root_file(
+        LANE_ONLY_NOPASS_SUDOERS,
+        format!("{USER} ALL=(root) NOPASSWD: {GATE_NOPASS} \"\"\n").as_bytes(),
+        0o440,
+    );
+    let _sudoers_guard = DeleteOnDrop(LANE_ONLY_NOPASS_SUDOERS.into());
+
+    // The line works: with nothing minted, `sudo -n` reaches the gate without a
+    // password, and the gate itself refuses.
+    let empty = through_sudo_n_nopass();
+    assert!(!empty.success);
+    assert!(
+        empty.stderr.contains("gate_no_pending_request"),
+        "sudo did not reach the gate: {empty:?}"
+    );
+
+    // A harness entry, for a caller the kernel does not attest as one.
+    let harness = write_remove_entry(&target, xudo_gate::request::Via::Harness);
+    let refused = through_sudo_n_nopass();
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.stderr.contains("gate_mode_not_an_enrolled_agent"),
+        "{refused:?}"
+    );
+    assert!(Path::new(&target).exists(), "the walk ran under -nopass");
+    assert!(entry_exists(&harness), "a refused entry was consumed");
+    clear_spool();
+
+    // A password entry through the passwordless file.
+    let password = write_remove_entry(&target, xudo_gate::request::Via::Auth);
+    let wrong = through_sudo_n_nopass();
+    assert!(!wrong.success, "{wrong:?}");
+    assert!(wrong.stderr.contains("gate_mode_wrong_via"), "{wrong:?}");
+    assert!(Path::new(&target).exists());
+    assert!(entry_exists(&password));
+
+    // The control: the same entry through the password gate, with the password.
+    let ran = through_sudo();
+    assert!(ran.success, "{ran:?}");
+    assert!(
+        !Path::new(&target).exists(),
+        "the password path removed nothing"
+    );
+    assert!(Path::new(G1E_TREE).exists(), "the tree root was removed");
+    assert!(!entry_exists(&password));
+    let log = fs::read_to_string(AUDIT_LOG).unwrap();
+    assert!(log.contains("via=auth"), "{log}");
+
+    let _ = fs::remove_dir_all(G1E_TREE);
+    for entry in fs::read_dir(RATE_DIR).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    remove_snippet();
+}
+
+/// The production shape: the pinned process is the unprivileged user's own,
+/// and it execs setuid `sudo`, whose real uid stays the user's. The gate must
+/// read that real uid as the caller's, not uid 0 and not the test's.
+#[test]
+fn a_pinned_non_root_process_that_execs_sudo_is_read_as_its_real_uid() {
+    if !begin_root_test("a_pinned_non_root_process_that_execs_sudo_is_read_as_its_real_uid") {
+        return;
+    }
+    let _journal = install_everything();
+    let user_uid = id_of(&["-u", USER]);
+    assert_ne!(user_uid, 0);
+
+    // The shell prints its own pid, waits to be pinned, then becomes `sudo`
+    // (the same pid, so the pin stays valid and `sudo` is its image).
+    let script = format!("echo $$; read go; exec /usr/bin/sudo -S {GATE_AUTH}");
+    let mut child = Command::new("/usr/sbin/runuser")
+        .args(["-u", USER, "--", "/bin/sh", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut first).unwrap();
+    let pid: u32 = first.trim().parse().unwrap();
+    let proc = VerifiedProc::open().unwrap();
+    let chain = lineage(&proc, pid, 1).unwrap().chain;
+    let pin = (chain[0].pid, chain[0].starttime);
+    let nonce = write_entry_as(
+        pin,
+        user_uid,
+        0,
+        ACTION,
+        "/usr/bin/id",
+        vec!["-u".to_owned()],
+    );
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(format!("go\n{PASSWORD}\n").as_bytes())
+        .unwrap();
+    drop(stdin);
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(status.success(), "{rest:?} {status:?}");
+    assert_eq!(rest.trim(), "0", "id -u did not run as root: {rest:?}");
+    assert!(!entry_exists(&nonce), "the entry was not consumed");
     remove_snippet();
 }
 

@@ -74,7 +74,25 @@ xudo \- decide whether a privileged command runs as root
 .RB [ \-\-dry\-run ]
 .RB [ \-\-show\-contents ]
 .RB [ \-\-uninstall ]
+.RB [ \-\-agent\-path
+.RB [ \-\-raise\-ptrace\-scope ]]
 .RB [ options ]
+.br
+.B xudo agent enrol
+.I label
+.B \-\-account
+.I name
+.BR \-\-reviewer
+.I name
+.RB [ \-\-dry\-run ]
+.B \-\-
+.I program
+.RI [ argument ...]
+.br
+.B xudo agent list
+.br
+.B xudo agent remove
+.I label
 .br
 .B xudo audit
 .RB [ \-\-log
@@ -87,16 +105,6 @@ xudo \- decide whether a privileged command runs as root
 .IR harness ]
 .RB [ options ]
 .br
-.B xudo pending
-.br
-.B xudo watch
-.br
-.B xudo freeze
-.B \-\-reason
-.I text
-.br
-.B xudo thaw
-.br
 .B xudo help
 .RI [ command ]
 .SH DESCRIPTION
@@ -108,12 +116,30 @@ runs an allowed command as root through the host's
 or
 .BR doas ,
 which asks for your password.
-This beta is that password path only.
-The passwordless agent path is not built: the package has no
+For an enrolled harness that a rule grants, the broker mints the entry for
 .B xudo\-gate\-nopass
-and installs no
+instead, and
+.B xudo
+runs
+.B sudo \-n
+on it: sudo never asks a password there, it refuses.
+Neither the package nor a plain
+.B xudo install
+writes a
 .B NOPASSWD
-rule.
+rule naming that file, so out of the box every such run is refused with
+"a password is required", and
+.B xudo
+says the passwordless agent path is not installed.
+Only
+.B sudo xudo install \-\-agent\-path
+turns it on (see
+.BR install ).
+It never retries with a password, and it refuses that path under
+.BR doas .
+A service harness that no rule grants is refused with
+.B harness_not_granted
+and exit status 17: it has no password to type.
 .PP
 This release is a beta and has not been externally audited.
 .SH OPTIONS
@@ -173,7 +199,12 @@ Executes nothing.
 .TP
 .B op
 Run a typed operation as root, if a rule permits it.
-Asks for your password through the host backend.
+Asks for your password through the host backend, except for an enrolled
+harness the rule grants, which runs it through
+.B xudo\-gate\-nopass
+as
+.B xudo exec
+does.
 .B remove\-path
 .I target
 removes
@@ -185,13 +216,13 @@ It does not run
 .BR rm .
 .B \-\-dry\-run
 lists the paths and removes nothing.
-A
+See
+.BR xudo\-rules (5)
+for the
 .B harness
-label on the rule is parsed and checked against the registry.
-It is not a grant.
-Harness use is not built yet.
-This command uses the password path only.
-The passwordless gate is not in this release.
+and
+.B outcome
+keys.
 .TP
 .B exec
 Run the command as root, if the broker permits it.
@@ -203,7 +234,7 @@ A policy refusal happens before the command runs.
 .IP
 Human-path denials are not written to the invoking user's
 .BR ido (1)
-queue. A registered agent's request matched by an
+queue. A verified harness request matched by an
 .B ask-human
 rule is stored by the broker in its root-held queue.
 .B xudo exec \-\-queued
@@ -211,7 +242,7 @@ rule is stored by the broker in its root-held queue.
 claims that entry for a fresh decision against the current rules. The stored
 working directory is not used; the command runs in
 .BR / .
-Only a caller classified as human, named in the harness entry's reviewers, and not the entry's owner can claim it. The run uses
+Only a human reviewer who does not own the entry can claim it. The run uses
 the same scoped sudo rule as any other xudo authorization, so sudo asks for
 the password. Its
 .B timestamp_timeout=0
@@ -219,7 +250,7 @@ setting prevents it from reusing a sudo credential cached by an earlier
 terminal login; the backend tests pin this setting in the generated rule.
 The entry is marked done only after the gate's audit record for that run.
 A denied password releases the claim back to pending. A rules change after
-queueing denies the run. No caller can be a registered agent in this release (nothing creates an agent scope), so the root-held queue stays empty. The passwordless gate is not installed.
+queueing denies the run. A queued run never uses the passwordless gate.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
@@ -238,9 +269,6 @@ each pending update is one compact JSON object per line (JSON Lines).
 .TP
 .B watch
 Watch for pending confirmation requests on this terminal.
-This is an optional extra check for a person on the human path, turned on by
-.BR confirm_human_path ;
-it is not how agents are approved.
 The broker checks the watcher's session and terminal on each heartbeat and
 answer. A line shows the canonical command, governing rule, classification,
 evidence, time left, and the action's final word. Type that word to approve,
@@ -260,18 +288,32 @@ Freeze the agent path with an operator supplied reason. The scope is the
 caller's. A user's freeze stops only that user's own agents: it writes a
 marker named by the user's uid, and root's global freeze is untouched.
 Root's freeze is global and stops every user's agents. An attested agent
-cannot freeze, and neither can a peer in another user namespace. Until agents can be registered, this sets the flag but changes nothing for new
-requests: no caller is a registered agent, and the password path stays
-available. A pending request from a registered agent in the freezer's scope
-(every user's, for root) would be denied and audited; a human's pending
-request is left alone.
+cannot freeze, and neither can a peer in another user namespace. Until the
+passwordless agent path ships this sets the flag but changes nothing for new
+requests or for human requests: every caller is unattested, and the human password path
+stays available. Pending or approved requests of an enrolled agent in the
+freezer's scope (every user's, for root) are denied and audited, without a
+backoff strike; a human's pending request is left alone.
 .TP
 .B thaw
 Lift the caller's own freeze and resume that scope. A user's thaw removes only
 the marker for their own uid: root's global freeze stays in force, and so does
 every other user's, until root lifts it. Root's thaw lifts the global freeze
-and every user's marker. An attested agent cannot thaw, and neither can a peer
-in another user namespace. Run it as the user who froze; do not run it as
+and every user's marker. A non-root thaw is refused for an attested agent, an unattested caller, a
+peer in another user namespace, and any caller whose uid is the account or a
+user of a registered harness: being outside an agent scope does not prove a
+human, because an agent can start a process outside its scope as its own uid.
+Those users run
+.B sudo xudo thaw
+instead, which reaches the broker as root and lifts ALL freezes: the global one and every user's marker. If /etc/passwd is missing or empty (stray non-UTF-8 bytes in it are read lossily), every
+xudo request refuses; this only withholds, and root can
+.B touch /var/lib/xudo/frozen
+to freeze or remove it to thaw. If the harness registry cannot be loaded, the
+rules still decide the human path, no harness is armed, and only
+.B sudo xudo thaw
+lifts a freeze, since no uid can be ruled out as an agent's. A thaw that needs a password proof for ordinary
+users arrives with the passwordless gate. A user who is not a harness uid runs
+it as themselves; do not run it as
 .B sudo
 to clear a user's freeze unless root's global freeze should go as well.
 .TP
@@ -287,8 +329,6 @@ An action that allowlists an executable the compiled-in deny-list refuses is a
 lint error.
 A systemctl rule that can start or stop a unit it does not name is a lint
 error too.
-An action with a harness key is a lint error when it uses path\-under or pattern, sets agent\-allowed = false, names a GTFOBins program without a waiver, or has no near\-miss deny test (JSON: harness_lints).
-Every path\-under matcher, and a [[deny]] rule no test names, is a lint warning.
 In the JSON envelope both sit under
 .BR lint :
 deny-list hits in
@@ -434,15 +474,116 @@ The keys are
 (default true), and
 .BR use_pty ,
 which is compiled in as true and is refused if set.
-When
-.B confirm_human_path
-is on, a rule that requires confirmation also requires an approval in
-.BR "xudo watch" ;
-the password alone does not satisfy it.
-It applies to the human path only.
+When enabled, a rule that requires confirmation also requires an out-of-band
+watch approval; the password alone does not satisfy it.
 The command marks security-relevant settings and says they are never
 settable from the environment.
 This binary does not read the environment for them.
+.TP
+.B agent
+Enrol, list or remove a harness that runs headless as its own account.
+.B enrol
+and
+.B remove
+need root, like
+.BR install .
+.B enrol
+prints the three files it will write, then writes a registry entry in
+.IR /etc/xudo/harnesses.d ,
+a systemd drop-in that sets
+.B User=
+and
+.B ExecStart=
+for
+.IR xudo\-agent@label.service ,
+and an empty environment file in
+.I /etc/xudo/agents
+(mode 0600, root, never replaced), then adds the account to the groups
+.B xudo
+and
+.B xudo\-agent
+(creating a group that does not exist, and only adding a member to one that
+does) as its last write, and enables the unit.
+The program is an absolute path and is written quoted, with
+.B %
+and
+.B $
+doubled, so nothing in it is expanded by systemd.
+It refuses an account that is root, has a usable password, is in
+.BR sudo ,
+.BR wheel ,
+.BR root ,
+.BR docker ,
+.BR lxd ,
+.BR incus ,
+.BR libvirt ,
+.BR disk ,
+.BR shadow ,
+.B adm
+or
+.BR systemd\-journal ,
+that the scan of other paths to root finds a sudo or doas rule for (the one
+exemption is
+.I /etc/sudoers.d/xudo
+when it holds, byte for byte, the passwordless snippet xudo itself writes; any
+other line naming
+.BR %xudo\-agent ,
+the account or the passwordless helper is a refusal), that is
+already used by another harness, or that is its own reviewer; a drop-in
+directory for the label that is not root's or is not empty; and a unit whose
+.B User=
+systemd does not report as the account.
+It also refuses, naming the file and line, when sudo's PAM
+.B auth
+stack is not one it recognizes: the account joins
+.BR xudo ,
+so the password prompt is all that stands in its way.
+It reads
+.IR /etc/pam.d/sudo ,
+.I sudo\-i
+and, where libpam would,
+.IR other ,
+with every file they include, as libpam does.
+Each
+.B auth
+line must be a stock form on a stock module
+.RB ( pam_unix ,
+.BR pam_deny ,
+.B pam_permit
+after a
+.BR "requisite pam_deny" ,
+.BR pam_env ,
+.BR pam_faildelay ,
+.BR pam_usertype ,
+.B pam_succeed_if
+and a few others), and no path through the stack may pass when
+.B pam_unix
+does not.
+The stock Debian, Ubuntu and RHEL stacks pass this check.
+Anything else, such as
+.BR pam_u2f ,
+.BR pam_sss ,
+.B pam_systemd_home
+or a bracket control of the operator's own, makes it refuse.
+It grants nothing: no rule names the harness, so every command it asks for
+still asks for the sudo password.
+On a machine whose escalator is doas it refuses: the agent path is sudo and
+sudo\-rs only.
+.B \-\-dry\-run
+prints the files and writes nothing.
+.B list
+shows each enrolled agent and whether its unit is active.
+.B remove
+stops the unit (its own stop hook voids the record), removes the drop-in and
+then the registry entry, and keeps the environment file, which may hold
+credentials.
+It also takes the account out of the groups
+.B enrol
+itself added it to (the registry entry records them), leaves any group an
+operator had it in, and never deletes a group.
+.B xudo doctor
+runs the account checks again for every registry entry and reports an enrolled
+account that has since gained a way to root.
 .TP
 .B install
 Integrate xudo with the local
@@ -459,7 +600,16 @@ prints the plan and changes nothing.
 prints the file each step would write.
 .B \-\-uninstall
 removes what an install wrote, for both backends, and nothing else.
-The rules this build would install all require a password.
+On doas, which uses the last rule that matches, an install refuses (exit 19)
+when a rule after xudo's own gives the xudo group
+.BR nopass ,
+and warns when it gives
+.BR persist .
+It can only see xudo's rule once installed, so the first install is checked by
+.BR "xudo doctor" .
+Without
+.B \-\-agent\-path
+every rule it installs requires a password.
 An install is reported as verified only when the broker minted a request for
 .BR "id -u" ,
 the gate ran through the backend and printed
@@ -469,6 +619,95 @@ Anything less keeps the validated files, says
 .BR "NOT VERIFIED" ,
 and exits
 .BR 19 .
+.IP
+.B Turn on the agent path.
+.B sudo xudo install \-\-agent\-path
+is the opt-in, for sudo and sudo-rs only (doas is refused).
+It writes the same file plus one line,
+.BR "%xudo\-agent ALL=(root) NOPASSWD: XUDO_NOPASS" ,
+where
+.B XUDO_NOPASS
+is
+.B /usr/libexec/xudo/xudo\-gate\-nopass
+with no arguments.
+That helper runs a command only when the kernel attests a registered harness
+and a root-written rule grants that harness that command.
+Before it writes anything it runs the helper through
+.B sudo \-n
+as a caller it cannot attest, and stops unless the helper refuses.
+It also stops, naming the line, when any other sudo or doas line names the
+group
+.BR xudo\-agent ,
+one of the aliases
+.BR XUDO_NOPASS ,
+.B XUDO_AUTH
+or
+.BR XUDO_SELF ,
+a path under
+.I /usr/libexec/xudo
+or a wildcard that reaches the helper, or an include it cannot follow.
+It stops when the helper or a directory above it is not root's, is writable
+by its group or by everyone, or is a symbolic link, or the helper has a second
+name; and when an account is in
+.B xudo\-agent
+(listed, or by its primary group) that is not the account of a service-way
+harness in the registry, the only accounts enrol adds to it; and when
+.I /etc/passwd
+holds no
+.B nobody
+or no such member, since the checks below ask about them.
+It never replaces
+.I /etc/sudoers.d/xudo
+when that file names the agent path but is not byte for byte xudo's text, and
+it checks for edits before it creates a group.
+After the rename it runs
+.B visudo \-c \-f /etc/sudoers
+on the whole configuration and asks the backend
+.RB ( "sudo \-l \-U" )
+that the helper is listed for
+.B root
+(the control that shows the listing works), and is not listed for
+.BR nobody ,
+nor with an argument for a member of the group.
+A listing counts only when the backend prints nothing on standard error.
+Any of those failing or getting no answer, or a functional probe that runs and
+fails, puts back what the install replaced and exits
+.BR 19 .
+When what was there cannot be put back, the new file is removed instead; when
+it cannot be removed either, the message says the line may be live and names
+the file to remove.
+Only a functional probe that cannot run here is reported on a
+.B could not verify:
+line, and the install exits 0.
+A plain
+.B xudo install
+(which a package upgrade runs) writes the human-only file again and turns the
+agent path off;
+.B xudo install \-\-uninstall
+removes it with everything else, and refuses to remove an edited
+.IR /etc/sudoers.d/xudo .
+.B xudo doctor
+says whether the agent path is on and whether its text is exact.
+.IP
+On a host at
+.BR kernel.yama.ptrace_scope=0 ,
+any process of a uid can read what is typed in that uid's other processes.
+With a session-way harness registered,
+.B \-\-agent\-path
+says so and names
+.BR \-\-raise\-ptrace\-scope ,
+which prints the diff and writes
+.I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
+setting it to 1.
+That file is written only with the flag and only while the live value is 0,
+so it never lowers a higher value.
+xudo does not apply it: it takes effect with
+.B sudo sysctl \-\-system
+or at boot, and only when no file read after it sets the value; the install
+warns about each such line.
+.B \-\-uninstall
+removes it, after the sudoers file, and leaves it with a warning when it was
+edited.
 .TP
 .B audit
 Verify that a hash-chained log has not been edited in place.
@@ -487,6 +726,93 @@ A damaged log exits
 .BR 17 .
 A log that cannot be read, or a journal check that cannot run, exits
 .BR 19 .
+.TP
+.B rules
+Check, install, list or remove a rule pack: one rule file with a
+.B [pack]
+header (see
+.BR xudo\-rules (5)).
+.B rules add
+.I file
+runs as you and writes nothing: it loads the installed rules with the pack,
+runs every
+.B [[test]]
+table, requires a near-miss deny test for every harness action, refuses a
+harness nobody registered and every lint error
+.B xudo check
+reports, then prints what each harness, the password path and everyone gain
+and lose: every setting of a rule that widens access, a
+.B [[deny]]
+rule that goes as a gain, a lost rule that still overlaps another as
+.IR "may widen" ,
+what the engine decides differently for the commands the rules' tests and
+examples name, every
+.B gtfobins\-waiver
+in the pack, and the lint warnings it adds.
+A harness that keeps a rule on the program a lost rule covered gets a
+.I "may widen"
+line of its own, because the engine applies the strictest of every rule that
+accepts a command.
+At most 64 engine lines are printed, gains first, and the rest are counted.
+A pack with more than 256 actions, operations and deny rules, or rules whose
+review would ask the engine too much, is refused as too large to review; root
+applies the same bounds.
+It ends with a token that binds the pack's bytes,
+.B \-\-allow\-waivers
+and the generation of the rules and harness registry it judged.
+Any failure refuses the pack, and so does a waiver without
+.BR \-\-allow\-waivers .
+.B sudo xudo rules add \-\-reviewed
+.I token file
+installs it: as root, after sudo's own prompt, it refuses a process inside
+.B xudo.slice
+or under an ancestor below pid 1 that is, a cgroup namespace other than pid
+1's and a bare
+.B /
+on the unified
+.B 0::
+cgroup line, takes a lock on the rules directory, checks everything again from
+root's own reading of
+.IR /etc/xudo ,
+refuses unless the token it computes is the reviewed one (the same
+.B \-\-allow\-waivers
+is needed), and renames the pack into
+.IR /etc/xudo/rules.d/pack\-name.toml
+(root:root 0644, starting with xudo's rule-pack marker).
+It never replaces a file xudo did not write.
+The real boundary is that an enrolled harness account has no password, so it
+cannot answer sudo's prompt: run every harness as an account of its own
+.RB ( "xudo agent enrol" ).
+The drop-in xudo installs sets
+.B timestamp_timeout=0
+for
+.I /usr/bin/xudo
+itself, but that is a speed bump, not a wall: a harness that shares your
+account and terminal can ride a warm sudo ticket through
+.BR "sudo env xudo" ,
+.B sudo \-s
+or a copy of the binary.
+If a harness must share your account, give it a terminal of its own, so the
+ticket (per terminal by default,
+.BR timestamp_type=tty )
+is not yours.
+When the drop-in predates that line, root says so after the change and does
+not block it; reinstall the drop-in with
+.BR "sudo xudo install" .
+.B rules list
+shows each pack and whether
+.B rules add
+installed it.
+.B rules remove
+.I name
+works the same way: as you it prints what the removal changes and a token,
+and
+.B sudo xudo rules remove \-\-reviewed
+.I token name
+removes only a pack
+.B rules add
+installed, only if the rules left still pass and the token still matches.
+Nothing is fetched and nothing updates itself.
 .TP
 .B agentdoc
 Print the block that tells an agent what the loaded rules permit.
@@ -530,11 +856,12 @@ that could not be read, or a status that does not fit in a byte.
 .TP
 .B 20
 .B check
-found a lint warning (overlapping actions, a path\-under matcher, an untested deny rule), and nothing worse.
+found a lint warning, and nothing worse.
 .TP
 .B 21
 .B check
-found a lint error: a deny\-listed executable, an open systemctl unit, a harness\-rule lint, or a \-\-fuzz finding.
+found a lint error: an action allowlists an executable the deny-list refuses,
+or a systemctl rule can start or stop a unit it does not name.
 .TP
 .B 22
 .B check
@@ -575,18 +902,6 @@ group
 .I /var/lib/xudo/audit.jsonl
 The hash-chained audit log the broker and the gate append to.
 .TP
-.I /etc/xudo/harnesses.d/
-Agent registrations, one <label>.toml each; empty as shipped.
-.TP
-.I /var/lib/xudo/queue/
-The root-held review queue.
-.TP
-.I /usr/libexec/xudo/xudo\-gate\-auth
-The password-authenticated gate, run by sudo.
-.TP
-.I /usr/libexec/xudo/xudod
-The broker.
-.TP
 .I /etc/sudoers.d/xudo
 Written by
 .BR "xudo install" ,
@@ -596,6 +911,17 @@ Not shipped in the package.
 The name has no dot and no trailing tilde, which
 .B sudo
 would ignore.
+Holds one
+.B NOPASSWD
+line only after
+.BR "xudo install \-\-agent\-path" .
+.TP
+.I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
+Written only by
+.BR "xudo install \-\-agent\-path \-\-raise\-ptrace\-scope" ;
+sets
+.B kernel.yama.ptrace_scope
+to 1.
 .TP
 .I /usr/lib/systemd/system/xudod.socket
 .TQ
@@ -618,17 +944,53 @@ the command line,
 .BR /proc/ pid /exe ,
 and process ancestry are unauthenticated hints.
 They are recorded.
+The broker and the gate write the requester's
+.BR comm ,
+.B exe
+path (at most 1024 bytes), a summary of its command line, and whether it set
+.B CLAUDECODE
+into every audit record as
+.BR hint_comm ,
+.BR hint_exe ,
+.B hint_cmdline
+and
+.BR hint_claudecode ,
+escaped and quoted, or
+.B unavailable
+when they could not be read from the pinned process.
+Of the command line only
+.BR argv[0] ,
+the argument count and the length are recorded, never an argument and no
+digest of one, so a password on a command line is not copied to the audit
+trail or the journal, for example
+.BR "hint_cmdline=argv0:\(dq/usr/bin/sudo\(dq argc:3 len:41" .
+.B argv[0]
+is whatever the caller made it, cut at 256 bytes: a process that rewrote
+its title as one string records that whole string there.
+Of the environment only
+.BR CLAUDECODE 's
+presence is recorded:
+.BR unset ,
+.B set:\(dq1\(dq
+when it is exactly 1, or
+.BI set:other(len= N )
+for any other value.
+Both files are looked at in their first 64 KiB only, and the broker reads
+no more of them than that; a
+.B +
+after the count or the length marks a longer command line.
+The broker runs without capabilities, so the kernel shows it another
+user's command line but not its
+.B exe
+or environment; its records carry those two as
+.BR unavailable ,
+and the gate, which runs as root, records them.
 Authorization does not branch on them.
-A command runs without a password only for a caller the kernel shows is
-inside a harness scope root registered, and only when a root-written rule
-allows that exact command for that harness.
-No caller is such a harness in this release, so every caller takes the human path and is asked for a password.
-Misclassification may only withhold: a caller that is not recognized
-takes the human path or is denied.
+An unattested caller takes the human path and is asked for a password.
 .PP
-A request that needs a person never resolves by itself.
-The person's answer is never read from the requester's standard input,
-standard output, or terminal; with no person to answer, it does not run.
+Confirmation is not read from the requester's standard input, standard
+output, or terminal.
+No live confirmation channel means deny.
 .PP
 This beta has not been externally audited.
 .SH SEE ALSO

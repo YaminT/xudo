@@ -51,6 +51,7 @@ pub mod queue;
 pub mod record;
 pub mod refusal;
 pub mod serve;
+pub mod unit_record;
 
 /// Parser entry points exposed only to the separate fuzz crate.
 #[cfg(feature = "fuzzing")]
@@ -68,7 +69,7 @@ use xudo_sys::{
 };
 use xudo_wire::RefusalCode;
 
-pub use identify::{Fault, IdentifyError, PeerIdentity, identify};
+pub use identify::{Fault, Identified, IdentifyError, PeerIdentity, identify};
 pub use policy::{HostPolicy, LoadedPolicy, PolicyError, PolicySource};
 pub use refusal::Refusal;
 pub use serve::{Platform, Served, UNUSABLE, serve};

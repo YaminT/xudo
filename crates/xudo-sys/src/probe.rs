@@ -6,6 +6,7 @@
 //! against a described machine rather than against whatever happens to be
 //! installed here.
 
+use std::io::Read;
 use std::path::Path;
 
 use xudo_backend::Probe;
@@ -33,6 +34,13 @@ impl Probe for HostProbe {
 
     fn directory_exists(&self, absolute_path: &str) -> bool {
         Path::new(absolute_path).is_absolute() && Path::new(absolute_path).is_dir()
+    }
+
+    fn doas_reads_drop_ins(&self, absolute_path: &str) -> bool {
+        // The build names the directory in its own executable or it does not
+        // read it. Anything unreadable answers `false`, the append path.
+        Path::new(absolute_path).is_absolute()
+            && std::fs::File::open(absolute_path).is_ok_and(names_doas_d)
     }
 
     fn honours_directive(&self, absolute_path: &str, directive: &str) -> bool {
@@ -65,6 +73,21 @@ impl Probe for HostProbe {
         accepts_wildcard_with(&HostRunner, absolute_path)
     }
 }
+
+/// The most of an executable looked at for the directory's name.
+const SCAN_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Whether the bytes of an executable contain the doas drop-in directory.
+fn names_doas_d(reader: impl Read) -> bool {
+    let mut bytes = Vec::new();
+    reader.take(SCAN_LIMIT).read_to_end(&mut bytes).is_ok()
+        && bytes
+            .windows(DOAS_DIR_NAME.len())
+            .any(|window| window == DOAS_DIR_NAME)
+}
+
+/// What a doas that reads its drop-in directory has in its binary.
+const DOAS_DIR_NAME: &[u8] = b"/etc/doas.d";
 
 /// The validator for a sudo-family backend, and how it takes a file.
 ///
@@ -532,6 +555,34 @@ mod tests {
             "/usr/bin/sudo",
             "use_pty"
         ));
+    }
+
+    /// A reader whose every read fails.
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("broken"))
+        }
+    }
+
+    #[test]
+    fn a_doas_reads_its_drop_in_directory_only_if_its_binary_names_it() {
+        assert!(names_doas_d(&b"\x7fELF..\0/etc/doas.d\0.."[..]));
+        assert!(!names_doas_d(&b"\x7fELF../etc/doas.conf"[..]));
+        assert!(!names_doas_d(&b""[..]));
+        // A read that fails answers no.
+        assert!(!names_doas_d(Broken));
+    }
+
+    #[test]
+    fn the_real_probe_reads_a_binary_a_missing_file_and_a_relative_path() {
+        let probe = HostProbe;
+        let me = std::env::current_exe().unwrap();
+        // This test binary carries the name, as the needle is in the library.
+        assert!(probe.doas_reads_drop_ins(me.to_str().unwrap()));
+        assert!(!probe.doas_reads_drop_ins(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")));
+        assert!(!probe.doas_reads_drop_ins("/definitely/not/here"));
+        assert!(!probe.doas_reads_drop_ins("Cargo.toml"));
     }
 
     #[test]

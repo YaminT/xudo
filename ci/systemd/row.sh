@@ -2,6 +2,10 @@
 # Inside a container whose PID 1 is systemd. Installs /opt/xudo.deb, drives
 # xudo exec on a pty (ci/differential/exec.exp, user xudotest), and removes it.
 # The unit files are the ones the package shipped. This script does not edit them.
+# grant.sh, sourced near the end, proves the passwordless grant through a live
+# enrolled unit; it alone writes a NOPASSWD line, and deletes it again. It
+# sources attack.sh, E7's rows that try every way around that grant. e2e.sh,
+# sourced last, walks an operator's whole journey with the real installer.
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -406,16 +410,10 @@ else
     cat /var/tmp/freeze.out >&2
 fi
 clear_confirm freeze_approve none
-set +e
-su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
-rc=$?
-set -e
-if [ "$rc" -eq 0 ] && [ -f "$frozen" ]; then
-    good "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc)"
-else
-    bad "a_users_thaw_cannot_lift_roots_global_freeze (rc=$rc, frozen file: $([ -f "$frozen" ] && echo present || echo gone))"
-    cat /var/tmp/nonroot-thaw.out >&2
-fi
+# Only a positively human, non-harness caller may thaw, and only its own
+# marker. su gives xudotest a login session the broker attests as human, so
+# its thaw lifts frozen-<uid> and leaves root's global freeze in place; root's
+# thaw (what `sudo xudo thaw` runs) lifts every marker.
 user_frozen=/var/lib/xudo/frozen-$test_uid
 set +e
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/var/tmp/user-freeze.out 2>&1
@@ -428,14 +426,14 @@ else
     cat /var/tmp/user-freeze.out >&2
 fi
 set +e
-su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/user-thaw.out 2>&1
+su -s /bin/sh -c '/usr/bin/xudo thaw' xudotest >/var/tmp/nonroot-thaw.out 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && [ ! -e "$user_frozen" ] && [ -f "$frozen" ]; then
-    good "a_users_thaw_removes_only_their_own_marker"
+if [ "$rc" -eq 0 ] && [ -f "$frozen" ] && [ ! -e "$user_frozen" ]; then
+    good "a_human_users_thaw_lifts_only_their_own_marker (rc=$rc)"
 else
-    bad "a_users_thaw_removes_only_their_own_marker (rc=$rc)"
-    cat /var/tmp/user-thaw.out >&2
+    bad "a_human_users_thaw_lifts_only_their_own_marker (rc=$rc, global: $([ -f "$frozen" ] && echo present || echo gone), user: $([ -f "$user_frozen" ] && echo present || echo gone))"
+    cat /var/tmp/nonroot-thaw.out >&2
 fi
 su -s /bin/sh -c '/usr/bin/xudo freeze --reason "user scope"' xudotest >/dev/null 2>&1 || true
 if xudo thaw >/var/tmp/root-thaw.out 2>&1 && [ ! -e "$frozen" ] && [ ! -e "$user_frozen" ]; then
@@ -640,10 +638,110 @@ if [ -f /var/lib/xudo/audit.jsonl ]; then
     sed -n 's/.*\(detail=[^"]*\).*/\1/p' /var/lib/xudo/audit.jsonl
 fi
 
+# `xudo agent enrol` under the real systemd: the files it writes, the unit it
+# enables, the record the helper makes, `remove` undoing all of it, and an
+# enrolled agent's unit still running when the package is removed (prerm must
+# stop it and ExecStopPost must void its record).
+id xudoagent >/dev/null 2>&1 || useradd --system --no-create-home xudoagent
+enrol_agent() {
+    /usr/bin/xudo agent enrol t --account xudoagent --reviewer xudotest -- /bin/sleep 3600 \
+        >/var/tmp/agent-enrol.log 2>&1
+}
+if enrol_agent; then
+    good "xudo agent enrol t"
+else
+    bad "xudo agent enrol t"
+    cat /var/tmp/agent-enrol.log >&2
+fi
+if [ "$(systemctl show --property=User --value xudo-agent@t.service)" = xudoagent ]; then
+    good "xudo-agent@t runs as xudoagent"
+else
+    bad "xudo-agent@t does not run as xudoagent"
+fi
+if [ "$(systemctl is-enabled xudo-agent@t.service 2>&1 || true)" = enabled ]; then
+    good "xudo-agent@t enabled"
+else
+    bad "xudo-agent@t not enabled"
+fi
+# The record helper runs as ExecStartPre=+, so a started unit has its record.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e /run/xudo/sessions/svc-t ] && break
+    sleep 1
+done
+if [ -e /run/xudo/sessions/svc-t ] && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
+    good "xudo-agent@t started and its record exists"
+else
+    bad "xudo-agent@t did not start with a record"
+    journalctl -u xudo-agent@t --no-pager -n 20 >&2 || true
+fi
+modes=$(stat -c '%U:%G %a' /etc/xudo/harnesses.d/t.toml /etc/xudo/agents/t.env /etc/xudo/agents)
+expected=$(printf 'root:root 644\nroot:root 600\nroot:root 700')
+if [ "$modes" = "$expected" ]; then good "enrolled files are root's with the planned modes"; else bad "enrolled file modes: $modes"; fi
+# A second enrol of the same label is refused and changes nothing.
+before=$(sha256sum /etc/xudo/harnesses.d/t.toml)
+if /usr/bin/xudo agent enrol t --account xudoagent --reviewer xudotest -- /bin/sleep 1 >/dev/null 2>&1; then
+    bad "a second enrol of t was accepted"
+else
+    good "a second enrol of t is refused"
+fi
+[ "$before" = "$(sha256sum /etc/xudo/harnesses.d/t.toml)" ] || bad "a refused enrol changed the registry entry"
+# A login as the agent account (what ssh gives it) is not the enrolled unit: it
+# is outside xudo.slice, so nothing attests it as the harness. It takes the
+# human path, where the password decides.
+login_cgroup=$(su -s /bin/sh xudoagent -c 'cat /proc/self/cgroup' 2>&1 || true)
+case $login_cgroup in
+*xudo.slice*) bad "a login as xudoagent is inside xudo.slice: $login_cgroup" ;;
+*) good "a login as xudoagent is outside xudo.slice (human path)" ;;
+esac
+if /usr/bin/xudo agent remove t >/var/tmp/agent-remove.log 2>&1; then
+    good "xudo agent remove t"
+else
+    bad "xudo agent remove t"
+    cat /var/tmp/agent-remove.log >&2
+fi
+case $(systemctl is-active xudo-agent@t.service 2>&1 || true) in
+active | activating) bad "xudo-agent@t still running after agent remove" ;;
+*) good "xudo-agent@t stopped by agent remove" ;;
+esac
+if [ ! -e /run/xudo/sessions/svc-t ]; then good "svc-t record voided by agent remove"; else bad "svc-t record survived agent remove"; fi
+if [ ! -e /etc/xudo/harnesses.d/t.toml ] && [ ! -e /etc/systemd/system/xudo-agent@t.service.d ]; then
+    good "agent remove took back the registry entry and the drop-in"
+else
+    bad "agent remove left files"
+fi
+[ -e /etc/xudo/agents/t.env ] && good "agent remove kept the environment file" || bad "agent remove deleted the environment file"
+# The passwordless grant end to end, with a lane-only NOPASSWD line that the
+# script removes before it returns (G1f). If it aborts first, this undoes its
+# edits to the system on the way out, and attack.sh's two bind mounts.
+g1f_cleanup() {
+    rm -f /etc/sudoers.d/xudo-g1f-lane-only
+    for mnt in /var/lib/xudo-g1f-tree/cache/deep/m2 /var/lib/xudo-g1f-tree/mnt; do
+        if mountpoint -q "$mnt"; then umount "$mnt" || umount -l "$mnt" || true; fi
+    done
+    if [ -f /var/tmp/g1f-pam-sudo ]; then
+        cp -a /var/tmp/g1f-pam-sudo /etc/pam.d/sudo
+        rm -f /var/tmp/g1f-pam-sudo
+    fi
+}
+trap g1f_cleanup EXIT
+. /harness/grant.sh
+# Enrol again, and leave it running for the package removal below.
+if enrol_agent && [ "$(systemctl is-active xudo-agent@t.service)" = active ]; then
+    good "xudo-agent@t enrolled again and running"
+else
+    bad "xudo-agent@t not running after the second enrol"
+    cat /var/tmp/agent-enrol.log >&2
+fi
 if ! apt-get remove -y xudo >/var/tmp/xudo-remove.log 2>&1; then
     cat /var/tmp/xudo-remove.log >&2
     bad "apt remove"
 fi
+aa=$(systemctl is-active xudo-agent@t.service 2>&1 || true)
+case $aa in
+active | activating) bad "xudo-agent@t still running after remove ($aa)" ;;
+*) good "xudo-agent@t stopped by remove ($aa)" ;;
+esac
+if [ ! -e /run/xudo/sessions/svc-t ]; then good "svc-t record gone after remove"; else bad "svc-t record survived remove"; fi
 en=$(systemctl is-enabled xudod.socket 2>&1 || true)
 case $en in
 enabled | static | indirect | generated | alias) bad "socket still enabled ($en)" ;;
@@ -669,6 +767,10 @@ if [ ! -e /etc/sudoers.d/xudo ] && [ ! -L /etc/sudoers.d/xudo ]; then
 else
     bad "sudoers rule still present"
 fi
+
+# The operator's whole journey, with the real `xudo install --agent-path` and
+# no lane-only line (E9). It purges what the rows above left first.
+. /harness/e2e.sh
 
 if [ "$fail" -ne 0 ]; then
     echo "row: FAILED"
