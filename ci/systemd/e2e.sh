@@ -10,7 +10,8 @@
 # left. Every root step is a human's: e2eadmin, in the image's own `%sudo`
 # rule, typing the password on a pty. Uses row.sh's good, bad and gate_exe.
 #
-# Ubuntu 26.04's sudo is sudo-rs, so the three images cover sudo and sudo-rs.
+# Ubuntu 26.04's sudo is sudo-rs (asserted below), so the three images cover
+# sudo and sudo-rs.
 
 # Never outside the throwaway container: this purges the package, deletes
 # accounts and turns the passwordless agent path on.
@@ -43,7 +44,35 @@ e2e_cleanup() {
 }
 trap 'g1f_cleanup; e2e_cleanup' EXIT
 
-echo "-- e2e: $(sudo --version 2>/dev/null | head -n 1)"
+# The image's sudo: sudo-rs on Ubuntu 26.04, sudo everywhere else.
+sudo_line=$(sudo --version 2>/dev/null | head -n 1)
+case $(. /etc/os-release && echo "$ID:$VERSION_ID") in
+ubuntu:26.04) sudo_kind=sudo-rs want_sudo='sudo-rs ' ;;
+*) sudo_kind=sudo want_sudo='Sudo version ' ;;
+esac
+case $sudo_line in
+"$want_sudo"*) good "e2e_the_image_runs_$sudo_kind ($sudo_line)" ;;
+*) bad "e2e_the_image_runs_$sudo_kind (got: $sudo_line)" ;;
+esac
+# sudo_refused <user>: sudo -n refused <user>'s call of the passwordless door
+# in sudo's own words. sudo says it wants a password; sudo-rs, whose rules
+# name nothing for the door, says no rule allows it.
+sudo_refused() {
+    case $sudo_kind in
+    sudo-rs) want="sudo: I'm sorry $1. I'm afraid I can't do that" ;;
+    *) want='sudo: a password is required' ;;
+    esac
+    printf '%s\n' "$hout" | grep -Fqx "$want"
+}
+# /etc/pam.d/sudo as its package shipped it: no lane PAM hook, no backup of
+# one, and the package's own checksum.
+pam_pristine() {
+    pam_pkg=$(dpkg-query -S /etc/pam.d/sudo | head -n 1 | cut -d: -f1)
+    pam_md5=$(dpkg-query -W -f='${Conffiles}\n' "$pam_pkg" | awk '$1 == "/etc/pam.d/sudo" { print $2 }')
+    ! grep -q pam_exec /etc/pam.d/sudo && [ ! -e /var/tmp/g1f-pam-sudo ] && [ -n "$pam_md5" ] &&
+        [ "$(md5sum </etc/pam.d/sudo | cut -d' ' -f1)" = "$pam_md5" ]
+}
+wants=/etc/systemd/system/multi-user.target.wants/xudo-agent@e2e.service
 
 # --- A clean host. The rows above removed the package but left `t` enrolled
 # (its drop-in, its enablement, its account in the agent groups) and their
@@ -60,15 +89,17 @@ fi
 ! id xudoagent >/dev/null 2>&1 || userdel xudoagent
 members=$(getent group xudo-agent | cut -d: -f4)
 if [ -z "$members" ] && [ ! -e /etc/xudo ] &&
-    ! grep -rqs xudo /etc/sudoers /etc/sudoers.d; then
-    good "e2e: the host starts with no xudo line, configuration or agent"
+    ! grep -rqs xudo /etc/sudoers /etc/sudoers.d && pam_pristine; then
+    good "e2e: the host starts with no xudo line, configuration, agent or PAM hook"
 else
-    bad "e2e: the host starts with no xudo line, configuration or agent (xudo-agent: $members)"
+    bad "e2e: the host starts with no xudo line, configuration, agent or PAM hook (xudo-agent: $members)"
     grep -rls xudo /etc/sudoers /etc/sudoers.d >&2 || true
+    cat /etc/pam.d/sudo >&2 || true
 fi
 sudoers_now() {
     sha256sum /etc/sudoers
     find /etc/sudoers.d -mindepth 1 -printf '%f %U:%G %m\n' | sort
+    find /etc/sudoers.d -type f -exec sha256sum {} + | sort
 }
 sudoers_before=$(sudoers_now)
 
@@ -93,13 +124,14 @@ exit [lindex $result 3]
 EOF
 # ido.exp <user> <password> <id>: the reviewer's `ido` picker on a pty. Waits
 # for the root-held entry, presses enter, types `run` at the picker's prompt,
-# then at `xudo exec --queued`'s, then the password at sudo's.
+# then at `xudo exec --queued`'s, then the password at sudo's. The second's
+# pause lets `su --pty` pass on the last bytes before it exits.
 cat >"$e2e/ido.exp" <<'EOF'
 set timeout 60
 set stty_init "rows 50 columns 250"
 set id [lindex $argv 2]
 set prompts 0
-spawn su --pty -s /bin/sh -c /usr/bin/ido [lindex $argv 0]
+spawn su --pty -s /bin/sh -c {/usr/bin/ido; rc=$?; sleep 1; exit $rc} [lindex $argv 0]
 expect {
     "root $id" {}
     timeout { puts "STEP=list"; exit 124 }
@@ -125,18 +157,29 @@ EOF
 chmod 0644 "$e2e/as.exp" "$e2e/ido.exp"
 # The transcript without CR and terminal sequences.
 clean() { tr -d '\r' | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b\][^\x1b]*\x1b\\//g'; }
-# as_user <user> <command>: on a pty, with the password `pw`. Sets hout, hrc.
+# as_user <user> <command>: on a pty, with the password `pw`. Its standard
+# output and status go to files; standard error stays on the terminal (a
+# queued run needs one) and gets a second to drain before `su --pty` exits.
+# Sets hout, hrc.
 as_user() {
+    printf '%s >%s; echo "$?" >%s; sleep 1\n' "$2" "$e2e/user.out" "$e2e/user.rc" >"$e2e/user"
+    chmod 0644 "$e2e/user"
+    for f in user.rc user.out; do
+        install -m 0644 -o "$1" -g "$1" /dev/null "$e2e/$f"
+    done
     set +e
-    expect "$e2e/as.exp" "$1" pw "$2" </dev/null >/var/tmp/e2e-user.raw 2>&1
-    hrc=$?
+    expect "$e2e/as.exp" "$1" pw "sh $e2e/user" </dev/null >/var/tmp/e2e-user.raw 2>&1
     set -e
-    hout=$(clean </var/tmp/e2e-user.raw)
+    hout="$(clean </var/tmp/e2e-user.raw)
+$(cat "$e2e/user.out")"
+    hrc=$(cat "$e2e/user.rc")
 }
 # as_admin <command>: e2eadmin on a pty, typing the password, in a system
 # unit of its own so root's ancestor walk ends at pid 1 and not at this
 # script's `docker exec`. The command's output and status also go to files,
-# because `su --pty` can drop the last bytes of its pty when it exits.
+# because `su --pty` can drop the last bytes of its pty when it exits. The
+# unit dies before `timeout` gives up, so a hung step writes no stale status
+# into the next one.
 as_admin() {
     printf '{ %s; echo "$?" >%s; } 2>&1 | tee %s\n' "$1" "$e2e/admin.rc" "$e2e/admin.out" >"$e2e/admin"
     chmod 0644 "$e2e/admin"
@@ -144,7 +187,7 @@ as_admin() {
         install -m 0644 -o "$admin" -g "$admin" /dev/null "$e2e/$f"
     done
     set +e
-    timeout 300 systemd-run --quiet --wait --pipe --collect \
+    timeout 300 systemd-run --quiet --wait --pipe --collect --property=RuntimeMaxSec=290 \
         expect "$e2e/as.exp" "$admin" pw "sh $e2e/admin" </dev/null >/var/tmp/e2e-admin.raw 2>&1
     set -e
     hout="$(clean </var/tmp/e2e-admin.raw)
@@ -204,7 +247,21 @@ for line in sys.stdin:
 '
 }
 spool_count() { find /run/xudo/req -mindepth 1 2>/dev/null | wc -l; }
-has_root_line() { printf '%s\n' "$hout" | grep -qx root; }
+# The `via` of every entry in the spool, one per line.
+spool_vias() {
+    for entry in /run/xudo/req/*; do
+        [ -e "$entry" ] || continue
+        python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("via"))' "$entry"
+    done
+}
+# A line that is uid 0 and nothing else: `id --user` (or `-ru`) as root.
+has_uid0() { printf '%s\n' "$hout" | grep -qx 0; }
+# `xudo doctor`'s agent path, as root reads it.
+doctor_agent_path() {
+    timeout 60 /usr/bin/xudo doctor --json 2>/dev/null |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["agent_path"]["state"])' 2>/dev/null ||
+        echo unreadable
+}
 show() {
     echo "--- $1: rc=$hrc" >&2
     printf '%s\n' "$hout" >&2
@@ -218,14 +275,15 @@ check() {
     if "$@"; then good "$case_name"; else bad "$case_name"; show "$case_name"; fi
 }
 token_of() { printf '%s\n' "$1" | sed -n 's/^  sudo xudo rules [a-z]*.* --reviewed \([0-9a-f]*\) .*/\1/p'; }
-gn="/usr/bin/xudo exec -- $gate_exe -gn"
+uid_cmd="/usr/bin/xudo exec -- $gate_exe --user"
 clean_cmd="/usr/bin/xudo op remove-path $tree/cache"
-# The agent path is off: the broker mints the harness's entry, and sudo,
-# asked for the passwordless door with -n, wants a password. Nothing runs and
-# no gate starts.
+# The agent path is off: the broker mints the harness's entry, sudo -n
+# refuses the passwordless door in its own words, and the entry is still in
+# the spool, the one entry there, unconsumed. Nothing runs and no gate starts.
 agent_path_off() {
-    [ "$hrc" = 1 ] && ! has_root_line &&
+    [ "$hrc" = 1 ] && ! has_uid0 && sudo_refused "$agent" &&
         printf '%s\n' "$hout" | grep -q 'passwordless agent path is not installed' &&
+        [ "$(spool_count)" = 1 ] && [ "$(spool_vias)" = harness ] &&
         trail "$mark" | grep -q '^enrolled-agent allowed - pack\.e2e\.[a-z]* via=harness$' &&
         ! trail "$mark" | grep -q 'gate_mode='
 }
@@ -264,13 +322,14 @@ done
 groups=$(id -nG "$agent" | tr ' ' '\n' | grep -x 'xudo\|xudo-agent' | sort | tr '\n' ' ')
 check e2e_the_operator_enrols_a_harness_through_sudo eval '
     [ "$hrc" = 0 ] && asked_password && [ -f "$registry" ] &&
-    [ "$(systemctl is-active "$unit")" = active ] && [ -e /run/xudo/sessions/svc-e2e ] &&
+    [ "$(systemctl is-active "$unit")" = active ] && [ -e /run/xudo/sessions/svc-e2e ] && [ -L "$wants" ] &&
     [ "$groups" = "xudo xudo-agent " ] && ! grep -rqsE "^[^#]*(NOPASSWD|xudo-gate-nopass)" /etc/sudoers /etc/sudoers.d'
 
-# --- 3. The rule pack: `id -gn` for the harness with no password, `id -g`
+# --- 3. The rule pack: `id --user` for the harness with no password, `id -ru`
 # only after a human approves it, and remove-path under the tree for what
 # the harness's account owns. Reviewed as the administrator, then installed
-# with the token through sudo.
+# with the token through sudo. Not `id -u`: the shipped probe rule accepts
+# that for the password path, and the strictest accepting rule wins.
 cat >"$packs/ops.toml" <<EOF
 [pack]
 name = "e2e-ops"
@@ -278,17 +337,17 @@ version = "1.0.0"
 for = ["e2e"]
 
 [[action]]
-id = "pack.e2e.gn"
+id = "pack.e2e.uid"
 tier = "diag-read"
 exe = "$gate_exe"
-args = [{ name = "group-name", matcher = { literal = "-gn" } }]
+args = [{ name = "effective-uid", matcher = { literal = "--user" } }]
 outcome = "allow"
 
 [[action]]
 id = "pack.e2e.ask"
 tier = "diag-read"
 exe = "$gate_exe"
-args = [{ name = "group", matcher = { literal = "-g" } }]
+args = [{ name = "real-uid", matcher = { literal = "-ru" } }]
 outcome = "ask-human"
 
 [[operation]]
@@ -302,23 +361,23 @@ owners = ["$agent"]
 outcome = "allow"
 
 [[test]]
-argv = ["$gate_exe", "-gn"]
+argv = ["$gate_exe", "--user"]
 expect = "allow"
-action = "pack.e2e.gn"
+action = "pack.e2e.uid"
 
 [[test]]
-argv = ["$gate_exe", "-Gn"]
+argv = ["$gate_exe", "--group"]
 expect = "deny"
-action = "pack.e2e.gn"
+action = "pack.e2e.uid"
 reason = "near miss: one operand off the allow test"
 
 [[test]]
-argv = ["$gate_exe", "-g"]
+argv = ["$gate_exe", "-ru"]
 expect = "allow"
 action = "pack.e2e.ask"
 
 [[test]]
-argv = ["$gate_exe", "-G"]
+argv = ["$gate_exe", "-rg"]
 expect = "deny"
 action = "pack.e2e.ask"
 reason = "near miss: one operand off the allow test"
@@ -336,7 +395,10 @@ check e2e_the_operator_installs_the_reviewed_pack_through_sudo eval '
     [ "$(stat -c "%U:%G %a" "$installed")" = "root:root 644" ]'
 
 # The tree remove-path works on: root's, with the account's build output in
-# it, a link to a file outside it, and a file of the reviewer's.
+# it, a link to a file outside it, and a file of the reviewer's. The two
+# directories are the account's but read-only, so only root's override of
+# the permissions can unlink what is in them: the account cannot fake a
+# removal by doing it itself.
 rm -rf "$tree" "$outside"
 install -d -m 0755 "$tree"
 install -d -m 0755 -o "$agent" -g "$agent" "$tree/cache" "$tree/cache/obj"
@@ -350,19 +412,21 @@ printf 'secret\n' >"$outside"
 chown "$agent:$agent" "$outside"
 ln -s "$outside" "$tree/cache/link"
 chown -h "$agent:$agent" "$tree/cache/link"
+chmod 0555 "$tree/cache/obj" "$tree/cache"
 tree_intact() {
     [ -f "$tree/cache/a.o" ] && [ -f "$tree/cache/obj/b.o" ] && [ -L "$tree/cache/link" ] &&
         [ "$(cat "$outside")" = secret ]
 }
 
 # --- 4. Before --agent-path: the rule grants, the door is shut.
+check e2e_doctor_says_the_agent_path_is_off eval '[ "$(doctor_agent_path)" = off ]'
 mark=$(trail_len)
-as_harness off-gn "$gn"
-check e2e_before_the_agent_path_a_granted_command_wants_a_password agent_path_off
+as_harness off-uid "$uid_cmd"
+check e2e_before_the_agent_path_sudo_refuses_a_granted_command agent_path_off
 rm -f /run/xudo/req/*
 mark=$(trail_len)
 as_harness off-clean "$clean_cmd"
-check e2e_before_the_agent_path_a_granted_remove_path_wants_a_password eval 'agent_path_off && tree_intact'
+check e2e_before_the_agent_path_sudo_refuses_a_granted_remove_path eval 'agent_path_off && tree_intact'
 rm -f /run/xudo/req/*
 
 # --- 5. The real installer turns the agent path on.
@@ -376,22 +440,38 @@ check e2e_the_operator_turns_the_agent_path_on_through_sudo eval '
     [ "$(grep -c NOPASSWD "$dest")" = 1 ] &&
     grep -qx "%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS" "$dest" &&
     [ "$(grep -rlsE "^[^#]*NOPASSWD" /etc/sudoers /etc/sudoers.d)" = "$dest" ] && visudo -c >/dev/null'
+check e2e_doctor_says_the_agent_path_is_on eval '[ "$(doctor_agent_path)" = on ]'
+# Run twice, it is the same file.
+agent_path_file() { sha256sum "$dest" && stat -c '%a %U:%G' "$dest"; }
+agent_path_before=$(agent_path_file)
+as_admin "/usr/bin/sudo /usr/bin/xudo install --agent-path"
+check e2e_a_second_agent_path_install_leaves_the_same_bytes eval '
+    [ "$hrc" = 0 ] && asked_password && [ "$(agent_path_file)" = "$agent_path_before" ] &&
+    [ "$(doctor_agent_path)" = on ]'
 
 # --- 6. The grant runs as root with no password; the gate says which door.
 mark=$(trail_len)
-as_harness on-gn "$gn"
+as_harness on-uid "$uid_cmd"
 check e2e_the_harness_runs_its_granted_command_as_root_with_no_password eval '
-    [ "$hrc" = 0 ] && has_root_line &&
-    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.gn via=harness$" &&
-    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.gn gate_mode=Nopass via=harness$" &&
+    [ "$hrc" = 0 ] && has_uid0 &&
+    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.uid via=harness$" &&
+    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.uid gate_mode=Nopass via=harness$" &&
     [ "$(spool_count)" = 0 ]'
+# The gate's two remove-path records (the intent before any unlink, the
+# result after) carry no `gate_mode=`. They name the entry's door instead:
+# the gate refuses a `via=harness` entry on any door but -nopass
+# (`gate_mode_wrong_via`), so `via=harness` in the gate's own records is the
+# passwordless door.
 mark=$(trail_len)
 as_harness on-clean "$clean_cmd"
 check e2e_the_harness_removes_its_own_files_as_root_with_no_password eval '
     [ "$hrc" = 0 ] && [ ! -e "$tree/cache/a.o" ] && [ ! -e "$tree/cache/obj" ] &&
     [ ! -L "$tree/cache/link" ] && [ "$(cat "$outside")" = secret ] &&
     [ "$(cat "$tree/cache/theirs.o")" = theirs ] && [ -d "$tree" ] &&
-    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.clean op=remove-path via=harness count=4$"'
+    [ "$(stat -c "%U %a" "$tree/cache")" = "$agent 555" ] &&
+    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.clean op=remove-path-intent via=harness$" &&
+    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.clean op=remove-path via=harness count=4$" &&
+    [ "$(spool_count)" = 0 ]'
 
 # --- 7. A command no rule allows: denied at the broker, nothing minted.
 mark=$(trail_len)
@@ -411,11 +491,11 @@ for entry in json.load(sys.stdin)["root_held"]:
 '
 }
 mark=$(trail_len)
-as_harness ask "/usr/bin/xudo exec -- $gate_exe -g"
+as_harness ask "/usr/bin/xudo exec -- $gate_exe -ru"
 queued=$(find /var/lib/xudo/queue -maxdepth 1 -type f -name '*.json' | wc -l)
-qid=$(root_held | awk -v exe="$gate_exe" '$2 == "pending" && $3 == "e2e" && $4 == exe && $5 == "-g" && NF == 5 { print $1 }')
+qid=$(root_held | awk -v exe="$gate_exe" '$2 == "pending" && $3 == "e2e" && $4 == exe && $5 == "-ru" && NF == 5 { print $1 }')
 check e2e_an_ask_human_request_waits_in_the_root_held_queue eval '
-    [ "$hrc" = 17 ] && ! printf "%s\n" "$hout" | grep -qx 0 &&
+    [ "$hrc" = 17 ] && ! has_uid0 &&
     printf "%s\n" "$hout" | grep -q "root-held queue" && [ "$queued" = 1 ] &&
     printf "%s\n" "$qid" | grep -Eqx "[0-9a-f]{64}" &&
     trail "$mark" | grep -q "^enrolled-agent denied ask_human pack\.e2e\.ask " &&
@@ -427,14 +507,15 @@ hrc=$?
 set -e
 hout=$(clean </var/tmp/e2e-ido.raw)
 check e2e_the_reviewer_approves_it_in_ido_and_it_runs_as_root eval '
-    [ "$hrc" = 0 ] && asked_password && printf "%s\n" "$hout" | grep -qx 0 &&
+    [ "$hrc" = 0 ] && asked_password && has_uid0 &&
     printf "%s\n" "$hout" | grep -q "^ido: xudo exec --queued $qid exited 0" &&
     [ "$(trail "$mark" | grep -c " allowed - pack\.e2e\.ask .*gate_mode=Auth via=auth$")" = 1 ] &&
     ! root_held | grep -q "^$qid pending"'
 mark=$(trail_len)
 as_user "$reviewer" "/usr/bin/xudo exec --queued $qid"
 check e2e_an_approved_entry_runs_once eval '
-    [ "$hrc" != 0 ] && ! printf "%s\n" "$hout" | grep -qx 0 &&
+    [ "$hrc" = 19 ] && ! has_uid0 && ! asked_password &&
+    printf "%s\n" "$hout" | grep -Fqx "xudo: the broker refused (RequestUnknown): the request is unknown or this question is not implemented yet" &&
     ! trail "$mark" | grep -q " allowed .*gate_mode="'
 rm -f /run/xudo/req/*
 
@@ -444,36 +525,43 @@ rm -f /run/xudo/req/*
 harness_marker=/var/lib/xudo/frozen-h-e2e
 reviewer_marker=/var/lib/xudo/frozen-$(id -u "$reviewer")
 as_plain "$reviewer" "/usr/bin/xudo freeze --reason 'e2e brake'"
-check e2e_the_reviewer_freezes_the_harness eval '[ "$hrc" = 0 ] && [ -f "$harness_marker" ]'
+check e2e_the_reviewer_freezes_the_harness eval '
+    [ "$hrc" = 0 ] && [ -f "$harness_marker" ] && [ -f "$reviewer_marker" ]'
 mark=$(trail_len)
-as_harness frozen "$gn"
+as_harness frozen "$uid_cmd"
 check e2e_a_frozen_harness_runs_nothing eval '
-    [ "$hrc" = 17 ] && ! has_root_line && printf "%s\n" "$hout" | grep -q frozen &&
+    [ "$hrc" = 17 ] && ! has_uid0 && printf "%s\n" "$hout" | grep -q frozen &&
     trail "$mark" | grep -q "^enrolled-agent denied frozen " &&
     ! trail "$mark" | grep -q "gate_mode=" && [ "$(spool_count)" = 0 ]'
+# The broker's refusal of a thaw from a harness's account, as `xudo thaw`
+# prints it.
+thaw_refused='xudo: Refused { code: ChannelUntrusted, remediation: "the peer is not trusted for this broker channel", detail: Some("this account runs an agent harness: use `sudo xudo thaw`, which lifts ALL freezes (the global one and every user'"'"'s)") }'
 as_harness self-thaw "/usr/bin/xudo thaw"
-check e2e_the_harness_cannot_thaw_itself eval '[ "$hrc" != 0 ] && [ -f "$harness_marker" ]'
+check e2e_the_harness_cannot_thaw_itself eval '
+    [ "$hrc" = 17 ] && [ -f "$harness_marker" ] &&
+    printf "%s\n" "$hout" | grep -Fqx "$thaw_refused"'
 as_plain "$reviewer" "/usr/bin/xudo thaw"
 check e2e_the_reviewers_thaw_leaves_the_harness_frozen eval '
     [ "$hrc" = 0 ] && [ ! -e "$reviewer_marker" ] && [ -f "$harness_marker" ]'
 as_admin "/usr/bin/sudo /usr/bin/xudo thaw"
 check e2e_root_thaws_through_sudo eval '[ "$hrc" = 0 ] && asked_password && [ ! -e "$harness_marker" ]'
 mark=$(trail_len)
-as_harness thawed "$gn"
+as_harness thawed "$uid_cmd"
 check e2e_the_thawed_harness_runs_again eval '
-    [ "$hrc" = 0 ] && has_root_line &&
-    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.gn gate_mode=Nopass via=harness$"'
+    [ "$hrc" = 0 ] && has_uid0 &&
+    trail "$mark" | grep -q "^enrolled-agent allowed - pack\.e2e\.uid gate_mode=Nopass via=harness$"'
 
 # --- 10. The human path, beside the agent path: the reviewer's password.
 mark=$(trail_len)
 as_user "$reviewer" "/usr/bin/xudo exec -- $gate_exe -u"
 check e2e_the_human_path_still_asks_the_password eval '
-    [ "$hrc" = 0 ] && asked_password && printf "%s\n" "$hout" | grep -qx 0 &&
+    [ "$hrc" = 0 ] && asked_password && has_uid0 &&
     trail "$mark" | grep -q "^human allowed - $probe_action .*gate_mode=Auth via=auth$" &&
     ! trail "$mark" | grep -q "via=harness"'
 as_user "$reviewer" "/usr/bin/sudo -n /usr/libexec/xudo/xudo-gate-nopass"
 check e2e_a_human_cannot_use_the_passwordless_door eval '
-    [ "$hrc" != 0 ] && ! printf "%s\n" "$hout" | grep -q "xudo-gate:"'
+    [ "$hrc" = 1 ] && ! asked_password && sudo_refused "$reviewer" &&
+    ! printf "%s\n" "$hout" | grep -q "xudo-gate:"'
 
 # --- 11. Uninstall: the agent path and the human path go; enrol's groups stay.
 as_admin "/usr/bin/sudo /usr/bin/xudo install --uninstall"
@@ -482,9 +570,10 @@ check e2e_uninstall_removes_every_xudo_sudoers_line eval '
     [ "$hrc" = 0 ] && asked_password && [ ! -e "$dest" ] && [ ! -L "$dest" ] &&
     ! grep -rqs "xudo" /etc/sudoers /etc/sudoers.d && visudo -c >/dev/null &&
     [ "$groups" = "xudo xudo-agent " ]'
+check e2e_doctor_says_the_agent_path_is_off_after_uninstall eval '[ "$(doctor_agent_path)" = off ]'
 mark=$(trail_len)
-as_harness gone "$gn"
-check e2e_after_uninstall_the_harness_wants_a_password_again agent_path_off
+as_harness gone "$uid_cmd"
+check e2e_after_uninstall_sudo_refuses_the_harness_again agent_path_off
 rm -f /run/xudo/req/*
 
 # --- 12. The pack and the harness go, through sudo.
@@ -517,6 +606,7 @@ check e2e_the_host_is_as_it_was_before_the_journey eval '
     [ "$(find /etc/xudo/rules.d -type f -printf "%f %U:%G %m\n" | sort)" = "$rules_installed" ] &&
     [ "$unit_state" = stopped ] && [ ! -e /run/xudo/sessions/svc-e2e ] &&
     [ ! -e /etc/systemd/system/xudo-agent@e2e.service.d ] && [ -z "$groups" ] &&
+    [ ! -e "$wants" ] && [ ! -L "$wants" ] && pam_pristine &&
     [ ! -e /etc/sysctl.d/05-xudo-ptrace-scope.conf ] && [ -f "$env_file" ]'
 
 if ! apt-get remove -y xudo >/var/tmp/e2e-remove.log 2>&1; then
