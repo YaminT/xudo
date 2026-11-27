@@ -1010,21 +1010,38 @@ mod tests {
     }
 
     fn recorded_invocation(id: &str) -> String {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-tmp/ido-queued-exec");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let parent =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join(format!(
+            "ido-queued-exec-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Exclusive creation: no parallel invocation can rewrite this script.
+        std::fs::create_dir(&dir).unwrap();
         let script = dir.join("xudo");
         let record = dir.join("argv");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
-                record.display(),
-                record.display()
-            ),
-        )
-        .unwrap();
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            record.display(),
+            record.display()
+        );
+        // Write in a child and wait for it: concurrent forks in the test
+        // process must never inherit a writable descriptor to this executable.
+        // Absolute test-only writer; no PATH lookup or privileged execution.
+        #[allow(clippy::disallowed_methods)]
+        let mut writer = std::process::Command::new("/bin/sh");
+        assert!(
+            writer
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture"])
+                .arg(&script)
+                .arg(body)
+                .status()
+                .unwrap()
+                .success()
+        );
         #[cfg(unix)]
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut command = crate::root_queue::queued_exec_command(&script, id);
@@ -1036,7 +1053,27 @@ mod tests {
         assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
         assert!(!invoked.iter().any(|arg| arg.contains("rm")));
         assert!(command.status().unwrap().success());
-        std::fs::read_to_string(&record).unwrap()
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        recorded
+    }
+
+    #[test]
+    fn queued_exec_fixtures_do_not_rewrite_each_others_executable() {
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    let id = format!("{worker:064x}");
+                    assert_eq!(
+                        recorded_invocation(&id),
+                        format!("/\nexec\n--queued\n{id}\n")
+                    );
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     fn root(id: &str, argv: &[&str], harness: &str) -> RootView {

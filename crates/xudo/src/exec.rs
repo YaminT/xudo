@@ -1239,7 +1239,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("b.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let broker = crate::test_broker::serve_once(listener, reply);
+        let broker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(PATIENT)).unwrap();
+            stream.set_write_timeout(Some(PATIENT)).unwrap();
+            let mut request = Vec::new();
+            // Wait for the client's write shutdown, not merely parseable JSON.
+            // Closing first races shutdown(Write) with ENOTCONN on macOS.
+            stream.read_to_end(&mut request).unwrap();
+            stream.write_all(&reply).unwrap();
+            request
+        });
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = plan_with_confirmation_timeout(
             cli,
@@ -1252,7 +1262,7 @@ mod tests {
             &mut out,
             &mut err,
         );
-        let request = broker.finish();
+        let request = broker.join().unwrap();
         // What the broker received is exactly what the caller typed.
         let sent = BrokerRequest::parse(&request).unwrap();
         assert_eq!(
