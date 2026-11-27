@@ -87,10 +87,6 @@ pub struct PeerIdentity {
     pub sid: i64,
     /// Controlling terminal number; zero means no controlling terminal.
     pub tty: i64,
-    /// Its `comm` from the same `/proc/<pid>/stat` read: the name the process
-    /// gave itself. An unauthenticated hint (invariant 1), recorded in the
-    /// audit trail and never read by a decision.
-    pub comm: Vec<u8>,
     /// Whether namespace facts diverge from the broker's identity namespace.
     pub diverged: bool,
     /// Whether a pidfd held the process while `/proc` was read and the
@@ -111,9 +107,11 @@ pub struct PeerIdentity {
 
 /// A peer's identity, and beside it what it claims about itself.
 ///
-/// The hints are its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd
-/// held it: unauthenticated (invariant 1), `unavailable` on the rung with no
-/// pidfd, where a read by number could be another process's. They are not
+/// The hints are its `comm`, from the `stat` the identity is read from, and
+/// its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd held it:
+/// unauthenticated (invariant 1). The last three are `unavailable` on the
+/// rung with no pidfd, where a read by number could be another process's;
+/// `comm` comes from the same read as the identity on every rung. They are not
 /// part of [`PeerIdentity`], so no decision, which is handed the identity,
 /// can reach them; only the audit record reads them. `Deref` hands out the
 /// identity alone.
@@ -362,7 +360,8 @@ fn identify_inner(
     let hints = match &pin {
         Some(_) => xudo_sys::peer_hints(peers, cred.pid),
         None => CallerHints::unavailable(),
-    };
+    }
+    .with_comm(&stat.comm);
 
     // After the last read of /proc by number, and not before.
     if let Some((pidfd, _)) = &pin {
@@ -388,7 +387,6 @@ fn identify_inner(
         starttime: stat.starttime,
         sid: stat.session,
         tty: stat.tty_nr,
-        comm: stat.comm,
         diverged: namespaces,
         pinned: pin.is_some(),
         cgroup_id: cgroup_result
@@ -754,6 +752,7 @@ mod tests {
             Some(b"xudo\0exec\0"),
             Some(b"CLAUDECODE=1\0"),
         )
+        .with_comm(b"xudo")
     }
 
     fn namespace_peer(status: Vec<u8>, uid_map: Option<&[u8]>) -> FakePeer {
@@ -925,7 +924,6 @@ mod tests {
                     starttime: START,
                     sid: 1,
                     tty: 0,
-                    comm: b"xudo".to_vec(),
                     diverged: false,
                     pinned: true,
                     cgroup_id: Some(77),
@@ -1063,7 +1061,11 @@ mod tests {
             .with_proc(PID, ProcFile::Exe, b"/usr/bin/claude".to_vec())
             .with_proc(PID, ProcFile::Environ, b"CLAUDECODE=1\0".to_vec());
         let identity = identify(sock.as_fd(), &FakeSyscalls::new(), &peers).unwrap();
-        assert_eq!(identity.hints, CallerHints::unavailable());
+        // Only the comm, from the stat the identity itself is read from.
+        assert_eq!(
+            identity.hints,
+            CallerHints::unavailable().with_comm(b"xudo")
+        );
         for file in [ProcFile::Exe, ProcFile::Cmdline, ProcFile::Environ] {
             assert!(!peers.calls().contains(&PeerCall::ReadProc(PID, file)));
         }
@@ -1081,7 +1083,10 @@ mod tests {
             .with_exit(Ok(false));
         let identity = identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers).unwrap();
         assert!(identity.pinned);
-        assert_eq!(identity.hints, CallerHints::unavailable());
+        assert_eq!(
+            identity.hints,
+            CallerHints::unavailable().with_comm(b"xudo")
+        );
         // And the identity is the one a peer showing every hint gets: the
         // hints sit beside it and change nothing in it.
         let hinted = identify(

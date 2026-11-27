@@ -1,16 +1,18 @@
 //! The hints about a caller that go in the audit trail and nowhere else.
 //!
-//! A caller's executable path, its command line and whether it exported
-//! `CLAUDECODE` are all its own to choose (invariant 1). They are recorded so
+//! A caller's `comm`, its executable path, its command line and whether it
+//! exported `CLAUDECODE` are all its own to choose (invariant 1). They are recorded so
 //! an operator reading the trail can see who claimed to be what, and nothing
 //! may decide on them: [`CallerHints`] has no accessor and its `Debug` prints
 //! no value, only [`CallerHints::evidence`] renders the audit lines.
 //!
 //! What is kept is little on purpose. Of the command line, `argv[0]`, the
-//! argument count, the length and the start of a SHA-256, never an argument:
-//! a password typed on a command line must not reach the audit trail or the
-//! journal. Of the environment, only whether `CLAUDECODE` is set, and whether
-//! to exactly `1`. Both files are looked at in their first
+//! argument count and the length, and no digest: a digest of a short secret
+//! confirms a guess offline, and a password typed on a command line must not
+//! reach the audit trail or the journal. `argv[0]` is the caller's own, and
+//! bounded: a process that rewrote its title as one string with no
+//! terminator shows that whole string as `argv[0]`. Of the environment, only
+//! whether `CLAUDECODE` is set, and whether to exactly `1`. Both files are looked at in their first
 //! [`HINT_READ_MAX`] bytes only, and the broker reads no more than that.
 //!
 //! Every text is escaped (`escape_ascii`, so control characters and non-ASCII
@@ -24,7 +26,6 @@
 use std::fmt;
 
 use bstr::ByteSlice;
-use sha2::{Digest as _, Sha256};
 
 use crate::peer::{PeerCalls, ProcFile};
 use crate::proc::parse_stat;
@@ -36,6 +37,9 @@ use crate::source::ProcSource;
 pub const HINT_EXE_MAX: usize = 1024;
 /// How much of `argv[0]` is recorded, before escaping.
 pub const HINT_ARGV0_MAX: usize = 256;
+/// How much of `comm` is recorded, before escaping. The kernel keeps 15
+/// bytes; this only bounds what a seam could hand over.
+pub const HINT_COMM_MAX: usize = 64;
 /// How much of `cmdline` and of `environ` is looked at. The broker reads one
 /// byte more, to tell a file of exactly this size from a longer one.
 pub const HINT_READ_MAX: usize = 64 * 1024;
@@ -50,6 +54,7 @@ pub struct CallerHints {
     exe: String,
     cmdline: String,
     claudecode: String,
+    comm: Option<String>,
 }
 
 impl fmt::Debug for CallerHints {
@@ -66,6 +71,7 @@ impl CallerHints {
             exe: UNAVAILABLE.to_owned(),
             cmdline: UNAVAILABLE.to_owned(),
             claudecode: UNAVAILABLE.to_owned(),
+            comm: None,
         }
     }
 
@@ -77,16 +83,29 @@ impl CallerHints {
             exe: exe.map_or_else(|| UNAVAILABLE.to_owned(), |link| quoted(link, HINT_EXE_MAX)),
             cmdline: cmdline.map_or_else(|| UNAVAILABLE.to_owned(), command_line),
             claudecode: environ.map_or_else(|| UNAVAILABLE.to_owned(), claudecode),
+            comm: None,
         }
     }
 
-    /// The audit lines, in a fixed order.
-    pub fn evidence(&self) -> [String; 3] {
-        [
-            format!("hint_exe={}", self.exe),
-            format!("hint_cmdline={}", self.cmdline),
-            format!("hint_claudecode={}", self.claudecode),
-        ]
+    /// The same hints with the `comm` the broker read from `stat`, recorded
+    /// as `hint_comm`. The gate records none.
+    #[must_use]
+    pub fn with_comm(mut self, comm: &[u8]) -> Self {
+        self.comm = Some(quoted(comm, HINT_COMM_MAX));
+        self
+    }
+
+    /// The audit lines, in a fixed order: `hint_comm` first when there is
+    /// one.
+    pub fn evidence(&self) -> Vec<String> {
+        let comm = self.comm.as_ref().map(|comm| format!("hint_comm={comm}"));
+        comm.into_iter()
+            .chain([
+                format!("hint_exe={}", self.exe),
+                format!("hint_cmdline={}", self.cmdline),
+                format!("hint_claudecode={}", self.claudecode),
+            ])
+            .collect()
     }
 }
 
@@ -103,9 +122,9 @@ fn quoted(bytes: &[u8], max: usize) -> String {
     format!("\"{}\"{marker}", kept.escape_ascii())
 }
 
-/// `argv0:"<argv[0]>" argc:N len:N sha256:<8 hex>` of the first
-/// [`HINT_READ_MAX`] bytes, with `+` after the count and the length when the
-/// file was longer. No argument's text.
+/// `argv0:"<argv[0]>" argc:N len:N` of the first [`HINT_READ_MAX`] bytes,
+/// with `+` after the count and the length when the file was longer. Nothing
+/// past the first terminator: no argument's text and no digest of one.
 fn command_line(bytes: &[u8]) -> String {
     let (window, was_cut) = cut(bytes, HINT_READ_MAX);
     let argv = window.strip_suffix(b"\0").unwrap_or(window);
@@ -116,10 +135,8 @@ fn command_line(bytes: &[u8]) -> String {
         argv.find_iter("\0").count().saturating_add(1)
     };
     let more = if was_cut { "+" } else { "" };
-    let mut short = format!("{:x}", Sha256::digest(window));
-    short.truncate(8);
     format!(
-        "argv0:{} argc:{count}{more} len:{}{more} sha256:{short}",
+        "argv0:{} argc:{count}{more} len:{}{more}",
         quoted(argv0, HINT_ARGV0_MAX),
         window.len()
     )
@@ -211,15 +228,11 @@ mod tests {
     }
 
     fn lines(hints: &CallerHints) -> Vec<String> {
-        hints.evidence().to_vec()
+        hints.evidence()
     }
 
-    /// The first eight hex digits of the SHA-256 of `bytes`.
-    fn short(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-            .get(..8)
-            .unwrap()
-            .to_owned()
+    fn three(hints: &CallerHints) -> [String; 3] {
+        hints.evidence().try_into().unwrap()
     }
 
     #[test]
@@ -233,10 +246,7 @@ mod tests {
             lines(&hints),
             [
                 "hint_exe=\"/usr/bin/claude\"".to_owned(),
-                format!(
-                    "hint_cmdline=argv0:\"claude\" argc:2 len:15 sha256:{}",
-                    short(b"claude\0--print\0")
-                ),
+                "hint_cmdline=argv0:\"claude\" argc:2 len:15".to_owned(),
                 "hint_claudecode=set:\"1\"".to_owned(),
             ]
         );
@@ -252,26 +262,40 @@ mod tests {
         assert_eq!(
             lines(&hints)[1],
             format!(
-                "hint_cmdline=argv0:\"/usr/bin/mysql\" argc:3 len:{} sha256:{}",
-                cmdline.len(),
-                short(cmdline)
+                "hint_cmdline=argv0:\"/usr/bin/mysql\" argc:3 len:{}",
+                cmdline.len()
             )
+        );
+    }
+
+    #[test]
+    fn a_guessed_password_cannot_be_confirmed_from_the_record() {
+        // With a digest, a journal reader who knows argv[0], the count and
+        // the length could test guesses offline. Two command lines that differ
+        // only in a secret of the same length must render the same.
+        let right = CallerHints::from_reads(None, Some(b"mysql\0--password=hunter2\0"), None);
+        let guess = CallerHints::from_reads(None, Some(b"mysql\0--password=letmein\0"), None);
+        assert_eq!(right, guess);
+        assert_eq!(
+            lines(&right)[1],
+            "hint_cmdline=argv0:\"mysql\" argc:2 len:25"
         );
     }
 
     #[test]
     fn an_empty_or_unterminated_cmdline_is_counted_as_it_is() {
         // A kernel thread or a zombie shows nothing; a process that rewrote
-        // its title may show one string with no terminator.
+        // its title may show one string with no terminator, and that string,
+        // arguments and all, is its argv[0]: its own choice, and bounded.
         let empty = CallerHints::from_reads(None, Some(b""), None);
-        assert_eq!(
-            lines(&empty)[1],
-            format!("hint_cmdline=argv0:\"\" argc:0 len:0 sha256:{}", short(b""))
-        );
+        assert_eq!(lines(&empty)[1], "hint_cmdline=argv0:\"\" argc:0 len:0");
         let title = CallerHints::from_reads(None, Some(b"sshd: alice"), None);
-        assert!(lines(&title)[1].starts_with("hint_cmdline=argv0:\"sshd: alice\" argc:1 len:11 "));
+        assert_eq!(
+            lines(&title)[1],
+            "hint_cmdline=argv0:\"sshd: alice\" argc:1 len:11"
+        );
         let blank = CallerHints::from_reads(None, Some(b"\0"), None);
-        assert!(lines(&blank)[1].starts_with("hint_cmdline=argv0:\"\" argc:1 len:1 "));
+        assert_eq!(lines(&blank)[1], "hint_cmdline=argv0:\"\" argc:1 len:1");
     }
 
     #[test]
@@ -325,15 +349,14 @@ mod tests {
         argv.extend(std::iter::repeat_n(b"a\0".as_slice(), 1 << 16).flatten());
         let path = vec![b'x'; 5000];
         let hints = CallerHints::from_reads(Some(&path), Some(&argv), Some(&argv));
-        let [exe, cmdline, claudecode] = hints.evidence();
+        let [exe, cmdline, claudecode] = three(&hints);
         let window = argv.get(..HINT_READ_MAX).unwrap();
         assert_eq!(
             cmdline,
             format!(
-                "hint_cmdline=argv0:\"{}\"\u{2026} argc:{}+ len:{HINT_READ_MAX}+ sha256:{}",
+                "hint_cmdline=argv0:\"{}\"\u{2026} argc:{}+ len:{HINT_READ_MAX}+",
                 "x".repeat(HINT_ARGV0_MAX),
-                window.find_iter("\0").count() + 1,
-                short(window)
+                window.find_iter("\0").count() + 1
             )
         );
         assert_eq!(exe.len(), "hint_exe=\"\"\u{2026}".len() + HINT_EXE_MAX);
@@ -353,7 +376,7 @@ mod tests {
             Some(b"unavailable\" argc:0\x1b[2J\xff\0-p\0"),
             None,
         );
-        let [exe, cmdline, claudecode] = hints.evidence();
+        let [exe, cmdline, claudecode] = three(&hints);
         assert_eq!(exe, "hint_exe=\"/x\\\" via=harness\\n\"");
         assert!(
             cmdline.starts_with(
@@ -362,6 +385,32 @@ mod tests {
             "{cmdline}"
         );
         assert_eq!(claudecode, "hint_claudecode=unavailable");
+    }
+
+    #[test]
+    fn a_comm_is_quoted_capped_and_first_and_the_gate_records_none() {
+        let hints = CallerHints::from_reads(Some(b"/usr/bin/xudo"), None, None);
+        assert_eq!(lines(&hints).len(), 3);
+        let named = hints.clone().with_comm(b"unavailable\" via=harness\n");
+        assert_eq!(
+            lines(&named),
+            [
+                "hint_comm=\"unavailable\\\" via=harness\\n\"",
+                "hint_exe=\"/usr/bin/xudo\"",
+                "hint_cmdline=unavailable",
+                "hint_claudecode=unavailable",
+            ]
+        );
+        let long = CallerHints::unavailable().with_comm(&[b'c'; HINT_COMM_MAX + 1]);
+        assert_eq!(
+            lines(&long)[0],
+            format!("hint_comm=\"{}\"\u{2026}", "c".repeat(HINT_COMM_MAX))
+        );
+        assert_eq!(
+            format!("{named:?}"),
+            "CallerHints { .. }",
+            "the comm shows in Debug no more than the rest"
+        );
     }
 
     #[test]
@@ -420,10 +469,7 @@ mod tests {
             lines(&pinned_hints(&peer(500), 7, 500)),
             [
                 "hint_exe=\"/usr/bin/claude\"".to_owned(),
-                format!(
-                    "hint_cmdline=argv0:\"claude\" argc:1 len:7 sha256:{}",
-                    short(b"claude\0")
-                ),
+                "hint_cmdline=argv0:\"claude\" argc:1 len:7".to_owned(),
                 "hint_claudecode=set:\"1\"".to_owned(),
             ]
         );
@@ -454,16 +500,28 @@ mod tests {
             let mut environ = b"CLAUDECODE=".to_vec();
             environ.extend(value.iter().filter(|b| **b != 0));
             let hints = CallerHints::from_reads(Some(&exe), Some(&cmdline), Some(&environ));
-            let total: usize = hints.evidence().iter().map(String::len).sum();
+            let named = hints.clone().with_comm(&exe);
+            let total: usize = named.evidence().iter().map(String::len).sum();
             // Four bytes per escaped byte, plus prefixes, counts and markers.
-            prop_assert!(total < 4 * (HINT_EXE_MAX + HINT_ARGV0_MAX) + 256);
-            for line in hints.evidence() {
+            prop_assert!(total < 4 * (HINT_EXE_MAX + HINT_ARGV0_MAX + HINT_COMM_MAX) + 256);
+            for line in named.evidence() {
                 prop_assert!(line.replace('\u{2026}', "").is_ascii(), "{line}");
                 prop_assert!(!line.contains('\n'), "{line}");
             }
             // No argument after the first, and no value but `1`, survives.
-            let [_, rendered_cmdline, rendered_env] = hints.evidence();
-            prop_assert!(rendered_cmdline.ends_with(&short(&cmdline)), "{rendered_cmdline}");
+            let [_, rendered_cmdline, rendered_env] = three(&hints);
+            // After argv[0], only the count and the length: no digest.
+            let tail = rendered_cmdline.rsplit_once(" argc:").map_or("", |(_, tail)| tail);
+            let numbers: Vec<&str> = tail.split(" len:").collect();
+            prop_assert_eq!(numbers.len(), 2, "{}", rendered_cmdline);
+            for number in numbers {
+                let digits = number.strip_suffix('+').unwrap_or(number);
+                prop_assert!(
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+                    "{}",
+                    rendered_cmdline
+                );
+            }
             prop_assert!(
                 rendered_env == "hint_claudecode=set:\"1\""
                     || rendered_env.starts_with("hint_claudecode=set:other(len="),

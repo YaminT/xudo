@@ -2463,14 +2463,11 @@ mod tests {
             Some(posing.as_bytes()),
             Some(format!("CLAUDECODE={posing}").as_bytes()),
         );
-        let only_hints = bound.clone().with_evidence(hints.evidence().to_vec());
+        let only_hints = bound.clone().with_evidence(hints.evidence());
         assert!(!gate_record_binds(&stored, &only_hints));
-        let mut with_comm = hints.evidence().to_vec();
-        with_comm.push(format!(
-            "hint_comm=\"{}\"",
-            posing.as_bytes().escape_ascii()
-        ));
-        let with_comm = bound.clone().with_evidence(with_comm);
+        let with_comm = bound
+            .clone()
+            .with_evidence(hints.with_comm(posing.as_bytes()).evidence());
         assert!(!gate_record_binds(&stored, &with_comm));
     }
 

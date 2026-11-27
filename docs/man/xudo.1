@@ -960,10 +960,13 @@ escaped and quoted, or
 when they could not be read from the pinned process.
 Of the command line only
 .BR argv[0] ,
-the argument count, the length and the first 8 hex digits of its SHA-256
-are recorded, never an argument, so a password on a command line is not
-copied to the audit trail or the journal, for example
-.BR "hint_cmdline=argv0:\(dq/usr/bin/sudo\(dq argc:3 len:41 sha256:ab12cd34" .
+the argument count and the length are recorded, never an argument and no
+digest of one, so a password on a command line is not copied to the audit
+trail or the journal, for example
+.BR "hint_cmdline=argv0:\(dq/usr/bin/sudo\(dq argc:3 len:41" .
+.B argv[0]
+is whatever the caller made it, cut at 256 bytes: a process that rewrote
+its title as one string records that whole string there.
 Of the environment only
 .BR CLAUDECODE 's
 presence is recorded:

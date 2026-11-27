@@ -186,10 +186,6 @@ fn identity_evidence(peer: &Identified) -> Vec<String> {
         format!("peer_gid={}", identity.gid),
         format!("pinned={}", identity.pinned),
         format!("euid_from={}", identity.euid_source.label()),
-        // A hint, never a fact: escaped and quoted like the others, so any
-        // byte the peer named itself with reads as itself and cannot pose as
-        // another field or as the bare word `unavailable`.
-        format!("hint_comm=\"{}\"", identity.comm.escape_ascii()),
     ];
     evidence.extend(peer.hints.evidence());
     if let Some(id) = identity.cgroup_id {
@@ -236,7 +232,7 @@ mod tests {
     use crate::identify::EuidSource;
 
     fn identity(cgroup_id: Option<u64>) -> Identified {
-        crate::identify::PeerIdentity {
+        let identity = crate::identify::PeerIdentity {
             rung: Attestation::PeerPidfdInfo,
             pid: 4242,
             uid: 1000,
@@ -244,15 +240,17 @@ mod tests {
             starttime: 998_877,
             sid: 1,
             tty: 0,
-            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id,
             cgroup_attestation: crate::identify::CgroupAttestation::NotChecked,
             cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
+        };
+        Identified {
+            identity,
+            hints: xudo_sys::CallerHints::unavailable().with_comm(b"xudo"),
         }
-        .into()
     }
 
     fn caller() -> CallerFacts {
@@ -513,7 +511,7 @@ mod tests {
     #[test]
     fn a_comm_posing_as_another_field_is_recorded_escaped_under_its_prefix() {
         let mut peer = identity(None);
-        peer.identity.comm = b"via=harness\x1b[2J\n\xff".to_vec();
+        peer.hints = xudo_sys::CallerHints::unavailable().with_comm(b"via=harness\x1b[2J\n\xff");
         let evidence = identity_evidence(&peer);
         assert!(
             evidence.contains(&"hint_comm=\"via=harness\\x1b[2J\\n\\xff\"".to_owned()),
@@ -525,7 +523,7 @@ mod tests {
     #[test]
     fn a_process_named_unavailable_is_not_read_as_the_sentinel() {
         let mut peer = identity(None);
-        peer.identity.comm = b"unavailable".to_vec();
+        peer.hints = xudo_sys::CallerHints::unavailable().with_comm(b"unavailable");
         let evidence = identity_evidence(&peer);
         assert!(evidence.contains(&"hint_comm=\"unavailable\"".to_owned()));
         assert!(!evidence.contains(&"hint_comm=unavailable".to_owned()));
@@ -575,8 +573,8 @@ mod tests {
         let mut environ = b"CLAUDECODE=".to_vec();
         environ.extend(&junk);
         let mut peer = identity(Some(77));
-        peer.identity.comm = vec![0xff; 15];
-        peer.hints = xudo_sys::CallerHints::from_reads(Some(&junk), Some(&junk), Some(&environ));
+        peer.hints = xudo_sys::CallerHints::from_reads(Some(&junk), Some(&junk), Some(&environ))
+            .with_comm(&junk);
         peer
     }
 

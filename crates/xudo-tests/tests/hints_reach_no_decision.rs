@@ -45,13 +45,14 @@ const TOKENS: &[(&str, Bound)] = &[
     ("Exe", Bound::Word),
     ("Cmdline", Bound::Word),
     ("Environ", Bound::Word),
+    ("comm", Bound::Word),
 ];
 
 /// The files that may name a hint, how many times, and why. Nothing else may.
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
         "crates/xudo-sys/src/caller_hints.rs",
-        24,
+        38,
         "defines the hints; they render to audit lines only",
     ),
     (
@@ -66,7 +67,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/xudo-sys/src/provenance.rs",
-        2,
+        8,
         "the front end's collector, shown by `xudo doctor`, sent nowhere",
     ),
     (
@@ -86,13 +87,28 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/xudod/src/identify.rs",
-        9,
-        "reads the peer's hints while the pidfd holds it, beside the identity",
+        10,
+        "reads the peer's hints while the pidfd holds it, and its comm from stat, beside the identity",
     ),
     (
         "crates/xudod/src/record.rs",
-        2,
+        1,
         "writes them into the audit record",
+    ),
+    (
+        "crates/xudo-sys/src/proc.rs",
+        5,
+        "parses comm out of stat, its field and two error messages; the identity never keeps it",
+    ),
+    (
+        "crates/xudo-sys/src/own.rs",
+        1,
+        "the test double's stat names a comm",
+    ),
+    (
+        "crates/xudod/src/unit_record.rs",
+        1,
+        "hands the gate's namespace check a process with an empty comm",
     ),
     (
         "crates/xudo-gate/src/run.rs",
@@ -410,6 +426,7 @@ fn the_hints_type_has_no_accessor_a_decision_could_read() {
         [
             "unavailable",
             "from_reads",
+            "with_comm",
             "evidence",
             "peer_hints",
             "pinned_hints"
@@ -424,16 +441,81 @@ fn the_hints_type_has_no_accessor_a_decision_could_read() {
     assert!(!code.contains("derive(Clone, Debug"), "{code}");
 }
 
+/// The field names of `pub struct <name> { .. }` in `code`, outside tests.
+fn struct_fields(code: &str, name: &str) -> Vec<String> {
+    let open = format!("pub struct {name} {{");
+    let start = code.find(&open).unwrap() + open.len();
+    let body = &code[start..start + code[start..].find("\n}").unwrap()];
+    body.lines()
+        .map(str::trim_start)
+        .filter_map(|line| line.strip_prefix("pub "))
+        .filter_map(|line| line.split_once(':'))
+        .map(|(field, _)| field.trim().to_owned())
+        .collect()
+}
+
+/// What in `identify.rs` would hand a decision a hint: a field of
+/// `PeerIdentity` that is a hint word, or an `Identified` that holds more
+/// than the identity and the hints, or derefs to anything but the identity.
+fn identity_leaks(source: &str) -> Vec<String> {
+    let code = without_tests(source);
+    let mut leaks: Vec<String> = struct_fields(&code, "PeerIdentity")
+        .into_iter()
+        .filter(|field| !named(field).is_empty() || field.contains("hint"))
+        .map(|field| format!("PeerIdentity.{field}"))
+        .collect();
+    let beside = struct_fields(&code, "Identified");
+    if beside != ["identity", "hints"] {
+        leaks.push(format!("Identified holds {beside:?}"));
+    }
+    if !code.contains("type Target = PeerIdentity;") {
+        leaks.push("Identified derefs to something else".to_owned());
+    }
+    leaks
+}
+
 #[test]
 fn the_identity_decisions_are_handed_carries_no_hint() {
-    // The broker hands decisions a `PeerIdentity`; the hints sit beside it in
-    // `Identified`, which only the record reads.
+    // The broker hands decisions a `PeerIdentity`; the hints, `comm` among
+    // them, sit beside it in `Identified`, which only the record reads.
     let source = fs::read_to_string(repo().join("crates/xudod/src/identify.rs")).unwrap();
     let code = without_tests(&source);
-    let start = code.find("pub struct PeerIdentity {").unwrap();
-    let body = &code[start..start + code[start..].find("\n}").unwrap()];
-    assert!(named(body).is_empty(), "{body}");
-    assert!(code.contains("pub struct Identified {"), "{code}");
+    let fields = struct_fields(&code, "PeerIdentity");
+    for kernel in ["pid", "uid", "starttime", "cgroup_attestation"] {
+        assert!(fields.contains(&kernel.to_owned()), "{fields:?}");
+    }
+    assert_eq!(identity_leaks(&source), Vec::<String>::new());
+}
+
+#[test]
+fn the_identity_check_catches_a_hint_put_back_into_the_identity() {
+    let source = fs::read_to_string(repo().join("crates/xudod/src/identify.rs")).unwrap();
+    let with_comm = source.replacen(
+        "pub struct PeerIdentity {\n",
+        "pub struct PeerIdentity {\n    pub comm: Vec<u8>,\n",
+        1,
+    );
+    assert_eq!(identity_leaks(&with_comm), ["PeerIdentity.comm"]);
+    let with_exe = source.replacen(
+        "pub struct PeerIdentity {\n",
+        "pub struct PeerIdentity {\n    pub hint_exe: String,\n",
+        1,
+    );
+    assert_eq!(identity_leaks(&with_exe), ["PeerIdentity.hint_exe"]);
+    let beside = source.replacen(
+        "    pub hints: CallerHints,\n",
+        "    pub hints: CallerHints,\n    pub comm: Vec<u8>,\n",
+        1,
+    );
+    assert_eq!(
+        identity_leaks(&beside),
+        ["Identified holds [\"identity\", \"hints\", \"comm\"]"]
+    );
+    let deref = source.replacen("type Target = PeerIdentity;", "type Target = Self;", 1);
+    assert_eq!(
+        identity_leaks(&deref),
+        ["Identified derefs to something else"]
+    );
 }
 
 /// A decision that destructures the hints and branches on their `Debug`
@@ -456,6 +538,12 @@ fn the_scan_catches_a_decision_that_branches_on_a_hint() {
             "crates/xudod/src/serve.rs: names `hints` outside its tests",
             "crates/xudod/src/serve.rs: names `hint_` outside its tests",
         ]
+    );
+    // A process's name is a hint too, wherever it was parsed.
+    let named_comm = "fn decide(stat: &ProcStat) -> bool {\n    stat.comm == b\"claude\"\n}\n";
+    assert_eq!(
+        problems("crates/xudo-gate/src/decide.rs", named_comm),
+        ["crates/xudo-gate/src/decide.rs: names `comm` outside its tests"]
     );
     // The same text in an inline test module is fine.
     let tested = format!("fn x() {{}}\n#[cfg(test)]\nmod tests {{\n{SMUGGLED}}}\n");

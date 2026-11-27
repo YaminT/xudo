@@ -2187,15 +2187,13 @@ args = [
             (status2, message2, decisions2),
             (status, message, decisions)
         );
-        for line in ["hint_exe=\"/usr/bin/claude\"", "hint_claudecode=set:\"1\""] {
+        for line in [
+            "hint_exe=\"/usr/bin/claude\"",
+            "hint_cmdline=argv0:\"claude\" argc:2 len:38",
+            "hint_claudecode=set:\"1\"",
+        ] {
             assert!(hinted.contains(&line.to_owned()), "{line} in {hinted:?}");
         }
-        assert!(
-            hinted
-                .iter()
-                .any(|line| line.starts_with("hint_cmdline=argv0:\"claude\" argc:2 len:38 ")),
-            "{hinted:?}"
-        );
         let all = hinted.join(" ");
         assert!(!all.contains("AI_AGENT"), "{all}");
         assert!(!all.contains("dangerously"), "{all}");

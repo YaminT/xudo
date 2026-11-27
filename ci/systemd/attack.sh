@@ -419,10 +419,10 @@ for line in sys.stdin:
             hints[k] for k in ("hint_comm", "hint_exe", "hint_cmdline", "hint_claudecode") if k in hints))
 '
 }
-# Of the command line only argv[0], the count, the length and a digest are
-# recorded, never an argument.
+# Of the command line only argv[0], the count and the length are recorded,
+# never an argument and no digest.
 claude_argv() { printf '%s\000exec\000--\000%s\000-un\000' "$e7/claude" "$gate_exe"; }
-claude_cmdline="argv0:\"$e7/claude\" argc:5 len:$(claude_argv | wc -c | tr -d ' ') sha256:$(claude_argv | sha256sum | cut -c1-8)"
+claude_cmdline="argv0:\"$e7/claude\" argc:5 len:$(claude_argv | wc -c | tr -d ' ')"
 mark=$(trail_len)
 as_harness e7-lane hint-human "$e7/claude exec -- $gate_exe -un"
 claude_trail=$(hints_since "$mark")

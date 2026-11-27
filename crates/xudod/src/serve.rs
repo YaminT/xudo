@@ -11441,7 +11441,6 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             starttime,
             sid,
             tty,
-            comm: b"xudo".to_vec(),
             diverged: false,
             pinned: true,
             cgroup_id: None,
@@ -11463,18 +11462,18 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         hints: Option<HintRow<'_>>,
         request: &BrokerRequest,
     ) -> (Served, Answer, Vec<Record>) {
-        let mut host = Host::honest();
+        let mut host = with_test_boot(Host::honest());
         let mut identity = test_identity(PID, START, 0, 0);
         match kind {
             0 => identity = enrolled_identity(&mut host),
             1 => identity.cgroup_attestation = crate::identify::CgroupAttestation::Outside,
             _ => identity.cgroup_attestation = crate::identify::CgroupAttestation::Recordless,
         }
+        host.policy.answer = Ok(hint_policy());
         let hints = hints.map_or_else(
             xudo_sys::CallerHints::unavailable,
             |(comm, exe, cmd, env)| {
-                identity.comm = comm.to_vec();
-                xudo_sys::CallerHints::from_reads(Some(exe), Some(cmd), Some(env))
+                xudo_sys::CallerHints::from_reads(Some(exe), Some(cmd), Some(env)).with_comm(comm)
             },
         );
         let conn = connection(Ok(request.to_json().into_bytes()));
@@ -11502,8 +11501,37 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
         (served, answer, records)
     }
 
-    /// A rule that runs, one that always confirms, and none at all.
-    fn hint_requests() -> [BrokerRequest; 3] {
+    /// The serve tests' rules, plus an ask-human rule and a remove-path
+    /// operation for the `codex` harness, so every path that writes a record
+    /// is reachable from [`hint_requests`].
+    fn hint_policy() -> LoadedPolicy {
+        const HARNESS: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 4\n";
+        const MORE: &str = "[[action]]\nid = \"xudo.queue.review\"\ntier = \"diag-read\"\nexe = \"/usr/bin/apt-get\"\nargs = [{ name = \"verb\", matcher = { literal = \"upgrade\" } }]\nharness = [\"codex\"]\noutcome = \"ask-human\"\ngtfobins-waiver = \"package upgrade pager escape: the only operand is a literal upgrade, so no option or program can be passed to it at all\"\n\n[[operation]]\nid = \"web.clean-build\"\nop = \"remove-path\"\nunder = \"/srv/app/build\"\nrecursive = true\nmax-depth = 4\nmax-entries = 10\nowners = [\"agent\"]\nharness = [\"codex\"]\noutcome = \"allow\"\n";
+        let mut loaded = policy();
+        loaded.rules = load_policy(
+            vec![
+                RuleFile {
+                    name: b"10-test.toml".to_vec(),
+                    bytes: RULES.as_bytes().to_vec(),
+                },
+                RuleFile {
+                    name: b"20-hints.toml".to_vec(),
+                    bytes: MORE.as_bytes().to_vec(),
+                },
+            ],
+            &[HarnessFile {
+                name: b"codex.toml".to_vec(),
+                bytes: HARNESS.as_bytes().to_vec(),
+            }],
+        )
+        .unwrap();
+        loaded.passwd = "agent:x:1000:1000:Agent:/home/agent:/bin/sh\n".to_owned();
+        loaded
+    }
+
+    /// A rule that runs, one that always confirms, none at all, an ask-human
+    /// rule, a remove-path, and two questions that are not a run.
+    fn hint_requests() -> [BrokerRequest; 7] {
         let ask = |program: &str, argv: &[&str]| {
             BrokerRequest::new(
                 program,
@@ -11515,6 +11543,10 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
             ask("/usr/bin/systemctl", &["restart", "nginx.service"]),
             ask("/usr/bin/apt-get", &["-y", "remove", "gcc"]),
             ask("/usr/bin/id", &[]),
+            ask("/usr/bin/apt-get", &["upgrade"]).with_cwd_bytes(b"/srv".to_vec()),
+            remove_question(b"/srv/app/build/out", false),
+            answer_request(NONCE, "remove", true),
+            freeze_request(),
         ]
     }
 
@@ -11565,15 +11597,21 @@ args = [{ name = "c", matcher = { literal = "-c" } }]
                 baselines.push(baseline);
             }
         }
-        // The baseline is not trivially one answer for everyone.
-        assert_ne!(baselines[0].1, baselines[3].1);
+        // The baseline is not trivially one answer for everyone, every
+        // question wrote a record a hint would sit in, and the harness's
+        // ask-human request reached the queue.
+        assert_ne!(baselines[0].1, baselines[7].1);
+        for (at, baseline) in baselines.iter().enumerate() {
+            assert!(!baseline.2.is_empty(), "{at}: {baseline:?}");
+        }
+        assert_eq!(denial_of(&baselines[3].1), Some(DenialCode::AskHuman));
     }
 
     proptest::proptest! {
         #[test]
         fn hints_never_change_a_decision_for_any_bytes(
             kind in 0usize..3,
-            which in 0usize..3,
+            which in 0usize..7,
             comm in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..16),
             exe in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
             cmd in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
