@@ -397,53 +397,59 @@ else
     bad "$case_name"
     printf '%s\n' "$hout" >&2
 fi
-# The broker records the requester's comm, exe and CLAUDECODE as hints
-# (`hint_comm=`, `hint_exe=`, `hint_claudecode=`) and decides without them: a
-# copy of xudo named `claude`, asked from the impostor (CLAUDECODE=1) and from
-# the real harness, is recorded under that name and path and classified as
-# before, human and harness.
+# The requester's comm, exe, command line and CLAUDECODE are recorded as
+# hints (`hint_comm=`, `hint_exe=`, `hint_cmdline=`, `hint_claudecode=`) and
+# decided without: a copy of xudo named `claude`, asked from the impostor
+# (CLAUDECODE=1) and from the real harness, is classified as before, human and
+# harness. The broker has no capabilities, so the kernel shows it another
+# uid's command line but not its exe or environ: those read `unavailable` in
+# its record, and a broker that could read them has gained CAP_SYS_PTRACE,
+# which must fail here. The gate runs as root and records all three.
 install -m 0755 /usr/bin/xudo "$e7/claude"
-# hints_since <mark>: classification, decision and the comm, exe and
-# CLAUDECODE hints of each broker record (the ones with `hint_comm=`; the
-# gate's records carry the other hints too).
+# hints_since <mark>: classification, decision and hints of each record that
+# has any; the broker's carry hint_comm, the gate's do not.
 hints_since() {
     tail -n +"$(($1 + 1))" "$audit" | python3 -c '
 import json, sys
 for line in sys.stdin:
     r = json.loads(line)
     hints = {e.split("=", 1)[0]: e for e in r["evidence"] if e.startswith("hint_")}
-    if "hint_comm" in hints:
+    if hints:
         print(r["classification"], r["decision"], " ".join(
-            hints.get(k, k + "=missing") for k in ("hint_comm", "hint_exe", "hint_claudecode")))
+            hints[k] for k in ("hint_comm", "hint_exe", "hint_cmdline", "hint_claudecode") if k in hints))
 '
 }
+claude_cmdline=$(printf '"%s\\x00exec\\x00--\\x00%s\\x00-un"' "$e7/claude" "$gate_exe")
 mark=$(trail_len)
 as_harness e7-lane hint-human "$e7/claude exec -- $gate_exe -un"
 claude_trail=$(hints_since "$mark")
 human_path an_impostor_named_claude_is_human human
-case_name=an_impostors_comm_exe_and_claudecode_are_recorded_and_not_trusted
-if [ "$claude_trail" = "human allowed hint_comm=claude hint_exe=\"$e7/claude\" hint_claudecode=\"1\"" ]; then
+case_name=an_impostors_comm_and_cmdline_are_recorded_and_not_trusted
+if [ "$claude_trail" = "human allowed hint_comm=claude hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ]; then
     good "$case_name"
 else
     bad "$case_name"
-    printf '%s\n' "$claude_trail" >&2
+    printf '%s\n%s\n' "$claude_trail" "$claude_cmdline" >&2
 fi
 mark=$(trail_len)
 as_harness lane hint-harness "$e7/claude exec -- $gate_exe -un"
 case_name=a_harness_named_claude_is_still_only_its_scope
 harness_trail=$(hints_since "$mark")
-case $harness_trail in
-"enrolled-agent allowed hint_comm=claude hint_exe=\"$e7/claude\" hint_claudecode="*) harness_hints=yes ;;
-*) harness_hints= ;;
+broker_line=$(printf '%s\n' "$harness_trail" | sed -n 1p)
+gate_line=$(printf '%s\n' "$harness_trail" | sed -n 2p)
+case $gate_line in
+"enrolled-agent allowed hint_exe=\"$e7/claude\" hint_cmdline=$claude_cmdline hint_claudecode="*) gate_hints=yes ;;
+*) gate_hints= ;;
 esac
-if [ "$hrc" = 0 ] && has_root_line "$hout" && [ -n "$harness_hints" ] &&
-    [ "$(printf '%s\n' "$harness_trail" | wc -l)" = 1 ] &&
+if [ "$hrc" = 0 ] && has_root_line "$hout" &&
+    [ "$broker_line" = "enrolled-agent allowed hint_comm=claude hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ] &&
+    [ -n "$gate_hints" ] && [ "$(printf '%s\n' "$harness_trail" | wc -l)" = 2 ] &&
     e7_trail "$mark" | grep -q '^enrolled-agent allowed - g1f.whoami gate_mode=Nopass via=harness'; then
     good "$case_name"
 else
     bad "$case_name"
     show "$case_name"
-    printf '%s\n' "$harness_trail" >&2
+    printf '%s\n%s\n' "$harness_trail" "$claude_cmdline" >&2
 fi
 rm -f "$e7/claude"
 systemctl stop e7-impostor.service

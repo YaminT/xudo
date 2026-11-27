@@ -959,6 +959,12 @@ and
 escaped, or
 .B unavailable
 when they could not be read from the pinned process.
+The broker runs without capabilities, so the kernel shows it another
+user's command line but not its
+.B exe
+or environment; its records carry those two as
+.BR unavailable ,
+and the gate, which runs as root, records them.
 Authorization does not branch on them.
 An unattested caller takes the human path and is asked for a password.
 .PP
