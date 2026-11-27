@@ -80,7 +80,7 @@ pub use audit::{
     AUDIT_DIR, AUDIT_FILE_NAME, Approval, AuditError, AuditMirror, AuditReceipt, AuditSink,
     AuditTrail, Authorized, JOURNAL_SOCKET, JournaldSink, JsonlLog, authorize,
 };
-pub use caller_hints::{CallerHints, pinned_hints};
+pub use caller_hints::{CallerHints, peer_hints, pinned_hints};
 pub use cgroup::{
     CgroupCalls, CgroupIdentity, CgroupRung, HostCgroup, ProcessSecurityStatus, RecordIdentity,
     SERVICE_RECORD_PREFIX, Scope, ScopeFacts, ScopeKind, is_record_name,

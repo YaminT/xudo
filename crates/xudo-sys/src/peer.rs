@@ -79,6 +79,11 @@ pub enum ProcFile {
     Environ,
 }
 
+/// How much of a hint file the broker reads: the window, and one byte to
+/// tell a longer file from one that fills it.
+#[cfg(target_os = "linux")]
+const HINT_READ_CAP: u64 = crate::caller_hints::HINT_READ_MAX as u64 + 1;
+
 impl ProcFile {
     /// The file's name under `/proc/<pid>`.
     pub fn name(self) -> &'static str {
@@ -188,10 +193,12 @@ impl PeerCalls for HostPeer {
 
         let source = crate::source::DirSource::proc();
         let relative = format!("{pid}/{}", file.name());
-        if file == ProcFile::Exe {
-            source.read_link(&relative)
-        } else {
-            source.read(&relative)
+        match file {
+            ProcFile::Exe => source.read_link(&relative),
+            // The caller sizes these, up to about 6 MiB: read one byte past
+            // the window the hints look at, and never more.
+            ProcFile::Cmdline | ProcFile::Environ => source.read_prefix(&relative, HINT_READ_CAP),
+            ProcFile::Stat | ProcFile::Status | ProcFile::UidMap => source.read(&relative),
         }
     }
 
@@ -1022,6 +1029,11 @@ mod tests {
                     .is_empty()
             );
             assert!(HostPeer.read_proc(own, ProcFile::Environ).is_ok());
+            // The status file is read whole, the hint files at most to the cap.
+            assert!(HostPeer.read_proc(own, ProcFile::Status).is_ok());
+            assert!(
+                HostPeer.read_proc(own, ProcFile::Cmdline).unwrap().len() as u64 <= HINT_READ_CAP
+            );
             assert!(HostPeer.read_proc(4_194_999, ProcFile::Exe).is_err());
         }
 

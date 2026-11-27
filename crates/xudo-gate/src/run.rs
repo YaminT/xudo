@@ -2187,14 +2187,46 @@ args = [
             (status2, message2, decisions2),
             (status, message, decisions)
         );
-        for line in [
-            "hint_exe=\"/usr/bin/claude\"",
-            "hint_cmdline=\"claude\\x00--dangerously-skip-permissions\"",
-            "hint_claudecode=\"1\"",
-        ] {
+        for line in ["hint_exe=\"/usr/bin/claude\"", "hint_claudecode=set:\"1\""] {
             assert!(hinted.contains(&line.to_owned()), "{line} in {hinted:?}");
         }
-        assert!(!hinted.iter().any(|line| line.contains("AI_AGENT")));
+        assert!(
+            hinted
+                .iter()
+                .any(|line| line.starts_with("hint_cmdline=argv0:\"claude\" argc:2 len:38 ")),
+            "{hinted:?}"
+        );
+        let all = hinted.join(" ");
+        assert!(!all.contains("AI_AGENT"), "{all}");
+        assert!(!all.contains("dangerously"), "{all}");
+    }
+
+    #[test]
+    fn a_requesters_largest_hints_cannot_swell_the_gate_record_toward_the_limit() {
+        // Every byte the worst kind, far past every cap, on the requester the
+        // entry is pinned to: the hints add under 8 KiB to the record.
+        let size = |proc: MapSource| {
+            let spool = Rc::new(holding(&[(NONCE_A, ours())]));
+            let mut host = FakeHost::new(&spool);
+            host.proc = Ok(proc);
+            let _ = run(&mut host, &auth());
+            let records = host.audit.records();
+            assert!(has_line(&records[0].evidence, "nonce="), "{records:?}");
+            records[0].to_jsonl().len()
+        };
+        let junk = vec![0xff_u8; 1 << 20];
+        let mut environ = b"CLAUDECODE=".to_vec();
+        environ.extend(&junk);
+        let plain = size(proc_tree());
+        let hostile = size(
+            proc_tree()
+                .with_link("200/exe", junk.clone())
+                .with("200/cmdline", junk.clone())
+                .with("200/environ", environ),
+        );
+        assert!(hostile > plain + 4096, "{plain} -> {hostile}");
+        assert!(hostile - plain < 8 * 1024, "{plain} -> {hostile}");
+        assert!(hostile < xudo_audit::MAX_RECORD_BYTES);
     }
 
     #[test]

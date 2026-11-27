@@ -124,6 +124,37 @@ impl DirSource {
     }
 }
 
+/// Reads at most `cap` bytes of `reader`, however much it holds.
+///
+/// For a file a caller controls the size of, like `/proc/<pid>/cmdline`,
+/// which the kernel lets reach about 6 MiB: the bound is on the read, so
+/// nothing past it is ever copied.
+///
+/// # Errors
+///
+/// Returns the reader's error.
+pub fn read_prefix(reader: &mut dyn std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    reader.take(cap).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+impl DirSource {
+    /// The first `cap` bytes of a file under the root, never more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Read`] when the file cannot be opened or read.
+    pub fn read_prefix(&self, relative: &str, cap: u64) -> Result<Vec<u8>, SysError> {
+        let path = self.resolve(relative)?;
+        std::fs::File::open(&path)
+            .and_then(|mut file| read_prefix(&mut file, cap))
+            .map_err(|e| SysError::read(relative, e.to_string()))
+    }
+}
+
 /// Refuses a path that is empty, absolute, or has an empty, current, or parent
 /// component: the lexical rule every source holds its relative paths to.
 pub(crate) fn check_relative(relative: &str) -> Result<(), SysError> {
@@ -354,6 +385,64 @@ mod tests {
         // And the well-formed version of the same path still works, so the
         // check is not simply refusing everything.
         assert!(source.read("100/stat").is_ok());
+    }
+
+    /// A reader of `size` bytes that counts how many it handed out.
+    struct Counting {
+        left: usize,
+        handed: usize,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            buf.iter_mut().take(n).for_each(|byte| *byte = b'x');
+            self.left -= n;
+            self.handed += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_six_mib_file_is_read_only_up_to_the_cap() {
+        // The largest `cmdline` the kernel lets a caller make: the root
+        // broker must not copy it to keep a few hundred bytes.
+        let mut file = Counting {
+            left: 6 << 20,
+            handed: 0,
+        };
+        let bytes = read_prefix(&mut file, 64 * 1024 + 1).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024 + 1);
+        assert_eq!(file.handed, 64 * 1024 + 1, "read past the cap");
+        let mut short = Counting {
+            left: 10,
+            handed: 0,
+        };
+        assert_eq!(read_prefix(&mut short, 64).unwrap(), b"xxxxxxxxxx");
+    }
+
+    #[test]
+    fn a_reader_that_fails_fails_the_prefix() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken"))
+            }
+        }
+        assert!(read_prefix(&mut Broken, 8).is_err());
+    }
+
+    #[test]
+    fn a_directory_source_reads_a_prefix_and_refuses_what_it_cannot_open() {
+        let dir = DirSource::new(fixture_root());
+        let whole = dir.read("100/stat").unwrap();
+        assert_eq!(
+            dir.read_prefix("100/stat", 5).unwrap(),
+            whole.get(..5).unwrap()
+        );
+        assert_eq!(dir.read_prefix("100/stat", 1 << 20).unwrap(), whole);
+        assert!(dir.read_prefix("100/missing", 5).is_err());
+        assert!(dir.read_prefix("../100/stat", 5).is_err());
     }
 
     #[test]

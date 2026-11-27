@@ -237,7 +237,9 @@ fn identify_with_boot(
         )
         .with_exit(Ok(false));
     let clock = xudo_sys::FixedClock(100);
-    identify_classified(fd.as_fd(), &syscalls, &peer, cgroup, &clock).unwrap()
+    identify_classified(fd.as_fd(), &syscalls, &peer, cgroup, &clock)
+        .unwrap()
+        .identity
 }
 
 #[test]

@@ -91,11 +91,6 @@ pub struct PeerIdentity {
     /// gave itself. An unauthenticated hint (invariant 1), recorded in the
     /// audit trail and never read by a decision.
     pub comm: Vec<u8>,
-    /// Its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd held it:
-    /// unauthenticated hints like `comm`, recorded and never decided on.
-    /// `unavailable` on the rung with no pidfd, where a read by number could
-    /// be another process's.
-    pub hints: CallerHints,
     /// Whether namespace facts diverge from the broker's identity namespace.
     pub diverged: bool,
     /// Whether a pidfd held the process while `/proc` was read and the
@@ -112,6 +107,41 @@ pub struct PeerIdentity {
     pub cgroup_rung: Option<CgroupRung>,
     /// Where the current effective uid that was compared came from.
     pub euid_source: EuidSource,
+}
+
+/// A peer's identity, and beside it what it claims about itself.
+///
+/// The hints are its `exe`, `cmdline` and `CLAUDECODE`, read while the pidfd
+/// held it: unauthenticated (invariant 1), `unavailable` on the rung with no
+/// pidfd, where a read by number could be another process's. They are not
+/// part of [`PeerIdentity`], so no decision, which is handed the identity,
+/// can reach them; only the audit record reads them. `Deref` hands out the
+/// identity alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identified {
+    /// What the kernel attested.
+    pub identity: PeerIdentity,
+    /// What the peer showed, for the audit record only.
+    pub hints: CallerHints,
+}
+
+impl std::ops::Deref for Identified {
+    type Target = PeerIdentity;
+
+    fn deref(&self) -> &PeerIdentity {
+        &self.identity
+    }
+}
+
+#[cfg(test)]
+impl From<PeerIdentity> for Identified {
+    /// An identity with no hints read, for tests that build one by hand.
+    fn from(identity: PeerIdentity) -> Self {
+        Self {
+            identity,
+            hints: CallerHints::unavailable(),
+        }
+    }
 }
 
 /// Where the peer's current effective uid was read.
@@ -268,7 +298,7 @@ pub fn identify(
     socket: BorrowedFd<'_>,
     syscalls: &dyn Syscalls,
     peers: &dyn PeerCalls,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     identify_inner(socket, syscalls, peers, None)
 }
 
@@ -285,7 +315,7 @@ pub fn identify_classified(
     peers: &dyn PeerCalls,
     cgroups: &dyn CgroupCalls,
     clock: &dyn Clock,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     identify_inner(socket, syscalls, peers, Some((cgroups, clock)))
 }
 
@@ -294,7 +324,7 @@ fn identify_inner(
     syscalls: &dyn Syscalls,
     peers: &dyn PeerCalls,
     cgroup_inputs: Option<(&dyn CgroupCalls, &dyn Clock)>,
-) -> Result<PeerIdentity, IdentifyError> {
+) -> Result<Identified, IdentifyError> {
     let cred = peers.peer_cred(socket).map_err(IdentifyError::PeerCred)?;
     // Pid 0 names no process: refuse it before any call that takes a pid.
     if cred.pid == 0 {
@@ -330,7 +360,7 @@ fn identify_inner(
 
     // Hints are read last by number, so the re-check below covers them too.
     let hints = match &pin {
-        Some(_) => peer_hints(cred.pid, peers),
+        Some(_) => xudo_sys::peer_hints(peers, cred.pid),
         None => CallerHints::unavailable(),
     };
 
@@ -350,7 +380,7 @@ fn identify_inner(
                 clock.boottime_millis(),
             )
         });
-    Ok(PeerIdentity {
+    let identity = PeerIdentity {
         rung: rung_of(pin.as_ref().map(|(_, source)| *source), info.is_some()),
         pid: cred.pid,
         uid: cred.uid,
@@ -359,7 +389,6 @@ fn identify_inner(
         sid: stat.session,
         tty: stat.tty_nr,
         comm: stat.comm,
-        hints,
         diverged: namespaces,
         pinned: pin.is_some(),
         cgroup_id: cgroup_result
@@ -370,7 +399,8 @@ fn identify_inner(
         cgroup_attestation: cgroup_result.0,
         cgroup_rung: cgroup_result.1.as_ref().map(|identity| identity.rung),
         euid_source,
-    })
+    };
+    Ok(Identified { identity, hints })
 }
 
 fn attest_cgroup(
@@ -490,15 +520,6 @@ fn namespace_facts(pid: u32, peers: &dyn PeerCalls, status: Option<&[u8]>) -> bo
         .read_proc(pid, ProcFile::UidMap)
         .is_ok_and(|bytes| is_identity_uid_map(&bytes));
     nested_pid || !identity_uid
-}
-
-/// The peer's hints. A file that cannot be read is `unavailable` and never
-/// fails identification: nothing decides on a hint.
-fn peer_hints(pid: u32, peers: &dyn PeerCalls) -> CallerHints {
-    let exe = peers.read_proc(pid, ProcFile::Exe).ok();
-    let cmdline = peers.read_proc(pid, ProcFile::Cmdline).ok();
-    let environ = peers.read_proc(pid, ProcFile::Environ).ok();
-    CallerHints::from_reads(exe.as_deref(), cmdline.as_deref(), environ.as_deref())
 }
 
 /// Confirms, through the pidfd, that the pinned process has not exited.
@@ -895,22 +916,24 @@ mod tests {
         let identity = identify(sock.as_fd(), &syscalls, &peers).unwrap();
         assert_eq!(
             identity,
-            PeerIdentity {
-                rung: Attestation::PeerPidfdInfo,
-                pid: PID,
-                uid: UID,
-                gid: GID,
-                starttime: START,
-                sid: 1,
-                tty: 0,
-                comm: b"xudo".to_vec(),
+            Identified {
+                identity: PeerIdentity {
+                    rung: Attestation::PeerPidfdInfo,
+                    pid: PID,
+                    uid: UID,
+                    gid: GID,
+                    starttime: START,
+                    sid: 1,
+                    tty: 0,
+                    comm: b"xudo".to_vec(),
+                    diverged: false,
+                    pinned: true,
+                    cgroup_id: Some(77),
+                    cgroup_attestation: CgroupAttestation::NotChecked,
+                    cgroup_rung: None,
+                    euid_source: EuidSource::PidfdInfo,
+                },
                 hints: honest_hints(),
-                diverged: false,
-                pinned: true,
-                cgroup_id: Some(77),
-                cgroup_attestation: CgroupAttestation::NotChecked,
-                cgroup_rung: None,
-                euid_source: EuidSource::PidfdInfo,
             }
         );
         // Namespace facts are read after stat and before the pidfd re-check.
@@ -1059,6 +1082,16 @@ mod tests {
         let identity = identify(sock.as_fd(), &top_rung(Ok(record(PID, UID))), &peers).unwrap();
         assert!(identity.pinned);
         assert_eq!(identity.hints, CallerHints::unavailable());
+        // And the identity is the one a peer showing every hint gets: the
+        // hints sit beside it and change nothing in it.
+        let hinted = identify(
+            socket().as_fd(),
+            &top_rung(Ok(record(PID, UID))),
+            &honest_peer(),
+        )
+        .unwrap();
+        assert_eq!(hinted.hints, honest_hints());
+        assert_eq!(hinted.identity, identity.identity);
     }
 
     #[test]

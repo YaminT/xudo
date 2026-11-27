@@ -419,13 +419,16 @@ for line in sys.stdin:
             hints[k] for k in ("hint_comm", "hint_exe", "hint_cmdline", "hint_claudecode") if k in hints))
 '
 }
-claude_cmdline=$(printf '"%s\\x00exec\\x00--\\x00%s\\x00-un"' "$e7/claude" "$gate_exe")
+# Of the command line only argv[0], the count, the length and a digest are
+# recorded, never an argument.
+claude_argv() { printf '%s\000exec\000--\000%s\000-un\000' "$e7/claude" "$gate_exe"; }
+claude_cmdline="argv0:\"$e7/claude\" argc:5 len:$(claude_argv | wc -c | tr -d ' ') sha256:$(claude_argv | sha256sum | cut -c1-8)"
 mark=$(trail_len)
 as_harness e7-lane hint-human "$e7/claude exec -- $gate_exe -un"
 claude_trail=$(hints_since "$mark")
 human_path an_impostor_named_claude_is_human human
 case_name=an_impostors_comm_and_cmdline_are_recorded_and_not_trusted
-if [ "$claude_trail" = "human allowed hint_comm=claude hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ]; then
+if [ "$claude_trail" = "human allowed hint_comm=\"claude\" hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ]; then
     good "$case_name"
 else
     bad "$case_name"
@@ -442,7 +445,7 @@ case $gate_line in
 *) gate_hints= ;;
 esac
 if [ "$hrc" = 0 ] && has_root_line "$hout" &&
-    [ "$broker_line" = "enrolled-agent allowed hint_comm=claude hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ] &&
+    [ "$broker_line" = "enrolled-agent allowed hint_comm=\"claude\" hint_exe=unavailable hint_cmdline=$claude_cmdline hint_claudecode=unavailable" ] &&
     [ -n "$gate_hints" ] && [ "$(printf '%s\n' "$harness_trail" | wc -l)" = 2 ] &&
     e7_trail "$mark" | grep -q '^enrolled-agent allowed - g1f.whoami gate_mode=Nopass via=harness'; then
     good "$case_name"

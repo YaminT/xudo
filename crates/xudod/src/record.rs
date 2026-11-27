@@ -11,7 +11,7 @@ use xudo_gate::request::PendingRequest;
 use xudo_policy::{CallerFacts, Decision, Generation, Verdict, deny_list_version};
 use xudo_wire::BrokerRequest;
 
-use crate::identify::PeerIdentity;
+use crate::identify::Identified;
 use crate::mint::Grant;
 use crate::refusal::Refusal;
 
@@ -26,7 +26,7 @@ pub fn decided(
     previous: Option<&Record>,
     decision: &Decision,
     caller: &CallerFacts,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     generation: &Generation,
     minted: Option<&PendingRequest>,
@@ -79,7 +79,7 @@ pub fn decided_under(
     previous: Option<&Record>,
     decision: &Decision,
     caller: &CallerFacts,
-    identity: &PeerIdentity,
+    identity: &Identified,
     request: &BrokerRequest,
     policy: &LoadedPolicy,
     minted: Option<&PendingRequest>,
@@ -122,7 +122,7 @@ fn deciding_deny_rule_id(decision: &Decision) -> Option<&str> {
 pub fn refused(
     previous: Option<&Record>,
     refusal: &Refusal,
-    identity: Option<&PeerIdentity>,
+    identity: Option<&Identified>,
     request: Option<&BrokerRequest>,
 ) -> Record {
     let mut evidence = vec![
@@ -172,8 +172,9 @@ fn question_kind(question: &xudo_wire::Question) -> &'static str {
     }
 }
 
-/// The evidence for how the peer was identified.
-fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
+/// The evidence for how the peer was identified, and what it showed.
+fn identity_evidence(peer: &Identified) -> Vec<String> {
+    let identity = &peer.identity;
     let mut evidence = vec![
         format!("rung={}", identity.rung.mechanism()),
         format!("peer_pid={}", identity.pid),
@@ -185,11 +186,12 @@ fn identity_evidence(identity: &PeerIdentity) -> Vec<String> {
         format!("peer_gid={}", identity.gid),
         format!("pinned={}", identity.pinned),
         format!("euid_from={}", identity.euid_source.label()),
-        // A hint, never a fact: escaped, so any byte the peer named itself
-        // with reads as itself and cannot pose as another field.
-        format!("hint_comm={}", identity.comm.escape_ascii()),
+        // A hint, never a fact: escaped and quoted like the others, so any
+        // byte the peer named itself with reads as itself and cannot pose as
+        // another field or as the bare word `unavailable`.
+        format!("hint_comm=\"{}\"", identity.comm.escape_ascii()),
     ];
-    evidence.extend(identity.hints.evidence());
+    evidence.extend(peer.hints.evidence());
     if let Some(id) = identity.cgroup_id {
         evidence.push(format!("cgroup_id={id}"));
     }
@@ -233,8 +235,8 @@ mod tests {
     use super::*;
     use crate::identify::EuidSource;
 
-    fn identity(cgroup_id: Option<u64>) -> PeerIdentity {
-        PeerIdentity {
+    fn identity(cgroup_id: Option<u64>) -> Identified {
+        crate::identify::PeerIdentity {
             rung: Attestation::PeerPidfdInfo,
             pid: 4242,
             uid: 1000,
@@ -243,7 +245,6 @@ mod tests {
             sid: 1,
             tty: 0,
             comm: b"xudo".to_vec(),
-            hints: xudo_sys::CallerHints::unavailable(),
             diverged: false,
             pinned: true,
             cgroup_id,
@@ -251,6 +252,7 @@ mod tests {
             cgroup_rung: None,
             euid_source: EuidSource::PidfdInfo,
         }
+        .into()
     }
 
     fn caller() -> CallerFacts {
@@ -505,27 +507,36 @@ mod tests {
             &generation(),
             None,
         );
-        assert!(record.evidence.contains(&"hint_comm=xudo".to_owned()));
+        assert!(record.evidence.contains(&"hint_comm=\"xudo\"".to_owned()));
     }
 
     #[test]
     fn a_comm_posing_as_another_field_is_recorded_escaped_under_its_prefix() {
         let mut peer = identity(None);
-        peer.comm = b"via=harness\x1b[2J\n\xff".to_vec();
+        peer.identity.comm = b"via=harness\x1b[2J\n\xff".to_vec();
         let evidence = identity_evidence(&peer);
         assert!(
-            evidence.contains(&"hint_comm=via=harness\\x1b[2J\\n\\xff".to_owned()),
+            evidence.contains(&"hint_comm=\"via=harness\\x1b[2J\\n\\xff\"".to_owned()),
             "{evidence:?}"
         );
         assert!(!evidence.iter().any(|line| line.starts_with("via=")));
     }
 
     #[test]
-    fn the_peers_exe_cmdline_and_claudecode_are_recorded_as_hints_on_decisions_and_refusals() {
+    fn a_process_named_unavailable_is_not_read_as_the_sentinel() {
+        let mut peer = identity(None);
+        peer.identity.comm = b"unavailable".to_vec();
+        let evidence = identity_evidence(&peer);
+        assert!(evidence.contains(&"hint_comm=\"unavailable\"".to_owned()));
+        assert!(!evidence.contains(&"hint_comm=unavailable".to_owned()));
+    }
+
+    #[test]
+    fn the_peers_exe_argv0_and_claudecode_are_recorded_as_hints_on_decisions_and_refusals() {
         let mut peer = identity(None);
         peer.hints = xudo_sys::CallerHints::from_reads(
             Some(b"/usr/bin/claude"),
-            Some(b"claude\0-p\0"),
+            Some(b"claude\0-p\0--password=hunter2\0"),
             Some(b"PATH=/bin\0CLAUDECODE=1\0"),
         );
         let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
@@ -547,47 +558,70 @@ mod tests {
             assert!(
                 record
                     .evidence
-                    .contains(&"hint_claudecode=\"1\"".to_owned()),
+                    .contains(&"hint_claudecode=set:\"1\"".to_owned()),
                 "{:?}",
                 record.evidence
             );
-            assert!(!record.evidence.iter().any(|line| line.contains("PATH=")));
+            let all = record.evidence.join(" ");
+            assert!(!all.contains("PATH="), "{all}");
+            assert!(!all.contains("hunter2"), "{all}");
         }
     }
 
-    #[test]
-    fn a_hostile_peers_hints_cannot_swell_a_record_toward_the_limit() {
-        // Every byte the worst kind (escaped to four, then JSON-escaped), and
-        // far longer than any cap: the hints add under 8 KiB to the record.
+    /// The largest hints a peer can make: every byte the worst kind (escaped
+    /// to four, then JSON-escaped to five), far past every cap.
+    fn hostile_peer() -> Identified {
         let junk = vec![0xff_u8; 1 << 20];
         let mut environ = b"CLAUDECODE=".to_vec();
         environ.extend(&junk);
-        let mut peer = identity(None);
-        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
-        let size = |peer: &PeerIdentity| {
-            decided(
-                None,
-                &decision,
-                &caller(),
-                peer,
-                &request(),
-                &generation(),
-                None,
-            )
-            .to_jsonl()
-            .len()
-        };
-        let plain = size(&peer);
+        let mut peer = identity(Some(77));
+        peer.identity.comm = vec![0xff; 15];
         peer.hints = xudo_sys::CallerHints::from_reads(Some(&junk), Some(&junk), Some(&environ));
-        let hostile = size(&peer);
-        assert!(hostile > plain + 4096, "{plain} -> {hostile}");
-        assert!(hostile - plain < 8 * 1024, "{plain} -> {hostile}");
-        assert!(hostile < xudo_audit::MAX_RECORD_BYTES);
+        peer
     }
 
     #[test]
-    fn a_minted_decision_records_the_pin_the_rule_the_nonce_and_the_unheeded_claim() {
-        let entry = PendingRequest {
+    fn a_hostile_peers_hints_cannot_swell_any_record_toward_the_limit() {
+        // A decision, a mint and a refusal, each with the largest hints: they
+        // add under 8 KiB, an eighth of what a record may hold.
+        let entry = minted_entry();
+        let decision = Decision::deny(DenialCode::ArgvRejected, Vec::new(), Vec::new());
+        let refusal = Refusal::client(RefusalCode::RequestUnknown, "x");
+        let records = |peer: &Identified| {
+            [
+                decided(
+                    None,
+                    &decision,
+                    &caller(),
+                    peer,
+                    &request(),
+                    &generation(),
+                    None,
+                ),
+                decided(
+                    None,
+                    &permitted(Verdict::Allow),
+                    &caller(),
+                    peer,
+                    &request(),
+                    &generation(),
+                    Some(&entry),
+                ),
+                refused(None, &refusal, Some(peer), Some(&request())),
+            ]
+            .map(|record| record.to_jsonl().len())
+        };
+        let plain = records(&identity(Some(77)));
+        let hostile = records(&hostile_peer());
+        for (plain, hostile) in plain.into_iter().zip(hostile) {
+            assert!(hostile > plain + 4096, "{plain} -> {hostile}");
+            assert!(hostile - plain < 8 * 1024, "{plain} -> {hostile}");
+            assert!(hostile < xudo_audit::MAX_RECORD_BYTES);
+        }
+    }
+
+    fn minted_entry() -> PendingRequest {
+        PendingRequest {
             schema_version: xudo_gate::request::REQUEST_SCHEMA_VERSION,
             nonce: "ab".repeat(32),
             caller_pid: 4242,
@@ -615,7 +649,12 @@ mod tests {
             via: xudo_gate::request::Via::Auth,
             queue_id: None,
             operation: None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_minted_decision_records_the_pin_the_rule_the_nonce_and_the_unheeded_claim() {
+        let entry = minted_entry();
         let record = decided(
             None,
             &permitted(Verdict::Allow),
