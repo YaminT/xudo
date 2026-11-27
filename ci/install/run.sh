@@ -16,6 +16,12 @@
 # did not write; a backend that rejects the candidate leaves the old state as it
 # was; and uninstall removes exactly what install wrote and nothing else.
 #
+# `xudo install --agent-path` (sudo and sudo-rs rows) runs the real gate as the
+# `-nopass` helper through sudo, as a caller it cannot attest, before it writes
+# its one passwordless line; the rows prove it writes nothing when the helper is
+# missing or does not refuse, and that a member of xudo-agent then reaches the
+# helper with no password and nothing else.
+#
 # The one thing it does NOT prove is that the gate runs as root through the rule:
 # `xudo install` cannot yet ask the broker for a request (M2b plan item C1), so
 # its functional probe is missing. row.sh asserts the install says so, loudly,
@@ -41,8 +47,9 @@ bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 
-if [[ ! -x $bin ]]; then
-    echo "FAIL: $bin is not an executable" >&2
+gate=$(dirname "$bin")/xudo-gate
+if [[ ! -x $bin || ! -x $gate ]]; then
+    echo "FAIL: $bin or its sibling xudo-gate is not an executable" >&2
     exit 1
 fi
 if ! command -v docker >/dev/null 2>&1; then
@@ -68,6 +75,7 @@ for spec in "${rows[@]}"; do
     echo "== $row  ($image)"
     if ! docker run --rm \
         -v "$bin:/usr/local/bin/xudo:ro" \
+        -v "$gate:/harness-bin/xudo-gate:ro" \
         -v "$here:/harness:ro" \
         -v "$out:/out" \
         "$image" sh /harness/row.sh "$row" "$setup"; then

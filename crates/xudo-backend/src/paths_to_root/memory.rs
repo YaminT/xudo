@@ -135,6 +135,16 @@ impl MemoryHost {
         )
     }
 
+    /// Gives the file at `path` a second name, as a hard link would: its link
+    /// count becomes 2. Anything else at `path` is left as it is.
+    #[must_use]
+    pub fn hard_linked(mut self, path: &str) -> Self {
+        if let Some(Node::File { meta, .. }) = self.nodes.get_mut(Path::new(path)) {
+            meta.nlink = 2;
+        }
+        self
+    }
+
     /// Adds a regular file this process may examine but not read: mode
     /// `0440`, as `/etc/sudoers` is.
     #[must_use]
@@ -292,6 +302,7 @@ fn meta(uid: u32, gid: u32, mode: u32, kind: Kind) -> Meta {
         gid,
         mode,
         kind,
+        nlink: 1,
     }
 }
 

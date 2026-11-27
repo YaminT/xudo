@@ -906,6 +906,24 @@ fn blockers(host: &MemoryHost, managed: Option<&str>) -> Vec<String> {
 }
 
 #[test]
+fn enrol_and_doctor_agree_on_a_file_an_older_sudo_version_got() {
+    // After a sudo upgrade the installed file names the old version in its
+    // header. `recognize` (doctor) still calls it xudo's; so must enrol.
+    let text = managed();
+    let older = text.replace("Sudo version 1.9.17p2", "Sudo version 1.9.15p5");
+    assert_ne!(older, text);
+    assert!(crate::snippet::recognize(older.as_bytes()).is_some());
+    let host = sudoers_host(ENROLLED_GROUP, Some(&older));
+    assert_eq!(blockers(&host, Some(&text)), Vec::<String>::new());
+    // Without a backend that writes a sudoers file, nothing is exempt.
+    assert!(
+        blockers(&host, None)
+            .iter()
+            .any(|line| line.contains("NOPASSWD"))
+    );
+}
+
+#[test]
 fn enrol_exempts_only_the_byte_exact_managed_snippet() {
     let text = managed();
     assert!(

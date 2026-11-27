@@ -71,8 +71,8 @@ pub fn after_backend(plan: &ExecPlan, code: Option<i32>, err: &mut dyn Write) {
         let _ = writeln!(
             err,
             "xudo: if sudo said a password is required, the passwordless agent path is not \
-             installed (no sudoers line names {GATE_NOPASS}, the default); nothing was \
-             retried with a password"
+             installed (no sudoers line names {GATE_NOPASS}, the default; root turns it on \
+             with `sudo xudo install --agent-path`); nothing was retried with a password"
         );
     }
 }

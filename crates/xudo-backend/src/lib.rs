@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_path;
 pub mod blocks;
 pub mod capability;
 pub mod detect;

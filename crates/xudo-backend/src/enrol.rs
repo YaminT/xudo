@@ -349,14 +349,14 @@ pub fn env_path(label: &str) -> String {
 }
 
 /// One account line of `/etc/passwd`.
-struct Passwd<'a> {
-    name: &'a [u8],
+pub(crate) struct Passwd<'a> {
+    pub(crate) name: &'a [u8],
     password: &'a [u8],
     uid: u32,
-    gid: u32,
+    pub(crate) gid: u32,
 }
 
-fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
+pub(crate) fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
     bytes
         .split(|byte| *byte == b'\n')
         .filter_map(|line| {
@@ -374,7 +374,7 @@ fn parse_passwd(bytes: &[u8]) -> Vec<Passwd<'_>> {
         .collect()
 }
 
-fn number(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn number(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
@@ -504,26 +504,26 @@ fn with_membership(group_file: &[u8], account: &str) -> Vec<u8> {
 pub use crate::snippet::managed_agent_snippet as managed_snippet;
 
 /// Whether the sudoers file xudo manages is root's alone (a regular file, uid
-/// 0, no group or world write) and holds exactly `managed` or the human-only
-/// text that ships. Both name `%xudo`; nothing else is exempt.
+/// 0, no group or world write) and holds exactly one of xudo's two texts, for
+/// the backend version its own header names ([`crate::snippet::recognize`],
+/// the reader `xudo doctor` uses): after a sudo upgrade the file an older
+/// version wrote is still xudo's. Both name `%xudo`; nothing else is exempt.
+/// `managed` is `None` where xudo writes no sudoers file (doas, no backend).
 fn managed_installed(host: &dyn HostView, managed: Option<&str>) -> bool {
-    let Some(text) = managed else {
-        return false;
-    };
     let trusted = matches!(
         host.stat(Path::new(SUDOERS_PATH)),
         Lookup::Found(meta) if meta.kind == Kind::File && meta.uid == 0 && meta.mode & 0o022 == 0
     );
-    trusted
+    managed.is_some()
+        && trusted
         && matches!(
             host.read(Path::new(SUDOERS_PATH)),
-            Lookup::Found(bytes)
-                if bytes == text.as_bytes() || bytes == crate::snippet::human_only_form(text).as_bytes()
+            Lookup::Found(bytes) if crate::snippet::recognize(&bytes).is_some()
         )
 }
 
 /// The gid of the group named `group` in `/etc/group`, when it appears once.
-fn group_gid(host: &dyn HostView, group: &str) -> Option<u32> {
+pub(crate) fn group_gid(host: &dyn HostView, group: &str) -> Option<u32> {
     let Lookup::Found(file) = host.read(Path::new("/etc/group")) else {
         return None;
     };
@@ -562,13 +562,13 @@ fn held_gids(account: &str, primary: u32, group_file: &[u8]) -> Vec<u32> {
 
 /// Where sudo, sudo-rs and doas read rules, and the directories that add to
 /// them.
-const RULE_FILES: [&str; 4] = [
+pub(crate) const RULE_FILES: [&str; 4] = [
     "/etc/sudoers",
     "/etc/sudoers-rs",
     "/etc/doas.conf",
     "/usr/local/etc/doas.conf",
 ];
-const RULE_DIRS: [&str; 2] = ["/etc/sudoers.d", "/etc/doas.d"];
+pub(crate) const RULE_DIRS: [&str; 2] = ["/etc/sudoers.d", "/etc/doas.d"];
 
 /// Every line of every sudo or doas file that names the account (by name or
 /// `#uid`), with or without a password, or that names everyone, or that
@@ -681,7 +681,7 @@ fn lines_naming(
 
 /// Whether `token` occurs in `line` as a whole word: not followed by another
 /// word byte, so `%xudo` is not `%xudo-agent` and `%#99` is not `%#998`.
-fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
+pub(crate) fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool {
     line.windows(token.len().max(1))
         .enumerate()
         .any(|(at, window)| {
@@ -693,7 +693,7 @@ fn names_token(line: &[u8], token: &[u8], is_word: &dyn Fn(&u8) -> bool) -> bool
 }
 
 /// Whether `line` has a `%#N` or `%N` group, `N` being digits.
-fn names_numeric_group(line: &[u8]) -> bool {
+pub(crate) fn names_numeric_group(line: &[u8]) -> bool {
     line.split(|byte| *byte == b'%').skip(1).any(|rest| {
         let rest = rest.strip_prefix(b":").unwrap_or(rest);
         let rest = rest.strip_prefix(b"#").unwrap_or(rest);
@@ -702,7 +702,7 @@ fn names_numeric_group(line: &[u8]) -> bool {
 }
 
 /// Whether `needle` occurs in `haystack`.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len().max(1))
         .any(|window| window == needle)

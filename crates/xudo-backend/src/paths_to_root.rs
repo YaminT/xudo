@@ -370,6 +370,9 @@ pub struct Meta {
     pub mode: u32,
     /// What it is.
     pub kind: Kind,
+    /// How many names it has: a file with a second hard link can be changed
+    /// through a name nobody checked.
+    pub nlink: u64,
 }
 
 /// This process's credentials.

@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+mod agent_path;
 pub mod agentdoc;
 mod check;
 pub mod cli;

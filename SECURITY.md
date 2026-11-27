@@ -8,8 +8,9 @@ matter.
 
 The broker and password-authenticated gate are built. Every caller is currently
 classified as `Unattested`, so every request uses the password path. The
-package does not install a `NOPASSWD` rule. The passwordless agent path,
-Landlock confinement, and same-uid watcher separation are not in this release.
+package does not install a `NOPASSWD` rule: the passwordless agent path is off
+unless root runs `sudo xudo install --agent-path`. Landlock confinement and
+same-uid watcher separation are not in this release.
 Out-of-band confirmation through `xudo watch` is built but off by default; every
 path still requires the password. Session and terminal checks do not prove a
 human: a same-uid agent can run `script -qc 'xudo watch'`. A cgroup scope for agents, not in this

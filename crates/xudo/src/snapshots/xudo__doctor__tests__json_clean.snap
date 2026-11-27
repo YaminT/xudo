@@ -52,6 +52,10 @@ expression: "render::json_of(&report)"
     "ignored_reason": "sudo skips filenames containing a dot or ending in ~",
     "unavailable": "test fixture has no sudoers directory"
   },
+  "agent_path": {
+    "state": "off",
+    "detail": null
+  },
   "caller": {
     "classification": "unattested",
     "password_required": true,

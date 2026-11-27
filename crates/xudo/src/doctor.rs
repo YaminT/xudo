@@ -91,6 +91,8 @@ pub struct Report {
     pub ruleset: RulesetReport,
     /// Whether xudo's sudoers rule is installed under a name sudo reads.
     pub sudoers_snippet: SnippetReport,
+    /// Whether the opt-in agent path is on, and byte for byte xudo's text.
+    pub agent_path: AgentPathReport,
     /// How this caller is classified.
     pub caller: CallerReport,
     /// The privilege backend.
@@ -101,6 +103,48 @@ pub struct Report {
     pub proposals: Option<Vec<Proposal>>,
     /// The enrol checks, run again for every enrolled agent account.
     pub enrolled_accounts: EnrolledAccountsReport,
+}
+
+/// Whether `xudo install --agent-path` is in place, read from
+/// `/etc/sudoers.d/xudo` (root's alone, so `unknown` to anyone else).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentPathReport {
+    /// `on`: exactly xudo's agent-path text. `off`: no line of it names the
+    /// agent path. `edited`: it names the agent path and is not exactly
+    /// xudo's text. `unknown`: it could not be read.
+    pub state: &'static str,
+    /// Why, for `edited` and `unknown`.
+    pub detail: Option<String>,
+}
+
+impl AgentPathReport {
+    fn of(read: Lookup<Vec<u8>>) -> Self {
+        let (state, detail) = match read {
+            Lookup::Missing => ("off", None),
+            Lookup::Unreadable(why) => ("unknown", Some(why)),
+            Lookup::Found(bytes) => match xudo_backend::snippet::recognize(&bytes) {
+                Some(xudo_backend::snippet::ManagedForm::AgentPath) => ("on", None),
+                _ if xudo_backend::snippet::names_agent_path(&bytes) => (
+                    "edited",
+                    Some(
+                        "it names the agent path and is not byte for byte xudo's text; \
+                         `sudo xudo install --agent-path` cannot replace it either"
+                            .to_owned(),
+                    ),
+                ),
+                _ => ("off", None),
+            },
+        };
+        Self { state, detail }
+    }
+
+    /// The prose row.
+    fn line(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}: {}", self.state, safe(detail)),
+            None => self.state.to_owned(),
+        }
+    }
 }
 
 /// The account checks `enrol` ran, run again for each registry entry. An
@@ -490,6 +534,11 @@ pub(crate) fn gather(
         kernel: KernelReport::of(platform.ops.kernel()),
         ruleset: ruleset(rules, loaded, passwd_fault_of(platform.host)),
         sudoers_snippet: sudoers_snippets(),
+        agent_path: AgentPathReport::of(
+            platform
+                .host
+                .read(Path::new(xudo_backend::snippet::SUDOERS_PATH)),
+        ),
         caller: caller(platform.ops.classify(std::process::id())),
         backend: BackendReport::of(backend),
         paths_to_root: paths,
@@ -1004,6 +1053,7 @@ pub(crate) fn human(report: &Report) -> String {
             line("sudoers xudo", &format!("unknown: {}", safe(reason)));
         }
     }
+    line("agent path", &report.agent_path.line());
     enrolled_lines(&report.enrolled_accounts, &mut line);
     if let Some(label) = report.caller.classification {
         line("classified", label);
@@ -2665,6 +2715,45 @@ mod tests {
         let json = render::json_of(&report);
         assert!(json.contains("\"note\": \"exempt\""), "{json}");
         assert!(json.contains("\"note\": \"unknown\""), "{json}");
+    }
+
+    #[test]
+    fn doctor_reports_the_agent_path_and_whether_its_text_is_byte_exact() {
+        let backend = xudo_backend::Backend {
+            exe: "/usr/bin/sudo".to_owned(),
+            kind: BackendKind::Sudo,
+            version: "Sudo version 1.9.17p2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::from_supported(Capability::ALL),
+        };
+        let agent = xudo_backend::SudoersSnippet::with_agent_path(&backend)
+            .unwrap()
+            .contents;
+        let human = xudo_backend::SudoersSnippet::human_only(&backend)
+            .unwrap()
+            .contents;
+        let state = |read| AgentPathReport::of(read).state;
+        assert_eq!(state(Lookup::Found(agent.clone().into_bytes())), "on");
+        assert_eq!(state(Lookup::Found(human.into_bytes())), "off");
+        assert_eq!(
+            state(Lookup::Found(b"# Managed by xudo.\n".to_vec())),
+            "off"
+        );
+        assert_eq!(state(Lookup::Missing), "off");
+        // Both prose forms, whatever this host's own file says.
+        assert_eq!(AgentPathReport::of(Lookup::Missing).line(), "off");
+        assert_eq!(
+            AgentPathReport::of(Lookup::Unreadable("denied".to_owned())).line(),
+            "unknown: denied"
+        );
+        let edited = format!("{agent}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n");
+        let report = AgentPathReport::of(Lookup::Found(edited.into_bytes()));
+        assert_eq!(report.state, "edited");
+        assert!(report.detail.unwrap().contains("byte for byte"));
+        let report = AgentPathReport::of(Lookup::Unreadable("permission denied".to_owned()));
+        assert_eq!(
+            (report.state, report.detail.as_deref()),
+            ("unknown", Some("permission denied"))
+        );
     }
 
     #[test]

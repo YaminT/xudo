@@ -15,6 +15,7 @@ protect rule missing shipped deny rule xudo.protect.pkg-install-removal
 protect rule missing shipped deny rule xudo.protect.dpkg-remove
 sudoers xudo unknown: canonical rule could not be read
 sudoers xudo unknown: test fixture has no sudoers directory
+agent path   off
 classified   unattested
 password     required
 hints        1 recorded, 0 trusted

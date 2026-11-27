@@ -74,6 +74,8 @@ xudo \- decide whether a privileged command runs as root
 .RB [ \-\-dry\-run ]
 .RB [ \-\-show\-contents ]
 .RB [ \-\-uninstall ]
+.RB [ \-\-agent\-path
+.RB [ \-\-raise\-ptrace\-scope ]]
 .RB [ options ]
 .br
 .B xudo agent enrol
@@ -121,12 +123,18 @@ instead, and
 runs
 .B sudo \-n
 on it: sudo never asks a password there, it refuses.
-The package installs no
+Neither the package nor a plain
+.B xudo install
+writes a
 .B NOPASSWD
 rule naming that file, so out of the box every such run is refused with
 "a password is required", and
 .B xudo
 says the passwordless agent path is not installed.
+Only
+.B sudo xudo install \-\-agent\-path
+turns it on (see
+.BR install ).
 It never retries with a password, and it refuses that path under
 .BR doas .
 A service harness that no rule grants is refused with
@@ -242,7 +250,7 @@ setting prevents it from reusing a sudo credential cached by an earlier
 terminal login; the backend tests pin this setting in the generated rule.
 The entry is marked done only after the gate's audit record for that run.
 A denied password releases the claim back to pending. A rules change after
-queueing denies the run. The passwordless gate is not installed.
+queueing denies the run. A queued run never uses the passwordless gate.
 .IP
 If a human watch approval is pending, the default timeout returns at once
 with exit status 18 and leaves the request pending.
@@ -599,7 +607,9 @@ and warns when it gives
 .BR persist .
 It can only see xudo's rule once installed, so the first install is checked by
 .BR "xudo doctor" .
-The rules this build would install all require a password.
+Without
+.B \-\-agent\-path
+every rule it installs requires a password.
 An install is reported as verified only when the broker minted a request for
 .BR "id -u" ,
 the gate ran through the backend and printed
@@ -609,6 +619,95 @@ Anything less keeps the validated files, says
 .BR "NOT VERIFIED" ,
 and exits
 .BR 19 .
+.IP
+.B Turn on the agent path.
+.B sudo xudo install \-\-agent\-path
+is the opt-in, for sudo and sudo-rs only (doas is refused).
+It writes the same file plus one line,
+.BR "%xudo\-agent ALL=(root) NOPASSWD: XUDO_NOPASS" ,
+where
+.B XUDO_NOPASS
+is
+.B /usr/libexec/xudo/xudo\-gate\-nopass
+with no arguments.
+That helper runs a command only when the kernel attests a registered harness
+and a root-written rule grants that harness that command.
+Before it writes anything it runs the helper through
+.B sudo \-n
+as a caller it cannot attest, and stops unless the helper refuses.
+It also stops, naming the line, when any other sudo or doas line names the
+group
+.BR xudo\-agent ,
+one of the aliases
+.BR XUDO_NOPASS ,
+.B XUDO_AUTH
+or
+.BR XUDO_SELF ,
+a path under
+.I /usr/libexec/xudo
+or a wildcard that reaches the helper, or an include it cannot follow.
+It stops when the helper or a directory above it is not root's, is writable
+by its group or by everyone, or is a symbolic link, or the helper has a second
+name; and when an account is in
+.B xudo\-agent
+(listed, or by its primary group) that is not the account of a service-way
+harness in the registry, the only accounts enrol adds to it; and when
+.I /etc/passwd
+holds no
+.B nobody
+or no such member, since the checks below ask about them.
+It never replaces
+.I /etc/sudoers.d/xudo
+when that file names the agent path but is not byte for byte xudo's text, and
+it checks for edits before it creates a group.
+After the rename it runs
+.B visudo \-c \-f /etc/sudoers
+on the whole configuration and asks the backend
+.RB ( "sudo \-l \-U" )
+that the helper is listed for
+.B root
+(the control that shows the listing works), and is not listed for
+.BR nobody ,
+nor with an argument for a member of the group.
+A listing counts only when the backend prints nothing on standard error.
+Any of those failing or getting no answer, or a functional probe that runs and
+fails, puts back what the install replaced and exits
+.BR 19 .
+When what was there cannot be put back, the new file is removed instead; when
+it cannot be removed either, the message says the line may be live and names
+the file to remove.
+Only a functional probe that cannot run here is reported on a
+.B could not verify:
+line, and the install exits 0.
+A plain
+.B xudo install
+(which a package upgrade runs) writes the human-only file again and turns the
+agent path off;
+.B xudo install \-\-uninstall
+removes it with everything else, and refuses to remove an edited
+.IR /etc/sudoers.d/xudo .
+.B xudo doctor
+says whether the agent path is on and whether its text is exact.
+.IP
+On a host at
+.BR kernel.yama.ptrace_scope=0 ,
+any process of a uid can read what is typed in that uid's other processes.
+With a session-way harness registered,
+.B \-\-agent\-path
+says so and names
+.BR \-\-raise\-ptrace\-scope ,
+which prints the diff and writes
+.I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
+setting it to 1.
+That file is written only with the flag and only while the live value is 0,
+so it never lowers a higher value.
+xudo does not apply it: it takes effect with
+.B sudo sysctl \-\-system
+or at boot, and only when no file read after it sets the value; the install
+warns about each such line.
+.B \-\-uninstall
+removes it, after the sudoers file, and leaves it with a warning when it was
+edited.
 .TP
 .B audit
 Verify that a hash-chained log has not been edited in place.
@@ -812,6 +911,17 @@ Not shipped in the package.
 The name has no dot and no trailing tilde, which
 .B sudo
 would ignore.
+Holds one
+.B NOPASSWD
+line only after
+.BR "xudo install \-\-agent\-path" .
+.TP
+.I /etc/sysctl.d/05\-xudo\-ptrace\-scope.conf
+Written only by
+.BR "xudo install \-\-agent\-path \-\-raise\-ptrace\-scope" ;
+sets
+.B kernel.yama.ptrace_scope
+to 1.
 .TP
 .I /usr/lib/systemd/system/xudod.socket
 .TQ

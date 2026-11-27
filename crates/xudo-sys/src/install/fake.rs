@@ -15,10 +15,11 @@ const WRITTEN: FileIdentity = FileIdentity {
 pub(super) struct FakeInstallOps {
     uid: u32,
     calls: RefCell<Vec<String>>,
-    failures: BTreeMap<&'static str, InstallError>,
+    failures: BTreeMap<&'static str, (usize, InstallError)>,
     group: bool,
     present: RefCell<BTreeSet<String>>,
     identity: FileIdentity,
+    contents: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl FakeInstallOps {
@@ -35,7 +36,17 @@ impl FakeInstallOps {
             group: false,
             present: RefCell::new(BTreeSet::new()),
             identity: WRITTEN,
+            contents: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// `path` holds these bytes of xudo's. A candidate path set this way keeps
+    /// them when the run writes it, as if the write were tampered with.
+    pub(super) fn with_contents(self, path: &str, bytes: &[u8]) -> Self {
+        self.contents
+            .borrow_mut()
+            .insert(path.to_owned(), bytes.to_vec());
+        self
     }
 
     /// Makes `method` fail with the error that method would plausibly raise.
@@ -45,7 +56,7 @@ impl FakeInstallOps {
                 name: "xudo".to_owned(),
                 reason: "scripted".to_owned(),
             },
-            "validate" => InstallError::ValidatorRejected {
+            "validate" | "validate_whole" => InstallError::ValidatorRejected {
                 detail: "scripted".to_owned(),
             },
             _ => InstallError::Io {
@@ -57,8 +68,18 @@ impl FakeInstallOps {
         self.failing_with(method, error)
     }
 
-    pub(super) fn failing_with(mut self, method: &'static str, error: InstallError) -> Self {
-        self.failures.insert(method, error);
+    pub(super) fn failing_with(self, method: &'static str, error: InstallError) -> Self {
+        self.failing_from(method, 0, error)
+    }
+
+    /// Makes `method` fail from its call after the first `succeed` on.
+    pub(super) fn failing_from(
+        mut self,
+        method: &'static str,
+        succeed: usize,
+        error: InstallError,
+    ) -> Self {
+        self.failures.insert(method, (succeed, error));
         self
     }
 
@@ -82,15 +103,29 @@ impl FakeInstallOps {
         self
     }
 
+    /// What `path` holds now, as a test reads it back.
+    pub(super) fn holds(&self, path: &str) -> Option<Vec<u8>> {
+        self.contents.borrow().get(path).cloned()
+    }
+
     pub(super) fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
 
     fn record(&self, method: &'static str, detail: &str) -> Result<(), InstallError> {
+        let before = self
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.split(' ').next() == Some(method))
+            .count();
         self.calls
             .borrow_mut()
             .push(format!("{method} {detail}").trim_end().to_owned());
-        self.failures.get(method).map_or(Ok(()), |e| Err(e.clone()))
+        match self.failures.get(method) {
+            Some((succeed, error)) if before >= *succeed => Err(error.clone()),
+            _ => Ok(()),
+        }
     }
 
     fn removal(&self, path: &str) -> Removal {
@@ -119,15 +154,27 @@ impl InstallOps for FakeInstallOps {
     fn write_candidate(
         &self,
         path: &str,
-        _contents: &[u8],
+        contents: &[u8],
         _mode: u32,
     ) -> Result<FileIdentity, InstallError> {
         self.record("write_candidate", path)?;
+        self.contents
+            .borrow_mut()
+            .entry(path.to_owned())
+            .or_insert_with(|| contents.to_vec());
         Ok(WRITTEN)
     }
 
+    /// A validator that names a candidate is `validate`; one that does not
+    /// checks the whole configuration and is `validate_whole`, so a test can
+    /// fail the one and not the other.
     fn validate(&self, argv: &[String]) -> Result<(), InstallError> {
-        self.record("validate", &argv.join(" "))
+        let method = if argv.iter().any(|arg| arg.ends_with(".candidate")) {
+            "validate"
+        } else {
+            "validate_whole"
+        };
+        self.record(method, &argv.join(" "))
     }
 
     fn identity(&self, path: &str) -> Result<FileIdentity, InstallError> {
@@ -135,16 +182,27 @@ impl InstallOps for FakeInstallOps {
         Ok(self.identity)
     }
 
+    /// A rename: what was written at `from` is now at `to`.
     fn install(&self, from: &str, to: &str, _identity: FileIdentity) -> Result<(), InstallError> {
-        self.record("install", &format!("{from} {to}"))
+        self.record("install", &format!("{from} {to}"))?;
+        let mut contents = self.contents.borrow_mut();
+        let moved = contents.remove(from);
+        contents.extend(moved.map(|bytes| (to.to_owned(), bytes)));
+        Ok(())
     }
 
     fn discard(&self, path: &str, _identity: FileIdentity) -> Result<(), InstallError> {
         self.record("discard", path)
     }
 
+    fn read_managed(&self, path: &str) -> Result<Option<Vec<u8>>, InstallError> {
+        self.record("read_managed", path)?;
+        Ok(self.contents.borrow().get(path).cloned())
+    }
+
     fn remove_managed(&self, path: &str) -> Result<Removal, InstallError> {
         self.record("remove_managed", path)?;
+        self.contents.borrow_mut().remove(path);
         Ok(self.removal(path))
     }
 

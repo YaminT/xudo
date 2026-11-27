@@ -4,5 +4,10 @@ backend caps 6 of 7 supported
 install      exit 0
 plan for     sudo-rs
 snippet      accepted by /usr/sbin/visudo -cf /dev/stdin
+agent path   exit 0
+agent lines  1: %xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS
+agent snip   accepted by /usr/sbin/visudo -cf /dev/stdin
 check        exit 0
 install real  verified: the functional probe passed
+agent real   installed after the helper refused
+agent member reached the helper with no password; the gate refused
