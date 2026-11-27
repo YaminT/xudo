@@ -1007,6 +1007,10 @@ fn run_typed_operation(
         passwd,
         context.mode,
     )
+    // After the decision, so a denial or a freeze still names its own reason.
+    .and_then(|work| {
+        crate::decide::refuse_an_agent_removing_on_auth(caller, context).map(|()| work)
+    })
     .and_then(|work| count_nopass(&*host, progress).map(|()| work))?;
     // (Counted once, above: after the decision, before the entry is consumed.)
     progress.evidence.push(format!(
@@ -5071,6 +5075,35 @@ outcome = "allow"
         assert!(has_line(&records[0].evidence, "op=remove-path-intent"));
         assert!(has_line(&records[1].evidence, "count=1"));
         assert_eq!(*host.harness_freeze_asked.borrow(), ["codex"]);
+    }
+
+    #[test]
+    fn an_agent_account_outside_its_unit_cannot_remove_a_path_on_the_auth_gate() {
+        // Attack: a cron job or SSH login of the agent's account, classed a
+        // human and minted for `-auth`, asks for a remove-path and gets past
+        // PAM. Refused before the walk (and, without a password, a watch
+        // approval would not help: see
+        // `an_agent_account_never_removes_a_path_through_the_password_gate`).
+        {
+            let rules = remove_rules(REMOVE_RULE, &codex_registry());
+            let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+            entry.generation = rules.generation.id();
+            let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+            let mut host = FakeHost::new(&spool);
+            let mut policy = remove_policy(REMOVE_RULE);
+            policy.rules = rules;
+            host.policy = Ok(policy);
+            plant_tree(&mut host);
+            let exit = run(&mut host, &auth());
+            assert!(
+                exit.message.contains("gate_mode_agent_without_approval"),
+                "{}",
+                exit.message
+            );
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+            assert!(consumed(&spool).is_empty());
+        }
     }
 
     #[test]

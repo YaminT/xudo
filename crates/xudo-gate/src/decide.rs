@@ -638,6 +638,27 @@ fn require_human_for_agent(
     Ok(())
 }
 
+/// An agent's account never removes a path through the password gate: not a
+/// live enrolled agent, and not a process of its account outside its unit
+/// (a cron job or an SSH login, classed a human), whatever PAM did with a
+/// password. Stricter than the run path's check: a remove-path is never
+/// queued for a reviewer, so the only approval its entry could carry is a
+/// watch, which the same uid can give itself.
+pub(crate) fn refuse_an_agent_removing_on_auth(
+    caller: &GateCaller,
+    context: &GateContext,
+) -> Result<(), Refusal> {
+    if context.mode == GateMode::Auth
+        && (caller.facts.classification.is_enrolled_agent() || context.caller_is_agent_account)
+    {
+        return Err(mode_refusal(
+            context.mode,
+            ModeRefusal::AgentWithoutApproval,
+        ));
+    }
+    Ok(())
+}
+
 /// The refusal for an entry that does not belong to the running gate file.
 pub(crate) fn mode_refusal(mode: GateMode, reason: ModeRefusal) -> Refusal {
     Refusal::Mode {
@@ -2541,6 +2562,37 @@ args = [
                 .unwrap_err()
                 .code(),
             "gate_confirmation_missing"
+        );
+    }
+
+    #[test]
+    fn an_agent_account_never_removes_a_path_through_the_password_gate() {
+        // Whatever the entry carries (a watch approval included, which the
+        // same uid can give itself): no live enrolled agent, and no process
+        // of an agent's account outside its unit, removes on `-auth`.
+        let agent_account = GateContext {
+            caller_is_agent_account: true,
+            ..context()
+        };
+        for (caller, context) in [
+            (live_agent(77, "claude-code", 44), context()),
+            (human(77), agent_account),
+        ] {
+            assert_eq!(
+                refuse_an_agent_removing_on_auth(&caller, &context)
+                    .unwrap_err()
+                    .code(),
+                "gate_mode_agent_without_approval"
+            );
+        }
+        // A human, and the `-nopass` file, which has checks of its own.
+        assert!(refuse_an_agent_removing_on_auth(&human(77), &context()).is_ok());
+        let nopass = GateContext {
+            caller_is_agent_account: true,
+            ..nopass_context()
+        };
+        assert!(
+            refuse_an_agent_removing_on_auth(&live_agent(77, "claude-code", 44), &nopass).is_ok()
         );
     }
 
