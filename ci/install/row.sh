@@ -131,14 +131,15 @@ echo 0
     #     refused and named, in either include order.
     for line in '%xudo-agent ALL=(ALL) NOPASSWD: ALL' \
         '%xudo ALL=(root) NOPASSWD: /usr/libexec/xudo/xudo-gate-nopass'; do
-        for name in 00-ops zz-ops; do
-            printf '%s\n' "$line" >/etc/sudoers.d/$name
-            chmod 440 /etc/sudoers.d/$name
+        # Not `name`: try() sets that.
+        for ops_file in 00-ops zz-ops; do
+            printf '%s\n' "$line" >/etc/sudoers.d/$ops_file
+            chmod 440 /etc/sudoers.d/$ops_file
             try ops install --agent-path
-            expect_rc 19 "agent path beside an operator's line in $name"
-            expect_err ops "/etc/sudoers.d/$name line 1"
+            expect_rc 19 "agent path beside an operator's line in $ops_file"
+            expect_err ops "/etc/sudoers.d/$ops_file line 1"
             expect_absent "$dest"
-            rm -f /etc/sudoers.d/$name
+            rm -f /etc/sudoers.d/$ops_file
         done
     done
 
