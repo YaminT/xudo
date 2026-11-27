@@ -118,6 +118,10 @@ pub struct GateContext {
     /// the lineage gave: a process of the account that left its scope reads
     /// as a human, and the password it passed PAM with is not a human's.
     pub caller_is_agent_account: bool,
+    /// Whether the caller is a live enrolled agent whose registry entry is
+    /// `way = "service"`. Only such a harness runs without a password: a
+    /// session harness runs as a person, who can type it.
+    pub caller_is_service_harness: bool,
 }
 
 /// How loudly a refusal should be reported.
@@ -243,6 +247,9 @@ pub enum ModeRefusal {
     /// is in the group that may run `-auth` and PAM is not the boundary.
     #[error("an enrolled agent cannot pass the password gate without a recorded human approval")]
     AgentWithoutApproval,
+    /// The live enrolled agent's registry entry is not `way = "service"`.
+    #[error("only a service harness runs without a password")]
+    NotAServiceHarness,
 }
 
 impl ModeRefusal {
@@ -254,6 +261,7 @@ impl ModeRefusal {
             Self::LabelDiffers => "gate_mode_label_differs",
             Self::NotGranted => "gate_mode_not_granted",
             Self::AgentWithoutApproval => "gate_mode_agent_without_approval",
+            Self::NotAServiceHarness => "gate_mode_not_a_service_harness",
         }
     }
 }
@@ -685,13 +693,21 @@ fn require_mode(
     let outcome = match context.mode {
         GateMode::Auth if pending.via == Via::Auth => Ok(()),
         GateMode::Auth => Err(ModeRefusal::WrongVia),
-        GateMode::Nopass => require_live_harness(pending, caller),
+        GateMode::Nopass => {
+            require_live_harness(pending, caller, context.caller_is_service_harness)
+        }
     };
     outcome.map_err(|reason| mode_refusal(context.mode, reason))
 }
 
-/// The `-nopass` half of [`require_mode`].
-fn require_live_harness(pending: &PendingRequest, caller: &GateCaller) -> Result<(), ModeRefusal> {
+/// The `-nopass` half of [`require_mode`]. `service` is
+/// [`GateContext::caller_is_service_harness`]: an entry the broker would never
+/// mint for a session-way harness is refused here too.
+fn require_live_harness(
+    pending: &PendingRequest,
+    caller: &GateCaller,
+    service: bool,
+) -> Result<(), ModeRefusal> {
     if pending.via != Via::Harness {
         return Err(ModeRefusal::WrongVia);
     }
@@ -705,6 +721,9 @@ fn require_live_harness(pending: &PendingRequest, caller: &GateCaller) -> Result
     };
     if pending.attested_harness.as_deref() != Some(agent_id.as_str()) {
         return Err(ModeRefusal::LabelDiffers);
+    }
+    if !service {
+        return Err(ModeRefusal::NotAServiceHarness);
     }
     Ok(())
 }
@@ -1029,6 +1048,7 @@ all = [
             password_confirms: false,
             mode: GateMode::Auth,
             caller_is_agent_account: false,
+            caller_is_service_harness: true,
         }
     }
 
@@ -2237,7 +2257,7 @@ args = [
             pending.attested_class = class;
             let live = live_agent(77, "claude-code", 44);
             assert_eq!(
-                require_live_harness(&pending, &live),
+                require_live_harness(&pending, &live, true),
                 Err(ModeRefusal::NotAnEnrolledAgent)
             );
             assert!(decide(&grant_rules(), &live, Some(&pending), nopass_context()).is_err());
@@ -2603,7 +2623,7 @@ args = [
         let mut caller = live_agent(77, "claude-code", 44);
         caller.facts = human(77).facts;
         assert_eq!(
-            require_live_harness(&harness_entry(77), &caller),
+            require_live_harness(&harness_entry(77), &caller, true),
             Err(ModeRefusal::NotAnEnrolledAgent)
         );
     }
@@ -2612,7 +2632,7 @@ args = [
     fn the_live_harness_requirements_hold_for_a_matching_entry() {
         // The positive half: what a future grant must also satisfy.
         assert_eq!(
-            require_live_harness(&harness_entry(77), &live_agent(77, "claude-code", 44)),
+            require_live_harness(&harness_entry(77), &live_agent(77, "claude-code", 44), true),
             Ok(())
         );
     }
@@ -2657,9 +2677,41 @@ args = [
             ModeRefusal::NotAnEnrolledAgent,
             ModeRefusal::LabelDiffers,
             ModeRefusal::NotGranted,
+            ModeRefusal::NotAServiceHarness,
         ] {
             assert!(!reason.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_hand_built_harness_entry_for_a_session_way_agent() {
+        // Attack: a session-way harness (it runs as a person) holds a grant,
+        // and a harness entry for it reaches `-nopass` though the broker would
+        // never mint one. The gate's own reading of the registry refuses it.
+        let session = GateContext {
+            caller_is_service_harness: false,
+            ..nopass_context()
+        };
+        let refusal = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            Some(&harness_entry(77)),
+            session,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "gate_mode_not_a_service_harness");
+        assert_eq!(
+            refusal.to_string(),
+            "the -nopass gate refuses this entry: only a service harness runs without a password"
+        );
+        assert_eq!(
+            require_live_harness(
+                &harness_entry(77),
+                &live_agent(77, "claude-code", 44),
+                false
+            ),
+            Err(ModeRefusal::NotAServiceHarness)
+        );
     }
 
     /// Over class × via × scope × label × verdict × grant (all 432 cases, no
@@ -2693,7 +2745,7 @@ args = [
                                     let mut caller = live_agent(77, label, 44);
                                     caller.attested_class =
                                         class(live, if same_scope { 44 } else { 45 });
-                                    let required = require_live_harness(&pending, &caller);
+                                    let required = require_live_harness(&pending, &caller, true);
                                     let mut decision = confirming_decision();
                                     decision.verdict = match verdict {
                                         0 => Verdict::Allow,

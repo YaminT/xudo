@@ -144,8 +144,8 @@ pub enum ExecPath {
 
 /// Which gate a run question's decision is minted for.
 ///
-/// `Harness` only when every fact holds: the caller is an enrolled agent, the
-/// kernel handed over its pidfd from the socket, the pidfd held it while it
+/// `Harness` only when every fact holds: the caller is an enrolled agent whose
+/// registry entry is `way = "service"`, the kernel handed over its pidfd from the socket, the pidfd held it while it
 /// was read, its namespaces are the broker's, its scope is a live one, and
 /// the decision is a plain allow whose grant is the action it cites. Anything
 /// weaker keeps the password path, or refuses a service harness.
@@ -169,12 +169,14 @@ pub fn exec_path(
     let granted = decision.verdict == Verdict::Allow
         && decision.harness_grant.is_some()
         && decision.harness_grant == decision.action;
-    if live && granted {
-        return ExecPath::Harness;
-    }
+    // Only a service harness runs without a password: a session harness runs
+    // as a person, who can type it, and keeps the password path.
     let service = registry
         .get(agent_id)
         .is_some_and(|entry| entry.way == HarnessWay::Service);
+    if live && granted && service {
+        return ExecPath::Harness;
+    }
     if service && decision.verdict.is_permitted() {
         ExecPath::NotGranted
     } else {

@@ -11937,7 +11937,7 @@ outcome = "allow"
                     .iter()
                     .filter(|entry| entry.via == xudo_gate::request::Via::Harness)
                     .collect();
-                if matches!(question_kind(question), 0 | 12) {
+                if harness == SERVICE_CODEX && matches!(question_kind(question), 0 | 12) {
                     assert_eq!(harness_entries.len(), 1, "{question:?}");
                     let entry = harness_entries[0];
                     assert_eq!(entry.deadline.0, NOW + HARNESS_TTL_MILLIS);
@@ -12054,8 +12054,18 @@ outcome = "allow"
 
     #[test]
     fn a_live_listed_harness_gets_a_nopass_remove_path_entry() {
-        for harness in [SERVICE_CODEX, SESSION_CODEX] {
-            let (mut host, scope) = granting_host(Some(harness));
+        // A session-way harness runs as a person: the password gate.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let (served, answer, entries) = served_by(
+            &mut host,
+            harness_identity(scope),
+            remove_question(b"/srv/app/build/cache", false),
+        );
+        assert_eq!(served, Served::Minted);
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+        {
+            let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
             let (served, answer, entries) = served_by(
                 &mut host,
                 harness_identity(scope),
@@ -12313,6 +12323,30 @@ outcome = "allow"
     }
 
     #[test]
+    fn a_session_way_agent_holding_a_grant_gets_no_harness_entry() {
+        // Attack: a session-way harness runs as a person, and a rule grants
+        // its label a command. It keeps the password path: no `-nopass`
+        // entry is minted for it, and `exec_path` says so on its own.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        let (served, answer, entries) =
+            served_by(&mut host, harness_identity(scope), status_question("x"));
+        assert_eq!(served, Served::Minted);
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].via, xudo_gate::request::Via::Auth);
+
+        let (host, scope) = granting_host(Some(SERVICE_CODEX));
+        let identity = harness_identity(scope);
+        let (_, caller, decision) = queue_decision_context(&host, &identity, &status_question("x"));
+        let session =
+            xudo_policy::HarnessRegistry::from_files([("codex.toml", SESSION_CODEX)]).unwrap();
+        assert_eq!(
+            exec_path(&identity, &caller, &decision, &session),
+            ExecPath::Password
+        );
+    }
+
+    #[test]
     fn exec_path_needs_a_plain_allow_that_cites_its_grant() {
         let (host, scope) = granting_host(Some(SERVICE_CODEX));
         let identity = harness_identity(scope);
@@ -12438,18 +12472,20 @@ outcome = "allow"
                         let harness = entries
                             .iter()
                             .any(|entry| entry.via == xudo_gate::request::Via::Harness);
-                        assert_eq!(harness, weakening.none(), "{weakening:?}");
+                        // A session-way harness never: it runs as a person.
+                        let grants = weakening.none() && !session;
+                        assert_eq!(harness, grants, "{weakening:?}");
                         assert_eq!(
                             gate_of(&answer) == Some(xudo_backend::snippet::GATE_NOPASS),
-                            weakening.none()
+                            grants
                         );
                         granted += u32::from(harness);
                     }
                 }
             }
         }
-        // The two `SO_PEERPIDFD` rungs, for each way: nothing else.
-        assert_eq!(granted, 4);
+        // The two `SO_PEERPIDFD` rungs of the service way: nothing else.
+        assert_eq!(granted, 2);
     }
 
     fn shown_entry() -> PendingRequest {

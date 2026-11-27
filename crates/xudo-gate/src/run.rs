@@ -901,6 +901,10 @@ fn proceed(
         password_confirms: mode == GateMode::Auth,
         mode,
         caller_is_agent_account: is_agent_account(&loaded.rules.harnesses, passwd, live_uid),
+        caller_is_service_harness: is_service_harness(
+            &loaded.rules.harnesses,
+            &caller.facts.classification,
+        ),
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -2679,6 +2683,7 @@ args = [
             password_confirms: true,
             mode: GateMode::Auth,
             caller_is_agent_account: false,
+            caller_is_service_harness: false,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -5452,10 +5457,44 @@ fn is_agent_account(
     })
 }
 
+/// Whether `class` is a live enrolled agent whose registry entry is
+/// `way = "service"`: the only harness `-nopass` runs for.
+fn is_service_harness(
+    registry: &xudo_policy::HarnessRegistry,
+    class: &xudo_policy::Classification,
+) -> bool {
+    class
+        .enrolled_agent_id()
+        .and_then(|label| registry.get(label))
+        .is_some_and(|entry| entry.way == xudo_policy::HarnessWay::Service)
+}
+
 #[cfg(test)]
 mod agent_account_tests {
     #![allow(clippy::unwrap_used)]
-    use super::is_agent_account;
+    use super::{is_agent_account, is_service_harness};
+    use xudo_policy::Classification;
+
+    fn enrolled(label: &str) -> Classification {
+        Classification::EnrolledAgent {
+            agent_id: label.to_owned(),
+            session_id: "s".to_owned(),
+            declared_yolo: false,
+        }
+    }
+
+    #[test]
+    fn only_a_service_way_enrolled_agent_is_a_service_harness() {
+        let registry = xudo_policy::HarnessRegistry::from_files([
+            ("codex.toml", REGISTRY),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
+        assert!(is_service_harness(&registry, &enrolled("codex")));
+        assert!(!is_service_harness(&registry, &enrolled("claude")));
+        assert!(!is_service_harness(&registry, &enrolled("ghost")));
+        assert!(!is_service_harness(&registry, &Classification::Human));
+    }
 
     const REGISTRY: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
     const SESSION: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
