@@ -444,6 +444,26 @@ fn public_docs_pin_correct_queue_freeze_session_and_audit_limits() {
 }
 
 #[test]
+fn public_docs_say_the_agent_path_refuses_at_ptrace_scope_zero() {
+    // At 0 a process of the service account outside its unit (an SSH key
+    // login, a cron job) can attach to the harness: the docs once said such
+    // a login "is not enough", which is false there.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let how = fs::read_to_string(root.join("howiwork.md")).unwrap();
+    let security = fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let manual = fs::read_to_string(root.join("docs/man/xudo.1")).unwrap();
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    for text in [&how, &security, &manual] {
+        let flat = flatten_claim(text);
+        assert!(!flat.contains("an ssh login as the service account is not enough"));
+        assert!(flat.contains("an ssh key login, a cron or at job, a lingering user manager"));
+        assert!(flat.contains("is 0 or cannot be read"));
+        assert!(flat.contains("leaves the agent path off"));
+    }
+    assert!(flatten_claim(&readme).contains("refuses while kernel.yama.ptrace_scope is 0"));
+}
+
+#[test]
 fn the_approval_check_catches_permanent_claims_and_allows_the_beta_status() {
     assert!(stale_approval_claim("Every request asks for a password."));
     assert!(stale_approval_claim(

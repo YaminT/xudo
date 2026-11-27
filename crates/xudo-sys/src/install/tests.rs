@@ -709,8 +709,8 @@ impl InstallProbe for Refusing {
     }
 }
 
-fn nopass_plan(raise: bool) -> InstallPlan {
-    InstallPlan::with_agent_path(&backend(BackendKind::Sudo, true), raise, None).unwrap()
+fn nopass_plan() -> InstallPlan {
+    InstallPlan::with_agent_path(&backend(BackendKind::Sudo, true), None).unwrap()
 }
 
 fn run_agent(
@@ -730,7 +730,7 @@ fn agent_text() -> String {
 #[test]
 fn the_agent_path_installs_after_the_helper_refused() {
     let ops = FakeInstallOps::root();
-    let report = run_agent(&nopass_plan(false), &ops, ProbeResult::Verified).unwrap();
+    let report = run_agent(&nopass_plan(), &ops, ProbeResult::Verified).unwrap();
     let calls = ops.calls();
     assert_eq!(calls[0], "read_managed /etc/sudoers.d/xudo");
     assert_eq!(calls[1], "group_exists xudo");
@@ -767,7 +767,7 @@ fn the_probe_failing_writes_nothing() {
         },
     ] {
         let ops = FakeInstallOps::root();
-        let err = run_agent(&nopass_plan(true), &ops, answer).unwrap_err();
+        let err = run_agent(&nopass_plan(), &ops, answer).unwrap_err();
         assert!(
             matches!(err, InstallError::HelperDidNotRefuse { .. }),
             "{err}"
@@ -777,7 +777,7 @@ fn the_probe_failing_writes_nothing() {
     }
     // A probe that only knows `verify` cannot show a refusal either.
     let ops = FakeInstallOps::root();
-    let err = run(&nopass_plan(false), &ops).unwrap_err();
+    let err = run(&nopass_plan(), &ops).unwrap_err();
     assert!(
         err.to_string()
             .contains("cannot run the passwordless helper"),
@@ -791,7 +791,7 @@ fn an_edited_agent_file_is_never_replaced_or_removed() {
     // An operator added a line to xudo's agent file. Neither a second
     // `--agent-path` nor an uninstall touches it; both say why.
     let tampered = format!("{}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n", agent_text());
-    for plan in [nopass_plan(false), uninstall_plan(BackendKind::Sudo)] {
+    for plan in [nopass_plan(), uninstall_plan(BackendKind::Sudo)] {
         let ops = FakeInstallOps::root()
             .with_present(&["/etc/sudoers.d/xudo"])
             .with_contents("/etc/sudoers.d/xudo", tampered.as_bytes());
@@ -815,13 +815,13 @@ fn a_second_install_changes_nothing() {
     let ops = FakeInstallOps::root()
         .with_group()
         .with_contents("/etc/sudoers.d/xudo", agent_text().as_bytes());
-    let report = run_agent(&nopass_plan(false), &ops, ProbeResult::Verified).unwrap();
+    let report = run_agent(&nopass_plan(), &ops, ProbeResult::Verified).unwrap();
     assert!(
         report
             .events
             .contains(&"/etc/sudoers.d/xudo holds no edit".to_owned())
     );
-    let written = nopass_plan(false)
+    let written = nopass_plan()
         .steps
         .iter()
         .find_map(|s| match s {
@@ -836,7 +836,7 @@ fn a_second_install_changes_nothing() {
 #[test]
 fn the_ptrace_drop_in_is_read_back_before_it_is_installed() {
     let ops = FakeInstallOps::root();
-    let report = run_agent(&nopass_plan(true), &ops, ProbeResult::Verified).unwrap();
+    let report = run(&InstallPlan::ptrace_drop_in(BackendKind::Sudo), &ops).unwrap();
     let calls = ops.calls();
     let at = |needle: &str| calls.iter().position(|c| c == needle).unwrap();
     let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
@@ -852,7 +852,7 @@ fn the_ptrace_drop_in_is_read_back_before_it_is_installed() {
 fn a_drop_in_that_does_not_read_back_is_not_installed() {
     let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
     let ops = FakeInstallOps::root().with_contents(&candidate, b"kernel.yama.ptrace_scope = 0\n");
-    let err = run_agent(&nopass_plan(true), &ops, ProbeResult::Verified).unwrap_err();
+    let err = run(&InstallPlan::ptrace_drop_in(BackendKind::Sudo), &ops).unwrap_err();
     assert!(
         err.to_string().contains("does not hold what was written"),
         "{err}"
@@ -1119,7 +1119,7 @@ fn an_alias_clash_found_only_after_the_rename_restores_what_was_there() {
             ops = ops.with_contents("/etc/sudoers.d/xudo", human_text().as_bytes());
         }
         let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
-        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
         assert!(
             matches!(&err, InstallError::RolledBack { cause }
                 if matches!(**cause, InstallError::WholeRejected { .. })),
@@ -1150,7 +1150,7 @@ fn a_whole_configuration_check_that_cannot_run_restores_too() {
         },
     );
     let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
-    let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+    let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
     assert!(
         matches!(&err, InstallError::RolledBack { cause }
             if matches!(**cause, InstallError::Io { .. })),
@@ -1162,7 +1162,7 @@ fn a_whole_configuration_check_that_cannot_run_restores_too() {
 fn the_helper_listed_wider_than_its_line_restores_what_was_there() {
     let ops = FakeInstallOps::root();
     let probe = checks(failed("sudo lists it for nobody"), ProbeResult::Verified);
-    let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+    let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
     assert!(
         matches!(&err, InstallError::RolledBack { cause }
             if matches!(**cause, InstallError::ProbeFailed { .. })),
@@ -1179,7 +1179,7 @@ fn the_helper_listed_wider_than_its_line_restores_what_was_there() {
 fn the_checks_that_pass_are_reported_as_verified() {
     let ops = FakeInstallOps::root();
     let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
-    let report = execute(&nopass_plan(false), &ops, &probe).unwrap();
+    let report = execute(&nopass_plan(), &ops, &probe).unwrap();
     assert_eq!(report.verification, Verification::Verified);
     let verified: Vec<&String> = report
         .events
@@ -1200,7 +1200,7 @@ fn a_functional_probe_that_ran_and_failed_takes_the_agent_path_back_out() {
     // It ran, so the answer is a fact about the install: restored.
     let ops = FakeInstallOps::root();
     let probe = checks(ProbeResult::Verified, failed("printed 1000"));
-    let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+    let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
     assert!(
         err.to_string().contains("functional probe ran and failed"),
         "{err}"
@@ -1213,7 +1213,7 @@ fn a_functional_probe_that_ran_and_failed_takes_the_agent_path_back_out() {
     // and the report says what was not checked.
     let ops = FakeInstallOps::root();
     let probe = checks(ProbeResult::Verified, unavailable("no broker"));
-    let report = execute(&nopass_plan(false), &ops, &probe).unwrap();
+    let report = execute(&nopass_plan(), &ops, &probe).unwrap();
     assert_eq!(
         report.verification,
         Verification::Unverified {
@@ -1227,15 +1227,26 @@ fn a_functional_probe_that_ran_and_failed_takes_the_agent_path_back_out() {
 }
 
 #[test]
-fn a_drop_in_failure_takes_the_passwordless_line_back_out() {
-    let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
-    let ops = FakeInstallOps::root().with_contents(&candidate, b"kernel.yama.ptrace_scope = 0\n");
-    let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
-    let err = execute(&nopass_plan(true), &ops, &probe).unwrap_err();
-    assert!(matches!(err, InstallError::RolledBack { .. }), "{err}");
+fn the_ptrace_plan_writes_no_passwordless_line_and_says_the_path_is_off() {
+    // At a live ptrace_scope of 0 only the drop-in is written: no group, no
+    // sudoers file, and the report says the agent path is not on.
+    let ops = FakeInstallOps::root();
+    let report = run(&InstallPlan::ptrace_drop_in(BackendKind::Sudo), &ops).unwrap();
     let calls = ops.calls();
-    assert!(calls.contains(&format!("discard {candidate}")));
-    assert!(calls.contains(&"remove_managed /etc/sudoers.d/xudo".to_owned()));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains("/etc/sudoers.d/xudo") || c.starts_with("create_group")),
+        "{calls:?}"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.starts_with("The agent path is NOT on")),
+        "{:?}",
+        report.notices
+    );
 }
 
 #[test]
@@ -1253,7 +1264,7 @@ fn a_restore_that_fails_removes_the_line_it_could_not_take_back() {
         let ops = FakeInstallOps::root()
             .with_contents("/etc/sudoers.d/xudo", human_text().as_bytes())
             .failing_from(method, 1, error(method));
-        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
         assert!(
             matches!(&err, InstallError::RemovedInstead { path, .. } if path == "/etc/sudoers.d/xudo"),
             "{err}"
@@ -1270,7 +1281,7 @@ fn a_restore_that_fails_removes_the_line_it_could_not_take_back() {
     let ops = FakeInstallOps::root()
         .with_contents("/etc/sudoers.d/xudo", human_text().as_bytes())
         .failing_from("install", 1, error("install"));
-    let _ = execute(&nopass_plan(false), &ops, &probe);
+    let _ = execute(&nopass_plan(), &ops, &probe);
     assert!(
         ops.calls()
             .contains(&"discard /etc/sudoers.d/xudo.candidate".to_owned())
@@ -1296,7 +1307,7 @@ fn a_line_that_can_be_neither_restored_nor_removed_is_called_possibly_live() {
         } else {
             ops
         };
-        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
         assert!(
             matches!(&err, InstallError::NotRolledBack { path, .. } if path == "/etc/sudoers.d/xudo"),
             "{err}"
@@ -1323,7 +1334,7 @@ fn what_an_install_would_replace_unread_stops_it_before_the_rename() {
         },
     );
     let probe = checks(ProbeResult::Verified, ProbeResult::Verified);
-    let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+    let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
     assert!(matches!(err, InstallError::NotOurs { .. }), "{err}");
     assert!(!ops.calls().iter().any(|c| c.starts_with("install ")));
 }
@@ -1401,7 +1412,7 @@ fn a_listing_check_that_cannot_run_takes_the_agent_path_back_out() {
             control,
             verify: ProbeResult::Verified,
         };
-        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        let err = execute(&nopass_plan(), &ops, &probe).unwrap_err();
         assert!(
             matches!(&err, InstallError::RolledBack { cause }
                 if matches!(**cause, InstallError::ProbeFailed { .. })),
@@ -1411,7 +1422,7 @@ fn a_listing_check_that_cannot_run_takes_the_agent_path_back_out() {
     }
     // A probe that cannot ask the backend at all cannot vouch for the line.
     let ops = FakeInstallOps::root();
-    let err = execute(&nopass_plan(false), &ops, &Blind).unwrap_err();
+    let err = execute(&nopass_plan(), &ops, &Blind).unwrap_err();
     assert!(err.to_string().contains("cannot ask the backend"), "{err}");
     assert_eq!(Blind.verify(&[]), ProbeResult::Verified);
     assert_eq!(

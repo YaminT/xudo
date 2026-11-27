@@ -429,7 +429,18 @@ as_harness off-clean "$clean_cmd"
 check e2e_before_the_agent_path_sudo_refuses_a_granted_remove_path eval 'agent_path_off && tree_intact'
 rm -f /run/xudo/req/*
 
-# --- 5. The real installer turns the agent path on.
+# --- 5. The real installer turns the agent path on. Yama is not namespaced:
+# the container sees the host's kernel.yama.ptrace_scope, and setting it here
+# would change the host. At 0 the install refuses, so the lane needs the host
+# at 1 or more, and says so rather than skip.
+scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo none)
+case $scope in
+1 | 2 | 3) ;;
+*)
+    bad "e2e: the host's kernel.yama.ptrace_scope is $scope; --agent-path refuses below 1. Set it on the host: sudo sysctl -w kernel.yama.ptrace_scope=1"
+    return 1
+    ;;
+esac
 as_admin "/usr/bin/sudo /usr/bin/xudo install --agent-path"
 check e2e_the_operator_turns_the_agent_path_on_through_sudo eval '
     [ "$hrc" = 0 ] && asked_password &&

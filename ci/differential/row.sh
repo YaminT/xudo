@@ -98,6 +98,11 @@ run_xudo install --agent-path --dry-run --show-contents >"$out/agent-path.txt" 2
 rc=$?
 set -e
 echo "agent path   exit $rc" >>"$report"
+# Yama is not namespaced and the agent path is refused at ptrace_scope 0:
+# say so, so the mismatch with the expected report names its cause.
+if grep -q 'refusing --agent-path: kernel.yama.ptrace_scope' "$out/agent-path.txt"; then
+    echo "agent path   HOST kernel.yama.ptrace_scope is not 1 or more; set it on the host" >>"$report"
+fi
 if [ "$rc" -eq 0 ]; then
     awk '/^   [0-9]+\. write candidate/ { grab = 1; next }
          /^   [0-9]+\. / { grab = 0 }

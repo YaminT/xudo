@@ -21,7 +21,8 @@ sudo apt install ./xudo_<ver>_<arch>.deb
 Supported: Debian 13, Ubuntu 24.04 and 26.04, amd64 and arm64. The package
 installs no passwordless rule. Passwordless harness execution is off by
 default and requires service enrollment, a matching root-owned rule, and the
-explicit `sudo xudo install --agent-path` opt-in (sudo or sudo-rs only).
+explicit `sudo xudo install --agent-path` opt-in (sudo or sudo-rs only), which
+refuses while `kernel.yama.ptrace_scope` is 0.
 
 ## Example
 

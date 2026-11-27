@@ -7,9 +7,14 @@
 //! line that names the agent group, xudo's aliases or its helpers stops the
 //! install, as does a helper file or directory above it that is not root's
 //! alone, and an account in the agent group that no harness in the registry
-//! names; and the host's `kernel.yama.ptrace_scope` decides what
-//! `--raise-ptrace-scope` writes (OD9 f-b). It never lowers a value and never
-//! writes without the flag.
+//! names. The host's live `kernel.yama.ptrace_scope` must be 1 or more: at 0
+//! a process of an enrolled agent's account outside its unit (an SSH key
+//! login, a cron or at job, a lingering user manager) can attach to the
+//! harness and run its granted commands from inside the scope, so the install
+//! refuses, and refuses a value it cannot read. `--raise-ptrace-scope` at 0
+//! writes the sysctl drop-in alone and leaves the agent path off until the
+//! value is live (OD9 f-b). It never lowers a value and never writes without
+//! the flag.
 
 use std::io::Write;
 use std::path::Path;
@@ -26,23 +31,9 @@ use crate::rules::{LoadError, LoadedRules};
 /// Where the kernel reports the Yama ptrace setting.
 pub(crate) const PTRACE_SCOPE: &str = "/proc/sys/kernel/yama/ptrace_scope";
 
-/// Whether a session-way harness is registered: such a harness runs as the
-/// human's uid, which is what a ptrace scope of 0 exposes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SessionHarness {
-    /// At least one.
-    Registered,
-    /// None: service-way harnesses only, or none at all.
-    None,
-    /// The registry could not be read, so nobody can say.
-    Unknown(String),
-}
-
 /// What `--agent-path` needs from the harness registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Registry {
-    /// Whether a session-way harness is registered.
-    pub(crate) session: SessionHarness,
     /// Every service-way harness's account, the only accounts `enrol` adds to
     /// the agent group, or why the registry could not be read. A user a
     /// session harness names is not one: a session harness keeps the
@@ -65,28 +56,7 @@ pub(crate) fn registry(loaded: Result<&LoadedRules, &LoadError>) -> Registry {
                 .collect()),
         },
     };
-    Registry {
-        session: session_harness(loaded),
-        accounts,
-    }
-}
-
-/// What the loaded rules say about session-way harnesses.
-pub(crate) fn session_harness(loaded: Result<&LoadedRules, &LoadError>) -> SessionHarness {
-    match loaded {
-        Err(error) => SessionHarness::Unknown(error.to_string()),
-        Ok(rules) => match rules.registry_fault() {
-            Some(fault) => SessionHarness::Unknown(fault.to_owned()),
-            None if rules
-                .harnesses()
-                .entries()
-                .any(|entry| entry.way == HarnessWay::Session) =>
-            {
-                SessionHarness::Registered
-            }
-            None => SessionHarness::None,
-        },
-    }
+    Registry { accounts }
 }
 
 /// The live `kernel.yama.ptrace_scope`, or why it cannot be read.
@@ -103,11 +73,23 @@ pub(crate) fn ptrace_scope(host: &dyn HostView) -> Result<u8, String> {
     }
 }
 
+/// What `--agent-path` runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentPlan {
+    /// The plan.
+    pub(crate) plan: InstallPlan,
+    /// The plan writes only the ptrace drop-in: the live value is 0, and the
+    /// agent path stays off until it is 1 or more.
+    pub(crate) waits_for_scope: bool,
+}
+
 /// Builds the opt-in plan, or says why not and returns the exit status.
 ///
 /// `raise` is `--raise-ptrace-scope`. The drop-in is planned only when the
-/// live value is 0: at 1 or more there is nothing to raise, and writing 1
-/// over a higher value set at run time would lower it on `sysctl --system`.
+/// live value is 0, and then alone: a drop-in changes nothing until it is
+/// applied, and the agent path is turned on only on the live value. At 1 or
+/// more there is nothing to raise, and writing 1 over a higher value set at
+/// run time would lower it on `sysctl --system`.
 pub(crate) fn plan(
     host: &dyn HostView,
     backend: &Backend,
@@ -115,12 +97,11 @@ pub(crate) fn plan(
     raise: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<InstallPlan, ExitCode> {
+) -> Result<AgentPlan, ExitCode> {
     if backend.kind == BackendKind::Doas {
         let _ = writeln!(err, "xudo: refusing --agent-path: {AGENT_PATH_SUDO_ONLY}");
         return Err(ExitCode::Unusable);
     }
-    let session = &registry.session;
     let mut refusals = xudo_backend::agent_path::conflicts(host);
     refusals.extend(
         xudo_backend::agent_path::gate_faults(host)
@@ -165,36 +146,72 @@ pub(crate) fn plan(
         );
         return Err(ExitCode::Unusable);
     }
-    let raise = match (raise, ptrace_scope(host)) {
-        (true, Ok(0)) => true,
-        (true, Ok(now)) => {
-            let _ = writeln!(
-                out,
-                "kernel.yama.ptrace_scope is already {now}: --raise-ptrace-scope writes nothing"
-            );
-            false
-        }
-        (true, Err(why)) => {
+    let scope = match ptrace_gate(host, backend, raise, out, err)? {
+        Scope::Live(scope) => scope,
+        Scope::Waits(plan) => return Ok(plan),
+    };
+    if raise {
+        let _ = writeln!(
+            out,
+            "kernel.yama.ptrace_scope is already {scope}: --raise-ptrace-scope writes nothing"
+        );
+    }
+    agent_plan_for(backend, member.as_deref())
+        .map(|plan| AgentPlan {
+            plan,
+            waits_for_scope: false,
+        })
+        .map_err(|reason| {
+            let _ = writeln!(err, "xudo: no usable backend: {reason}");
+            ExitCode::Unusable
+        })
+}
+
+/// What the live `kernel.yama.ptrace_scope` lets `--agent-path` do.
+enum Scope {
+    /// 1 or more: the agent path may be planned.
+    Live(u8),
+    /// 0, with `--raise-ptrace-scope`: the drop-in alone.
+    Waits(AgentPlan),
+}
+
+/// Refuses the agent path at a live `kernel.yama.ptrace_scope` of 0, or one
+/// that cannot be read, and plans the drop-in alone at 0 with the flag.
+fn ptrace_gate(
+    host: &dyn HostView,
+    backend: &Backend,
+    raise: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<Scope, ExitCode> {
+    // At 0 any process of an enrolled agent's account outside its unit can
+    // attach to the harness and act from inside its scope. The live value
+    // decides, never a drop-in's promise, and one that cannot be read is 0.
+    let scope = match ptrace_scope(host) {
+        Ok(scope) => scope,
+        Err(why) => {
             let _ = writeln!(
                 err,
-                "xudo: refusing --raise-ptrace-scope: {why}. Nothing was written."
+                "xudo: refusing --agent-path: kernel.yama.ptrace_scope cannot be read ({why}), \
+                 so nothing shows that a process of an agent's account outside its unit cannot \
+                 attach to the harness. Nothing was written."
             );
             return Err(ExitCode::Unusable);
         }
-        (false, Ok(0)) if *session != SessionHarness::None => {
-            let _ = writeln!(
-                err,
-                "xudo: warning: kernel.yama.ptrace_scope is 0 here and a session-way harness \
-                 is registered, or the registry could not be read. At 0 any process of the \
-                 human's uid, an agent included, can attach to the human's terminal and read \
-                 a password as it is typed. `sudo xudo install --agent-path \
-                 --raise-ptrace-scope` writes {PTRACE_DROP_IN_PATH} setting it to 1."
-            );
-            false
-        }
-        (false, _) => false,
     };
-    if raise {
+    if scope == 0 && !raise {
+        let _ = writeln!(
+            err,
+            "xudo: refusing --agent-path: kernel.yama.ptrace_scope is 0. At 0 any process of an \
+             enrolled agent's account outside its unit (an SSH key login, a cron or at job, a \
+             lingering user manager) can attach to the harness and run its granted commands \
+             with no password. Raise it first: `sudo xudo install --agent-path \
+             --raise-ptrace-scope` writes {PTRACE_DROP_IN_PATH}; then run \
+             `sudo sysctl --system` and this install again. Nothing was written."
+        );
+        return Err(ExitCode::Unusable);
+    }
+    if scope == 0 {
         let _ = writeln!(out, "--- /dev/null\n+++ {PTRACE_DROP_IN_PATH}");
         for line in PTRACE_DROP_IN.lines() {
             let _ = writeln!(out, "+{line}");
@@ -203,7 +220,7 @@ pub(crate) fn plan(
             out,
             "xudo writes this file and does not apply it: it takes effect with \
              `sudo sysctl --system` or at boot, and only if no file read after it sets the \
-             value too."
+             value too. The agent path stays off until the live value is 1 or more."
         );
         for setting in later_ptrace_settings(host) {
             let _ = writeln!(
@@ -212,21 +229,18 @@ pub(crate) fn plan(
                  scope may stay at 0"
             );
         }
+        return Ok(Scope::Waits(AgentPlan {
+            plan: InstallPlan::ptrace_drop_in(backend.kind),
+            waits_for_scope: true,
+        }));
     }
-    agent_plan_for(backend, raise, member.as_deref()).map_err(|reason| {
-        let _ = writeln!(err, "xudo: no usable backend: {reason}");
-        ExitCode::Unusable
-    })
+    Ok(Scope::Live(scope))
 }
 
 /// The opt-in plan, with its failure as text. Detection refuses a backend
 /// that cannot be given a snippet first, so only a test reaches the error.
-fn agent_plan_for(
-    backend: &Backend,
-    raise: bool,
-    member: Option<&str>,
-) -> Result<InstallPlan, String> {
-    InstallPlan::with_agent_path(backend, raise, member).map_err(|source| source.to_string())
+fn agent_plan_for(backend: &Backend, member: Option<&str>) -> Result<InstallPlan, String> {
+    InstallPlan::with_agent_path(backend, member).map_err(|source| source.to_string())
 }
 
 /// One refusal per member of the agent group that no harness names. Only
@@ -402,11 +416,9 @@ mod tests {
     fn planned(
         host: &MemoryHost,
         kind: BackendKind,
-        session: &SessionHarness,
         raise: bool,
     ) -> (Result<InstallPlan, ExitCode>, String, String) {
         let registry = Registry {
-            session: session.clone(),
             accounts: Ok(vec!["agent".to_owned()]),
         };
         planned_with(host, kind, &registry, raise)
@@ -420,11 +432,26 @@ mod tests {
     ) -> (Result<InstallPlan, ExitCode>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = plan(host, &backend(kind), registry, raise, &mut out, &mut err);
+        // A plan that waits for the live value writes the drop-in alone.
+        if let Ok(planned) = &result {
+            assert_eq!(planned.waits_for_scope, writes_drop_in(&planned.plan));
+        }
         (
-            result,
+            result.map(|planned| planned.plan),
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// Every file the plan renames into place.
+    fn installed(plan: &InstallPlan) -> Vec<&str> {
+        plan.steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::Install { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn writes_drop_in(plan: &InstallPlan) -> bool {
@@ -435,12 +462,7 @@ mod tests {
 
     #[test]
     fn the_agent_path_refuses_doas() {
-        let (result, out, err) = planned(
-            &host(Some(b"1\n")),
-            BackendKind::Doas,
-            &SessionHarness::None,
-            false,
-        );
+        let (result, out, err) = planned(&host(Some(b"1\n")), BackendKind::Doas, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(err.contains("sudo and sudo-rs only"), "{err}");
         assert_eq!(out, "");
@@ -455,93 +477,73 @@ mod tests {
             0o440,
             b"%xudo-agent ALL=(ALL) NOPASSWD: ALL\n",
         );
-        let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&host, BackendKind::Sudo, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(err.contains("/etc/sudoers.d/00-ops line 1"), "{err}");
         assert!(err.contains("Nothing was written"), "{err}");
     }
 
     #[test]
-    fn the_drop_in_is_raised_only_with_the_flag_and_only_from_zero() {
-        // At 0 with the flag: planned, and the diff is printed first.
-        let (result, out, _) = planned(
-            &host(Some(b"0\n")),
-            BackendKind::Sudo,
-            &SessionHarness::None,
-            true,
-        );
-        assert!(writes_drop_in(&result.unwrap()));
+    fn agent_path_refuses_at_ptrace_scope_zero() {
+        // Attack: at 0 an SSH key login, a cron job or a lingering user
+        // manager of the agent's account attaches to the harness and runs its
+        // granted commands from inside the scope. Without the flag nothing is
+        // planned, and the operator is told how to raise it.
+        let (result, out, err) = planned(&host(Some(b"0\n")), BackendKind::Sudo, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert_eq!(out, "");
+        assert!(err.contains("kernel.yama.ptrace_scope is 0"), "{err}");
+        assert!(err.contains("an SSH key login, a cron or at job"), "{err}");
+        assert!(err.contains("--raise-ptrace-scope"), "{err}");
+        assert!(err.contains("`sudo sysctl --system`"), "{err}");
+        assert!(err.contains("Nothing was written"), "{err}");
+    }
+
+    #[test]
+    fn raise_flag_writes_dropin_but_install_waits_for_live_value() {
+        // A drop-in is a promise about the next boot, not the live value: at 0
+        // the flag plans the drop-in alone, and the agent path stays off.
+        let (result, out, _) = planned(&host(Some(b"0\n")), BackendKind::Sudo, true);
+        let plan = result.unwrap();
+        assert!(writes_drop_in(&plan));
+        assert_eq!(installed(&plan), [PTRACE_DROP_IN_PATH]);
         assert!(
             out.contains("+++ /etc/sysctl.d/05-xudo-ptrace-scope.conf"),
             "{out}"
         );
         assert!(out.contains("+kernel.yama.ptrace_scope = 1"), "{out}");
-        // At 0 without the flag: never written, whatever is registered.
-        for session in [
-            SessionHarness::Registered,
-            SessionHarness::None,
-            SessionHarness::Unknown("x".to_owned()),
-        ] {
-            let (result, _, _) = planned(&host(Some(b"0\n")), BackendKind::Sudo, &session, false);
-            assert!(!writes_drop_in(&result.unwrap()), "{session:?}");
-        }
+        assert!(out.contains("The agent path stays off"), "{out}");
     }
 
     #[test]
     fn the_drop_in_never_lowers_a_higher_value() {
-        // 1, 2 or 3 is already at least what the drop-in sets: nothing written.
+        // 1, 2 or 3 is already at least what the drop-in sets: nothing written,
+        // and the agent path is planned.
         for now in [&b"1\n"[..], b"2\n", b"3"] {
-            let (result, out, _) = planned(
-                &host(Some(now)),
-                BackendKind::SudoRs,
-                &SessionHarness::None,
-                true,
-            );
-            assert!(!writes_drop_in(&result.unwrap()));
+            let (result, out, _) = planned(&host(Some(now)), BackendKind::SudoRs, true);
+            let plan = result.unwrap();
+            assert!(!writes_drop_in(&plan));
+            assert_eq!(installed(&plan), [SUDOERS_PATH]);
             assert!(out.contains("already"), "{out}");
         }
     }
 
     #[test]
-    fn an_unreadable_ptrace_scope_refuses_the_flag_and_writes_nothing() {
+    fn an_unreadable_ptrace_scope_refuses_the_agent_path_and_writes_nothing() {
+        // Fail closed: a value nobody can read may be 0.
         for host in [
             host(None),
             host(Some(b"zero\n")),
             host(Some(&[0xff])),
             host(None).unreadable_file(PTRACE_SCOPE, 0, 0, 0o600),
         ] {
-            let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, true);
-            assert_eq!(result.unwrap_err(), ExitCode::Unusable);
-            assert!(err.contains("Nothing was written"), "{err}");
-            // Without the flag the same host still gets the agent path.
-            let (result, _, _) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
-            assert!(result.is_ok());
+            for raise in [false, true] {
+                let (result, _, err) = planned(&host, BackendKind::Sudo, raise);
+                assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+                assert!(err.contains("cannot be read"), "{err}");
+                assert!(err.contains("Nothing was written"), "{err}");
+            }
         }
-    }
-
-    #[test]
-    fn a_session_harness_at_zero_is_told_the_flag_and_a_service_host_is_not() {
-        for session in [
-            SessionHarness::Registered,
-            SessionHarness::Unknown("x".to_owned()),
-        ] {
-            let (_, _, err) = planned(&host(Some(b"0\n")), BackendKind::Sudo, &session, false);
-            assert!(err.contains("--raise-ptrace-scope"), "{err}");
-        }
-        let (_, _, err) = planned(
-            &host(Some(b"0\n")),
-            BackendKind::Sudo,
-            &SessionHarness::None,
-            false,
-        );
-        assert_eq!(err, "");
-        let (_, _, err) = planned(
-            &host(Some(b"1\n")),
-            BackendKind::Sudo,
-            &SessionHarness::Registered,
-            false,
-        );
-        assert_eq!(err, "");
     }
 
     #[test]
@@ -551,7 +553,7 @@ mod tests {
             ..backend(BackendKind::Sudo)
         };
         assert!(
-            agent_plan_for(&crippled, false, None)
+            agent_plan_for(&crippled, None)
                 .unwrap_err()
                 .contains("cannot generate")
         );
@@ -560,7 +562,6 @@ mod tests {
             &host(Some(b"1")),
             &crippled,
             &Registry {
-                session: SessionHarness::None,
                 accounts: Ok(Vec::new()),
             },
             false,
@@ -613,21 +614,21 @@ mod tests {
     }
 
     #[test]
-    fn a_session_way_entry_is_what_counts() {
+    fn only_a_service_way_account_belongs_in_the_agent_group() {
         let service = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
         let session = "label = \"dev\"\nway = \"session\"\nusers = [\"carol\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n";
-        let only_service =
-            LoadedRules::from_dir(&registry_dir("service", &[("codex.toml", service)]));
-        assert_eq!(session_harness(only_service.as_ref()), SessionHarness::None);
         let both = LoadedRules::from_dir(&registry_dir(
             "session",
             &[("codex.toml", service), ("dev.toml", session)],
         ));
-        assert_eq!(session_harness(both.as_ref()), SessionHarness::Registered);
+        assert_eq!(
+            registry(both.as_ref()).accounts,
+            Ok(vec!["agent".to_owned()])
+        );
         let faulty = LoadedRules::from_dir(&registry_dir("fault", &[("x.toml", "wat = 1\n")]));
-        assert!(format!("{:?}", session_harness(faulty.as_ref())).starts_with("Unknown("));
+        assert!(registry(faulty.as_ref()).accounts.is_err());
         let missing = LoadedRules::from_dir(Path::new("/xudo-test-no-such-rules"));
-        assert!(format!("{:?}", session_harness(missing.as_ref())).starts_with("Unknown("));
+        assert!(registry(missing.as_ref()).accounts.is_err());
     }
 
     #[test]
@@ -638,8 +639,7 @@ mod tests {
             host(Some(b"1\n")).dir("/usr/libexec/xudo", 1000, 1000, 0o755),
             host(Some(b"1\n")).hard_linked(gate),
         ] {
-            let (result, out, err) =
-                planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+            let (result, out, err) = planned(&host, BackendKind::Sudo, false);
             assert_eq!(result.unwrap_err(), ExitCode::Unusable);
             assert!(
                 err.contains("refusing --agent-path: the passwordless helper cannot be trusted"),
@@ -684,7 +684,7 @@ mod tests {
             (b"xudo-agent:x:997:agent\nlurk:x:997:\n", "lurker"),
         ] {
             let host = with_members(group);
-            let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+            let (result, _, err) = planned(&host, BackendKind::Sudo, false);
             assert_eq!(result.unwrap_err(), ExitCode::Unusable);
             assert!(
                 err.contains(&format!(
@@ -699,13 +699,12 @@ mod tests {
     #[test]
     fn a_group_of_exactly_registered_accounts_is_accepted_and_asked_about() {
         let host = with_members(b"xudo-agent:x:996:agent\n");
-        let (result, _, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&host, BackendKind::Sudo, false);
         assert_eq!(listed_users(&result.unwrap()), ["nobody", "agent"], "{err}");
         // A registered name that could be read as an option is never passed
         // to the backend: nobody stands in.
         let odd = with_members(b"xudo-agent:x:996:-x\n");
         let registry = Registry {
-            session: SessionHarness::None,
             accounts: Ok(vec!["-x".to_owned()]),
         };
         let (result, _, _) = planned_with(&odd, BackendKind::Sudo, &registry, false);
@@ -719,7 +718,6 @@ mod tests {
         // The registry could not be read: no member can be shown to belong.
         let members = with_members(b"xudo-agent:x:996:agent\n");
         let unread = Registry {
-            session: SessionHarness::Unknown("bad".to_owned()),
             accounts: Err("bad registry".to_owned()),
         };
         let (result, _, err) = planned_with(&members, BackendKind::Sudo, &unread, false);
@@ -733,8 +731,7 @@ mod tests {
         assert!(result.is_ok());
         // The group itself could not be read: the members cannot be known.
         let unreadable = host(Some(b"1\n")).unreadable_file("/etc/group", 0, 0, 0o600);
-        let (result, _, err) =
-            planned(&unreadable, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&unreadable, BackendKind::Sudo, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(
             err.contains("the members of xudo-agent cannot be known"),
@@ -771,7 +768,7 @@ mod tests {
         // written.
         let no_nobody =
             host(Some(b"1\n")).file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n");
-        let (result, _, err) = planned(&no_nobody, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&no_nobody, BackendKind::Sudo, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(
             err.contains("ask the backend about nobody, and /etc/passwd holds no such account"),
@@ -779,12 +776,12 @@ mod tests {
         );
         // agent is in the group and registered, and has no passwd line.
         let ghost = host(Some(b"1\n")).file("/etc/group", 0, 0, 0o644, b"xudo-agent:x:996:agent\n");
-        let (result, _, err) = planned(&ghost, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&ghost, BackendKind::Sudo, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(err.contains("about agent, and /etc/passwd holds"), "{err}");
         // /etc/passwd unreadable: nothing can be asked about.
         let unread = host(Some(b"1\n")).unreadable_file("/etc/passwd", 0, 0, 0o600);
-        let (result, _, err) = planned(&unread, BackendKind::Sudo, &SessionHarness::None, false);
+        let (result, _, err) = planned(&unread, BackendKind::Sudo, false);
         assert_eq!(result.unwrap_err(), ExitCode::Unusable);
         assert!(
             err.contains("the accounts the checks after the write ask about cannot be known"),
@@ -812,7 +809,7 @@ mod tests {
             .file("/usr/lib/sysctl.d/50-x.conf", 0, 0, 0o644, b"kernel/yama/ptrace_scope=0\n")
             .unreadable_file("/usr/lib/sysctl.d/60-y.conf", 0, 0, 0o600)
             .file("/etc/sysctl.conf", 0, 0, 0o644, b"kernel.yama.ptrace_scope=0\n");
-        let (result, out, err) = planned(&host, BackendKind::Sudo, &SessionHarness::None, true);
+        let (result, out, err) = planned(&host, BackendKind::Sudo, true);
         assert!(writes_drop_in(&result.unwrap()));
         assert!(out.contains("does not apply it"), "{out}");
         assert!(!out.contains("next boot"), "{out}");

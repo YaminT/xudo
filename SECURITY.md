@@ -16,8 +16,14 @@ start command. A session harness shares the human's uid: at
 `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
 password, `xudo watch` accepts a same-uid watcher on another tty, and a
 registry entry can name the human's account. Run harnesses as separate service
-accounts. `--raise-ptrace-scope` takes effect only after `sudo sysctl --system`
-or reboot.
+accounts. A service harness's own account is no safer at 0: any process of
+that account outside the unit (an SSH key login, a cron or at job, a lingering
+user manager) can attach to the harness and act from inside its scope, so
+`sudo xudo install --agent-path` refuses while the live
+`kernel.yama.ptrace_scope` is 0 or cannot be read. At 0,
+`--raise-ptrace-scope` writes only a sysctl drop-in and leaves the agent path
+off; it takes effect only after `sudo sysctl --system` or reboot, and then the
+install turns the path on.
 
 ## Security boundary
 

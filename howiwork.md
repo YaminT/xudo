@@ -61,16 +61,23 @@ in the root-only environment file. Enrollment itself authorizes no command.
 
 Only a process running inside the live scope created by that root-managed unit,
 with a matching registry record, is a verified harness. A similarly named
-process or an SSH login as the service account is not enough. Root-created
-cgroups and registry state are the authentication basis; display names are not.
+process is not enough, and neither is a process of the service account outside
+the unit (an SSH key login, a cron or at job, a lingering user manager): it is
+not in the scope. At `kernel.yama.ptrace_scope = 0`, though, such a process can
+attach to the harness and act from inside the scope, so
+`sudo xudo install --agent-path` refuses while the live value is 0 or cannot be
+read. Root-created cgroups and registry state are the authentication basis;
+display names are not.
 
 The session way (a harness running in the human's own account) is parsed and
 loaded, but has no start command. A session harness shares the human's uid:
 with `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
 password, `xudo watch` accepts a same-uid watcher on another tty, and a session
 registry entry can name the human's account. Run harnesses as separate service
-accounts. `--raise-ptrace-scope` writes a sysctl drop-in; it takes effect only
-after `sudo sysctl --system` or reboot.
+accounts. At a live value of 0, `--raise-ptrace-scope` writes only a sysctl
+drop-in and leaves the agent path off; it takes effect only after
+`sudo sysctl --system` or reboot, and then `sudo xudo install --agent-path`
+turns the path on.
 
 The package and plain `xudo install` install only the password-authenticated
 backend rule. After enrollment and after installing rules that grant the

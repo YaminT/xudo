@@ -714,13 +714,22 @@ a process of that uid can read a typed password,
 .B xudo watch
 accepts a same-uid watcher on another tty, and a registry entry can name the
 human's account. Run harnesses as separate service accounts.
+.IP
+.B \-\-agent\-path
+refuses while the live
+.B kernel.yama.ptrace_scope
+is 0 or cannot be read: at 0 any process of a service harness's account outside
+its unit (an SSH key login, a cron or at job, a lingering user manager) can
+attach to the harness and act from inside its scope.
 .B \-\-raise\-ptrace\-scope
-also writes a root-owned sysctl drop-in setting
-.BR kernel.yama.ptrace_scope=1 ,
-but only when its live value is 0. It never lowers a higher value and does not
-apply the setting immediately; it takes effect after
+at 0 writes only a root-owned sysctl drop-in setting
+.B kernel.yama.ptrace_scope=1
+and leaves the agent path off, exiting with a failure. It never lowers a higher
+value and does not apply the setting immediately; it takes effect after
 .B sudo sysctl \-\-system
-or at boot. Uninstall removes an unedited drop-in and leaves an edited
+or at boot, and then
+.B xudo install \-\-agent\-path
+turns the path on. Uninstall removes an unedited drop-in and leaves an edited
 one with a warning.
 .TP
 .B audit

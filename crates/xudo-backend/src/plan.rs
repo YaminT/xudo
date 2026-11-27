@@ -357,18 +357,14 @@ impl InstallPlan {
     /// configuration and must not list the helper for `nobody`, nor with an
     /// argument for `member` (a member of the agent group, or `nobody` when
     /// there is none); any of those failing restores what the run installed.
-    /// `raise_ptrace` adds the sysctl drop-in; the caller decides it, from the
-    /// flag and the live value.
+    /// It never carries the ptrace drop-in: the caller builds it only once the
+    /// live `kernel.yama.ptrace_scope` is 1 or more (see [`Self::ptrace_drop_in`]).
     ///
     /// # Errors
     ///
     /// [`SnippetError::Unsupported`] for doas ([`AGENT_PATH_SUDO_ONLY`]) or a
     /// backend that cannot be given a snippet.
-    pub fn with_agent_path(
-        backend: &Backend,
-        raise_ptrace: bool,
-        member: Option<&str>,
-    ) -> Result<Self, SnippetError> {
+    pub fn with_agent_path(backend: &Backend, member: Option<&str>) -> Result<Self, SnippetError> {
         if backend.kind == BackendKind::Doas {
             return Err(SnippetError::Unsupported {
                 backend: backend.kind.label().to_owned(),
@@ -391,11 +387,6 @@ impl InstallPlan {
                 path: SUDOERS_PATH.to_owned(),
             },
         ];
-        if raise_ptrace {
-            steps.push(PlanStep::RefuseEdited {
-                path: PTRACE_DROP_IN_PATH.to_owned(),
-            });
-        }
         steps.extend([
             PlanStep::CreateGroup {
                 name: XUDO_GROUP.to_owned(),
@@ -406,23 +397,6 @@ impl InstallPlan {
         ]);
         steps.extend(sudoers_steps(snippet));
         steps.extend(checks_after_rename(&exe, member.unwrap_or("nobody")));
-        if raise_ptrace {
-            let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
-            steps.extend([
-                PlanStep::WriteCandidate {
-                    path: candidate.clone(),
-                    contents: PTRACE_DROP_IN.to_owned(),
-                    mode: 0o440,
-                },
-                PlanStep::ReadBack {
-                    candidate: candidate.clone(),
-                },
-                PlanStep::Install {
-                    from: candidate,
-                    to: PTRACE_DROP_IN_PATH.to_owned(),
-                },
-            ]);
-        }
         steps.push(auth_probe(&exe));
         steps.push(PlanStep::Notice {
             text: "The agent path is on. A member of xudo-agent may run the passwordless helper \
@@ -437,6 +411,42 @@ impl InstallPlan {
             backend: backend.kind,
             steps,
         })
+    }
+
+    /// The plan `--agent-path --raise-ptrace-scope` runs while the live
+    /// `kernel.yama.ptrace_scope` is 0: the sysctl drop-in, and nothing else.
+    /// At 0 a process of an enrolled agent's account outside its unit can
+    /// attach to the harness and act from inside its scope, and a drop-in
+    /// changes nothing until `sysctl --system` or a reboot applies it, so the
+    /// agent path is not turned on: the install does that only on the live
+    /// value.
+    pub fn ptrace_drop_in(backend: BackendKind) -> Self {
+        let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
+        let steps = vec![
+            PlanStep::RefuseEdited {
+                path: PTRACE_DROP_IN_PATH.to_owned(),
+            },
+            PlanStep::WriteCandidate {
+                path: candidate.clone(),
+                contents: PTRACE_DROP_IN.to_owned(),
+                mode: 0o440,
+            },
+            PlanStep::ReadBack {
+                candidate: candidate.clone(),
+            },
+            PlanStep::Install {
+                from: candidate,
+                to: PTRACE_DROP_IN_PATH.to_owned(),
+            },
+            PlanStep::Notice {
+                text: "The agent path is NOT on, and only the ptrace drop-in was written, not \
+                       applied. The path is turned on only while kernel.yama.ptrace_scope is 1 \
+                       or more: run `sudo sysctl --system` (or reboot), then \
+                       `sudo xudo install --agent-path` again."
+                    .to_owned(),
+            },
+        ];
+        Self { backend, steps }
     }
 
     /// Every step, described, for a dry run.
@@ -937,8 +947,8 @@ mod tests {
             .collect()
     }
 
-    fn agent_plan(kind: BackendKind, raise: bool) -> InstallPlan {
-        InstallPlan::with_agent_path(&backend(kind, true, true), raise, None).unwrap()
+    fn agent_plan(kind: BackendKind) -> InstallPlan {
+        InstallPlan::with_agent_path(&backend(kind, true, true), None).unwrap()
     }
 
     #[test]
@@ -964,7 +974,7 @@ mod tests {
         // Exactly one passwordless line, for `%xudo-agent` (never `%xudo`),
         // on an alias naming only the `-nopass` file with no arguments.
         for kind in [BackendKind::Sudo, BackendKind::SudoRs] {
-            let lines = written(&agent_plan(kind, false));
+            let lines = written(&agent_plan(kind));
             let nopass: Vec<&String> = lines.iter().filter(|l| l.contains("NOPASSWD")).collect();
             assert_eq!(nopass, ["%xudo-agent ALL=(root) NOPASSWD: XUDO_NOPASS"]);
             let alias: Vec<&String> = lines
@@ -981,7 +991,7 @@ mod tests {
     #[test]
     fn the_auth_rule_never_carries_nopasswd() {
         for plan in [
-            agent_plan(BackendKind::Sudo, true),
+            agent_plan(BackendKind::Sudo),
             InstallPlan::human_only(&backend(BackendKind::Sudo, true, true)).unwrap(),
         ] {
             let lines = written(&plan);
@@ -995,9 +1005,8 @@ mod tests {
 
     #[test]
     fn the_agent_path_refuses_doas() {
-        let refused =
-            InstallPlan::with_agent_path(&backend(BackendKind::Doas, true, true), false, None)
-                .unwrap_err();
+        let refused = InstallPlan::with_agent_path(&backend(BackendKind::Doas, true, true), None)
+            .unwrap_err();
         assert!(
             refused.to_string().contains("sudo and sudo-rs only"),
             "{refused}"
@@ -1005,8 +1014,8 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_path_plan_probes_first_and_writes_the_drop_in_only_when_asked() {
-        let plan = agent_plan(BackendKind::Sudo, false);
+    fn the_agent_path_plan_probes_first_and_never_writes_the_drop_in() {
+        let plan = agent_plan(BackendKind::Sudo);
         assert_eq!(
             plan.steps.first(),
             Some(&PlanStep::RefusalProbe {
@@ -1024,37 +1033,52 @@ mod tests {
         let at = |needle: &str| described.iter().position(|d| d.contains(needle)).unwrap();
         assert!(at("was edited") < at("write candidate"));
         assert!(!described.join("\n").contains("sysctl"));
+    }
 
-        let raised = agent_plan(BackendKind::SudoRs, true).describe();
-        let at = |needle: &str| raised.iter().position(|d| d.contains(needle)).unwrap();
+    #[test]
+    fn the_ptrace_plan_writes_the_drop_in_and_never_turns_the_agent_path_on() {
+        // At a live scope of 0 the agent path waits for the value: this plan
+        // writes the drop-in alone, read back before the rename.
+        let plan = InstallPlan::ptrace_drop_in(BackendKind::SudoRs);
+        assert_eq!(plan.backend, BackendKind::SudoRs);
+        let described = plan.describe();
+        let at = |needle: &str| described.iter().position(|d| d.contains(needle)).unwrap();
         assert!(at("stop if /etc/sysctl.d/05-xudo-ptrace-scope.conf was edited") < at("read back"));
         assert!(at("read back") < at("-> /etc/sysctl.d/05-xudo-ptrace-scope.conf"));
+        assert!(described.last().unwrap().starts_with(
+            "notice: The agent path is NOT on, and only the ptrace drop-in was written"
+        ));
+        let lines = written(&plan);
+        assert!(lines.contains(&"kernel.yama.ptrace_scope = 1".to_owned()));
+        assert!(!lines.iter().any(|line| names_agent_path(line.as_bytes())));
+        let installed: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::Install { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(installed, [PTRACE_DROP_IN_PATH]);
         assert!(
-            raised
-                .last()
-                .unwrap()
-                .starts_with("notice: The agent path is on.")
-        );
-        assert!(
-            written(&agent_plan(BackendKind::Sudo, true))
-                .contains(&"kernel.yama.ptrace_scope = 1".to_owned())
+            !described
+                .iter()
+                .any(|d| d.starts_with("create group") || d.starts_with("probe first"))
         );
     }
 
     #[test]
     fn an_edited_file_stops_the_agent_path_before_any_group_is_created() {
-        for raise in [false, true] {
-            let described = agent_plan(BackendKind::Sudo, raise).describe();
-            let last_check = described
-                .iter()
-                .rposition(|d| d.starts_with("stop if"))
-                .unwrap();
-            let first_group = described
-                .iter()
-                .position(|d| d.starts_with("create group"))
-                .unwrap();
-            assert!(last_check < first_group, "{described:?}");
-        }
+        let described = agent_plan(BackendKind::Sudo).describe();
+        let last_check = described
+            .iter()
+            .rposition(|d| d.starts_with("stop if"))
+            .unwrap();
+        let first_group = described
+            .iter()
+            .position(|d| d.starts_with("create group"))
+            .unwrap();
+        assert!(last_check < first_group, "{described:?}");
     }
 
     #[test]
@@ -1063,7 +1087,7 @@ mod tests {
             exe: "/usr/bin/sudo-rs".to_owned(),
             ..backend(BackendKind::SudoRs, true, true)
         };
-        let plan = InstallPlan::with_agent_path(&sudo_rs_only, false, Some("agent")).unwrap();
+        let plan = InstallPlan::with_agent_path(&sudo_rs_only, Some("agent")).unwrap();
         let install = plan
             .steps
             .iter()
@@ -1116,7 +1140,7 @@ mod tests {
             }
         }
         // With no member to ask about, nobody stands in for one.
-        let alone = agent_plan(BackendKind::Sudo, false);
+        let alone = agent_plan(BackendKind::Sudo);
         assert!(
             alone
                 .describe()
@@ -1132,7 +1156,7 @@ mod tests {
             version: "0.0".to_owned(),
             capabilities: CapabilityMatrix::empty(),
         };
-        assert!(InstallPlan::with_agent_path(&crippled, false, None).is_err());
+        assert!(InstallPlan::with_agent_path(&crippled, None).is_err());
     }
 
     #[test]

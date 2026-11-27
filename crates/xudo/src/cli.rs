@@ -290,9 +290,11 @@ pub enum Command {
         #[arg(long, conflicts_with = "uninstall")]
         agent_path: bool,
 
-        /// With `--agent-path`, on a host at `kernel.yama.ptrace_scope = 0`:
-        /// also write a sysctl.d drop-in that sets it to 1. Never lowers a
-        /// higher value; removed by `--uninstall`.
+        /// With `--agent-path`, on a host at `kernel.yama.ptrace_scope = 0`,
+        /// where the agent path is refused: write a sysctl.d drop-in that sets
+        /// it to 1, and nothing else. Apply it (`sudo sysctl --system`), then
+        /// run `--agent-path` again. Never lowers a higher value; removed by
+        /// `--uninstall`.
         #[arg(long, requires = "agent_path")]
         raise_ptrace_scope: bool,
     },
@@ -740,6 +742,9 @@ fn install(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    // `--agent-path --raise-ptrace-scope` at a live ptrace_scope of 0 writes
+    // the drop-in alone; the agent path waits for the live value.
+    let mut waits_for_scope = false;
     let plans = if mode.uninstall {
         vec![
             uninstall_plan(BackendKind::Sudo),
@@ -754,7 +759,10 @@ fn install(
             }
         };
         match crate::agent_path::plan(host, &backend, registry, *raise, out, err) {
-            Ok(plan) => vec![plan],
+            Ok(planned) => {
+                waits_for_scope = planned.waits_for_scope;
+                vec![planned.plan]
+            }
             Err(code) => return code,
         }
     } else {
@@ -791,15 +799,7 @@ fn install(
         let _ = writeln!(
             out,
             "{}",
-            if mode.agent_path.is_some() {
-                "\nNothing was written. With --agent-path the plan also writes one passwordless\n\
-                 line: %xudo-agent may run /usr/libexec/xudo/xudo-gate-nopass with no\n\
-                 arguments, which runs a command only for an attested, registered harness\n\
-                 that a root-written rule grants it."
-            } else {
-                "\nNothing was written. This plan grants the human path only: every rule it\n\
-                 would install requires a password, and no passwordless rule exists in it."
-            }
+            dry_run_footer(waits_for_scope, mode.agent_path.is_some())
         );
         return ExitCode::Delegated;
     }
@@ -818,6 +818,9 @@ fn install(
                 return ExitCode::Unusable;
             }
         }
+    }
+    if waits_for_scope {
+        return agent_path_waits(err);
     }
     match unverified {
         // The agent path's own checks passed after the write, and anything
@@ -846,6 +849,35 @@ fn install(
         }
         None => ExitCode::Delegated,
     }
+}
+
+/// What a dry run of `install` ends with.
+fn dry_run_footer(waits_for_scope: bool, agent_path: bool) -> &'static str {
+    if waits_for_scope {
+        "\nNothing was written. At a live kernel.yama.ptrace_scope of 0 this plan\n\
+         writes only the sysctl drop-in; the agent path stays off until the value\n\
+         is 1 or more."
+    } else if agent_path {
+        "\nNothing was written. With --agent-path the plan also writes one passwordless\n\
+         line: %xudo-agent may run /usr/libexec/xudo/xudo-gate-nopass with no\n\
+         arguments, which runs a command only for an attested, registered harness\n\
+         that a root-written rule grants it."
+    } else {
+        "\nNothing was written. This plan grants the human path only: every rule it\n\
+         would install requires a password, and no passwordless rule exists in it."
+    }
+}
+
+/// After the drop-in alone was written at a live `ptrace_scope` of 0: the
+/// agent path is not on, and a quiet success would say it is.
+fn agent_path_waits(err: &mut dyn Write) -> ExitCode {
+    let _ = writeln!(
+        err,
+        "xudo: the agent path is NOT on: kernel.yama.ptrace_scope is still 0 until the \
+         drop-in is applied. Run `sudo sysctl --system` (or reboot), then \
+         `sudo xudo install --agent-path` again."
+    );
+    ExitCode::Unusable
 }
 
 /// Looks at the doas rules that would come after xudo's own once the plan has
@@ -4586,6 +4618,46 @@ expect = "deny"
     }
 
     #[test]
+    fn at_ptrace_scope_zero_the_raise_flag_writes_only_the_drop_in_and_fails() {
+        // The drop-in is not the live value: the agent path stays off, and
+        // the run says so with a failing status, dry or not.
+        let host = nopass_host(b"0\n", &[]);
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, out, _) = install_on(
+            &host,
+            &installer,
+            &["--agent-path", "--raise-ptrace-scope", "--dry-run"],
+        );
+        assert_eq!(code, ExitCode::Delegated);
+        assert!(out.contains("writes only the sysctl drop-in"), "{out}");
+        assert!(!out.contains("NOPASSWD"), "{out}");
+        assert!(installer.plans.borrow().is_empty());
+
+        let installer = ScriptedInstaller::answering(vec![Ok(report(
+            BackendKind::Sudo,
+            Verification::Unverified {
+                reason: "the plan has no functional probe".to_owned(),
+            },
+        ))]);
+        let (code, _, err) =
+            install_on(&host, &installer, &["--agent-path", "--raise-ptrace-scope"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("the agent path is NOT on"), "{err}");
+        assert!(err.contains("`sudo sysctl --system`"), "{err}");
+        let plans = installer.plans.borrow();
+        assert_eq!(
+            plans[0],
+            xudo_backend::InstallPlan::ptrace_drop_in(BackendKind::Sudo)
+        );
+        // Without the flag nothing reaches the installer at all.
+        let installer = ScriptedInstaller::answering(vec![]);
+        let (code, _, err) = install_on(&host, &installer, &["--agent-path"]);
+        assert_eq!(code, ExitCode::Unusable);
+        assert!(err.contains("kernel.yama.ptrace_scope is 0"), "{err}");
+        assert!(installer.plans.borrow().is_empty());
+    }
+
+    #[test]
     fn a_probe_that_cannot_run_is_said_and_does_not_fail_the_agent_path() {
         // The functional probe could not run (no broker yet). Every check
         // that did run passed, or the executor would have restored the old
@@ -4676,7 +4748,7 @@ expect = "deny"
     #[test]
     fn a_plain_install_over_the_agent_path_warns_and_writes_no_nopasswd() {
         let backend = xudo_backend::detect(&WorkingSudoProbe).unwrap();
-        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, false, None)
+        let agent = xudo_backend::InstallPlan::with_agent_path(&backend, None)
             .unwrap()
             .steps
             .into_iter()

@@ -116,6 +116,14 @@ agent_path() {
     sudo_exe=$(command -v sudo || command -v sudo-rs)
     install -d -m 755 /usr/libexec/xudo
     expect_absent "$dest"
+    # Yama is not namespaced: a container sees the host's value, and setting
+    # it here would change the host. --agent-path refuses at 0 or unreadable,
+    # so every row below needs the host at 1 or more.
+    scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo none)
+    case $scope in
+    1 | 2 | 3) ;;
+    *) fail "the host's kernel.yama.ptrace_scope is $scope: the agent-path rows need 1 or more; set it on the host (sudo sysctl -w kernel.yama.ptrace_scope=1)" ;;
+    esac
 
     # 9. No helper on the machine: nothing to trust, so nothing is written,
     #    not even the group.
@@ -237,28 +245,15 @@ echo 0
     [ "$(sum "$dest")" = "$before" ] || fail "a second agent-path install changed the file"
     [ "$(ls /etc/sudoers.d | grep -c '^xudo')" -eq 1 ] || fail "more than one xudo file"
 
-    # 15. --raise-ptrace-scope writes only from 0 and never lowers. A container
-    #     shares the host's kernel, so this row sees the host's value.
-    scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo none)
+    # 15. --raise-ptrace-scope never lowers: at the host's 1 or more (checked
+    #     above) it writes nothing. What it does at 0 (the drop-in alone, the
+    #     agent path left off) is the unit tests' raise_flag_writes_dropin_but_
+    #     install_waits_for_live_value: this lane cannot set the host to 0.
     mkdir -p /etc/sysctl.d
     try raise install --agent-path --raise-ptrace-scope
-    case $scope in
-    0)
-        expect_agent_ok raise
-        expect_out raise "+kernel.yama.ptrace_scope = 1"
-        expect_meta "$drop_in" "440 root:root"
-        ;;
-    1 | 2 | 3)
-        expect_agent_ok raise
-        expect_out raise "is already $scope"
-        expect_absent "$drop_in"
-        ;;
-    *)
-        expect_rc 19 "raise with no Yama"
-        expect_err raise "Nothing was written"
-        expect_absent "$drop_in"
-        ;;
-    esac
+    expect_agent_ok raise
+    expect_out raise "is already $scope"
+    expect_absent "$drop_in"
 
     # 16. An operator's edit is never replaced or removed, and is named.
     cp "$dest" "$out/agent.saved"
