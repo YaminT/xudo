@@ -103,6 +103,11 @@ impl FakeInstallOps {
         self
     }
 
+    /// What `path` holds now, as a test reads it back.
+    pub(super) fn holds(&self, path: &str) -> Option<Vec<u8>> {
+        self.contents.borrow().get(path).cloned()
+    }
+
     pub(super) fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
@@ -177,8 +182,13 @@ impl InstallOps for FakeInstallOps {
         Ok(self.identity)
     }
 
+    /// A rename: what was written at `from` is now at `to`.
     fn install(&self, from: &str, to: &str, _identity: FileIdentity) -> Result<(), InstallError> {
-        self.record("install", &format!("{from} {to}"))
+        self.record("install", &format!("{from} {to}"))?;
+        let mut contents = self.contents.borrow_mut();
+        let moved = contents.remove(from);
+        contents.extend(moved.map(|bytes| (to.to_owned(), bytes)));
+        Ok(())
     }
 
     fn discard(&self, path: &str, _identity: FileIdentity) -> Result<(), InstallError> {
@@ -192,6 +202,7 @@ impl InstallOps for FakeInstallOps {
 
     fn remove_managed(&self, path: &str) -> Result<Removal, InstallError> {
         self.record("remove_managed", path)?;
+        self.contents.borrow_mut().remove(path);
         Ok(self.removal(path))
     }
 

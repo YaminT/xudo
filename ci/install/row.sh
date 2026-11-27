@@ -97,11 +97,12 @@ EOF
 restore_doas() { mv /usr/bin/doas.orig /usr/bin/doas; }
 
 # An agent-path install that wrote its line and passed every check that could
-# run: exit 0, the whole configuration parsed, the helper not listed for
-# nobody, and the functional probe either passed or said why it could not run.
+# run: exit 0, the whole configuration parsed, the helper listed for root (the
+# control) and not for nobody, and the functional probe either passed or said why it could not run.
 expect_agent_ok() {
     expect_rc 0 "$1"
     expect_out "$1" "the backend parsed its whole configuration"
+    expect_out "$1" "verified: the backend lists the passwordless helper for root"
     expect_out "$1" "verified: the backend does not list the passwordless helper for nobody"
     has "$out/$1.out" "could not verify: " || has "$out/$1.out" "verified     the functional probe passed" ||
         fail "$1: neither verified nor said what it could not verify"

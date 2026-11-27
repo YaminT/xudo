@@ -39,9 +39,11 @@
 //! * **All or nothing, once a plan checks the whole configuration.** A plan
 //!   with a `ValidateWhole` step records what each file it installs replaced.
 //!   Any failure after an install restores those files: the whole-config check
-//!   failing, a `MustNotList` probe finding the helper listed, or a functional
-//!   probe that ran and failed. A probe that cannot run is reported as such
-//!   and restores nothing.
+//!   failing, a listing check (`MustList`, `MustNotList`) that fails or
+//!   cannot run, or a functional probe that ran and failed. Only a functional
+//!   probe that cannot run is reported as such and restores nothing. A file
+//!   whose earlier bytes cannot be put back is removed instead, so the line
+//!   just shown wrong never stays.
 //!
 //! * **Validate before install, structurally.** An `Install` step is refused
 //!   unless the candidate it names was written by this run and validated by
@@ -325,10 +327,26 @@ pub enum InstallError {
         /// The failure.
         cause: Box<InstallError>,
     },
-    /// A failure after an install, and a file that could not be restored.
+    /// A failure after an install, and a file whose earlier bytes could not be
+    /// put back, so it was removed: what this run wrote is gone, and so is
+    /// what was there before.
     #[error(
-        "{cause}; and then {path} could not be restored: {reason}. Check it by hand before \
-         relying on sudo"
+        "{cause}; and then {path} could not be restored ({reason}), so it was removed: \
+         nothing this run wrote stays. `sudo xudo install` writes it again"
+    )]
+    RemovedInstead {
+        /// The file.
+        path: String,
+        /// Why the restore failed.
+        reason: String,
+        /// The failure.
+        cause: Box<InstallError>,
+    },
+    /// A failure after an install, and a file that could be neither restored
+    /// nor removed.
+    #[error(
+        "{cause}; and then {path} could be neither restored nor removed: {reason}. The line \
+         this run wrote MAY BE LIVE: remove {path} by hand before relying on sudo"
     )]
     NotRolledBack {
         /// The file.
@@ -384,6 +402,14 @@ pub trait InstallProbe {
     /// helper. [`ProbeResult::Verified`] when it does not; [`ProbeResult::Failed`]
     /// when it does; unavailable when it could not be asked.
     fn not_listed(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Unavailable {
+            reason: "this probe cannot ask the backend".to_owned(),
+        }
+    }
+
+    /// The control for [`Self::not_listed`]: [`ProbeResult::Verified`] only
+    /// when the backend, asked through `argv`, does list the helper.
+    fn listed(&self, _argv: &[String]) -> ProbeResult {
         ProbeResult::Unavailable {
             reason: "this probe cannot ask the backend".to_owned(),
         }
@@ -895,6 +921,7 @@ fn preflight(step: &PlanStep) -> Result<(), InstallError> {
         PlanStep::FunctionalProbe { .. }
         | PlanStep::Notice { .. }
         | PlanStep::MustNotList { .. }
+        | PlanStep::MustList { .. }
         | PlanStep::RefusalProbe { .. } => Ok(()),
     }
 }
@@ -1010,6 +1037,14 @@ impl Run {
                 });
             }
             PlanStep::FunctionalProbe { argv, .. } => self.functional_probe(argv, probe)?,
+            // After the rename, because before it the candidate's name holds
+            // a dot and sudo's `@includedir` skips it, so the whole
+            // configuration cannot be checked with it in. For the few
+            // milliseconds in between sudo reads a configuration not checked
+            // as a whole. Accepted: the candidate passed alone, and only a
+            // clash with another file that the front-end's scan for lines
+            // naming xudo's group, aliases and helpers missed could matter in
+            // that window. A failure here undoes the rename.
             PlanStep::ValidateWhole { argv } => {
                 ops.validate(argv).map_err(|error| match error {
                     InstallError::ValidatorRejected { detail } => {
@@ -1022,15 +1057,15 @@ impl Run {
                     argv.join(" ")
                 ));
             }
-            PlanStep::MustNotList { argv, expectation } => match probe.not_listed(argv) {
-                ProbeResult::Verified => self.events.push(format!("verified: {expectation}")),
-                ProbeResult::Unavailable { reason } => self
-                    .events
-                    .push(format!("could not verify that {expectation}: {reason}")),
-                ProbeResult::Failed { reason } => {
-                    return Err(InstallError::ProbeFailed { reason });
-                }
-            },
+            // Both listings ran the backend seconds after the refusal probe
+            // did, so one that cannot run now is an anomaly, and an anomaly
+            // after the rename is not a line to keep.
+            PlanStep::MustNotList { argv, expectation } => {
+                self.listing(probe.not_listed(argv), expectation)?;
+            }
+            PlanStep::MustList { argv, expectation } => {
+                self.listing(probe.listed(argv), expectation)?;
+            }
             PlanStep::RemoveUnlessEdited { path } => self.remove_unless_edited(path, ops)?,
             PlanStep::Notice { text } => self.notices.push(text.clone()),
             PlanStep::RefusalProbe { argv, .. } => self.refusal_probe(argv, probe)?,
@@ -1038,6 +1073,20 @@ impl Run {
             PlanStep::ReadBack { candidate } => self.read_back(candidate, ops)?,
         }
         Ok(())
+    }
+
+    /// A listing check's answer: verified, or the install is undone.
+    fn listing(&mut self, answer: ProbeResult, expectation: &str) -> Result<(), InstallError> {
+        match answer {
+            ProbeResult::Verified => {
+                self.events.push(format!("verified: {expectation}"));
+                Ok(())
+            }
+            ProbeResult::Failed { reason } => Err(InstallError::ProbeFailed { reason }),
+            ProbeResult::Unavailable { reason } => Err(InstallError::ProbeFailed {
+                reason: format!("could not check that {expectation}: {reason}"),
+            }),
+        }
     }
 
     /// A `RefusalProbe` step: the helper must refuse a caller it cannot attest.
@@ -1233,9 +1282,20 @@ impl Run {
             return error;
         }
         let mut failed = None;
+        let mut removed = None;
         while let Some((path, replaced)) = self.installed.pop() {
             let restored = match &replaced {
-                Some(bytes) => restore(ops, &path, bytes),
+                // What stands at `path` now is what this run just showed
+                // wrong. When the earlier bytes cannot go back (no space, an
+                // I/O error), it is removed: an unlink needs no space, and no
+                // file grants less than the one that failed its check.
+                Some(bytes) => restore(ops, &path, bytes).or_else(|why| {
+                    ops.remove_managed(&path)
+                        .map(|_| {
+                            removed.get_or_insert((path.clone(), why.to_string()));
+                        })
+                        .map_err(|_| why)
+                }),
                 None => ops.remove_managed(&path).map(|_| ()),
             };
             if let Err(why) = restored {
@@ -1243,13 +1303,18 @@ impl Run {
             }
         }
         let cause = Box::new(error);
-        match failed {
-            None => InstallError::RolledBack { cause },
-            Some((path, reason)) => InstallError::NotRolledBack {
+        match (failed, removed) {
+            (Some((path, reason)), _) => InstallError::NotRolledBack {
                 path,
                 reason,
                 cause,
             },
+            (None, Some((path, reason))) => InstallError::RemovedInstead {
+                path,
+                reason,
+                cause,
+            },
+            (None, None) => InstallError::RolledBack { cause },
         }
     }
 
@@ -1273,7 +1338,9 @@ impl Run {
 
 /// Puts `bytes`, what an install replaced, back at `path`: written beside it
 /// and renamed over it, as every install is. Not validated again: it is the
-/// configuration the backend was reading before this run.
+/// configuration the backend was reading before this run. The mode is 0440,
+/// the mode every install writes, not read from the file replaced: an
+/// operator's chmod of xudo's own file is the one thing not put back.
 fn restore(ops: &dyn InstallOps, path: &str, bytes: &[u8]) -> Result<(), InstallError> {
     let candidate = format!("{path}.candidate");
     let identity = ops.write_candidate(&candidate, bytes, 0o440)?;

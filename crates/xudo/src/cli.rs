@@ -991,6 +991,7 @@ fn step_contents(step: &PlanStep) -> &str {
         | PlanStep::RemoveUnlessEdited { .. }
         | PlanStep::ValidateWhole { .. }
         | PlanStep::MustNotList { .. }
+        | PlanStep::MustList { .. }
         | PlanStep::FunctionalProbe { .. } => "",
     }
 }
@@ -4509,6 +4510,13 @@ expect = "deny"
         .dir("/", 0, 0, 0o755)
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo:x:998:\n")
+        .file(
+            "/etc/passwd",
+            0,
+            0,
+            0o644,
+            b"root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n",
+        )
         .file("/etc/sudoers", 0, 0, 0o440, b"@includedir /etc/sudoers.d\n")
         .dir("/etc/sudoers.d", 0, 0, 0o750)
         .dir("/usr", 0, 0, 0o755)

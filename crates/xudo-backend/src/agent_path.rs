@@ -248,11 +248,7 @@ pub fn gate_faults(host: &dyn HostView) -> Vec<String> {
 /// A file that could not be read, or a group line with no numeric gid: the
 /// members cannot be known, so nothing may be assumed about them.
 pub fn agent_members(host: &dyn HostView) -> Result<Vec<String>, String> {
-    let read = |path: &str| match host.read(Path::new(path)) {
-        Lookup::Found(bytes) => Ok(bytes),
-        Lookup::Missing => Err(format!("{path} is missing")),
-        Lookup::Unreadable(why) => Err(format!("could not examine {path}: {why}")),
-    };
+    let read = |path: &str| read_file(host, path);
     let group = read("/etc/group")?;
     let lines: Vec<Vec<&[u8]>> = group
         .split(|byte| *byte == b'\n')
@@ -287,6 +283,29 @@ pub fn agent_members(host: &dyn HostView) -> Result<Vec<String>, String> {
             .map(|entry| shown(entry.name)),
     );
     Ok(names.into_iter().collect())
+}
+
+/// Whether `/etc/passwd` holds an account named `name`: the listing checks
+/// ask the backend about an account, and one that does not exist gets no
+/// answer.
+///
+/// # Errors
+///
+/// `/etc/passwd` could not be read.
+pub fn account_exists(host: &dyn HostView, name: &str) -> Result<bool, String> {
+    let passwd = read_file(host, "/etc/passwd")?;
+    Ok(parse_passwd(&passwd)
+        .iter()
+        .any(|entry| entry.name == name.as_bytes()))
+}
+
+/// The whole of `path`, or why not.
+fn read_file(host: &dyn HostView, path: &str) -> Result<Vec<u8>, String> {
+    match host.read(Path::new(path)) {
+        Lookup::Found(bytes) => Ok(bytes),
+        Lookup::Missing => Err(format!("{path} is missing")),
+        Lookup::Unreadable(why) => Err(format!("could not examine {path}: {why}")),
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +650,20 @@ mod tests {
             agent_members(&bad_gid)
                 .unwrap_err()
                 .contains("no numeric gid")
+        );
+    }
+
+    #[test]
+    fn an_account_the_listing_asks_about_must_be_in_passwd() {
+        // sudo answers `-l -U` for an unknown user on standard error, which
+        // is no answer; the front-end checks first.
+        let known = host(STOCK, &[]).file("/etc/passwd", 0, 0, 0o644, PASSWD);
+        assert_eq!(account_exists(&known, "agent"), Ok(true));
+        assert_eq!(account_exists(&known, "nobody"), Ok(false));
+        assert_eq!(account_exists(&known, "agen"), Ok(false));
+        assert_eq!(
+            account_exists(&host(STOCK, &[]), "nobody").unwrap_err(),
+            "/etc/passwd is missing"
         );
     }
 }

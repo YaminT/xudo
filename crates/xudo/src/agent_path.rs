@@ -43,8 +43,11 @@ pub(crate) enum SessionHarness {
 pub(crate) struct Registry {
     /// Whether a session-way harness is registered.
     pub(crate) session: SessionHarness,
-    /// Every account a harness names (a service account, or a user who may
-    /// start a session), or why the registry could not be read.
+    /// Every service-way harness's account, the only accounts `enrol` adds to
+    /// the agent group, or why the registry could not be read. A user a
+    /// session harness names is not one: a session harness keeps the
+    /// password path, and that user in the group would only be a human with
+    /// a password in reach of the passwordless helper.
     pub(crate) accounts: Result<Vec<String>, String>,
 }
 
@@ -57,8 +60,8 @@ pub(crate) fn registry(loaded: Result<&LoadedRules, &LoadError>) -> Registry {
             None => Ok(rules
                 .harnesses()
                 .entries()
-                .flat_map(|entry| entry.account.iter().chain(&entry.users))
-                .cloned()
+                .filter(|entry| entry.way == HarnessWay::Service)
+                .filter_map(|entry| entry.account.clone())
                 .collect()),
         },
     };
@@ -134,6 +137,21 @@ pub(crate) fn plan(
             members.into_iter().find(|name| is_plain_name(name))
         }
     };
+    // The listing checks ask the backend about nobody and the member; it
+    // answers an account it does not know on standard error, which is no
+    // answer, and the install would be undone after its write.
+    for name in [Some("nobody"), member.as_deref()].into_iter().flatten() {
+        match xudo_backend::agent_path::account_exists(host, name) {
+            Ok(true) => {}
+            Ok(false) => refusals.push(format!(
+                "the checks after the write ask the backend about {name}, and /etc/passwd \
+                 holds no such account"
+            )),
+            Err(why) => refusals.push(format!(
+                "the accounts the checks after the write ask about cannot be known: {why}"
+            )),
+        }
+    }
     if !refusals.is_empty() {
         for refusal in &refusals {
             let _ = writeln!(err, "xudo: refusing --agent-path: {refusal}");
@@ -351,7 +369,13 @@ mod tests {
         .dir("/", 0, 0, 0o755)
         .dir("/etc", 0, 0, 0o755)
         .file("/etc/group", 0, 0, 0o644, b"root:x:0:\nxudo-agent:x:997:\n")
-        .file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n")
+        .file(
+            "/etc/passwd",
+            0,
+            0,
+            0o644,
+            b"root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n",
+        )
         .dir("/usr", 0, 0, 0o755)
         .dir("/usr/libexec", 0, 0, 0o755)
         .dir("/usr/libexec/xudo", 0, 0, 0o755)
@@ -636,7 +660,8 @@ mod tests {
                 0,
                 0,
                 0o644,
-                b"agent:x:990:990::/:/bin/sh\nlurker:x:991:997::/:/bin/sh\n",
+                b"agent:x:990:990::/:/bin/sh\nlurker:x:991:997::/:/bin/sh\n\
+                  nobody:x:65534:65534::/:/bin/false\n",
             )
     }
 
@@ -718,6 +743,56 @@ mod tests {
     }
 
     #[test]
+    fn a_session_user_added_to_the_agent_group_by_hand_stops_the_install() {
+        // carol may start a session of a session harness. In xudo-agent she
+        // would reach the passwordless helper with no password; enrol never
+        // puts her there, so the install refuses and names her.
+        let service = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
+        let session = "label = \"dev\"\nway = \"session\"\nusers = [\"carol\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n";
+        let rules = LoadedRules::from_dir(&registry_dir(
+            "session-member",
+            &[("codex.toml", service), ("dev.toml", session)],
+        ));
+        let registry = registry(rules.as_ref());
+        let host = with_members(b"xudo-agent:x:996:agent,carol\n");
+        let (result, _, err) = planned_with(&host, BackendKind::Sudo, &registry, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(
+            err.contains("refusing --agent-path: carol is in xudo-agent and no harness"),
+            "{err}"
+        );
+        assert!(!err.contains("agent is in xudo-agent"), "{err}");
+    }
+
+    #[test]
+    fn a_listing_about_an_account_passwd_does_not_hold_stops_before_the_write() {
+        // sudo says `unknown user` on standard error, which is no answer; so
+        // nobody, and the member asked about, must exist before anything is
+        // written.
+        let no_nobody =
+            host(Some(b"1\n")).file("/etc/passwd", 0, 0, 0o644, b"root:x:0:0::/root:/bin/sh\n");
+        let (result, _, err) = planned(&no_nobody, BackendKind::Sudo, &SessionHarness::None, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(
+            err.contains("ask the backend about nobody, and /etc/passwd holds no such account"),
+            "{err}"
+        );
+        // agent is in the group and registered, and has no passwd line.
+        let ghost = host(Some(b"1\n")).file("/etc/group", 0, 0, 0o644, b"xudo-agent:x:996:agent\n");
+        let (result, _, err) = planned(&ghost, BackendKind::Sudo, &SessionHarness::None, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(err.contains("about agent, and /etc/passwd holds"), "{err}");
+        // /etc/passwd unreadable: nothing can be asked about.
+        let unread = host(Some(b"1\n")).unreadable_file("/etc/passwd", 0, 0, 0o600);
+        let (result, _, err) = planned(&unread, BackendKind::Sudo, &SessionHarness::None, false);
+        assert_eq!(result.unwrap_err(), ExitCode::Unusable);
+        assert!(
+            err.contains("the accounts the checks after the write ask about cannot be known"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_later_sysctl_setting_is_named_and_the_drop_in_is_not_said_to_win() {
         let host = host(Some(b"0\n"))
             .dir("/etc/sysctl.d", 0, 0, 0o755)
@@ -757,16 +832,16 @@ mod tests {
     }
 
     #[test]
-    fn every_account_a_harness_names_is_registered() {
+    fn only_a_service_harness_account_is_a_registered_member() {
         let service = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"alice\"]\nmax-sessions = 1\n";
         let session = "label = \"dev\"\nway = \"session\"\nusers = [\"carol\", \"dave\"]\nreviewers = [\"bob\"]\nmax-sessions = 1\n";
         let both = LoadedRules::from_dir(&registry_dir(
             "accounts",
             &[("codex.toml", service), ("dev.toml", session)],
         ));
-        let mut accounts = registry(both.as_ref()).accounts.unwrap();
-        accounts.sort();
-        assert_eq!(accounts, ["agent", "carol", "dave"]);
+        // Only the service account: carol and dave may start a session, and
+        // a session harness keeps the password path.
+        assert_eq!(registry(both.as_ref()).accounts.unwrap(), ["agent"]);
         let faulty =
             LoadedRules::from_dir(&registry_dir("accounts-fault", &[("x.toml", "wat = 1\n")]));
         assert!(registry(faulty.as_ref()).accounts.is_err());

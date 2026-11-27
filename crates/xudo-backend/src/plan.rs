@@ -155,6 +155,16 @@ pub enum PlanStep {
         /// What must be true.
         expectation: String,
     },
+    /// Ask the backend whether it lists the passwordless helper for `argv`'s
+    /// user, and require that it does: the control that shows the listing
+    /// works, so a `MustNotList` that is answered no means no. A listing that
+    /// does not work, or says no here, restores what this run installed.
+    MustList {
+        /// What to run.
+        argv: Vec<String>,
+        /// What must be true.
+        expectation: String,
+    },
     /// Delete a file xudo owns unless it holds an edit, in which case leave it
     /// and warn: for the sysctl drop-in, whose edit must never keep the
     /// passwordless line in place.
@@ -198,12 +208,65 @@ impl PlanStep {
             Self::ValidateWhole { argv } => {
                 format!("validate the whole configuration: {}", argv.join(" "))
             }
-            Self::MustNotList { expectation, .. } => format!("check: {expectation}"),
+            Self::MustNotList { expectation, .. } | Self::MustList { expectation, .. } => {
+                format!("check: {expectation}")
+            }
             Self::RemoveUnlessEdited { path } => {
                 format!("remove {path}, or leave it with a warning if it was edited")
             }
         }
     }
+}
+
+/// What the agent path checks once its file is in place: the whole
+/// configuration parses, the backend lists the helper for root (the
+/// control), and not for nobody nor with an argument for `member`.
+fn checks_after_rename(exe: &str, member: &str) -> [PlanStep; 4] {
+    let listing = |user: &str, extra: &[&str]| {
+        let mut argv = vec![
+            exe.to_owned(),
+            "-n".to_owned(),
+            "-l".to_owned(),
+            "-U".to_owned(),
+            user.to_owned(),
+            GATE_NOPASS.to_owned(),
+        ];
+        argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        argv
+    };
+    [
+        // `-f` names the file sudo reads, so its includes are parsed
+        // with it, and skips the mode check that `-c` alone makes:
+        // Ubuntu 26.04's sudo-rs ships it 0644, which sudo accepts.
+        PlanStep::ValidateWhole {
+            argv: [VISUDO, "-c", "-f", "/etc/sudoers"]
+                .map(str::to_owned)
+                .to_vec(),
+        },
+        // The control: root, whom the stock configuration gives `ALL`,
+        // is listed. Without it a listing that cannot work at all (no
+        // `-U`, a configuration the backend will not read) would pass
+        // the two checks after it.
+        PlanStep::MustList {
+            argv: listing("root", &[]),
+            expectation: "the backend lists the passwordless helper for root, so the \
+                          listing works"
+                .to_owned(),
+        },
+        PlanStep::MustNotList {
+            argv: listing("nobody", &[]),
+            expectation: "the backend does not list the passwordless helper for nobody, \
+                          who is not in the agent group"
+                .to_owned(),
+        },
+        PlanStep::MustNotList {
+            argv: listing(member, &["x"]),
+            expectation: format!(
+                "the backend does not list the passwordless helper with an argument for \
+                 {member}"
+            ),
+        },
+    ]
 }
 
 /// The first sentence of a notice, for a one-line summary.
@@ -316,19 +379,6 @@ impl InstallPlan {
         // The backend detection found, not the kind's usual path: Ubuntu's
         // sudo-rs package installs `/usr/bin/sudo-rs` alone.
         let exe = backend.exe.clone();
-        let listing = |user: &str, extra: &[&str]| {
-            let mut argv = vec![
-                exe.clone(),
-                "-n".to_owned(),
-                "-l".to_owned(),
-                "-U".to_owned(),
-                user.to_owned(),
-                GATE_NOPASS.to_owned(),
-            ];
-            argv.extend(extra.iter().map(|arg| (*arg).to_owned()));
-            argv
-        };
-        let member = member.unwrap_or("nobody");
         let mut steps = vec![
             PlanStep::RefusalProbe {
                 argv: vec![exe.clone(), "-n".to_owned(), GATE_NOPASS.to_owned()],
@@ -355,29 +405,7 @@ impl InstallPlan {
             },
         ]);
         steps.extend(sudoers_steps(snippet));
-        steps.extend([
-            // `-f` names the file sudo reads, so its includes are parsed
-            // with it, and skips the mode check that `-c` alone makes:
-            // Ubuntu 26.04's sudo-rs ships it 0644, which sudo accepts.
-            PlanStep::ValidateWhole {
-                argv: [VISUDO, "-c", "-f", "/etc/sudoers"]
-                    .map(str::to_owned)
-                    .to_vec(),
-            },
-            PlanStep::MustNotList {
-                argv: listing("nobody", &[]),
-                expectation: "the backend does not list the passwordless helper for nobody, \
-                              who is not in the agent group"
-                    .to_owned(),
-            },
-            PlanStep::MustNotList {
-                argv: listing(member, &["x"]),
-                expectation: format!(
-                    "the backend does not list the passwordless helper with an argument for \
-                     {member}"
-                ),
-            },
-        ]);
+        steps.extend(checks_after_rename(&exe, member.unwrap_or("nobody")));
         if raise_ptrace {
             let candidate = format!("{PTRACE_DROP_IN_PATH}.candidate");
             steps.extend([
@@ -873,6 +901,10 @@ mod tests {
                 argv: vec!["/usr/bin/sudo".to_owned()],
                 expectation: "e".to_owned(),
             },
+            PlanStep::MustList {
+                argv: vec!["/usr/bin/sudo".to_owned()],
+                expectation: "e".to_owned(),
+            },
             PlanStep::RemoveUnlessEdited {
                 path: "/p".to_owned(),
             },
@@ -1049,14 +1081,24 @@ mod tests {
             .steps
             .iter()
             .filter_map(|s| match s {
-                PlanStep::MustNotList { argv, .. } => Some(argv.clone()),
+                PlanStep::MustNotList { argv, .. } | PlanStep::MustList { argv, .. } => {
+                    Some(argv.clone())
+                }
                 _ => None,
             })
             .collect();
         let nopass = GATE_NOPASS.to_owned();
+        // The control first: root is listed, so a no below is a real no.
+        assert_eq!(
+            plan.steps[install + 2].describe(),
+            "check: the backend lists the passwordless helper for root, so the listing works"
+        );
         assert_eq!(
             listings,
             [
+                ["/usr/bin/sudo-rs", "-n", "-l", "-U", "root", &nopass]
+                    .map(String::from)
+                    .to_vec(),
                 ["/usr/bin/sudo-rs", "-n", "-l", "-U", "nobody", &nopass]
                     .map(String::from)
                     .to_vec(),

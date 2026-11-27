@@ -2739,6 +2739,12 @@ mod tests {
             "off"
         );
         assert_eq!(state(Lookup::Missing), "off");
+        // Both prose forms, whatever this host's own file says.
+        assert_eq!(AgentPathReport::of(Lookup::Missing).line(), "off");
+        assert_eq!(
+            AgentPathReport::of(Lookup::Unreadable("denied".to_owned())).line(),
+            "unknown: denied"
+        );
         let edited = format!("{agent}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n");
         let report = AgentPathReport::of(Lookup::Found(edited.into_bytes()));
         assert_eq!(report.state, "edited");

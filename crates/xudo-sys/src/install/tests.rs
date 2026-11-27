@@ -699,6 +699,14 @@ impl InstallProbe for Refusing {
     fn refuses(&self, _argv: &[String]) -> ProbeResult {
         self.0.clone()
     }
+
+    fn not_listed(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Verified
+    }
+
+    fn listed(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Verified
+    }
 }
 
 fn nopass_plan(raise: bool) -> InstallPlan {
@@ -727,15 +735,14 @@ fn the_agent_path_installs_after_the_helper_refused() {
     assert_eq!(calls[0], "read_managed /etc/sudoers.d/xudo");
     assert_eq!(calls[1], "group_exists xudo");
     assert!(calls.contains(&"create_group xudo-agent".to_owned()));
-    // The default probe cannot ask the backend: said, and nothing restored.
-    assert!(
-        report
-            .events
-            .iter()
-            .any(|e| e.starts_with("could not verify that the backend does not list")),
-        "{:?}",
-        report.events
-    );
+    // The control, then the two listings it vouches for.
+    let checked: Vec<&String> = report
+        .events
+        .iter()
+        .filter(|e| e.starts_with("verified: the backend"))
+        .collect();
+    assert_eq!(checked.len(), 3, "{:?}", report.events);
+    assert!(checked[0].contains("lists the passwordless helper for root"));
     assert!(
         calls.contains(&"install /etc/sudoers.d/xudo.candidate /etc/sudoers.d/xudo".to_owned())
     );
@@ -1034,10 +1041,12 @@ fn an_edited_drop_in_never_keeps_the_passwordless_line_in_place() {
     );
 }
 
-/// A probe whose helper refuses, whose listing check answers `listed`, and
-/// whose functional probe answers `verify`.
+/// A probe whose helper refuses, whose listing check answers `listed`, whose
+/// control listing (root's) answers `control`, and whose functional probe
+/// answers `verify`.
 struct Checks {
     listed: ProbeResult,
+    control: ProbeResult,
     verify: ProbeResult,
 }
 
@@ -1053,10 +1062,18 @@ impl InstallProbe for Checks {
     fn not_listed(&self, _argv: &[String]) -> ProbeResult {
         self.listed.clone()
     }
+
+    fn listed(&self, _argv: &[String]) -> ProbeResult {
+        self.control.clone()
+    }
 }
 
 fn checks(listed: ProbeResult, verify: ProbeResult) -> Checks {
-    Checks { listed, verify }
+    Checks {
+        listed,
+        control: ProbeResult::Verified,
+        verify,
+    }
 }
 
 fn failed(reason: &str) -> ProbeResult {
@@ -1169,7 +1186,7 @@ fn the_checks_that_pass_are_reported_as_verified() {
         .iter()
         .filter(|e| e.starts_with("verified: "))
         .collect();
-    assert_eq!(verified.len(), 2, "{:?}", report.events);
+    assert_eq!(verified.len(), 3, "{:?}", report.events);
     assert!(
         report.events.contains(
             &"the backend parsed its whole configuration: /usr/sbin/visudo -c -f /etc/sudoers"
@@ -1222,40 +1239,32 @@ fn a_drop_in_failure_takes_the_passwordless_line_back_out() {
 }
 
 #[test]
-fn a_restore_that_fails_names_the_file_to_check() {
+fn a_restore_that_fails_removes_the_line_it_could_not_take_back() {
+    // The whole configuration or a listing showed the new file wrong, and the
+    // earlier bytes cannot go back (no space for the write, a failed rename).
+    // The file that failed its check is removed: no NOPASSWD line remains.
     let error = |method: &str| InstallError::Io {
         operation: "scripted",
         path: method.to_owned(),
         reason: "scripted".to_owned(),
     };
     let probe = checks(failed("listed"), ProbeResult::Verified);
-    // The restore's write, its rename, and removing a file that was not
-    // there before: each leaves the operator told which file to check.
-    for (ops, earlier) in [
-        (
-            FakeInstallOps::root().failing_from("write_candidate", 1, error("write")),
-            true,
-        ),
-        (
-            FakeInstallOps::root().failing_from("install", 1, error("install")),
-            true,
-        ),
-        (
-            FakeInstallOps::root().failing_with("remove_managed", error("remove")),
-            false,
-        ),
-    ] {
-        let ops = if earlier {
-            ops.with_contents("/etc/sudoers.d/xudo", human_text().as_bytes())
-        } else {
-            ops
-        };
+    for method in ["write_candidate", "install"] {
+        let ops = FakeInstallOps::root()
+            .with_contents("/etc/sudoers.d/xudo", human_text().as_bytes())
+            .failing_from(method, 1, error(method));
         let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
         assert!(
-            matches!(&err, InstallError::NotRolledBack { path, .. } if path == "/etc/sudoers.d/xudo"),
+            matches!(&err, InstallError::RemovedInstead { path, .. } if path == "/etc/sudoers.d/xudo"),
             "{err}"
         );
-        assert!(err.to_string().contains("could not be restored"), "{err}");
+        assert!(err.to_string().contains("so it was removed"), "{err}");
+        assert_eq!(ops.holds("/etc/sudoers.d/xudo"), None, "{method}");
+        assert!(
+            ops.calls()
+                .contains(&"remove_managed /etc/sudoers.d/xudo".to_owned()),
+            "{method}"
+        );
     }
     // A failed rename leaves no restore candidate behind.
     let ops = FakeInstallOps::root()
@@ -1266,6 +1275,39 @@ fn a_restore_that_fails_names_the_file_to_check() {
         ops.calls()
             .contains(&"discard /etc/sudoers.d/xudo.candidate".to_owned())
     );
+}
+
+#[test]
+fn a_line_that_can_be_neither_restored_nor_removed_is_called_possibly_live() {
+    // Restore and unlink both fail, or there was nothing before and the
+    // unlink fails: the operator is told the line may be live, and which file
+    // to remove.
+    let error = |method: &str| InstallError::Io {
+        operation: "scripted",
+        path: method.to_owned(),
+        reason: "scripted".to_owned(),
+    };
+    let probe = checks(failed("listed"), ProbeResult::Verified);
+    for earlier in [true, false] {
+        let ops = FakeInstallOps::root().failing_with("remove_managed", error("remove"));
+        let ops = if earlier {
+            ops.with_contents("/etc/sudoers.d/xudo", human_text().as_bytes())
+                .failing_from("write_candidate", 1, error("write"))
+        } else {
+            ops
+        };
+        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        assert!(
+            matches!(&err, InstallError::NotRolledBack { path, .. } if path == "/etc/sudoers.d/xudo"),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("MAY BE LIVE"), "{text}");
+        assert!(
+            text.contains("remove /etc/sudoers.d/xudo by hand"),
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -1323,6 +1365,62 @@ fn a_whole_configuration_check_must_be_absolute_and_name_no_candidate() {
         assert!(matches!(err, InstallError::BadValidator { .. }), "{err}");
         assert!(ops.calls().is_empty());
     }
+}
+
+/// A probe whose helper refuses and which cannot ask the backend anything.
+struct Blind;
+
+impl InstallProbe for Blind {
+    fn verify(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Verified
+    }
+
+    fn refuses(&self, _argv: &[String]) -> ProbeResult {
+        ProbeResult::Verified
+    }
+}
+
+#[test]
+fn a_listing_check_that_cannot_run_takes_the_agent_path_back_out() {
+    // The refusal probe ran the backend seconds earlier; a listing that now
+    // gets no answer (an unknown user, a configuration it will not read), or
+    // a control that does not list root, proves nothing about the line. So
+    // the line does not stay.
+    let cases = [
+        (
+            unavailable("sudo: unknown user nobody"),
+            ProbeResult::Verified,
+        ),
+        (ProbeResult::Verified, unavailable("invalid configuration")),
+        (ProbeResult::Verified, failed("does not list it for root")),
+    ];
+    for (listed, control) in cases {
+        let ops = FakeInstallOps::root();
+        let probe = Checks {
+            listed,
+            control,
+            verify: ProbeResult::Verified,
+        };
+        let err = execute(&nopass_plan(false), &ops, &probe).unwrap_err();
+        assert!(
+            matches!(&err, InstallError::RolledBack { cause }
+                if matches!(**cause, InstallError::ProbeFailed { .. })),
+            "{err}"
+        );
+        assert_eq!(ops.holds("/etc/sudoers.d/xudo"), None, "{err}");
+    }
+    // A probe that cannot ask the backend at all cannot vouch for the line.
+    let ops = FakeInstallOps::root();
+    let err = execute(&nopass_plan(false), &ops, &Blind).unwrap_err();
+    assert!(err.to_string().contains("cannot ask the backend"), "{err}");
+    assert_eq!(Blind.verify(&[]), ProbeResult::Verified);
+    assert_eq!(
+        Blind.not_listed(&[]),
+        ProbeResult::Unavailable {
+            reason: "this probe cannot ask the backend".to_owned()
+        }
+    );
+    assert_eq!(ops.holds("/etc/sudoers.d/xudo"), None);
 }
 
 #[test]

@@ -650,7 +650,12 @@ It stops when the helper or a directory above it is not root's, is writable
 by its group or by everyone, or is a symbolic link, or the helper has a second
 name; and when an account is in
 .B xudo\-agent
-(listed, or by its primary group) that no harness in the registry names.
+(listed, or by its primary group) that is not the account of a service-way
+harness in the registry, the only accounts enrol adds to it; and when
+.I /etc/passwd
+holds no
+.B nobody
+or no such member, since the checks below ask about them.
 It never replaces
 .I /etc/sudoers.d/xudo
 when that file names the agent path but is not byte for byte xudo's text, and
@@ -659,13 +664,19 @@ After the rename it runs
 .B visudo \-c \-f /etc/sudoers
 on the whole configuration and asks the backend
 .RB ( "sudo \-l \-U" )
-that the helper is not listed for
+that the helper is listed for
+.B root
+(the control that shows the listing works), and is not listed for
 .BR nobody ,
 nor with an argument for a member of the group.
-Any of those failing, or a functional probe that runs and fails, puts back
-what the install replaced and exits
+A listing counts only when the backend prints nothing on standard error.
+Any of those failing or getting no answer, or a functional probe that runs and
+fails, puts back what the install replaced and exits
 .BR 19 .
-A probe that cannot run here is reported on a
+When what was there cannot be put back, the new file is removed instead; when
+it cannot be removed either, the message says the line may be live and names
+the file to remove.
+Only a functional probe that cannot run here is reported on a
 .B could not verify:
 line, and the install exits 0.
 A plain
