@@ -143,7 +143,10 @@ pub use source::{DirSource, MapSource, ProcSource};
 #[cfg(any(test, feature = "fake"))]
 pub use spool::{FakeSpool, SpoolCall};
 pub use spool::{Spool, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
-pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
+pub use syscall::{
+    Creds, FakeCall, FakeSyscalls, HostSyscalls, PTRACE_SCOPE_PATH, PidfdInfo, ProcessIds,
+    Syscalls, ptrace_contained,
+};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_policy, load_trusted_rules,
     open_trusted, read_trusted_dir, verify_path,

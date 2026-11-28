@@ -15,6 +15,7 @@ rule package /etc/xudo/rules.d/90-unknown.toml: unknown
 sudoers xudo managed rule at /etc/sudoers.d/xudo
 sudoers xudo /etc/sudoers.d/xudo.conf is not in effect: sudo skips filenames containing a dot or ending in ~
 agent path   off
+ptrace scope unknown: /proc/sys/kernel/yama/ptrace_scope is missing: this kernel has no Yama
 classified   unavailable: cannot read self/stat: test stub refuses
 password     required (failing closed)
 backend      UNUSABLE: sudo-rs sudo-rs 0.2.2 is missing a required control (REQUIRED: scopes xudo's settings to xudo's own commands; without it the only way to apply them is globally, which changes sudo's behaviour for every user on the host); xudo refuses to install rather than install something weaker than it advertises

@@ -38,7 +38,9 @@ expression: "render::json_of(&hostile_report(true))"
   },
   "agent_path": {
     "state": "off",
-    "detail": null
+    "detail": null,
+    "ptrace_scope": null,
+    "ptrace_unreadable": "/proc/sys/kernel/yama/ptrace_scope is missing: this kernel has no Yama"
   },
   "caller": {
     "classification": null,

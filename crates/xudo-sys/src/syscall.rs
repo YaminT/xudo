@@ -45,6 +45,21 @@ pub trait Syscalls {
     /// Returns an error when the boot id cannot be read or is malformed.
     fn boot_id(&self) -> Result<String, SysError>;
 
+    /// The live `kernel.yama.ptrace_scope`, from [`PTRACE_SCOPE_PATH`].
+    ///
+    /// The passwordless path rests on it: at 0, or on a kernel without Yama,
+    /// any process of a harness's account can attach to the harness and run
+    /// what the harness may run. The broker and the gate read it on every
+    /// `via = harness` run, so a later `sysctl` back to 0 turns the path off
+    /// (see [`ptrace_contained`]). Implementations must not consult the
+    /// process environment.
+    ///
+    /// # Errors
+    ///
+    /// When the file is missing (no Yama), unreadable, or not one of `0` to
+    /// `3`.
+    fn ptrace_scope(&self) -> Result<u8, SysError>;
+
     /// Marks every descriptor numbered `first` or above close-on-exec.
     ///
     /// `close_range(first, ~0, CLOSE_RANGE_CLOEXEC)`. It does not close them:
@@ -164,6 +179,16 @@ pub trait Syscalls {
     fn exec_fd(&self, program: BorrowedFd<'_>, argv: &[&CStr], envp: &[&CStr]) -> SysError;
 }
 
+/// Where the kernel reports `kernel.yama.ptrace_scope`.
+pub const PTRACE_SCOPE_PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
+
+/// Whether a [`Syscalls::ptrace_scope`] answer keeps a harness's account from
+/// attaching to the harness: 1, 2 or 3. Zero, no Yama, and a value that
+/// cannot be read are not, and turn the passwordless path off.
+pub fn ptrace_contained(scope: &Result<u8, SysError>) -> bool {
+    matches!(scope, Ok(1..=3))
+}
+
 /// Refuses a record no kernel answered.
 ///
 /// Applied by every implementation, real and fake alike, so no caller of
@@ -221,6 +246,10 @@ impl Syscalls for HostSyscalls {
         parse_boot_id(std::fs::read("/proc/sys/kernel/random/boot_id"))
     }
 
+    fn ptrace_scope(&self) -> Result<u8, SysError> {
+        parse_ptrace_scope(std::fs::read(PTRACE_SCOPE_PATH))
+    }
+
     fn mark_cloexec_from(&self, first: u32) -> Result<(), SysError> {
         xudo_sys_raw::sys::mark_cloexec_from(first).map_err(SysError::from)
     }
@@ -268,11 +297,41 @@ fn parse_boot_id(read: std::io::Result<Vec<u8>>) -> Result<String, SysError> {
     Ok(id.to_owned())
 }
 
+/// `kernel.yama.ptrace_scope` as the file holds it: one digit, 0 to 3, and
+/// a newline. Anything else, a missing file included, is an error.
+#[cfg(target_os = "linux")]
+fn parse_ptrace_scope(read: std::io::Result<Vec<u8>>) -> Result<u8, SysError> {
+    let refused = |code: Option<i32>, reason: &str| SysError::Os {
+        operation: format!("read {PTRACE_SCOPE_PATH}"),
+        code,
+        reason: reason.to_owned(),
+    };
+    let bytes = read.map_err(|error| {
+        refused(
+            error.raw_os_error(),
+            "kernel.yama.ptrace_scope could not be read (a kernel without Yama has none)",
+        )
+    })?;
+    match bytes.strip_suffix(b"\n").unwrap_or(&bytes) {
+        b"0" => Ok(0),
+        b"1" => Ok(1),
+        b"2" => Ok(2),
+        b"3" => Ok(3),
+        _ => Err(refused(None, "kernel.yama.ptrace_scope is not 0 to 3")),
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 impl Syscalls for HostSyscalls {
     fn boot_id(&self) -> Result<String, SysError> {
         Err(SysError::unsupported(
             "kernel boot id on a non-Linux platform",
+        ))
+    }
+
+    fn ptrace_scope(&self) -> Result<u8, SysError> {
+        Err(SysError::unsupported(
+            "kernel.yama.ptrace_scope on a non-Linux platform",
         ))
     }
 
@@ -306,6 +365,8 @@ impl Syscalls for HostSyscalls {
 pub enum FakeCall {
     /// [`Syscalls::boot_id`].
     BootId,
+    /// [`Syscalls::ptrace_scope`].
+    PtraceScope,
     /// [`Syscalls::mark_cloexec_from`] with this lower bound.
     MarkCloexecFrom(u32),
     /// [`Syscalls::peer_pidfd`].
@@ -340,6 +401,7 @@ pub struct FakeSyscalls {
     calls: RefCell<Vec<FakeCall>>,
     cloexec: Result<(), SysError>,
     boot_id: Result<String, SysError>,
+    ptrace_scope: Result<u8, SysError>,
     peer: RefCell<Option<Result<OwnedFd, SysError>>>,
     cred: Result<PeerCred, SysError>,
     info: Result<PidfdInfo, SysError>,
@@ -361,6 +423,9 @@ impl FakeSyscalls {
         Self {
             calls: RefCell::new(Vec::new()),
             boot_id: Err(SysError::unsupported("fake: no boot id scripted")),
+            // A host as Ubuntu ships it: a process cannot attach to another
+            // that is not its descendant.
+            ptrace_scope: Ok(1),
             cloexec: Err(missing(
                 "close_range",
                 rustix::io::Errno::NOSYS,
@@ -385,6 +450,13 @@ impl FakeSyscalls {
     #[must_use]
     pub fn with_boot_id(mut self, answer: Result<String, SysError>) -> Self {
         self.boot_id = answer;
+        self
+    }
+
+    /// Scripts [`Syscalls::ptrace_scope`]. Unscripted, it answers 1.
+    #[must_use]
+    pub fn with_ptrace_scope(mut self, answer: Result<u8, SysError>) -> Self {
+        self.ptrace_scope = answer;
         self
     }
 
@@ -461,6 +533,11 @@ impl Syscalls for FakeSyscalls {
                 Err(SysError::unsupported("fake: malformed boot id"))
             }
         })
+    }
+
+    fn ptrace_scope(&self) -> Result<u8, SysError> {
+        self.record(FakeCall::PtraceScope);
+        self.ptrace_scope.clone()
     }
 
     fn mark_cloexec_from(&self, first: u32) -> Result<(), SysError> {
@@ -543,6 +620,58 @@ mod tests {
         assert_eq!(
             parse_boot_id(Ok(b"abcdef01-2345-6789-abcd-ef0123456789\n".to_vec())).unwrap(),
             "abcdef01-2345-6789-abcd-ef0123456789"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ptrace_scope_that_is_missing_or_not_a_digit_is_refused() {
+        // No Yama: the file is not there.
+        let missing = parse_ptrace_scope(Err(std::io::Error::from_raw_os_error(2))).unwrap_err();
+        assert!(missing.to_string().contains("without Yama"), "{missing}");
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"4\n",
+            b"01\n",
+            b"1\n\n",
+            b"-1\n",
+            b" 1\n",
+            b"x",
+        ] {
+            assert!(parse_ptrace_scope(Ok(bad.to_vec())).is_err(), "{bad:?}");
+        }
+        for (text, scope) in [(&b"0\n"[..], 0), (b"1\n", 1), (b"2\n", 2), (b"3", 3)] {
+            assert_eq!(parse_ptrace_scope(Ok(text.to_vec())).unwrap(), scope);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_hosts_ptrace_scope_is_read_or_refused_never_guessed() {
+        // Whatever this host says, the answer is the file's, or an error.
+        assert_eq!(
+            HostSyscalls.ptrace_scope().ok(),
+            parse_ptrace_scope(std::fs::read(PTRACE_SCOPE_PATH)).ok()
+        );
+    }
+
+    #[test]
+    fn only_a_ptrace_scope_of_one_to_three_contains_a_harness() {
+        for scope in 1..=3 {
+            assert!(ptrace_contained(&Ok(scope)), "{scope}");
+        }
+        for scope in [0, 4, u8::MAX] {
+            assert!(!ptrace_contained(&Ok(scope)), "{scope}");
+        }
+        assert!(!ptrace_contained(&Err(SysError::unsupported("no Yama"))));
+        let fake = FakeSyscalls::new();
+        assert_eq!(fake.ptrace_scope().unwrap(), 1);
+        let fake = fake.with_ptrace_scope(Ok(0));
+        assert_eq!(fake.ptrace_scope().unwrap(), 0);
+        assert_eq!(
+            fake.calls(),
+            vec![FakeCall::PtraceScope, FakeCall::PtraceScope]
         );
     }
 
@@ -734,6 +863,7 @@ mod tests {
         let host = HostSyscalls;
         let refusals = [
             host.boot_id().unwrap_err(),
+            host.ptrace_scope().unwrap_err(),
             host.mark_cloexec_from(3).unwrap_err(),
             host.peer_pidfd(a.as_fd()).unwrap_err(),
             host.peer_cred(a.as_fd()).unwrap_err(),

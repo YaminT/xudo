@@ -55,8 +55,8 @@ use xudo_gate::request::{
 };
 use xudo_policy::{CallerFacts, Classification, Decision, HarnessRegistry, HarnessWay, Verdict};
 use xudo_sys::{
-    Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, TEMP_PREFIX,
-    parse_stat, parse_status_uids,
+    Authorized, Entropy, PeerCalls, ProcFile, Spool, SpoolError, StatusUids, SysError, Syscalls,
+    TEMP_PREFIX, parse_stat, parse_status_uids, ptrace_contained,
 };
 use xudo_wire::BrokerRequest;
 
@@ -140,6 +140,11 @@ pub enum ExecPath {
     /// A service harness no rule grants. It has no password to type, so it is
     /// refused and nothing is minted.
     NotGranted,
+    /// A live harness a rule grants, on a host whose live
+    /// `kernel.yama.ptrace_scope` is 0, missing or unreadable: any process
+    /// of its account could attach to it and run what it may run. Refused,
+    /// and nothing is minted.
+    PtraceScopeOpen,
 }
 
 /// Which gate a run question's decision is minted for.
@@ -148,12 +153,17 @@ pub enum ExecPath {
 /// registry entry is `way = "service"`, the kernel handed over its pidfd from the socket, the pidfd held it while it
 /// was read, its namespaces are the broker's, its scope is a live one, and
 /// the decision is a plain allow whose grant is the action it cites. Anything
-/// weaker keeps the password path, or refuses a service harness.
+/// weaker keeps the password path, or refuses a service harness. Where all
+/// of that holds, the live `kernel.yama.ptrace_scope` is read through
+/// `syscalls` and must be 1 to 3 ([`ptrace_contained`]); otherwise
+/// [`ExecPath::PtraceScopeOpen`]. It is read on every such run, so a later
+/// `sysctl` back to 0 turns the path off at once.
 pub fn exec_path(
     identity: &PeerIdentity,
     caller: &CallerFacts,
     decision: &Decision,
     registry: &HarnessRegistry,
+    syscalls: &dyn Syscalls,
 ) -> ExecPath {
     let Classification::EnrolledAgent { agent_id, .. } = &caller.classification else {
         return ExecPath::Password;
@@ -175,6 +185,9 @@ pub fn exec_path(
         .get(agent_id)
         .is_some_and(|entry| entry.way == HarnessWay::Service);
     if live && granted && service {
+        if !ptrace_contained(&syscalls.ptrace_scope()) {
+            return ExecPath::PtraceScopeOpen;
+        }
         return ExecPath::Harness;
     }
     if service && decision.verdict.is_permitted() {

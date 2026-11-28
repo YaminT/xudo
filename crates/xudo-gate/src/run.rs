@@ -905,6 +905,10 @@ fn proceed(
             &loaded.rules.harnesses,
             &caller.facts.classification,
         ),
+        // Read live on every `-nopass` run: a `sysctl` back to 0 after the
+        // agent path was installed turns it off here, not at the next install.
+        ptrace_contained: mode == GateMode::Nopass
+            && xudo_sys::ptrace_contained(&host.syscalls().ptrace_scope()),
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -2684,6 +2688,7 @@ args = [
             mode: GateMode::Auth,
             caller_is_agent_account: false,
             caller_is_service_harness: false,
+            ptrace_contained: false,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -4496,6 +4501,39 @@ args = [
         let exit = run(&mut host, &nopass());
         assert_eq!(exec_calls(&host), 1, "{}", exit.message);
         assert_eq!(consumed(&spool), [NONCE_A]);
+    }
+
+    #[test]
+    fn a_ptrace_scope_set_back_to_zero_stops_a_minted_harness_entry_at_the_gate() {
+        // Attack: the agent path was installed at ptrace_scope 1; then root
+        // (or a sysctl drop-in sorting after xudo's, at the next boot) set it
+        // to 0, so any process of the harness's account can attach to the
+        // harness. An entry minted while it was 1 must not run: the gate
+        // reads the live value itself. A kernel without Yama, or a value it
+        // cannot read, is the same as 0.
+        for scope in [Ok(0), Err(xudo_sys::SysError::unsupported("no Yama"))] {
+            let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+            let generation = rules.generation.id();
+            let (mut host, spool) = granting_host(granted_entry(generation), rules);
+            host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(scope);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "gate_mode_ptrace_scope_open");
+            assert!(
+                host.syscalls
+                    .calls()
+                    .contains(&xudo_sys::FakeCall::PtraceScope)
+            );
+        }
+        // 1, 2 and 3 all run it.
+        for scope in 1..=3 {
+            let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+            let generation = rules.generation.id();
+            let (mut host, spool) = granting_host(granted_entry(generation), rules);
+            host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(Ok(scope));
+            let exit = run(&mut host, &nopass());
+            assert_eq!(exec_calls(&host), 1, "{scope}: {}", exit.message);
+            assert_eq!(consumed(&spool), [NONCE_A]);
+        }
     }
 
     #[test]

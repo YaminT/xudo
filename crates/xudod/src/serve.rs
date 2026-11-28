@@ -357,7 +357,13 @@ fn serve_request(
         policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
     }
     let decision = decide(&policy, &caller, &request);
-    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
+    let path = exec_path(
+        &identity,
+        &caller,
+        &decision,
+        &policy.rules.harnesses,
+        platform.syscalls,
+    );
     let evaluated = Evaluated {
         decision,
         caller,
@@ -372,6 +378,7 @@ fn serve_request(
     match path {
         ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
         ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::PtraceScopeOpen => return ptrace_scope_open(conn, platform, &evaluated),
         ExecPath::Password => {}
     }
     let evaluated = match confirm_run(conn, platform, spool, evaluated) {
@@ -446,6 +453,37 @@ fn harness_not_granted(
     answer(
         conn,
         &BrokerResponse::harness_not_granted(action),
+        Served::Decided,
+    )
+}
+
+/// A live harness a rule grants, refused because the live
+/// `kernel.yama.ptrace_scope` is 0, missing or unreadable. Nothing is minted.
+/// The reply carries the code and its fixed remediation only: no action, no
+/// decision, no trace.
+fn ptrace_scope_open(
+    conn: &dyn Connection,
+    platform: &mut Platform<'_>,
+    evaluated: &Evaluated,
+) -> Served {
+    let Evaluated {
+        decision,
+        caller,
+        identity,
+        request,
+        policy,
+    } = evaluated;
+    // Nothing is enabled by this record, so a sink that cannot take it does
+    // not change the answer.
+    let _ = platform.audit.append(&|previous| {
+        let record = decided_under(previous, decision, caller, identity, request, policy, None);
+        let mut evidence = record.evidence.clone();
+        evidence.push("refused=ptrace_scope_open".to_owned());
+        record.with_evidence(evidence)
+    });
+    answer(
+        conn,
+        &BrokerResponse::refused(RefusalCode::PtraceScopeOpen),
         Served::Decided,
     )
 }
@@ -3802,7 +3840,13 @@ fn serve_remove(
         policy.settings.frozen |= harness_freeze_stands(platform, agent_id);
     }
     let decision = crate::policy::decide_remove(&policy, &caller, &request);
-    let path = exec_path(&identity, &caller, &decision, &policy.rules.harnesses);
+    let path = exec_path(
+        &identity,
+        &caller,
+        &decision,
+        &policy.rules.harnesses,
+        platform.syscalls,
+    );
     let evaluated = Evaluated {
         decision,
         caller,
@@ -3815,6 +3859,7 @@ fn serve_remove(
     match path {
         ExecPath::Harness => return mint(conn, platform, spool, evaluated, MintFor::Harness),
         ExecPath::NotGranted => return harness_not_granted(conn, platform, &evaluated),
+        ExecPath::PtraceScopeOpen => return ptrace_scope_open(conn, platform, &evaluated),
         ExecPath::Password => {}
     }
     let Evaluated {
@@ -12210,6 +12255,74 @@ outcome = "allow"
     }
 
     #[test]
+    fn a_granted_harness_gets_no_entry_while_ptrace_scope_is_open() {
+        // Attack: the agent path was installed at ptrace_scope 1, then root
+        // set it back to 0 (or a later sysctl drop-in did at boot). Any
+        // process of the harness's account could now attach to the harness
+        // and drive it, so the broker reads the live value on every run and
+        // mints nothing. No Yama, or a value it cannot read, is the same.
+        for scope_answer in [Ok(0), Err(SysError::unsupported("no Yama"))] {
+            for question in [
+                status_question("x"),
+                remove_question(b"/srv/app/build/cache", false),
+            ] {
+                let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+                host.syscalls =
+                    std::mem::take(&mut host.syscalls).with_ptrace_scope(scope_answer.clone());
+                let (served, answer, entries) =
+                    served_by(&mut host, harness_identity(scope), question);
+                assert_eq!(served, Served::Decided);
+                assert!(entries.is_empty());
+                assert_eq!(
+                    answer,
+                    BrokerResponse::refused(RefusalCode::PtraceScopeOpen).answer
+                );
+                assert!(
+                    host.syscalls
+                        .calls()
+                        .contains(&xudo_sys::FakeCall::PtraceScope)
+                );
+                // A code of its own, named for the cause: not the one a
+                // harness no rule grants gets, and no trace either way.
+                assert_ne!(
+                    answer,
+                    BrokerResponse::harness_not_granted(Some("xudo.svc.status")).answer
+                );
+                let record = host.audit.records().last().unwrap().clone();
+                assert!(
+                    record
+                        .evidence
+                        .contains(&"refused=ptrace_scope_open".to_owned()),
+                    "{record:?}"
+                );
+            }
+        }
+        // 1, 2 and 3 mint it.
+        for scope_answer in 1..=3 {
+            let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+            host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(Ok(scope_answer));
+            let (served, answer, _) =
+                served_by(&mut host, harness_identity(scope), status_question("x"));
+            assert_eq!(served, Served::Minted);
+            assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_NOPASS));
+        }
+        // A human, or a harness the password path serves, never needs it:
+        // it is not read.
+        let (mut host, scope) = granting_host(Some(SESSION_CODEX));
+        host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(Ok(0));
+        let (served, answer, _) =
+            served_by(&mut host, harness_identity(scope), status_question("x"));
+        assert_eq!(served, Served::Minted);
+        assert_eq!(gate_of(&answer), Some(xudo_backend::snippet::GATE_AUTH));
+        assert!(
+            !host
+                .syscalls
+                .calls()
+                .contains(&xudo_sys::FakeCall::PtraceScope)
+        );
+    }
+
+    #[test]
     fn a_service_harness_no_rule_grants_gets_harness_not_granted() {
         // `restart` is allowed with confirmation: a password the service
         // account does not have. Refused, nothing minted, no trace sent.
@@ -12341,7 +12454,13 @@ outcome = "allow"
         let session =
             xudo_policy::HarnessRegistry::from_files([("codex.toml", SESSION_CODEX)]).unwrap();
         assert_eq!(
-            exec_path(&identity, &caller, &decision, &session),
+            exec_path(
+                &identity,
+                &caller,
+                &decision,
+                &session,
+                &FakeSyscalls::new()
+            ),
             ExecPath::Password
         );
     }
@@ -12354,7 +12473,13 @@ outcome = "allow"
         let (policy, caller, decision) = queue_decision_context(&host, &identity, &request);
         let registry = &policy.rules.harnesses;
         assert_eq!(
-            exec_path(&identity, &caller, &decision, registry),
+            exec_path(
+                &identity,
+                &caller,
+                &decision,
+                registry,
+                &FakeSyscalls::new()
+            ),
             ExecPath::Harness
         );
         let mut other_action = decision.clone();
@@ -12365,7 +12490,7 @@ outcome = "allow"
         confirming.verdict = Verdict::AllowWithConfirmation;
         for weaker in [&other_action, &no_grant, &confirming] {
             assert_eq!(
-                exec_path(&identity, &caller, weaker, registry),
+                exec_path(&identity, &caller, weaker, registry, &FakeSyscalls::new()),
                 ExecPath::NotGranted
             );
         }
@@ -12375,13 +12500,13 @@ outcome = "allow"
         let mut outside = identity.clone();
         outside.cgroup_attestation = crate::identify::CgroupAttestation::Outside;
         assert_eq!(
-            exec_path(&outside, &caller, &decision, registry),
+            exec_path(&outside, &caller, &decision, registry, &FakeSyscalls::new()),
             ExecPath::NotGranted
         );
         let mut denied = decision;
         denied.verdict = Verdict::Deny;
         assert_eq!(
-            exec_path(&identity, &caller, &denied, registry),
+            exec_path(&identity, &caller, &denied, registry, &FakeSyscalls::new()),
             ExecPath::Password
         );
     }

@@ -88,6 +88,9 @@ impl GateCaller {
 pub const UNKNOWN_UID: u32 = u32::MAX;
 
 /// The state the gate decides against.
+// Each bool is a separate fact the gate read for itself; folding them into an
+// enum would let one stand for another.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug)]
 pub struct GateContext {
     /// The policy generation currently in force, read from root-owned state.
@@ -122,6 +125,13 @@ pub struct GateContext {
     /// `way = "service"`. Only such a harness runs without a password: a
     /// session harness runs as a person, who can type it.
     pub caller_is_service_harness: bool,
+    /// Whether the live `kernel.yama.ptrace_scope` keeps the harness's own
+    /// account from attaching to it: 1, 2 or 3, read by the gate itself
+    /// through [`xudo_sys::Syscalls::ptrace_scope`] (see
+    /// [`xudo_sys::ptrace_contained`]). At 0, or without Yama, `-nopass`
+    /// refuses. Read only on `-nopass`; `false` on `-auth`, which does not
+    /// look at it.
+    pub ptrace_contained: bool,
 }
 
 /// How loudly a refusal should be reported.
@@ -250,6 +260,10 @@ pub enum ModeRefusal {
     /// The live enrolled agent's registry entry is not `way = "service"`.
     #[error("only a service harness runs without a password")]
     NotAServiceHarness,
+    /// The live `kernel.yama.ptrace_scope` is 0, missing or unreadable: any
+    /// process of the harness's account could attach to the harness.
+    #[error("kernel.yama.ptrace_scope is 0 or cannot be read, so nothing runs without a password")]
+    PtraceScopeOpen,
 }
 
 impl ModeRefusal {
@@ -262,6 +276,7 @@ impl ModeRefusal {
             Self::NotGranted => "gate_mode_not_granted",
             Self::AgentWithoutApproval => "gate_mode_agent_without_approval",
             Self::NotAServiceHarness => "gate_mode_not_a_service_harness",
+            Self::PtraceScopeOpen => "gate_mode_ptrace_scope_open",
         }
     }
 }
@@ -694,7 +709,13 @@ fn require_mode(
         GateMode::Auth if pending.via == Via::Auth => Ok(()),
         GateMode::Auth => Err(ModeRefusal::WrongVia),
         GateMode::Nopass => {
-            require_live_harness(pending, caller, context.caller_is_service_harness)
+            require_live_harness(pending, caller, context.caller_is_service_harness).and(
+                if context.ptrace_contained {
+                    Ok(())
+                } else {
+                    Err(ModeRefusal::PtraceScopeOpen)
+                },
+            )
         }
     };
     outcome.map_err(|reason| mode_refusal(context.mode, reason))
@@ -1049,6 +1070,7 @@ all = [
             mode: GateMode::Auth,
             caller_is_agent_account: false,
             caller_is_service_harness: true,
+            ptrace_contained: true,
         }
     }
 
@@ -2678,9 +2700,60 @@ args = [
             ModeRefusal::LabelDiffers,
             ModeRefusal::NotGranted,
             ModeRefusal::NotAServiceHarness,
+            ModeRefusal::PtraceScopeOpen,
         ] {
             assert!(!reason.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn nopass_refuses_a_granted_harness_while_ptrace_scope_is_open() {
+        // Attack: root set `kernel.yama.ptrace_scope` back to 0 after the
+        // agent path was installed. Any process of the harness's account can
+        // now attach to the harness, so its grant runs nothing without a
+        // password, even with an entry the broker minted earlier.
+        let open = GateContext {
+            ptrace_contained: false,
+            ..nopass_context()
+        };
+        let refusal = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            Some(&harness_entry(77)),
+            open,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "gate_mode_ptrace_scope_open");
+        assert_eq!(
+            refusal.to_string(),
+            "the -nopass gate refuses this entry: kernel.yama.ptrace_scope is 0 or cannot be \
+             read, so nothing runs without a password"
+        );
+        // The same entry passes once the scope is closed again.
+        assert!(
+            decide(
+                &grant_rules(),
+                &live_agent(77, "claude-code", 44),
+                Some(&harness_entry(77)),
+                nopass_context(),
+            )
+            .is_ok()
+        );
+        // `-auth` does not look at it.
+        let auth = GateContext {
+            ptrace_contained: false,
+            ..context()
+        };
+        assert_eq!(
+            require_mode(
+                &harness_entry(77),
+                &live_agent(77, "claude-code", 44),
+                &auth
+            )
+            .unwrap_err()
+            .code(),
+            "gate_mode_wrong_via"
+        );
     }
 
     #[test]

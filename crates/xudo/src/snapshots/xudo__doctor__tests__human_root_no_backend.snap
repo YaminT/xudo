@@ -16,6 +16,7 @@ protect rule missing shipped deny rule xudo.protect.dpkg-remove
 sudoers xudo unknown: canonical rule could not be read
 sudoers xudo unknown: test fixture has no sudoers directory
 agent path   off
+ptrace scope unknown: /proc/sys/kernel/yama/ptrace_scope is missing: this kernel has no Yama
 classified   unattested
 password     required
 hints        1 recorded, 0 trusted

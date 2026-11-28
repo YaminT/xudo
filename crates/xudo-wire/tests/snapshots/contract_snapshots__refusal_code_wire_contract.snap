@@ -38,3 +38,5 @@ expression: table
     the broker rejected this confirmation answer
 18  harness_not_granted
     no rule grants this harness the command, and a service harness has no password to type; ask root to add a rule that names the harness, or use the queue
+19  ptrace_scope_open
+    kernel.yama.ptrace_scope is 0 or cannot be read on this host, so any process of the harness's account could take over the harness: nothing runs without a password until root sets it to 1 or more (`sudo xudo install --agent-path --raise-ptrace-scope`, then reboot or `sysctl --system`); `xudo doctor` shows it
