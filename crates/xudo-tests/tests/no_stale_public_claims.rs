@@ -485,6 +485,113 @@ fn public_docs_say_the_agent_path_refuses_at_ptrace_scope_zero() {
     assert!(flatten_claim(&readme).contains("refuses while kernel.yama.ptrace_scope is 0"));
 }
 
+/// A sentence that says a process of the service account outside its unit
+/// "is not enough": false, because such a process can edit the harness's
+/// home and configuration, or restart it with edited settings.
+fn stale_service_account_claim(flat: &str) -> bool {
+    flat.split(['.', ';'])
+        .any(|sentence| sentence.contains("service account") && sentence.contains("not enough"))
+}
+
+/// Every public page, the site's HTML included.
+fn public_pages() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = vec![
+        "README.md".to_owned(),
+        "SECURITY.md".to_owned(),
+        "howiwork.md".to_owned(),
+        "docs/man/xudo.1".to_owned(),
+    ];
+    let mut site = Vec::new();
+    markdown_and_html_files(&root.join("site"), &mut site);
+    assert!(site.len() >= 5, "{site:?}");
+    files.extend(site);
+    files
+        .into_iter()
+        .map(|file| {
+            let text = fs::read_to_string(root.join(&file)).unwrap();
+            let name = Path::new(&file)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            (name, flatten_claim(&text))
+        })
+        .collect()
+}
+
+#[test]
+fn no_public_page_says_the_service_account_outside_its_unit_is_harmless() {
+    for (file, flat) in public_pages() {
+        assert!(!stale_service_account_claim(&flat), "{file}");
+        assert!(
+            !flat.contains("an ssh login as the service account is not enough"),
+            "{file}"
+        );
+    }
+    // The pages that describe the service way say what the account is.
+    for (file, flat) in public_pages() {
+        if [
+            "howiwork.md",
+            "SECURITY.md",
+            "xudo.1",
+            "security.html",
+            "how-it-works.html",
+        ]
+        .contains(&file.as_str())
+        {
+            assert!(flat.contains("trusted exactly like the harness"), "{file}");
+            assert!(flat.contains("no logins"), "{file}");
+        }
+    }
+}
+
+#[test]
+fn public_pages_say_broker_and_gate_recheck_ptrace_scope_on_every_run() {
+    for (file, flat) in public_pages() {
+        if ["howiwork.md", "SECURITY.md", "xudo.1", "security.html"].contains(&file.as_str()) {
+            assert!(
+                flat.contains("read the live value again on every passwordless run"),
+                "{file}"
+            );
+            assert!(flat.contains("ptrace_scope_open"), "{file}");
+            assert!(flat.contains("disabled"), "{file}");
+            assert!(flat.contains("is 0 or cannot be read"), "{file}");
+        }
+        if ["README.md", "how-it-works.html"].contains(&file.as_str()) {
+            assert!(flat.contains("on every passwordless run"), "{file}");
+        }
+    }
+}
+
+#[test]
+fn the_site_says_a_same_uid_process_can_answer_a_watch_prompt() {
+    let pages = public_pages();
+    let security = &pages
+        .iter()
+        .find(|(file, _)| file == "security.html")
+        .unwrap()
+        .1;
+    assert!(security.contains("can open a pty in a new session and answer"));
+    assert!(security.contains("the password at -auth still applies"));
+    assert!(security.contains("a same-uid watcher on another tty"));
+}
+
+#[test]
+fn the_service_account_check_catches_the_old_claim() {
+    let old = flatten_claim(
+        "A similarly named process is not enough, and neither is a process of the service \
+         account outside the unit (an SSH key login): it is not in the scope.",
+    );
+    assert!(stale_service_account_claim(&old));
+    let new = flatten_claim(
+        "A similarly named process is not. A process of the service account outside the unit \
+         is not in the scope, but it can edit the harness's home directory.",
+    );
+    assert!(!stale_service_account_claim(&new));
+}
+
 #[test]
 fn the_approval_check_catches_permanent_claims_and_allows_the_beta_status() {
     assert!(stale_approval_claim("Every request asks for a password."));

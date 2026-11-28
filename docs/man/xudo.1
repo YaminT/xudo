@@ -707,7 +707,12 @@ agent path off;
 removes it with everything else, and refuses to remove an edited
 .IR /etc/sudoers.d/xudo .
 .B xudo doctor
-says whether the agent path is on and whether its text is exact.
+says whether the agent path is on and whether its text is exact, shows the
+live
+.BR kernel.yama.ptrace_scope ,
+and says
+.B disabled
+when the text is in place but that value turns the path off.
 .IP
 The shipped enrollment path uses a dedicated service account. The session way
 (a harness running in the human's own account) is parsed and loaded but has no
@@ -723,7 +728,19 @@ refuses while the live
 .B kernel.yama.ptrace_scope
 is 0 or cannot be read: at 0 any process of a service harness's account outside
 its unit (an SSH key login, a cron or at job, a lingering user manager) can
-attach to the harness and act from inside its scope.
+attach to the harness and act from inside its scope. The broker and the gate
+read the live value again on every passwordless run and, at 0, with no Yama, or
+when it cannot be read, refuse with
+.B ptrace_scope_open
+and mint and run nothing;
+.B xudo doctor
+then shows the agent path as
+.BR disabled .
+At any value, a process of the service account outside its unit can still edit
+the harness's home directory and configuration, or kill the harness so the
+unit restarts it with edited settings: the service account must have no logins,
+no SSH keys, no cron or at jobs and no lingering user manager, and its home and
+configuration are trusted exactly like the harness itself.
 .B \-\-raise\-ptrace\-scope
 at 0 writes only a root-owned sysctl drop-in setting
 .B kernel.yama.ptrace_scope=1

@@ -69,13 +69,21 @@ in the root-only environment file. Enrollment itself authorizes no command.
 
 Only a process running inside the live scope created by that root-managed unit,
 with a matching registry record, is a verified harness. A similarly named
-process is not enough, and neither is a process of the service account outside
-the unit (an SSH key login, a cron or at job, a lingering user manager): it is
-not in the scope. At `kernel.yama.ptrace_scope = 0`, though, such a process can
-attach to the harness and act from inside the scope, so
-`sudo xudo install --agent-path` refuses while the live value is 0 or cannot be
-read. Root-created cgroups and registry state are the authentication basis;
-display names are not.
+process is not. A process of the service account outside the unit (an SSH key
+login, a cron or at job, a lingering user manager) is not in the scope, so the
+broker does not treat it as the harness, but it can still act through the
+harness: it can edit the harness's home directory and configuration, or kill
+the harness so the unit restarts it with edited settings inside the scope. So
+the service account must have no logins, no SSH keys, no cron or at jobs and
+no lingering user manager, and its home and configuration are trusted exactly
+like the harness itself. At `kernel.yama.ptrace_scope = 0` such a process can
+also attach to the harness directly, so `sudo xudo install --agent-path`
+refuses while the live value is 0 or cannot be read, and the broker and the
+gate read the live value again on every passwordless run: at 0, with no Yama,
+or when it cannot be read, they refuse with `ptrace_scope_open`, mint and run
+nothing, and `xudo doctor` shows the agent path as `disabled`. Root-created
+cgroups and registry state are the authentication basis; display names are
+not.
 
 The session way (a harness running in the human's own account) is parsed and
 loaded, but has no start command. A session harness shares the human's uid:
