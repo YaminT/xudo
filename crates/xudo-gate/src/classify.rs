@@ -70,6 +70,9 @@ mod tests {
         fn boot_id(&self) -> Result<String, SysError> {
             Ok("not-a-boot-id".to_owned())
         }
+        fn ptrace_scope(&self) -> Result<u8, SysError> {
+            self.0.ptrace_scope()
+        }
         fn mark_cloexec_from(&self, first: u32) -> Result<(), SysError> {
             self.0.mark_cloexec_from(first)
         }
@@ -246,6 +249,7 @@ mod tests {
     fn invalid_boot_test_syscalls_delegate_non_boot_operations() {
         let syscalls = InvalidBootSyscalls(FakeSyscalls::new());
         let descriptor = fd();
+        assert_eq!(syscalls.ptrace_scope().unwrap(), 1);
         let _ = syscalls.mark_cloexec_from(3);
         let _ = syscalls.peer_pidfd(descriptor.as_fd());
         let _ = syscalls.peer_cred(descriptor.as_fd());

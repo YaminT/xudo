@@ -758,6 +758,48 @@ expression: text
   "seq": 1
 }
 
+## ptrace_scope_open with a request and a peer
+{
+  "action": null,
+  "argv": [
+    "/usr/bin/systemctl",
+    "restart",
+    "nginx.service"
+  ],
+  "classification": "unattested",
+  "decision": "denied",
+  "denial": "ptrace_scope_open",
+  "deny_list_version": 0,
+  "evidence": [
+    "broker=xudod",
+    "fault=broker",
+    "detail=detail of the broker's fault",
+    "rung=SO_PEERPIDFD + PIDFD_GET_INFO",
+    "peer_pid=4242",
+    "peer_starttime=998877",
+    "peer_sid=1",
+    "peer_tty=0",
+    "diverged=true",
+    "peer_uid=1000",
+    "peer_gid=100",
+    "pinned=true",
+    "euid_from=PIDFD_GET_INFO",
+    "hint_comm=\"xudo\"",
+    "hint_exe=\"/usr/bin/xudo\"",
+    "hint_cmdline=argv0:\"xudo\" argc:4 len:25",
+    "hint_claudecode=set:\"1\"",
+    "cgroup_id=77",
+    "question=run",
+    "claimed_classification=enrolled-agent-yolo"
+  ],
+  "hash": "6235416c806eb275da099a360825ff7cbcd126b04bf1b993de48f90d764c6694",
+  "outcome": "not_executed",
+  "prev_hash": "",
+  "rule_source": null,
+  "schema_version": 1,
+  "seq": 1
+}
+
 ## before anything was known
 {
   "action": null,

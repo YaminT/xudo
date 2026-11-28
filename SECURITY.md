@@ -16,8 +16,27 @@ start command. A session harness shares the human's uid: at
 `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
 password, `xudo watch` accepts a same-uid watcher on another tty, and a
 registry entry can name the human's account. Run harnesses as separate service
-accounts. `--raise-ptrace-scope` takes effect only after `sudo sysctl --system`
-or reboot.
+accounts. A service harness's own account is trusted exactly like the
+harness: a process of that account outside the unit (an SSH key login, a cron
+or at job, a lingering user manager) is not in the scope, but it can edit the
+harness's home directory and configuration, or kill the harness so the unit
+restarts it with edited settings inside the scope. Give the service account no
+logins, no SSH keys, no cron or at jobs and no lingering user manager. At 0
+such a process can also attach to the harness and act from inside its scope,
+so `sudo xudo install --agent-path` refuses while the live
+`kernel.yama.ptrace_scope` is 0 or cannot be read, and the broker and the gate
+read the live value again on every passwordless run: at 0, with no Yama, or
+when it cannot be read, they refuse with `ptrace_scope_open` and mint and run
+nothing, and `xudo doctor` shows the agent path as `disabled`. At 0,
+`--raise-ptrace-scope` writes only a sysctl drop-in and leaves the agent path
+off; it takes effect only after `sudo sysctl --system` or reboot, and then the
+install turns the path on.
+
+`xudo watch` requires only a different session, a different terminal and a
+pty or virtual console for a watcher of the requester's own uid: a process of
+that uid can open a pty in a new session and answer its own prompt. Treat a
+watch approval as an extra check on the human path; the password at `-auth`
+still applies.
 
 ## Security boundary
 

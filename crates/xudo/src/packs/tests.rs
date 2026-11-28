@@ -404,9 +404,9 @@ fn what_is_not_a_reviewable_pack_is_refused() {
     // Not there.
     let (code, _, err) = go(&etc, &script, &add(etc.root.join("absent.toml")));
     assert_eq!(code, ExitCode::Unusable);
-    assert!(err.contains("cannot read"), "{err}");
+    assert!(err.contains("cannot use "), "{err}");
     // Too big to be one.
-    let huge = etc.write("huge.toml", &vec![b'#'; MAX_PACK_BYTES + 1]);
+    let huge = etc.write("huge.toml", &vec![b'#'; xudo_sys::MAX_PACK_BYTES + 1]);
     let (code, _, err) = go(&etc, &script, &add(huge));
     assert_eq!(code, ExitCode::Unusable);
     assert!(err.contains("larger than"), "{err}");
@@ -499,6 +499,31 @@ fn reviewed_hands_root_the_bytes_and_the_digest() {
     let (code, _, _) = go(&etc, &unread, &reviewed(&etc.root.join("absent")));
     assert_eq!(code, ExitCode::Unusable);
     assert!(unread.asked.borrow().is_empty());
+}
+
+#[test]
+fn a_pack_swapped_for_a_symlink_after_review_is_refused_and_never_echoed() {
+    // The agent wrote the pack, the operator reviewed it, then the agent
+    // pointed the path at a secret before the operator ran the sudo step.
+    let etc = Etc::new("swapped");
+    let file = etc.write("ids.toml", IDS.as_bytes());
+    let (code, out, _) = go(&etc, &Script::default(), &add(file.clone()));
+    assert_eq!(code, ExitCode::Delegated);
+    let secret = etc.write("shadow", b"root:$y$j9T$secretsecret:20000:0:99999:7:::\n");
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&secret, &file).unwrap();
+    let script = Script::default();
+    let action = RulesAction::Add {
+        file,
+        reviewed: Some(token_in(&out)),
+        allow_waivers: false,
+    };
+    let (code, out, err) = go(&etc, &script, &action);
+    assert_eq!(code, ExitCode::Unusable);
+    assert!(err.contains("a symbolic link on its path"), "{err}");
+    assert!(!format!("{out}{err}").contains("secret"), "{out}{err}");
+    // Root was handed nothing.
+    assert!(script.asked.borrow().is_empty());
 }
 
 #[test]

@@ -123,6 +123,7 @@ fn conflicting_lines(bytes: &[u8], tokens: &[String], numeric: bool) -> Vec<usiz
                 && (contains(line, HELPERS_DIR)
                     || contains(line, b"xudo-gate")
                     || reaches_helper(line)
+                    || defaults_for_all_or_an_alias(line)
                     || tokens
                         .iter()
                         .any(|token| names_token(line, token.as_bytes(), &is_word))
@@ -158,6 +159,23 @@ fn reaches_helper(line: &[u8]) -> bool {
                     .zip(&helper)
                     .all(|(pattern, name)| component_matches(pattern, name))
         })
+}
+
+/// Whether `line` sets `Defaults!` for `ALL` or for an alias: either can
+/// reach the helper, and a later one undoes xudo's `env_reset, !setenv` for
+/// it (`Defaults!ALL setenv`, `Defaults!OPS env_keep+=LD_PRELOAD`). A path in
+/// the list is [`reaches_helper`]'s. An alias is taken to reach the helper:
+/// conservative, like every check here.
+fn defaults_for_all_or_an_alias(line: &[u8]) -> bool {
+    let Some(rest) = line.trim_ascii_start().strip_prefix(b"Defaults!") else {
+        return false;
+    };
+    rest.split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default()
+        .split(|byte| *byte == b',')
+        .map(|item| item.strip_prefix(b"!").unwrap_or(item))
+        .any(|item| item.first().is_some_and(u8::is_ascii_uppercase))
 }
 
 /// Whether one glob component matches one name: `*`, `?` and literal bytes,
@@ -239,9 +257,12 @@ pub fn gate_faults(host: &dyn HostView) -> Vec<String> {
     out
 }
 
-/// Every account in the agent group: listed in `/etc/group`, or with it as
-/// the primary group in `/etc/passwd`. Sorted, each once. A name that is not
-/// plain text is shown escaped, so it can never equal a registered one.
+/// Every account in the agent group: listed in `/etc/group` on its line or on
+/// any other line with its gid (`groupadd -o` gives one group two names, and
+/// sudo's `%xudo-agent` matches the members of both), or with it as the
+/// primary group in `/etc/passwd`. Sorted, each once. A name that is not plain
+/// text is shown escaped, so it can never equal a registered one. Groups from
+/// another NSS source (LDAP, sssd) are not seen: only the files are read.
 ///
 /// # Errors
 ///
@@ -253,19 +274,28 @@ pub fn agent_members(host: &dyn HostView) -> Result<Vec<String>, String> {
     let lines: Vec<Vec<&[u8]>> = group
         .split(|byte| *byte == b'\n')
         .map(|line| line.split(|byte| *byte == b':').collect())
-        .filter(|fields: &Vec<&[u8]>| fields.first() == Some(&XUDO_AGENT_GROUP.as_bytes()))
         .collect();
-    if lines.is_empty() {
-        return Ok(Vec::new());
-    }
-    let shown = |name: &[u8]| name.escape_ascii().to_string();
-    let mut names = BTreeSet::new();
     let mut gids = Vec::new();
-    for fields in &lines {
+    for fields in lines
+        .iter()
+        .filter(|fields| fields.first() == Some(&XUDO_AGENT_GROUP.as_bytes()))
+    {
         let gid = fields.get(2).and_then(|gid| number(gid)).ok_or_else(|| {
             format!("the {XUDO_AGENT_GROUP} line in /etc/group has no numeric gid")
         })?;
         gids.push(gid);
+    }
+    if gids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let shown = |name: &[u8]| name.escape_ascii().to_string();
+    let mut names = BTreeSet::new();
+    for fields in lines.iter().filter(|fields| {
+        fields
+            .get(2)
+            .and_then(|gid| number(gid))
+            .is_some_and(|gid| gids.contains(&gid))
+    }) {
         names.extend(
             fields
                 .get(3)
@@ -507,6 +537,36 @@ mod tests {
     }
 
     #[test]
+    fn a_defaults_line_for_every_command_or_an_alias_blocks() {
+        // Read after xudo's file, `Defaults!ALL setenv` lets a caller of the
+        // helper keep its environment: xudo's `env_reset, !setenv` is undone.
+        for line in [
+            &b"Defaults!ALL setenv\n"[..],
+            b"  Defaults!ALL env_keep+=LD_PRELOAD\n",
+            b"Defaults!OPS,/usr/bin/id !env_reset\n",
+            b"Defaults!/usr/bin/id,!ALL setenv\n",
+        ] {
+            let found = conflicts(&host(STOCK, &[("/etc/sudoers.d/zz-env", line)]));
+            assert_eq!(found.len(), 1, "{line:?}");
+            assert!(
+                found[0].starts_with("/etc/sudoers.d/zz-env line 1"),
+                "{found:?}"
+            );
+        }
+        // A global or per-user default comes before xudo's per-command one,
+        // and a path the helper is not is no conflict.
+        for line in [
+            &b"Defaults setenv\n"[..],
+            b"Defaults:%sudo env_keep+=http_proxy\n",
+            b"Defaults!/usr/bin/sudoreplay !log_output\n",
+            b"# Defaults!ALL setenv\n",
+        ] {
+            let found = conflicts(&host(STOCK, &[("/etc/sudoers.d/zz-env", line)]));
+            assert_eq!(found, Vec::<String>::new(), "{line:?}");
+        }
+    }
+
+    #[test]
     fn a_pattern_that_cannot_reach_the_helper_or_xudos_doas_rule_is_no_conflict() {
         let lines = b"Defaults!/usr/bin/* !lecture\n\
                       Defaults!/usr/libexec/* !lecture\n\
@@ -624,6 +684,19 @@ mod tests {
         assert_eq!(
             agent_members(&host).unwrap(),
             ["\\\\xff", "agent", "carol", "lurker"]
+        );
+        // A second name for the same gid (`groupadd -o`): sudo's
+        // `%xudo-agent` matches its members, so they are members.
+        let aliased = host.clone().file(
+            "/etc/group",
+            0,
+            0,
+            0o644,
+            b"xudo-agent:x:997:agent\nother:x:997:mallory\nstaff:x:50:eve\n",
+        );
+        assert_eq!(
+            agent_members(&aliased).unwrap(),
+            ["agent", "lurker", "mallory"]
         );
         // No group yet: nobody is in it, and /etc/passwd is not needed.
         let none = host.file("/etc/group", 0, 0, 0o644, b"root:x:0:\n");

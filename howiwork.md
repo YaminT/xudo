@@ -26,6 +26,14 @@ password-authenticated path.
 2. **No caller gets passwordless root by mistake or by default.** A command runs without a password only when the kernel attests the caller is inside a root-registered harness scope **and** a root-written rule allows that exact command for that harness. Everything else (a human, an unattested caller, a process that left its scope, a command no rule allows) takes the human path, where the machine's own `sudo` asks the password, or is denied. Misclassification may only withhold. Nothing the agent may run is closed to the human path.
 3. **A human decision is made where the requester cannot answer it.** Anything that needs a human (an `ido` entry, or the optional `xudo watch` check on the human path) is decided by the human on a channel the requesting process tree cannot answer: never from its stdin, stdout, or `/dev/tty`. "Needs a human" never resolves by itself; with no human, it does not run.
 
+What `xudo watch` checks is narrower than invariant 3 reads. The broker
+accepts a watcher of the requester's own uid in a different session on a
+different terminal (a pty or a virtual console), and nothing more: a process of
+that uid can open a pty in a new session and answer its own prompt. A watch
+approval is an extra check, not proof of a human; on the human path the
+password at `-auth` still applies, and the requester cannot supply it without
+the secret.
+
 ## Components and trust
 
 - `xudo` is the unprivileged CLI used by people and harnesses.
@@ -61,16 +69,31 @@ in the root-only environment file. Enrollment itself authorizes no command.
 
 Only a process running inside the live scope created by that root-managed unit,
 with a matching registry record, is a verified harness. A similarly named
-process or an SSH login as the service account is not enough. Root-created
-cgroups and registry state are the authentication basis; display names are not.
+process is not. A process of the service account outside the unit (an SSH key
+login, a cron or at job, a lingering user manager) is not in the scope, so the
+broker does not treat it as the harness, but it can still act through the
+harness: it can edit the harness's home directory and configuration, or kill
+the harness so the unit restarts it with edited settings inside the scope. So
+the service account must have no logins, no SSH keys, no cron or at jobs and
+no lingering user manager, and its home and configuration are trusted exactly
+like the harness itself. At `kernel.yama.ptrace_scope = 0` such a process can
+also attach to the harness directly, so `sudo xudo install --agent-path`
+refuses while the live value is 0 or cannot be read, and the broker and the
+gate read the live value again on every passwordless run: at 0, with no Yama,
+or when it cannot be read, they refuse with `ptrace_scope_open`, mint and run
+nothing, and `xudo doctor` shows the agent path as `disabled`. Root-created
+cgroups and registry state are the authentication basis; display names are
+not.
 
 The session way (a harness running in the human's own account) is parsed and
 loaded, but has no start command. A session harness shares the human's uid:
 with `kernel.yama.ptrace_scope = 0`, a process of that uid can read a typed
 password, `xudo watch` accepts a same-uid watcher on another tty, and a session
 registry entry can name the human's account. Run harnesses as separate service
-accounts. `--raise-ptrace-scope` writes a sysctl drop-in; it takes effect only
-after `sudo sysctl --system` or reboot.
+accounts. At a live value of 0, `--raise-ptrace-scope` writes only a sysctl
+drop-in and leaves the agent path off; it takes effect only after
+`sudo sysctl --system` or reboot, and then `sudo xudo install --agent-path`
+turns the path on.
 
 The package and plain `xudo install` install only the password-authenticated
 backend rule. After enrollment and after installing rules that grant the
@@ -114,7 +137,9 @@ Human requests that match ordinary allow rules use the password-authenticated
 gate. The optional `xudo watch` flow can provide an extra human confirmation
 where policy requires it; it is not required for the passwordless harness
 path. No agent can answer a human confirmation from its own terminal or
-process tree.
+process tree, though a process of the requester's own uid can open a pty in a
+new session and answer a watch prompt there; the password at `-auth` still
+applies.
 
 ### Typed `remove-path`
 

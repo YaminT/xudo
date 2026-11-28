@@ -77,6 +77,10 @@ fn site_pins_session_uid_and_broker_queue_limits() {
     let faq = fs::read_to_string(root.join("site/faq.html")).unwrap();
     assert!(security.contains("a same-uid watcher on another tty"));
     assert!(security.contains("--raise-ptrace-scope</code> takes effect after"));
+    assert!(security.contains("refuses while the live value is 0 or cannot be read"));
+    assert!(
+        how.contains("The agent path is refused while the live <code>ptrace_scope</code> is 0")
+    );
     for page in [&how, &faq] {
         assert!(page.contains("can see its own"));
         assert!(page.contains("cannot edit, claim, release, or answer"));

@@ -12,7 +12,7 @@
 //! the registry or `--allow-waivers` are not what was reviewed (see
 //! `xudo_sys::add_pack`). Nothing is fetched and nothing updates itself.
 
-use std::io::{Read as _, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
@@ -20,7 +20,7 @@ use xudo_policy::pack::{
     Change, PackRefusal, Review, header_of, installed_by_xudo, review, with_pack, without_pack,
 };
 use xudo_policy::{ExitCode, RuleFile, load_policy_with_registry};
-use xudo_sys::{Installer, MAX_PACK_BYTES, PackError, PackRequest};
+use xudo_sys::{Installer, PackError, PackRequest, read_pack_file};
 
 use crate::check::{path_under_warnings, safe};
 use crate::rules::{LoadedRules, read_rule_files, registry_beside};
@@ -105,28 +105,11 @@ pub(crate) fn run(
     }
 }
 
-/// The pack's bytes, bounded.
+/// The pack's bytes: one bounded read of a regular file, never through a
+/// symbolic link and never waiting on a FIFO, the same as the operator and
+/// as root (see [`xudo_sys::read_pack_file`]).
 fn read_pack(file: &Path) -> Result<Vec<u8>, String> {
-    let cannot = |error: std::io::Error| format!("cannot read {}: {error}", file.display());
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)
-        .and_then(|opened| {
-            opened
-                .take(
-                    u64::try_from(MAX_PACK_BYTES)
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(1),
-                )
-                .read_to_end(&mut bytes)
-        })
-        .map_err(cannot)?;
-    if bytes.len() > MAX_PACK_BYTES {
-        return Err(format!(
-            "{} is larger than {MAX_PACK_BYTES} bytes, so it is not a rule pack",
-            file.display()
-        ));
-    }
-    Ok(bytes)
+    read_pack_file(file).map_err(|error| error.to_string())
 }
 
 fn print_review(review: &Review, out: &mut dyn Write) {

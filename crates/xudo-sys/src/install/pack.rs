@@ -28,7 +28,12 @@
 //! * **The change the operator reviewed.** The token binds the pack's bytes
 //!   (or the name removed), `--allow-waivers`, and the generation of the rules
 //!   and harness registry it was judged against. Root computes it again from
-//!   its own reading; any difference refuses.
+//!   its own reading; any difference refuses. It is checked before a byte of
+//!   the pack is parsed, and the pack file is read once, through no symbolic
+//!   link in any component, and opened for reading only once it is known to
+//!   be a regular file ([`read_pack_file`]): a file swapped after the review
+//!   is refused unread, root never shows a line of it, and a refusal shows
+//!   no token, so root's hash of what it read never reaches the agent.
 //! * **[`xudo_policy::pack::review`] again**, on the rules as root reads them
 //!   now, with the pack's file as it will be written (marker included).
 //! * **Never an operator's file.** The pack lands at `pack-<name>.toml` by an
@@ -38,13 +43,13 @@
 //! Nothing here fetches, and nothing updates by itself.
 
 use std::os::unix::ffi::OsStringExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use xudo_backend::enrol::REGISTRY_DIR;
 use xudo_backend::snippet::{SUDOERS_PATH, XUDO_SELF_DEFAULTS, sets_self_timeout};
 use xudo_policy::pack::{
     Change, PackRefusal, Review, file_name, header_of, installed_by_xudo, installed_bytes, review,
-    with_pack, without_pack,
+    token_of, with_pack, without_pack,
 };
 use xudo_policy::{HarnessFile, RuleFile, is_rule_file_name};
 
@@ -62,6 +67,8 @@ const PACK_MODE: u32 = 0o644;
 
 /// The most bytes a pack may have.
 pub const MAX_PACK_BYTES: usize = 1 << 20;
+
+mod file;
 
 /// What `xudo rules add` hands the root side.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,18 +110,13 @@ pub enum PackError {
     /// The process's cgroup could not be read.
     #[error("cannot tell whether this runs inside an agent's box ({0}); nothing was changed")]
     CgroupUnknown(String),
-    /// The change is not the one reviewed.
+    /// The change is not the one reviewed. Fixed text: the token root
+    /// computed is a hash of what it read, and the agent chose the path.
     #[error(
-        "this is not the change that was reviewed (token {reviewed}, now {found}): the pack, the \
-         rules, the harness registry or --allow-waivers differ; review it again as yourself; \
-         nothing was changed"
+        "this is not the change that was reviewed: the pack, the rules, the harness registry or \
+         --allow-waivers differ; review it again as yourself; nothing was changed"
     )]
-    Changed {
-        /// The token the operator was shown.
-        reviewed: String,
-        /// The token of what root read.
-        found: String,
-    },
+    Changed,
     /// The pack, or the rules with or without it, failed a check.
     #[error("{0}; nothing was changed")]
     Refused(#[from] PackRefusal),
@@ -124,6 +126,65 @@ pub enum PackError {
     /// `remove` named a pack xudo did not install.
     #[error("{0} is not a pack xudo installed; nothing was changed")]
     NotInstalled(String),
+    /// The reviewed bytes do not parse as a pack. Fixed text: the parser's
+    /// own message quotes the line it stopped at, and root must never show
+    /// a line of a file it was handed.
+    #[error("the file is not a rule pack; review it again as yourself; nothing was changed")]
+    NotAPack,
+    /// The pack file named on the command line was not read.
+    #[error("{0}")]
+    File(#[from] PackFileError),
+}
+
+/// Why the pack file named on the command line was not read. Never a byte of
+/// the file, and never which step failed: only the path the operator typed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PackFileError {
+    /// Not a regular file reached through no symbolic link: missing, not
+    /// permitted, a link anywhere on the path, a directory, a FIFO, a device
+    /// or a socket. One text for all of them, so root's refusal does not say
+    /// whether a path only root can see exists.
+    #[error("cannot use {path}: not a readable regular file, or a symbolic link on its path")]
+    Unusable {
+        /// The path as given.
+        path: String,
+    },
+    /// It is larger than [`MAX_PACK_BYTES`].
+    #[error("{path} is larger than {MAX_PACK_BYTES} bytes, so it is not a rule pack")]
+    TooLarge {
+        /// The path as given.
+        path: String,
+    },
+    /// The read failed.
+    #[error("cannot read {path}: {reason}")]
+    Read {
+        /// The path as given.
+        path: String,
+        /// What the read returned.
+        reason: String,
+    },
+}
+
+/// Reads the pack file `path` names, once, into memory: what the review
+/// judges, and what the root side is handed and digests before it parses.
+///
+/// `xudo rules add --reviewed` runs this as root, on a path in a directory
+/// the agent that wrote the pack may control. No component of the path is
+/// followed if it is a symbolic link, the file is not opened for reading
+/// until `fstat` on an `O_PATH` descriptor says it is a regular file, so a
+/// device is never opened, and every refusal has the same text (see
+/// `file.rs`). Only up to [`MAX_PACK_BYTES`] is read.
+///
+/// # Errors
+///
+/// Any [`PackFileError`].
+pub fn read_pack_file(path: &Path) -> Result<Vec<u8>, PackFileError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    file::read_with(
+        &mut file::Host,
+        path.as_os_str().as_bytes(),
+        &path.display().to_string(),
+    )
 }
 
 /// Where this process runs, as `/proc` reports it: a seam, so the checks are
@@ -318,14 +379,11 @@ fn drop_in_warnings(host: &dyn EnrolOps) -> Vec<String> {
 }
 
 /// Refuses a change whose token is not the one the operator was shown.
-fn reviewed(review: &Review, token: &str) -> Result<(), PackError> {
-    if review.token == token {
+fn reviewed(found: &str, token: &str) -> Result<(), PackError> {
+    if found == token {
         Ok(())
     } else {
-        Err(PackError::Changed {
-            reviewed: token.to_owned(),
-            found: review.token.clone(),
-        })
+        Err(PackError::Changed)
     }
 }
 
@@ -343,12 +401,23 @@ pub fn add_pack(
     host: &dyn EnrolOps,
 ) -> Result<PackReport, PackError> {
     root_outside_box(ops, at)?;
-    let header = header_of(&request.bytes)?;
-    let name = header.file_name();
-    let path = format!("{RULES_DIR}/{name}");
     // Held until the rename: two runs cannot each judge without the other.
     let _lock = ops.lock_dir(RULES_DIR)?;
     let before = rule_files(host)?;
+    let registry = registry(host);
+    let change = Change::Add {
+        pack: &request.bytes,
+        allow_waivers: request.allow_waivers,
+    };
+    // Before a byte of the pack is parsed: bytes that are not the ones
+    // reviewed are refused unread, so no parse error can quote them.
+    reviewed(
+        &token_of(before.clone(), &registry, change)?,
+        &request.reviewed,
+    )?;
+    let header = header_of(&request.bytes).map_err(|_| PackError::NotAPack)?;
+    let name = header.file_name();
+    let path = format!("{RULES_DIR}/{name}");
     if let Some(existing) = before.iter().find(|file| file.name == name.as_bytes()) {
         if !installed_by_xudo(&existing.bytes) {
             return Err(InstallError::NotOurs {
@@ -359,12 +428,7 @@ pub fn add_pack(
         }
     }
     let after = with_pack(&before, &header, &request.bytes);
-    let change = Change::Add {
-        pack: &request.bytes,
-        allow_waivers: request.allow_waivers,
-    };
-    let review = review(before, after, &registry(host), change)?;
-    reviewed(&review, &request.reviewed)?;
+    let review = review(before, after, &registry, change)?;
     let candidate = format!("{path}.candidate");
     let identity = ops.write_candidate(&candidate, &installed_bytes(&request.bytes), PACK_MODE)?;
     if let Err(error) = ops.install(&candidate, &path, identity) {
@@ -399,7 +463,7 @@ pub fn remove_pack(
     let after =
         without_pack(&before, name).ok_or_else(|| PackError::NotInstalled(name.to_owned()))?;
     let review = review(before, after, &registry(host), Change::Remove { name })?;
-    reviewed(&review, token)?;
+    reviewed(&review.token, token)?;
     let path = format!("{RULES_DIR}/{}", file_name(name));
     ops.remove_managed(&path)?;
     let warnings = drop_in_warnings(host);

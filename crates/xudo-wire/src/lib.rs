@@ -732,11 +732,16 @@ pub enum RefusalCode {
     /// A service harness asked for a command no rule grants it. It has no
     /// password to type, so nothing was minted. Carries the action id only.
     HarnessNotGranted,
+    /// A service harness a rule grants, on a host whose live
+    /// `kernel.yama.ptrace_scope` is 0, missing or unreadable, so any process
+    /// of its account could attach to it. Nothing was minted. Carries nothing
+    /// else: no action, no decision, no trace.
+    PtraceScopeOpen,
 }
 
 impl RefusalCode {
     /// Every code, in numeric order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::RequestTooLarge,
         Self::RequestTimedOut,
         Self::RequestUnreadable,
@@ -755,6 +760,7 @@ impl RefusalCode {
         Self::RequestUnknown,
         Self::AnswerRejected,
         Self::HarnessNotGranted,
+        Self::PtraceScopeOpen,
     ];
 
     /// The stable numeric code. Append-only.
@@ -778,6 +784,7 @@ impl RefusalCode {
             Self::RequestUnknown => 16,
             Self::AnswerRejected => 17,
             Self::HarnessNotGranted => 18,
+            Self::PtraceScopeOpen => 19,
         }
     }
 
@@ -802,6 +809,7 @@ impl RefusalCode {
             Self::RequestUnknown => "request_unknown",
             Self::AnswerRejected => "answer_rejected",
             Self::HarnessNotGranted => "harness_not_granted",
+            Self::PtraceScopeOpen => "ptrace_scope_open",
         }
     }
 
@@ -872,6 +880,12 @@ impl RefusalCode {
             Self::HarnessNotGranted => {
                 "no rule grants this harness the command, and a service harness has no password \
                  to type; ask root to add a rule that names the harness, or use the queue"
+            }
+            Self::PtraceScopeOpen => {
+                "kernel.yama.ptrace_scope is 0 or cannot be read on this host, so any process of \
+                 the harness's account could take over the harness: nothing runs without a \
+                 password until root sets it to 1 or more (`sudo xudo install --agent-path \
+                 --raise-ptrace-scope`, then reboot or `sysctl --system`); `xudo doctor` shows it"
             }
         }
     }

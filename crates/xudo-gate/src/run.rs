@@ -901,6 +901,14 @@ fn proceed(
         password_confirms: mode == GateMode::Auth,
         mode,
         caller_is_agent_account: is_agent_account(&loaded.rules.harnesses, passwd, live_uid),
+        caller_is_service_harness: is_service_harness(
+            &loaded.rules.harnesses,
+            &caller.facts.classification,
+        ),
+        // Read live on every `-nopass` run: a `sysctl` back to 0 after the
+        // agent path was installed turns it off here, not at the next install.
+        ptrace_contained: mode == GateMode::Nopass
+            && xudo_sys::ptrace_contained(&host.syscalls().ptrace_scope()),
     };
     // A missing spool entry is refused here. `decide` refuses the same case,
     // and after it succeeds the entry is always present, so a later check
@@ -1007,6 +1015,10 @@ fn run_typed_operation(
         passwd,
         context.mode,
     )
+    // After the decision, so a denial or a freeze still names its own reason.
+    .and_then(|work| {
+        crate::decide::refuse_an_agent_removing_on_auth(caller, context).map(|()| work)
+    })
     .and_then(|work| count_nopass(&*host, progress).map(|()| work))?;
     // (Counted once, above: after the decision, before the entry is consumed.)
     progress.evidence.push(format!(
@@ -2675,6 +2687,8 @@ args = [
             password_confirms: true,
             mode: GateMode::Auth,
             caller_is_agent_account: false,
+            caller_is_service_harness: false,
+            ptrace_contained: false,
         };
         let refusal = decide(&rules().rules, &caller, Some(&found.entry), context).unwrap_err();
         assert!(
@@ -4490,6 +4504,39 @@ args = [
     }
 
     #[test]
+    fn a_ptrace_scope_set_back_to_zero_stops_a_minted_harness_entry_at_the_gate() {
+        // Attack: the agent path was installed at ptrace_scope 1; then root
+        // (or a sysctl drop-in sorting after xudo's, at the next boot) set it
+        // to 0, so any process of the harness's account can attach to the
+        // harness. An entry minted while it was 1 must not run: the gate
+        // reads the live value itself. A kernel without Yama, or a value it
+        // cannot read, is the same as 0.
+        for scope in [Ok(0), Err(xudo_sys::SysError::unsupported("no Yama"))] {
+            let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+            let generation = rules.generation.id();
+            let (mut host, spool) = granting_host(granted_entry(generation), rules);
+            host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(scope);
+            let exit = run(&mut host, &nopass());
+            assert_refused_with(&host, &spool, &exit, "gate_mode_ptrace_scope_open");
+            assert!(
+                host.syscalls
+                    .calls()
+                    .contains(&xudo_sys::FakeCall::PtraceScope)
+            );
+        }
+        // 1, 2 and 3 all run it.
+        for scope in 1..=3 {
+            let rules = granting_rules(&[(b"codex.toml", CODEX_ENTRY)]);
+            let generation = rules.generation.id();
+            let (mut host, spool) = granting_host(granted_entry(generation), rules);
+            host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(Ok(scope));
+            let exit = run(&mut host, &nopass());
+            assert_eq!(exec_calls(&host), 1, "{scope}: {}", exit.message);
+            assert_eq!(consumed(&spool), [NONCE_A]);
+        }
+    }
+
+    #[test]
     fn a_harness_freeze_marker_stops_that_harness_at_the_nopass_gate() {
         // The positive control above runs; the same entry with the label's own
         // marker standing is refused at once, and the entry stays unconsumed.
@@ -5074,6 +5121,35 @@ outcome = "allow"
     }
 
     #[test]
+    fn an_agent_account_outside_its_unit_cannot_remove_a_path_on_the_auth_gate() {
+        // Attack: a cron job or SSH login of the agent's account, classed a
+        // human and minted for `-auth`, asks for a remove-path and gets past
+        // PAM. Refused before the walk (and, without a password, a watch
+        // approval would not help: see
+        // `an_agent_account_never_removes_a_path_through_the_password_gate`).
+        {
+            let rules = remove_rules(REMOVE_RULE, &codex_registry());
+            let mut entry = remove_entry(REMOVE_RULE, b"/srv/app/build/cache", false);
+            entry.generation = rules.generation.id();
+            let spool = Rc::new(holding(&[(NONCE_A, entry)]));
+            let mut host = FakeHost::new(&spool);
+            let mut policy = remove_policy(REMOVE_RULE);
+            policy.rules = rules;
+            host.policy = Ok(policy);
+            plant_tree(&mut host);
+            let exit = run(&mut host, &auth());
+            assert!(
+                exit.message.contains("gate_mode_agent_without_approval"),
+                "{}",
+                exit.message
+            );
+            assert!(host.remove.unlinked().is_empty());
+            assert!(host.remove.exists(&[b"srv", b"app", b"build", b"cache"]));
+            assert!(consumed(&spool).is_empty());
+        }
+    }
+
+    #[test]
     fn a_password_remove_path_records_via_auth() {
         let spool = Rc::new(holding(&[(
             NONCE_A,
@@ -5419,10 +5495,44 @@ fn is_agent_account(
     })
 }
 
+/// Whether `class` is a live enrolled agent whose registry entry is
+/// `way = "service"`: the only harness `-nopass` runs for.
+fn is_service_harness(
+    registry: &xudo_policy::HarnessRegistry,
+    class: &xudo_policy::Classification,
+) -> bool {
+    class
+        .enrolled_agent_id()
+        .and_then(|label| registry.get(label))
+        .is_some_and(|entry| entry.way == xudo_policy::HarnessWay::Service)
+}
+
 #[cfg(test)]
 mod agent_account_tests {
     #![allow(clippy::unwrap_used)]
-    use super::is_agent_account;
+    use super::{is_agent_account, is_service_harness};
+    use xudo_policy::Classification;
+
+    fn enrolled(label: &str) -> Classification {
+        Classification::EnrolledAgent {
+            agent_id: label.to_owned(),
+            session_id: "s".to_owned(),
+            declared_yolo: false,
+        }
+    }
+
+    #[test]
+    fn only_a_service_way_enrolled_agent_is_a_service_harness() {
+        let registry = xudo_policy::HarnessRegistry::from_files([
+            ("codex.toml", REGISTRY),
+            ("claude.toml", SESSION),
+        ])
+        .unwrap();
+        assert!(is_service_harness(&registry, &enrolled("codex")));
+        assert!(!is_service_harness(&registry, &enrolled("claude")));
+        assert!(!is_service_harness(&registry, &enrolled("ghost")));
+        assert!(!is_service_harness(&registry, &Classification::Human));
+    }
 
     const REGISTRY: &str = "label = \"codex\"\nway = \"service\"\naccount = \"agent\"\nreviewers = [\"carol\"]\nmax-sessions = 1\n";
     const SESSION: &str = "label = \"claude\"\nway = \"session\"\nusers = [\"alice\"]\nreviewers = [\"carol\"]\nmax-sessions = 1\n";

@@ -109,17 +109,57 @@ pub struct Report {
 /// `/etc/sudoers.d/xudo` (root's alone, so `unknown` to anyone else).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AgentPathReport {
-    /// `on`: exactly xudo's agent-path text. `off`: no line of it names the
-    /// agent path. `edited`: it names the agent path and is not exactly
+    /// `on`: exactly xudo's agent-path text. `disabled`: that text, but the
+    /// live `kernel.yama.ptrace_scope` is 0 or cannot be read, so the broker
+    /// and the gate refuse every passwordless run. `off`: no line of it names
+    /// the agent path. `edited`: it names the agent path and is not exactly
     /// xudo's text. `unknown`: it could not be read.
     pub state: &'static str,
-    /// Why, for `edited` and `unknown`.
+    /// Why, for `disabled`, `edited` and `unknown`.
     pub detail: Option<String>,
+    /// The live `kernel.yama.ptrace_scope`; `null` when it cannot be read.
+    pub ptrace_scope: Option<u8>,
+    /// Why it cannot be read, when it cannot.
+    pub ptrace_unreadable: Option<String>,
 }
 
 impl AgentPathReport {
-    fn of(read: Lookup<Vec<u8>>) -> Self {
-        let (state, detail) = match read {
+    fn of(read: Lookup<Vec<u8>>, scope: Result<u8, String>) -> Self {
+        let (state, detail) = Self::installed(read);
+        let (state, detail) = match &scope {
+            _ if state != "on" => (state, detail),
+            Ok(1..=3) => (state, detail),
+            Ok(value) => (
+                "disabled",
+                Some(format!(
+                    "kernel.yama.ptrace_scope is {value}, so the broker and the gate refuse every \
+                     passwordless run until it is 1 or more (`sudo xudo install --agent-path \
+                     --raise-ptrace-scope`)"
+                )),
+            ),
+            Err(why) => (
+                "disabled",
+                Some(format!(
+                    "kernel.yama.ptrace_scope cannot be read ({why}), so the broker and the gate \
+                     refuse every passwordless run"
+                )),
+            ),
+        };
+        let (ptrace_scope, ptrace_unreadable) = match scope {
+            Ok(value) => (Some(value), None),
+            Err(why) => (None, Some(why)),
+        };
+        Self {
+            state,
+            detail,
+            ptrace_scope,
+            ptrace_unreadable,
+        }
+    }
+
+    /// What the sudoers file says, before the live scope is weighed.
+    fn installed(read: Lookup<Vec<u8>>) -> (&'static str, Option<String>) {
+        match read {
             Lookup::Missing => ("off", None),
             Lookup::Unreadable(why) => ("unknown", Some(why)),
             Lookup::Found(bytes) => match xudo_backend::snippet::recognize(&bytes) {
@@ -134,8 +174,7 @@ impl AgentPathReport {
                 ),
                 _ => ("off", None),
             },
-        };
-        Self { state, detail }
+        }
     }
 
     /// The prose row.
@@ -144,6 +183,17 @@ impl AgentPathReport {
             Some(detail) => format!("{}: {}", self.state, safe(detail)),
             None => self.state.to_owned(),
         }
+    }
+
+    /// The prose row for the live `kernel.yama.ptrace_scope`.
+    fn ptrace_line(&self) -> String {
+        self.ptrace_scope.map_or_else(
+            || {
+                let why = self.ptrace_unreadable.as_deref().unwrap_or_default();
+                format!("unknown: {}", safe(why))
+            },
+            |value| value.to_string(),
+        )
     }
 }
 
@@ -538,6 +588,7 @@ pub(crate) fn gather(
             platform
                 .host
                 .read(Path::new(xudo_backend::snippet::SUDOERS_PATH)),
+            crate::agent_path::ptrace_scope(platform.host),
         ),
         caller: caller(platform.ops.classify(std::process::id())),
         backend: BackendReport::of(backend),
@@ -1054,6 +1105,7 @@ pub(crate) fn human(report: &Report) -> String {
         }
     }
     line("agent path", &report.agent_path.line());
+    line("ptrace scope", &report.agent_path.ptrace_line());
     enrolled_lines(&report.enrolled_accounts, &mut line);
     if let Some(label) = report.caller.classification {
         line("classified", label);
@@ -2731,7 +2783,7 @@ mod tests {
         let human = xudo_backend::SudoersSnippet::human_only(&backend)
             .unwrap()
             .contents;
-        let state = |read| AgentPathReport::of(read).state;
+        let state = |read| AgentPathReport::of(read, Ok(1)).state;
         assert_eq!(state(Lookup::Found(agent.clone().into_bytes())), "on");
         assert_eq!(state(Lookup::Found(human.into_bytes())), "off");
         assert_eq!(
@@ -2740,20 +2792,57 @@ mod tests {
         );
         assert_eq!(state(Lookup::Missing), "off");
         // Both prose forms, whatever this host's own file says.
-        assert_eq!(AgentPathReport::of(Lookup::Missing).line(), "off");
+        assert_eq!(AgentPathReport::of(Lookup::Missing, Ok(1)).line(), "off");
         assert_eq!(
-            AgentPathReport::of(Lookup::Unreadable("denied".to_owned())).line(),
+            AgentPathReport::of(Lookup::Unreadable("denied".to_owned()), Ok(1)).line(),
             "unknown: denied"
         );
         let edited = format!("{agent}%xudo-agent ALL=(ALL) NOPASSWD: ALL\n");
-        let report = AgentPathReport::of(Lookup::Found(edited.into_bytes()));
+        let report = AgentPathReport::of(Lookup::Found(edited.into_bytes()), Ok(1));
         assert_eq!(report.state, "edited");
         assert!(report.detail.unwrap().contains("byte for byte"));
-        let report = AgentPathReport::of(Lookup::Unreadable("permission denied".to_owned()));
+        let report = AgentPathReport::of(Lookup::Unreadable("permission denied".to_owned()), Ok(1));
         assert_eq!(
             (report.state, report.detail.as_deref()),
             ("unknown", Some("permission denied"))
         );
+    }
+
+    #[test]
+    fn doctor_says_when_an_installed_agent_path_is_disabled_by_ptrace_scope() {
+        // Root set kernel.yama.ptrace_scope back to 0 after `--agent-path`:
+        // the sudoers text is still xudo's, and the doctor must not say `on`.
+        let backend = xudo_backend::Backend {
+            exe: "/usr/bin/sudo".to_owned(),
+            kind: BackendKind::Sudo,
+            version: "Sudo version 1.9.17p2".to_owned(),
+            capabilities: xudo_backend::CapabilityMatrix::from_supported(Capability::ALL),
+        };
+        let agent = xudo_backend::SudoersSnippet::with_agent_path(&backend)
+            .unwrap()
+            .contents
+            .into_bytes();
+        for scope in 1..=3 {
+            let report = AgentPathReport::of(Lookup::Found(agent.clone()), Ok(scope));
+            assert_eq!(report.line(), "on");
+            assert_eq!(report.ptrace_line(), scope.to_string());
+        }
+        let report = AgentPathReport::of(Lookup::Found(agent.clone()), Ok(0));
+        assert_eq!(report.state, "disabled");
+        assert_eq!(report.ptrace_scope, Some(0));
+        assert!(
+            report
+                .line()
+                .starts_with("disabled: kernel.yama.ptrace_scope is 0, so the broker")
+        );
+        let missing = "/proc/sys/kernel/yama/ptrace_scope is missing: this kernel has no Yama";
+        let report = AgentPathReport::of(Lookup::Found(agent), Err(missing.to_owned()));
+        assert_eq!(report.state, "disabled");
+        assert!(report.line().contains("cannot be read"));
+        assert_eq!(report.ptrace_line(), format!("unknown: {missing}"));
+        // Off stays off, whatever the scope: nothing to disable.
+        let report = AgentPathReport::of(Lookup::Missing, Ok(0));
+        assert_eq!((report.state, report.ptrace_scope), ("off", Some(0)));
     }
 
     #[test]

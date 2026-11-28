@@ -85,6 +85,11 @@ for unit in \
 do
     ln -sfn /dev/null "/etc/systemd/system/$unit"
 done
+# The lane sentinel: row.sh and every script it sources refuse to run without
+# it. Made here, in the container this script started, and nowhere else.
+printf "%s\\n" "xudo systemd lane: a throwaway container made by ci/systemd/run.sh" >/xudo-systemd-lane
+chown 0:0 /xudo-systemd-lane
+chmod 0400 /xudo-systemd-lane
 echo "boot: exec /sbin/init"
 exec /sbin/init
 '

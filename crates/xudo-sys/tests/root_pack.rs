@@ -19,9 +19,11 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+use xudo_policy::pack::{Change, review, token_of, without_pack};
+use xudo_policy::{HarnessFile, RuleFile, is_rule_file_name};
 use xudo_sys::{
-    HostInstallOps, HostInstaller, InstallError, InstallProbe, Installer, PackError, PackReport,
-    PackRequest, ProbeResult, Whereabouts, add_pack, remove_pack,
+    HostInstallOps, HostInstaller, InstallError, InstallProbe, Installer, PackError, PackFileError,
+    PackReport, PackRequest, ProbeResult, Whereabouts, add_pack, read_pack_file, remove_pack,
 };
 use xudo_tests::root_lane::root_guard;
 
@@ -37,6 +39,7 @@ impl InstallProbe for NoProbe {
 }
 
 const DIR: &str = "/etc/xudo/rules.d";
+const REGISTRY: &str = "/etc/xudo/harnesses.d";
 const PATH: &str = "/etc/xudo/rules.d/pack-rootpack.toml";
 /// A pack for no harness: it needs no registry, and grants only what sudo's
 /// password already would.
@@ -69,28 +72,72 @@ fn request(text: &str, reviewed: &str) -> PackRequest {
     }
 }
 
-/// Root's own token for the change, learnt from its refusal of a wrong one:
-/// what the operator's review prints for the same files (the unit tests hold
-/// the two equal).
-fn token_of(result: Result<PackReport, PackError>) -> String {
-    match result {
-        Err(PackError::Changed { found, .. }) => found,
-        other => panic!("{other:?}"),
-    }
+/// The rule files in `/etc/xudo/rules.d` and the registry, as the operator's
+/// review reads them.
+fn rules_now() -> (Vec<RuleFile>, Result<Vec<HarnessFile>, String>) {
+    let mut names: Vec<String> = fs::read_dir(DIR)
+        .map(|dir| {
+            dir.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let rules = names
+        .into_iter()
+        .filter(|name| is_rule_file_name(name.as_bytes()))
+        .map(|name| RuleFile {
+            bytes: fs::read(format!("{DIR}/{name}")).unwrap(),
+            name: name.into_bytes(),
+        })
+        .collect();
+    let mut harnesses: Vec<String> = fs::read_dir(REGISTRY)
+        .map(|dir| {
+            dir.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    harnesses.sort();
+    let registry = harnesses
+        .into_iter()
+        .filter(|name| name.as_bytes().ends_with(b".toml"))
+        .map(|name| HarnessFile {
+            bytes: fs::read(format!("{REGISTRY}/{name}")).unwrap(),
+            name: name.into_bytes(),
+        })
+        .collect();
+    (rules, Ok(registry))
+}
+
+/// The token the operator's review prints for adding `text` now. Root's
+/// refusal of a wrong one no longer carries it.
+fn add_token(text: &str) -> String {
+    let (before, registry) = rules_now();
+    let change = Change::Add {
+        pack: text.as_bytes(),
+        allow_waivers: false,
+    };
+    token_of(before, &registry, change).unwrap()
 }
 
 fn add(text: &str) -> Result<PackReport, PackError> {
     let ops = HostInstallOps::system();
-    let token = token_of(add_pack(&request(text, "?"), &Session, &ops, &ops));
-    add_pack(&request(text, &token), &Session, &ops, &ops)
+    assert_eq!(
+        add_pack(&request(text, "?"), &Session, &ops, &ops).unwrap_err(),
+        PackError::Changed
+    );
+    add_pack(&request(text, &add_token(text)), &Session, &ops, &ops)
 }
 
 fn remove(name: &str) -> Result<PackReport, PackError> {
     let ops = HostInstallOps::system();
-    match remove_pack(name, "?", &Session, &ops, &ops) {
-        Err(PackError::Changed { found, .. }) => remove_pack(name, &found, &Session, &ops, &ops),
-        other => other,
-    }
+    let (before, registry) = rules_now();
+    let Some(after) = without_pack(&before, name) else {
+        return remove_pack(name, "?", &Session, &ops, &ops);
+    };
+    let token = review(before, after, &registry, Change::Remove { name })
+        .unwrap()
+        .token;
+    remove_pack(name, &token, &Session, &ops, &ops)
 }
 
 /// `true` when the calling test should go on. See `root_lane.rs`.
@@ -126,8 +173,9 @@ fn a_pack_lands_root_owned_0644_and_leaves_an_operators_file_alone() {
     // An operator's own file under the pack's name is never replaced or removed.
     fs::write(PATH, PACK).unwrap();
     fs::set_permissions(PATH, fs::Permissions::from_mode(0o644)).unwrap();
+    // The token is checked first, so the refusal comes with the right one.
     let ops = HostInstallOps::system();
-    let error = add_pack(&request(PACK, "?"), &Session, &ops, &ops).unwrap_err();
+    let error = add_pack(&request(PACK, &add_token(PACK)), &Session, &ops, &ops).unwrap_err();
     assert!(
         matches!(error, PackError::Install(InstallError::NotOurs { .. })),
         "{error}"
@@ -161,10 +209,64 @@ fn the_real_proc_walk_refuses_where_it_cannot_tell_where_it_runs() {
     } else {
         // A host cgroup namespace: the walk reached pid 1 outside the box,
         // and the wrong token is what refuses.
-        assert!(
-            matches!(add, Err(PackError::Changed { .. })),
-            "{own}: {add:?}"
-        );
+        assert_eq!(add, Err(PackError::Changed), "{own}");
     }
     assert!(!fs::exists(PATH).unwrap());
+}
+
+#[test]
+fn root_never_reads_a_pack_swapped_for_a_symlink_to_shadow() {
+    if !begin_root_test("root_never_reads_a_pack_swapped_for_a_symlink_to_shadow") {
+        return;
+    }
+    // The agent's directory, the agent's link to a file only root can read:
+    // root refuses the link, and its refusal holds no byte of the target.
+    let dir = "/var/tmp/xudo-root-pack-swap";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let secret = format!("{dir}/shadow");
+    fs::write(&secret, "root:$y$j9T$secretsecret:20000:0:99999:7:::\n").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    for target in [secret.as_str(), "/etc/shadow"] {
+        let link = format!("{dir}/pack.toml");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let error = read_pack_file(std::path::Path::new(&link)).unwrap_err();
+        assert_eq!(error, PackFileError::Unusable { path: link.clone() });
+        let text = error.to_string();
+        assert!(
+            !text.contains("secret") && !text.contains("root:"),
+            "{text}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn root_never_follows_a_parent_directory_swapped_for_a_link() {
+    if !begin_root_test("root_never_follows_a_parent_directory_swapped_for_a_link") {
+        return;
+    }
+    // The operator reviewed `<dir>/x/<name>`; the agent then made `x` a link
+    // to `/dev` (a watchdog starts on open) or to `/etc` (a regular file
+    // root alone may read). Root refuses on the link with one text, whether
+    // the target exists or not.
+    let dir = "/var/tmp/xudo-root-pack-parent";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let link = format!("{dir}/x");
+    for (target, name) in [
+        ("/dev", "null"),
+        ("/dev", "zero"),
+        ("/etc", "shadow"),
+        ("/etc", "no-such-file"),
+    ] {
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let path = format!("{link}/{name}");
+        let error = read_pack_file(std::path::Path::new(&path)).unwrap_err();
+        assert_eq!(error, PackFileError::Unusable { path: path.clone() });
+        assert!(!error.to_string().contains("root:"), "{error}");
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

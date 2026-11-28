@@ -16,8 +16,11 @@
 # attack.sh, sourced before the flood, holds E7's attack rows.
 
 # Never outside the throwaway container: this writes a NOPASSWD line.
-systemd-detect-virt --container -q || {
-    bad "g1f: not inside a container; refusing to write a NOPASSWD line"
+lane_sentinel=/xudo-systemd-lane
+[ -f "$lane_sentinel" ] && [ ! -L "$lane_sentinel" ] && [ "$(stat -c %u "$lane_sentinel")" = 0 ] &&
+    [ "$(cat "$lane_sentinel")" = "xudo systemd lane: a throwaway container made by ci/systemd/run.sh" ] &&
+    systemd-detect-virt --container -q || {
+    bad "g1f: not inside the systemd lane's container (no run.sh sentinel); refusing to write a NOPASSWD line"
     return 1
 }
 

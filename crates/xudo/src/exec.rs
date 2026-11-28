@@ -2415,6 +2415,16 @@ mod tests {
     }
 
     #[test]
+    fn a_ptrace_scope_open_reply_names_the_cause_and_runs_nothing() {
+        let reply = BrokerResponse::refused(RefusalCode::PtraceScopeOpen);
+        let (result, out, err) = against(reply.to_json().into_bytes(), &SUDO, &argv());
+        assert_eq!(result, Err(ExitCode::Unusable));
+        assert!(out.is_empty());
+        assert!(err.contains("(PtraceScopeOpen)"), "{err}");
+        assert!(err.contains("kernel.yama.ptrace_scope is 0"), "{err}");
+    }
+
+    #[test]
     fn broker_refusal_text_cannot_inject_terminal_controls() {
         for code in [RefusalCode::HarnessNotGranted, RefusalCode::BrokerUnusable] {
             let reply = BrokerResponse {

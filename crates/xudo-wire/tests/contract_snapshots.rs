@@ -39,6 +39,7 @@ fn lists_every_refusal_code(code: RefusalCode) -> &'static str {
         RefusalCode::RequestUnknown => "request_unknown",
         RefusalCode::AnswerRejected => "answer_rejected",
         RefusalCode::HarnessNotGranted => "harness_not_granted",
+        RefusalCode::PtraceScopeOpen => "ptrace_scope_open",
     }
 }
 
@@ -64,6 +65,7 @@ fn renaming_a_refusal_code_breaks_the_wire_contract_and_this_test() {
         "request_unknown",
         "answer_rejected",
         "harness_not_granted",
+        "ptrace_scope_open",
     ];
     assert_eq!(RefusalCode::ALL.len(), pinned.len());
     for (code, name) in RefusalCode::ALL.iter().zip(pinned) {
@@ -112,4 +114,17 @@ fn harness_not_granted_reply_carries_no_trace() {
         let _ = writeln!(table, "{json}");
     }
     insta::assert_snapshot!("harness_not_granted_reply", table);
+}
+
+/// A harness refused for an open `kernel.yama.ptrace_scope` learns the cause
+/// and nothing else: no action, no decision, no trace.
+#[test]
+fn ptrace_scope_open_reply_carries_no_action_and_no_trace() {
+    let response = BrokerResponse::refused(RefusalCode::PtraceScopeOpen);
+    let json = response.to_json();
+    for key in [r#""trace""#, r#""decision""#, r#""detail""#, r#""action""#] {
+        assert!(!json.contains(key), "{key}: {json}");
+    }
+    assert!(json.contains(r#""code":"ptrace_scope_open""#), "{json}");
+    assert_eq!(BrokerResponse::parse(json.as_bytes()).unwrap(), response);
 }

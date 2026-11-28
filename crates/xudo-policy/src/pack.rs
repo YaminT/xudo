@@ -575,6 +575,24 @@ fn token(change: Change<'_>, before: &Generation) -> String {
     Generation::from_digest(hasher.finalize().into()).hex()
 }
 
+/// The token of `change` onto the rules `before`, made without reading the
+/// pack at all: only its digest enters it. The root side checks this before
+/// it parses a byte of the pack, so a file swapped after the review is
+/// refused unparsed, and no parse error can show a line of what it now is.
+///
+/// # Errors
+///
+/// [`PackRefusal::Current`] when `before` does not load.
+pub fn token_of(
+    before: Vec<RuleFile>,
+    registry: &Result<Vec<HarnessFile>, String>,
+    change: Change<'_>,
+) -> Result<String, PackRefusal> {
+    let old = load_policy_with_registry(before, registry.as_deref().map_err(Clone::clone))
+        .map_err(PackRefusal::Current)?;
+    Ok(token(change, &old.generation))
+}
+
 /// What a change does, and the generation it leads to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Review {

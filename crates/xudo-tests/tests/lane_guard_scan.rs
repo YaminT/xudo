@@ -142,3 +142,54 @@ fn the_lane_script_writes_the_sentinel_the_guard_looks_for() {
         "the sentinel is made after the tests run"
     );
 }
+
+/// The systemd lane's scripts install a package, make an account with a
+/// known password and write NOPASSWD lines. `systemd-detect-virt --container`
+/// also passes on WSL, LXC and distrobox, so each checks the sentinel
+/// `ci/systemd/run.sh` writes inside the container it started, before init.
+#[test]
+fn every_systemd_lane_script_checks_the_sentinel_run_sh_writes() {
+    const SENTINEL: &str = "/xudo-systemd-lane";
+    const CONTENT: &str = "xudo systemd lane: a throwaway container made by ci/systemd/run.sh";
+    let run = fs::read_to_string(repo().join("ci/systemd/run.sh")).unwrap();
+    let made = run
+        .find(&format!("\"{CONTENT}\" >{SENTINEL}"))
+        .unwrap_or_else(|| panic!("run.sh does not write {SENTINEL}"));
+    assert!(run.contains(&format!("chown 0:0 {SENTINEL}")));
+    assert!(run.contains(&format!("chmod 0400 {SENTINEL}")));
+    assert!(made < run.find("exec /sbin/init").unwrap());
+    for script in ["row.sh", "grant.sh", "attack.sh", "e2e.sh"] {
+        let text = fs::read_to_string(repo().join("ci/systemd").join(script)).unwrap();
+        let guard = text
+            .find(&format!("lane_sentinel={SENTINEL}\n"))
+            .unwrap_or_else(|| panic!("{script} does not check {SENTINEL}"));
+        assert!(
+            text.contains(&format!(
+                "[ \"$(cat \"$lane_sentinel\")\" = \"{CONTENT}\" ]"
+            )),
+            "{script} does not check the sentinel's content"
+        );
+        assert!(text.contains("[ ! -L \"$lane_sentinel\" ]"), "{script}");
+        assert!(
+            text.contains("[ \"$(stat -c %u \"$lane_sentinel\")\" = 0 ]"),
+            "{script}"
+        );
+        // Before anything else the script does: its first command line that
+        // is neither a comment nor a setting comes after the guard.
+        let first_command = text
+            .lines()
+            .map(str::trim)
+            .position(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with("set ")
+                    && !line.starts_with("export ")
+            })
+            .unwrap();
+        let guard_line = text[..guard].lines().count();
+        assert_eq!(
+            first_command, guard_line,
+            "{script}: something runs before the guard"
+        );
+    }
+}

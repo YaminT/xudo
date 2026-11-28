@@ -108,9 +108,9 @@ pub use hygiene::{FakeHygiene, HostHygiene, Hygiene, HygieneCall};
 pub use install::{
     AgentError, AgentRow, DirLock, Effect, EnrolOps, HostInstallOps, HostInstaller,
     HostWhereabouts, InstallError, InstallOps, InstallProbe, InstallReport, Installer,
-    MAX_PACK_BYTES, PackError, PackReport, PackRequest, ProbeResult, RULES_DIR, RefusingInstaller,
-    Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol, check_effect, execute,
-    list_agents, plan_enrol, remove_agent, remove_pack,
+    MAX_PACK_BYTES, PackError, PackFileError, PackReport, PackRequest, ProbeResult, RULES_DIR,
+    RefusingInstaller, Removal, Systemctl, Verification, Whereabouts, add_pack, apply_enrol,
+    check_effect, execute, list_agents, plan_enrol, read_pack_file, remove_agent, remove_pack,
 };
 pub use kernel::{Attestation, KernelSupport, KernelVersion, Resolution};
 pub use live::LiveHost;
@@ -143,7 +143,10 @@ pub use source::{DirSource, MapSource, ProcSource};
 #[cfg(any(test, feature = "fake"))]
 pub use spool::{FakeSpool, SpoolCall};
 pub use spool::{Spool, SpoolDir, SpoolError, TEMP_PREFIX, as_seam};
-pub use syscall::{Creds, FakeCall, FakeSyscalls, HostSyscalls, PidfdInfo, ProcessIds, Syscalls};
+pub use syscall::{
+    Creds, FakeCall, FakeSyscalls, HostSyscalls, PTRACE_SCOPE_PATH, PidfdInfo, ProcessIds,
+    Syscalls, ptrace_contained,
+};
 pub use trust::{
     PathFacts, TrustError, TrustedFile, TrustedRulesError, load_trusted_policy, load_trusted_rules,
     open_trusted, read_trusted_dir, verify_path,
