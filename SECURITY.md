@@ -90,6 +90,10 @@ host configuration responsibility.
 - A broad rule can grant broad root access. Rule packs are previewed and bound
   to the reviewed bytes and policy generation; installation still requires a
   root reviewer. Read the preview, especially any GTFOBins waiver.
+- `sudo xudo rules add --reviewed` opens a path the operator names. An
+  agent-owned FUSE mount with `allow_other` under that path can stall the root
+  step (`O_NONBLOCK` does not help); the operator can interrupt it. Review
+  packs from a directory you own.
 - The system uses systemd and journald on Debian 13, Ubuntu 24.04, and Ubuntu
   26.04, amd64 and arm64. Other releases and distributions are not supported.
 

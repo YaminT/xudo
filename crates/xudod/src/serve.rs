@@ -12297,6 +12297,33 @@ outcome = "allow"
                 );
             }
         }
+        // Attack: an ungranted service harness learns nothing from the scope.
+        // `restart` has no grant, so it gets `harness_not_granted`, never the
+        // ptrace code, and the live value is not even read for it.
+        let (mut host, scope) = granting_host(Some(SERVICE_CODEX));
+        host.syscalls = std::mem::take(&mut host.syscalls).with_ptrace_scope(Ok(0));
+        let request = BrokerRequest::new(
+            "/usr/bin/systemctl",
+            vec!["restart".to_owned(), "nginx.service".to_owned()],
+            "x",
+        );
+        let (served, answer, entries) = served_by(&mut host, harness_identity(scope), request);
+        assert_eq!(served, Served::Decided);
+        assert!(entries.is_empty());
+        assert_eq!(
+            answer,
+            BrokerResponse::harness_not_granted(Some("xudo.svc.restart")).answer
+        );
+        assert_ne!(
+            answer,
+            BrokerResponse::refused(RefusalCode::PtraceScopeOpen).answer
+        );
+        assert!(
+            !host
+                .syscalls
+                .calls()
+                .contains(&xudo_sys::FakeCall::PtraceScope)
+        );
         // 1, 2 and 3 mint it.
         for scope_answer in 1..=3 {
             let (mut host, scope) = granting_host(Some(SERVICE_CODEX));

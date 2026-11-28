@@ -2785,6 +2785,21 @@ args = [
             ),
             Err(ModeRefusal::NotAServiceHarness)
         );
+        // Both faults at once: the grant check comes first, so a session-way
+        // entry at an open scope is named for what it is, not for the scope.
+        let both = GateContext {
+            caller_is_service_harness: false,
+            ptrace_contained: false,
+            ..nopass_context()
+        };
+        let refusal = decide(
+            &grant_rules(),
+            &live_agent(77, "claude-code", 44),
+            Some(&harness_entry(77)),
+            both,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code(), "gate_mode_not_a_service_harness");
     }
 
     /// Over class × via × scope × label × verdict × grant (all 432 cases, no
