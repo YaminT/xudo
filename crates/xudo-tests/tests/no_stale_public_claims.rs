@@ -444,6 +444,26 @@ fn public_docs_pin_correct_queue_freeze_session_and_audit_limits() {
 }
 
 #[test]
+fn public_docs_say_a_fuse_mount_can_stall_the_reviewed_pack_read() {
+    // An agent-owned FUSE mount with allow_other under the path the operator
+    // names can block the root step; the docs must say so and say what to do.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in ["howiwork.md", "SECURITY.md"] {
+        let flat = flatten_claim(&fs::read_to_string(root.join(file)).unwrap());
+        for needle in [
+            "opens a path the operator names",
+            "fuse mount with allow_other",
+            "can stall the root step",
+            "o_nonblock does not help",
+            "the operator can interrupt it",
+            "review packs from a directory you own",
+        ] {
+            assert!(flat.contains(needle), "{file}: {needle}");
+        }
+    }
+}
+
+#[test]
 fn public_docs_say_a_same_uid_process_can_answer_a_watch_prompt() {
     // The watcher must only be in another session on another terminal: a
     // process of the requester's uid can openpty and setsid. The docs must

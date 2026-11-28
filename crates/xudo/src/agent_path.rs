@@ -62,9 +62,7 @@ pub(crate) fn registry(loaded: Result<&LoadedRules, &LoadError>) -> Registry {
 /// The live `kernel.yama.ptrace_scope`, or why it cannot be read.
 pub(crate) fn ptrace_scope(host: &dyn HostView) -> Result<u8, String> {
     match host.read(Path::new(PTRACE_SCOPE)) {
-        Lookup::Found(bytes) => std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
+        Lookup::Found(bytes) => xudo_sys::syscall::ptrace_scope_digit(&bytes)
             .ok_or_else(|| format!("{PTRACE_SCOPE} does not hold a number")),
         Lookup::Missing => Err(format!(
             "{PTRACE_SCOPE} is missing: this kernel has no Yama"
@@ -535,6 +533,11 @@ mod tests {
             host(None),
             host(Some(b"zero\n")),
             host(Some(&[0xff])),
+            host(Some(b"4\n")),
+            host(Some(b" 1\n")),
+            host(Some(b"01\n")),
+            host(Some(b"1\n\n")),
+            host(Some(b"")),
             host(None).unreadable_file(PTRACE_SCOPE, 0, 0, 0o600),
         ] {
             for raise in [false, true] {

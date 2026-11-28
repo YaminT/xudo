@@ -312,12 +312,20 @@ fn parse_ptrace_scope(read: std::io::Result<Vec<u8>>) -> Result<u8, SysError> {
             "kernel.yama.ptrace_scope could not be read (a kernel without Yama has none)",
         )
     })?;
-    match bytes.strip_suffix(b"\n").unwrap_or(&bytes) {
-        b"0" => Ok(0),
-        b"1" => Ok(1),
-        b"2" => Ok(2),
-        b"3" => Ok(3),
-        _ => Err(refused(None, "kernel.yama.ptrace_scope is not 0 to 3")),
+    ptrace_scope_digit(&bytes)
+        .ok_or_else(|| refused(None, "kernel.yama.ptrace_scope is not 0 to 3"))
+}
+
+/// The one reading of `kernel.yama.ptrace_scope`'s text, shared by the broker
+/// and `xudo doctor`: exactly `0` to `3`, with at most one trailing newline.
+#[must_use]
+pub fn ptrace_scope_digit(bytes: &[u8]) -> Option<u8> {
+    match bytes.strip_suffix(b"\n").unwrap_or(bytes) {
+        b"0" => Some(0),
+        b"1" => Some(1),
+        b"2" => Some(2),
+        b"3" => Some(3),
+        _ => None,
     }
 }
 
@@ -643,6 +651,26 @@ mod tests {
         }
         for (text, scope) in [(&b"0\n"[..], 0), (b"1\n", 1), (b"2\n", 2), (b"3", 3)] {
             assert_eq!(parse_ptrace_scope(Ok(text.to_vec())).unwrap(), scope);
+        }
+    }
+
+    #[test]
+    fn ptrace_scope_text_is_one_digit_zero_to_three_and_an_optional_newline() {
+        for (text, scope) in [(&b"0\n"[..], 0), (b"1", 1), (b"2\n", 2), (b"3", 3)] {
+            assert_eq!(ptrace_scope_digit(text), Some(scope));
+        }
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"4",
+            b"01",
+            b"1\n\n",
+            b" 1",
+            b"1 ",
+            b"1\r\n",
+            b"\xff",
+        ] {
+            assert_eq!(ptrace_scope_digit(bad), None, "{bad:?}");
         }
     }
 

@@ -218,5 +218,10 @@ other root path exists. The deny-list is defense in depth; narrow root-owned
 rules are the policy boundary. `path-under` does not provide filesystem
 containment. Landlock confinement and an external audit are not implemented.
 
+`sudo xudo rules add --reviewed` opens a path the operator names. An agent-owned
+FUSE mount with `allow_other` under that path can stall the root step
+(`O_NONBLOCK` does not help); the operator can interrupt it. Review packs from a
+directory you own.
+
 For the security reporting route and details of the limits, see
 [`SECURITY.md`](SECURITY.md).
