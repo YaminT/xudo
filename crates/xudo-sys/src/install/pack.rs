@@ -29,10 +29,11 @@
 //!   (or the name removed), `--allow-waivers`, and the generation of the rules
 //!   and harness registry it was judged against. Root computes it again from
 //!   its own reading; any difference refuses. It is checked before a byte of
-//!   the pack is parsed, and the pack file is read once, never through a
-//!   symbolic link and never waiting on a FIFO ([`read_pack_file`]): a file
-//!   swapped after the review is refused unread, and root never shows a line
-//!   of it.
+//!   the pack is parsed, and the pack file is read once, through no symbolic
+//!   link in any component, and opened for reading only once it is known to
+//!   be a regular file ([`read_pack_file`]): a file swapped after the review
+//!   is refused unread, root never shows a line of it, and a refusal shows
+//!   no token, so root's hash of what it read never reaches the agent.
 //! * **[`xudo_policy::pack::review`] again**, on the rules as root reads them
 //!   now, with the pack's file as it will be written (marker included).
 //! * **Never an operator's file.** The pack lands at `pack-<name>.toml` by an
@@ -41,11 +42,8 @@
 //!
 //! Nothing here fetches, and nothing updates by itself.
 
-use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
-
-use rustix::fs::{FileType, Mode, OFlags, fstat, open};
 
 use xudo_backend::enrol::REGISTRY_DIR;
 use xudo_backend::snippet::{SUDOERS_PATH, XUDO_SELF_DEFAULTS, sets_self_timeout};
@@ -69,6 +67,8 @@ const PACK_MODE: u32 = 0o644;
 
 /// The most bytes a pack may have.
 pub const MAX_PACK_BYTES: usize = 1 << 20;
+
+mod file;
 
 /// What `xudo rules add` hands the root side.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,18 +110,13 @@ pub enum PackError {
     /// The process's cgroup could not be read.
     #[error("cannot tell whether this runs inside an agent's box ({0}); nothing was changed")]
     CgroupUnknown(String),
-    /// The change is not the one reviewed.
+    /// The change is not the one reviewed. Fixed text: the token root
+    /// computed is a hash of what it read, and the agent chose the path.
     #[error(
-        "this is not the change that was reviewed (token {reviewed}, now {found}): the pack, the \
-         rules, the harness registry or --allow-waivers differ; review it again as yourself; \
-         nothing was changed"
+        "this is not the change that was reviewed: the pack, the rules, the harness registry or \
+         --allow-waivers differ; review it again as yourself; nothing was changed"
     )]
-    Changed {
-        /// The token the operator was shown.
-        reviewed: String,
-        /// The token of what root read.
-        found: String,
-    },
+    Changed,
     /// The pack, or the rules with or without it, failed a check.
     #[error("{0}; nothing was changed")]
     Refused(#[from] PackRefusal),
@@ -142,21 +137,15 @@ pub enum PackError {
 }
 
 /// Why the pack file named on the command line was not read. Never a byte of
-/// the file: only the path the operator typed, and what the kernel said.
+/// the file, and never which step failed: only the path the operator typed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackFileError {
-    /// It could not be opened, or it is a symbolic link, which is never
-    /// followed.
-    #[error("cannot open {path}: {reason}; a symbolic link is never followed")]
-    Open {
-        /// The path as given.
-        path: String,
-        /// What the kernel said.
-        reason: String,
-    },
-    /// It is a directory, a FIFO, a device or a socket.
-    #[error("{path} is not a regular file, so it is not a rule pack")]
-    NotRegular {
+    /// Not a regular file reached through no symbolic link: missing, not
+    /// permitted, a link anywhere on the path, a directory, a FIFO, a device
+    /// or a socket. One text for all of them, so root's refusal does not say
+    /// whether a path only root can see exists.
+    #[error("cannot use {path}: not a readable regular file, or a symbolic link on its path")]
+    Unusable {
         /// The path as given.
         path: String,
     },
@@ -180,54 +169,22 @@ pub enum PackFileError {
 /// judges, and what the root side is handed and digests before it parses.
 ///
 /// `xudo rules add --reviewed` runs this as root, on a path in a directory
-/// the agent that wrote the pack may control. So the last component is
-/// never followed (`O_NOFOLLOW`): a symbolic link swapped in after the review
-/// cannot make root open `/etc/shadow`. The open never waits (`O_NONBLOCK`),
-/// so a FIFO cannot hang the sudo step, and takes no terminal (`O_NOCTTY`).
-/// Only a regular file is read, and only up to [`MAX_PACK_BYTES`]. A
-/// directory above the file can still be a link; the token, checked on these
-/// bytes before any parse, refuses whatever that reaches.
+/// the agent that wrote the pack may control. No component of the path is
+/// followed if it is a symbolic link, the file is not opened for reading
+/// until `fstat` on an `O_PATH` descriptor says it is a regular file, so a
+/// device is never opened, and every refusal has the same text (see
+/// `file.rs`). Only up to [`MAX_PACK_BYTES`] is read.
 ///
 /// # Errors
 ///
 /// Any [`PackFileError`].
 pub fn read_pack_file(path: &Path) -> Result<Vec<u8>, PackFileError> {
-    let at = path.display().to_string();
-    let flags =
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY;
-    let fd = open(path, flags, Mode::empty()).map_err(|errno| PackFileError::Open {
-        path: at.clone(),
-        reason: errno.to_string(),
-    })?;
-    if !fstat(&fd).is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile)
-    {
-        return Err(PackFileError::NotRegular { path: at });
-    }
-    let mut bytes = Vec::new();
-    let ceiling = u64::try_from(MAX_PACK_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let read = std::fs::File::from(fd)
-        .take(ceiling)
-        .read_to_end(&mut bytes);
-    pack_bytes(read, bytes, at)
-}
-
-/// The outcome of the bounded read as the pack. Split out so the failure arm
-/// is reachable from a test with a real error.
-fn pack_bytes(
-    read: std::io::Result<usize>,
-    bytes: Vec<u8>,
-    path: String,
-) -> Result<Vec<u8>, PackFileError> {
-    match read {
-        Ok(_) if bytes.len() > MAX_PACK_BYTES => Err(PackFileError::TooLarge { path }),
-        Ok(_) => Ok(bytes),
-        Err(error) => Err(PackFileError::Read {
-            path,
-            reason: error.to_string(),
-        }),
-    }
+    use std::os::unix::ffi::OsStrExt as _;
+    file::read_with(
+        &mut file::Host,
+        path.as_os_str().as_bytes(),
+        &path.display().to_string(),
+    )
 }
 
 /// Where this process runs, as `/proc` reports it: a seam, so the checks are
@@ -426,10 +383,7 @@ fn reviewed(found: &str, token: &str) -> Result<(), PackError> {
     if found == token {
         Ok(())
     } else {
-        Err(PackError::Changed {
-            reviewed: token.to_owned(),
-            found: found.to_owned(),
-        })
+        Err(PackError::Changed)
     }
 }
 

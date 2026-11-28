@@ -911,7 +911,8 @@ as_admin "$sudo_add --reviewed $stale $pack_dir/ops.toml"
 case_name=a_pack_reviewed_against_other_rules_is_refused_at_the_sudo_step
 if [ -n "$stale" ] && [ "$hrc" = 19 ] && [ ! -e "$installed" ] &&
     printf '%s\n' "$hout" | grep -qi password &&
-    printf '%s\n' "$hout" | grep -q "this is not the change that was reviewed (token $stale, now "; then
+    printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed: " &&
+    ! printf '%s\n' "$hout" | grep -qF "$stale"; then
     good "$case_name"
 else
     bad "$case_name (rc=$hrc token=$stale)"
@@ -928,7 +929,7 @@ ln -sfn /etc/shadow "$pack_dir/swap/ops.toml"
 as_admin "$sudo_add --reviewed $swapped_token $pack_dir/swap/ops.toml"
 case_name=a_pack_swapped_for_a_symlink_to_shadow_is_never_read_as_root
 if [ -n "$swapped_token" ] && [ "$hrc" = 19 ] && [ ! -e "$installed" ] &&
-    printf '%s\n' "$hout" | grep -q 'a symbolic link is never followed' &&
+    printf '%s\n' "$hout" | grep -q 'a symbolic link on its path' &&
     ! printf '%s\n' "$hout" | grep -q '^root:\|1 | root\|TOML parse error'; then
     good "$case_name"
 else
@@ -936,6 +937,36 @@ else
     printf '%s\n' "$hout" >&2
 fi
 rm -rf "$pack_dir/swap"
+
+# Swapped higher up: the directory the human was told to type is now a link
+# to /etc (a regular file only root reads) or to /dev (a device that acts on
+# open). Root refuses on the link, with the text a missing file gets, and
+# never opens what it names.
+as_operator "/usr/bin/xudo rules add $pack_dir/ops.toml"
+swapped_token=$(token_of "$hout")
+parent_texts=
+for target in /etc/shadow /etc/no-such-file /dev/null; do
+    rm -rf "$pack_dir/up"
+    ln -sfn "$(dirname "$target")" "$pack_dir/up"
+    as_admin "$sudo_add --reviewed $swapped_token $pack_dir/up/$(basename "$target")"
+    # hout holds the transcript and the output file, so a line can be there
+    # twice: count whether, not how often.
+    refused=no
+    leaked=no
+    printf '%s\n' "$hout" | grep -q 'a symbolic link on its path' && refused=yes
+    printf '%s\n' "$hout" | grep -q '^root:\|TOML parse error\|not the change' && leaked=yes
+    parent_texts="$parent_texts$hrc $refused $leaked
+"
+done
+case_name=a_pack_whose_parent_directory_became_a_link_is_never_read_as_root
+if [ -n "$swapped_token" ] && [ ! -e "$installed" ] &&
+    [ "$(printf '%s' "$parent_texts" | sort -u)" = "19 yes no" ]; then
+    good "$case_name"
+else
+    bad "$case_name ($parent_texts)"
+    printf '%s\n' "$hout" >&2
+fi
+rm -rf "$pack_dir/up"
 
 # Refused at review, and never written: a failing [[test]], an unregistered
 # harness, a waiver without --allow-waivers. The review prints no token, and
@@ -948,7 +979,7 @@ refused_pack() {
     as_admin "$sudo_add --reviewed $bogus $pack_dir/$2.toml"
     if [ "$review_rc" = 21 ] && [ -z "$(token_of "$review_out")" ] &&
         printf '%s\n' "$review_out" | grep -qF "$3" && printf '%s\n' "$hout" | grep -qi password &&
-        [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed (token $bogus, now " &&
+        [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed: " &&
         [ ! -e "/etc/xudo/rules.d/pack-e7-$2.toml" ]; then
         good "$1"
     else
@@ -972,7 +1003,7 @@ if [ "$review_rc" = 0 ] && [ -n "$waived" ] &&
     printf '%s\n' "$review_out" | grep -q '^GTFOBins waivers: ' &&
     printf '%s\n' "$review_out" | grep -q '^  pack.e7.restart: pager and unit-file shell escapes via systemctl: ' &&
     printf '%s\n' "$review_out" | grep -q '^  sudo xudo rules add --allow-waivers --reviewed ' &&
-    [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed (token $waived, now " &&
+    [ "$hrc" = 19 ] && printf '%s\n' "$hout" | grep -qF "this is not the change that was reviewed: " &&
     [ ! -e /etc/xudo/rules.d/pack-e7-waiver.toml ]; then
     good "$case_name"
 else

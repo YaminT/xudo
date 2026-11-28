@@ -495,7 +495,7 @@ fn the_root_side_re_validates_before_rename() {
     let mut changed = request_on(&machine, NGINX);
     changed.bytes = NGINX.replace("1.0.0", "1.0.1").into_bytes();
     let error = add_pack(&changed, &session(), &machine, &machine).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
     assert!(
         error
             .to_string()
@@ -583,7 +583,7 @@ fn rules_that_changed_between_review_and_install_refuse() {
         "[[action]]\nid = \"more.uptime\"\ntier = \"diag-read\"\nexe = \"/usr/bin/uptime\"\n",
     );
     let error = add_pack(&reviewed, &session(), &machine, &machine).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
     assert!(wrote_nothing(&machine));
 
     // A harness registered between review and install.
@@ -594,7 +594,7 @@ fn rules_that_changed_between_review_and_install_refuse() {
         &CODEX.replace("codex", "claude"),
     );
     let error = add_pack(&reviewed, &session(), &machine, &machine).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
 
     // The flag the review ran with is part of what was reviewed, even for a
     // pack with no waiver in it.
@@ -603,7 +603,7 @@ fn rules_that_changed_between_review_and_install_refuse() {
     let mut flipped = request_on(&machine, ids);
     flipped.allow_waivers = false;
     let error = add_pack(&flipped, &session(), &machine, &machine).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
     flipped.reviewed = operator_token(&machine, ids, false);
     assert!(add_pack(&flipped, &session(), &machine, &machine).is_ok());
 }
@@ -734,7 +734,7 @@ fn remove_takes_away_only_a_pack_xudo_installed_and_only_as_reviewed() {
         "[[action]]\nid = \"more.uptime\"\ntier = \"diag-read\"\nexe = \"/usr/bin/uptime\"\n",
     );
     let error = remove_pack("nginx-ops", &stale, &session(), &moved, &moved).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
     assert!(moved.files.borrow().contains_key(PATH));
 
     let token = removal_token(&moved, "nginx-ops");
@@ -827,16 +827,96 @@ fn a_regular_pack_file_is_read_whole() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The one refusal every unusable path gets.
+fn unusable(path: &Path) -> PackFileError {
+    PackFileError::Unusable {
+        path: path.display().to_string(),
+    }
+}
+
+#[test]
+fn a_relative_pack_path_is_read_from_the_working_directory() {
+    // `cargo test` runs in the crate's directory.
+    assert_eq!(
+        read_pack_file(Path::new("Cargo.toml")).unwrap(),
+        std::fs::read("Cargo.toml").unwrap()
+    );
+    assert_eq!(
+        read_pack_file(Path::new("./src/../Cargo.toml")).unwrap(),
+        std::fs::read("Cargo.toml").unwrap()
+    );
+}
+
 #[test]
 fn a_pack_swapped_for_a_symlink_to_a_secret_is_never_followed() {
     let dir = scratch("symlink");
     std::fs::write(dir.join("shadow"), SECRET).unwrap();
     std::os::unix::fs::symlink(dir.join("shadow"), dir.join("pack.toml")).unwrap();
     let error = read_pack_file(&dir.join("pack.toml")).unwrap_err();
-    assert!(matches!(error, PackFileError::Open { .. }), "{error}");
+    assert_eq!(error, unusable(&dir.join("pack.toml")));
     let text = PackError::from(error).to_string();
-    assert!(text.contains("symbolic link is never followed"), "{text}");
+    assert!(text.contains("a symbolic link on its path"), "{text}");
     assert!(!text.contains("secret"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_parent_directory_swapped_for_a_link_to_dev_never_opens_the_device() {
+    // The operator reviewed `<dir>/x/null`; the agent then made `x` a link
+    // to `/dev`. Root must refuse on the link, not open the device behind it
+    // (a watchdog starts its timer on open).
+    let dir = scratch("parent-dev");
+    std::os::unix::fs::symlink("/dev", dir.join("x")).unwrap();
+    let path = dir.join("x/null");
+    assert_eq!(read_pack_file(&path).unwrap_err(), unusable(&path));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_parent_directory_swapped_for_a_link_to_a_secret_directory_is_refused() {
+    // `x` links to a directory holding a file only root should read: the
+    // file is regular, so only the link refusal stands between it and root.
+    let dir = scratch("parent-hidden");
+    std::fs::create_dir_all(dir.join("etc")).unwrap();
+    std::fs::write(dir.join("etc/shadow"), SECRET).unwrap();
+    std::os::unix::fs::symlink(dir.join("etc"), dir.join("x")).unwrap();
+    for path in [dir.join("x/shadow"), dir.join("x/../etc/shadow")] {
+        let error = read_pack_file(&path).unwrap_err();
+        assert_eq!(error, unusable(&path));
+        assert!(
+            !format!("{error} {error:?}").contains("notarealhash"),
+            "{error}"
+        );
+    }
+    // A link further up the path is refused the same way.
+    std::fs::create_dir_all(dir.join("real/sub")).unwrap();
+    std::fs::write(dir.join("real/sub/pack.toml"), NGINX).unwrap();
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("up")).unwrap();
+    let path = dir.join("up/sub/pack.toml");
+    assert_eq!(read_pack_file(&path).unwrap_err(), unusable(&path));
+    assert_eq!(
+        read_pack_file(&dir.join("real/sub/pack.toml")).unwrap(),
+        NGINX.as_bytes()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missing_pack_reads_like_one_that_exists_behind_a_link() {
+    // Whether a path exists is not told apart from a refused one.
+    let dir = scratch("missing");
+    std::fs::write(dir.join("shadow"), SECRET).unwrap();
+    std::os::unix::fs::symlink(&dir, dir.join("x")).unwrap();
+    let text = |path: PathBuf| {
+        read_pack_file(&path)
+            .unwrap_err()
+            .to_string()
+            .replace(&path.display().to_string(), "P")
+    };
+    let exists = text(dir.join("x/shadow"));
+    assert_eq!(text(dir.join("x/nothing")), exists);
+    assert_eq!(text(dir.join("nothing/shadow")), exists);
+    assert_eq!(text(dir.join("shadow/x")), exists);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -854,27 +934,15 @@ fn a_pack_swapped_for_a_fifo_is_refused_without_hanging() {
     )
     .unwrap();
     // Nobody writes to it: a blocking open would never return.
-    assert_eq!(
-        read_pack_file(&fifo).unwrap_err(),
-        PackFileError::NotRegular {
-            path: fifo.display().to_string()
-        }
-    );
+    assert_eq!(read_pack_file(&fifo).unwrap_err(), unusable(&fifo));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_pack_path_naming_a_device_or_a_directory_is_refused() {
     let dir = scratch("kinds");
-    for path in [Path::new("/dev/null"), dir.as_path()] {
-        let error = read_pack_file(path).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "{} is not a regular file, so it is not a rule pack",
-                path.display()
-            )
-        );
+    for path in [Path::new("/dev/null"), dir.as_path(), Path::new("/")] {
+        assert_eq!(read_pack_file(path).unwrap_err(), unusable(path));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -891,13 +959,37 @@ fn an_oversized_pack_file_is_refused_not_truncated() {
 
 #[test]
 fn a_failed_pack_read_names_the_path_and_no_content() {
-    let error = pack_bytes(
-        Err(std::io::Error::other("device gone")),
-        SECRET.as_bytes().to_vec(),
-        "pack.toml".to_owned(),
-    )
-    .unwrap_err();
+    let error = PackFileError::Read {
+        path: "pack.toml".to_owned(),
+        reason: "device gone".to_owned(),
+    };
     assert_eq!(error.to_string(), "cannot read pack.toml: device gone");
+}
+
+#[test]
+fn a_refused_token_shows_neither_token() {
+    // Root's token is a hash of what it read from a path the agent chose:
+    // printed, it would confirm a guess at a root-only file's bytes.
+    let machine = host();
+    let mut swapped = request_on(&machine, NGINX);
+    let root_token = {
+        let change = Change::Add {
+            pack: SECRET.as_bytes(),
+            allow_waivers: true,
+        };
+        token_of(rule_files(&machine).unwrap(), &registry(&machine), change).unwrap()
+    };
+    swapped.bytes = SECRET.as_bytes().to_vec();
+    let error = add_pack(&swapped, &session(), &machine, &machine).unwrap_err();
+    assert_eq!(error, PackError::Changed);
+    let text = format!("{error} {error:?}");
+    assert!(!text.contains(&root_token), "{text}");
+    assert!(!text.contains(&swapped.reviewed), "{text}");
+    assert_eq!(
+        error.to_string(),
+        "this is not the change that was reviewed: the pack, the rules, the harness registry or \
+         --allow-waivers differ; review it again as yourself; nothing was changed"
+    );
 }
 
 #[test]
@@ -909,7 +1001,7 @@ fn a_pack_swapped_after_review_is_refused_before_it_is_parsed() {
     let mut swapped = request_on(&machine, NGINX);
     swapped.bytes = SECRET.as_bytes().to_vec();
     let error = add_pack(&swapped, &session(), &machine, &machine).unwrap_err();
-    assert!(matches!(error, PackError::Changed { .. }), "{error}");
+    assert_eq!(error, PackError::Changed);
     assert!(!format!("{error} {error:?}").contains("secret"), "{error}");
     assert!(wrote_nothing(&machine));
 }

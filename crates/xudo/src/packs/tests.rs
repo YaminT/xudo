@@ -404,7 +404,7 @@ fn what_is_not_a_reviewable_pack_is_refused() {
     // Not there.
     let (code, _, err) = go(&etc, &script, &add(etc.root.join("absent.toml")));
     assert_eq!(code, ExitCode::Unusable);
-    assert!(err.contains("cannot open"), "{err}");
+    assert!(err.contains("cannot use "), "{err}");
     // Too big to be one.
     let huge = etc.write("huge.toml", &vec![b'#'; xudo_sys::MAX_PACK_BYTES + 1]);
     let (code, _, err) = go(&etc, &script, &add(huge));
@@ -520,7 +520,7 @@ fn a_pack_swapped_for_a_symlink_after_review_is_refused_and_never_echoed() {
     };
     let (code, out, err) = go(&etc, &script, &action);
     assert_eq!(code, ExitCode::Unusable);
-    assert!(err.contains("symbolic link is never followed"), "{err}");
+    assert!(err.contains("a symbolic link on its path"), "{err}");
     assert!(!format!("{out}{err}").contains("secret"), "{out}{err}");
     // Root was handed nothing.
     assert!(script.asked.borrow().is_empty());
